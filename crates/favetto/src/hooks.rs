@@ -176,6 +176,7 @@ impl HookEngine {
                 match db::insert_task(&self.state.db, &task).await {
                     Ok(()) => {
                         tracing::info!(skill, event_id = ev.id, "hook enqueued task");
+                        crate::metrics::inc_tasks();
                         self.state.bus.publish(ServerPush::TaskUpdated(task));
                     }
                     Err(e) => tracing::warn!(error = %e, "hook failed to enqueue task"),

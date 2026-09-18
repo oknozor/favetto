@@ -2,7 +2,6 @@
 //! wire protocol whether attached locally (Unix socket) or remotely (WebSocket).
 
 mod app;
-mod client;
 mod ui;
 
 use std::io;
@@ -21,8 +20,8 @@ use favetto_core::model::{ChatSession, Event, NotificationRecord, Schedule, Task
 use favetto_core::rpc::method;
 
 use crate::cli::TuiArgs;
+use crate::client::{Client, Transport};
 use app::{App, ConnState, UiAction};
-use client::{Client, Transport};
 
 /// Outcome of a connected session: the user quit, or the link dropped.
 enum SessionOutcome {
@@ -31,7 +30,7 @@ enum SessionOutcome {
 }
 
 pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
-    let transport = resolve_transport(&args);
+    let transport = resolve_transport(&args).await;
 
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
@@ -237,11 +236,17 @@ fn drain_quit(ev_rx: &mut mpsc::UnboundedReceiver<CEvent>, app: &mut App) {
     }
 }
 
-fn resolve_transport(args: &TuiArgs) -> Transport {
+async fn resolve_transport(args: &TuiArgs) -> Transport {
+    // Pairing: exchange a short-lived code for the daemon's bearer token.
+    let pair_token = match (&args.remote, &args.pair_code) {
+        (Some(remote), Some(code)) => exchange_pair_code(remote, code).await.ok(),
+        _ => None,
+    };
+
     if let Some(remote) = &args.remote {
         return Transport::Ws {
             url: remote.clone(),
-            token: read_token(args),
+            token: pair_token.or_else(|| read_token(args)),
         };
     }
     if let Ok(url) = std::env::var("FAVETTO_URL") {
@@ -257,6 +262,25 @@ fn resolve_transport(args: &TuiArgs) -> Transport {
         .clone()
         .unwrap_or_else(|| PathBuf::from("/tmp/favetto.sock"));
     Transport::Unix(socket)
+}
+
+/// Exchange a pairing code for the daemon's token over the HTTP pairing endpoint.
+async fn exchange_pair_code(remote: &str, code: &str) -> anyhow::Result<String> {
+    let http_url = remote
+        .replace("wss://", "https://")
+        .replace("ws://", "http://");
+    let resp: serde_json::Value = reqwest::Client::new()
+        .post(format!("{}/pair/exchange", http_url.trim_end_matches('/')))
+        .json(&serde_json::json!({ "code": code }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    resp.get("token")
+        .and_then(|t| t.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("pair/exchange response missing token"))
 }
 
 fn read_token(args: &TuiArgs) -> Option<String> {

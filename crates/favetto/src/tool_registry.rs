@@ -91,6 +91,8 @@ impl ToolRegistry {
         tool: &str,
         args: serde_json::Value,
     ) -> anyhow::Result<String> {
+        let started = std::time::Instant::now();
+
         let session = self
             .sessions
             .get(server)
@@ -102,7 +104,14 @@ impl ToolRegistry {
             other => anyhow::bail!("tool arguments must be an object, got {other}"),
         };
 
-        let result = session.call_tool(tool, arg_map).await?;
+        let result = session.call_tool(tool, arg_map).await;
+        crate::metrics::record_tool_call(
+            server,
+            tool,
+            started.elapsed().as_millis() as u64,
+            result.is_ok(),
+        );
+        let result = result?;
 
         let mut text = result
             .content

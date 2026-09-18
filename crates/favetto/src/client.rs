@@ -1,6 +1,8 @@
-//! Wire client used by the TUI. Mirrors the daemon's transport abstraction: it
-//! connects over a Unix socket or a WebSocket and exposes
-//! [`request`](Client::request) plus a push broadcast the UI can subscribe to.
+//! Wire client: connects over a Unix socket or a WebSocket and exposes
+//! [`request`](Client::request) plus a push broadcast subscribers can listen to.
+//!
+//! Shared by the TUI and `mcp serve` — both are just different consumers of the same
+//! daemon wire protocol.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -28,10 +30,11 @@ pub enum Transport {
     Ws { url: String, token: Option<String> },
 }
 
+#[derive(Clone)]
 pub struct Client {
     out_tx: mpsc::Sender<Frame>,
     pending: Arc<Mutex<HashMap<RequestId, oneshot::Sender<Response>>>>,
-    next_id: AtomicU64,
+    next_id: Arc<AtomicU64>,
     push_tx: broadcast::Sender<Notification>,
 }
 
@@ -86,7 +89,7 @@ impl Client {
         Ok(Self {
             out_tx,
             pending,
-            next_id: AtomicU64::new(1),
+            next_id: Arc::new(AtomicU64::new(1)),
             push_tx,
         })
     }
@@ -132,7 +135,7 @@ async fn ws_connect(url: &str, token: Option<&str>) -> anyhow::Result<(ClientStr
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
     if url.starts_with("wss://") {
-        anyhow::bail!("TLS WebSocket (wss://) is not enabled in M1; use ws:// or the Unix socket");
+        anyhow::bail!("TLS WebSocket (wss://) is not enabled in M6; use ws:// or the Unix socket");
     }
 
     let mut builder = http::Request::builder().uri(url);

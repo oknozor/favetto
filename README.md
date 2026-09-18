@@ -111,7 +111,7 @@ tool schemas and drives a tool-calling loop through the MCP `ToolRegistry`.
 | **M3** | GitHub + Linear integrations as first-party MCP servers, webhook receivers, hooks, local dev Linear via docker-compose, `implement_*` skills | ✅ Done |
 | **M4** | Gmail: thin `reqwest` client + OAuth refresh + `mcp-gmail` + email summarizer skill | ✅ Done |
 | **M5** | Scheduler + notifications: cron, task queue → runtime, notification channels, Scheduler + Notifications TUI tabs | ✅ Done |
-| **M6** | Hardening: sandboxing, metrics, mTLS/pairing, favetto-as-MCP-server, replay/recovery tests | ⬜ Planned |
+| **M6** | Hardening: orchestrator-as-MCP-server (`mcp-serve`), metrics, pairing, sandbox + replay tests | ✅ Done |
 
 ### M1 (done)
 
@@ -195,6 +195,22 @@ tool schemas and drives a tool-calling loop through the MCP `ToolRegistry`.
 - Verified: a `*/2 * * * * *` schedule fired repeatedly — each fire emitted
   `cron_tick`, enqueued a task, and the executor ran it to `succeeded` (emitting
   `task_completed`); `log` and `webhook` notifications delivered and were persisted.
+
+### M6 (done)
+
+- **Orchestrator-as-MCP-server**: `favetto mcp-serve` bridges to a running daemon
+  (Unix socket or WebSocket) and exposes `create_task`, `list_tasks`, `cancel_task`,
+  `query_events`, and `send_notification` as MCP tools — so any MCP client can drive
+  favetto. Backed by a new `tasks.create` RPC method.
+- **Metrics**: a hand-rolled Prometheus registry exposed at `GET /metrics`
+  (`favetto_*_total` counters plus per-MCP-server tool-call counts/latency).
+- **Pairing**: `favetto pair` prints a short-lived code; `POST /pair/generate` /
+  `POST /pair/exchange` exchange it for the bearer token (single-use, 60s TTL), and
+  the TUI accepts `--pair-code`.
+- **Sandboxing**: the filesystem tool's path confinement is now covered by tests
+  (`. ..`/absolute escapes rejected), and replay/recovery is tested via the
+  append-only event log (`events_after` resumes from `last_event_id`). Full
+  seccomp/landlock/WASM isolation and mTLS remain future work.
 
 ## Webhooks & hooks
 
@@ -286,14 +302,18 @@ echo backend offline, or uses `openai:<model>` when `--features openai` and
 `OPENAI_API_KEY` are set. Chat sessions are in-memory for now; they'll persist
 once the scheduler lands in M5.
 
-## Remote API (M1)
+## Remote API
 
 The daemon exposes one wire protocol over two transports:
 
 - **Unix socket** `/tmp/favetto.sock` (local, trusted).
 - **WebSocket** `ws://127.0.0.1:7878/rpc` (bearer token required).
 
-Methods: `system.ping`, `tasks.list`, `tasks.cancel`, `events.tail`,
-`events.subscribe`, `chat.open`, `chat.send`, `chat.messages`,
+Methods: `system.ping`, `tasks.list`, `tasks.create`, `tasks.cancel`,
+`events.tail`, `events.subscribe`, `chat.open`, `chat.send`, `chat.messages`,
 `schedules.list`, `schedules.upsert`, `schedules.delete`, `notifications.list`,
 `notifications.test`. Server pushes: `event`, `task.updated`, `log.line`.
+
+The daemon also serves HTTP endpoints: `GET /metrics` (Prometheus),
+`POST /pair/generate` and `POST /pair/exchange` (pairing), plus the webhook
+receivers. And `favetto mcp-serve` exposes the whole thing as an MCP server.

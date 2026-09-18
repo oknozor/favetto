@@ -35,32 +35,36 @@ impl FilesystemServer {
     /// Handles both absolute (anchored to root) and relative paths, and follows
     /// symlinks via `canonicalize` so `..` traversal cannot escape the root.
     fn resolve(&self, path: &str) -> anyhow::Result<PathBuf> {
-        let p = Path::new(path);
-        let joined = if p.is_absolute() {
-            self.root.join(p.strip_prefix("/").unwrap_or(p))
-        } else {
-            self.root.join(p)
-        };
-
-        // If the final component doesn't exist yet (e.g. write_file), canonicalize
-        // the parent and re-attach the file name.
-        let resolved = if joined.exists() {
-            joined.canonicalize()?
-        } else {
-            let parent = joined.parent().unwrap_or(&self.root);
-            let parent_canon = parent.canonicalize()?;
-            let name = joined
-                .file_name()
-                .context("path has no file name")?;
-            parent_canon.join(name)
-        };
-
-        let root_canon = self.root.canonicalize()?;
-        if !resolved.starts_with(&root_canon) {
-            anyhow::bail!("path escapes root: {path}");
-        }
-        Ok(resolved)
+        resolve_path(&self.root, path)
     }
+}
+
+/// Sandbox helper: resolve `path` strictly inside `root`, refusing `..`/absolute
+/// escapes. Shared with tests to prove the filesystem tool is confined.
+fn resolve_path(root: &Path, path: &str) -> anyhow::Result<PathBuf> {
+    let p = Path::new(path);
+    let joined = if p.is_absolute() {
+        root.join(p.strip_prefix("/").unwrap_or(p))
+    } else {
+        root.join(p)
+    };
+
+    // If the final component doesn't exist yet (e.g. write_file), canonicalize
+    // the parent and re-attach the file name.
+    let resolved = if joined.exists() {
+        joined.canonicalize()?
+    } else {
+        let parent = joined.parent().unwrap_or(root);
+        let parent_canon = parent.canonicalize()?;
+        let name = joined.file_name().context("path has no file name")?;
+        parent_canon.join(name)
+    };
+
+    let root_canon = root.canonicalize()?;
+    if !resolved.starts_with(&root_canon) {
+        anyhow::bail!("path escapes root: {path}");
+    }
+    Ok(resolved)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -164,4 +168,46 @@ fn parse_root(mut args: impl Iterator<Item = String>) -> PathBuf {
         }
     }
     root
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_path;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn sandbox(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("favetto-fs-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("file.txt"), "hello").unwrap();
+        dir
+    }
+
+    #[test]
+    fn resolves_within_root() {
+        let root = sandbox("within");
+        let p = resolve_path(&root, "file.txt").unwrap();
+        assert!(p.starts_with(&root));
+        assert_eq!(p.file_name().unwrap().to_str().unwrap(), "file.txt");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn blocks_dotdot_escape() {
+        let root = sandbox("dotdot");
+        assert!(resolve_path(&root, "../etc/passwd").is_err());
+        assert!(resolve_path(&root, "sub/../../etc/passwd").is_err());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn blocks_absolute_escape() {
+        let root = sandbox("absolute");
+        // Absolute paths are anchored to the root, so "/etc" resolves under root,
+        // not the real /etc.
+        let p = resolve_path(&root, "/etc").unwrap();
+        assert!(p.starts_with(&root));
+        fs::remove_dir_all(&root).ok();
+    }
 }

@@ -40,6 +40,7 @@ pub async fn register(scheduler: &JobScheduler, state: Arc<State>, schedule: &Sc
                 error: None,
             };
             let _ = db::insert_task(&state.db, &task).await;
+            crate::metrics::inc_tasks();
             state.bus.publish(ServerPush::TaskUpdated(task.clone()));
             state
                 .emit_event(

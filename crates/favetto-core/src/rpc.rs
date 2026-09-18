@@ -26,6 +26,7 @@ pub mod method {
     pub const PING: &str = "system.ping";
     pub const TASKS_LIST: &str = "tasks.list";
     pub const TASKS_CANCEL: &str = "tasks.cancel";
+    pub const TASKS_CREATE: &str = "tasks.create";
     pub const EVENTS_TAIL: &str = "events.tail";
     /// (Re)subscribe to the live event stream. Accepts `last_event_id` to replay
     /// missed events before switching to live delivery.

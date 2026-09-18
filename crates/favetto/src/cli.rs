@@ -23,9 +23,9 @@ pub enum Command {
     Tui(TuiArgs),
     /// Run a single skill as a one-off task.
     TaskRun(TaskRunArgs),
-    /// Expose favetto itself as an MCP server (M6+).
+    /// Expose favetto itself as an MCP server (bridges to a running daemon).
     McpServe(McpServeArgs),
-    /// Print a short-lived pairing code for remote TUI attachment (M6+).
+    /// Print a short-lived pairing code for remote TUI attachment.
     Pair(PairArgs),
     /// Rotate the bearer token.
     TokenRotate(TokenRotateArgs),
@@ -67,6 +67,9 @@ pub struct TuiArgs {
     /// Unix socket path (overrides the default).
     #[arg(long)]
     pub socket: Option<PathBuf>,
+    /// Short-lived pairing code to exchange for a token (remote attach only).
+    #[arg(long)]
+    pub pair_code: Option<String>,
 }
 
 #[derive(Args)]
@@ -86,13 +89,23 @@ pub struct TaskRunArgs {
 
 #[derive(Args)]
 pub struct McpServeArgs {
-    /// TCP listen address for the MCP server.
-    #[arg(long, default_value = "127.0.0.1:7879")]
-    pub listen: String,
+    /// Unix socket of the daemon to bridge to.
+    #[arg(long, default_value = "/tmp/favetto.sock")]
+    pub socket: PathBuf,
+    /// Remote WebSocket URL of the daemon (alternative to --socket).
+    #[arg(long)]
+    pub remote: Option<String>,
+    /// Bearer token for remote attach.
+    #[arg(long)]
+    pub token: Option<String>,
 }
 
 #[derive(Args)]
-pub struct PairArgs {}
+pub struct PairArgs {
+    /// Daemon HTTP base URL (e.g. http://127.0.0.1:7878).
+    #[arg(long, default_value = "http://127.0.0.1:7878")]
+    pub url: String,
+}
 
 #[derive(Args)]
 pub struct TokenRotateArgs {

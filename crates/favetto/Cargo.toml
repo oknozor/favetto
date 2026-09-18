@@ -23,7 +23,8 @@ hex = "0.4"
 hmac = "0.13"
 http = "1"
 ratatui = "0.30"
-rmcp = { version = "3.4", default-features = false, features = ["client", "transport-child-process"] }
+rmcp = { version = "3.4", default-features = false, features = ["client", "server", "macros", "transport-child-process", "transport-io"] }
+schemars = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.11"

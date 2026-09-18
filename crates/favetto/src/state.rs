@@ -13,6 +13,7 @@ use crate::chat::ChatManager;
 use crate::config::FavettoConfig;
 use crate::db;
 use crate::event_bus::{EventBus, ServerPush};
+use crate::pair::PairStore;
 use crate::webhooks::WebhookSecrets;
 
 /// Everything the daemon owns that connections and background tasks need access to.
@@ -28,6 +29,7 @@ pub struct State {
     pub config: Arc<FavettoConfig>,
     pub skills_dir: PathBuf,
     pub scheduler: JobScheduler,
+    pub pair: PairStore,
 }
 
 impl State {
@@ -51,6 +53,7 @@ impl State {
             config,
             skills_dir,
             scheduler,
+            pair: PairStore::new(),
         }
     }
 
@@ -69,6 +72,7 @@ impl State {
         match db::insert_event(&self.db, &event).await {
             Ok(id) => {
                 let event = Event { id, ..event };
+                crate::metrics::inc_events();
                 self.bus.publish(ServerPush::Event(event));
             }
             Err(e) => tracing::warn!(error = %e, "failed to persist event"),

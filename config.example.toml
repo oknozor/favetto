@@ -5,17 +5,26 @@
 # back to built-in defaults for anything you omit.
 
 # Default model for the interactive chat and the runtime. `"echo"` is a local,
-# keyless backend for offline development; `"openai:<model>"` uses the provider
-# declared under [providers].
+# keyless backend for offline development; `"<provider>:<model>"` uses an
+# OpenAI-compatible provider declared under [providers].
 [agent]
-model = "echo"
+model = "deepseek:deepseek-v4-flash"
+# model = "echo"
 # model = "openai:gpt-4o"
 
-# LLM providers. Only `kind = "openai"` is wired so far (enabled at build time
-# with `cargo build --features openai`).
-[providers.openai]
+# LLM providers. Any `kind = "openai"` provider can back the runtime (enabled at
+# build time with `cargo build --features openai`) — DeepSeek exposes an
+# OpenAI-compatible API, so it reuses the same backend with a different base URL.
+[providers.deepseek]
 kind = "openai"
 # Provide the key directly, or reference an environment variable.
+# api_key = "sk-..."
+api_key_env = "DEEPSEEK_API_KEY"
+model = "deepseek-v4-flash"
+base_url = "https://api.deepseek.com"
+
+[providers.openai]
+kind = "openai"
 # api_key = "sk-..."
 api_key_env = "OPENAI_API_KEY"
 model = "gpt-4o"

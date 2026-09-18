@@ -358,3 +358,43 @@ pub async fn next_pending_task(pool: &SqlitePool) -> anyhow::Result<Option<Task>
     .await?;
     Ok(row.as_ref().map(row_to_task))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use favetto_core::model::Event;
+
+    #[tokio::test]
+    async fn event_replay_resumes_from_cursor() {
+        let dir = std::env::temp_dir().join(format!("favetto-replay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = open(&dir.join("test.db")).await.unwrap();
+        migrate(&pool).await.unwrap();
+
+        for i in 0..5 {
+            let ev = Event {
+                id: 0,
+                kind: EventKind::Synthetic,
+                payload: serde_json::json!({ "n": i }),
+                created_at: Utc::now(),
+            };
+            let id = insert_event(&pool, &ev).await.unwrap();
+            assert_eq!(id, i + 1);
+        }
+
+        // Replay after cursor 2 replays events 3, 4, 5 in ascending order.
+        let replay = events_after(&pool, 2, 100).await.unwrap();
+        assert_eq!(replay.len(), 3);
+        assert_eq!(replay[0].id, 3);
+        assert_eq!(replay[2].id, 5);
+
+        // Tail returns the newest, in ascending order.
+        let tail = tail_events(&pool, 3).await.unwrap();
+        assert_eq!(tail.len(), 3);
+        assert_eq!(tail[0].id, 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

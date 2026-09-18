@@ -84,6 +84,7 @@ pub async fn serve_connection(state: Arc<State>, mut incoming: BoxIn, mut outgoi
 /// an ack plus a variable number of replayed events.
 async fn handle_request(state: &Arc<State>, out_tx: &mpsc::Sender<Frame>, req: Request) {
     let id = req.id;
+    crate::metrics::inc_rpc();
 
     if req.method == method::EVENTS_SUBSCRIBE {
         let _ = out_tx
@@ -141,6 +142,19 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
                     error_code::INVALID_PARAMS,
                     "missing or invalid 'id'".to_string(),
                 )),
+            }
+        }
+
+        method::TASKS_CREATE => {
+            let skill = match req.params.get("skill").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => return Response::err(req.id, error_code::INVALID_PARAMS, "missing skill"),
+            };
+            let input = req.params.get("input").cloned().unwrap_or(serde_json::Value::Null);
+            let dedupe_key = req.params.get("dedupe_key").and_then(|v| v.as_str()).map(str::to_string);
+            match create_task(state, skill, input, dedupe_key).await {
+                Ok(task) => Ok(serde_json::json!(task)),
+                Err(e) => Err((error_code::INTERNAL, e.to_string())),
             }
         }
 
@@ -317,9 +331,34 @@ async fn delete_schedule(state: &Arc<State>, id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Create a pending task (executed by the task executor) and announce it.
+async fn create_task(
+    state: &Arc<State>,
+    skill: String,
+    input: serde_json::Value,
+    dedupe_key: Option<String>,
+) -> anyhow::Result<favetto_core::model::Task> {
+    use favetto_core::model::{Task, TaskStatus};
+    let task = Task {
+        id: Uuid::new_v4(),
+        skill,
+        status: TaskStatus::Pending,
+        input,
+        output: None,
+        dedupe_key,
+        created_at: chrono::Utc::now(),
+        started_at: None,
+        finished_at: None,
+        error: None,
+    };
+    db::insert_task(&state.db, &task).await?;
+    crate::metrics::inc_tasks();
+    state.bus.publish(crate::event_bus::ServerPush::TaskUpdated(task.clone()));
+    Ok(task)
+}
+
 /// Mark a task cancelled, persist it, and announce the change.
-async fn cancel_task(state: &State, id: Uuid) -> anyhow::Result<favetto_core::model::Task> {
-    let Some(mut task) = db::get_task(&state.db, id).await? else {
+async fn cancel_task(state: &State, id: Uuid) -> anyhow::Result<favetto_core::model::Task> {    let Some(mut task) = db::get_task(&state.db, id).await? else {
         anyhow::bail!("task not found");
     };
     task.status = favetto_core::model::TaskStatus::Cancelled;

@@ -2,6 +2,7 @@
 
 mod chat;
 mod cli;
+mod client;
 mod config;
 mod daemon;
 mod db;
@@ -9,7 +10,10 @@ mod event_bus;
 mod executor;
 mod hooks;
 mod mcp_client;
+mod mcp_serve;
+mod metrics;
 mod notify;
+mod pair;
 mod runtime;
 mod scheduler;
 mod server;
@@ -41,8 +45,8 @@ async fn main() -> anyhow::Result<()> {
         Command::Daemon(args) => daemon::run(args).await,
         Command::Tui(args) => tui::run(args).await,
         Command::TaskRun(args) => task_run(args).await,
-        Command::McpServe(args) => mcp_serve(args),
-        Command::Pair(args) => pair(args),
+        Command::McpServe(args) => mcp_serve::run(args).await,
+        Command::Pair(args) => pair(args).await,
         Command::TokenRotate(args) => token_rotate(args),
     }
 }
@@ -81,22 +85,9 @@ async fn task_run(args: cli::TaskRunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn mcp_serve(args: cli::McpServeArgs) -> anyhow::Result<()> {
-    println!(
-        "`mcp serve` arrives in M6 (favetto-as-MCP-server). Would listen on {}.",
-        args.listen
-    );
-    Ok(())
-}
-
-fn pair(_args: cli::PairArgs) -> anyhow::Result<()> {
-    let code = format!("{:06}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() % 1_000_000)
-        .unwrap_or(0));
-    println!("pairing code (valid 60s): {code}");
-    println!("note: the full pairing exchange lands in M6; use --token-file for now.");
-    Ok(())
+/// `favetto pair`: ask the daemon for a short-lived pairing code and print it.
+async fn pair(args: cli::PairArgs) -> anyhow::Result<()> {
+    pair::run(args).await
 }
 
 fn token_rotate(args: cli::TokenRotateArgs) -> anyhow::Result<()> {

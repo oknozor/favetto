@@ -214,18 +214,19 @@ pub fn build_backend(skill: &Skill, config: &FavettoConfig) -> anyhow::Result<Ar
     }
 
     anyhow::bail!(
-        "unknown or unavailable model backend '{}' (use \"mock\", or enable the 'openai' feature)",
-        model
+        "unknown or unavailable model backend '{model}' (use \"mock\", or \"<provider>:<model>\" \
+         with an OpenAI-compatible provider and the 'openai' feature)"
     )
 }
 
 /// Build a backend for the interactive TUI chat.
 ///
-/// Uses the skill's model, falling back to the global `[agent]` model, then to
-/// [`EchoBackend`] so the chat always works offline.
+/// Uses the skill's model when it resolves to a configured provider, falling back to
+/// the global `[agent]` model, then to [`EchoBackend`] so the chat always works
+/// offline.
 pub fn build_chat_backend(skill: Option<&Skill>, config: &FavettoConfig) -> Arc<dyn ModelBackend> {
     let model = skill
-        .filter(|s| s.config.agent.model.starts_with("openai"))
+        .filter(|s| is_compatible(&s.config.agent.model, config))
         .map(|s| s.config.agent.model.as_str())
         .or(config.agent.model.as_deref());
 
@@ -238,42 +239,55 @@ pub fn build_chat_backend(skill: Option<&Skill>, config: &FavettoConfig) -> Arc<
     Arc::new(EchoBackend)
 }
 
-/// Construct an OpenAI backend from a model string like `"openai"` or
-/// `"openai:gpt-4o"`, resolving the API key/model from the global config
-/// `[providers]` table (or the `OPENAI_API_KEY` env var as a last resort).
-#[allow(unused_variables)] // `config` is only read by the feature-gated openai backend
-fn openai_backend(model: &str, config: &FavettoConfig) -> Option<Arc<dyn ModelBackend>> {
-    if !model.starts_with("openai") {
-        return None;
-    }
+/// Whether `model` names a provider configured as OpenAI-compatible (e.g. `openai`
+/// or `deepseek`).
+fn is_compatible(model: &str, config: &FavettoConfig) -> bool {
+    let name = model.split_once(':').map(|(n, _)| n).unwrap_or(model);
+    config
+        .providers
+        .get(name)
+        .is_some_and(|p| p.kind == "openai")
+}
 
+/// Construct an OpenAI-compatible backend from a model string like `"openai"`,
+/// `"openai:gpt-4o"`, or `"deepseek:deepseek-v4-flash"`, resolving the provider's
+/// API key, model, and base URL from the global config `[providers]` table (with
+/// `OPENAI_API_KEY` as a last-resort key).
+#[allow(unused_variables)] // `model`/`config` are only read by the feature-gated backend
+fn openai_backend(model: &str, config: &FavettoConfig) -> Option<Arc<dyn ModelBackend>> {
     #[cfg(feature = "openai")]
     {
-        let provider = config
-            .providers
-            .get("openai")
-            .or_else(|| config.provider("openai").map(|(_, p)| p));
+        let (provider_name, model_part) = match model.split_once(':') {
+            Some((name, m)) => (name, Some(m)),
+            None => (model, None),
+        };
+
+        let provider = config.providers.get(provider_name)?;
+        if provider.kind != "openai" {
+            return None;
+        }
 
         let api_key = provider
-            .and_then(|p| p.api_key.clone())
+            .api_key
+            .clone()
             .or_else(|| {
                 provider
-                    .and_then(|p| p.api_key_env.as_deref())
+                    .api_key_env
+                    .as_deref()
                     .and_then(|name| std::env::var(name).ok())
             })
             .or_else(|| std::env::var("OPENAI_API_KEY").ok())?;
 
-        let model_name = model
-            .strip_prefix("openai:")
+        let model_name = model_part
             .map(str::to_string)
-            .or_else(|| provider.and_then(|p| p.model.clone()))
+            .or_else(|| provider.model.clone())
             .unwrap_or_else(|| "gpt-4o".to_string());
 
-        let base_url = provider.and_then(|p| p.base_url.clone());
+        let base_url = provider.base_url.clone();
 
         match OpenAiBackend::new(model_name, api_key, base_url) {
             Ok(backend) => return Some(Arc::new(backend)),
-            Err(e) => tracing::warn!(error = %e, "openai backend unavailable; falling back to echo"),
+            Err(e) => tracing::warn!(error = %e, "model backend unavailable; falling back to echo"),
         }
     }
 
