@@ -14,12 +14,14 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
-use favetto_core::model::{Event, EventKind, NotificationRecord, Schedule, Task, TaskStatus};
+use favetto_core::model::{
+    ChatMessage, Event, EventKind, MessageRole, NotificationRecord, Schedule, Task, TaskStatus,
+};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS tasks (
     id          TEXT PRIMARY KEY,
-    skill       TEXT NOT NULL,
+    name        TEXT NOT NULL,
     status      TEXT NOT NULL,
     input       TEXT NOT NULL,
     output      TEXT,
@@ -42,7 +44,7 @@ CREATE INDEX IF NOT EXISTS idx_events_id ON events(id);
 CREATE TABLE IF NOT EXISTS schedules (
     id          TEXT PRIMARY KEY,
     cron        TEXT NOT NULL,
-    skill       TEXT NOT NULL,
+    task        TEXT NOT NULL,
     input       TEXT NOT NULL,
     enabled     INTEGER NOT NULL DEFAULT 1,
     last_run    INTEGER,
@@ -57,6 +59,16 @@ CREATE TABLE IF NOT EXISTS notifications (
     status      TEXT NOT NULL,
     sent_at     INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id  TEXT NOT NULL,
+    role             TEXT NOT NULL,
+    content          TEXT NOT NULL,
+    reasoning        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation ON chat_messages(conversation_id, id);
 "#;
 
 fn ts_ms(dt: DateTime<Utc>) -> i64 {
@@ -88,11 +100,11 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
 /// Insert a task, silently ignoring a duplicate dedupe key.
 pub async fn insert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT OR IGNORE INTO tasks (id, skill, status, input, output, dedupe_key, created_at, started_at, finished_at, error)
+        "INSERT OR IGNORE INTO tasks (id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(task.id.to_string())
-    .bind(&task.skill)
+    .bind(&task.name)
     .bind(task.status.as_str())
     .bind(serde_json::to_string(&task.input)?)
     .bind(task.output.as_ref().map(serde_json::to_string).transpose()?)
@@ -109,7 +121,7 @@ pub async fn insert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
 /// Insert-or-update a task (full overwrite of mutable fields).
 pub async fn upsert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO tasks (id, skill, status, input, output, dedupe_key, created_at, started_at, finished_at, error)
+        "INSERT INTO tasks (id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
              status = excluded.status,
@@ -119,7 +131,7 @@ pub async fn upsert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
              error = excluded.error",
     )
     .bind(task.id.to_string())
-    .bind(&task.skill)
+    .bind(&task.name)
     .bind(task.status.as_str())
     .bind(serde_json::to_string(&task.input)?)
     .bind(task.output.as_ref().map(serde_json::to_string).transpose()?)
@@ -136,7 +148,7 @@ pub async fn upsert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
 /// Fetch a single task by id.
 pub async fn get_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Option<Task>> {
     let row = sqlx::query(
-        "SELECT id, skill, status, input, output, dedupe_key, created_at, started_at, finished_at, error \
+        "SELECT id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error \
          FROM tasks WHERE id = ?",
     )
     .bind(id.to_string())
@@ -148,7 +160,7 @@ pub async fn get_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Option<Task
 /// List the most recent tasks (newest first).
 pub async fn list_tasks(pool: &SqlitePool) -> anyhow::Result<Vec<Task>> {
     let rows = sqlx::query(
-        "SELECT id, skill, status, input, output, dedupe_key, created_at, started_at, finished_at, error \
+        "SELECT id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error \
          FROM tasks ORDER BY created_at DESC LIMIT 500",
     )
     .fetch_all(pool)
@@ -193,7 +205,7 @@ pub async fn events_after(pool: &SqlitePool, id: i64, limit: i64) -> anyhow::Res
 fn row_to_task(row: &SqliteRow) -> Task {
     Task {
         id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap_or_default(),
-        skill: row.get("skill"),
+        name: row.get("name"),
         status: row
             .get::<String, _>("status")
             .parse()
@@ -229,7 +241,7 @@ fn row_to_event(row: &SqliteRow) -> Event {
 /// List schedules (newest first).
 pub async fn list_schedules(pool: &SqlitePool) -> anyhow::Result<Vec<Schedule>> {
     let rows = sqlx::query(
-        "SELECT id, cron, skill, input, enabled, last_run FROM schedules ORDER BY id",
+        "SELECT id, cron, task, input, enabled, last_run FROM schedules ORDER BY id",
     )
     .fetch_all(pool)
     .await?;
@@ -239,13 +251,13 @@ pub async fn list_schedules(pool: &SqlitePool) -> anyhow::Result<Vec<Schedule>> 
 /// Insert or update a schedule, preserving its job_id column.
 pub async fn upsert_schedule(pool: &SqlitePool, schedule: &Schedule) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO schedules (id, cron, skill, input, enabled, last_run) VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET cron = excluded.cron, skill = excluded.skill,
+        "INSERT INTO schedules (id, cron, task, input, enabled, last_run) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET cron = excluded.cron, task = excluded.task,
              input = excluded.input, enabled = excluded.enabled, last_run = excluded.last_run",
     )
     .bind(&schedule.id)
     .bind(&schedule.cron)
-    .bind(&schedule.skill)
+    .bind(&schedule.task)
     .bind(serde_json::to_string(&schedule.input)?)
     .bind(schedule.enabled as i64)
     .bind(schedule.last_run.map(ts_ms))
@@ -292,7 +304,7 @@ fn row_to_schedule(row: &SqliteRow) -> Schedule {
     Schedule {
         id: row.get("id"),
         cron: row.get("cron"),
-        skill: row.get("skill"),
+        task: row.get("task"),
         input: serde_json::from_str(&row.get::<String, _>("input")).unwrap_or_default(),
         enabled: row.get::<i64, _>("enabled") != 0,
         last_run: row.get::<Option<i64>, _>("last_run").map(from_ms),
@@ -345,13 +357,65 @@ fn row_to_notification(row: &SqliteRow) -> NotificationRecord {
 }
 
 // ---------------------------------------------------------------------------
+// Chat persistence
+// ---------------------------------------------------------------------------
+
+/// Load a persisted conversation (in order), if any.
+pub async fn list_chat_messages(
+    pool: &SqlitePool,
+    conversation_id: &str,
+) -> anyhow::Result<Vec<ChatMessage>> {
+    let rows = sqlx::query(
+        "SELECT role, content, reasoning FROM chat_messages WHERE conversation_id = ? ORDER BY id ASC",
+    )
+    .bind(conversation_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| ChatMessage {
+            role: r
+                .get::<String, _>("role")
+                .parse()
+                .unwrap_or(MessageRole::User),
+            content: r.get("content"),
+            reasoning: r.get("reasoning"),
+        })
+        .collect())
+}
+
+/// Replace the persisted conversation with `messages`.
+pub async fn save_chat_messages(
+    pool: &SqlitePool,
+    conversation_id: &str,
+    messages: &[ChatMessage],
+) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM chat_messages WHERE conversation_id = ?")
+        .bind(conversation_id)
+        .execute(pool)
+        .await?;
+    for m in messages {
+        sqlx::query(
+            "INSERT INTO chat_messages (conversation_id, role, content, reasoning) VALUES (?, ?, ?, ?)",
+        )
+        .bind(conversation_id)
+        .bind(m.role.as_str())
+        .bind(&m.content)
+        .bind(&m.reasoning)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Task queue
 // ---------------------------------------------------------------------------
 
 /// The oldest pending task, if any (for the executor).
 pub async fn next_pending_task(pool: &SqlitePool) -> anyhow::Result<Option<Task>> {
     let row = sqlx::query(
-        "SELECT id, skill, status, input, output, dedupe_key, created_at, started_at, finished_at, error \
+        "SELECT id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error \
          FROM tasks WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1",
     )
     .fetch_optional(pool)

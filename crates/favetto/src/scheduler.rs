@@ -1,6 +1,7 @@
 //! Cron scheduler: loads `schedules` from SQLite and runs them via
-//! `tokio-cron-scheduler`. Each fire enqueues a `run_skill` task and emits a
-//! `CronTick` event. Schedules can be added/removed live through the RPC API.
+//! `tokio-cron-scheduler`. Each fire enqueues a task and emits a `CronTick` event.
+//! Schedules can be added/removed live through the RPC API, and catalog tasks with
+//! a `schedule` header are registered here as recurring tasks.
 
 use std::sync::Arc;
 
@@ -8,46 +9,35 @@ use chrono::Utc;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use uuid::Uuid;
 
-use favetto_core::model::{Schedule, Task, TaskStatus};
+use favetto_core::model::Schedule;
 
 use crate::db;
-use crate::event_bus::ServerPush;
+use crate::executor;
 use crate::state::State;
+
 /// Register a schedule's job with the scheduler. Returns the job id.
 pub async fn register(scheduler: &JobScheduler, state: Arc<State>, schedule: &Schedule) -> anyhow::Result<Uuid> {
     let cron = schedule.cron.clone();
     let state2 = state.clone();
-    let skill = schedule.skill.clone();
+    let task = schedule.task.clone();
     let input = schedule.input.clone();
     let schedule_id = schedule.id.clone();
 
     let job = Job::new_async(cron, move |_uuid, _sched| {
         let state = state2.clone();
-        let skill = skill.clone();
+        let task = task.clone();
         let input = input.clone();
         let schedule_id = schedule_id.clone();
         Box::pin(async move {
-            let task = Task {
-                id: Uuid::new_v4(),
-                skill: skill.clone(),
-                status: TaskStatus::Pending,
-                input,
-                output: None,
-                dedupe_key: Some(format!("schedule:{schedule_id}:{}", Utc::now().timestamp())),
-                created_at: Utc::now(),
-                started_at: None,
-                finished_at: None,
-                error: None,
-            };
-            let _ = db::insert_task(&state.db, &task).await;
-            crate::metrics::inc_tasks();
-            state.bus.publish(ServerPush::TaskUpdated(task.clone()));
-            state
-                .emit_event(
-                    favetto_core::model::EventKind::CronTick,
-                    serde_json::json!({ "schedule_id": schedule_id, "task_id": task.id }),
-                )
-                .await;
+            let dedupe = format!("schedule:{schedule_id}:{}", Utc::now().timestamp());
+            if let Ok(task) = executor::enqueue_task(&state, task, input, Some(dedupe)).await {
+                state
+                    .emit_event(
+                        favetto_core::model::EventKind::CronTick,
+                        serde_json::json!({ "schedule_id": schedule_id, "task_id": task.id }),
+                    )
+                    .await;
+            }
             let _ = db::touch_schedule(&state.db, &schedule_id).await;
         })
     })?;
@@ -59,6 +49,44 @@ pub async fn register(scheduler: &JobScheduler, state: Arc<State>, schedule: &Sc
 /// Unregister a schedule's job.
 pub async fn unregister(scheduler: &JobScheduler, job_id: &Uuid) -> anyhow::Result<()> {
     Ok(scheduler.remove(job_id).await?)
+}
+
+/// Insert-or-update a schedule, (re)registering its cron job. Shared by the RPC
+/// handler and catalog schedule sync.
+pub async fn upsert(state: &Arc<State>, schedule: &Schedule) -> anyhow::Result<()> {
+    if let Some(old_job_id) = db::get_schedule_job_id(&state.db, &schedule.id).await? {
+        if let Ok(job_uuid) = Uuid::parse_str(&old_job_id) {
+            let _ = unregister(&state.scheduler, &job_uuid).await;
+        }
+    }
+    db::upsert_schedule(&state.db, schedule).await?;
+    if schedule.enabled {
+        let job_id = register(&state.scheduler, state.clone(), schedule).await?;
+        db::set_schedule_job_id(&state.db, &schedule.id, &job_id.to_string()).await?;
+    }
+    Ok(())
+}
+
+/// Register recurring catalog tasks (those with a `schedule` header) as schedules.
+pub async fn sync_catalog_schedules(state: &Arc<State>) -> anyhow::Result<()> {
+    let catalog = state.catalog.read().unwrap().clone();
+    for def in catalog {
+        let Some(cron) = &def.schedule else {
+            continue;
+        };
+        let schedule = Schedule {
+            id: format!("catalog:{}", def.name),
+            cron: cron.clone(),
+            task: def.name.clone(),
+            input: serde_json::json!({}),
+            enabled: true,
+            last_run: None,
+        };
+        if let Err(e) = upsert(state, &schedule).await {
+            tracing::warn!(error = %e, task = %def.name, "failed to register catalog schedule");
+        }
+    }
+    Ok(())
 }
 
 /// Load persisted schedules, register their jobs, and start the scheduler tick loop.

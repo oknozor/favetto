@@ -10,9 +10,11 @@ use std::time::Duration;
 
 use anyhow::Context;
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{self, Event as CEvent, KeyCode, KeyEventKind};
+use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyEventKind};
 use ratatui::crossterm::execute;
-use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use ratatui::crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
@@ -21,7 +23,7 @@ use favetto_core::rpc::method;
 
 use crate::cli::TuiArgs;
 use crate::client::{Client, Transport};
-use app::{App, ConnState, UiAction};
+use app::{App, CatalogEntry, ConnState, UiAction};
 
 /// Outcome of a connected session: the user quit, or the link dropped.
 enum SessionOutcome {
@@ -34,7 +36,7 @@ pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
 
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("init terminal")?;
 
@@ -82,13 +84,13 @@ pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
             break Ok(());
         }
 
-        let _ = terminal.draw(|f| ui::draw(f, &app));
+        let _ = terminal.draw(|f| ui::draw(f, &mut app));
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(10));
     };
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
 
     result
 }
@@ -147,6 +149,66 @@ async fn sync_initial(client: &Client, app: &mut App) {
             serde_json::json!({ "last_event_id": app.last_event_id }),
         )
         .await;
+
+    fetch_catalog(client, app).await;
+
+    // Re-sync the active chat so any messages delivered while disconnected are
+    // recovered from the persisted conversation.
+    if app.chat_session_id.is_some() {
+        if let Ok(resp) = client
+            .request(
+                method::CHAT_OPEN,
+                serde_json::json!({ "task_id": app.chat_task_id }),
+            )
+            .await
+        {
+            if let Some(v) = resp.result {
+                if let Ok(session) = serde_json::from_value::<ChatSession>(v) {
+                    app.resume_chat(session);
+                }
+            }
+        }
+    }
+}
+
+/// Fetch the task catalog.
+async fn fetch_catalog(client: &Client, app: &mut App) {
+    if let Ok(resp) = client.request(method::CATALOG_LIST, serde_json::json!({})).await {
+        if let Some(v) = resp.result {
+            if let Ok(catalog) = serde_json::from_value::<Vec<CatalogEntry>>(v) {
+                app.catalog = catalog;
+            }
+        }
+    }
+}
+
+/// Re-fetch the list-based tabs (used after a form submission).
+async fn refresh_lists(client: &Client, app: &mut App) {
+    if let Ok(resp) = client.request(method::TASKS_LIST, serde_json::json!({})).await {
+        if let Some(v) = resp.result {
+            if let Ok(tasks) = serde_json::from_value::<Vec<Task>>(v) {
+                app.tasks = tasks;
+            }
+        }
+    }
+    if let Ok(resp) = client.request(method::SCHEDULES_LIST, serde_json::json!({})).await {
+        if let Some(v) = resp.result {
+            if let Ok(schedules) = serde_json::from_value::<Vec<Schedule>>(v) {
+                app.schedules = schedules;
+            }
+        }
+    }
+    if let Ok(resp) = client
+        .request(method::NOTIFICATIONS_LIST, serde_json::json!({ "limit": 100 }))
+        .await
+    {
+        if let Some(v) = resp.result {
+            if let Ok(notifications) = serde_json::from_value::<Vec<NotificationRecord>>(v) {
+                app.notifications = notifications;
+            }
+        }
+    }
+    fetch_catalog(client, app).await;
 }
 
 /// The connected interaction loop: redraw, handle keys, apply pushes, ping.
@@ -157,9 +219,12 @@ async fn run_session(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> SessionOutcome {
     let mut push_rx = client.subscribe();
+    let mut closed_rx = client.closed();
     let mut ping = tokio::time::interval(Duration::from_secs(5));
+    let (chat_tx, mut chat_rx) = mpsc::unbounded_channel::<anyhow::Result<ChatSession>>();
 
     loop {
+        app.throbber_state.calc_next();
         let _ = terminal.draw(|f| ui::draw(f, app));
 
         tokio::select! {
@@ -167,7 +232,7 @@ async fn run_session(
             ev = ev_rx.recv() => {
                 match ev {
                     Some(CEvent::Key(k)) if k.kind == KeyEventKind::Press => {
-                        match app.handle_key(k.code) {
+                        match app.handle_key(k) {
                             UiAction::Quit => return SessionOutcome::Quit,
                             UiAction::OpenChat(task_id) => {
                                 match client.request(method::CHAT_OPEN, serde_json::json!({ "task_id": task_id })).await {
@@ -191,20 +256,60 @@ async fn run_session(
                                 if message.trim().is_empty() {
                                     continue;
                                 }
-                                match client.request(method::CHAT_SEND, serde_json::json!({ "session_id": session_id, "message": message })).await {
+                                // Stream the turn: spawn the request so the loop keeps
+                                // pumping CHAT_DELTA / CHAT_REASONING pushes meanwhile.
+                                app.thinking = true;
+                                app.streaming = None;
+                                app.streaming_reasoning.clear();
+                                app.chat_scroll = 0;
+
+                                let client = client.clone();
+                                let tx = chat_tx.clone();
+                                tokio::spawn(async move {
+                                    let result = client
+                                        .request_with_timeout(
+                                            method::CHAT_SEND,
+                                            serde_json::json!({ "session_id": session_id, "message": message }),
+                                            Duration::from_secs(300),
+                                        )
+                                        .await
+                                        .and_then(|resp| match resp.result {
+                                            Some(v) => serde_json::from_value::<ChatSession>(v)
+                                                .map_err(|e| anyhow::anyhow!("chat.send: {e}")),
+                                            None => anyhow::bail!("chat.send: {:?}", resp.error),
+                                        });
+                                    let _ = tx.send(result);
+                                });
+                            }
+                            UiAction::StartTask(name) => {
+                                match client.request(method::TASKS_START, serde_json::json!({ "name": name })).await {
                                     Ok(resp) => {
-                                        if let Some(v) = resp.result {
-                                            match serde_json::from_value::<ChatSession>(v) {
-                                                Ok(session) => app.update_chat(session),
-                                                Err(e) => app.logs.push_back(format!("chat.send: {e}")),
-                                            }
+                                        match resp.result {
+                                            Some(_) => app.logs.push_back(format!("started task: {name}")),
+                                            None => app.logs.push_back(format!("start task error: {:?}", resp.error)),
                                         }
                                     }
-                                    Err(e) => app.logs.push_back(format!("chat.send failed: {e}")),
+                                    Err(e) => app.logs.push_back(format!("start task failed: {e}")),
                                 }
+                                refresh_lists(client, app).await;
+                            }
+                            UiAction::Submit { method, params } => {
+                                match client.request(method, params).await {
+                                    Ok(resp) => {
+                                        match resp.result {
+                                            Some(_) => app.logs.push_back(format!("{method}: ok")),
+                                            None => app.logs.push_back(format!("{method}: error {:?}", resp.error)),
+                                        }
+                                    }
+                                    Err(e) => app.logs.push_back(format!("{method} failed: {e}")),
+                                }
+                                refresh_lists(client, app).await;
                             }
                             UiAction::None => {}
                         }
+                    }
+                    Some(CEvent::Mouse(m)) => {
+                        app.handle_mouse(m);
                     }
                     Some(_) => {}
                     None => return SessionOutcome::Quit,
@@ -215,6 +320,19 @@ async fn run_session(
                     Ok(n) => app.handle_notification(n),
                     Err(_) => return SessionOutcome::Disconnected,
                 }
+            }
+            outcome = chat_rx.recv() => {
+                app.thinking = false;
+                app.streaming = None;
+                app.streaming_reasoning.clear();
+                match outcome {
+                    Some(Ok(session)) => app.update_chat(session),
+                    Some(Err(e)) => app.logs.push_back(format!("chat.send failed: {e}")),
+                    None => {}
+                }
+            }
+            _ = closed_rx.recv() => {
+                return SessionOutcome::Disconnected;
             }
             _ = ping.tick() => {
                 if client.request(method::PING, serde_json::json!({})).await.is_err() {

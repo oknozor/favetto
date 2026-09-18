@@ -17,18 +17,25 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Run the favetto daemon (event bus, API server, synthetic driver).
+    /// Run the favetto daemon (event bus, API server, scheduler, executor).
     Daemon(DaemonArgs),
     /// Attach the TUI to a running daemon (local Unix socket or remote WebSocket).
     Tui(TuiArgs),
-    /// Run a single skill as a one-off task.
-    TaskRun(TaskRunArgs),
     /// Expose favetto itself as an MCP server (bridges to a running daemon).
     McpServe(McpServeArgs),
     /// Print a short-lived pairing code for remote TUI attachment.
     Pair(PairArgs),
     /// Rotate the bearer token.
     TokenRotate(TokenRotateArgs),
+    /// Internal: run a built-in MCP server in-process (spawned by the daemon).
+    #[command(name = "__mcp", hide = true)]
+    InternalMcp {
+        /// Built-in server name (e.g. `mcp-filesystem`).
+        server: String,
+        /// Server-specific arguments.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Args)]
@@ -45,15 +52,12 @@ pub struct DaemonArgs {
     /// Directory for SQLite + token (default `~/.local/share/favetto`).
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
-    /// Disable the synthetic event driver (useful for tests).
-    #[arg(long)]
-    pub no_synthetic: bool,
     /// Path to `hooks.toml`.
     #[arg(long)]
     pub hooks: Option<PathBuf>,
-    /// Directory containing skill folders (for chat context).
+    /// Directory of task-definition `.md` files (the task catalog).
     #[arg(long)]
-    pub skills_dir: Option<PathBuf>,
+    pub tasks_dir: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -70,21 +74,6 @@ pub struct TuiArgs {
     /// Short-lived pairing code to exchange for a token (remote attach only).
     #[arg(long)]
     pub pair_code: Option<String>,
-}
-
-#[derive(Args)]
-pub struct TaskRunArgs {
-    /// Skill to run.
-    pub skill: String,
-    /// Path to the config file (default `~/.config/favetto/config.toml`).
-    #[arg(long)]
-    pub config: Option<PathBuf>,
-    /// Directory containing skill folders.
-    #[arg(long, default_value = "skills")]
-    pub skills_dir: PathBuf,
-    /// JSON input passed to the skill.
-    #[arg(long)]
-    pub input: Option<String>,
 }
 
 #[derive(Args)]

@@ -55,16 +55,17 @@ impl FromStr for TaskStatus {
 /// A unit of work the favetto is driving.
 ///
 /// Tasks are created by integrations, hooks, the scheduler, or manually via the
-/// API, then handed to the agent runtime which executes the referenced skill.
+/// API, then handed to the agent runtime which executes the referenced catalog
+/// task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: Uuid,
-    /// Name of the skill (folder under `skills/`) that defines how to run this task.
-    pub skill: String,
+    /// Name of the catalog task (the `*.md` file) that defines how to run this.
+    pub name: String,
     pub status: TaskStatus,
-    /// Arbitrary input passed to the skill's `AGENT.md`/runtime.
+    /// Arbitrary input passed to the task's prompt.
     pub input: serde_json::Value,
-    /// Produced by the skill on completion.
+    /// Produced by the task on completion.
     pub output: Option<serde_json::Value>,
     /// Optional dedupe key. Inserting a second task with the same key is a no-op.
     pub dedupe_key: Option<String>,
@@ -97,6 +98,12 @@ pub enum EventKind {
     TaskCompleted,
     TaskFailed,
     TaskCancelled,
+    /// A task was enqueued and is idle (waiting to run).
+    TaskIdle,
+    /// A task began running.
+    TaskStarted,
+    /// A task ended (success or failure) — used by `needs` dependencies.
+    TaskFinished,
     CronTick,
     // Integration events (M3+): emitted by webhook receivers and integrations.
     IssueCreated,
@@ -121,6 +128,9 @@ impl EventKind {
             EventKind::TaskCompleted => "task_completed",
             EventKind::TaskFailed => "task_failed",
             EventKind::TaskCancelled => "task_cancelled",
+            EventKind::TaskIdle => "task_idle",
+            EventKind::TaskStarted => "task_started",
+            EventKind::TaskFinished => "task_finished",
             EventKind::CronTick => "cron_tick",
             EventKind::IssueCreated => "issue_created",
             EventKind::IssueUpdated => "issue_updated",
@@ -153,6 +163,9 @@ impl EventKind {
             "task_completed" => EventKind::TaskCompleted,
             "task_failed" => EventKind::TaskFailed,
             "task_cancelled" => EventKind::TaskCancelled,
+            "task_idle" => EventKind::TaskIdle,
+            "task_started" => EventKind::TaskStarted,
+            "task_finished" => EventKind::TaskFinished,
             "cron_tick" => EventKind::CronTick,
             "issue_created" => EventKind::IssueCreated,
             "issue_updated" => EventKind::IssueUpdated,
@@ -168,6 +181,9 @@ impl EventKind {
             "TaskCompleted" => EventKind::TaskCompleted,
             "TaskFailed" => EventKind::TaskFailed,
             "TaskCancelled" => EventKind::TaskCancelled,
+            "TaskIdle" => EventKind::TaskIdle,
+            "TaskStarted" => EventKind::TaskStarted,
+            "TaskFinished" => EventKind::TaskFinished,
             "CronTick" => EventKind::CronTick,
             "IssueCreated" => EventKind::IssueCreated,
             "IssueUpdated" => EventKind::IssueUpdated,
@@ -217,11 +233,41 @@ pub enum MessageRole {
     Tool,
 }
 
+impl MessageRole {
+    /// Stable string form used for persistence and on-the-wire encoding.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MessageRole::System => "system",
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+            MessageRole::Tool => "tool",
+        }
+    }
+}
+
+impl std::str::FromStr for MessageRole {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "system" => MessageRole::System,
+            "user" => MessageRole::User,
+            "assistant" => MessageRole::Assistant,
+            "tool" => MessageRole::Tool,
+            _ => return Err(()),
+        })
+    }
+}
+
 /// A single turn in an agent conversation (the LLM chat).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: MessageRole,
     pub content: String,
+    /// Optional chain-of-thought produced by the model before the content. This is
+    /// display-only: it is never sent back to the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 impl ChatMessage {
@@ -229,7 +275,13 @@ impl ChatMessage {
         Self {
             role,
             content: content.into(),
+            reasoning: None,
         }
+    }
+
+    pub fn with_reasoning(mut self, reasoning: Option<String>) -> Self {
+        self.reasoning = reasoning;
+        self
     }
 }
 
@@ -242,12 +294,13 @@ pub struct ChatSession {
     pub messages: Vec<ChatMessage>,
 }
 
-/// A cron schedule that enqueues a `run_skill` task (and emits a `CronTick`) on fire.
+/// A cron schedule that enqueues a task (and emits a `CronTick`) on fire.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Schedule {
     pub id: String,
     pub cron: String,
-    pub skill: String,
+    /// The catalog task name to enqueue on each fire.
+    pub task: String,
     pub input: serde_json::Value,
     pub enabled: bool,
     pub last_run: Option<DateTime<Utc>>,

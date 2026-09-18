@@ -26,7 +26,12 @@ pub mod method {
     pub const PING: &str = "system.ping";
     pub const TASKS_LIST: &str = "tasks.list";
     pub const TASKS_CANCEL: &str = "tasks.cancel";
-    pub const TASKS_CREATE: &str = "tasks.create";
+    /// Start a catalog task by name.
+    pub const TASKS_START: &str = "tasks.start";
+    /// List the task catalog.
+    pub const CATALOG_LIST: &str = "catalog.list";
+    /// Add a task definition to the catalog (does not run it).
+    pub const CATALOG_ADD: &str = "catalog.add";
     pub const EVENTS_TAIL: &str = "events.tail";
     /// (Re)subscribe to the live event stream. Accepts `last_event_id` to replay
     /// missed events before switching to live delivery.
@@ -47,6 +52,10 @@ pub mod method {
     pub const NOTIFICATIONS_LIST: &str = "notifications.list";
     /// Send a test notification through a channel.
     pub const NOTIFICATIONS_TEST: &str = "notifications.test";
+    /// Add or update an LLM provider (runtime + persisted config).
+    pub const CONFIG_SET_PROVIDER: &str = "config.set_provider";
+    /// Add a notification hook reacting to an event kind.
+    pub const HOOKS_UPSERT: &str = "hooks.upsert";
 }
 
 /// Well-known server → client push (notification) method names.
@@ -54,6 +63,10 @@ pub mod push {
     pub const EVENT: &str = "event";
     pub const TASK_UPDATED: &str = "task.updated";
     pub const LOG_LINE: &str = "log.line";
+    /// A streamed answer token for a chat session.
+    pub const CHAT_DELTA: &str = "chat.delta";
+    /// A streamed reasoning/thinking token for a chat session.
+    pub const CHAT_REASONING: &str = "chat.reasoning";
 }
 
 /// A client → server request.

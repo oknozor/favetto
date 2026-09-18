@@ -1365,10 +1365,15 @@ dependencies = [
  "config",
  "dirs",
  "favetto-core",
+ "favetto-integrations",
  "futures-util",
  "hex",
  "hmac 0.13.0",
  "http",
+ "mcp-filesystem",
+ "mcp-github",
+ "mcp-gmail",
+ "mcp-linear",
  "ratatui",
  "reqwest",
  "rmcp",
@@ -1378,6 +1383,7 @@ dependencies = [
  "sha2 0.11.0",
  "sqlx",
  "subtle",
+ "throbber-widgets-tui",
  "tokio",
  "tokio-cron-scheduler",
  "tokio-tungstenite 0.30.0",
@@ -3432,6 +3438,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures-core",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",
@@ -3451,12 +3458,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "webpki-roots",
 ]
@@ -4455,6 +4464,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "throbber-widgets-tui"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b0452e418faaa263a742d94e5c2f9f50c777a0ae5b3ec53ce754d917d568e36"
+dependencies = [
+ "ratatui",
+]
+
+[[package]]
 name = "time"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5052,6 +5070,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81941cd78d0c92026c33e5e01312845a4cb1e9af3407f9134b100dd03144103e"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

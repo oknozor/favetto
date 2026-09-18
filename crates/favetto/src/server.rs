@@ -70,7 +70,20 @@ pub async fn serve_connection(state: Arc<State>, mut incoming: BoxIn, mut outgoi
             }
         };
         match frame {
-            Frame::Request(req) => handle_request(&state, &out_tx, req).await,
+            Frame::Request(req) => {
+                // Long-running requests (chat.send streams a full LLM turn) must not
+                // block the read loop, otherwise the client's pings time out and the
+                // connection flaps. Run them on a separate task.
+                if req.method == method::CHAT_SEND {
+                    let state = state.clone();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        handle_request(&state, &out_tx, req).await;
+                    });
+                } else {
+                    handle_request(&state, &out_tx, req).await;
+                }
+            }
             Frame::Notification(_) | Frame::Response(_) => {}
         }
     }
@@ -113,6 +126,65 @@ async fn handle_request(state: &Arc<State>, out_tx: &mpsc::Sender<Frame>, req: R
         return;
     }
 
+    // `chat.send` streams answer/reasoning tokens as pushes before the final
+    // response, so it's handled here rather than in `dispatch`.
+    if req.method == method::CHAT_SEND {
+        let session_id = match req.params.get("session_id").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => {
+                let _ = out_tx
+                    .send(Frame::Response(Response::err(
+                        id,
+                        error_code::INVALID_PARAMS,
+                        "missing session_id",
+                    )))
+                    .await;
+                return;
+            }
+        };
+        let message = match req.params.get("message").and_then(|v| v.as_str()) {
+            Some(m) => m.to_string(),
+            None => {
+                let _ = out_tx
+                    .send(Frame::Response(Response::err(
+                        id,
+                        error_code::INVALID_PARAMS,
+                        "missing message",
+                    )))
+                    .await;
+                return;
+            }
+        };
+
+        let sid = session_id.clone();
+        let delta_tx = out_tx.clone();
+        let on_delta = move |s: &str| {
+            let _ = delta_tx.try_send(Frame::Notification(Notification {
+                method: push::CHAT_DELTA.to_string(),
+                params: serde_json::json!({ "session_id": sid, "text": s }),
+            }));
+        };
+        let sid = session_id.clone();
+        let reason_tx = out_tx.clone();
+        let on_reasoning = move |s: &str| {
+            let _ = reason_tx.try_send(Frame::Notification(Notification {
+                method: push::CHAT_REASONING.to_string(),
+                params: serde_json::json!({ "session_id": sid, "text": s }),
+            }));
+        };
+
+        let resp = match state
+            .chat
+            .send_streaming(&session_id, &message, &on_delta, &on_reasoning)
+            .await
+        {
+            Ok(session) => Response::ok(id, serde_json::json!(session)),
+            Err(e) => Response::err(id, error_code::INTERNAL, e.to_string()),
+        };
+        let _ = out_tx.send(Frame::Response(resp)).await;
+        return;
+    }
+
     let resp = dispatch(state, req).await;
     let _ = out_tx.send(Frame::Response(resp)).await;
 }
@@ -145,17 +217,42 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
             }
         }
 
-        method::TASKS_CREATE => {
-            let skill = match req.params.get("skill").and_then(|v| v.as_str()) {
+        method::TASKS_START => {
+            let name = match req.params.get("name").and_then(|v| v.as_str()) {
                 Some(s) => s.to_string(),
-                None => return Response::err(req.id, error_code::INVALID_PARAMS, "missing skill"),
+                None => return Response::err(req.id, error_code::INVALID_PARAMS, "missing name"),
             };
             let input = req.params.get("input").cloned().unwrap_or(serde_json::Value::Null);
-            let dedupe_key = req.params.get("dedupe_key").and_then(|v| v.as_str()).map(str::to_string);
-            match create_task(state, skill, input, dedupe_key).await {
+            match crate::executor::enqueue_task(state, name, input, None).await {
                 Ok(task) => Ok(serde_json::json!(task)),
                 Err(e) => Err((error_code::INTERNAL, e.to_string())),
             }
+        }
+
+        method::CATALOG_LIST => {
+            let catalog = state.catalog.read().unwrap().clone();
+            let list: Vec<serde_json::Value> = catalog
+                .iter()
+                .map(|d| {
+                    serde_json::json!({
+                        "name": d.name,
+                        "model": d.model,
+                        "schedule": d.schedule,
+                        "needs": d.needs,
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!(list))
+        }
+
+        method::CATALOG_ADD => match add_catalog_task(state, &req.params) {
+            Ok(def) => Ok(serde_json::json!({
+                "name": def.name,
+                "model": def.model,
+                "schedule": def.schedule,
+                "needs": def.needs,
+            })),
+            Err(e) => Err((error_code::INTERNAL, e.to_string())),
         }
 
         method::EVENTS_TAIL => {
@@ -174,21 +271,6 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
         method::CHAT_OPEN => {
             let task_id = req.params.get("task_id").and_then(|v| v.as_str()).map(str::to_string);
             match state.chat.open(&state.db, task_id).await {
-                Ok(session) => Ok(serde_json::json!(session)),
-                Err(e) => Err((error_code::INTERNAL, e.to_string())),
-            }
-        }
-
-        method::CHAT_SEND => {
-            let session_id = match req.params.get("session_id").and_then(|v| v.as_str()) {
-                Some(s) => s.to_string(),
-                None => return Response::err(req.id, error_code::INVALID_PARAMS, "missing session_id"),
-            };
-            let message = match req.params.get("message").and_then(|v| v.as_str()) {
-                Some(m) => m.to_string(),
-                None => return Response::err(req.id, error_code::INVALID_PARAMS, "missing message"),
-            };
-            match state.chat.send(&session_id, &message).await {
                 Ok(session) => Ok(serde_json::json!(session)),
                 Err(e) => Err((error_code::INTERNAL, e.to_string())),
             }
@@ -261,6 +343,16 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
             Ok(serde_json::json!({ "sent": true }))
         }
 
+        method::CONFIG_SET_PROVIDER => match set_provider(state, &req.params).await {
+            Ok(provider) => Ok(serde_json::json!(provider)),
+            Err(e) => Err((error_code::INTERNAL, e.to_string())),
+        },
+
+        method::HOOKS_UPSERT => match upsert_hook(state, &req.params) {
+            Ok(()) => Ok(serde_json::json!({ "added": true })),
+            Err(e) => Err((error_code::INVALID_PARAMS, e.to_string())),
+        },
+
         _ => Err((
             error_code::METHOD_NOT_FOUND,
             format!("unknown method: {}", req.method),
@@ -287,10 +379,10 @@ async fn upsert_schedule(state: &Arc<State>, params: &serde_json::Value) -> anyh
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing cron"))?
         .to_string();
-    let skill = params
-        .get("skill")
+    let task = params
+        .get("task")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing skill"))?
+        .ok_or_else(|| anyhow::anyhow!("missing task"))?
         .to_string();
     let input = params.get("input").cloned().unwrap_or(serde_json::Value::Null);
     let enabled = params.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
@@ -298,27 +390,46 @@ async fn upsert_schedule(state: &Arc<State>, params: &serde_json::Value) -> anyh
     let schedule = Schedule {
         id,
         cron,
-        skill,
+        task,
         input,
         enabled,
         last_run: None,
     };
 
-    // Remove any existing job, then register the new one.
-    if let Some(old_job_id) = db::get_schedule_job_id(&state.db, &schedule.id).await? {
-        if let Ok(job_uuid) = Uuid::parse_str(&old_job_id) {
-            let _ = crate::scheduler::unregister(&state.scheduler, &job_uuid).await;
-        }
-    }
-
-    db::upsert_schedule(&state.db, &schedule).await?;
-
-    if schedule.enabled {
-        let job_id = crate::scheduler::register(&state.scheduler, state.clone(), &schedule).await?;
-        db::set_schedule_job_id(&state.db, &schedule.id, &job_id.to_string()).await?;
-    }
-
+    crate::scheduler::upsert(state, &schedule).await?;
     Ok(schedule)
+}
+
+/// Add a task definition to the catalog (writes the `.md` file + updates memory).
+fn add_catalog_task(state: &Arc<State>, params: &serde_json::Value) -> anyhow::Result<crate::tasks::TaskDef> {
+    use crate::tasks::TaskDef;
+
+    let name = params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing 'name'"))?
+        .to_string();
+    let model = params
+        .get("model")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing 'model'"))?
+        .to_string();
+    let schedule = params.get("schedule").and_then(|v| v.as_str()).map(str::to_string);
+    let needs = params.get("needs").and_then(|v| v.as_str()).map(str::to_string);
+    let prompt = params.get("prompt").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+
+    let def = TaskDef { name, model, schedule, needs, prompt };
+    crate::tasks::write_task_md(&state.tasks_dir, &def)?;
+
+    // Update the live catalog.
+    {
+        let mut catalog = state.catalog.write().unwrap();
+        catalog.retain(|d| d.name != def.name);
+        catalog.push(def.clone());
+        catalog.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
+    Ok(def)
 }
 
 async fn delete_schedule(state: &Arc<State>, id: &str) -> anyhow::Result<()> {
@@ -331,34 +442,62 @@ async fn delete_schedule(state: &Arc<State>, id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Create a pending task (executed by the task executor) and announce it.
-async fn create_task(
-    state: &Arc<State>,
-    skill: String,
-    input: serde_json::Value,
-    dedupe_key: Option<String>,
-) -> anyhow::Result<favetto_core::model::Task> {
-    use favetto_core::model::{Task, TaskStatus};
-    let task = Task {
-        id: Uuid::new_v4(),
-        skill,
-        status: TaskStatus::Pending,
-        input,
-        output: None,
-        dedupe_key,
-        created_at: chrono::Utc::now(),
-        started_at: None,
-        finished_at: None,
-        error: None,
+/// Add or update an LLM provider: mutate the live config and persist it to disk.
+async fn set_provider(state: &Arc<State>, params: &serde_json::Value) -> anyhow::Result<crate::config::Provider> {
+    use crate::config::Provider;
+
+    let name = params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing 'name'"))?
+        .to_string();
+    let provider = Provider {
+        kind: params
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("openai")
+            .to_string(),
+        api_key: params.get("api_key").and_then(|v| v.as_str()).map(str::to_string),
+        api_key_env: params.get("api_key_env").and_then(|v| v.as_str()).map(str::to_string),
+        model: params.get("model").and_then(|v| v.as_str()).map(str::to_string),
+        base_url: params.get("base_url").and_then(|v| v.as_str()).map(str::to_string),
     };
-    db::insert_task(&state.db, &task).await?;
-    crate::metrics::inc_tasks();
-    state.bus.publish(crate::event_bus::ServerPush::TaskUpdated(task.clone()));
-    Ok(task)
+
+    let toml = {
+        let mut cfg = state.config.write().unwrap();
+        cfg.providers.insert(name.clone(), provider.clone());
+        cfg.to_toml()?
+    };
+    if let Err(e) = tokio::fs::write(&state.config_path, toml).await {
+        tracing::warn!(error = %e, path = %state.config_path.display(), "failed to persist config");
+    }
+
+    Ok(provider)
+}
+
+/// Add a notification hook reacting to an event kind (live, in-memory).
+fn upsert_hook(state: &Arc<State>, params: &serde_json::Value) -> anyhow::Result<()> {
+    let event = params
+        .get("event")
+        .and_then(|v| v.as_str())
+        .and_then(favetto_core::model::EventKind::from_name)
+        .ok_or_else(|| anyhow::anyhow!("missing or invalid 'event' kind"))?;
+    let channel = params
+        .get("channel")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing 'channel'"))?
+        .to_string();
+    let config = params.get("config").cloned().unwrap_or(serde_json::Value::Null);
+
+    let hook = crate::hooks::notify_hook(event, channel, config);
+    state.hook_store.write().unwrap().push(hook);
+    tracing::info!("added notification hook");
+    Ok(())
 }
 
 /// Mark a task cancelled, persist it, and announce the change.
-async fn cancel_task(state: &State, id: Uuid) -> anyhow::Result<favetto_core::model::Task> {    let Some(mut task) = db::get_task(&state.db, id).await? else {
+async fn cancel_task(state: &State, id: Uuid) -> anyhow::Result<favetto_core::model::Task> {
+    let Some(mut task) = db::get_task(&state.db, id).await? else {
         anyhow::bail!("task not found");
     };
     task.status = favetto_core::model::TaskStatus::Cancelled;

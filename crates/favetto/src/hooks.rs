@@ -1,28 +1,25 @@
 //! Hook engine: map event + filter → action, defined in `hooks.toml`.
 //!
 //! Hooks are evaluated against every event published on the bus. Supported actions:
-//! - `run_skill` — enqueue a task for the named skill (executed by the scheduler in M5).
+//! - `run_task` — enqueue a task for the named catalog task.
 //! - `emit_event` — emit a new derived event.
-//! - `notify` — send a notification (M5).
+//! - `notify` — send a notification.
 //!
 //! ```toml
 //! [[hooks]]
 //! event = "TicketCreated"
 //! filter = { type = "Issue" }
-//! action = { type = "run_skill", skill = "implement_linear_ticket" }
+//! action = { type = "run_task", task = "implement_linear_ticket" }
 //! ```
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
-use chrono::Utc;
 use serde::Deserialize;
 use serde_json::Value;
-use uuid::Uuid;
 
-use favetto_core::model::{Event, EventKind, Task, TaskStatus};
+use favetto_core::model::{Event, EventKind};
 
-use crate::db;
 use crate::event_bus::ServerPush;
 use crate::state::State;
 
@@ -36,7 +33,7 @@ pub struct Hook {
 
 #[derive(Debug, Clone)]
 pub enum HookAction {
-    RunSkill { skill: String },
+    RunTask { task: String },
     EmitEvent { kind: EventKind },
     Notify { channel: String, config: Value },
 }
@@ -74,7 +71,7 @@ struct HookToml {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ActionToml {
-    RunSkill { skill: String },
+    RunTask { task: String },
     EmitEvent { kind: String },
     Notify {
         channel: String,
@@ -105,7 +102,7 @@ pub fn load_hooks(path: &Path) -> anyhow::Result<Vec<Hook>> {
             let event = EventKind::from_name(&h.event)
                 .ok_or_else(|| anyhow::anyhow!("unknown hook event kind: {}", h.event))?;
             let action = match h.action {
-                ActionToml::RunSkill { skill } => HookAction::RunSkill { skill },
+                ActionToml::RunTask { task } => HookAction::RunTask { task },
                 ActionToml::EmitEvent { kind } => HookAction::EmitEvent {
                     kind: EventKind::from_name(&kind)
                         .ok_or_else(|| anyhow::anyhow!("unknown hook action event kind: {kind}"))?,
@@ -122,14 +119,16 @@ pub fn load_hooks(path: &Path) -> anyhow::Result<Vec<Hook>> {
         .collect()
 }
 
-/// Subscribes to the bus and runs matching hooks against every event.
+/// Subscribes to the bus and runs matching hooks against every event. The hook list
+/// is shared behind a lock so new hooks (e.g. notification hooks added from the TUI)
+/// take effect immediately.
 pub struct HookEngine {
-    hooks: Vec<Hook>,
+    hooks: Arc<RwLock<Vec<Hook>>>,
     state: Arc<State>,
 }
 
 impl HookEngine {
-    pub fn new(hooks: Vec<Hook>, state: Arc<State>) -> Self {
+    pub fn new(hooks: Arc<RwLock<Vec<Hook>>>, state: Arc<State>) -> Self {
         Self { hooks, state }
     }
 
@@ -150,7 +149,8 @@ impl HookEngine {
     }
 
     async fn evaluate(&self, ev: Event) {
-        for hook in &self.hooks {
+        let hooks = self.hooks.read().unwrap().clone();
+        for hook in &hooks {
             if !hook.enabled || hook.event != ev.kind || !hook.matches(&ev.payload) {
                 continue;
             }
@@ -160,24 +160,19 @@ impl HookEngine {
 
     async fn run_action(&self, hook: &Hook, ev: &Event) {
         match &hook.action {
-            HookAction::RunSkill { skill } => {
-                let task = Task {
-                    id: Uuid::new_v4(),
-                    skill: skill.clone(),
-                    status: TaskStatus::Pending,
-                    input: ev.payload.clone(),
-                    output: None,
-                    dedupe_key: Some(format!("hook:{}:{}", skill, ev.id)),
-                    created_at: Utc::now(),
-                    started_at: None,
-                    finished_at: None,
-                    error: None,
-                };
-                match db::insert_task(&self.state.db, &task).await {
-                    Ok(()) => {
-                        tracing::info!(skill, event_id = ev.id, "hook enqueued task");
-                        crate::metrics::inc_tasks();
-                        self.state.bus.publish(ServerPush::TaskUpdated(task));
+            HookAction::RunTask { task } => {
+                let dedupe = Some(format!("hook:{}:{}", task, ev.id));
+                match crate::executor::enqueue_task(
+                    &self.state,
+                    task.clone(),
+                    ev.payload.clone(),
+                    dedupe,
+                )
+                .await
+                {
+                    Ok(enqueued) => {
+                        tracing::info!(task, event_id = ev.id, "hook enqueued task");
+                        self.state.bus.publish(ServerPush::TaskUpdated(enqueued));
                     }
                     Err(e) => tracing::warn!(error = %e, "hook failed to enqueue task"),
                 }
@@ -198,5 +193,15 @@ impl HookEngine {
                 .await;
             }
         }
+    }
+}
+
+/// Build a notification hook that reacts to `event` and sends via `channel`.
+pub fn notify_hook(event: EventKind, channel: String, config: Value) -> Hook {
+    Hook {
+        event,
+        filter: None,
+        action: HookAction::Notify { channel, config },
+        enabled: true,
     }
 }

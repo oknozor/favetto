@@ -1,18 +1,16 @@
 //! MCP client: a single long-lived session to one MCP server, built on `rmcp`.
 //!
 //! M2 supports the stdio transport (spawning a child process); the streamable-HTTP
-//! transport is declared in [`McpTransport`](crate::skills::McpTransport) and lands
-//! in M3. A session owns its connection for its whole lifetime and exposes the
-//! server's tool list plus a `call_tool` primitive. Restart-on-crash and health
-//! checks live in the pool/registry layer (M3+); for M2 a session is created fresh
-//! per `task run`.
+//! transport is declared in [`McpTransport`](crate::mcp::McpTransport) and lands
+//! in a later milestone. A session owns its connection for its whole lifetime and
+//! exposes the server's tool list plus a `call_tool` primitive.
 
 use anyhow::Context;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ClientConfig, Tool};
 use rmcp::transport::TokioChildProcess;
 use rmcp::{ClientHandler, ServiceExt};
 
-use crate::skills::{McpServerConfig, McpTransport};
+use crate::mcp::{McpServerConfig, McpTransport};
 
 /// Minimal client-side handler. The client role only needs identity info.
 #[derive(Clone)]
@@ -38,11 +36,13 @@ impl McpSession {
     pub async fn connect(config: &McpServerConfig) -> anyhow::Result<Self> {
         let running = match &config.transport {
             McpTransport::Stdio { command, args } => {
-                let command = resolve_binary(command);
-                let mut cmd = tokio::process::Command::new(&command);
-                cmd.args(args);
-                let transport = TokioChildProcess::new(cmd)
-                    .with_context(|| format!("spawn MCP server '{command}'"))?;
+                let cmd = spawn_command(command, args);
+                let transport = TokioChildProcess::new(cmd).with_context(|| {
+                    format!(
+                        "spawn MCP server '{command}' (built-in servers run in-process; external \
+                         ones must be built and on PATH)"
+                    )
+                })?;
                 Client
                     .serve(transport)
                     .await
@@ -83,6 +83,30 @@ impl McpSession {
     pub async fn shutdown(self) {
         let _ = self.running.cancel().await;
     }
+}
+
+/// Built-in MCP servers that favetto can run in-process (via `favetto __mcp`).
+const BUILTIN_SERVERS: &[&str] = &["mcp-filesystem", "mcp-linear", "mcp-github", "mcp-gmail"];
+
+/// Build the process command for an MCP server.
+///
+/// Built-in servers are run in-process by re-invoking the current `favetto` binary
+/// with a hidden `__mcp <server>` subcommand, so they are always available even when
+/// only `favetto` itself was installed. External servers resolve to `<exe_dir>/<name>`
+/// first, then `PATH`.
+fn spawn_command(command: &str, args: &[String]) -> tokio::process::Command {
+    if BUILTIN_SERVERS.contains(&command) {
+        if let Ok(exe) = std::env::current_exe() {
+            let mut cmd = tokio::process::Command::new(exe);
+            cmd.arg("__mcp").arg(command);
+            cmd.args(args);
+            return cmd;
+        }
+    }
+
+    let mut cmd = tokio::process::Command::new(resolve_binary(command));
+    cmd.args(args);
+    cmd
 }
 
 /// Resolve a server binary: prefer `<exe_dir>/<command>` (so `cargo build` layouts

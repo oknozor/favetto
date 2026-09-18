@@ -9,6 +9,7 @@ mod db;
 mod event_bus;
 mod executor;
 mod hooks;
+mod mcp;
 mod mcp_client;
 mod mcp_serve;
 mod metrics;
@@ -17,15 +18,13 @@ mod pair;
 mod runtime;
 mod scheduler;
 mod server;
-mod skills;
 mod state;
-mod synthetic;
+mod tasks;
 mod tool_registry;
 mod transport;
 mod tui;
 mod webhooks;
 
-use anyhow::Context;
 use clap::Parser;
 
 use crate::cli::Command;
@@ -44,45 +43,22 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Daemon(args) => daemon::run(args).await,
         Command::Tui(args) => tui::run(args).await,
-        Command::TaskRun(args) => task_run(args).await,
         Command::McpServe(args) => mcp_serve::run(args).await,
         Command::Pair(args) => pair(args).await,
         Command::TokenRotate(args) => token_rotate(args),
+        Command::InternalMcp { server, args } => internal_mcp(server, args).await,
     }
 }
 
-/// Run one skill end-to-end through the MCP tool registry and the agent runtime.
-async fn task_run(args: cli::TaskRunArgs) -> anyhow::Result<()> {
-    // Load config (providers + global MCP servers).
-    let config_path = args
-        .config
-        .clone()
-        .unwrap_or_else(cli::default_config_path);
-    let config = config::FavettoConfig::load_from(&config_path).unwrap_or_default();
-
-    let skills = skills::load_skills(&args.skills_dir)?;
-    let skill = skills
-        .into_iter()
-        .find(|s| s.name == args.skill)
-        .with_context(|| {
-            format!(
-                "skill '{}' not found in {}",
-                args.skill,
-                args.skills_dir.display()
-            )
-        })?;
-
-    let input: serde_json::Value = args
-        .input
-        .as_deref()
-        .map(serde_json::from_str)
-        .transpose()?
-        .unwrap_or(serde_json::json!({}));
-
-    tracing::info!(skill = %skill.name, model = %skill.config.agent.model, "running skill");
-    let output = runtime::run_skill(&skill, &config, input).await?;
-    println!("{}", serde_json::to_string_pretty(&output)?);
-    Ok(())
+/// Run a built-in MCP server in-process (self-invocation from the daemon).
+async fn internal_mcp(server: String, args: Vec<String>) -> anyhow::Result<()> {
+    match server.as_str() {
+        "mcp-filesystem" => mcp_filesystem::serve(args).await,
+        "mcp-linear" => mcp_linear::serve(args).await,
+        "mcp-github" => mcp_github::serve(args).await,
+        "mcp-gmail" => mcp_gmail::serve(args).await,
+        other => anyhow::bail!("unknown built-in MCP server: {other}"),
+    }
 }
 
 /// `favetto pair`: ask the daemon for a short-lived pairing code and print it.

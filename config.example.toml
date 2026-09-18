@@ -12,9 +12,9 @@ model = "deepseek:deepseek-v4-flash"
 # model = "echo"
 # model = "openai:gpt-4o"
 
-# LLM providers. Any `kind = "openai"` provider can back the runtime (enabled at
-# build time with `cargo build --features openai`) — DeepSeek exposes an
-# OpenAI-compatible API, so it reuses the same backend with a different base URL.
+# LLM providers. Any `kind = "openai"` provider can back the runtime — DeepSeek
+# exposes an OpenAI-compatible API, so it reuses the same backend with a different
+# base URL.
 [providers.deepseek]
 kind = "openai"
 # Provide the key directly, or reference an environment variable.
@@ -30,8 +30,7 @@ api_key_env = "OPENAI_API_KEY"
 model = "gpt-4o"
 # base_url = "https://api.openai.com/v1"   # for compatible providers / local proxies
 
-# Global MCP servers. Any skill may rely on these; a skill's own [mcp.*] table
-# overrides a global server of the same name.
+# Global MCP servers. Task prompts can rely on these.
 [mcp.filesystem]
 transport = "stdio"
 command = "mcp-filesystem"
@@ -61,5 +60,5 @@ args = ["--root", "./workdir"]
 [daemon]
 listen = "127.0.0.1:7878"
 socket = "/tmp/favetto.sock"
-skills_dir = "skills"
+tasks_dir = "tasks"
 # data_dir = "~/.local/share/favetto"

@@ -36,6 +36,7 @@ pub struct Client {
     pending: Arc<Mutex<HashMap<RequestId, oneshot::Sender<Response>>>>,
     next_id: Arc<AtomicU64>,
     push_tx: broadcast::Sender<Notification>,
+    closed_tx: broadcast::Sender<()>,
 }
 
 impl Client {
@@ -51,6 +52,7 @@ impl Client {
     fn from_streams(mut incoming: ClientStream, mut outgoing: ClientSink) -> anyhow::Result<Self> {
         let (out_tx, mut out_rx) = mpsc::channel::<Frame>(256);
         let (push_tx, _) = broadcast::channel::<Notification>(256);
+        let (closed_tx, _) = broadcast::channel::<()>(1);
         let pending: Arc<Mutex<HashMap<RequestId, oneshot::Sender<Response>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
@@ -66,6 +68,7 @@ impl Client {
         // Reader: route responses to their pending oneshots, pushes to the broadcast.
         let pending2 = pending.clone();
         let push_tx2 = push_tx.clone();
+        let closed_tx2 = closed_tx.clone();
         tokio::spawn(async move {
             while let Some(res) = incoming.next().await {
                 let frame = match res {
@@ -84,6 +87,8 @@ impl Client {
                     Frame::Request(_) => {}
                 }
             }
+            // Signal closure so the session loop can reconnect promptly.
+            let _ = closed_tx2.send(());
         });
 
         Ok(Self {
@@ -91,11 +96,29 @@ impl Client {
             pending,
             next_id: Arc::new(AtomicU64::new(1)),
             push_tx,
+            closed_tx,
         })
+    }
+
+    /// Subscribe to the connection-closed signal (fires once when the reader task
+    /// exits, e.g. the daemon closed the socket).
+    pub fn closed(&self) -> broadcast::Receiver<()> {
+        self.closed_tx.subscribe()
     }
 
     /// Send a request and await its response (5s timeout).
     pub async fn request(&self, method: &str, params: serde_json::Value) -> anyhow::Result<Response> {
+        self.request_with_timeout(method, params, Duration::from_secs(5))
+            .await
+    }
+
+    /// Send a request and await its response with an explicit timeout.
+    pub async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+    ) -> anyhow::Result<Response> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
@@ -109,7 +132,7 @@ impl Client {
             .await
             .context("send request")?;
 
-        match tokio::time::timeout(Duration::from_secs(5), rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(resp)) => Ok(resp),
             Ok(Err(_)) => anyhow::bail!("connection closed before response"),
             Err(_) => anyhow::bail!("request timed out"),

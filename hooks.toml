@@ -4,7 +4,7 @@
 [[hooks]]
 event = "TicketCreated"
 filter = { type = "Issue" }
-action = { type = "run_skill", skill = "implement_linear_ticket" }
+action = { type = "run_task", task = "implement_linear_ticket" }
 
 # When a GitHub issue is created, derive a task-created event.
 [[hooks]]
@@ -15,4 +15,3 @@ action = { type = "emit_event", kind = "TaskCreated" }
 # [[hooks]]
 # event = "TaskFailed"
 # action = { type = "notify", channel = "webhook", config = { url = "http://localhost:9999/hook" } }
-

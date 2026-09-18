@@ -33,14 +33,11 @@ impl OrchestratorMcp {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct CreateTask {
-    /// Skill name to run.
-    skill: String,
-    /// Optional input JSON for the skill.
+    /// Catalog task name to run.
+    name: String,
+    /// Optional input JSON for the task.
     #[serde(default)]
     input: Option<Value>,
-    /// Optional dedupe key for idempotency.
-    #[serde(default)]
-    dedupe_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -68,14 +65,13 @@ struct SendNotification {
 
 #[tool_router]
 impl OrchestratorMcp {
-    #[tool(description = "Create a task (enqueued for the agent runtime).")]
+    #[tool(description = "Start a catalog task (enqueued for the agent runtime).")]
     async fn create_task(&self, Parameters(p): Parameters<CreateTask>) -> String {
         let params = serde_json::json!({
-            "skill": p.skill,
+            "name": p.name,
             "input": p.input.unwrap_or(Value::Null),
-            "dedupe_key": p.dedupe_key,
         });
-        self.call("tasks.create", params).await
+        self.call("tasks.start", params).await
     }
 
     #[tool(description = "List tasks.")]
