@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 
 use ratatui::crossterm::event::KeyCode;
 
-use favetto_core::model::{ChatMessage, ChatSession, Event, Task};
+use favetto_core::model::{ChatMessage, ChatSession, Event, NotificationRecord, Schedule, Task};
 use favetto_core::rpc::{push, Notification};
 
 /// Tabs shown in the header. Tasks and Events are live; the rest are placeholders
@@ -82,6 +82,10 @@ pub struct App {
     pub chat_task_id: Option<String>,
     pub chat_messages: Vec<ChatMessage>,
     pub input: String,
+
+    // Scheduler + notifications.
+    pub schedules: Vec<Schedule>,
+    pub notifications: Vec<NotificationRecord>,
 }
 
 impl App {
@@ -100,6 +104,8 @@ impl App {
             chat_task_id: None,
             chat_messages: Vec::new(),
             input: String::new(),
+            schedules: Vec::new(),
+            notifications: Vec::new(),
         }
     }
 

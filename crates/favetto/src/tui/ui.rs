@@ -33,10 +33,100 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Tab::Tasks => draw_tasks(frame, app, chunks[1]),
         Tab::Chat => draw_chat(frame, app, chunks[1]),
         Tab::Events => draw_events(frame, app, chunks[1]),
+        Tab::Scheduler => draw_schedules(frame, app, chunks[1]),
+        Tab::Notifications => draw_notifications(frame, app, chunks[1]),
         _ => draw_placeholder(frame, app, chunks[1]),
     }
 
     draw_status(frame, app, chunks[2]);
+}
+
+fn draw_schedules(frame: &mut Frame, app: &App, area: Rect) {
+    let widths = [
+        Constraint::Length(10),
+        Constraint::Length(20),
+        Constraint::Length(26),
+        Constraint::Length(12),
+        Constraint::Min(0),
+    ];
+    let header = Row::new(vec!["ID", "CRON", "SKILL", "ENABLED", "INPUT"])
+        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = app
+        .schedules
+        .iter()
+        .map(|s| {
+            let input = s.input.to_string();
+            let input = if input.chars().count() > 40 {
+                format!("{}…", input.chars().take(40).collect::<String>())
+            } else {
+                input
+            };
+            Row::new(vec![
+                Cell::from(short_str(&s.id)),
+                Cell::from(s.cron.clone()),
+                Cell::from(s.skill.clone()),
+                Cell::from(if s.enabled { "yes" } else { "no" }),
+                Cell::from(input),
+            ])
+        })
+        .collect();
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" Schedules ({}) ", app.schedules.len())),
+        )
+        .column_spacing(2);
+    frame.render_widget(table, area);
+}
+
+fn draw_notifications(frame: &mut Frame, app: &App, area: Rect) {
+    let widths = [
+        Constraint::Length(8),
+        Constraint::Length(12),
+        Constraint::Length(10),
+        Constraint::Length(28),
+        Constraint::Min(0),
+    ];
+    let header = Row::new(vec!["ID", "CHANNEL", "STATUS", "SUBJECT", "BODY"])
+        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = app
+        .notifications
+        .iter()
+        .map(|n| {
+            let body = n.body.chars().take(40).collect::<String>();
+            Row::new(vec![
+                Cell::from(n.id.to_string()),
+                Cell::from(n.channel.clone()),
+                Cell::from(status_ok(&n.status)),
+                Cell::from(n.subject.clone()),
+                Cell::from(body),
+            ])
+        })
+        .collect();
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" Notifications ({}) ", app.notifications.len())),
+        )
+        .column_spacing(2);
+    frame.render_widget(table, area);
+}
+
+fn status_ok(s: &str) -> Span<'static> {
+    let (txt, color) = if s == "ok" {
+        ("ok", Color::Green)
+    } else {
+        ("error", Color::Red)
+    };
+    Span::styled(txt.to_string(), Style::default().fg(color))
 }
 
 fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
@@ -220,6 +310,10 @@ fn status_span(s: TaskStatus) -> Span<'static> {
 
 fn short_id(id: &uuid::Uuid) -> String {
     id.to_string().split('-').next().unwrap_or("?").to_string()
+}
+
+fn short_str(id: &str) -> String {
+    id.chars().take(8).collect()
 }
 
 fn age(ts: DateTime<Utc>) -> String {

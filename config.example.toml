@@ -36,6 +36,13 @@ args = ["--root", "./workdir"]
 # transport = "stdio"
 # command = "mcp-github"
 #
+# [mcp.gmail]
+# transport = "stdio"
+# command = "mcp-gmail"
+#   # Gmail auth/endpoint come from the environment: GMAIL_ACCESS_TOKEN (static)
+#   # or GMAIL_CLIENT_ID + GMAIL_CLIENT_SECRET + GMAIL_REFRESH_TOKEN (OAuth), and
+#   # GMAIL_BASE_URL (default https://gmail.googleapis.com/gmail/v1).
+#
 # Remote MCP servers use the streamable-HTTP transport (arrives in a later milestone):
 # [mcp.remote]
 # transport = "streamable_http"

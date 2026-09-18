@@ -241,3 +241,25 @@ pub struct ChatSession {
     pub task_id: Option<String>,
     pub messages: Vec<ChatMessage>,
 }
+
+/// A cron schedule that enqueues a `run_skill` task (and emits a `CronTick`) on fire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Schedule {
+    pub id: String,
+    pub cron: String,
+    pub skill: String,
+    pub input: serde_json::Value,
+    pub enabled: bool,
+    pub last_run: Option<DateTime<Utc>>,
+}
+
+/// A persisted notification record (sent history).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationRecord {
+    pub id: i64,
+    pub channel: String,
+    pub subject: String,
+    pub body: String,
+    pub status: String,
+    pub sent_at: DateTime<Utc>,
+}

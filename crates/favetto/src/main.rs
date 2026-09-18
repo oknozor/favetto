@@ -6,9 +6,12 @@ mod config;
 mod daemon;
 mod db;
 mod event_bus;
+mod executor;
 mod hooks;
 mod mcp_client;
+mod notify;
 mod runtime;
+mod scheduler;
 mod server;
 mod skills;
 mod state;
@@ -17,8 +20,6 @@ mod tool_registry;
 mod transport;
 mod tui;
 mod webhooks;
-
-use std::collections::BTreeMap;
 
 use anyhow::Context;
 use clap::Parser;
@@ -67,25 +68,6 @@ async fn task_run(args: cli::TaskRunArgs) -> anyhow::Result<()> {
             )
         })?;
 
-    // Connect global MCP servers (from config) plus the skill's own, with the skill
-    // overriding a global server of the same name.
-    let servers = merge_servers(config.mcp_servers()?, skill.mcp_servers()?);
-    let mut sessions = Vec::new();
-    for cfg in &servers {
-        tracing::info!(server = %cfg.name, "connecting MCP server");
-        let session = mcp_client::McpSession::connect(cfg).await?;
-        tracing::info!(
-            server = %cfg.name,
-            tools = session.tools.len(),
-            "MCP server connected"
-        );
-        sessions.push(session);
-    }
-
-    let registry = tool_registry::ToolRegistry::new(sessions);
-    let backend = runtime::build_backend(&skill, &config)?;
-    let runtime = runtime::Runtime::new(registry, backend);
-
     let input: serde_json::Value = args
         .input
         .as_deref()
@@ -94,24 +76,9 @@ async fn task_run(args: cli::TaskRunArgs) -> anyhow::Result<()> {
         .unwrap_or(serde_json::json!({}));
 
     tracing::info!(skill = %skill.name, model = %skill.config.agent.model, "running skill");
-    let output = runtime.run(&skill, input).await?;
+    let output = runtime::run_skill(&skill, &config, input).await?;
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
-}
-
-/// Merge global and per-skill MCP servers; the skill's own servers win on name clash.
-fn merge_servers(
-    global: Vec<skills::McpServerConfig>,
-    skill: Vec<skills::McpServerConfig>,
-) -> Vec<skills::McpServerConfig> {
-    let mut map: BTreeMap<String, skills::McpServerConfig> = global
-        .into_iter()
-        .map(|s| (s.name.clone(), s))
-        .collect();
-    for s in skill {
-        map.insert(s.name.clone(), s);
-    }
-    map.into_values().collect()
 }
 
 fn mcp_serve(args: cli::McpServeArgs) -> anyhow::Result<()> {

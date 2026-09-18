@@ -71,8 +71,23 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     );
 
     let bus = event_bus::EventBus::new(1024);
-    let chat = crate::chat::ChatManager::new(skills_dir, config.clone());
-    let state = Arc::new(State::new(pool, bus, token, WebhookSecrets::from_env(), chat));
+    let chat = crate::chat::ChatManager::new(skills_dir.clone(), config.clone());
+    let scheduler = tokio_cron_scheduler::JobScheduler::new().await?;
+
+    let state = Arc::new(State::new(
+        pool,
+        bus,
+        token,
+        WebhookSecrets::from_env(),
+        chat,
+        config,
+        skills_dir,
+        scheduler,
+    ));
+
+    // Start the scheduler (persisted cron schedules) and the task queue executor.
+    crate::scheduler::start(&state).await?;
+    crate::executor::spawn(state.clone());
 
     // Load and start the hook engine.
     let hooks = hooks::load_hooks(&hooks_path)?;

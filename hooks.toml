@@ -10,3 +10,9 @@ action = { type = "run_skill", skill = "implement_linear_ticket" }
 [[hooks]]
 event = "IssueCreated"
 action = { type = "emit_event", kind = "TaskCreated" }
+
+# Example: notify via webhook whenever a task fails.
+# [[hooks]]
+# event = "TaskFailed"
+# action = { type = "notify", channel = "webhook", config = { url = "http://localhost:9999/hook" } }
+

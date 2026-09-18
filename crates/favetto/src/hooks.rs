@@ -38,7 +38,7 @@ pub struct Hook {
 pub enum HookAction {
     RunSkill { skill: String },
     EmitEvent { kind: EventKind },
-    Notify { channel: String },
+    Notify { channel: String, config: Value },
 }
 
 impl Hook {
@@ -76,7 +76,11 @@ struct HookToml {
 enum ActionToml {
     RunSkill { skill: String },
     EmitEvent { kind: String },
-    Notify { channel: String },
+    Notify {
+        channel: String,
+        #[serde(default)]
+        config: Value,
+    },
 }
 
 fn default_true() -> bool {
@@ -106,7 +110,7 @@ pub fn load_hooks(path: &Path) -> anyhow::Result<Vec<Hook>> {
                     kind: EventKind::from_name(&kind)
                         .ok_or_else(|| anyhow::anyhow!("unknown hook action event kind: {kind}"))?,
                 },
-                ActionToml::Notify { channel } => HookAction::Notify { channel },
+                ActionToml::Notify { channel, config } => HookAction::Notify { channel, config },
             };
             Ok(Hook {
                 event,
@@ -182,8 +186,15 @@ impl HookEngine {
                     .emit_event(kind.clone(), serde_json::json!({ "source_event_id": ev.id }))
                     .await;
             }
-            HookAction::Notify { channel } => {
-                tracing::debug!(channel, event_id = ev.id, "notify hook is deferred to M5");
+            HookAction::Notify { channel, config } => {
+                crate::notify::send(
+                    &self.state,
+                    channel,
+                    config,
+                    &format!("favetto event: {}", ev.kind.as_str()),
+                    &serde_json::to_string(&ev.payload).unwrap_or_default(),
+                )
+                .await;
             }
         }
     }

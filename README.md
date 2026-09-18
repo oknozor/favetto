@@ -45,7 +45,9 @@ crates/
   mcp-filesystem/             first-party MCP server (read/write/list under a root)
   mcp-linear/                 first-party MCP server (Linear issues/teams)
   mcp-github/                 first-party MCP server (GitHub issues/PRs)
+  mcp-gmail/                  first-party MCP server (Gmail messages/threads/labels)
   mock-linear/                tiny GraphQL mock of Linear for offline dev
+  mock-gmail/                 tiny Gmail REST mock for offline dev
 skills/                       plugin-style skill folders (AGENT.md + config.toml)
 workdir/                      sample filesystem target for the M2 demo
 dev/Dockerfile                multi-stage build for mock-linear (docker-compose)
@@ -107,8 +109,8 @@ tool schemas and drives a tool-calling loop through the MCP `ToolRegistry`.
 | **M1** | Skeleton + remote TUI: daemon, SQLite, event bus, MessagePack wire protocol over Unix socket + WebSocket, token auth, ratatui client, synthetic events | ✅ Done |
 | **M2** | MCP foundation + agent runtime: `rmcp` client, ToolRegistry, skill loader, LLM loop (mock + optional OpenAI), first-party `mcp-filesystem`, one end-to-end skill | ✅ Done |
 | **M3** | GitHub + Linear integrations as first-party MCP servers, webhook receivers, hooks, local dev Linear via docker-compose, `implement_*` skills | ✅ Done |
-| **M4** | Gmail: thin `reqwest` client + OAuth/PKCE + `mcp-gmail` + email summarizer skill | ⬜ Planned |
-| **M5** | Scheduler + notifications: cron, notification channels, digest mode, Scheduler + Notifications TUI tabs, daemon task queue → runtime | ⬜ Planned |
+| **M4** | Gmail: thin `reqwest` client + OAuth refresh + `mcp-gmail` + email summarizer skill | ✅ Done |
+| **M5** | Scheduler + notifications: cron, task queue → runtime, notification channels, Scheduler + Notifications TUI tabs | ✅ Done |
 | **M6** | Hardening: sandboxing, metrics, mTLS/pairing, favetto-as-MCP-server, replay/recovery tests | ⬜ Planned |
 
 ### M1 (done)
@@ -160,6 +162,40 @@ tool schemas and drives a tool-calling loop through the MCP `ToolRegistry`.
   `ticket_created`/`issue_created` events, and the matching hooks enqueue a task
   and derive a `task_created` event.
 
+### M4 (done)
+
+- **`favetto-integrations::gmail`**: a thin `reqwest` client over the Gmail REST API
+  (no `google-gmail1`). Typed structs for the used fields, `format=metadata` for
+  list views, `format=full` only on demand, base64url MIME decode for incoming
+  bodies, and raw-MIME build/encode for sending.
+- **Auth**: a static token (`GMAIL_ACCESS_TOKEN`) or an OAuth 2.0 refresh flow
+  (`GMAIL_CLIENT_ID`/`GMAIL_CLIENT_SECRET` + a refresh token from
+  `GMAIL_REFRESH_TOKEN` or the OS keyring), with an in-memory access-token cache
+  and expiry-aware refresh.
+- **`mcp-gmail`**: first-party MCP server exposing `list_labels`, `list_messages`,
+  `get_message`, `get_thread`, `send_message`, `modify_labels`.
+- **Local dev Gmail**: `mock-gmail` implements the Gmail endpoints favetto uses;
+  `docker compose up -d` runs it on `:4001`.
+- Verified: `task-run summarize_email_thread` drives the mock Gmail through
+  `list_messages → get_message` (decoding the body) and returns a summary.
+
+### M5 (done)
+
+- **Scheduler**: `tokio-cron-scheduler` runs cron schedules persisted in the
+  `schedules` table. Each fire emits a `CronTick` event and enqueues a `run_skill`
+  task. Schedules are managed live via `schedules.list` / `schedules.upsert` /
+  `schedules.delete`.
+- **Task executor**: a background worker drains the pending task queue and runs each
+  task through the agent runtime (skill + MCP registry + LLM loop), closing the loop
+  opened in M3 (hooks and schedules enqueue tasks that now actually execute).
+- **Notifications**: pluggable channels (`log`, `webhook`, `ntfy`) with a persisted
+  `notifications` history; hooks' `notify` action and `notifications.test` both send
+  through it. Desktop (`notify-rust`) and email (`lettre`) channels are deferred.
+- **TUI**: the Scheduler and Notifications tabs are now live.
+- Verified: a `*/2 * * * * *` schedule fired repeatedly — each fire emitted
+  `cron_tick`, enqueued a task, and the executor ran it to `succeeded` (emitting
+  `task_completed`); `log` and `webhook` notifications delivered and were persisted.
+
 ## Webhooks & hooks
 
 ```bash
@@ -170,8 +206,10 @@ GITHUB_WEBHOOK_SECRET=… LINEAR_WEBHOOK_SECRET=… \
 
 GitHub signs with `X-Hub-Signature-256`; Linear signs with `Linear-Signature`.
 Both are HMAC-SHA256 over the raw body, verified in constant time. Hooks run
-against every persisted event; `run_skill` creates a task (executed by the
-scheduler in M5), and `emit_event` derives a new event.
+against every persisted event; `run_skill` enqueues a task (executed by the task
+executor), `emit_event` derives a new event, and `notify` sends a notification
+through a channel (e.g. `action = { type = "notify", channel = "webhook",
+config = { url = "http://…" } }`).
 
 ## Configuration & credentials
 
@@ -215,16 +253,24 @@ Gmail in M4). The M3 integrations use:
 - `LINEAR_API_KEY` / `LINEAR_BASE_URL` — for `mcp-linear` (`LINEAR_WEBHOOK_SECRET`
   for webhook verification). `LINEAR_BASE_URL` can point at the local dev
   instance described below.
+- `GMAIL_ACCESS_TOKEN` (static) or `GMAIL_CLIENT_ID` + `GMAIL_CLIENT_SECRET` +
+  `GMAIL_REFRESH_TOKEN` (OAuth refresh) — for `mcp-gmail` (`GMAIL_BASE_URL` points
+  at the local dev instance).
 
 ## Local dev (docker-compose)
 
-A local mock of Linear's GraphQL API is provided for offline development. It
-implements the small subset of the Linear schema favetto uses.
+Local mocks of Linear's GraphQL API and Gmail's REST API are provided for offline
+development. They implement the small subsets of each schema favetto uses.
 
 ```bash
-docker compose up -d            # starts mock-linear on http://localhost:4000/graphql
+docker compose up -d            # mock-linear on :4000, mock-gmail on :4001
+
 LINEAR_API_KEY=dev LINEAR_BASE_URL=http://localhost:4000/graphql \
   ./target/debug/favetto task-run implement_linear_ticket --skills-dir skills
+
+GMAIL_ACCESS_TOKEN=dev GMAIL_BASE_URL=http://localhost:4001/gmail/v1 \
+  ./target/debug/favetto task-run summarize_email_thread --skills-dir skills
+
 docker compose down
 ```
 
@@ -248,5 +294,6 @@ The daemon exposes one wire protocol over two transports:
 - **WebSocket** `ws://127.0.0.1:7878/rpc` (bearer token required).
 
 Methods: `system.ping`, `tasks.list`, `tasks.cancel`, `events.tail`,
-`events.subscribe`, `chat.open`, `chat.send`, `chat.messages`. Server pushes:
-`event`, `task.updated`, `log.line`.
+`events.subscribe`, `chat.open`, `chat.send`, `chat.messages`,
+`schedules.list`, `schedules.upsert`, `schedules.delete`, `notifications.list`,
+`notifications.test`. Server pushes: `event`, `task.updated`, `log.line`.

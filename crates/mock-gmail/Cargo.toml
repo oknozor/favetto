@@ -1,0 +1,17 @@
+[package]
+name = "mock-gmail"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mock-gmail"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+serde_json = { workspace = true }
+base64 = "0.23"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

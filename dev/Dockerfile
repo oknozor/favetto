@@ -1,10 +1,13 @@
-# Multi-stage build for the mock-linear dev server (see docker-compose.yml).
+# Multi-stage build for the dev mock servers (see docker-compose.yml).
+ARG BIN=mock-linear
 FROM rust:1-slim AS build
+ARG BIN=mock-linear
 WORKDIR /app
 COPY . .
-RUN cargo build -p mock-linear --release
+RUN cargo build -p ${BIN} --release
 
 FROM debian:bookworm-slim
-COPY --from=build /app/target/release/mock-linear /usr/local/bin/mock-linear
+ARG BIN=mock-linear
+COPY --from=build /app/target/release/${BIN} /usr/local/bin/mock
 EXPOSE 4000
-CMD ["mock-linear"]
+CMD ["mock"]

@@ -14,7 +14,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
-use favetto_core::model::{Event, EventKind, Task, TaskStatus};
+use favetto_core::model::{Event, EventKind, NotificationRecord, Schedule, Task, TaskStatus};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS tasks (
@@ -38,6 +38,25 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_id ON events(id);
+
+CREATE TABLE IF NOT EXISTS schedules (
+    id          TEXT PRIMARY KEY,
+    cron        TEXT NOT NULL,
+    skill       TEXT NOT NULL,
+    input       TEXT NOT NULL,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    last_run    INTEGER,
+    job_id      TEXT
+);
+
+CREATE TABLE IF NOT EXISTS notifications (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel     TEXT NOT NULL,
+    subject     TEXT NOT NULL,
+    body        TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    sent_at     INTEGER NOT NULL
+);
 "#;
 
 fn ts_ms(dt: DateTime<Utc>) -> i64 {
@@ -201,4 +220,141 @@ fn row_to_event(row: &SqliteRow) -> Event {
         payload: serde_json::from_str(&row.get::<String, _>("payload")).unwrap_or_default(),
         created_at: from_ms(row.get("created_at")),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Schedules
+// ---------------------------------------------------------------------------
+
+/// List schedules (newest first).
+pub async fn list_schedules(pool: &SqlitePool) -> anyhow::Result<Vec<Schedule>> {
+    let rows = sqlx::query(
+        "SELECT id, cron, skill, input, enabled, last_run FROM schedules ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(row_to_schedule).collect())
+}
+
+/// Insert or update a schedule, preserving its job_id column.
+pub async fn upsert_schedule(pool: &SqlitePool, schedule: &Schedule) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO schedules (id, cron, skill, input, enabled, last_run) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET cron = excluded.cron, skill = excluded.skill,
+             input = excluded.input, enabled = excluded.enabled, last_run = excluded.last_run",
+    )
+    .bind(&schedule.id)
+    .bind(&schedule.cron)
+    .bind(&schedule.skill)
+    .bind(serde_json::to_string(&schedule.input)?)
+    .bind(schedule.enabled as i64)
+    .bind(schedule.last_run.map(ts_ms))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn set_schedule_job_id(pool: &SqlitePool, id: &str, job_id: &str) -> anyhow::Result<()> {
+    sqlx::query("UPDATE schedules SET job_id = ? WHERE id = ?")
+        .bind(job_id)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn get_schedule_job_id(pool: &SqlitePool, id: &str) -> anyhow::Result<Option<String>> {
+    let row = sqlx::query("SELECT job_id FROM schedules WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.and_then(|r| r.get::<Option<String>, _>("job_id")))
+}
+
+pub async fn touch_schedule(pool: &SqlitePool, id: &str) -> anyhow::Result<()> {
+    sqlx::query("UPDATE schedules SET last_run = ? WHERE id = ?")
+        .bind(ts_ms(Utc::now()))
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn delete_schedule(pool: &SqlitePool, id: &str) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM schedules WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+fn row_to_schedule(row: &SqliteRow) -> Schedule {
+    Schedule {
+        id: row.get("id"),
+        cron: row.get("cron"),
+        skill: row.get("skill"),
+        input: serde_json::from_str(&row.get::<String, _>("input")).unwrap_or_default(),
+        enabled: row.get::<i64, _>("enabled") != 0,
+        last_run: row.get::<Option<i64>, _>("last_run").map(from_ms),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+pub async fn insert_notification(
+    pool: &SqlitePool,
+    channel: &str,
+    subject: &str,
+    body: &str,
+    status: &str,
+) -> anyhow::Result<i64> {
+    let res = sqlx::query(
+        "INSERT INTO notifications (channel, subject, body, status, sent_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(channel)
+    .bind(subject)
+    .bind(body)
+    .bind(status)
+    .bind(ts_ms(Utc::now()))
+    .execute(pool)
+    .await?;
+    Ok(res.last_insert_rowid())
+}
+
+pub async fn list_notifications(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec<NotificationRecord>> {
+    let rows = sqlx::query(
+        "SELECT id, channel, subject, body, status, sent_at FROM notifications ORDER BY id DESC LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(row_to_notification).collect())
+}
+
+fn row_to_notification(row: &SqliteRow) -> NotificationRecord {
+    NotificationRecord {
+        id: row.get("id"),
+        channel: row.get("channel"),
+        subject: row.get("subject"),
+        body: row.get("body"),
+        status: row.get("status"),
+        sent_at: from_ms(row.get("sent_at")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task queue
+// ---------------------------------------------------------------------------
+
+/// The oldest pending task, if any (for the executor).
+pub async fn next_pending_task(pool: &SqlitePool) -> anyhow::Result<Option<Task>> {
+    let row = sqlx::query(
+        "SELECT id, skill, status, input, output, dedupe_key, created_at, started_at, finished_at, error \
+         FROM tasks WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.as_ref().map(row_to_task))
 }

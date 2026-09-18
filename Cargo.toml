@@ -8,6 +8,8 @@ members = [
     "crates/mcp-linear",
     "crates/mcp-github",
     "crates/mock-linear",
+    "crates/mcp-gmail",
+    "crates/mock-gmail",
 ]
 
 [workspace.package]

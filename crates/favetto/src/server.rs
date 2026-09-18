@@ -82,7 +82,7 @@ pub async fn serve_connection(state: Arc<State>, mut incoming: BoxIn, mut outgoi
 
 /// Route a single request. `events.subscribe` is handled here because it produces
 /// an ack plus a variable number of replayed events.
-async fn handle_request(state: &State, out_tx: &mpsc::Sender<Frame>, req: Request) {
+async fn handle_request(state: &Arc<State>, out_tx: &mpsc::Sender<Frame>, req: Request) {
     let id = req.id;
 
     if req.method == method::EVENTS_SUBSCRIBE {
@@ -117,7 +117,7 @@ async fn handle_request(state: &State, out_tx: &mpsc::Sender<Frame>, req: Reques
 }
 
 /// Execute a request and build its response.
-pub async fn dispatch(state: &State, req: Request) -> Response {
+pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
     let result: Result<serde_json::Value, (i32, String)> = match req.method.as_str() {
         method::PING => Ok(serde_json::json!({ "pong": true })),
 
@@ -191,6 +191,62 @@ pub async fn dispatch(state: &State, req: Request) -> Response {
             }
         }
 
+        method::SCHEDULES_LIST => match db::list_schedules(&state.db).await {
+            Ok(schedules) => Ok(serde_json::json!(schedules)),
+            Err(e) => Err((error_code::INTERNAL, e.to_string())),
+        },
+
+        method::SCHEDULES_UPSERT => match upsert_schedule(state, &req.params).await {
+            Ok(schedule) => Ok(serde_json::json!(schedule)),
+            Err(e) => Err((error_code::INTERNAL, e.to_string())),
+        },
+
+        method::SCHEDULES_DELETE => {
+            let id = match req.params.get("id").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => return Response::err(req.id, error_code::INVALID_PARAMS, "missing id"),
+            };
+            match delete_schedule(state, &id).await {
+                Ok(()) => Ok(serde_json::json!({ "deleted": id })),
+                Err(e) => Err((error_code::INTERNAL, e.to_string())),
+            }
+        }
+
+        method::NOTIFICATIONS_LIST => {
+            let limit = req
+                .params
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(50)
+                .min(1000) as i64;
+            match db::list_notifications(&state.db, limit).await {
+                Ok(notifications) => Ok(serde_json::json!(notifications)),
+                Err(e) => Err((error_code::INTERNAL, e.to_string())),
+            }
+        }
+
+        method::NOTIFICATIONS_TEST => {
+            let channel = match req.params.get("channel").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => return Response::err(req.id, error_code::INVALID_PARAMS, "missing channel"),
+            };
+            let config = req.params.get("config").cloned().unwrap_or(serde_json::Value::Null);
+            let subject = req
+                .params
+                .get("subject")
+                .and_then(|v| v.as_str())
+                .unwrap_or("test")
+                .to_string();
+            let body = req
+                .params
+                .get("body")
+                .and_then(|v| v.as_str())
+                .unwrap_or("test notification")
+                .to_string();
+            crate::notify::send(state, &channel, &config, &subject, &body).await;
+            Ok(serde_json::json!({ "sent": true }))
+        }
+
         _ => Err((
             error_code::METHOD_NOT_FOUND,
             format!("unknown method: {}", req.method),
@@ -201,6 +257,64 @@ pub async fn dispatch(state: &State, req: Request) -> Response {
         Ok(value) => Response::ok(req.id, value),
         Err((code, message)) => Response::err(req.id, code, message),
     }
+}
+
+/// Create or update a schedule: (re)register its cron job and persist it.
+async fn upsert_schedule(state: &Arc<State>, params: &serde_json::Value) -> anyhow::Result<favetto_core::model::Schedule> {
+    use favetto_core::model::Schedule;
+
+    let id = params
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let cron = params
+        .get("cron")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing cron"))?
+        .to_string();
+    let skill = params
+        .get("skill")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing skill"))?
+        .to_string();
+    let input = params.get("input").cloned().unwrap_or(serde_json::Value::Null);
+    let enabled = params.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    let schedule = Schedule {
+        id,
+        cron,
+        skill,
+        input,
+        enabled,
+        last_run: None,
+    };
+
+    // Remove any existing job, then register the new one.
+    if let Some(old_job_id) = db::get_schedule_job_id(&state.db, &schedule.id).await? {
+        if let Ok(job_uuid) = Uuid::parse_str(&old_job_id) {
+            let _ = crate::scheduler::unregister(&state.scheduler, &job_uuid).await;
+        }
+    }
+
+    db::upsert_schedule(&state.db, &schedule).await?;
+
+    if schedule.enabled {
+        let job_id = crate::scheduler::register(&state.scheduler, state.clone(), &schedule).await?;
+        db::set_schedule_job_id(&state.db, &schedule.id, &job_id.to_string()).await?;
+    }
+
+    Ok(schedule)
+}
+
+async fn delete_schedule(state: &Arc<State>, id: &str) -> anyhow::Result<()> {
+    if let Some(job_id) = db::get_schedule_job_id(&state.db, id).await? {
+        if let Ok(job_uuid) = Uuid::parse_str(&job_id) {
+            let _ = crate::scheduler::unregister(&state.scheduler, &job_uuid).await;
+        }
+    }
+    db::delete_schedule(&state.db, id).await?;
+    Ok(())
 }
 
 /// Mark a task cancelled, persist it, and announce the change.

@@ -11,3 +11,5 @@ thiserror = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 octocrab = "0.54"
 http = "1"
+base64 = "0.23"
+keyring = "4"

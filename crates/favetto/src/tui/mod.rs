@@ -17,7 +17,7 @@ use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlter
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use favetto_core::model::{ChatSession, Event, Task};
+use favetto_core::model::{ChatSession, Event, NotificationRecord, Schedule, Task};
 use favetto_core::rpc::method;
 
 use crate::cli::TuiArgs;
@@ -113,6 +113,31 @@ async fn sync_initial(client: &Client, app: &mut App) {
                 for ev in events {
                     app.ingest_event(ev);
                 }
+            }
+        }
+    }
+
+    if let Ok(resp) = client
+        .request(method::SCHEDULES_LIST, serde_json::json!({}))
+        .await
+    {
+        if let Some(v) = resp.result {
+            if let Ok(schedules) = serde_json::from_value::<Vec<Schedule>>(v) {
+                app.schedules = schedules;
+            }
+        }
+    }
+
+    if let Ok(resp) = client
+        .request(
+            method::NOTIFICATIONS_LIST,
+            serde_json::json!({ "limit": 100 }),
+        )
+        .await
+    {
+        if let Some(v) = resp.result {
+            if let Ok(notifications) = serde_json::from_value::<Vec<NotificationRecord>>(v) {
+                app.notifications = notifications;
             }
         }
     }

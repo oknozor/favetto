@@ -1,11 +1,16 @@
 //! Shared daemon state passed to every connection handler and background task.
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use chrono::Utc;
 use favetto_core::auth::Token;
 use favetto_core::model::{Event, EventKind};
 use sqlx::SqlitePool;
+use tokio_cron_scheduler::JobScheduler;
 
 use crate::chat::ChatManager;
+use crate::config::FavettoConfig;
 use crate::db;
 use crate::event_bus::{EventBus, ServerPush};
 use crate::webhooks::WebhookSecrets;
@@ -20,15 +25,22 @@ pub struct State {
     pub token: Token,
     pub webhooks: WebhookSecrets,
     pub chat: ChatManager,
+    pub config: Arc<FavettoConfig>,
+    pub skills_dir: PathBuf,
+    pub scheduler: JobScheduler,
 }
 
 impl State {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: SqlitePool,
         bus: EventBus,
         token: Token,
         webhooks: WebhookSecrets,
         chat: ChatManager,
+        config: Arc<FavettoConfig>,
+        skills_dir: PathBuf,
+        scheduler: JobScheduler,
     ) -> Self {
         Self {
             db,
@@ -36,6 +48,9 @@ impl State {
             token,
             webhooks,
             chat,
+            config,
+            skills_dir,
+            scheduler,
         }
     }
 

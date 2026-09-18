@@ -163,6 +163,43 @@ fn describe_tools(tools: &[crate::tool_registry::ToolRef]) -> String {
     serde_json::to_string_pretty(&arr).unwrap_or_else(|_| "[]".to_string())
 }
 
+/// Merge global (config) and per-skill MCP servers; the skill's own servers win on
+/// name clash.
+pub fn merged_servers(
+    config: &FavettoConfig,
+    skill: &Skill,
+) -> anyhow::Result<Vec<crate::skills::McpServerConfig>> {
+    let mut map: std::collections::BTreeMap<String, crate::skills::McpServerConfig> = config
+        .mcp_servers()?
+        .into_iter()
+        .map(|s| (s.name.clone(), s))
+        .collect();
+    for s in skill.mcp_servers()? {
+        map.insert(s.name.clone(), s);
+    }
+    Ok(map.into_values().collect())
+}
+
+/// Run a skill end-to-end: connect its MCP servers (plus globals), build the
+/// registry and backend, and drive the tool-calling loop. Shared by `task-run` and
+/// the daemon's task executor.
+pub async fn run_skill(
+    skill: &Skill,
+    config: &FavettoConfig,
+    input: Value,
+) -> anyhow::Result<Value> {
+    let servers = merged_servers(config, skill)?;
+    let mut sessions = Vec::new();
+    for cfg in &servers {
+        let session = crate::mcp_client::McpSession::connect(cfg).await?;
+        sessions.push(session);
+    }
+    let registry = ToolRegistry::new(sessions);
+    let backend = build_backend(skill, config)?;
+    let runtime = Runtime::new(registry, backend);
+    runtime.run(skill, input).await
+}
+
 /// Build a backend from a skill's `agent` config plus the global config's
 /// providers. Returns an error for backends that aren't compiled in.
 pub fn build_backend(skill: &Skill, config: &FavettoConfig) -> anyhow::Result<Arc<dyn ModelBackend>> {

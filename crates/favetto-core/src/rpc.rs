@@ -36,6 +36,16 @@ pub mod method {
     pub const CHAT_SEND: &str = "chat.send";
     /// Fetch a chat session's full conversation.
     pub const CHAT_MESSAGES: &str = "chat.messages";
+    /// List cron schedules.
+    pub const SCHEDULES_LIST: &str = "schedules.list";
+    /// Create or update a cron schedule.
+    pub const SCHEDULES_UPSERT: &str = "schedules.upsert";
+    /// Delete a cron schedule.
+    pub const SCHEDULES_DELETE: &str = "schedules.delete";
+    /// List recent notifications.
+    pub const NOTIFICATIONS_LIST: &str = "notifications.list";
+    /// Send a test notification through a channel.
+    pub const NOTIFICATIONS_TEST: &str = "notifications.test";
 }
 
 /// Well-known server → client push (notification) method names.
