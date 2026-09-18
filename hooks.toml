@@ -1,0 +1,12 @@
+# Example hooks. Loaded by `favetto daemon --hooks hooks.toml`.
+
+# When a Linear ticket is created, enqueue an `implement_linear_ticket` task.
+[[hooks]]
+event = "TicketCreated"
+filter = { type = "Issue" }
+action = { type = "run_skill", skill = "implement_linear_ticket" }
+
+# When a GitHub issue is created, derive a task-created event.
+[[hooks]]
+event = "IssueCreated"
+action = { type = "emit_event", kind = "TaskCreated" }

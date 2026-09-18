@@ -1,0 +1,32 @@
+[agent]
+model = "mock"
+max_iterations = 10
+
+[[agent.steps]]
+kind = "tool"
+server = "linear"
+tool = "list_teams"
+args = {}
+
+[[agent.steps]]
+kind = "tool"
+server = "linear"
+tool = "create_issue"
+args = { title = "Implement retry on flaky test", team_id = "team-eng", description = "Add retry logic to the flaky integration test." }
+
+[[agent.steps]]
+kind = "tool"
+server = "linear"
+tool = "comment_issue"
+args = { issue_id = "issue-new", body = "Starting work on this ticket." }
+
+[[agent.steps]]
+kind = "final"
+text = "Linear ticket created and commented."
+
+[mcp.linear]
+transport = "stdio"
+command = "mcp-linear"
+
+[tools.allow]
+linear = ["list_teams", "list_issues", "create_issue", "comment_issue"]

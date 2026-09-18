@@ -1,0 +1,49 @@
+# favetto example configuration.
+#
+# Copy to ~/.config/favetto/config.toml (or point favetto at it with
+# --config <path> / $FAVETTO_CONFIG). Every section is optional; favetto falls
+# back to built-in defaults for anything you omit.
+
+# Default model for the interactive chat and the runtime. `"echo"` is a local,
+# keyless backend for offline development; `"openai:<model>"` uses the provider
+# declared under [providers].
+[agent]
+model = "echo"
+# model = "openai:gpt-4o"
+
+# LLM providers. Only `kind = "openai"` is wired so far (enabled at build time
+# with `cargo build --features openai`).
+[providers.openai]
+kind = "openai"
+# Provide the key directly, or reference an environment variable.
+# api_key = "sk-..."
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-4o"
+# base_url = "https://api.openai.com/v1"   # for compatible providers / local proxies
+
+# Global MCP servers. Any skill may rely on these; a skill's own [mcp.*] table
+# overrides a global server of the same name.
+[mcp.filesystem]
+transport = "stdio"
+command = "mcp-filesystem"
+args = ["--root", "./workdir"]
+
+# [mcp.linear]
+# transport = "stdio"
+# command = "mcp-linear"
+#
+# [mcp.github]
+# transport = "stdio"
+# command = "mcp-github"
+#
+# Remote MCP servers use the streamable-HTTP transport (arrives in a later milestone):
+# [mcp.remote]
+# transport = "streamable_http"
+# url = "http://localhost:4000/graphql"
+
+# Daemon defaults. CLI flags take precedence over these.
+[daemon]
+listen = "127.0.0.1:7878"
+socket = "/tmp/favetto.sock"
+skills_dir = "skills"
+# data_dir = "~/.local/share/favetto"

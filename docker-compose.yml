@@ -1,0 +1,7 @@
+services:
+  mock-linear:
+    build:
+      context: .
+      dockerfile: dev/Dockerfile
+    ports:
+      - "4000:4000"

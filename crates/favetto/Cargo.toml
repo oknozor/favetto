@@ -1,0 +1,44 @@
+[package]
+name = "favetto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "favetto"
+path = "src/main.rs"
+
+[dependencies]
+favetto-core = { path = "../favetto-core" }
+
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["ws"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+config = "0.15"
+dirs = "7"
+futures-util = "0.3"
+hex = "0.4"
+hmac = "0.13"
+http = "1"
+ratatui = "0.30"
+rmcp = { version = "3.4", default-features = false, features = ["client", "transport-child-process"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.11"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+subtle = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.30"
+tokio-util = { version = "0.7", features = ["codec"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+
+[features]
+default = []
+openai = ["dep:reqwest"]

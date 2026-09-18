@@ -1,0 +1,16 @@
+[package]
+name = "mock-linear"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mock-linear"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
