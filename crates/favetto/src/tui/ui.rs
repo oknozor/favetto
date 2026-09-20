@@ -11,7 +11,7 @@ use ratatui::Frame;
 
 use favetto_core::model::TaskStatus;
 
-use super::app::{App, ClickAction, ClickRegion, ConnState, Form, Popup, Tab, MENU_OPTIONS};
+use super::app::{App, ClickAction, ClickRegion, ConnState, Form, Popup, Tab, Wizard, WizardStep, MENU_OPTIONS};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     app.click_regions.clear();
@@ -67,6 +67,7 @@ fn draw_popup(frame: &mut Frame, app: &App) {
         Popup::None => {}
         Popup::Menu { selected } => draw_menu(frame, *selected),
         Popup::Form(form) => draw_form(frame, form),
+        Popup::Wizard(wizard) => draw_wizard(frame, wizard),
     }
 }
 
@@ -151,6 +152,75 @@ fn draw_form(frame: &mut Frame, form: &Form) {
                 .borders(Borders::ALL)
                 .title(" Step-by-step form "),
         )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(Clear, rect);
+    frame.render_widget(paragraph, rect);
+}
+
+/// Number of list rows the wizard shows at once.
+const WIZARD_VISIBLE: usize = 12;
+
+fn draw_wizard(frame: &mut Frame, wizard: &Wizard) {
+    let area = frame.area();
+    let rows = wizard.choices.len().min(WIZARD_VISIBLE) as u16;
+    let rect = centered_rect(area, 70, rows + 6);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        wizard.step.title(),
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    if wizard.step == WizardStep::Dir {
+        lines.push(Line::from(vec![
+            Span::styled("> Directory: ", Style::default().fg(Color::Cyan)),
+            Span::raw(wizard.dir.as_str()),
+            Span::styled("█", Style::default().fg(Color::Cyan)),
+        ]));
+    } else if wizard.loading {
+        lines.push(Line::from(Span::styled(
+            "loading…",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        let start = wizard.selected.saturating_sub(WIZARD_VISIBLE - 1);
+        for (idx, (label, _)) in wizard
+            .choices
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(WIZARD_VISIBLE)
+        {
+            let style = if idx == wizard.selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(format!(" {label} "), style)));
+        }
+        if wizard.choices.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "(nothing available)",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    if let Some(err) = &wizard.error {
+        lines.push(Line::from(Span::styled(
+            err.as_str(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " ↑/↓ select · Enter: next · Esc: cancel ",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(" New one-shot task "))
         .wrap(Wrap { trim: false });
     frame.render_widget(Clear, rect);
     frame.render_widget(paragraph, rect);

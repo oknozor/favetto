@@ -83,6 +83,11 @@ pub struct AgentConfig {
     /// substituted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_args: Option<Vec<String>>,
+    /// Interactive arguments used when a model is selected (e.g. for a one-shot
+    /// session); `{provider}` and `{model}` are substituted. Lets an agent reach a
+    /// path that accepts a model when its plain `args` do not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interactive_model_args: Option<Vec<String>>,
     /// Key under which a run's line-delimited JSON output carries the agent's
     /// session id (e.g. `"sessionID"`). Unset disables capture.
     #[serde(default, skip_serializing_if = "Option::is_none")]

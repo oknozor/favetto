@@ -949,6 +949,7 @@ dependencies = [
  "config",
  "dirs",
  "favetto-core",
+ "favetto-providers",
  "futures-util",
  "hex",
  "hmac",
@@ -987,6 +988,17 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio-util",
  "uuid",
+]
+
+[[package]]
+name = "favetto-providers"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "reqwest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

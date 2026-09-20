@@ -118,8 +118,13 @@ impl AgentEvent {
 
 /// How an agent is invoked for a session.
 pub enum Invocation<'a> {
-    /// Interactive TUI: base `args` + `prompt_args` (or the prompt on stdin).
-    Interactive(Option<&'a str>),
+    /// Interactive TUI: base `args` (or `interactive_model_args` when a model is
+    /// given) plus `prompt_args`, or the prompt on stdin.
+    Interactive {
+        prompt: Option<&'a str>,
+        provider: Option<&'a str>,
+        model: Option<&'a str>,
+    },
     /// Unattended run: `run_args` when a model is given, else `headless_args`.
     Headless {
         prompt: &'a str,
@@ -268,12 +273,33 @@ impl AgentManager {
         let mut stdin_prompt: Option<&str> = None;
         let mut headless = false;
         match invocation {
-            Invocation::Interactive(prompt) => {
-                for a in &cfg.args {
+            Invocation::Interactive {
+                prompt,
+                provider,
+                model,
+            } => {
+                // A selected model may require a different interactive entry point
+                // (e.g. opencode's `mini --model`), since its main TUI has no flag.
+                let base = if model.is_some() && cfg.interactive_model_args.is_some() {
+                    cfg.interactive_model_args.as_deref().unwrap_or(&cfg.args)
+                } else {
+                    cfg.args.as_slice()
+                };
+                for a in substitute(
+                    base,
+                    &[
+                        ("{provider}", provider.unwrap_or("")),
+                        ("{model}", model.unwrap_or("")),
+                    ],
+                ) {
                     cmd.arg(a);
                 }
                 if let (Some(p), Some(prompt_args)) = (prompt, cfg.prompt_args.as_ref()) {
-                    let vars = [("{prompt}", p)];
+                    let vars = [
+                        ("{prompt}", p),
+                        ("{provider}", provider.unwrap_or("")),
+                        ("{model}", model.unwrap_or("")),
+                    ];
                     prompt_via_args = append_template(&mut cmd, prompt_args, &vars);
                 }
                 if !prompt_via_args {
@@ -755,10 +781,45 @@ mod tests {
     }
 
     #[test]
+    fn interactive_with_model_uses_interactive_model_args() {
+        let mgr = AgentManager::new();
+        let mut agent = cfg("sh", &[]);
+        agent.interactive_model_args = Some(vec![
+            "-c".to_string(),
+            r#"printf 'model:%s/%s' "$1" "$2""#.to_string(),
+            "ignored".to_string(),
+            "{provider}".to_string(),
+            "{model}".to_string(),
+        ]);
+        let info = mgr
+            .start(
+                "sh",
+                &agent,
+                None,
+                Invocation::Interactive {
+                    prompt: None,
+                    provider: Some("jev"),
+                    model: Some("1.13"),
+                },
+                24,
+                80,
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (_info, data) = mgr.attach(&info.id).unwrap();
+        assert!(
+            String::from_utf8_lossy(&data).contains("model:jev/1.13"),
+            "frame: {:?}",
+            String::from_utf8_lossy(&data)
+        );
+        mgr.close(&info.id).unwrap();
+    }
+
+    #[test]
     fn attach_returns_current_frame() {
         let mgr = AgentManager::new();
         let agent = cfg("sh", &["-c", "printf hello-pty; sleep 1"]);
-        let info = mgr.start("sh", &agent, None, Invocation::Interactive(None), 24, 80).unwrap();
+        let info = mgr.start("sh", &agent, None, Invocation::Interactive { prompt: None, provider: None, model: None }, 24, 80).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(400));
         let (attached, data) = mgr.attach(&info.id).unwrap();
@@ -775,7 +836,7 @@ mod tests {
     fn pty_session_accepts_input() {
         let mgr = AgentManager::new();
         let info = mgr
-            .start("cat", &cfg("cat", &[]), None, Invocation::Interactive(None), 24, 80)
+            .start("cat", &cfg("cat", &[]), None, Invocation::Interactive { prompt: None, provider: None, model: None }, 24, 80)
             .unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -795,7 +856,7 @@ mod tests {
     fn pty_resize_does_not_error() {
         let mgr = AgentManager::new();
         let info = mgr
-            .start("cat", &cfg("cat", &[]), None, Invocation::Interactive(None), 24, 80)
+            .start("cat", &cfg("cat", &[]), None, Invocation::Interactive { prompt: None, provider: None, model: None }, 24, 80)
             .unwrap();
         mgr.resize(&info.id, 40, 120).unwrap();
         mgr.close(&info.id).unwrap();
@@ -814,7 +875,7 @@ mod tests {
         // Prompt goes via prompt_args, so it is not written to stdin; the submit
         // thread must press Enter for `read` to unblock.
         let info = mgr
-            .start("sh", &agent, None, Invocation::Interactive(Some("ignored")), 24, 80)
+            .start("sh", &agent, None, Invocation::Interactive { prompt: Some("ignored"), provider: None, model: None }, 24, 80)
             .unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(2500));

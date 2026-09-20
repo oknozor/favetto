@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 favetto-core = { path = "../favetto-core" }
+favetto-providers = { path = "../favetto-providers" }
 
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }

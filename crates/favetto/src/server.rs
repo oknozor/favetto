@@ -10,16 +10,18 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
+use chrono::Utc;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
-use favetto_core::model::{AgentCatalogEntry, AgentSessionInfo};
+use favetto_core::model::{AgentCatalogEntry, AgentSessionInfo, EventKind, Task, TaskStatus};
 use favetto_core::rpc::{error_code, method, push, Frame, Notification, Request, Response};
 use favetto_core::wire::WireError;
 
 use crate::agents::{AgentEvent, Invocation};
 use crate::db;
+use crate::event_bus::ServerPush;
 use crate::state::State;
 
 /// Per-connection set of attached agent sessions. Used to scope screen frames to
@@ -200,6 +202,26 @@ async fn handle_request(
         return;
     }
 
+    // `tasks.start_oneshot` creates an inline task and opens its interactive
+    // session; subscribe this connection so the Agent panel receives its frames.
+    if req.method == method::TASKS_START_ONESHOT {
+        let resp = match start_oneshot_task(state, &req.params).await {
+            Ok(value) => {
+                if let Some(sid) = value
+                    .get("session")
+                    .and_then(|s| s.get("id"))
+                    .and_then(|v| v.as_str())
+                {
+                    subscribed.lock().unwrap().insert(sid.to_string());
+                }
+                Response::ok(id, value)
+            }
+            Err(e) => Response::err(id, error_code::INTERNAL, e.to_string()),
+        };
+        let _ = out_tx.send(Frame::Response(resp)).await;
+        return;
+    }
+
     // `agents.attach` subscribes this connection; `agents.close` unsubscribes.
     if req.method == method::AGENTS_ATTACH {
         let resp = match session_id(&req.params) {
@@ -253,7 +275,12 @@ fn session_id(params: &serde_json::Value) -> Result<String, String> {
 /// Execute a request and build its response.
 pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
     let result: Result<serde_json::Value, (i32, String)> = match req.method.as_str() {
-        method::PING => Ok(serde_json::json!({ "pong": true })),
+        method::PING => Ok(serde_json::json!({
+            "pong": true,
+            "cwd": std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        })),
 
         method::TASKS_LIST => match db::list_tasks(&state.db).await {
             Ok(tasks) => Ok(serde_json::json!(tasks)),
@@ -367,6 +394,11 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
             }
             entries.sort_by(|a, b| a.name.cmp(&b.name));
             Ok(serde_json::json!(entries))
+        }
+
+        method::PROVIDERS_LIST => match list_providers(state).await {
+            Ok(providers) => Ok(serde_json::json!({ "providers": providers })),
+            Err(e) => Err((error_code::INTERNAL, e.to_string())),
         }
 
         method::AGENTS_INPUT => {
@@ -572,7 +604,18 @@ async fn start_agent(
 
     state
         .agents
-        .start(&name, &agent, task_id, Invocation::Interactive(prompt.as_deref()), rows, cols)
+        .start(
+            &name,
+            &agent,
+            task_id,
+            Invocation::Interactive {
+                prompt: prompt.as_deref(),
+                provider: None,
+                model: None,
+            },
+            rows,
+            cols,
+        )
 }
 
 /// Wait briefly for a still-running headless run to publish its agent session id
@@ -600,6 +643,181 @@ async fn persisted_session_id(state: &Arc<State>, task_id: Option<&str>) -> Opti
         .ok()
         .flatten()
         .and_then(|t| t.session_id)
+}
+
+/// Configured providers and their models (opencode `auth.json` + models.dev),
+/// cached for the daemon's lifetime.
+async fn list_providers(state: &Arc<State>) -> anyhow::Result<Vec<favetto_providers::Provider>> {
+    {
+        let cache = state.providers_cache.lock().await;
+        if let Some(providers) = cache.as_ref() {
+            return Ok(providers.clone());
+        }
+    }
+
+    let configured = favetto_providers::configured_providers()?;
+    let url = std::env::var("OPENCODE_MODELS_URL")
+        .unwrap_or_else(|_| favetto_providers::DEFAULT_CATALOG_URL.to_string());
+    let client = reqwest::Client::new();
+    let providers = favetto_providers::fetch_catalog(&client, &configured, &url).await?;
+
+    let mut cache = state.providers_cache.lock().await;
+    *cache = Some(providers.clone());
+    Ok(providers)
+}
+
+/// Start a one-shot task: an inline (non-catalog) task whose work is an
+/// interactive agent session the user drives from the Agent panel. Emits the
+/// normal task lifecycle and finishes the task when the session exits.
+async fn start_oneshot_task(
+    state: &Arc<State>,
+    params: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let requested = params
+        .get("agent")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let provider = params
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let model = params
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let cwd = params
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let rows = params.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
+    let cols = params.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
+
+    let (name, mut agent) = {
+        let cfg = state.config.read().unwrap();
+        let name = requested.or_else(|| cfg.agent.default.clone()).ok_or_else(|| {
+            anyhow::anyhow!("no agent given and no default configured ([agent].default)")
+        })?;
+        let agent = cfg
+            .agents
+            .get(&name)
+            .ok_or_else(|| anyhow::anyhow!("agent '{name}' is not configured under [agents.*]"))?
+            .clone();
+        (name, agent)
+    };
+    if let Some(cwd) = &cwd {
+        agent.cwd = Some(std::path::PathBuf::from(cwd));
+    }
+
+    let task = Task {
+        id: Uuid::new_v4(),
+        name: "one-shot".to_string(),
+        status: TaskStatus::Running,
+        input: serde_json::json!({
+            "oneshot": true,
+            "agent": name.clone(),
+            "provider": provider.clone(),
+            "model": model.clone(),
+            "cwd": agent.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        }),
+        output: None,
+        dedupe_key: None,
+        created_at: Utc::now(),
+        started_at: Some(Utc::now()),
+        finished_at: None,
+        error: None,
+        session_id: None,
+    };
+    db::insert_task(&state.db, &task).await?;
+    crate::metrics::inc_tasks();
+    state.bus.publish(ServerPush::TaskUpdated(task.clone()));
+    state
+        .emit_event(
+            EventKind::TaskIdle,
+            serde_json::json!({ "name": task.name, "task_id": task.id }),
+        )
+        .await;
+    state
+        .emit_event(
+            EventKind::TaskStarted,
+            serde_json::json!({ "name": task.name, "task_id": task.id }),
+        )
+        .await;
+
+    let info = state.agents.start(
+        &name,
+        &agent,
+        Some(task.id.to_string()),
+        Invocation::Interactive {
+            prompt: None,
+            provider: provider.as_deref(),
+            model: model.as_deref(),
+        },
+        rows,
+        cols,
+    )?;
+
+    // Finish the task once the interactive session ends.
+    {
+        let state = state.clone();
+        let task_id = task.id;
+        let session = info.id.clone();
+        tokio::spawn(async move {
+            let code = state.agents.wait(&session).await;
+            finish_oneshot(&state, task_id, code).await;
+        });
+    }
+
+    let (session_info, frame) = state.agents.attach(&info.id)?;
+    Ok(serde_json::json!({
+        "task": task,
+        "session": session_info,
+        "data": base64::engine::general_purpose::STANDARD.encode(&frame),
+    }))
+}
+
+/// Mark a one-shot task finished once its interactive session exits.
+async fn finish_oneshot(state: &Arc<State>, task_id: Uuid, code: Option<i32>) {
+    let Ok(Some(mut task)) = db::get_task(&state.db, task_id).await else {
+        return;
+    };
+    if task.status != TaskStatus::Running {
+        return;
+    }
+    let success = code == Some(0);
+    task.status = if success {
+        TaskStatus::Succeeded
+    } else {
+        TaskStatus::Failed
+    };
+    task.error = if success {
+        None
+    } else {
+        Some(format!(
+            "agent session exited with {}",
+            code.map(|c| c.to_string()).unwrap_or_else(|| "?".to_string())
+        ))
+    };
+    task.finished_at = Some(Utc::now());
+    let _ = db::upsert_task(&state.db, &task).await;
+    state.bus.publish(ServerPush::TaskUpdated(task.clone()));
+    state
+        .emit_event(
+            if success {
+                EventKind::TaskCompleted
+            } else {
+                EventKind::TaskFailed
+            },
+            serde_json::json!({ "task_id": task.id }),
+        )
+        .await;
+    state
+        .emit_event(
+            EventKind::TaskFinished,
+            serde_json::json!({ "name": task.name, "task_id": task.id, "success": success }),
+        )
+        .await;
 }
 
 /// Create or update a schedule: (re)register its cron job and persist it.

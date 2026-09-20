@@ -39,6 +39,7 @@ orchestrator never implements its own agent loop.
 ```
 crates/
   favetto-core/          shared wire protocol + domain types (no HTTP/DB/LLM)
+  favetto-providers/     provider/model catalog (opencode auth + models.dev)
   favetto/               single binary: daemon, tui, agent exec wrapper
 tasks/                        task catalog: `*.md` files with TOML header + prompt
 hooks.toml                    example hooks (event + filter → action)
@@ -264,10 +265,27 @@ keep_worktree = true     # default true; false removes the worktree afterwards
 Press **Ctrl+P** in the TUI to open a floating menu with guided, step-by-step
 forms for:
 
+- **New one-shot task** — a wizard (agent → provider → model → directory) that
+  starts an inline, interactive task and opens it in the Agent panel for you to
+  prompt. It emits the normal task events but is **not** written to the catalog.
 - **Add task to catalog** — writes a task `.md` file (does not run it).
 - **Create a schedule event** — adds a cron schedule.
 - **Create a notification (hook)** — adds a hook that reacts to an event kind and
   sends a notification through a channel.
+
+### One-shot tasks
+
+The wizard lists agents from the config, then providers and models from the
+`favetto-providers` catalog: providers are the ones authenticated with opencode
+(read from `~/.local/share/opencode/auth.json`) and their models come from the
+models.dev catalog (`https://models.dev/api.json`, overridable with
+`OPENCODE_MODELS_URL`). The daemon caches the catalog for its lifetime. The
+directory step is prefilled with the daemon's working directory. On completion
+favetto creates a task row (input carries the inline definition, no `.md` file),
+emits `task_idle`/`task_started`, and opens an interactive session using the
+agent's `interactive_model_args` (so a model can be applied even when the agent's
+main TUI has no model flag — for opencode, `mini --model provider/model`). The task
+is marked completed/failed when that session exits.
 
 ## Remote API
 

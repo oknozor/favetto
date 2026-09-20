@@ -20,8 +20,9 @@ use ratatui::crossterm::terminal::{
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use favetto_core::model::{AgentSessionInfo, Event, NotificationRecord, Schedule, Task};
+use favetto_core::model::{AgentCatalogEntry, AgentSessionInfo, Event, NotificationRecord, Schedule, Task};
 use favetto_core::rpc::method;
+use favetto_providers::Provider;
 
 use crate::cli::TuiArgs;
 use crate::client::{Client, Transport};
@@ -99,6 +100,12 @@ pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
 
 /// Fetch the initial snapshot and subscribe for live pushes.
 async fn sync_initial(client: &Client, app: &mut App) {
+    if let Ok(resp) = client.request(method::PING, serde_json::json!({})).await {
+        if let Some(v) = resp.result {
+            app.daemon_cwd = v.get("cwd").and_then(|c| c.as_str()).map(str::to_string);
+        }
+    }
+
     if let Ok(resp) = client.request(method::TASKS_LIST, serde_json::json!({})).await {
         if let Some(v) = resp.result {
             if let Ok(tasks) = serde_json::from_value::<Vec<Task>>(v) {
@@ -250,6 +257,15 @@ async fn run_session(
                                 }
                                 refresh_lists(client, app).await;
                             }
+                            UiAction::OpenWizard => {
+                                fetch_agents(client, app).await;
+                            }
+                            UiAction::WizardLoadProviders => {
+                                load_wizard_providers(client, app).await;
+                            }
+                            UiAction::WizardStart { agent, provider, model, cwd } => {
+                                start_oneshot(client, app, agent, provider, model, cwd).await;
+                            }
                             UiAction::Submit { method, params } => {
                                 match client.request(method, params).await {
                                     Ok(resp) => {
@@ -337,26 +353,91 @@ async fn open_agent(client: &Client, app: &mut App, task_id: String, force_new: 
     }
 
     match client.request(method::AGENTS_START, params).await {
-        Ok(resp) => match resp.result {
-            Some(v) => {
-                let session = v
-                    .get("session")
-                    .cloned()
-                    .and_then(|s| serde_json::from_value::<AgentSessionInfo>(s).ok());
-                let frame = v
-                    .get("data")
-                    .and_then(|d| d.as_str())
-                    .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
-                    .unwrap_or_default();
-                match session {
-                    Some(session) => app.open_agent(session, &frame),
-                    None => app.logs.push_back("agents.start: malformed response".to_string()),
-                }
-            }
-            None => app.logs.push_back(format!("agents.start error: {:?}", resp.error)),
-        },
+        Ok(resp) => apply_agent_response(app, resp),
         Err(e) => app.logs.push_back(format!("agents.start failed: {e}")),
     }
+}
+
+/// Apply an `agents.start` / `tasks.start_oneshot` response: open the returned
+/// session (with its current frame) in the Agent panel.
+fn apply_agent_response(app: &mut App, resp: favetto_core::rpc::Response) {
+    match resp.result {
+        Some(v) => {
+            let session = v
+                .get("session")
+                .cloned()
+                .and_then(|s| serde_json::from_value::<AgentSessionInfo>(s).ok());
+            let frame = v
+                .get("data")
+                .and_then(|d| d.as_str())
+                .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+                .unwrap_or_default();
+            match session {
+                Some(session) => app.open_agent(session, &frame),
+                None => app.logs.push_back("agent response: malformed session".to_string()),
+            }
+        }
+        None => app.logs.push_back(format!("agent error: {:?}", resp.error)),
+    }
+}
+
+/// Fetch the configured agents and open the one-shot wizard.
+async fn fetch_agents(client: &Client, app: &mut App) {
+    match client.request(method::AGENTS_LIST, serde_json::json!({})).await {
+        Ok(resp) => match resp.result {
+            Some(v) => match serde_json::from_value::<Vec<AgentCatalogEntry>>(v) {
+                Ok(agents) => app.open_wizard(agents),
+                Err(e) => app.logs.push_back(format!("agents.list: {e}")),
+            },
+            None => app.logs.push_back(format!("agents.list error: {:?}", resp.error)),
+        },
+        Err(e) => app.logs.push_back(format!("agents.list failed: {e}")),
+    }
+}
+
+/// Fetch the configured provider/model catalog for the wizard.
+async fn load_wizard_providers(client: &Client, app: &mut App) {
+    match client
+        .request(method::PROVIDERS_LIST, serde_json::json!({}))
+        .await
+    {
+        Ok(resp) => match resp.result {
+            Some(v) => {
+                let providers = v
+                    .get("providers")
+                    .and_then(|p| serde_json::from_value::<Vec<Provider>>(p.clone()).ok())
+                    .unwrap_or_default();
+                app.wizard_set_providers(providers);
+            }
+            None => app.wizard_error(format!("{:?}", resp.error)),
+        },
+        Err(e) => app.wizard_error(format!("{e}")),
+    }
+}
+
+/// Start a one-shot interactive task and open its agent session.
+async fn start_oneshot(
+    client: &Client,
+    app: &mut App,
+    agent: String,
+    provider: Option<String>,
+    model: Option<String>,
+    cwd: Option<String>,
+) {
+    let (rows, cols) = app.term.size();
+    let params = serde_json::json!({
+        "agent": agent,
+        "provider": provider,
+        "model": model,
+        "cwd": cwd,
+        "rows": rows,
+        "cols": cols,
+    });
+    match client.request(method::TASKS_START_ONESHOT, params).await {
+        Ok(resp) => apply_agent_response(app, resp),
+        Err(e) => app.logs.push_back(format!("start one-shot failed: {e}")),
+    }
+    refresh_lists(client, app).await;
 }
 
 /// Forward raw bytes to the active agent session's PTY.

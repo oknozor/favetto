@@ -16,6 +16,9 @@ default = "opencode"
 # instead when the task sets `model`, with `{prompt}`, `{provider}`, and `{model}`
 # substituted so the model flag can sit where the CLI expects it.
 # `resume_args` reopens a previously run session (`{session_id}`).
+# `interactive_model_args` is the interactive invocation used when a model is
+# selected (e.g. the one-shot wizard); it is a path that accepts a model, since
+# some agents' main TUI does not.
 # `session_id_json_key` reads the agent's session id from a run's line-delimited
 # JSON output. `prompt_args` seeds an interactive session (otherwise the prompt is
 # written to stdin).
@@ -27,6 +30,7 @@ submit_prompt = true                          # press Enter so the prompt is sen
 headless_args = ["run", "--auto", "{prompt}"] # --auto avoids approval prompts
 run_args = ["run", "--model", "{provider}/{model}", "--auto", "--format", "json", "{prompt}"]
 resume_args = ["--session", "{session_id}"]   # reopen a session in the TUI
+interactive_model_args = ["mini", "--model", "{provider}/{model}"]  # interactive + model
 session_id_json_key = "sessionID"             # from `run --format json` events
 
 [agents.claude]
@@ -35,6 +39,7 @@ args = []
 prompt_args = ["{prompt}"]
 headless_args = ["-p", "{prompt}"]
 run_args = ["-p", "--model", "{model}", "{prompt}"]
+interactive_model_args = ["--model", "{model}"]
 
 [agents.pi]
 command = "pi"
@@ -47,6 +52,7 @@ prompt_args = ["{prompt}"]
 submit_prompt = true
 headless_args = ["-p", "{prompt}", "--auto-approve"]
 run_args = ["-p", "--provider", "{provider}", "--model", "{model}", "{prompt}", "--auto-approve"]
+interactive_model_args = ["--provider", "{provider}", "--model", "{model}"]
 
 # Daemon defaults. CLI flags take precedence over these.
 [daemon]

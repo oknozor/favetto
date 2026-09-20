@@ -28,6 +28,9 @@ pub mod method {
     pub const TASKS_CANCEL: &str = "tasks.cancel";
     /// Start a catalog task by name.
     pub const TASKS_START: &str = "tasks.start";
+    /// Start a one-shot task from an inline definition (not added to the catalog)
+    /// and open its interactive agent session.
+    pub const TASKS_START_ONESHOT: &str = "tasks.start_oneshot";
     /// List the task catalog.
     pub const CATALOG_LIST: &str = "catalog.list";
     /// Add a task definition to the catalog (does not run it).
@@ -48,6 +51,8 @@ pub mod method {
     pub const AGENTS_ATTACH: &str = "agents.attach";
     /// Terminate a session.
     pub const AGENTS_CLOSE: &str = "agents.close";
+    /// List configured providers and their available models.
+    pub const PROVIDERS_LIST: &str = "providers.list";
     /// List cron schedules.
     pub const SCHEDULES_LIST: &str = "schedules.list";
     /// Create or update a cron schedule.

@@ -10,7 +10,10 @@ use serde_json::Value;
 
 use base64::Engine as _;
 
-use favetto_core::model::{AgentSessionInfo, Event, NotificationRecord, Schedule, Task};
+use favetto_core::model::{
+    AgentCatalogEntry, AgentSessionInfo, Event, NotificationRecord, Schedule, Task,
+};
+use favetto_providers::Provider;
 use favetto_core::rpc::{method, push, Notification};
 
 use super::term::TerminalView;
@@ -67,15 +70,28 @@ pub enum UiAction {
     AgentInput(Vec<u8>),
     /// Start a catalog task by name (runs headlessly through the configured agent).
     StartTask(String),
+    /// Open the one-shot task wizard.
+    OpenWizard,
+    /// The wizard needs the configured provider/model catalog (`providers.list`).
+    WizardLoadProviders,
+    /// The wizard completed: start an inline, interactive one-shot task.
+    WizardStart {
+        agent: String,
+        provider: Option<String>,
+        model: Option<String>,
+        cwd: Option<String>,
+    },
     /// Submit a completed form via an RPC call.
     Submit { method: &'static str, params: Value },
 }
 
-/// The Ctrl+P popup: either the top-level menu or a step-by-step form.
+/// The Ctrl+P popup: either the top-level menu, a step-by-step form, or the
+/// one-shot wizard.
 pub enum Popup {
     None,
     Menu { selected: usize },
     Form(Form),
+    Wizard(Wizard),
 }
 
 pub struct Form {
@@ -95,6 +111,42 @@ pub enum FormKind {
     AddTask,
     CreateSchedule,
     CreateNotification,
+}
+
+/// A step in the one-shot task wizard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WizardStep {
+    Agent,
+    Provider,
+    Model,
+    Dir,
+}
+
+impl WizardStep {
+    pub fn title(self) -> &'static str {
+        match self {
+            WizardStep::Agent => "One-shot task · 1/4 — select agent",
+            WizardStep::Provider => "One-shot task · 2/4 — select provider",
+            WizardStep::Model => "One-shot task · 3/4 — select model",
+            WizardStep::Dir => "One-shot task · 4/4 — working directory",
+        }
+    }
+}
+
+/// State for the one-shot task wizard (agent → provider → model → directory).
+pub struct Wizard {
+    pub step: WizardStep,
+    pub selected: usize,
+    /// `(label, value)` pairs for the current step.
+    pub choices: Vec<(String, String)>,
+    /// The configured provider/model catalog (fetched once).
+    pub providers: Vec<Provider>,
+    pub agent: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub dir: String,
+    pub loading: bool,
+    pub error: Option<String>,
 }
 
 /// A task-definition entry in the catalog (as returned by `catalog.list`).
@@ -130,7 +182,8 @@ impl CatalogEntry {
 }
 
 /// The Ctrl+P menu entries, in order.
-pub const MENU_OPTIONS: [&str; 3] = [
+pub const MENU_OPTIONS: [&str; 4] = [
+    "New one-shot task",
     "Add task to catalog",
     "Create schedule",
     "Create notification hook",
@@ -192,6 +245,10 @@ pub struct App {
     pub schedules: Vec<Schedule>,
     pub notifications: Vec<NotificationRecord>,
 
+    /// The daemon's working directory (from `system.ping`), used to prefill the
+    /// one-shot wizard's directory step.
+    pub daemon_cwd: Option<String>,
+
     // Ctrl+P popup.
     pub popup: Popup,
 }
@@ -223,6 +280,7 @@ impl App {
             throbber_state: throbber_widgets_tui::ThrobberState::default(),
             schedules: Vec::new(),
             notifications: Vec::new(),
+            daemon_cwd: None,
             popup: Popup::None,
         }
     }
@@ -315,6 +373,7 @@ impl App {
         match &self.popup {
             Popup::Form(_) => return self.handle_form_key(key.code),
             Popup::Menu { .. } => return self.handle_menu_key(key.code),
+            Popup::Wizard(_) => return self.handle_wizard_key(key),
             Popup::None => {}
         }
 
@@ -422,17 +481,21 @@ impl App {
                     Popup::Menu { selected } => selected,
                     _ => 0,
                 };
-                self.open_form(selected);
-                UiAction::None
+                self.open_form(selected)
             }
             _ => UiAction::None,
         }
     }
 
-    fn open_form(&mut self, selected: usize) {
+    fn open_form(&mut self, selected: usize) -> UiAction {
+        // The first entry opens the one-shot wizard (which needs an async fetch of
+        // the agent list first).
+        if selected == 0 {
+            return UiAction::OpenWizard;
+        }
         let kind = match selected {
-            0 => FormKind::AddTask,
-            1 => FormKind::CreateSchedule,
+            1 => FormKind::AddTask,
+            2 => FormKind::CreateSchedule,
             _ => FormKind::CreateNotification,
         };
         let (title, fields) = match kind {
@@ -466,6 +529,147 @@ impl App {
             values: Vec::new(),
             input: String::new(),
         });
+        UiAction::None
+    }
+
+    /// Open the one-shot wizard with the configured agents.
+    pub fn open_wizard(&mut self, agents: Vec<AgentCatalogEntry>) {
+        let choices: Vec<(String, String)> = agents
+            .iter()
+            .filter(|a| !a.command.trim().is_empty())
+            .map(|a| (a.name.clone(), a.name.clone()))
+            .collect();
+        self.popup = Popup::Wizard(Wizard {
+            step: WizardStep::Agent,
+            selected: 0,
+            choices,
+            providers: Vec::new(),
+            agent: None,
+            provider: None,
+            model: None,
+            dir: self.daemon_cwd.clone().unwrap_or_default(),
+            loading: false,
+            error: None,
+        });
+    }
+
+    /// Populate the wizard with the configured providers and advance to the
+    /// provider step.
+    pub fn wizard_set_providers(&mut self, providers: Vec<Provider>) {
+        let Popup::Wizard(w) = &mut self.popup else {
+            return;
+        };
+        w.choices = providers
+            .iter()
+            .map(|p| (p.name.clone(), p.id.clone()))
+            .collect();
+        w.providers = providers;
+        w.step = WizardStep::Provider;
+        w.selected = 0;
+        w.loading = false;
+        w.error = None;
+    }
+
+    /// Surface an error in the wizard (e.g. the model list could not be fetched).
+    pub fn wizard_error(&mut self, message: String) {
+        if let Popup::Wizard(w) = &mut self.popup {
+            w.loading = false;
+            w.error = Some(message);
+        }
+    }
+
+    fn handle_wizard_key(&mut self, key: KeyEvent) -> UiAction {
+        // Take the wizard out so the borrow checker lets us mutate `self.popup`.
+        let mut popup = std::mem::replace(&mut self.popup, Popup::None);
+        let Popup::Wizard(w) = &mut popup else {
+            self.popup = popup;
+            return UiAction::None;
+        };
+
+        if key.code == KeyCode::Esc {
+            return UiAction::None; // popup already cleared
+        }
+
+        let action = match key.code {
+            KeyCode::Up => {
+                w.selected = w.selected.saturating_sub(1);
+                UiAction::None
+            }
+            KeyCode::Down => {
+                if !w.choices.is_empty() {
+                    w.selected = (w.selected + 1).min(w.choices.len() - 1);
+                }
+                UiAction::None
+            }
+            KeyCode::Backspace if w.step == WizardStep::Dir => {
+                w.dir.pop();
+                UiAction::None
+            }
+            KeyCode::Char(c) if w.step == WizardStep::Dir => {
+                w.dir.push(c);
+                UiAction::None
+            }
+            KeyCode::Enter if !w.loading => match w.step {
+                WizardStep::Agent => match w.choices.get(w.selected).cloned() {
+                    Some((_, name)) => {
+                        w.agent = Some(name.clone());
+                        w.loading = true;
+                        w.error = None;
+                        w.choices.clear();
+                        UiAction::WizardLoadProviders
+                    }
+                    None => UiAction::None,
+                },
+                WizardStep::Provider => match w.choices.get(w.selected).cloned() {
+                    Some((_, provider_id)) => {
+                        w.step = WizardStep::Model;
+                        w.selected = 0;
+                        w.choices = w
+                            .providers
+                            .iter()
+                            .find(|p| p.id == provider_id)
+                            .map(|p| {
+                                p.models
+                                    .iter()
+                                    .map(|m| (m.name.clone(), m.id.clone()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        w.provider = Some(provider_id);
+                        UiAction::None
+                    }
+                    None => UiAction::None,
+                },
+                WizardStep::Model => match w.choices.get(w.selected).cloned() {
+                    Some((_, model_id)) => {
+                        w.model = Some(model_id);
+                        w.step = WizardStep::Dir;
+                        UiAction::None
+                    }
+                    None => UiAction::None,
+                },
+                WizardStep::Dir => {
+                    let cwd = if w.dir.trim().is_empty() {
+                        None
+                    } else {
+                        Some(w.dir.trim().to_string())
+                    };
+                    UiAction::WizardStart {
+                        agent: w.agent.clone().unwrap_or_default(),
+                        provider: w.provider.clone(),
+                        model: w.model.clone(),
+                        cwd,
+                    }
+                }
+            },
+            _ => UiAction::None,
+        };
+
+        // A completed wizard closes; otherwise keep it open.
+        if !matches!(action, UiAction::WizardStart { .. }) {
+            self.popup = popup;
+        }
+        action
     }
 
     fn handle_form_key(&mut self, code: KeyCode) -> UiAction {
@@ -929,5 +1133,103 @@ mod tests {
             client.screen().mouse_protocol_encoding(),
             vt100::MouseProtocolEncoding::Sgr
         );
+    }
+
+    fn agent_entry(name: &str) -> AgentCatalogEntry {
+        AgentCatalogEntry {
+            name: name.to_string(),
+            command: "opencode".to_string(),
+            default: false,
+            sessions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn wizard_walks_agent_provider_model_dir() {
+        let mut app = App::new();
+        app.daemon_cwd = Some("/code/che".to_string());
+        app.open_wizard(vec![agent_entry("opencode")]);
+
+        // Agent step -> request the provider catalog.
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())),
+            UiAction::WizardLoadProviders
+        ));
+
+        // Catalog arrives; the provider step lists display names.
+        app.wizard_set_providers(vec![
+            Provider {
+                id: "deepseek".to_string(),
+                name: "DeepSeek".to_string(),
+                models: vec![
+                    favetto_providers::Model {
+                        id: "deepseek-v4-flash".to_string(),
+                        name: "DeepSeek V4 Flash".to_string(),
+                    },
+                    favetto_providers::Model {
+                        id: "deepseek-v4-pro".to_string(),
+                        name: "DeepSeek V4 Pro".to_string(),
+                    },
+                ],
+            },
+            Provider {
+                id: "mistral".to_string(),
+                name: "Mistral".to_string(),
+                models: vec![favetto_providers::Model {
+                    id: "mistral-large".to_string(),
+                    name: "Mistral Large".to_string(),
+                }],
+            },
+        ]);
+        {
+            let Popup::Wizard(w) = &app.popup else { panic!("wizard") };
+            assert_eq!(w.step, WizardStep::Provider);
+            assert_eq!(
+                w.choices,
+                vec![
+                    ("DeepSeek".to_string(), "deepseek".to_string()),
+                    ("Mistral".to_string(), "mistral".to_string()),
+                ]
+            );
+        }
+
+        // Pick DeepSeek -> model step lists its models by display name.
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
+        {
+            let Popup::Wizard(w) = &app.popup else { panic!("wizard") };
+            assert_eq!(w.step, WizardStep::Model);
+            assert_eq!(
+                w.choices[0],
+                (
+                    "DeepSeek V4 Flash".to_string(),
+                    "deepseek-v4-flash".to_string()
+                )
+            );
+        }
+
+        // Pick the first model -> directory step.
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
+        {
+            let Popup::Wizard(w) = &app.popup else { panic!("wizard") };
+            assert_eq!(w.step, WizardStep::Dir);
+            assert_eq!(w.model.as_deref(), Some("deepseek-v4-flash"));
+            assert_eq!(w.dir, "/code/che");
+        }
+
+        match app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())) {
+            UiAction::WizardStart {
+                agent,
+                provider,
+                model,
+                cwd,
+            } => {
+                assert_eq!(agent, "opencode");
+                assert_eq!(provider.as_deref(), Some("deepseek"));
+                assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
+                assert_eq!(cwd.as_deref(), Some("/code/che"));
+            }
+            _ => panic!("expected WizardStart"),
+        }
+        assert!(matches!(app.popup, Popup::None));
     }
 }

@@ -40,6 +40,8 @@ pub struct State {
     pub pair: PairStore,
     /// Live hook list (mutable so the TUI can add notification hooks).
     pub hook_store: Arc<RwLock<Vec<Hook>>>,
+    /// Cached provider/model catalog (fetched lazily from the provider API).
+    pub providers_cache: tokio::sync::Mutex<Option<Vec<favetto_providers::Provider>>>,
 }
 
 impl State {
@@ -70,6 +72,7 @@ impl State {
             scheduler,
             pair: PairStore::new(),
             hook_store,
+            providers_cache: tokio::sync::Mutex::new(None),
         }
     }
 
