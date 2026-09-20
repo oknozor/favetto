@@ -7,7 +7,7 @@
 //! execute catalog tasks.
 //!
 //! The daemon owns emulation and streams **self-contained full-screen frames**
-//! (`vt100`'s `contents_formatted`) rather than raw PTY bytes. Frames begin with
+//! (`vt100`'s `state_formatted`) rather than raw PTY bytes. Frames begin with
 //! a clear-screen, so a dropped or duplicated frame cannot corrupt the client —
 //! the next one repairs it. The daemon also answers terminal queries itself.
 //!
@@ -417,7 +417,7 @@ impl AgentManager {
                             let (frame, replies) = {
                                 let mut p = parser.lock().unwrap();
                                 p.process(bytes);
-                                (p.screen().contents_formatted(), terminal_replies(p.screen(), bytes))
+                                (p.screen().state_formatted(), terminal_replies(p.screen(), bytes))
                             };
                             ticks.fetch_add(1, Ordering::SeqCst);
                             if !replies.is_empty() {
@@ -482,7 +482,7 @@ impl AgentManager {
             .lock()
             .unwrap()
             .screen()
-            .contents_formatted();
+            .state_formatted();
         Ok((session.info(), frame))
     }
 

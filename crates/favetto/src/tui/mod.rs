@@ -236,17 +236,7 @@ async fn run_session(
                                 open_agent(client, app, task_id, true).await;
                             }
                             UiAction::AgentInput(bytes) => {
-                                let Some(sid) = app.agent_session_id.clone() else { continue };
-                                let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                                if let Err(e) = client
-                                    .request(
-                                        method::AGENTS_INPUT,
-                                        serde_json::json!({ "session_id": sid, "data": data }),
-                                    )
-                                    .await
-                                {
-                                    app.logs.push_back(format!("agent.input failed: {e}"));
-                                }
+                                send_agent_input(client, app, &bytes).await;
                             }
                             UiAction::StartTask(name) => {
                                 match client.request(method::TASKS_START, serde_json::json!({ "name": name })).await {
@@ -276,7 +266,9 @@ async fn run_session(
                         }
                     }
                     Some(CEvent::Mouse(m)) => {
-                        app.handle_mouse(m);
+                        if let UiAction::AgentInput(bytes) = app.handle_mouse(m) {
+                            send_agent_input(client, app, &bytes).await;
+                        }
                     }
                     Some(_) => {}
                     None => return SessionOutcome::Quit,
@@ -364,6 +356,23 @@ async fn open_agent(client: &Client, app: &mut App, task_id: String, force_new: 
             None => app.logs.push_back(format!("agents.start error: {:?}", resp.error)),
         },
         Err(e) => app.logs.push_back(format!("agents.start failed: {e}")),
+    }
+}
+
+/// Forward raw bytes to the active agent session's PTY.
+async fn send_agent_input(client: &Client, app: &mut App, bytes: &[u8]) {
+    let Some(sid) = app.agent_session_id.clone() else {
+        return;
+    };
+    let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+    if let Err(e) = client
+        .request(
+            method::AGENTS_INPUT,
+            serde_json::json!({ "session_id": sid, "data": data }),
+        )
+        .await
+    {
+        app.logs.push_back(format!("agent.input failed: {e}"));
     }
 }
 

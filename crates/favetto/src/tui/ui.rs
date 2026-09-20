@@ -333,6 +333,9 @@ fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = Block::default().borders(Borders::ALL);
     let inner_area = inner.inner(area);
+    // Remember the terminal's screen rectangle so mouse events can be translated
+    // into the agent's coordinate space.
+    app.agent_area = Some(inner_area);
 
     // Keep the emulator (and via `agent_resize`, the daemon-side PTY) in sync with
     // the panel size.
@@ -521,16 +524,38 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         ConnState::Disconnected => ("disconnected", Color::Red),
     };
 
+    // Keyboard focus: the embedded agent only owns the keyboard while its tab is
+    // open and capture is on; otherwise favetto does.
+    let agent_focused = app.tab == Tab::Agent && app.agent_capture;
+    let (focus_txt, focus_color) = if agent_focused {
+        ("agent", Color::Magenta)
+    } else {
+        ("favetto", Color::Cyan)
+    };
+
     let left = format!(" {state_txt} · {}", app.conn_detail);
-    let right = format!(
-        "tasks: {}  events: {}  [↑↓] select  [Enter] agent  [Tab] switch  [q] quit",
-        app.tasks.len(),
-        app.events.len()
-    );
+    let hint = if app.tab == Tab::Agent {
+        if agent_focused {
+            "[Ctrl+Y] favetto keys"
+        } else {
+            "[Ctrl+Y] agent keys  [Ctrl+Q] leave  [Ctrl+N] new"
+        }
+    } else {
+        "[↑↓] select  [Enter] agent  [Tab] switch  [q] quit"
+    };
+    let right = format!("tasks: {}  events: {}  {hint}", app.tasks.len(), app.events.len());
 
     let line = Line::from(vec![
         Span::styled(left, Style::default().fg(color)),
-        Span::raw(" "),
+        Span::raw("  "),
+        Span::styled(
+            format!(" {focus_txt} "),
+            Style::default()
+                .fg(Color::Black)
+                .bg(focus_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
         Span::raw(right),
     ]);
     frame.render_widget(Paragraph::new(line), area);

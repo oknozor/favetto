@@ -206,6 +206,19 @@ to fit. **Ctrl+Q** detaches without stopping the session (it keeps running on th
 daemon). Common terminal queries (cursor position, device attributes, colours,
 mode reports) are answered by the daemon on the PTY.
 
+**Keyboard focus.** When the Agent panel opens it captures the keyboard by default,
+so the embedded agent receives every keystroke (including ones favetto would
+otherwise use). Press **Ctrl+Y** to toggle focus between the agent and favetto; the
+active owner is shown in the bottom status bar (`focus: agent` / `focus: favetto`).
+With favetto focused, **Ctrl+Q** leaves the panel and **Ctrl+N** starts a new
+session. Ctrl+Y is chosen not to clash with opencode's default keybinds.
+
+**Mouse.** Clicks are delivered to both sides without conflict: favetto handles
+clicks on its own regions (the tab bar) and switches tabs, while clicks in the
+terminal area are forwarded to the agent as mouse reports whenever the agent has
+enabled mouse reporting. This requires the daemon to stream `state_formatted`
+frames, which carry the agent's input modes alongside the screen contents.
+
 `prompt_args` seeds the prompt (`{prompt}` is substituted); some agents only
 pre-fill their input, so set `submit_prompt = true` to send Enter once the UI has
 settled. With no `prompt_args`, the prompt is written to the agent's stdin instead.

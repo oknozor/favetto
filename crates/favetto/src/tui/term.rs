@@ -1,7 +1,7 @@
 //! Embedded terminal view backing the Agent tab.
 //!
 //! The daemon owns terminal emulation and streams self-contained full-screen
-//! frames (`vt100`'s `contents_formatted`). The TUI parses each frame into a grid
+//! frames (`vt100`'s `state_formatted`). The TUI parses each frame into a grid
 //! and renders it as ordinary ratatui cells — the local terminal is never
 //! involved, and a dropped frame can't corrupt the display because the next frame
 //! clears and redraws.

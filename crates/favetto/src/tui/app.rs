@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use ratatui::layout::Rect;
 use serde_json::Value;
 
 use base64::Engine as _;
@@ -172,6 +173,12 @@ pub struct App {
     pub agent_name: Option<String>,
     pub agent_running: bool,
     pub agent_status: String,
+    /// When true, keystrokes are forwarded to the embedded agent; when false they
+    /// are handled by the favetto TUI. Toggled with Ctrl+Y.
+    pub agent_capture: bool,
+    /// The embedded terminal's inner screen rectangle (set during draw), used to
+    /// translate mouse events into the agent's coordinate space.
+    pub agent_area: Option<Rect>,
     /// Set when the terminal was resized during draw; the session loop forwards
     /// the new size to the daemon and clears it.
     pub agent_resize: Option<(u16, u16)>,
@@ -208,6 +215,8 @@ impl App {
             agent_name: None,
             agent_running: false,
             agent_status: String::new(),
+            agent_capture: false,
+            agent_area: None,
             agent_resize: None,
             term: TerminalView::default(),
             click_regions: Vec::new(),
@@ -251,6 +260,8 @@ impl App {
         self.agent_name = Some(session.agent);
         self.agent_running = session.running;
         self.agent_status.clear();
+        // The embedded agent owns the keyboard as soon as the panel is opened.
+        self.agent_capture = true;
         self.tab = Tab::Agent;
     }
 
@@ -272,46 +283,85 @@ impl App {
         }
     }
 
-    /// Route a keypress. Ctrl+P toggles the menu; while a popup is open, keys go to
-    /// it; the Agent tab forwards everything else to the agent PTY. Returns the
-    /// async action to perform.
+    /// Route a keypress.
+    ///
+    /// Ctrl+Y toggles keyboard focus between the embedded agent and favetto. With
+    /// the agent focused (the default when the panel is opened), every other key is
+    /// forwarded to the agent PTY. With favetto focused, an open popup owns the
+    /// keyboard, Ctrl+P toggles the menu, and the Agent tab handles its own keys.
     pub fn handle_key(&mut self, key: KeyEvent) -> UiAction {
-        if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.popup = match self.popup {
-                Popup::None => Popup::Menu { selected: 0 },
-                Popup::Menu { .. } | Popup::Form(_) => Popup::None,
-            };
+        if is_focus_toggle(&key) {
+            self.agent_capture = !self.agent_capture;
             return UiAction::None;
         }
 
-        if matches!(self.popup, Popup::None) && self.tab == Tab::Agent {
-            return self.handle_agent_key(&key);
+        // Ctrl+P closes an open popup, or opens the menu under favetto focus. While
+        // the agent captures keys it is forwarded to the agent instead.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
+        {
+            if matches!(self.popup, Popup::None) {
+                if self.tab == Tab::Agent && self.agent_capture {
+                    return self.forward_agent_key(&key);
+                }
+                self.popup = Popup::Menu { selected: 0 };
+            } else {
+                self.popup = Popup::None;
+            }
+            return UiAction::None;
         }
 
+        // A popup owns the keyboard while it is open.
         match &self.popup {
             Popup::Form(_) => return self.handle_form_key(key.code),
             Popup::Menu { .. } => return self.handle_menu_key(key.code),
             Popup::None => {}
         }
 
+        // Agent keyboard focus: everything else is forwarded to the PTY.
+        if self.tab == Tab::Agent && self.agent_capture {
+            return self.forward_agent_key(&key);
+        }
+
+        if self.tab == Tab::Agent {
+            return self.handle_agent_favetto_key(&key);
+        }
+
         self.handle_normal_key(&key)
     }
 
-    /// Keys while the Agent tab is focused: Ctrl+Q detaches (leaving the session
-    /// running on the daemon); everything else is encoded and forwarded to the PTY.
-    fn handle_agent_key(&mut self, key: &KeyEvent) -> UiAction {
+    /// Keys for the Agent tab while favetto (not the agent) has the keyboard.
+    fn handle_agent_favetto_key(&mut self, key: &KeyEvent) -> UiAction {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if ctrl && matches!(key.code, KeyCode::Char('q')) {
+        if ctrl && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q')) {
             self.tab = Tab::Tasks;
             return UiAction::None;
         }
-        if ctrl && matches!(key.code, KeyCode::Char('n')) {
+        if ctrl && matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N')) {
             if let Some(task_id) = self.agent_task_id.clone() {
                 return UiAction::NewAgent(task_id);
             }
             return UiAction::None;
         }
+        match key.code {
+            KeyCode::Tab | KeyCode::Right => {
+                self.next_tab();
+                UiAction::None
+            }
+            KeyCode::Left | KeyCode::BackTab => {
+                self.prev_tab();
+                UiAction::None
+            }
+            KeyCode::Esc => {
+                self.tab = Tab::Tasks;
+                UiAction::None
+            }
+            _ => UiAction::None,
+        }
+    }
 
+    /// Encode a keypress and forward it to the active agent session.
+    fn forward_agent_key(&self, key: &KeyEvent) -> UiAction {
         let bytes = encode_key(key);
         if bytes.is_empty() {
             UiAction::None
@@ -320,7 +370,11 @@ impl App {
         }
     }
 
-    /// Handle mouse input: click the tab bar.
+    /// Handle mouse input.
+    ///
+    /// Favetto's own regions (the tab bar) are handled first so a click switches
+    /// tabs. Any other click on the Agent tab is forwarded to the embedded agent as
+    /// a terminal mouse report when the agent has enabled mouse reporting.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> UiAction {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             for region in &self.click_regions {
@@ -330,7 +384,15 @@ impl App {
                 {
                     let ClickAction::Tab(tab) = region.action;
                     self.tab = tab;
-                    break;
+                    return UiAction::None;
+                }
+            }
+        }
+
+        if self.tab == Tab::Agent && self.agent_running && self.agent_session_id.is_some() {
+            if let Some(area) = self.agent_area {
+                if let Some(bytes) = encode_mouse(mouse, area, self.term.screen()) {
+                    return UiAction::AgentInput(bytes);
                 }
             }
         }
@@ -596,6 +658,108 @@ impl App {
     }
 }
 
+/// Ctrl+Y: toggle keyboard focus between the embedded agent and favetto. Chosen
+/// because it is not bound by common agent TUIs (opencode's defaults do not use it).
+fn is_focus_toggle(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'))
+}
+
+/// The kind of mouse report to emit.
+#[derive(Clone, Copy)]
+enum MouseKind {
+    Press,
+    Release,
+    Motion,
+}
+
+/// Encode a mouse event as a terminal mouse report for the embedded agent.
+///
+/// Returns `None` when the agent has not enabled mouse reporting, when the event
+/// falls outside the terminal area, or when it is not relevant to the active mode.
+fn encode_mouse(mouse: MouseEvent, area: Rect, screen: &vt100::Screen) -> Option<Vec<u8>> {
+    use vt100::{MouseProtocolEncoding, MouseProtocolMode};
+
+    let mode = screen.mouse_protocol_mode();
+    if mode == MouseProtocolMode::None {
+        return None;
+    }
+
+    // Translate absolute screen coordinates into the agent's 1-based grid.
+    let col = mouse.column.checked_sub(area.x)? + 1;
+    let row = mouse.row.checked_sub(area.y)? + 1;
+    if col > area.width || row > area.height {
+        return None;
+    }
+
+    let (button, kind) = match mouse.kind {
+        MouseEventKind::Down(b) => (button_code(b), MouseKind::Press),
+        MouseEventKind::Up(_) => (0, MouseKind::Release),
+        MouseEventKind::Drag(b) => (button_code(b), MouseKind::Motion),
+        MouseEventKind::Moved => (0, MouseKind::Motion),
+        MouseEventKind::ScrollUp => (64, MouseKind::Press),
+        MouseEventKind::ScrollDown => (65, MouseKind::Press),
+        MouseEventKind::ScrollLeft => (66, MouseKind::Press),
+        MouseEventKind::ScrollRight => (67, MouseKind::Press),
+    };
+
+    // Respect the enabled mode: X10 reports presses only; motion needs a motion mode.
+    match kind {
+        MouseKind::Release if mode == MouseProtocolMode::Press => return None,
+        MouseKind::Motion
+            if !matches!(
+                mode,
+                MouseProtocolMode::ButtonMotion | MouseProtocolMode::AnyMotion
+            ) =>
+        {
+            return None
+        }
+        _ => {}
+    }
+
+    let mut code = button;
+    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+        code |= 4;
+    }
+    if mouse.modifiers.contains(KeyModifiers::ALT) {
+        code |= 8;
+    }
+    if mouse.modifiers.contains(KeyModifiers::CONTROL) {
+        code |= 16;
+    }
+    if matches!(kind, MouseKind::Motion) {
+        code |= 32;
+    }
+
+    if screen.mouse_protocol_encoding() == MouseProtocolEncoding::Sgr {
+        let final_byte = if matches!(kind, MouseKind::Release) {
+            'm'
+        } else {
+            'M'
+        };
+        Some(format!("\x1b[<{code};{col};{row}{final_byte}").into_bytes())
+    } else {
+        // Default / UTF-8 single-byte encoding; releases report button 3.
+        let code = if matches!(kind, MouseKind::Release) {
+            3
+        } else {
+            code
+        };
+        let cb = (32u16 + code).min(255) as u8;
+        let cx = (32u16 + col).min(255) as u8;
+        let cy = (32u16 + row).min(255) as u8;
+        Some(vec![0x1b, b'[', b'M', cb, cx, cy])
+    }
+}
+
+fn button_code(button: MouseButton) -> u16 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
+}
+
 /// Encode a keypress as the byte sequence a terminal would emit for it.
 fn encode_key(key: &KeyEvent) -> Vec<u8> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -658,4 +822,112 @@ fn encode_key(key: &KeyEvent) -> Vec<u8> {
         _ => {}
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn agent_capture_forwards_keys_favetto_would_otherwise_use() {
+        let mut app = App::new();
+        app.tab = Tab::Agent;
+        app.agent_capture = true;
+        // Ctrl+P is normally the favetto menu, but the agent owns the keyboard.
+        match app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL)) {
+            UiAction::AgentInput(bytes) => assert_eq!(bytes, vec![0x10]),
+            _ => panic!("expected AgentInput"),
+        }
+    }
+
+    #[test]
+    fn focus_toggle_flips_and_is_never_forwarded() {
+        let mut app = App::new();
+        app.tab = Tab::Agent;
+        app.agent_capture = true;
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('y'), KeyModifiers::CONTROL)),
+            UiAction::None
+        ));
+        assert!(!app.agent_capture);
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('y'), KeyModifiers::CONTROL)),
+            UiAction::None
+        ));
+        assert!(app.agent_capture);
+    }
+
+    #[test]
+    fn favetto_focus_handles_agent_tab_shortcuts() {
+        let mut app = App::new();
+        app.tab = Tab::Agent;
+        app.agent_capture = false;
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            UiAction::None
+        ));
+        assert_eq!(app.tab, Tab::Tasks);
+    }
+
+    #[test]
+    fn encode_mouse_sgr_reports_left_press() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(b"\x1b[?1000h\x1b[?1006h");
+        let area = Rect {
+            x: 2,
+            y: 1,
+            width: 80,
+            height: 24,
+        };
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 7,
+            row: 4,
+            modifiers: KeyModifiers::empty(),
+        };
+        let bytes = encode_mouse(ev, area, parser.screen()).unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "\x1b[<0;6;4M");
+    }
+
+    #[test]
+    fn encode_mouse_is_ignored_when_agent_disabled_reporting() {
+        let parser = vt100::Parser::new(24, 80, 0);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(encode_mouse(ev, area, parser.screen()).is_none());
+    }
+
+    #[test]
+    fn mouse_mode_survives_daemon_formatted_frames() {
+        // The daemon streams `state_formatted` frames (screen contents plus input
+        // modes); the client parses them, so the agent's enabled mouse mode must be
+        // preserved across the wire.
+        let mut daemon = vt100::Parser::new(24, 80, 0);
+        daemon.process(b"\x1b[?1000h\x1b[?1006h");
+        let frame = daemon.screen().state_formatted();
+        let mut client = vt100::Parser::new(24, 80, 0);
+        client.process(&frame);
+        assert_ne!(
+            client.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None
+        );
+        assert_eq!(
+            client.screen().mouse_protocol_encoding(),
+            vt100::MouseProtocolEncoding::Sgr
+        );
+    }
 }
