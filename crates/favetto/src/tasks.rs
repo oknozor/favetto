@@ -2,7 +2,10 @@
 //! header.
 //!
 //! ```md
-//! model = "deepseek:deepseek-v4-flash"   # required
+//! agent = "opencode"                     # optional — external agent
+//! provider = "jev"                       # optional — model provider
+//! model = "1.13"                         # optional — model id (uses run_args)
+//! cwd = "/path/to/repo"                  # optional — working directory
 //! schedule = "0 0 * * * *"               # optional — makes this a recurring task
 //! needs = "another_task:finished"        # optional — start when `another_task` ends
 //! ---
@@ -21,8 +24,15 @@ use serde::Deserialize;
 pub struct TaskDef {
     /// File name without the `.md` extension.
     pub name: String,
-    /// Provider/model string, e.g. `"deepseek:deepseek-v4-flash"`.
-    pub model: String,
+    /// Optional external agent name from `[agents.*]`. Overrides the global default.
+    pub agent: Option<String>,
+    /// Optional model provider (e.g. `"jev"`), substituted as `{provider}`.
+    pub provider: Option<String>,
+    /// Optional model id (e.g. `"1.13"`), substituted as `{model}`. When set, the
+    /// agent's `run_args` template is used; otherwise `headless_args`.
+    pub model: Option<String>,
+    /// Optional working directory the agent runs in (e.g. a repo checkout).
+    pub cwd: Option<String>,
     /// Optional cron expression; makes this a recurring task.
     pub schedule: Option<String>,
     /// Optional dependency, e.g. `"another_task:finished"`.
@@ -33,7 +43,14 @@ pub struct TaskDef {
 
 #[derive(Debug, Deserialize)]
 struct Header {
-    model: String,
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
     #[serde(default)]
     schedule: Option<String>,
     #[serde(default)]
@@ -61,7 +78,10 @@ pub fn parse_task_md(name: &str, content: &str) -> anyhow::Result<TaskDef> {
 
     Ok(TaskDef {
         name: name.to_string(),
+        agent: header.agent,
+        provider: header.provider,
         model: header.model,
+        cwd: header.cwd,
         schedule: header.schedule,
         needs: header.needs,
         prompt: prompt.trim().to_string(),
@@ -70,12 +90,24 @@ pub fn parse_task_md(name: &str, content: &str) -> anyhow::Result<TaskDef> {
 
 /// Serialize a task definition back to Markdown.
 pub fn to_markdown(def: &TaskDef) -> String {
-    let mut out = format!("model = {:?}\n", def.model);
+    let mut out = String::new();
+    if let Some(a) = &def.agent {
+        out.push_str(&format!("agent = {a:?}\n"));
+    }
+    if let Some(p) = &def.provider {
+        out.push_str(&format!("provider = {p:?}\n"));
+    }
+    if let Some(m) = &def.model {
+        out.push_str(&format!("model = {m:?}\n"));
+    }
+    if let Some(c) = &def.cwd {
+        out.push_str(&format!("cwd = {c:?}\n"));
+    }
     if let Some(s) = &def.schedule {
-        out.push_str(&format!("schedule = {:?}\n", s));
+        out.push_str(&format!("schedule = {s:?}\n"));
     }
     if let Some(n) = &def.needs {
-        out.push_str(&format!("needs = {:?}\n", n));
+        out.push_str(&format!("needs = {n:?}\n"));
     }
     out.push_str("---\n\n");
     out.push_str(&def.prompt);
@@ -116,4 +148,44 @@ pub fn write_task_md(dir: &Path, def: &TaskDef) -> anyhow::Result<()> {
     let path = dir.join(format!("{}.md", def.name));
     std::fs::write(path, to_markdown(def))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_agent_and_cwd_header() {
+        let def = parse_task_md(
+            "che",
+            "agent = \"opencode\"\nprovider = \"jev\"\nmodel = \"1.13\"\ncwd = \"/code/che\"\n---\n\nDo the thing.\n",
+        )
+        .unwrap();
+        assert_eq!(def.agent.as_deref(), Some("opencode"));
+        assert_eq!(def.provider.as_deref(), Some("jev"));
+        assert_eq!(def.model.as_deref(), Some("1.13"));
+        assert_eq!(def.cwd.as_deref(), Some("/code/che"));
+        assert_eq!(def.prompt, "Do the thing.");
+    }
+
+    #[test]
+    fn round_trips_through_markdown() {
+        let def = TaskDef {
+            name: "t".to_string(),
+            agent: Some("vibe".to_string()),
+            provider: Some("jev".to_string()),
+            model: Some("1.13".to_string()),
+            cwd: Some("/tmp/repo".to_string()),
+            schedule: None,
+            needs: None,
+            prompt: "hello".to_string(),
+        };
+        let md = to_markdown(&def);
+        let parsed = parse_task_md("t", &md).unwrap();
+        assert_eq!(parsed.agent.as_deref(), Some("vibe"));
+        assert_eq!(parsed.provider.as_deref(), Some("jev"));
+        assert_eq!(parsed.model.as_deref(), Some("1.13"));
+        assert_eq!(parsed.cwd.as_deref(), Some("/tmp/repo"));
+        assert_eq!(parsed.prompt, "hello");
+    }
 }

@@ -1,8 +1,5 @@
 //! Wire client: connects over a Unix socket or a WebSocket and exposes
 //! [`request`](Client::request) plus a push broadcast subscribers can listen to.
-//!
-//! Shared by the TUI and `mcp serve` — both are just different consumers of the same
-//! daemon wire protocol.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

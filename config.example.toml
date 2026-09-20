@@ -4,57 +4,49 @@
 # --config <path> / $FAVETTO_CONFIG). Every section is optional; favetto falls
 # back to built-in defaults for anything you omit.
 
-# Default model for the interactive chat and the runtime. `"echo"` is a local,
-# keyless backend for offline development; `"<provider>:<model>"` uses an
-# OpenAI-compatible provider declared under [providers].
+# The default external agent. `default` names an entry from [agents] below and is
+# used for catalog tasks and new embedded-agent sessions unless the task names its
+# own agent.
 [agent]
-model = "deepseek:deepseek-v4-flash"
-# model = "echo"
-# model = "openai:gpt-4o"
+default = "opencode"
 
-# LLM providers. Any `kind = "openai"` provider can back the runtime — DeepSeek
-# exposes an OpenAI-compatible API, so it reuses the same backend with a different
-# base URL.
-[providers.deepseek]
-kind = "openai"
-# Provide the key directly, or reference an environment variable.
-# api_key = "sk-..."
-api_key_env = "DEEPSEEK_API_KEY"
-model = "deepseek-v4-flash"
-base_url = "https://api.deepseek.com"
+# External coding agents. The daemon launches these in a PTY; the TUI embeds the
+# live terminal in the Agent tab. `args` is the interactive invocation.
+# `headless_args` runs catalog tasks unattended (no model); `run_args` is used
+# instead when the task sets `model`, with `{prompt}`, `{provider}`, and `{model}`
+# substituted so the model flag can sit where the CLI expects it.
+# `resume_args` reopens a previously run session (`{session_id}`).
+# `session_id_json_key` reads the agent's session id from a run's line-delimited
+# JSON output. `prompt_args` seeds an interactive session (otherwise the prompt is
+# written to stdin).
+[agents.opencode]
+command = "opencode"
+args = []
+prompt_args = ["--prompt", "{prompt}"]        # seed an interactive session
+submit_prompt = true                          # press Enter so the prompt is sent
+headless_args = ["run", "--auto", "{prompt}"] # --auto avoids approval prompts
+run_args = ["run", "--model", "{provider}/{model}", "--auto", "--format", "json", "{prompt}"]
+resume_args = ["--session", "{session_id}"]   # reopen a session in the TUI
+session_id_json_key = "sessionID"             # from `run --format json` events
 
-[providers.openai]
-kind = "openai"
-# api_key = "sk-..."
-api_key_env = "OPENAI_API_KEY"
-model = "gpt-4o"
-# base_url = "https://api.openai.com/v1"   # for compatible providers / local proxies
+[agents.claude]
+command = "claude"
+args = []
+prompt_args = ["{prompt}"]
+headless_args = ["-p", "{prompt}"]
+run_args = ["-p", "--model", "{model}", "{prompt}"]
 
-# Global MCP servers. Task prompts can rely on these.
-[mcp.filesystem]
-transport = "stdio"
-command = "mcp-filesystem"
-args = ["--root", "./workdir"]
+[agents.pi]
+command = "pi"
+args = []
 
-# [mcp.linear]
-# transport = "stdio"
-# command = "mcp-linear"
-#
-# [mcp.github]
-# transport = "stdio"
-# command = "mcp-github"
-#
-# [mcp.gmail]
-# transport = "stdio"
-# command = "mcp-gmail"
-#   # Gmail auth/endpoint come from the environment: GMAIL_ACCESS_TOKEN (static)
-#   # or GMAIL_CLIENT_ID + GMAIL_CLIENT_SECRET + GMAIL_REFRESH_TOKEN (OAuth), and
-#   # GMAIL_BASE_URL (default https://gmail.googleapis.com/gmail/v1).
-#
-# Remote MCP servers use the streamable-HTTP transport (arrives in a later milestone):
-# [mcp.remote]
-# transport = "streamable_http"
-# url = "http://localhost:4000/graphql"
+[agents.vibe]
+command = "vibe"
+args = []
+prompt_args = ["{prompt}"]
+submit_prompt = true
+headless_args = ["-p", "{prompt}", "--auto-approve"]
+run_args = ["-p", "--provider", "{provider}", "--model", "{model}", "{prompt}", "--auto-approve"]
 
 # Daemon defaults. CLI flags take precedence over these.
 [daemon]
@@ -62,3 +54,11 @@ listen = "127.0.0.1:7878"
 socket = "/tmp/favetto.sock"
 tasks_dir = "tasks"
 # data_dir = "~/.local/share/favetto"
+
+# Task executor concurrency + isolation.
+[executor]
+parallel = true            # run tasks concurrently (default false = one at a time)
+max_concurrency = 4        # slots when parallel
+worktree = true            # when parallel and in a git repo, give each task its own worktree
+# worktree_dir = "~/.local/share/favetto/worktrees"  # absolute or repo-relative
+keep_worktree = true       # keep worktrees after the task (so branches/changes can be inspected)

@@ -2,6 +2,7 @@
 //! wire protocol whether attached locally (Unix socket) or remotely (WebSocket).
 
 mod app;
+mod term;
 mod ui;
 
 use std::io;
@@ -9,6 +10,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context;
+use base64::Engine as _;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyEventKind};
 use ratatui::crossterm::execute;
@@ -18,7 +20,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use favetto_core::model::{ChatSession, Event, NotificationRecord, Schedule, Task};
+use favetto_core::model::{AgentSessionInfo, Event, NotificationRecord, Schedule, Task};
 use favetto_core::rpc::method;
 
 use crate::cli::TuiArgs;
@@ -151,24 +153,6 @@ async fn sync_initial(client: &Client, app: &mut App) {
         .await;
 
     fetch_catalog(client, app).await;
-
-    // Re-sync the active chat so any messages delivered while disconnected are
-    // recovered from the persisted conversation.
-    if app.chat_session_id.is_some() {
-        if let Ok(resp) = client
-            .request(
-                method::CHAT_OPEN,
-                serde_json::json!({ "task_id": app.chat_task_id }),
-            )
-            .await
-        {
-            if let Some(v) = resp.result {
-                if let Ok(session) = serde_json::from_value::<ChatSession>(v) {
-                    app.resume_chat(session);
-                }
-            }
-        }
-    }
 }
 
 /// Fetch the task catalog.
@@ -221,11 +205,22 @@ async fn run_session(
     let mut push_rx = client.subscribe();
     let mut closed_rx = client.closed();
     let mut ping = tokio::time::interval(Duration::from_secs(5));
-    let (chat_tx, mut chat_rx) = mpsc::unbounded_channel::<anyhow::Result<ChatSession>>();
 
     loop {
         app.throbber_state.calc_next();
         let _ = terminal.draw(|f| ui::draw(f, app));
+
+        // Keep the daemon-side PTY in sync with the panel size.
+        if let (Some(sid), Some((rows, cols))) =
+            (app.agent_session_id.clone(), app.agent_resize.take())
+        {
+            let _ = client
+                .request(
+                    method::AGENTS_RESIZE,
+                    serde_json::json!({ "session_id": sid, "rows": rows, "cols": cols }),
+                )
+                .await;
+        }
 
         tokio::select! {
             biased;
@@ -234,52 +229,24 @@ async fn run_session(
                     Some(CEvent::Key(k)) if k.kind == KeyEventKind::Press => {
                         match app.handle_key(k) {
                             UiAction::Quit => return SessionOutcome::Quit,
-                            UiAction::OpenChat(task_id) => {
-                                match client.request(method::CHAT_OPEN, serde_json::json!({ "task_id": task_id })).await {
-                                    Ok(resp) => {
-                                        if let Some(v) = resp.result {
-                                            match serde_json::from_value::<ChatSession>(v) {
-                                                Ok(session) => app.open_chat(session),
-                                                Err(e) => app.logs.push_back(format!("chat.open: {e}")),
-                                            }
-                                        }
-                                    }
-                                    Err(e) => app.logs.push_back(format!("chat.open failed: {e}")),
-                                }
+                            UiAction::OpenAgent(task_id) => {
+                                open_agent(client, app, task_id, false).await;
                             }
-                            UiAction::SendChat => {
-                                let Some(session_id) = app.chat_session_id.clone() else {
-                                    app.logs.push_back("no chat session".to_string());
-                                    continue;
-                                };
-                                let message = std::mem::take(&mut app.input);
-                                if message.trim().is_empty() {
-                                    continue;
+                            UiAction::NewAgent(task_id) => {
+                                open_agent(client, app, task_id, true).await;
+                            }
+                            UiAction::AgentInput(bytes) => {
+                                let Some(sid) = app.agent_session_id.clone() else { continue };
+                                let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                if let Err(e) = client
+                                    .request(
+                                        method::AGENTS_INPUT,
+                                        serde_json::json!({ "session_id": sid, "data": data }),
+                                    )
+                                    .await
+                                {
+                                    app.logs.push_back(format!("agent.input failed: {e}"));
                                 }
-                                // Stream the turn: spawn the request so the loop keeps
-                                // pumping CHAT_DELTA / CHAT_REASONING pushes meanwhile.
-                                app.thinking = true;
-                                app.streaming = None;
-                                app.streaming_reasoning.clear();
-                                app.chat_scroll = 0;
-
-                                let client = client.clone();
-                                let tx = chat_tx.clone();
-                                tokio::spawn(async move {
-                                    let result = client
-                                        .request_with_timeout(
-                                            method::CHAT_SEND,
-                                            serde_json::json!({ "session_id": session_id, "message": message }),
-                                            Duration::from_secs(300),
-                                        )
-                                        .await
-                                        .and_then(|resp| match resp.result {
-                                            Some(v) => serde_json::from_value::<ChatSession>(v)
-                                                .map_err(|e| anyhow::anyhow!("chat.send: {e}")),
-                                            None => anyhow::bail!("chat.send: {:?}", resp.error),
-                                        });
-                                    let _ = tx.send(result);
-                                });
                             }
                             UiAction::StartTask(name) => {
                                 match client.request(method::TASKS_START, serde_json::json!({ "name": name })).await {
@@ -321,16 +288,6 @@ async fn run_session(
                     Err(_) => return SessionOutcome::Disconnected,
                 }
             }
-            outcome = chat_rx.recv() => {
-                app.thinking = false;
-                app.streaming = None;
-                app.streaming_reasoning.clear();
-                match outcome {
-                    Some(Ok(session)) => app.update_chat(session),
-                    Some(Err(e)) => app.logs.push_back(format!("chat.send failed: {e}")),
-                    None => {}
-                }
-            }
             _ = closed_rx.recv() => {
                 return SessionOutcome::Disconnected;
             }
@@ -340,6 +297,73 @@ async fn run_session(
                 }
             }
         }
+    }
+}
+
+/// Resolve a task's catalog entry and open its agent session, seeding a new one
+/// with the task prompt when `force_new` is set.
+async fn open_agent(client: &Client, app: &mut App, task_id: String, force_new: bool) {
+    let task = app
+        .tasks
+        .iter()
+        .find(|t| t.id.to_string() == task_id)
+        .cloned();
+    let entry = task
+        .as_ref()
+        .and_then(|t| app.catalog.iter().find(|c| c.name == t.name).cloned());
+
+    let (rows, cols) = app.term.size();
+    let mut params = serde_json::json!({ "task_id": task_id, "rows": rows, "cols": cols });
+    if force_new {
+        params["new"] = serde_json::json!(true);
+    }
+    if let Some(agent) = entry.as_ref().and_then(|e| e.agent.clone()) {
+        params["agent"] = serde_json::json!(agent);
+    }
+    if let Some(model) = entry.as_ref().and_then(|e| e.model.clone()) {
+        params["model"] = serde_json::json!(model);
+    }
+    // Reattach to the agent's own session (e.g. opencode) once a run has captured it.
+    if let Some(session_id) = task.as_ref().and_then(|t| t.session_id.clone()) {
+        params["session_id"] = serde_json::json!(session_id);
+    }
+    if let Some(prompt) = entry
+        .as_ref()
+        .map(|e| e.prompt.clone())
+        .filter(|p| !p.is_empty())
+    {
+        params["prompt"] = serde_json::json!(prompt);
+    }
+    if let Some(cwd) = task
+        .as_ref()
+        .and_then(|t| t.input.get("cwd"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| entry.as_ref().and_then(|e| e.cwd.clone()))
+    {
+        params["cwd"] = serde_json::json!(cwd);
+    }
+
+    match client.request(method::AGENTS_START, params).await {
+        Ok(resp) => match resp.result {
+            Some(v) => {
+                let session = v
+                    .get("session")
+                    .cloned()
+                    .and_then(|s| serde_json::from_value::<AgentSessionInfo>(s).ok());
+                let frame = v
+                    .get("data")
+                    .and_then(|d| d.as_str())
+                    .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+                    .unwrap_or_default();
+                match session {
+                    Some(session) => app.open_agent(session, &frame),
+                    None => app.logs.push_back("agents.start: malformed response".to_string()),
+                }
+            }
+            None => app.logs.push_back(format!("agents.start error: {:?}", resp.error)),
+        },
+        Err(e) => app.logs.push_back(format!("agents.start failed: {e}")),
     }
 }
 

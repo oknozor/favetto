@@ -9,7 +9,7 @@ use favetto_core::model::{Event, EventKind};
 use sqlx::SqlitePool;
 use tokio_cron_scheduler::JobScheduler;
 
-use crate::chat::ChatManager;
+use crate::agents::AgentManager;
 use crate::config::FavettoConfig;
 use crate::db;
 use crate::event_bus::{EventBus, ServerPush};
@@ -27,11 +27,11 @@ pub struct State {
     pub bus: EventBus,
     pub token: Token,
     pub webhooks: WebhookSecrets,
-    pub chat: ChatManager,
-    /// Live config, mutable at runtime (e.g. adding a provider from the TUI).
+    pub agents: AgentManager,
+    /// Live config (external agents, executor/daemon defaults).
     pub config: Arc<RwLock<FavettoConfig>>,
-    /// Path the config was loaded from, for persisting runtime changes.
-    pub config_path: PathBuf,
+    /// Directory for SQLite + token + worktrees.
+    pub data_dir: PathBuf,
     /// Directory of task-definition `.md` files.
     pub tasks_dir: PathBuf,
     /// The live task catalog.
@@ -49,9 +49,9 @@ impl State {
         bus: EventBus,
         token: Token,
         webhooks: WebhookSecrets,
-        chat: ChatManager,
+        agents: AgentManager,
         config: Arc<RwLock<FavettoConfig>>,
-        config_path: PathBuf,
+        data_dir: PathBuf,
         tasks_dir: PathBuf,
         catalog: Arc<RwLock<Vec<TaskDef>>>,
         scheduler: JobScheduler,
@@ -62,9 +62,9 @@ impl State {
             bus,
             token,
             webhooks,
-            chat,
+            agents,
             config,
-            config_path,
+            data_dir,
             tasks_dir,
             catalog,
             scheduler,

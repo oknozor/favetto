@@ -1,15 +1,18 @@
 # Example hooks. Loaded by `favetto daemon --hooks hooks.toml`.
+#
+# WARNING: a hook whose action enqueues a task that itself emits the triggering
+# event (e.g. `event = "TaskFinished"` running a task) will loop forever. Prefer a
+# specific integration event as the trigger.
 
-# When a Linear ticket is created, enqueue an `implement_linear_ticket` task.
-[[hooks]]
-event = "TicketCreated"
-filter = { type = "Issue" }
-action = { type = "run_task", task = "implement_linear_ticket" }
+# When an issue-created event arrives (e.g. from a GitHub webhook), enqueue a task.
+# [[hooks]]
+# event = "IssueCreated"
+# action = { type = "run_task", task = "che_repo_review" }
 
-# When a GitHub issue is created, derive a task-created event.
-[[hooks]]
-event = "IssueCreated"
-action = { type = "emit_event", kind = "TaskCreated" }
+# Derive a new event from another.
+# [[hooks]]
+# event = "IssueCreated"
+# action = { type = "emit_event", kind = "TaskCreated" }
 
 # Example: notify via webhook whenever a task fails.
 # [[hooks]]

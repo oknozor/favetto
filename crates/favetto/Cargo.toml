@@ -10,15 +10,10 @@ path = "src/main.rs"
 
 [dependencies]
 favetto-core = { path = "../favetto-core" }
-favetto-integrations = { path = "../favetto-integrations" }
-mcp-filesystem = { path = "../mcp-filesystem" }
-mcp-linear = { path = "../mcp-linear" }
-mcp-github = { path = "../mcp-github" }
-mcp-gmail = { path = "../mcp-gmail" }
 
 anyhow = "1"
-async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
+base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 config = "0.15"
@@ -27,9 +22,9 @@ futures-util = "0.3"
 hex = "0.4"
 hmac = "0.13"
 http = "1"
+libc = "0.2"
 ratatui = "0.30"
-rmcp = { version = "3.4", default-features = false, features = ["client", "server", "macros", "transport-child-process", "transport-io"] }
-schemars = "1"
+portable-pty = "0.9"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.11"
@@ -44,5 +39,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 throbber-widgets-tui = "0.11"
+vt100 = "0.16"
 
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }

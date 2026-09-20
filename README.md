@@ -1,8 +1,9 @@
 # favetto
 
-A long-running, LLM-driven agent orchestrator that automates software workflows
-across **GitHub**, **Linear**, and **Gmail**. It is **MCP-native** for tooling and
-**remote-TUI-first** from milestone 1.
+A long-running, LLM-driven agent orchestrator with a **remote-TUI-first** design.
+It schedules and runs declarative tasks by delegating to external coding-agent CLIs
+(opencode, Claude Code, pi, Mistral Vibe, …), embedded as live terminals — the
+orchestrator never implements its own agent loop.
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
@@ -14,24 +15,22 @@ across **GitHub**, **Linear**, and **Gmail**. It is **MCP-native** for tooling a
                              │
 ┌───────────────────────────────────────────────────────────────┐
 │                  Favetto Daemon                          │
-│   Scheduler ─► Task Queue ─► Agent Runtime ─► MCP Client Pool │
+│   Scheduler ─► Task Queue ─► Agent Sessions (PTY) ─► Agent CLIs│
 │   Event Bus · Hook Engine · Notification Bus                  │
-│   Integrations (GitHub/Linear/Gmail, thin reqwest/octocrab)   │
 │   Persistence (SQLite/sqlx) · Remote API (axum)               │
 └───────────────────────────────────────────────────────────────┘
 ```
 
 ## Design principles
 
-- **MCP-first tooling** — every tool the agent calls is exposed via MCP (stdio
-  today; streamable HTTP in later milestones). Internal tools and third-party MCP
-  servers share one interface, so favetto is both a *consumer* and a
-  *building block*.
+- **Agents as workers** — favetto orchestrates; the coding loop is an external
+  agent CLI embedded as a live PTY session that can be attached, reattached, and
+  keystroke-driven from the TUI.
 - **Remote-TUI-first** — the TUI client and the daemon are decoupled over a single
   wire protocol; local attach is just a special case of remote attach.
 - **Event-driven core** — everything is a task, an event, or a hook.
-- **Declarative tasks** — each task is a Markdown file with a TOML header (model,
-  optional schedule/dependency) and a prompt body.
+- **Declarative tasks** — each task is a Markdown file with a TOML header
+  (`agent`, plus optional schedule/dependency) and a prompt body.
 - **Crash-resilient** — tasks and events persist across restarts; the event log is
   append-only and monotonic, doubling as the TUI's resume cursor.
 
@@ -40,18 +39,8 @@ across **GitHub**, **Linear**, and **Gmail**. It is **MCP-native** for tooling a
 ```
 crates/
   favetto-core/          shared wire protocol + domain types (no HTTP/DB/LLM)
-  favetto/               single binary: daemon, tui, mcp-serve, ...
-  favetto-integrations/  thin clients: Linear (GraphQL) + GitHub (octocrab)
-  mcp-filesystem/             first-party MCP server (read/write/list under a root)
-  mcp-linear/                 first-party MCP server (Linear issues/teams)
-  mcp-github/                 first-party MCP server (GitHub issues/PRs)
-  mcp-gmail/                  first-party MCP server (Gmail messages/threads/labels)
-  mock-linear/                tiny GraphQL mock of Linear for offline dev
-  mock-gmail/                 tiny Gmail REST mock for offline dev
+  favetto/               single binary: daemon, tui, agent exec wrapper
 tasks/                        task catalog: `*.md` files with TOML header + prompt
-workdir/                      sample filesystem target for the M2 demo
-dev/Dockerfile                multi-stage build for mock-linear (docker-compose)
-docker-compose.yml            local dev: mock-linear on :4000
 hooks.toml                    example hooks (event + filter → action)
 ```
 
@@ -70,7 +59,7 @@ cargo build
 ./target/debug/favetto tui --remote ws://127.0.0.1:7878 \
     --token-file ~/.local/share/favetto/token
 
-# configure providers + MCP servers, then start tasks from the TUI
+# configure external agents, then start tasks from the TUI
 ```
 
 ## Tasks (catalog)
@@ -79,17 +68,29 @@ A task is a Markdown file under `tasks/` with a TOML header and the prompt as th
 body:
 
 ```md
-model = "deepseek:deepseek-v4-flash"   # required — the LLM provider/model
-schedule = "0 8 * * * *"               # optional — makes this a recurring task
-needs = "another_task:finished"        # optional — start when `another_task` ends
+agent = "opencode"                      # optional — run through this external agent
+provider = "jev"                        # optional — model provider
+model = "1.13"                          # optional — model id (uses the agent's run_args)
+cwd = "/code/che"                       # optional — repo/checkout the agent works in
+schedule = "0 8 * * * *"                # optional — makes this a recurring task
+needs = "another_task:finished"         # optional — start when `another_task` ends
 ---
 
 You are an engineering agent that implements Linear tickets end-to-end.
 …
 ```
 
-- `model` selects the provider (any `[providers.*]` entry), so each task talks to
-  its own model.
+- `agent` names an `[agents.*]` entry (see below). When set — or when
+  `[agent].default` is configured — the task runs through that agent CLI with the
+  task prompt (headless for catalog runs, interactive in the Agent tab). A task
+  with no agent and no default fails to start.
+- `provider` and `model` select the model per task. When `model` is set the agent's
+  `run_args` template is used (`{provider}`/`{model}` substituted); otherwise the
+  agent's `headless_args` are used and the agent's own default model applies. A
+  `provider` without a `model` is ignored.
+- `cwd` is the directory the agent runs in (e.g. a repo checkout); it takes
+  precedence over the agent's configured `cwd`. Per-run `tasks.start` `input.cwd`
+  wins over both.
 - `schedule` registers a recurring cron task.
 - `needs` declares a dependency: this task auto-starts when the named task emits
   its `finished` event (mutually exclusive with `schedule`).
@@ -104,11 +105,9 @@ the **Catalog** tab lists the catalog and Enter starts a task; the Ctrl+P menu's
 | Milestone | Scope | Status |
 |-----------|-------|--------|
 | **M1** | Skeleton + remote TUI: daemon, SQLite, event bus, MessagePack wire protocol over Unix socket + WebSocket, token auth, ratatui client | ✅ Done |
-| **M2** | MCP foundation: `rmcp` client, ToolRegistry, agent runtime, first-party `mcp-filesystem` | ✅ Done |
-| **M3** | GitHub + Linear integrations as first-party MCP servers, webhook receivers, hooks, local dev mocks via docker-compose | ✅ Done |
-| **M4** | Gmail: thin `reqwest` client + OAuth refresh + `mcp-gmail` | ✅ Done |
-| **M5** | Scheduler + notifications: cron, task queue → runtime, notification channels, Scheduler + Notifications TUI tabs | ✅ Done |
-| **M6** | Hardening: orchestrator-as-MCP-server (`mcp-serve`), metrics, pairing, sandbox + replay tests | ✅ Done |
+| **M2** | External agent sessions: PTY spawn, server-side `vt100` emulation, remote attach/reattach, terminal query replies | ✅ Done |
+| **M3** | Scheduler + notifications: cron, task queue → agent sessions, notification channels, Scheduler + Notifications TUI tabs | ✅ Done |
+| **M4** | Hardening: metrics, pairing, webhook receivers + hooks, parallel git-worktree execution | ✅ Done |
 
 ## Webhooks & hooks
 
@@ -125,34 +124,27 @@ executor), `emit_event` derives a new event, and `notify` sends a notification
 through a channel (e.g. `action = { type = "notify", channel = "webhook",
 config = { url = "http://…" } }`).
 
-## Configuration & credentials
+## Configuration
 
 favetto reads a global config file (parsed with the `config` crate, located via
 the `dirs` crate) at **`~/.config/favetto/config.toml`** — override with
-`--config <path>` or `$FAVETTO_CONFIG`. It declares LLM providers, global MCP
-servers, and daemon defaults:
+`--config <path>` or `$FAVETTO_CONFIG`. It declares the external agents and daemon
+defaults:
 
 ```toml
 # ~/.config/favetto/config.toml
 [agent]
-model = "deepseek:deepseek-v4-flash"   # "<provider>:<model>"; "echo" for offline
+default = "opencode"           # default external agent (a key in [agents.*])
 
-[providers.deepseek]           # any OpenAI-compatible provider
-kind = "openai"
-api_key_env = "DEEPSEEK_API_KEY"   # or api_key = "..."
-model = "deepseek-v4-flash"
-base_url = "https://api.deepseek.com"
-
-[providers.openai]             # another provider
-kind = "openai"
-api_key_env = "OPENAI_API_KEY"
-model = "gpt-4o"
-base_url = "https://api.openai.com/v1"   # optional
-
-[mcp.filesystem]               # global MCP servers (task prompts can rely on these)
-transport = "stdio"
-command = "mcp-filesystem"
-args = ["--root", "./workdir"]
+[agents.opencode]              # external coding agents
+command = "opencode"
+args = []
+prompt_args = ["--prompt", "{prompt}"]   # seed an interactive session
+submit_prompt = true                     # press Enter so the seeded prompt is sent
+headless_args = ["run", "--auto", "{prompt}"]   # unattended runs without a model
+run_args = ["run", "--model", "{provider}/{model}", "--auto", "--format", "json", "{prompt}"]
+resume_args = ["--session", "{session_id}"]     # reopen a run's session
+session_id_json_key = "sessionID"               # captured from run JSON output
 
 [daemon]                       # defaults, overridable by CLI flags
 listen = "127.0.0.1:7878"
@@ -165,55 +157,100 @@ Data (SQLite + bearer token) lives in **`~/.local/share/favetto`** (or
 built-in default. See [`config.example.toml`](config.example.toml) for a full,
 annotated example.
 
-Credentials are read from the environment (OS keyring integration arrives with
-Gmail in M4). The M3 integrations use:
+Webhook receivers read their signing secrets from the environment:
+`GITHUB_WEBHOOK_SECRET` and `LINEAR_WEBHOOK_SECRET`.
 
-- `GITHUB_TOKEN` — personal access token for `mcp-github` and GitHub webhooks
-  (`GITHUB_WEBHOOK_SECRET` for HMAC verification).
-- `LINEAR_API_KEY` / `LINEAR_BASE_URL` — for `mcp-linear` (`LINEAR_WEBHOOK_SECRET`
-  for webhook verification). `LINEAR_BASE_URL` can point at the local dev
-  instance described below.
-- `GMAIL_ACCESS_TOKEN` (static) or `GMAIL_CLIENT_ID` + `GMAIL_CLIENT_SECRET` +
-  `GMAIL_REFRESH_TOKEN` (OAuth refresh) — for `mcp-gmail` (`GMAIL_BASE_URL` points
-  at the local dev instance).
+## Embedded agents
 
-## Local dev (docker-compose)
+favetto does not reimplement a coding agent: it runs a configured agent CLI
+(opencode, Claude Code, pi, Mistral Vibe, …) in a PTY on the daemon and embeds
+its live terminal in the TUI's **Agent** tab.
 
-Local mocks of Linear's GraphQL API and Gmail's REST API are provided for offline
-development. They implement the small subsets of each schema favetto uses.
+```toml
+# ~/.config/favetto/config.toml
+[agent]
+default = "opencode"
 
-```bash
-docker compose up -d            # mock-linear on :4000, mock-gmail on :4001
-
-LINEAR_API_KEY=dev LINEAR_BASE_URL=http://localhost:4000/graphql \
-  # start `implement_linear_ticket` from the TUI Catalog tab (or via the API)
-
-GMAIL_ACCESS_TOKEN=dev GMAIL_BASE_URL=http://localhost:4001/gmail/v1 \
-  # start `summarize_email_thread` from the TUI Catalog tab (or via the API)
-
-docker compose down
+[agents.opencode]
+command = "opencode"
+args = []
+prompt_args = ["--prompt", "{prompt}"]   # seed an interactive session with the task prompt
+submit_prompt = true                     # press Enter so the seeded prompt is sent
+headless_args = ["run", "--auto", "{prompt}"]   # unattended runs without a model
+run_args = ["run", "--model", "{provider}/{model}", "--auto", "--format", "json", "{prompt}"]
+resume_args = ["--session", "{session_id}"]     # reopen a session in the TUI
+session_id_json_key = "sessionID"               # captured from the run's JSON events
 ```
 
-## Chat (per-task LLM conversation)
+Model selection lives in the invocation templates, because many CLIs (e.g.
+opencode) only accept `--model` on a subcommand such as `run`. When a task sets
+`model`, favetto uses `run_args`; otherwise `headless_args` (agent default model).
+`{provider}` and `{model}` are the task's separate provider/model values. To also
+reattach to a finished run, set `resume_args` and `session_id_json_key`: the run's
+line-delimited JSON is scanned for the session id (opencode's `run --format json`
+puts `sessionID` on every event), it is stored on the task, and opening that task
+launches `resume_args`. An agent without these fields keeps the simpler
+PTY-replay behavior.
 
-From the TUI, highlight a task in the **Tasks** tab (↑/↓) and press **Enter** to
-open the **Chat** tab: it displays the agent conversation seeded from the task's
-task prompt and input. Type a message and press **Enter** to send it — the
-daemon runs one agent turn and appends the reply.
+A task may set `provider = "jev"` and `model = "1.13"` to pick the model per task;
+a `provider` without a `model` is ignored and the agent default applies.
 
-The chat uses the same `ModelBackend` abstraction as tasks: it resolves the
-global `[agent]` model through the configured `[providers]` (OpenAI-compatible —
-e.g. `deepseek:deepseek-v4-flash`), falling back to a local echo backend when no
-provider/key is available. Chat sessions are in-memory for now; they'll persist
-once the scheduler lands in M5.
+From the **Tasks** tab, highlight a task and press **Enter** to open its agent
+session, seeded with the task prompt and running in the task's workspace. Opening
+a task first reattaches to its running session; if the run already finished and a
+session id was captured, it reopens that session with `resume_args`. Press
+**Ctrl+N** in the Agent tab to force a new session. The daemon keeps a `vt100`
+emulator per session and streams self-contained full-screen frames; the panel
+parses and renders them, keys are forwarded to the agent, and the PTY is resized
+to fit. **Ctrl+Q** detaches without stopping the session (it keeps running on the
+daemon). Common terminal queries (cursor position, device attributes, colours,
+mode reports) are answered by the daemon on the PTY.
+
+`prompt_args` seeds the prompt (`{prompt}` is substituted); some agents only
+pre-fill their input, so set `submit_prompt = true` to send Enter once the UI has
+settled. With no `prompt_args`, the prompt is written to the agent's stdin instead.
+
+Agents are launched through a small supervisor (`favetto __agent-exec`) that owns
+a process group and dies with the daemon — on both `SIGTERM` and `SIGKILL` — taking
+the agent and its children with it. Live PTYs therefore do **not** survive a daemon
+restart, but an agent's own session (captured via `session_id_json_key`) does, so
+tasks can be resumed after a restart.
+
+Catalog tasks run through their `agent` (or `[agent].default`) in headless mode
+using `headless_args` (or `run_args` when a model is set); a task with no agent
+(and no default) fails to start. An external agent **without** the relevant args
+is rejected rather than launched interactively (an interactive TUI would never
+exit and would hang the task).
+
+## Parallel execution & git worktrees
+
+The executor is serial by default. Parallelism and isolation are configurable:
+
+```toml
+[executor]
+parallel = true          # default false
+max_concurrency = 4
+worktree = true          # default true; used only when `parallel`
+# worktree_dir = "~/.local/share/favetto/worktrees"  # absolute or repo-relative
+keep_worktree = true     # default true; false removes the worktree afterwards
+```
+
+- **Parallel + git repository** → each task runs in its own `git worktree`
+  (branch `favetto/<task>-<id>`, path under the worktree dir), so tasks don't
+  step on each other. Worktrees are kept by default so the agent's branch and
+  changes can be inspected.
+- **Parallel + not a repository** → tasks that share a working directory are
+  serialized (one at a time); different directories still run concurrently.
+- **Not parallel** → strict global serialization, as before.
+
+`worktree` is ignored unless `parallel = true`. The effective directory is
+`input.cwd` → task `cwd` → the daemon's working directory.
 
 ## Ctrl+P menu
 
 Press **Ctrl+P** in the TUI to open a floating menu with guided, step-by-step
 forms for:
 
-- **Add provider / model** — registers an LLM provider (persisted to the config
-  file and applied live).
 - **Add task to catalog** — writes a task `.md` file (does not run it).
 - **Create a schedule event** — adds a cron schedule.
 - **Create a notification (hook)** — adds a hook that reacts to an event kind and
@@ -227,11 +264,12 @@ The daemon exposes one wire protocol over two transports:
 - **WebSocket** `ws://127.0.0.1:7878/rpc` (bearer token required).
 
 Methods: `system.ping`, `tasks.list`, `tasks.start`, `tasks.cancel`,
-`events.tail`, `events.subscribe`, `chat.open`, `chat.send`, `chat.messages`,
-`schedules.list`, `schedules.upsert`, `schedules.delete`, `notifications.list`,
-`notifications.test`, `config.set_provider`, `hooks.upsert`. Server pushes:
-`event`, `task.updated`, `log.line`.
+`events.tail`, `events.subscribe`, `agents.list`, `agents.start`, `agents.input`,
+`agents.resize`, `agents.attach`, `agents.close`, `schedules.list`,
+`schedules.upsert`, `schedules.delete`, `notifications.list`,
+`notifications.test`, `hooks.upsert`. Server pushes:
+`event`, `task.updated`, `log.line`, `agent.output`, `agent.exit`.
 
 The daemon also serves HTTP endpoints: `GET /metrics` (Prometheus),
 `POST /pair/generate` and `POST /pair/exchange` (pairing), plus the webhook
-receivers. And `favetto mcp-serve` exposes the whole thing as an MCP server.
+receivers.

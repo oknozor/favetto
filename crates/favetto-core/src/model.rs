@@ -1,4 +1,4 @@
-//! Domain model types shared across the daemon, TUI client, and future MCP servers.
+//! Domain model types shared across the daemon and TUI client.
 
 use std::str::FromStr;
 
@@ -55,8 +55,8 @@ impl FromStr for TaskStatus {
 /// A unit of work the favetto is driving.
 ///
 /// Tasks are created by integrations, hooks, the scheduler, or manually via the
-/// API, then handed to the agent runtime which executes the referenced catalog
-/// task.
+/// API, then handed to the executor which runs the referenced catalog task through
+/// its external agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: Uuid,
@@ -74,6 +74,10 @@ pub struct Task {
     pub finished_at: Option<DateTime<Utc>>,
     /// Human-readable failure reason when `status == Failed`.
     pub error: Option<String>,
+    /// The agent's own session id (e.g. opencode's session id), captured from a
+    /// task run's output so the session can be reattached later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 impl Task {
@@ -285,13 +289,34 @@ impl ChatMessage {
     }
 }
 
-/// A chat session: the conversation the TUI displays and appends to.
+/// A live external-agent session (a PTY running an agent CLI on the daemon).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatSession {
+pub struct AgentSessionInfo {
     pub id: String,
-    /// Task this chat is attached to, if any.
+    /// Name of the `[agents.*]` entry that launched it.
+    pub agent: String,
+    /// Catalog task this session is attached to, if any.
     pub task_id: Option<String>,
-    pub messages: Vec<ChatMessage>,
+    /// Whether the child process is still running.
+    pub running: bool,
+    /// Whether this is an unattended run (machine-readable output) rather than an
+    /// interactive TUI that can be attached.
+    #[serde(default)]
+    pub headless: bool,
+    /// The agent's own session id (e.g. opencode's), captured from its output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+/// A configured external agent plus its live-session state, as returned by
+/// `agents.list`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentCatalogEntry {
+    pub name: String,
+    pub command: String,
+    pub default: bool,
+    /// Live sessions launched from this agent.
+    pub sessions: Vec<AgentSessionInfo>,
 }
 
 /// A cron schedule that enqueues a task (and emits a `CronTick`) on fire.

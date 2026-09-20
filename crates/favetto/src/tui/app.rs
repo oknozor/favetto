@@ -2,51 +2,47 @@
 
 use std::collections::VecDeque;
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use serde_json::Value;
 
-use favetto_core::model::{ChatMessage, ChatSession, Event, MessageRole, NotificationRecord, Schedule, Task};
+use base64::Engine as _;
+
+use favetto_core::model::{AgentSessionInfo, Event, NotificationRecord, Schedule, Task};
 use favetto_core::rpc::{method, push, Notification};
 
-/// Tabs shown in the header. Tasks and Events are live; the rest are placeholders
-/// that fill in over later milestones (Chat is the per-task LLM conversation).
+use super::term::TerminalView;
+
+/// Tabs shown in the header. Agent hosts the embedded external-agent terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Tasks,
     Catalog,
-    Chat,
+    Agent,
     Events,
     Scheduler,
     Notifications,
-    Repos,
-    Agents,
-    Mcp,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 9] = [
+    pub const ALL: [Tab; 6] = [
         Tab::Tasks,
         Tab::Catalog,
-        Tab::Chat,
+        Tab::Agent,
         Tab::Events,
         Tab::Scheduler,
         Tab::Notifications,
-        Tab::Repos,
-        Tab::Agents,
-        Tab::Mcp,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
             Tab::Tasks => "Tasks",
             Tab::Catalog => "Catalog",
-            Tab::Chat => "Chat",
+            Tab::Agent => "Agent",
             Tab::Events => "Events",
             Tab::Scheduler => "Scheduler",
             Tab::Notifications => "Notifications",
-            Tab::Repos => "Repos",
-            Tab::Agents => "Agents",
-            Tab::Mcp => "MCP",
         }
     }
 }
@@ -62,11 +58,13 @@ pub enum ConnState {
 pub enum UiAction {
     None,
     Quit,
-    /// Open (or switch to) the chat for a task id.
-    OpenChat(String),
-    /// Send the current input buffer.
-    SendChat,
-    /// Start a catalog task by name.
+    /// Start (and focus) an embedded agent session for a task id.
+    OpenAgent(String),
+    /// Start a brand-new agent session for a task, ignoring any existing one.
+    NewAgent(String),
+    /// Forward raw keystrokes to the active agent session.
+    AgentInput(Vec<u8>),
+    /// Start a catalog task by name (runs headlessly through the configured agent).
     StartTask(String),
     /// Submit a completed form via an RPC call.
     Submit { method: &'static str, params: Value },
@@ -93,7 +91,6 @@ pub struct Form {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum FormKind {
-    AddProvider,
     AddTask,
     CreateSchedule,
     CreateNotification,
@@ -103,14 +100,36 @@ pub enum FormKind {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct CatalogEntry {
     pub name: String,
-    pub model: String,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
     pub schedule: Option<String>,
+    #[serde(default)]
     pub needs: Option<String>,
+    #[serde(default)]
+    pub prompt: String,
+}
+
+impl CatalogEntry {
+    /// The `provider/model` selector shown in the catalog, or `—` when unset.
+    pub fn model_display(&self) -> String {
+        match (&self.provider, &self.model) {
+            (Some(p), Some(m)) => format!("{p}/{m}"),
+            (None, Some(m)) => m.clone(),
+            (Some(p), None) => p.clone(),
+            (None, None) => "—".to_string(),
+        }
+    }
 }
 
 /// The Ctrl+P menu entries, in order.
-pub const MENU_OPTIONS: [&str; 4] = [
-    "Add provider / model",
+pub const MENU_OPTIONS: [&str; 3] = [
     "Add task to catalog",
     "Create schedule",
     "Create notification hook",
@@ -128,8 +147,6 @@ pub struct ClickRegion {
 pub enum ClickAction {
     /// Switch to a tab.
     Tab(Tab),
-    /// Toggle the collapse of the i-th assistant message's thinking block.
-    ToggleThinking(usize),
 }
 
 pub struct App {
@@ -149,23 +166,19 @@ pub struct App {
     pub catalog: Vec<CatalogEntry>,
     pub catalog_selected: usize,
 
-    // Chat state.
-    pub chat_session_id: Option<String>,
-    pub chat_task_id: Option<String>,
-    pub chat_messages: Vec<ChatMessage>,
-    pub input: String,
-    /// Lines scrolled up from the bottom of the chat (0 = pinned to bottom).
-    pub chat_scroll: usize,
-    /// In-progress streamed answer text (not yet committed to the conversation).
-    pub streaming: Option<String>,
-    /// In-progress streamed reasoning text for the current turn.
-    pub streaming_reasoning: String,
-    /// Per-assistant-message collapse state (aligned to assistant messages).
-    pub thinking_collapsed: Vec<bool>,
-    /// Clickable regions (tab bar + thinking headers), populated during draw.
+    // Embedded agent terminal.
+    pub agent_session_id: Option<String>,
+    pub agent_task_id: Option<String>,
+    pub agent_name: Option<String>,
+    pub agent_running: bool,
+    pub agent_status: String,
+    /// Set when the terminal was resized during draw; the session loop forwards
+    /// the new size to the daemon and clears it.
+    pub agent_resize: Option<(u16, u16)>,
+    pub term: TerminalView,
+
+    // Clickable regions (tab bar), populated during draw.
     pub click_regions: Vec<ClickRegion>,
-    /// A chat turn is in flight (show the "Thinking" throbber).
-    pub thinking: bool,
     pub throbber_state: throbber_widgets_tui::ThrobberState,
 
     // Scheduler + notifications.
@@ -190,16 +203,14 @@ impl App {
             tasks_selected: 0,
             catalog: Vec::new(),
             catalog_selected: 0,
-            chat_session_id: None,
-            chat_task_id: None,
-            chat_messages: Vec::new(),
-            input: String::new(),
-            chat_scroll: 0,
-            streaming: None,
-            streaming_reasoning: String::new(),
-            thinking_collapsed: Vec::new(),
+            agent_session_id: None,
+            agent_task_id: None,
+            agent_name: None,
+            agent_running: false,
+            agent_status: String::new(),
+            agent_resize: None,
+            term: TerminalView::default(),
             click_regions: Vec::new(),
-            thinking: false,
             throbber_state: throbber_widgets_tui::ThrobberState::default(),
             schedules: Vec::new(),
             notifications: Vec::new(),
@@ -227,48 +238,43 @@ impl App {
         self.tasks_selected = self.tasks_selected.saturating_sub(1);
     }
 
-    /// Adopt a freshly opened chat session and switch to the Chat tab.
-    pub fn open_chat(&mut self, session: ChatSession) {
-        self.chat_session_id = Some(session.id);
-        self.chat_task_id = session.task_id;
-        self.chat_messages = session.messages;
-        self.sync_collapse();
-        self.input.clear();
-        self.chat_scroll = 0;
-        self.streaming = None;
-        self.streaming_reasoning.clear();
-        self.thinking = false;
-        self.tab = Tab::Chat;
+    /// Adopt a newly started agent session (with its current screen frame) and
+    /// switch to the Agent tab. Re-opening the same session keeps the existing
+    /// emulator (and its size) rather than resetting it.
+    pub fn open_agent(&mut self, session: AgentSessionInfo, frame: &[u8]) {
+        if self.agent_session_id.as_deref() != Some(session.id.as_str()) {
+            self.term = TerminalView::default();
+        }
+        self.term.process(frame);
+        self.agent_session_id = Some(session.id);
+        self.agent_task_id = session.task_id;
+        self.agent_name = Some(session.agent);
+        self.agent_running = session.running;
+        self.agent_status.clear();
+        self.tab = Tab::Agent;
     }
 
-    /// Replace the conversation with an updated session (after a send, or when
-    /// resuming after a reconnect). Does not switch tabs or reset input.
-    pub fn update_chat(&mut self, session: ChatSession) {
-        self.chat_session_id = Some(session.id);
-        self.chat_task_id = session.task_id;
-        self.chat_messages = session.messages;
-        self.sync_collapse();
+    /// Feed a full-screen frame to the active session's terminal.
+    pub fn agent_output(&mut self, session_id: &str, frame: &[u8]) {
+        if self.agent_session_id.as_deref() == Some(session_id) {
+            self.term.process(frame);
+        }
     }
 
-    /// Adopt a freshly opened chat session without switching to the Chat tab,
-    /// used to re-sync the conversation after a reconnect.
-    pub fn resume_chat(&mut self, session: ChatSession) {
-        self.update_chat(session);
-    }
-
-    /// Keep `thinking_collapsed` aligned with the number of assistant messages,
-    /// preserving existing state and defaulting new ones to collapsed.
-    pub(crate) fn sync_collapse(&mut self) {
-        let n = self
-            .chat_messages
-            .iter()
-            .filter(|m| m.role == MessageRole::Assistant)
-            .count();
-        self.thinking_collapsed.resize(n, true);
+    /// Mark the active session as exited.
+    pub fn agent_exit(&mut self, session_id: &str, code: Option<i32>) {
+        if self.agent_session_id.as_deref() == Some(session_id) {
+            self.agent_running = false;
+            self.agent_status = match code {
+                Some(c) => format!("exited ({c}) — Ctrl+N for a new session"),
+                None => "exited — Ctrl+N for a new session".to_string(),
+            };
+        }
     }
 
     /// Route a keypress. Ctrl+P toggles the menu; while a popup is open, keys go to
-    /// it; otherwise they go to the active tab. Returns the async action to perform.
+    /// it; the Agent tab forwards everything else to the agent PTY. Returns the
+    /// async action to perform.
     pub fn handle_key(&mut self, key: KeyEvent) -> UiAction {
         if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.popup = match self.popup {
@@ -276,6 +282,10 @@ impl App {
                 Popup::Menu { .. } | Popup::Form(_) => Popup::None,
             };
             return UiAction::None;
+        }
+
+        if matches!(self.popup, Popup::None) && self.tab == Tab::Agent {
+            return self.handle_agent_key(&key);
         }
 
         match &self.popup {
@@ -287,38 +297,42 @@ impl App {
         self.handle_normal_key(&key)
     }
 
-    /// Handle mouse input: scroll the chat and click the tab bar / thinking headers.
+    /// Keys while the Agent tab is focused: Ctrl+Q detaches (leaving the session
+    /// running on the daemon); everything else is encoded and forwarded to the PTY.
+    fn handle_agent_key(&mut self, key: &KeyEvent) -> UiAction {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && matches!(key.code, KeyCode::Char('q')) {
+            self.tab = Tab::Tasks;
+            return UiAction::None;
+        }
+        if ctrl && matches!(key.code, KeyCode::Char('n')) {
+            if let Some(task_id) = self.agent_task_id.clone() {
+                return UiAction::NewAgent(task_id);
+            }
+            return UiAction::None;
+        }
+
+        let bytes = encode_key(key);
+        if bytes.is_empty() {
+            UiAction::None
+        } else {
+            UiAction::AgentInput(bytes)
+        }
+    }
+
+    /// Handle mouse input: click the tab bar.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> UiAction {
-        match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                if self.tab == Tab::Chat {
-                    self.chat_scroll += 3;
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            for region in &self.click_regions {
+                if mouse.row == region.row
+                    && mouse.column >= region.col_start
+                    && mouse.column < region.col_end
+                {
+                    let ClickAction::Tab(tab) = region.action;
+                    self.tab = tab;
+                    break;
                 }
             }
-            MouseEventKind::ScrollDown => {
-                if self.tab == Tab::Chat {
-                    self.chat_scroll = self.chat_scroll.saturating_sub(3);
-                }
-            }
-            MouseEventKind::Down(MouseButton::Left) => {
-                for region in &self.click_regions {
-                    if mouse.row == region.row
-                        && mouse.column >= region.col_start
-                        && mouse.column < region.col_end
-                    {
-                        match region.action {
-                            ClickAction::Tab(tab) => self.tab = tab,
-                            ClickAction::ToggleThinking(i) => {
-                                if let Some(c) = self.thinking_collapsed.get_mut(i) {
-                                    *c = !*c;
-                                }
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-            _ => {}
         }
         UiAction::None
     }
@@ -355,21 +369,19 @@ impl App {
 
     fn open_form(&mut self, selected: usize) {
         let kind = match selected {
-            0 => FormKind::AddProvider,
-            1 => FormKind::AddTask,
-            2 => FormKind::CreateSchedule,
+            0 => FormKind::AddTask,
+            1 => FormKind::CreateSchedule,
             _ => FormKind::CreateNotification,
         };
         let (title, fields) = match kind {
-            FormKind::AddProvider => (
-                "Add provider",
-                vec!["Provider name", "Kind (openai)", "API key env var", "Model", "Base URL"],
-            ),
             FormKind::AddTask => (
                 "Add task to catalog",
                 vec![
                     "Task name",
-                    "Model (provider:model)",
+                    "Agent (optional)",
+                    "Provider (optional)",
+                    "Model (optional)",
+                    "Working dir (optional)",
                     "Schedule cron (optional)",
                     "Needs (optional)",
                     "Prompt",
@@ -444,24 +456,17 @@ impl App {
         let json = |s: &str| -> Value { serde_json::from_str(s).unwrap_or(Value::Null) };
 
         match kind {
-            FormKind::AddProvider => UiAction::Submit {
-                method: method::CONFIG_SET_PROVIDER,
-                params: serde_json::json!({
-                    "name": v(0),
-                    "kind": v(1),
-                    "api_key_env": v(2),
-                    "model": v(3),
-                    "base_url": v(4),
-                }),
-            },
             FormKind::AddTask => UiAction::Submit {
                 method: method::CATALOG_ADD,
                 params: serde_json::json!({
                     "name": v(0),
-                    "model": v(1),
-                    "schedule": opt(2),
-                    "needs": opt(3),
-                    "prompt": v(4),
+                    "agent": opt(1),
+                    "provider": opt(2),
+                    "model": opt(3),
+                    "cwd": opt(4),
+                    "schedule": opt(5),
+                    "needs": opt(6),
+                    "prompt": v(7),
                 }),
             },
             FormKind::CreateSchedule => UiAction::Submit {
@@ -485,65 +490,6 @@ impl App {
 
     fn handle_normal_key(&mut self, key: &KeyEvent) -> UiAction {
         let code = key.code;
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-
-        if self.tab == Tab::Chat {
-            return match code {
-                KeyCode::Esc => {
-                    self.tab = Tab::Tasks;
-                    UiAction::None
-                }
-                KeyCode::Tab | KeyCode::Right => {
-                    self.next_tab();
-                    UiAction::None
-                }
-                KeyCode::Left | KeyCode::BackTab => {
-                    self.prev_tab();
-                    UiAction::None
-                }
-                KeyCode::Enter => UiAction::SendChat,
-                KeyCode::Backspace => {
-                    self.input.pop();
-                    UiAction::None
-                }
-                KeyCode::Char('b') if ctrl => {
-                    self.chat_scroll += 3;
-                    UiAction::None
-                }
-                KeyCode::Char('f') if ctrl => {
-                    self.chat_scroll = self.chat_scroll.saturating_sub(3);
-                    UiAction::None
-                }
-                KeyCode::Char('r') if ctrl => {
-                    let expand = self.thinking_collapsed.iter().any(|c| *c);
-                    for c in &mut self.thinking_collapsed {
-                        *c = expand;
-                    }
-                    UiAction::None
-                }
-                KeyCode::Char(c) => {
-                    self.input.push(c);
-                    UiAction::None
-                }
-                KeyCode::Up => {
-                    self.chat_scroll += 1;
-                    UiAction::None
-                }
-                KeyCode::Down => {
-                    self.chat_scroll = self.chat_scroll.saturating_sub(1);
-                    UiAction::None
-                }
-                KeyCode::PageUp => {
-                    self.chat_scroll += 10;
-                    UiAction::None
-                }
-                KeyCode::PageDown => {
-                    self.chat_scroll = self.chat_scroll.saturating_sub(10);
-                    UiAction::None
-                }
-                _ => UiAction::None,
-            };
-        }
 
         match code {
             KeyCode::Char('q') | KeyCode::Esc => UiAction::Quit,
@@ -577,7 +523,7 @@ impl App {
             KeyCode::Enter => {
                 if self.tab == Tab::Tasks {
                     if let Some(t) = self.tasks.get(self.tasks_selected) {
-                        return UiAction::OpenChat(t.id.to_string());
+                        return UiAction::OpenAgent(t.id.to_string());
                     }
                 }
                 if self.tab == Tab::Catalog {
@@ -612,18 +558,22 @@ impl App {
                     self.logs.push_back(msg.to_string());
                 }
             }
-            push::CHAT_DELTA => {
-                if let Some(text) = n.params.get("text").and_then(|t| t.as_str()) {
-                    self.streaming
-                        .get_or_insert_with(String::new)
-                        .push_str(text);
-                    self.thinking = false;
+            push::AGENT_OUTPUT => {
+                let sid = n.params.get("session_id").and_then(|v| v.as_str());
+                let data = n
+                    .params
+                    .get("data")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok());
+                if let (Some(sid), Some(data)) = (sid, data) {
+                    self.agent_output(sid, &data);
                 }
             }
-            push::CHAT_REASONING => {
-                if let Some(text) = n.params.get("text").and_then(|t| t.as_str()) {
-                    self.streaming_reasoning.push_str(text);
-                    self.thinking = true;
+            push::AGENT_EXIT => {
+                let sid = n.params.get("session_id").and_then(|v| v.as_str());
+                let code = n.params.get("code").and_then(|v| v.as_i64()).map(|c| c as i32);
+                if let Some(sid) = sid {
+                    self.agent_exit(sid, code);
                 }
             }
             _ => {}
@@ -644,4 +594,68 @@ impl App {
             self.events.push_back(ev);
         }
     }
+}
+
+/// Encode a keypress as the byte sequence a terminal would emit for it.
+fn encode_key(key: &KeyEvent) -> Vec<u8> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let mut out = Vec::new();
+    if alt {
+        out.push(0x1b);
+    }
+    match key.code {
+        KeyCode::Char(c) => {
+            if ctrl {
+                // Ctrl+A..Z / Ctrl+@.._ map to control codes.
+                let b = c.to_ascii_lowercase() as u8;
+                if b.is_ascii_lowercase() {
+                    out.push(b & 0x1f);
+                } else if c == ' ' {
+                    out.push(0x00);
+                } else {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                }
+            } else {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+        KeyCode::Enter => out.push(b'\r'),
+        KeyCode::Backspace => out.push(0x7f),
+        KeyCode::Tab => out.push(b'\t'),
+        KeyCode::BackTab => out.extend_from_slice(b"\x1b[Z"),
+        KeyCode::Esc => out.push(0x1b),
+        KeyCode::Up => out.extend_from_slice(b"\x1b[A"),
+        KeyCode::Down => out.extend_from_slice(b"\x1b[B"),
+        KeyCode::Right => out.extend_from_slice(b"\x1b[C"),
+        KeyCode::Left => out.extend_from_slice(b"\x1b[D"),
+        KeyCode::Home => out.extend_from_slice(b"\x1b[H"),
+        KeyCode::End => out.extend_from_slice(b"\x1b[F"),
+        KeyCode::PageUp => out.extend_from_slice(b"\x1b[5~"),
+        KeyCode::PageDown => out.extend_from_slice(b"\x1b[6~"),
+        KeyCode::Insert => out.extend_from_slice(b"\x1b[2~"),
+        KeyCode::Delete => out.extend_from_slice(b"\x1b[3~"),
+        KeyCode::F(n) => {
+            let seq: &[u8] = match n {
+                1 => b"\x1bOP",
+                2 => b"\x1bOQ",
+                3 => b"\x1bOR",
+                4 => b"\x1bOS",
+                5 => b"\x1b[15~",
+                6 => b"\x1b[17~",
+                7 => b"\x1b[18~",
+                8 => b"\x1b[19~",
+                9 => b"\x1b[20~",
+                10 => b"\x1b[21~",
+                11 => b"\x1b[23~",
+                12 => b"\x1b[24~",
+                _ => b"",
+            };
+            out.extend_from_slice(seq);
+        }
+        _ => {}
+    }
+    out
 }

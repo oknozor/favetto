@@ -1,8 +1,6 @@
 //! SQLite persistence via `sqlx`.
 //!
-//! M1 keeps migrations inline (`CREATE TABLE IF NOT EXISTS`). A dedicated migration
-//! tool (refinery or `sqlx::migrate!`) is introduced in M2 once the schema grows the
-//! `mcp_servers` / `mcp_tool_perms` / `hooks` tables.
+//! Migrations are inline (`CREATE TABLE IF NOT EXISTS`) and applied at startup.
 //!
 //! Timestamps are stored as Unix epoch milliseconds (INTEGER) and JSON blobs as TEXT;
 //! the conversion happens at the boundary so the domain model stays clean.
@@ -15,7 +13,7 @@ use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use favetto_core::model::{
-    ChatMessage, Event, EventKind, MessageRole, NotificationRecord, Schedule, Task, TaskStatus,
+    Event, EventKind, NotificationRecord, Schedule, Task, TaskStatus,
 };
 
 const SCHEMA: &str = r#"
@@ -29,7 +27,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at  INTEGER NOT NULL,
     started_at  INTEGER,
     finished_at INTEGER,
-    error       TEXT
+    error       TEXT,
+    session_id  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -59,16 +58,6 @@ CREATE TABLE IF NOT EXISTS notifications (
     status      TEXT NOT NULL,
     sent_at     INTEGER NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS chat_messages (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    conversation_id  TEXT NOT NULL,
-    role             TEXT NOT NULL,
-    content          TEXT NOT NULL,
-    reasoning        TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation ON chat_messages(conversation_id, id);
 "#;
 
 fn ts_ms(dt: DateTime<Utc>) -> i64 {
@@ -94,14 +83,20 @@ pub async fn open(path: &Path) -> anyhow::Result<SqlitePool> {
 /// Apply the M1 schema.
 pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query(SCHEMA).execute(pool).await?;
+    // Additive migration for databases created before `session_id` existed.
+    // `ALTER TABLE ... ADD COLUMN` errors if the column is already present; that
+    // is the expected case for new databases, so the error is ignored.
+    let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN session_id TEXT")
+        .execute(pool)
+        .await;
     Ok(())
 }
 
 /// Insert a task, silently ignoring a duplicate dedupe key.
 pub async fn insert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT OR IGNORE INTO tasks (id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO tasks (id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(task.id.to_string())
     .bind(&task.name)
@@ -113,6 +108,7 @@ pub async fn insert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
     .bind(task.started_at.map(ts_ms))
     .bind(task.finished_at.map(ts_ms))
     .bind(&task.error)
+    .bind(&task.session_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -121,14 +117,15 @@ pub async fn insert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
 /// Insert-or-update a task (full overwrite of mutable fields).
 pub async fn upsert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO tasks (id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "INSERT INTO tasks (id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
              status = excluded.status,
              output = excluded.output,
              started_at = excluded.started_at,
              finished_at = excluded.finished_at,
-             error = excluded.error",
+             error = excluded.error,
+             session_id = excluded.session_id",
     )
     .bind(task.id.to_string())
     .bind(&task.name)
@@ -140,6 +137,7 @@ pub async fn upsert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
     .bind(task.started_at.map(ts_ms))
     .bind(task.finished_at.map(ts_ms))
     .bind(&task.error)
+    .bind(&task.session_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -148,7 +146,7 @@ pub async fn upsert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
 /// Fetch a single task by id.
 pub async fn get_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Option<Task>> {
     let row = sqlx::query(
-        "SELECT id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error \
+        "SELECT id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id \
          FROM tasks WHERE id = ?",
     )
     .bind(id.to_string())
@@ -160,7 +158,7 @@ pub async fn get_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Option<Task
 /// List the most recent tasks (newest first).
 pub async fn list_tasks(pool: &SqlitePool) -> anyhow::Result<Vec<Task>> {
     let rows = sqlx::query(
-        "SELECT id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error \
+        "SELECT id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id \
          FROM tasks ORDER BY created_at DESC LIMIT 500",
     )
     .fetch_all(pool)
@@ -219,6 +217,7 @@ fn row_to_task(row: &SqliteRow) -> Task {
         started_at: row.get::<Option<i64>, _>("started_at").map(from_ms),
         finished_at: row.get::<Option<i64>, _>("finished_at").map(from_ms),
         error: row.get("error"),
+        session_id: row.try_get::<Option<String>, _>("session_id").ok().flatten(),
     }
 }
 
@@ -357,70 +356,45 @@ fn row_to_notification(row: &SqliteRow) -> NotificationRecord {
 }
 
 // ---------------------------------------------------------------------------
-// Chat persistence
-// ---------------------------------------------------------------------------
-
-/// Load a persisted conversation (in order), if any.
-pub async fn list_chat_messages(
-    pool: &SqlitePool,
-    conversation_id: &str,
-) -> anyhow::Result<Vec<ChatMessage>> {
-    let rows = sqlx::query(
-        "SELECT role, content, reasoning FROM chat_messages WHERE conversation_id = ? ORDER BY id ASC",
-    )
-    .bind(conversation_id)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows
-        .iter()
-        .map(|r| ChatMessage {
-            role: r
-                .get::<String, _>("role")
-                .parse()
-                .unwrap_or(MessageRole::User),
-            content: r.get("content"),
-            reasoning: r.get("reasoning"),
-        })
-        .collect())
-}
-
-/// Replace the persisted conversation with `messages`.
-pub async fn save_chat_messages(
-    pool: &SqlitePool,
-    conversation_id: &str,
-    messages: &[ChatMessage],
-) -> anyhow::Result<()> {
-    sqlx::query("DELETE FROM chat_messages WHERE conversation_id = ?")
-        .bind(conversation_id)
-        .execute(pool)
-        .await?;
-    for m in messages {
-        sqlx::query(
-            "INSERT INTO chat_messages (conversation_id, role, content, reasoning) VALUES (?, ?, ?, ?)",
-        )
-        .bind(conversation_id)
-        .bind(m.role.as_str())
-        .bind(&m.content)
-        .bind(&m.reasoning)
-        .execute(pool)
-        .await?;
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // Task queue
 // ---------------------------------------------------------------------------
 
-/// The oldest pending task, if any (for the executor).
-pub async fn next_pending_task(pool: &SqlitePool) -> anyhow::Result<Option<Task>> {
-    let row = sqlx::query(
-        "SELECT id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error \
-         FROM tasks WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1",
+/// Mark tasks left `running` by a previous daemon instance as failed — they were
+/// interrupted and the agent process is gone. Returns the number reconciled.
+pub async fn fail_interrupted_tasks(pool: &SqlitePool) -> anyhow::Result<u64> {
+    let result = sqlx::query(
+        "UPDATE tasks SET status = 'failed', error = 'interrupted by daemon restart', finished_at = ? \
+         WHERE status = 'running'",
     )
-    .fetch_optional(pool)
+    .bind(ts_ms(Utc::now()))
+    .execute(pool)
     .await?;
-    Ok(row.as_ref().map(row_to_task))
+    Ok(result.rows_affected())
+}
+
+/// Up to `limit` pending tasks, oldest first (for the parallel executor).
+pub async fn next_pending_tasks(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec<Task>> {
+    let rows = sqlx::query(
+        "SELECT id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id \
+         FROM tasks WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?",
+    )
+    .bind(limit.max(1))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(row_to_task).collect())
+}
+
+/// Atomically claim a pending task for execution. Returns false if it was already
+/// claimed (e.g. by another dispatcher tick).
+pub async fn claim_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        "UPDATE tasks SET status = 'running', started_at = ? WHERE id = ? AND status = 'pending'",
+    )
+    .bind(ts_ms(Utc::now()))
+    .bind(id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 #[cfg(test)]
@@ -458,6 +432,34 @@ mod tests {
         let tail = tail_events(&pool, 3).await.unwrap();
         assert_eq!(tail.len(), 3);
         assert_eq!(tail[0].id, 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn task_session_id_round_trips() {
+        let dir = std::env::temp_dir().join(format!("favetto-tasks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = open(&dir.join("test.db")).await.unwrap();
+        migrate(&pool).await.unwrap();
+
+        let task = Task {
+            id: Uuid::new_v4(),
+            name: "t".to_string(),
+            status: TaskStatus::Succeeded,
+            input: serde_json::json!({}),
+            output: None,
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+            session_id: Some("ses_123".to_string()),
+        };
+        upsert_task(&pool, &task).await.unwrap();
+        let got = get_task(&pool, task.id).await.unwrap().unwrap();
+        assert_eq!(got.session_id.as_deref(), Some("ses_123"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

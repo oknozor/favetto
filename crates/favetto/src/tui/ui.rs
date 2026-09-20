@@ -9,7 +9,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use favetto_core::model::{MessageRole, TaskStatus};
+use favetto_core::model::TaskStatus;
 
 use super::app::{App, ClickAction, ClickRegion, ConnState, Form, Popup, Tab, MENU_OPTIONS};
 
@@ -49,11 +49,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     match tab {
         Tab::Tasks => draw_tasks(frame, app, chunks[1]),
         Tab::Catalog => draw_catalog(frame, app, chunks[1]),
-        Tab::Chat => draw_chat(frame, app, chunks[1]),
+        Tab::Agent => draw_agent(frame, app, chunks[1]),
         Tab::Events => draw_events(frame, app, chunks[1]),
         Tab::Scheduler => draw_schedules(frame, app, chunks[1]),
         Tab::Notifications => draw_notifications(frame, app, chunks[1]),
-        _ => draw_placeholder(frame, app, chunks[1]),
     }
 
     draw_status(frame, app, chunks[2]);
@@ -159,12 +158,13 @@ fn draw_form(frame: &mut Frame, form: &Form) {
 
 fn draw_catalog(frame: &mut Frame, app: &App, area: Rect) {
     let widths = [
-        Constraint::Length(26),
-        Constraint::Length(26),
-        Constraint::Length(20),
+        Constraint::Length(24),
+        Constraint::Length(14),
+        Constraint::Length(24),
+        Constraint::Length(16),
         Constraint::Min(0),
     ];
-    let header = Row::new(vec!["NAME", "MODEL", "SCHEDULE", "NEEDS"])
+    let header = Row::new(vec!["NAME", "AGENT", "MODEL", "SCHEDULE", "NEEDS"])
         .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
 
     let rows: Vec<Row> = app
@@ -173,7 +173,8 @@ fn draw_catalog(frame: &mut Frame, app: &App, area: Rect) {
         .map(|e| {
             Row::new(vec![
                 Cell::from(e.name.clone()),
-                Cell::from(e.model.clone()),
+                Cell::from(e.agent.clone().unwrap_or_else(|| "—".to_string())),
+                Cell::from(e.model_display()),
                 Cell::from(e.schedule.clone().unwrap_or_default()),
                 Cell::from(e.needs.clone().unwrap_or_default()),
             ])
@@ -317,7 +318,7 @@ fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(format!(
-                    " Tasks ({}) — ↑/↓ select, Enter to chat ",
+                    " Tasks ({}) — ↑/↓ select, Enter to run agent ",
                     app.tasks.len()
                 )),
         )
@@ -329,164 +330,124 @@ fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
-    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).split(area);
-    let (msg_area, input_area) = (chunks[0], chunks[1]);
+fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect) {
+    let inner = Block::default().borders(Borders::ALL);
+    let inner_area = inner.inner(area);
 
-    let title = match &app.chat_task_id {
-        Some(t) => format!(" Chat · task {t} "),
-        None => " Chat ".to_string(),
-    };
+    // Keep the emulator (and via `agent_resize`, the daemon-side PTY) in sync with
+    // the panel size.
+    let (rows, cols) = (inner_area.height, inner_area.width);
+    if rows > 0 && cols > 0 && app.term.size() != (rows, cols) {
+        app.term.resize(rows, cols);
+        app.agent_resize = Some((rows, cols));
+    }
 
-    let width = msg_area.width.saturating_sub(2) as usize;
-    let mut lines: Vec<Line> = Vec::new();
-    let mut thinking_headers: Vec<(usize, usize, usize)> = Vec::new(); // (buffer_line_idx, box_lines, asst_idx)
-
-    let mut asst_idx = 0usize;
-    for m in &app.chat_messages {
-        if m.role == MessageRole::Assistant {
-            if let Some(r) = &m.reasoning {
-                let collapsed = app.thinking_collapsed.get(asst_idx).copied().unwrap_or(true);
-                let header_line = lines.len();
-                let box_lines = push_thinking(&mut lines, r, !collapsed, false, "", width);
-                thinking_headers.push((header_line, box_lines, asst_idx));
-            }
-            asst_idx += 1;
-        }
-        let (label, color) = role_label_color(m.role);
-        lines.push(Line::from(Span::styled(
-            format!("[{label}]"),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        )));
-        if m.role == MessageRole::Assistant {
-            lines.extend(render_markdown(&m.content, width));
+    let title = if app.agent_session_id.is_none() {
+        " Agent — no session (Enter on a task) ".to_string()
+    } else {
+        let name = app.agent_name.as_deref().unwrap_or("agent");
+        let state = if app.agent_running { "running" } else { "stopped" };
+        let extra = if app.agent_status.is_empty() {
+            String::new()
         } else {
-            for wl in wrap_text(&m.content, width) {
-                lines.push(Line::from(Span::styled(wl, Style::default().fg(color))));
-            }
-        }
-        lines.push(Line::from(""));
-    }
-
-    // Live turn: streaming reasoning (expanded) and the streamed answer.
-    if app.thinking || !app.streaming_reasoning.is_empty() {
-        let spinner = if app.thinking { spinner_char(app) } else { "" };
-        push_thinking(&mut lines, &app.streaming_reasoning, true, true, spinner, width);
-    }
-    if let Some(stream) = &app.streaming {
-        lines.push(Line::from(Span::styled(
-            "[assistant]",
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-        )));
-        lines.extend(render_markdown(stream, width));
-        lines.push(Line::from(""));
-    }
-
-    if lines.is_empty() {
-        lines.push(Line::from("(no messages — press Enter on a task to open a chat)"));
-    }
-
-    // Scroll: `chat_scroll` is the number of lines up from the bottom (0 = pinned).
-    let visible = msg_area.height as usize;
-    let start = lines.len().saturating_sub(visible + app.chat_scroll);
-
-    // Record click regions for visible thinking headers (and their whole box).
-    let col_start = msg_area.x + 1;
-    let col_end = col_start + width as u16;
-    for (buffer_idx, box_lines, asst_idx) in &thinking_headers {
-        if *buffer_idx >= start && *buffer_idx < start + visible {
-            let top = msg_area.y + 1 + (*buffer_idx - start) as u16;
-            for r in top..top + *box_lines as u16 {
-                app.click_regions.push(ClickRegion {
-                    row: r,
-                    col_start,
-                    col_end,
-                    action: ClickAction::ToggleThinking(*asst_idx),
-                });
-            }
-        }
-    }
-
-    let shown: Vec<Line> = lines.into_iter().skip(start).collect();
-
-    let messages = Paragraph::new(shown)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(messages, msg_area);
-
-    let input = format!("> {}", app.input);
-    let input_box = Paragraph::new(input).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Message — type, Enter to send, Esc to leave"),
-    );
-    frame.render_widget(input_box, input_area);
-}
-
-/// Append a bordered "Thinking" box (arrow + optional spinner + reasoning) to the
-/// chat line buffer. Returns the number of lines added.
-fn push_thinking(
-    lines: &mut Vec<Line>,
-    reasoning: &str,
-    expanded: bool,
-    active: bool,
-    spinner: &str,
-    width: usize,
-) -> usize {
-    let before = lines.len();
-    let dim = Style::default().fg(Color::DarkGray);
-    let arrow = if expanded { "▾" } else { "▸" };
-    let title = if active {
-        format!("{spinner} {arrow} Thinking")
-    } else {
-        format!("{arrow} Thinking")
+            format!(" · {}", app.agent_status)
+        };
+        format!(" Agent · {name} · {state}{extra} · Ctrl+N new · Ctrl+Q leave ")
     };
 
-    // Top border: ┌─ <title> ──…┐
-    let inner = width.saturating_sub(2).max(1);
-    let mut title_pad = format!(" {title} ");
-    if title_pad.chars().count() > inner {
-        title_pad = title_pad.chars().take(inner).collect();
-    } else {
-        title_pad.push_str(&"─".repeat(inner - title_pad.chars().count()));
-    }
-    lines.push(Line::from(Span::styled(format!("┌{title_pad}┐"), dim)));
+    let block = Block::default().borders(Borders::ALL).title(title);
+    frame.render_widget(block, area);
 
-    if expanded && !reasoning.is_empty() {
-        for wl in wrap_text(reasoning, inner.saturating_sub(2)) {
-            let mut padded = wl;
-            if padded.chars().count() > inner {
-                padded = padded.chars().take(inner).collect();
-            } else {
-                padded.push_str(&" ".repeat(inner - padded.chars().count()));
+    if app.agent_session_id.is_none() || inner_area.width == 0 || inner_area.height == 0 {
+        let hint = Paragraph::new(Line::from(Span::styled(
+            "The embedded agent terminal appears here. Select a task and press Enter to launch the configured agent.",
+            Style::default().fg(Color::DarkGray),
+        )))
+        .wrap(Wrap { trim: true });
+        frame.render_widget(hint, inner_area);
+        return;
+    }
+
+    let screen = app.term.screen();
+    let (screen_rows, screen_cols) = screen.size();
+    let hide_cursor = screen.hide_cursor();
+    let (cursor_row, cursor_col) = screen.cursor_position();
+
+    let mut lines: Vec<Line> = Vec::with_capacity(screen_rows as usize);
+    for row in 0..screen_rows.min(inner_area.height) {
+        let mut spans: Vec<Span> = Vec::new();
+        let mut run = String::new();
+        let mut run_style: Option<Style> = None;
+        for col in 0..screen_cols.min(inner_area.width) {
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
             }
-            lines.push(Line::from(Span::styled(format!("│{padded}│"), dim)));
+            let style = cell_style(cell);
+            let contents = cell.contents();
+            let text = if contents.is_empty() { " " } else { contents };
+            if run_style == Some(style) {
+                run.push_str(text);
+            } else {
+                if let Some(prev) = run_style.take() {
+                    spans.push(Span::styled(std::mem::take(&mut run), prev));
+                }
+                run.push_str(text);
+                run_style = Some(style);
+            }
         }
+        if let Some(prev) = run_style {
+            spans.push(Span::styled(run, prev));
+        }
+        lines.push(Line::from(spans));
     }
 
-    lines.push(Line::from(Span::styled(
-        format!("└{}┘", "─".repeat(inner)),
-        dim,
-    )));
+    frame.render_widget(Paragraph::new(lines), inner_area);
 
-    lines.len() - before
-}
-
-fn role_label_color(role: MessageRole) -> (&'static str, Color) {
-    match role {
-        MessageRole::System => ("system", Color::DarkGray),
-        MessageRole::User => ("you", Color::Cyan),
-        MessageRole::Assistant => ("assistant", Color::Green),
-        MessageRole::Tool => ("tool", Color::Yellow),
+    // Draw the terminal cursor when the application shows one and it is visible.
+    if !hide_cursor && cursor_row < inner_area.height && cursor_col < inner_area.width {
+        frame.set_cursor_position((
+            inner_area.x + cursor_col,
+            inner_area.y + cursor_row,
+        ));
     }
 }
 
-/// The current frame of the BRAILLE_EIGHT throbber set.
-fn spinner_char(app: &App) -> &'static str {
-    let set = throbber_widgets_tui::BRAILLE_EIGHT;
-    let len = set.symbols.len() as i8;
-    let idx = app.throbber_state.index().rem_euclid(len) as usize;
-    set.symbols[idx]
+/// Map a vt100 cell's attributes to a ratatui style.
+fn cell_style(cell: &vt100::Cell) -> Style {
+    let mut style = Style::default();
+    let (mut fg, mut bg) = (vt_color(cell.fgcolor()), vt_color(cell.bgcolor()));
+
+    let mut modifier = Modifier::empty();
+    if cell.bold() {
+        modifier |= Modifier::BOLD;
+    }
+    if cell.italic() {
+        modifier |= Modifier::ITALIC;
+    }
+    if cell.underline() {
+        modifier |= Modifier::UNDERLINED;
+    }
+    if cell.dim() {
+        modifier |= Modifier::DIM;
+    }
+    if cell.inverse() {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+
+    style = style.fg(fg).bg(bg).add_modifier(modifier);
+    style
+}
+
+/// Convert a vt100 colour to a ratatui colour.
+fn vt_color(color: vt100::Color) -> Color {
+    match color {
+        vt100::Color::Default => Color::Reset,
+        vt100::Color::Idx(idx) => Color::Indexed(idx),
+        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
 }
 
 /// Compute the (tab, start column, end column) triplets for the tab bar, matching
@@ -500,212 +461,6 @@ fn tab_click_regions(x0: u16, _y0: u16) -> Vec<(Tab, u16, u16)> {
         x += width + 3;
     }
     out
-}
-
-/// Word-wrap `text` into lines of at most `width` characters.
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    for word in text.split_whitespace() {
-        if current.is_empty() {
-            current = word.to_string();
-        } else if current.len() + 1 + word.len() <= width {
-            current.push(' ');
-            current.push_str(word);
-        } else {
-            lines.push(std::mem::take(&mut current));
-            current = word.to_string();
-        }
-    }
-    if !current.is_empty() {
-        lines.push(current);
-    }
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines
-}
-
-/// Render Markdown text into styled ratatui lines. Handles headings, lists,
-/// blockquotes, fenced code blocks, and inline `**bold**` / `*italic*` / `` `code` ``.
-fn render_markdown(text: &str, width: usize) -> Vec<Line<'static>> {
-    let width = width.max(1);
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut in_code_block = false;
-
-    for raw in text.lines() {
-        let line = raw.trim_end();
-
-        if line.trim_start().starts_with("```") {
-            in_code_block = !in_code_block;
-            continue;
-        }
-        if in_code_block {
-            lines.push(Line::from(Span::styled(
-                line.to_string(),
-                Style::default().fg(Color::Yellow),
-            )));
-            continue;
-        }
-
-        if let Some(rest) = line.strip_prefix("#### ") {
-            push_heading(&mut lines, rest, width, Style::default().add_modifier(Modifier::BOLD));
-        } else if let Some(rest) = line.strip_prefix("### ") {
-            push_heading(
-                &mut lines,
-                rest,
-                width,
-                Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD),
-            );
-        } else if let Some(rest) = line.strip_prefix("## ") {
-            push_heading(
-                &mut lines,
-                rest,
-                width,
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            );
-        } else if let Some(rest) = line.strip_prefix("# ") {
-            push_heading(
-                &mut lines,
-                rest,
-                width,
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            );
-        } else if let Some(rest) = line.strip_prefix("> ") {
-            push_blockquote(&mut lines, rest, width);
-        } else if let Some((marker, rest)) = list_item(line) {
-            push_list_item(&mut lines, &marker, rest, width);
-        } else if line.trim().is_empty() {
-            lines.push(Line::from(""));
-        } else {
-            for w in wrap_text(line, width) {
-                lines.push(Line::from(inline_spans(&w, Style::default())));
-            }
-        }
-    }
-
-    lines
-}
-
-fn push_heading(lines: &mut Vec<Line<'static>>, text: &str, width: usize, style: Style) {
-    for w in wrap_text(text, width) {
-        lines.push(Line::from(Span::styled(w, style)));
-    }
-}
-
-fn push_blockquote(lines: &mut Vec<Line<'static>>, text: &str, width: usize) {
-    let style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
-    let inner = width.saturating_sub(2).max(1);
-    for w in wrap_text(text, inner) {
-        lines.push(Line::from(inline_spans(&format!("│ {w}"), style)));
-    }
-}
-
-fn push_list_item(lines: &mut Vec<Line<'static>>, marker: &str, text: &str, width: usize) {
-    let prefix = format!("  {marker} ");
-    let cont = " ".repeat(prefix.chars().count());
-    let inner = width.saturating_sub(prefix.chars().count()).max(1);
-    let wrapped = wrap_text(text, inner);
-    if wrapped.is_empty() {
-        lines.push(Line::from(inline_spans(&prefix, Style::default())));
-        return;
-    }
-    for (i, w) in wrapped.into_iter().enumerate() {
-        let p = if i == 0 { prefix.as_str() } else { cont.as_str() };
-        lines.push(Line::from(inline_spans(&format!("{p}{w}"), Style::default())));
-    }
-}
-
-/// Detect a list item prefix: `- `/`* `/`+ ` bullets or `N. ` numbers.
-/// Returns the rendered marker and the remaining content.
-fn list_item(line: &str) -> Option<(String, &str)> {
-    for b in ["- ", "* ", "+ "] {
-        if let Some(rest) = line.strip_prefix(b) {
-            return Some(("•".to_string(), rest));
-        }
-    }
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i > 0 && i < bytes.len() && bytes[i] == b'.' && i + 1 < bytes.len() && bytes[i + 1] == b' ' {
-        return Some((line[..i + 1].to_string(), &line[i + 2..]));
-    }
-    None
-}
-
-/// Parse inline `**bold**`, `*italic*`, and `` `code` `` into styled spans.
-fn inline_spans(text: &str, base: Style) -> Vec<Span<'static>> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut buf = String::new();
-    let mut chars = text.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        match c {
-            '*' if chars.peek() == Some(&'*') => {
-                chars.next();
-                flush_inline(&mut buf, base, &mut spans);
-                let (inner, closed) = take_until_double(&mut chars, '*');
-                if closed {
-                    spans.push(Span::styled(inner, base.add_modifier(Modifier::BOLD)));
-                } else {
-                    spans.push(Span::styled(format!("**{inner}"), base));
-                }
-            }
-            '*' => {
-                flush_inline(&mut buf, base, &mut spans);
-                let (inner, closed) = take_until_char(&mut chars, '*');
-                if closed {
-                    spans.push(Span::styled(inner, base.add_modifier(Modifier::ITALIC)));
-                } else {
-                    spans.push(Span::styled(format!("*{inner}"), base));
-                }
-            }
-            '`' => {
-                flush_inline(&mut buf, base, &mut spans);
-                let (inner, closed) = take_until_char(&mut chars, '`');
-                if closed {
-                    spans.push(Span::styled(inner, base.fg(Color::Yellow)));
-                } else {
-                    spans.push(Span::styled(format!("`{inner}"), base));
-                }
-            }
-            _ => buf.push(c),
-        }
-    }
-    flush_inline(&mut buf, base, &mut spans);
-    spans
-}
-
-fn flush_inline(buf: &mut String, base: Style, spans: &mut Vec<Span<'static>>) {
-    if !buf.is_empty() {
-        spans.push(Span::styled(std::mem::take(buf), base));
-    }
-}
-
-fn take_until_char(chars: &mut std::iter::Peekable<std::str::Chars>, ch: char) -> (String, bool) {
-    let mut s = String::new();
-    for c in chars.by_ref() {
-        if c == ch {
-            return (s, true);
-        }
-        s.push(c);
-    }
-    (s, false)
-}
-
-fn take_until_double(chars: &mut std::iter::Peekable<std::str::Chars>, ch: char) -> (String, bool) {
-    let mut s = String::new();
-    while let Some(c) = chars.next() {
-        if c == ch && chars.peek() == Some(&ch) {
-            chars.next();
-            return (s, true);
-        }
-        s.push(c);
-    }
-    (s, false)
 }
 
 fn draw_events(frame: &mut Frame, app: &App, area: Rect) {
@@ -759,16 +514,6 @@ fn draw_events(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(table, area);
 }
 
-fn draw_placeholder(frame: &mut Frame, app: &App, area: Rect) {
-    let msg = format!("The {} tab arrives in a later milestone.", app.tab.label());
-    let p = Paragraph::new(msg).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(app.tab.label()),
-    );
-    frame.render_widget(p, area);
-}
-
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let (state_txt, color) = match app.conn {
         ConnState::Connected => ("connected", Color::Green),
@@ -778,7 +523,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 
     let left = format!(" {state_txt} · {}", app.conn_detail);
     let right = format!(
-        "tasks: {}  events: {}  [↑↓] select  [Enter] chat  [Tab] switch  [q] quit",
+        "tasks: {}  events: {}  [↑↓] select  [Enter] agent  [Tab] switch  [q] quit",
         app.tasks.len(),
         app.events.len()
     );
@@ -824,139 +569,54 @@ fn age(ts: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn line_text(line: &Line) -> String {
-        line.spans.iter().map(|s| s.content.as_ref()).collect::<String>()
-    }
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     #[test]
-    fn thinking_box_has_border_and_uniform_width() {
-        let mut lines = Vec::new();
-        let width = 40usize;
-        push_thinking(&mut lines, "hello world this is reasoning", true, false, "", width);
-        let texts: Vec<String> = lines.iter().map(line_text).collect();
-
-        assert!(texts.len() >= 3, "expected top + body + bottom, got {texts:?}");
-        assert!(texts[0].starts_with('┌') && texts[0].ends_with('┐'));
-        assert!(texts[0].contains("▾ Thinking"));
-        assert!(texts.last().unwrap().starts_with('└'));
-        for t in &texts {
-            assert_eq!(t.chars().count(), width, "box line width mismatch: {t:?}");
-        }
-        for t in &texts[1..texts.len() - 1] {
-            assert!(t.starts_with('│') && t.ends_with('│'), "body line: {t:?}");
-        }
-    }
-
-    #[test]
-    fn collapsed_thinking_box_is_compact() {
-        let mut lines = Vec::new();
-        push_thinking(&mut lines, "", false, false, "", 40);
-        let texts: Vec<String> = lines.iter().map(line_text).collect();
-        assert_eq!(texts.len(), 2);
-        assert!(texts[0].contains("▸ Thinking"));
-    }
-
-    #[test]
-    fn tab_regions_map_columns_correctly() {
+    fn tab_regions_cover_every_tab() {
         let regions = tab_click_regions(0, 0);
-        let find = |col: u16| {
-            regions
-                .iter()
-                .find(|(_, s, e)| col >= *s && col < *e)
-                .map(|(t, _, _)| *t)
-        };
-        assert_eq!(find(2), Some(Tab::Tasks));
-        assert_eq!(find(10), Some(Tab::Catalog));
-        assert_eq!(find(20), Some(Tab::Chat));
-        assert_eq!(find(27), Some(Tab::Events));
-        assert_eq!(find(81), Some(Tab::Mcp));
+        assert_eq!(regions.len(), Tab::ALL.len());
+        for (i, (tab, start, end)) in regions.iter().enumerate() {
+            assert_eq!(*tab, Tab::ALL[i]);
+            assert!(end > start);
+            assert_eq!((end - start) as usize, tab.label().chars().count());
+        }
     }
 
     #[test]
-    fn thinking_click_region_matches_render() {
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
+    fn all_tabs_render_without_panic() {
+        for tab in Tab::ALL {
+            let mut app = App::new();
+            app.tab = tab;
+            let backend = TestBackend::new(80, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+        }
+    }
 
+    #[test]
+    fn agent_tab_renders_terminal_screen() {
         let mut app = App::new();
-        app.tab = Tab::Chat;
-        app.chat_messages = vec![favetto_core::model::ChatMessage {
-            role: MessageRole::Assistant,
-            content: "answer".to_string(),
-            reasoning: Some("reasoning text".to_string()),
-        }];
-        app.sync_collapse();
+        app.tab = Tab::Agent;
+        app.agent_session_id = Some("s1".into());
+        app.agent_name = Some("demo".into());
+        app.agent_running = true;
+        app.term.process(b"hello agent");
 
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
 
-        let region = app
-            .click_regions
-            .iter()
-            .find(|r| matches!(r.action, ClickAction::ToggleThinking(_)))
-            .expect("no thinking click region recorded");
-
         let buffer = terminal.backend().buffer();
-        let cell = buffer
-            .cell((region.col_start, region.row))
-            .expect("region out of bounds");
-        assert_eq!(cell.symbol(), "┌", "thinking header should start with a box corner");
-    }
-
-    #[test]
-    fn clicking_thinking_region_toggles_collapse() {
-        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-
-        let mut app = App::new();
-        app.chat_messages = vec![favetto_core::model::ChatMessage {
-            role: MessageRole::Assistant,
-            content: "answer".to_string(),
-            reasoning: Some("reasoning".to_string()),
-        }];
-        app.sync_collapse();
-        app.click_regions.push(ClickRegion {
-            row: 3,
-            col_start: 1,
-            col_end: 79,
-            action: ClickAction::ToggleThinking(0),
-        });
-
-        assert!(app.thinking_collapsed[0]);
-        app.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 5,
-            row: 3,
-            modifiers: KeyModifiers::empty(),
-        });
-        assert!(!app.thinking_collapsed[0], "click should expand the thinking box");
-    }
-
-    #[test]
-    fn markdown_renders_headings_lists_and_inline() {
-        let out = render_markdown("# Title\n\n- one\n- **two**\n\n1. first\n2. `code`\n", 40);
-        let texts: Vec<String> = out.iter().map(line_text).collect();
-
-        assert!(texts.iter().any(|t| t == "Title"), "heading: {texts:?}");
-        assert!(texts.iter().any(|t| t == "  • one"), "bullet: {texts:?}");
-        assert!(texts.iter().any(|t| t == "  • two"), "bold bullet: {texts:?}");
-        assert!(texts.iter().any(|t| t == "  1. first"), "numbered: {texts:?}");
-        assert!(texts.iter().any(|t| t == "  2. code"), "numbered code: {texts:?}");
-
-        let bold_span = out
-            .iter()
-            .flat_map(|l| l.spans.iter())
-            .find(|s| s.content.as_ref() == "two")
-            .expect("bold span missing");
-        assert!(bold_span.style.add_modifier.contains(Modifier::BOLD));
-    }
-
-    #[test]
-    fn markdown_renders_code_blocks_and_quotes() {
-        let out = render_markdown("```\nlet x = 1;\n```\n\n> quoted\n", 40);
-        let texts: Vec<String> = out.iter().map(line_text).collect();
-        assert!(texts.iter().any(|t| t == "let x = 1;"), "code body: {texts:?}");
-        assert!(texts.iter().any(|t| t == "│ quoted"), "quote: {texts:?}");
-        assert!(!texts.iter().any(|t| t.contains("```")), "fences stripped: {texts:?}");
+        let area = *buffer.area();
+        let mut text = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    text.push_str(cell.symbol());
+                }
+            }
+        }
+        assert!(text.contains("hello agent"), "screen not rendered: {text:?}");
     }
 }

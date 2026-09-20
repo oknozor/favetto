@@ -1,5 +1,0 @@
-target/
-.git/
-**/*.rs.bk
-.orchestrator/
-workdir/SUMMARY.md

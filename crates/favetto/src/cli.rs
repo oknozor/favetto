@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
-/// favetto — LLM-driven agent orchestrator (daemon, remote TUI, MCP tooling).
+/// favetto — LLM-driven agent orchestrator (daemon + remote TUI).
 #[derive(Parser)]
 #[command(name = "favetto", version, about, long_about = None)]
 pub struct Cli {
@@ -21,20 +21,16 @@ pub enum Command {
     Daemon(DaemonArgs),
     /// Attach the TUI to a running daemon (local Unix socket or remote WebSocket).
     Tui(TuiArgs),
-    /// Expose favetto itself as an MCP server (bridges to a running daemon).
-    McpServe(McpServeArgs),
     /// Print a short-lived pairing code for remote TUI attachment.
     Pair(PairArgs),
     /// Rotate the bearer token.
     TokenRotate(TokenRotateArgs),
-    /// Internal: run a built-in MCP server in-process (spawned by the daemon).
-    #[command(name = "__mcp", hide = true)]
-    InternalMcp {
-        /// Built-in server name (e.g. `mcp-filesystem`).
-        server: String,
-        /// Server-specific arguments.
+    /// Internal: exec an agent process with a parent-death signal (spawned by the daemon).
+    #[command(name = "__agent-exec", hide = true)]
+    InternalAgentExec {
+        /// The agent command and its arguments (after `--`).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        argv: Vec<String>,
     },
 }
 
@@ -74,19 +70,6 @@ pub struct TuiArgs {
     /// Short-lived pairing code to exchange for a token (remote attach only).
     #[arg(long)]
     pub pair_code: Option<String>,
-}
-
-#[derive(Args)]
-pub struct McpServeArgs {
-    /// Unix socket of the daemon to bridge to.
-    #[arg(long, default_value = "/tmp/favetto.sock")]
-    pub socket: PathBuf,
-    /// Remote WebSocket URL of the daemon (alternative to --socket).
-    #[arg(long)]
-    pub remote: Option<String>,
-    /// Bearer token for remote attach.
-    #[arg(long)]
-    pub token: Option<String>,
 }
 
 #[derive(Args)]

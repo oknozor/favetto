@@ -1,4 +1,4 @@
-model = "deepseek:deepseek-v4-flash"
+agent = "opencode"
 ---
 
 Say Hello Tom

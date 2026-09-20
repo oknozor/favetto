@@ -71,6 +71,15 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let pool = db::open(&db_path).await?;
     db::migrate(&pool).await?;
 
+    // Tasks left running by a previous instance are interrupted: their agent
+    // process died with the old daemon, so mark them failed rather than letting
+    // them linger (the executor only ever picks up `pending` tasks).
+    match db::fail_interrupted_tasks(&pool).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(count = n, "marked interrupted task(s) as failed"),
+        Err(e) => tracing::warn!(error = %e, "failed to reconcile interrupted tasks"),
+    }
+
     let token = Token::load_or_create(&token_path)?;
     tracing::info!(
         data_dir = %data_dir.display(),
@@ -83,7 +92,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let catalog = Arc::new(std::sync::RwLock::new(
         crate::tasks::load_catalog(&tasks_dir)?,
     ));
-    let chat = crate::chat::ChatManager::new(pool.clone(), config.clone(), catalog.clone());
+    let agents = crate::agents::AgentManager::new();
     let scheduler = tokio_cron_scheduler::JobScheduler::new().await?;
     let hook_store = Arc::new(std::sync::RwLock::new(hooks::load_hooks(&hooks_path)?));
 
@@ -92,9 +101,9 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         bus,
         token,
         WebhookSecrets::from_env(),
-        chat,
+        agents,
         config,
-        config_path,
+        data_dir.clone(),
         tasks_dir,
         catalog,
         scheduler,

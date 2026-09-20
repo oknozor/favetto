@@ -36,12 +36,18 @@ pub mod method {
     /// (Re)subscribe to the live event stream. Accepts `last_event_id` to replay
     /// missed events before switching to live delivery.
     pub const EVENTS_SUBSCRIBE: &str = "events.subscribe";
-    /// Open (or reopen) a chat session for a task.
-    pub const CHAT_OPEN: &str = "chat.open";
-    /// Send a user message to a chat session and run one agent turn.
-    pub const CHAT_SEND: &str = "chat.send";
-    /// Fetch a chat session's full conversation.
-    pub const CHAT_MESSAGES: &str = "chat.messages";
+    /// List configured external agents and live agent sessions.
+    pub const AGENTS_LIST: &str = "agents.list";
+    /// Start an external agent session (optionally attached to a task).
+    pub const AGENTS_START: &str = "agents.start";
+    /// Write raw bytes (base64) to a session's PTY.
+    pub const AGENTS_INPUT: &str = "agents.input";
+    /// Resize a session's PTY.
+    pub const AGENTS_RESIZE: &str = "agents.resize";
+    /// Attach to a session: returns the session and a replay of its output.
+    pub const AGENTS_ATTACH: &str = "agents.attach";
+    /// Terminate a session.
+    pub const AGENTS_CLOSE: &str = "agents.close";
     /// List cron schedules.
     pub const SCHEDULES_LIST: &str = "schedules.list";
     /// Create or update a cron schedule.
@@ -52,8 +58,6 @@ pub mod method {
     pub const NOTIFICATIONS_LIST: &str = "notifications.list";
     /// Send a test notification through a channel.
     pub const NOTIFICATIONS_TEST: &str = "notifications.test";
-    /// Add or update an LLM provider (runtime + persisted config).
-    pub const CONFIG_SET_PROVIDER: &str = "config.set_provider";
     /// Add a notification hook reacting to an event kind.
     pub const HOOKS_UPSERT: &str = "hooks.upsert";
 }
@@ -63,10 +67,10 @@ pub mod push {
     pub const EVENT: &str = "event";
     pub const TASK_UPDATED: &str = "task.updated";
     pub const LOG_LINE: &str = "log.line";
-    /// A streamed answer token for a chat session.
-    pub const CHAT_DELTA: &str = "chat.delta";
-    /// A streamed reasoning/thinking token for a chat session.
-    pub const CHAT_REASONING: &str = "chat.reasoning";
+    /// Raw PTY output (base64) from a running agent session.
+    pub const AGENT_OUTPUT: &str = "agent.output";
+    /// An agent session's child process exited.
+    pub const AGENT_EXIT: &str = "agent.exit";
 }
 
 /// A client → server request.

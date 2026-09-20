@@ -3,13 +3,6 @@ resolver = "2"
 members = [
     "crates/favetto-core",
     "crates/favetto",
-    "crates/mcp-filesystem",
-    "crates/favetto-integrations",
-    "crates/mcp-linear",
-    "crates/mcp-github",
-    "crates/mock-linear",
-    "crates/mcp-gmail",
-    "crates/mock-gmail",
 ]
 
 [workspace.package]
