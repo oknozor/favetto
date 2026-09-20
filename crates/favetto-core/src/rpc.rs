@@ -33,6 +33,8 @@ pub mod method {
     pub const TASKS_START_ONESHOT: &str = "tasks.start_oneshot";
     /// List the task catalog.
     pub const CATALOG_LIST: &str = "catalog.list";
+    /// Fetch a catalog task's raw Markdown source (for the preview pane).
+    pub const CATALOG_GET: &str = "catalog.get";
     /// Add a task definition to the catalog (does not run it).
     pub const CATALOG_ADD: &str = "catalog.add";
     pub const EVENTS_TAIL: &str = "events.tail";

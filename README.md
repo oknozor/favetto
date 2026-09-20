@@ -101,6 +101,15 @@ the **Catalog** tab lists the catalog and Enter starts a task; the Ctrl+P menu's
 "Add task" writes a new `.md` file (it does not run it). Task lifecycle emits
 `task_idle` / `task_started` / `task_finished` events.
 
+The Catalog tab shows a **preview side panel** for the highlighted task: its raw
+`.md` source with the TOML front-matter highlighted as TOML and the prompt rendered
+as Markdown (headings, lists, blockquotes, fenced code, inline code/bold/italic/
+links). Moving the selection with ↑/↓ loads the preview for the new task.
+
+The Events tab is a selectable, scrolling list (↑/↓, PageUp/PageDown) with a
+**payload side panel** that pretty-prints the selected event's JSON with syntax
+highlighting (keys, strings, numbers, booleans/null).
+
 ## Milestones
 
 | Milestone | Scope | Status |

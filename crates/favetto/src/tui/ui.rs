@@ -12,6 +12,7 @@ use ratatui::Frame;
 use favetto_core::model::TaskStatus;
 
 use super::app::{App, ClickAction, ClickRegion, ConnState, Form, Popup, Tab, Wizard, WizardStep, MENU_OPTIONS};
+use super::{json, markdown};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     app.click_regions.clear();
@@ -227,14 +228,23 @@ fn draw_wizard(frame: &mut Frame, wizard: &Wizard) {
 }
 
 fn draw_catalog(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::horizontal([
+        Constraint::Percentage(42),
+        Constraint::Percentage(58),
+    ])
+    .split(area);
+    draw_catalog_table(frame, app, chunks[0]);
+    draw_catalog_preview(frame, app, chunks[1]);
+}
+
+fn draw_catalog_table(frame: &mut Frame, app: &App, area: Rect) {
     let widths = [
-        Constraint::Length(24),
-        Constraint::Length(14),
-        Constraint::Length(24),
-        Constraint::Length(16),
+        Constraint::Min(14),
+        Constraint::Length(10),
+        Constraint::Length(18),
         Constraint::Min(0),
     ];
-    let header = Row::new(vec!["NAME", "AGENT", "MODEL", "SCHEDULE", "NEEDS"])
+    let header = Row::new(vec!["NAME", "AGENT", "MODEL", "NEEDS"])
         .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
 
     let rows: Vec<Row> = app
@@ -245,7 +255,6 @@ fn draw_catalog(frame: &mut Frame, app: &App, area: Rect) {
                 Cell::from(e.name.clone()),
                 Cell::from(e.agent.clone().unwrap_or_else(|| "—".to_string())),
                 Cell::from(e.model_display()),
-                Cell::from(e.schedule.clone().unwrap_or_default()),
                 Cell::from(e.needs.clone().unwrap_or_default()),
             ])
         })
@@ -256,17 +265,41 @@ fn draw_catalog(frame: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(
-                    " Catalog ({}) — ↑/↓ select, Enter to start ",
-                    app.catalog.len()
-                )),
+                .title(format!(" Catalog ({}) — Enter to start ", app.catalog.len())),
         )
         .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .column_spacing(2);
+        .column_spacing(1);
 
     let mut state = TableState::default();
     state.select(Some(app.catalog_selected));
     frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn draw_catalog_preview(frame: &mut Frame, app: &App, area: Rect) {
+    let (title, lines) = match app.catalog_preview.as_ref() {
+        Some((name, markdown)) if !markdown.trim().is_empty() => {
+            (format!(" Preview · {name} "), markdown::render_task(markdown))
+        }
+        Some((name, _)) => (
+            format!(" Preview · {name} "),
+            vec![Line::from(Span::styled(
+                "(no content)",
+                Style::default().fg(Color::DarkGray),
+            ))],
+        ),
+        None => (
+            " Preview ".to_string(),
+            vec![Line::from(Span::styled(
+                "Select a task to preview its definition.",
+                Style::default().fg(Color::DarkGray),
+            ))],
+        ),
+    };
+
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
 }
 
 fn draw_schedules(frame: &mut Frame, app: &App, area: Rect) {
@@ -537,54 +570,73 @@ fn tab_click_regions(x0: u16, _y0: u16) -> Vec<(Tab, u16, u16)> {
 }
 
 fn draw_events(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::horizontal([
+        Constraint::Percentage(40),
+        Constraint::Percentage(60),
+    ])
+    .split(area);
+    draw_event_list(frame, app, chunks[0]);
+    draw_event_payload(frame, app, chunks[1]);
+}
+
+fn draw_event_list(frame: &mut Frame, app: &App, area: Rect) {
     let widths = [
         Constraint::Length(8),
-        Constraint::Length(18),
-        Constraint::Length(10),
-        Constraint::Min(0),
+        Constraint::Min(18),
+        Constraint::Length(8),
     ];
-    let header = Row::new(vec!["ID", "KIND", "AGE", "PAYLOAD"])
+    let header = Row::new(vec!["ID", "KIND", "AGE"])
         .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
 
-    let max_rows = area.height.saturating_sub(3) as usize;
-    let mut rows: Vec<Row> = app
+    let rows: Vec<Row> = app
         .events
         .iter()
         .rev()
-        .take(max_rows)
         .map(|e| {
-            let payload = e.payload.to_string();
-            let payload = if payload.chars().count() > 60 {
-                format!("{}…", payload.chars().take(60).collect::<String>())
-            } else {
-                payload
-            };
             Row::new(vec![
                 Cell::from(e.id.to_string()),
                 Cell::from(e.kind.as_str()),
                 Cell::from(age(e.created_at)),
-                Cell::from(payload),
             ])
         })
         .collect();
-    if rows.is_empty() {
-        rows.push(Row::new(vec![
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from("(no events yet)"),
-        ]));
-    }
 
     let table = Table::new(rows, widths)
         .header(header)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" Events ({}) ", app.events.len())),
+                .title(format!(" Events ({}) — ↑/↓ select ", app.events.len())),
         )
-        .column_spacing(2);
-    frame.render_widget(table, area);
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .column_spacing(1);
+
+    let mut state = TableState::default();
+    if !app.events.is_empty() {
+        state.select(Some(app.events_selected.min(app.events.len() - 1)));
+    }
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn draw_event_payload(frame: &mut Frame, app: &App, area: Rect) {
+    let (title, lines) = match app.selected_event() {
+        Some(ev) => (
+            format!(" Payload · {} #{} ", ev.kind.as_str(), ev.id),
+            json::render(&ev.payload),
+        ),
+        None => (
+            " Payload ".to_string(),
+            vec![Line::from(Span::styled(
+                "(no events yet)",
+                Style::default().fg(Color::DarkGray),
+            ))],
+        ),
+    };
+
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
@@ -713,5 +765,77 @@ mod tests {
             }
         }
         assert!(text.contains("hello agent"), "screen not rendered: {text:?}");
+    }
+
+    #[test]
+    fn catalog_preview_renders_task_markdown() {
+        use super::super::app::CatalogEntry;
+
+        let mut app = App::new();
+        app.tab = Tab::Catalog;
+        app.catalog = vec![CatalogEntry {
+            name: "demo".to_string(),
+            agent: Some("opencode".to_string()),
+            provider: None,
+            model: Some("deepseek-v4-flash".to_string()),
+            cwd: None,
+            needs: None,
+            prompt: String::new(),
+        }];
+        app.catalog_preview = Some((
+            "demo".to_string(),
+            "agent = \"opencode\"\n---\n# Heading\n\n- item\n".to_string(),
+        ));
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let area = *buffer.area();
+        let mut text = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    text.push_str(cell.symbol());
+                }
+            }
+        }
+        assert!(text.contains("Preview"), "preview title missing: {text:?}");
+        assert!(text.contains("Heading"), "rendered heading missing: {text:?}");
+        assert!(text.contains("item"), "rendered list missing: {text:?}");
+    }
+
+    #[test]
+    fn events_tab_renders_payload_panel() {
+        use chrono::Utc;
+        use favetto_core::model::{Event, EventKind};
+
+        let mut app = App::new();
+        app.tab = Tab::Events;
+        app.ingest_event(Event {
+            id: 1,
+            kind: EventKind::Synthetic,
+            payload: serde_json::json!({ "hello": "world", "n": 3 }),
+            created_at: Utc::now(),
+        });
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let area = *buffer.area();
+        let mut text = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    text.push_str(cell.symbol());
+                }
+            }
+        }
+        assert!(text.contains("Payload"), "payload title missing: {text:?}");
+        assert!(text.contains("hello"), "payload key missing: {text:?}");
+        assert!(text.contains("world"), "payload value missing: {text:?}");
     }
 }

@@ -337,6 +337,31 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
             Ok(serde_json::json!(list))
         }
 
+        method::CATALOG_GET => match req.params.get("name").and_then(|v| v.as_str()) {
+            None => Err((error_code::INVALID_PARAMS, "missing 'name'".to_string())),
+            Some(name) => {
+                let path = state.tasks_dir.join(format!("{name}.md"));
+                let markdown = std::fs::read_to_string(&path)
+                    .ok()
+                    .or_else(|| {
+                        state
+                            .catalog
+                            .read()
+                            .unwrap()
+                            .iter()
+                            .find(|d| d.name == name)
+                            .map(crate::tasks::to_markdown)
+                    });
+                match markdown {
+                    Some(markdown) => Ok(serde_json::json!({ "markdown": markdown })),
+                    None => Err((
+                        error_code::INVALID_PARAMS,
+                        format!("unknown task '{name}'"),
+                    )),
+                }
+            }
+        },
+
         method::CATALOG_ADD => match add_catalog_task(state, &req.params) {
             Ok(def) => Ok(serde_json::json!({
                 "name": def.name,

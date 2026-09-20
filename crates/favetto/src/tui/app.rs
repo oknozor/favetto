@@ -162,8 +162,6 @@ pub struct CatalogEntry {
     #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default)]
-    pub schedule: Option<String>,
-    #[serde(default)]
     pub needs: Option<String>,
     #[serde(default)]
     pub prompt: String,
@@ -209,6 +207,8 @@ pub struct App {
     pub conn_detail: String,
     pub tasks: Vec<Task>,
     pub events: VecDeque<Event>,
+    /// Selected event, counted from the newest (0 = newest).
+    pub events_selected: usize,
     pub last_event_id: i64,
     pub logs: VecDeque<String>,
     pub should_quit: bool,
@@ -219,6 +219,10 @@ pub struct App {
     // Task catalog.
     pub catalog: Vec<CatalogEntry>,
     pub catalog_selected: usize,
+    /// Raw Markdown of the selected catalog task as `(name, source)`.
+    pub catalog_preview: Option<(String, String)>,
+    /// Name currently being fetched for the preview (avoids duplicate requests).
+    pub catalog_preview_pending: Option<String>,
 
     // Embedded agent terminal.
     pub agent_session_id: Option<String>,
@@ -261,12 +265,15 @@ impl App {
             conn_detail: String::new(),
             tasks: Vec::new(),
             events: VecDeque::new(),
+            events_selected: 0,
             last_event_id: 0,
             logs: VecDeque::new(),
             should_quit: false,
             tasks_selected: 0,
             catalog: Vec::new(),
             catalog_selected: 0,
+            catalog_preview: None,
+            catalog_preview_pending: None,
             agent_session_id: None,
             agent_task_id: None,
             agent_name: None,
@@ -303,6 +310,26 @@ impl App {
 
     pub fn select_prev(&mut self) {
         self.tasks_selected = self.tasks_selected.saturating_sub(1);
+    }
+
+    /// The catalog task whose preview should be loaded, if the Catalog tab is
+    /// showing a task that isn't already loaded or being fetched.
+    pub fn catalog_preview_target(&self) -> Option<String> {
+        if self.tab != Tab::Catalog {
+            return None;
+        }
+        let name = self.catalog.get(self.catalog_selected)?.name.clone();
+        if self
+            .catalog_preview
+            .as_ref()
+            .is_some_and(|(loaded, _)| loaded == &name)
+        {
+            return None;
+        }
+        if self.catalog_preview_pending.as_deref() == Some(name.as_str()) {
+            return None;
+        }
+        Some(name)
     }
 
     /// Adopt a newly started agent session (with its current screen frame) and
@@ -771,6 +798,7 @@ impl App {
                 match self.tab {
                     Tab::Tasks => self.select_prev(),
                     Tab::Catalog => self.catalog_selected = self.catalog_selected.saturating_sub(1),
+                    Tab::Events => self.events_selected = self.events_selected.saturating_sub(1),
                     _ => {}
                 }
                 UiAction::None
@@ -782,7 +810,22 @@ impl App {
                         self.catalog_selected =
                             (self.catalog_selected + 1).min(self.catalog.len() - 1);
                     }
+                    Tab::Events if !self.events.is_empty() => {
+                        self.events_selected =
+                            (self.events_selected + 1).min(self.events.len() - 1);
+                    }
                     _ => {}
+                }
+                UiAction::None
+            }
+            KeyCode::PageUp if self.tab == Tab::Events => {
+                self.events_selected = self.events_selected.saturating_sub(10);
+                UiAction::None
+            }
+            KeyCode::PageDown if self.tab == Tab::Events => {
+                if !self.events.is_empty() {
+                    self.events_selected =
+                        (self.events_selected + 10).min(self.events.len() - 1);
                 }
                 UiAction::None
             }
@@ -859,6 +902,16 @@ impl App {
             self.last_event_id = ev.id;
             self.events.push_back(ev);
         }
+    }
+
+    /// The event at the current selection (0 = newest).
+    pub fn selected_event(&self) -> Option<&Event> {
+        let n = self.events.len();
+        if n == 0 {
+            return None;
+        }
+        let offset = self.events_selected.min(n - 1);
+        self.events.get(n - 1 - offset)
     }
 }
 

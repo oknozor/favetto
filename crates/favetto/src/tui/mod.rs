@@ -2,6 +2,8 @@
 //! wire protocol whether attached locally (Unix socket) or remotely (WebSocket).
 
 mod app;
+mod json;
+mod markdown;
 mod term;
 mod ui;
 
@@ -173,6 +175,29 @@ async fn fetch_catalog(client: &Client, app: &mut App) {
     }
 }
 
+/// Load the raw Markdown for the selected catalog task, if the preview needs it.
+async fn maybe_load_catalog_preview(client: &Client, app: &mut App) {
+    let Some(name) = app.catalog_preview_target() else {
+        return;
+    };
+    app.catalog_preview_pending = Some(name.clone());
+    let markdown = match client
+        .request(method::CATALOG_GET, serde_json::json!({ "name": name }))
+        .await
+    {
+        Ok(resp) => resp
+            .result
+            .and_then(|v| v.get("markdown").and_then(|m| m.as_str()).map(str::to_string))
+            .unwrap_or_default(),
+        Err(e) => {
+            app.logs.push_back(format!("catalog.get failed: {e}"));
+            String::new()
+        }
+    };
+    app.catalog_preview = Some((name, markdown));
+    app.catalog_preview_pending = None;
+}
+
 /// Re-fetch the list-based tabs (used after a form submission).
 async fn refresh_lists(client: &Client, app: &mut App) {
     if let Ok(resp) = client.request(method::TASKS_LIST, serde_json::json!({})).await {
@@ -305,6 +330,9 @@ async fn run_session(
                 }
             }
         }
+
+        // Load the Catalog preview for the selected task, if needed.
+        maybe_load_catalog_preview(client, app).await;
     }
 }
 
