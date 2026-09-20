@@ -910,9 +910,25 @@ fn add_catalog_task(state: &Arc<State>, params: &serde_json::Value) -> anyhow::R
     }
     let schedule = params.get("schedule").and_then(|v| v.as_str()).map(str::to_string);
     let needs = params.get("needs").and_then(|v| v.as_str()).map(str::to_string);
+    let spawn = params.get("spawn").and_then(|v| v.as_str()).map(str::to_string);
+    let spawn_file = params
+        .get("spawn_file")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     let prompt = params.get("prompt").and_then(|v| v.as_str()).unwrap_or_default().to_string();
 
-    let def = TaskDef { name, agent, provider, model, cwd, schedule, needs, prompt };
+    let def = TaskDef {
+        name,
+        agent,
+        provider,
+        model,
+        cwd,
+        schedule,
+        needs,
+        spawn,
+        spawn_file,
+        prompt,
+    };
     crate::tasks::write_task_md(&state.tasks_dir, &def)?;
 
     // Update the live catalog.

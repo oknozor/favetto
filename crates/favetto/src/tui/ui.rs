@@ -227,7 +227,7 @@ fn draw_wizard(frame: &mut Frame, wizard: &Wizard) {
     frame.render_widget(paragraph, rect);
 }
 
-fn draw_catalog(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_catalog(frame: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::horizontal([
         Constraint::Percentage(42),
         Constraint::Percentage(58),
@@ -275,20 +275,23 @@ fn draw_catalog_table(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-fn draw_catalog_preview(frame: &mut Frame, app: &App, area: Rect) {
-    let (title, lines) = match app.catalog_preview.as_ref() {
+fn draw_catalog_preview(frame: &mut Frame, app: &mut App, area: Rect) {
+    // Remember the pane's rectangle so the mouse wheel can be targeted at it.
+    app.catalog_preview_area = Some(area);
+
+    let (name, lines) = match app.catalog_preview.as_ref() {
         Some((name, markdown)) if !markdown.trim().is_empty() => {
-            (format!(" Preview · {name} "), markdown::render_task(markdown))
+            (Some(name.as_str()), markdown::render_task(markdown))
         }
         Some((name, _)) => (
-            format!(" Preview · {name} "),
+            Some(name.as_str()),
             vec![Line::from(Span::styled(
                 "(no content)",
                 Style::default().fg(Color::DarkGray),
             ))],
         ),
         None => (
-            " Preview ".to_string(),
+            None,
             vec![Line::from(Span::styled(
                 "Select a task to preview its definition.",
                 Style::default().fg(Color::DarkGray),
@@ -296,9 +299,29 @@ fn draw_catalog_preview(frame: &mut Frame, app: &App, area: Rect) {
         ),
     };
 
-    let paragraph = Paragraph::new(lines)
+    // Measure the wrapped content so the scroll offset can be clamped to it.
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let inner_width = area.width.saturating_sub(2);
+    let inner_height = area.height.saturating_sub(2);
+    let line_count = paragraph.line_count(inner_width) as u16;
+    app.catalog_preview_max_scroll = line_count.saturating_sub(inner_height);
+    app.catalog_preview_scroll = app
+        .catalog_preview_scroll
+        .min(app.catalog_preview_max_scroll);
+
+    let hint = if app.catalog_preview_max_scroll > 0 {
+        " · PgUp/PgDn or wheel to scroll"
+    } else {
+        ""
+    };
+    let title = match name {
+        Some(name) => format!(" Preview · {name}{hint} "),
+        None => format!(" Preview{hint} "),
+    };
+
+    let paragraph = paragraph
         .block(Block::default().borders(Borders::ALL).title(title))
-        .wrap(Wrap { trim: false });
+        .scroll((app.catalog_preview_scroll, 0));
     frame.render_widget(paragraph, area);
 }
 
@@ -804,6 +827,54 @@ mod tests {
         assert!(text.contains("Preview"), "preview title missing: {text:?}");
         assert!(text.contains("Heading"), "rendered heading missing: {text:?}");
         assert!(text.contains("item"), "rendered list missing: {text:?}");
+    }
+
+    #[test]
+    fn catalog_preview_scrolls_to_later_content() {
+        use super::super::app::CatalogEntry;
+
+        let mut app = App::new();
+        app.tab = Tab::Catalog;
+        app.catalog = vec![CatalogEntry {
+            name: "demo".to_string(),
+            agent: None,
+            provider: None,
+            model: None,
+            cwd: None,
+            needs: None,
+            prompt: String::new(),
+        }];
+        let mut markdown = String::new();
+        for i in 0..80 {
+            markdown.push_str(&format!("line {i}\n"));
+        }
+        app.catalog_preview = Some(("demo".to_string(), markdown));
+
+        let backend = TestBackend::new(100, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(
+            app.catalog_preview_max_scroll > 0,
+            "content should overflow the pane"
+        );
+
+        app.catalog_preview_scroll = app.catalog_preview_max_scroll;
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let area = *buffer.area();
+        let mut text = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    text.push_str(cell.symbol());
+                }
+            }
+        }
+        assert!(
+            text.contains("line 79"),
+            "scrolled content missing: {text:?}"
+        );
     }
 
     #[test]

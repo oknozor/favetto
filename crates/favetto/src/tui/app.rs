@@ -223,6 +223,12 @@ pub struct App {
     pub catalog_preview: Option<(String, String)>,
     /// Name currently being fetched for the preview (avoids duplicate requests).
     pub catalog_preview_pending: Option<String>,
+    /// Vertical scroll offset (in rendered lines) of the catalog preview pane.
+    pub catalog_preview_scroll: u16,
+    /// Maximum useful scroll offset of the preview (set during draw).
+    pub catalog_preview_max_scroll: u16,
+    /// The preview pane's screen rectangle (set during draw) for mouse hit tests.
+    pub catalog_preview_area: Option<Rect>,
 
     // Embedded agent terminal.
     pub agent_session_id: Option<String>,
@@ -274,6 +280,9 @@ impl App {
             catalog_selected: 0,
             catalog_preview: None,
             catalog_preview_pending: None,
+            catalog_preview_scroll: 0,
+            catalog_preview_max_scroll: 0,
+            catalog_preview_area: None,
             agent_session_id: None,
             agent_task_id: None,
             agent_name: None,
@@ -330,6 +339,26 @@ impl App {
             return None;
         }
         Some(name)
+    }
+
+    /// Scroll the catalog preview by `delta` rendered lines (negative scrolls up),
+    /// clamped to the available content.
+    pub fn scroll_catalog_preview(&mut self, delta: i32) {
+        let max = self.catalog_preview_max_scroll as i32;
+        self.catalog_preview_scroll =
+            (self.catalog_preview_scroll as i32 + delta).clamp(0, max) as u16;
+    }
+
+    /// A page-sized scroll step for the preview: its inner height, or 10 lines
+    /// before the pane has been drawn once.
+    fn catalog_preview_page(&self) -> i32 {
+        self.catalog_preview_area
+            .map_or(10, |a| a.height.saturating_sub(2).max(1)) as i32
+    }
+
+    /// Reset the preview scroll to the top (e.g. when the selected task changes).
+    fn reset_catalog_preview_scroll(&mut self) {
+        self.catalog_preview_scroll = 0;
     }
 
     /// Adopt a newly started agent session (with its current screen frame) and
@@ -471,6 +500,29 @@ impl App {
                     let ClickAction::Tab(tab) = region.action;
                     self.tab = tab;
                     return UiAction::None;
+                }
+            }
+        }
+
+        // The wheel scrolls the Catalog preview when the pointer is over it.
+        if self.tab == Tab::Catalog {
+            if let Some(area) = self.catalog_preview_area {
+                let over = mouse.column >= area.x
+                    && mouse.column < area.x + area.width
+                    && mouse.row >= area.y
+                    && mouse.row < area.y + area.height;
+                if over {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => {
+                            self.scroll_catalog_preview(-3);
+                            return UiAction::None;
+                        }
+                        MouseEventKind::ScrollDown => {
+                            self.scroll_catalog_preview(3);
+                            return UiAction::None;
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -797,7 +849,10 @@ impl App {
             KeyCode::Up => {
                 match self.tab {
                     Tab::Tasks => self.select_prev(),
-                    Tab::Catalog => self.catalog_selected = self.catalog_selected.saturating_sub(1),
+                    Tab::Catalog => {
+                        self.catalog_selected = self.catalog_selected.saturating_sub(1);
+                        self.reset_catalog_preview_scroll();
+                    }
                     Tab::Events => self.events_selected = self.events_selected.saturating_sub(1),
                     _ => {}
                 }
@@ -809,6 +864,7 @@ impl App {
                     Tab::Catalog if !self.catalog.is_empty() => {
                         self.catalog_selected =
                             (self.catalog_selected + 1).min(self.catalog.len() - 1);
+                        self.reset_catalog_preview_scroll();
                     }
                     Tab::Events if !self.events.is_empty() => {
                         self.events_selected =
@@ -818,14 +874,32 @@ impl App {
                 }
                 UiAction::None
             }
-            KeyCode::PageUp if self.tab == Tab::Events => {
-                self.events_selected = self.events_selected.saturating_sub(10);
+            KeyCode::PageUp => {
+                match self.tab {
+                    Tab::Events => {
+                        self.events_selected = self.events_selected.saturating_sub(10);
+                    }
+                    Tab::Catalog => {
+                        let page = self.catalog_preview_page();
+                        self.scroll_catalog_preview(-page);
+                    }
+                    _ => {}
+                }
                 UiAction::None
             }
-            KeyCode::PageDown if self.tab == Tab::Events => {
-                if !self.events.is_empty() {
-                    self.events_selected =
-                        (self.events_selected + 10).min(self.events.len() - 1);
+            KeyCode::PageDown => {
+                match self.tab {
+                    Tab::Events => {
+                        if !self.events.is_empty() {
+                            self.events_selected =
+                                (self.events_selected + 10).min(self.events.len() - 1);
+                        }
+                    }
+                    Tab::Catalog => {
+                        let page = self.catalog_preview_page();
+                        self.scroll_catalog_preview(page);
+                    }
+                    _ => {}
                 }
                 UiAction::None
             }
@@ -1128,6 +1202,65 @@ mod tests {
             UiAction::None
         ));
         assert_eq!(app.tab, Tab::Tasks);
+    }
+
+    #[test]
+    fn catalog_preview_scrolls_with_keys_and_wheel() {
+        let mut app = App::new();
+        app.tab = Tab::Catalog;
+        app.catalog = vec![
+            CatalogEntry {
+                name: "a".to_string(),
+                agent: None,
+                provider: None,
+                model: None,
+                cwd: None,
+                needs: None,
+                prompt: String::new(),
+            },
+            CatalogEntry {
+                name: "b".to_string(),
+                agent: None,
+                provider: None,
+                model: None,
+                cwd: None,
+                needs: None,
+                prompt: String::new(),
+            },
+        ];
+        app.catalog_preview_max_scroll = 100;
+        app.catalog_preview_area = Some(Rect {
+            x: 40,
+            y: 1,
+            width: 40,
+            height: 20,
+        });
+
+        // PageDown/PageUp move by the pane's inner height.
+        app.handle_key(key(KeyCode::PageDown, KeyModifiers::empty()));
+        assert_eq!(app.catalog_preview_scroll, 18);
+        app.handle_key(key(KeyCode::PageUp, KeyModifiers::empty()));
+        assert_eq!(app.catalog_preview_scroll, 0);
+
+        // The wheel scrolls three lines at a time when over the pane.
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 50,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.catalog_preview_scroll, 3);
+
+        // The scroll is clamped to the content.
+        app.handle_key(key(KeyCode::PageDown, KeyModifiers::empty()));
+        for _ in 0..20 {
+            app.handle_key(key(KeyCode::PageDown, KeyModifiers::empty()));
+        }
+        assert_eq!(app.catalog_preview_scroll, 100);
+
+        // Changing the selected task resets the scroll to the top.
+        app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+        assert_eq!(app.catalog_preview_scroll, 0);
     }
 
     #[test]

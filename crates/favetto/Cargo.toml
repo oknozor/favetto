@@ -24,7 +24,7 @@ hex = "0.4"
 hmac = "0.13"
 http = "1"
 libc = "0.2"
-ratatui = "0.30"
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 portable-pty = "0.9"
 serde = { workspace = true }
 serde_json = { workspace = true }

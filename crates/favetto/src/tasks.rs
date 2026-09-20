@@ -8,11 +8,15 @@
 //! cwd = "/path/to/repo"                  # optional — working directory
 //! schedule = "0 0 * * * *"               # optional — makes this a recurring task
 //! needs = "another_task:finished"        # optional — start when `another_task` ends
+//! spawn = "child_task"                   # optional — fan out from a handoff file
+//! spawn_file = ".favetto/{{ task.id }}/manifest.json"  # array → one child per item
 //! ---
 //! You are an engineering agent…
 //! ```
 //!
 //! Everything before the first `---` line is TOML; everything after is the prompt.
+//! The prompt and `spawn_file` are rendered against a small context
+//! (`{{ task.id }}`, `{{ input.* }}`, `{{ prev.output }}`) before use.
 //! The catalog lives in a directory (`tasks/` by default) of `*.md` files.
 
 use std::path::Path;
@@ -37,6 +41,13 @@ pub struct TaskDef {
     pub schedule: Option<String>,
     /// Optional dependency, e.g. `"another_task:finished"`.
     pub needs: Option<String>,
+    /// Optional catalog task to enqueue from this task's handoff file. When set,
+    /// after a successful run the file at `spawn_file` is read as a JSON array and
+    /// one `spawn` task is enqueued per element, with that element as its input.
+    pub spawn: Option<String>,
+    /// Path (relative to the task's working directory, or absolute) of the JSON
+    /// handoff file consumed by `spawn`. Rendered as a template at run time.
+    pub spawn_file: Option<String>,
     /// The Markdown prompt body.
     pub prompt: String,
 }
@@ -55,6 +66,10 @@ struct Header {
     schedule: Option<String>,
     #[serde(default)]
     needs: Option<String>,
+    #[serde(default)]
+    spawn: Option<String>,
+    #[serde(default)]
+    spawn_file: Option<String>,
 }
 
 /// Parse a task definition from Markdown + TOML front-matter.
@@ -84,6 +99,8 @@ pub fn parse_task_md(name: &str, content: &str) -> anyhow::Result<TaskDef> {
         cwd: header.cwd,
         schedule: header.schedule,
         needs: header.needs,
+        spawn: header.spawn,
+        spawn_file: header.spawn_file,
         prompt: prompt.trim().to_string(),
     })
 }
@@ -108,6 +125,12 @@ pub fn to_markdown(def: &TaskDef) -> String {
     }
     if let Some(n) = &def.needs {
         out.push_str(&format!("needs = {n:?}\n"));
+    }
+    if let Some(s) = &def.spawn {
+        out.push_str(&format!("spawn = {s:?}\n"));
+    }
+    if let Some(s) = &def.spawn_file {
+        out.push_str(&format!("spawn_file = {s:?}\n"));
     }
     out.push_str("---\n\n");
     out.push_str(&def.prompt);
@@ -178,6 +201,8 @@ mod tests {
             cwd: Some("/tmp/repo".to_string()),
             schedule: None,
             needs: None,
+            spawn: Some("plan".to_string()),
+            spawn_file: Some(".favetto/{{ input.id }}/manifest.json".to_string()),
             prompt: "hello".to_string(),
         };
         let md = to_markdown(&def);
@@ -186,6 +211,11 @@ mod tests {
         assert_eq!(parsed.provider.as_deref(), Some("jev"));
         assert_eq!(parsed.model.as_deref(), Some("1.13"));
         assert_eq!(parsed.cwd.as_deref(), Some("/tmp/repo"));
+        assert_eq!(parsed.spawn.as_deref(), Some("plan"));
+        assert_eq!(
+            parsed.spawn_file.as_deref(),
+            Some(".favetto/{{ input.id }}/manifest.json")
+        );
         assert_eq!(parsed.prompt, "hello");
     }
 }

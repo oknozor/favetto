@@ -179,10 +179,13 @@ async fn run_one(
 
     let config = state.config.read().unwrap().clone();
 
+    let context = render_context(&task);
+    let prompt = crate::template::render(&def.prompt, &context);
+
     let agent_name = def.agent.clone().or_else(|| config.agent.default.clone());
     let outcome = match agent_name {
         Some(agent_name) => {
-            run_agent_task(state, &task, &agent_name, &config, &def, &plan.cwd).await
+            run_agent_task(state, &task, &agent_name, &config, &def, &prompt, &plan.cwd).await
         }
         None => Err(anyhow::anyhow!(
             "task '{}' has no agent: set `agent` in the task or `[agent].default` in the config",
@@ -230,6 +233,80 @@ async fn run_one(
             serde_json::json!({ "name": task.name, "task_id": task.id, "success": success }),
         )
         .await;
+
+    if success && def.spawn.is_some() {
+        if let Err(e) = spawn_from_manifest(state, &task, &def, &plan.cwd).await {
+            tracing::warn!(task = %task.name, error = %e, "failed to spawn tasks from handoff");
+        }
+    }
+}
+
+/// Build the template context for a task's prompt and handoff path. `prev` is
+/// populated from `input._prev`, which the `needs` dependency listener attaches.
+fn render_context(task: &Task) -> serde_json::Value {
+    let mut ctx = serde_json::json!({
+        "task": {
+            "id": task.id.to_string(),
+            "name": task.name,
+        },
+        "input": task.input,
+    });
+    if let Some(prev) = task.input.get("_prev") {
+        ctx["prev"] = prev.clone();
+    }
+    ctx
+}
+
+/// Read the task's `spawn_file` (rendered template), parse it as a JSON array,
+/// and enqueue one `spawn` task per element (the element becomes its `input`). An
+/// empty array is a no-op. A non-array JSON value is treated as a single element.
+async fn spawn_from_manifest(
+    state: &Arc<State>,
+    task: &Task,
+    def: &TaskDef,
+    cwd: &Path,
+) -> anyhow::Result<()> {
+    let spawn_task = def
+        .spawn
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("task '{}' has no `spawn` task", def.name))?;
+    let spawn_file = def
+        .spawn_file
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("task '{}' sets `spawn` but no `spawn_file`", def.name))?;
+
+    let rendered = crate::template::render(spawn_file, &render_context(task));
+    let path = if Path::new(&rendered).is_absolute() {
+        PathBuf::from(&rendered)
+    } else {
+        cwd.join(&rendered)
+    };
+
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("cannot read spawn_file {}: {e}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| anyhow::anyhow!("spawn_file {} is not valid JSON: {e}", path.display()))?;
+
+    let items = match value {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::Null => Vec::new(),
+        other => vec![other],
+    };
+    if items.is_empty() {
+        tracing::info!(task = %task.name, "spawn manifest is empty; nothing to enqueue");
+        return Ok(());
+    }
+
+    for (i, item) in items.into_iter().enumerate() {
+        let dedupe = format!("spawn:{}:{i}", task.id);
+        match enqueue_task(state, spawn_task.to_string(), item, Some(dedupe)).await {
+            Ok(enqueued) => {
+                tracing::info!(task = %task.name, spawned = %enqueued.id, "spawned task");
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to enqueue spawned task"),
+        }
+    }
+    Ok(())
 }
 
 /// Run a task through its configured external agent as a real PTY session bound
@@ -241,6 +318,7 @@ async fn run_agent_task(
     agent_name: &str,
     config: &crate::config::FavettoConfig,
     def: &TaskDef,
+    prompt: &str,
     cwd: &Path,
 ) -> anyhow::Result<(serde_json::Value, Option<String>)> {
     let mut agent = config
@@ -255,7 +333,7 @@ async fn run_agent_task(
         &agent,
         Some(task.id.to_string()),
         crate::agents::Invocation::Headless {
-            prompt: &def.prompt,
+            prompt,
             provider: def.provider.as_deref(),
             model: def.model.as_deref(),
         },
@@ -485,11 +563,63 @@ async fn start_dependents(state: &Arc<State>, ev: &Event) {
         .map(|d| d.name.clone())
         .collect();
 
+    // Attach the finished task's result as `input._prev` so dependent prompts can
+    // reach it as `{{ prev.output }}` / `{{ prev.session_id }}`.
+    let input = match ev
+        .payload
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+    {
+        Some(id) => match db::get_task(&state.db, id).await {
+            Ok(Some(prev)) => serde_json::json!({
+                "_prev": {
+                    "name": prev.name,
+                    "task_id": prev.id.to_string(),
+                    "status": prev.status.as_str(),
+                    "output": prev.output,
+                    "session_id": prev.session_id,
+                }
+            }),
+            _ => serde_json::json!({}),
+        },
+        None => serde_json::json!({}),
+    };
+
     for dep in dependents {
         tracing::info!(task = %dep, trigger = %name, "auto-starting dependent task");
         let dedupe = format!("needs:{}:{}", dep, ev.id);
-        if let Err(e) = enqueue_task(state, dep, serde_json::json!({}), Some(dedupe)).await {
+        if let Err(e) = enqueue_task(state, dep, input.clone(), Some(dedupe)).await {
             tracing::warn!(error = %e, "failed to enqueue dependent task");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_context_exposes_task_input_and_prev() {
+        let task = Task {
+            id: Uuid::new_v4(),
+            name: "triage".to_string(),
+            status: TaskStatus::Succeeded,
+            input: serde_json::json!({
+                "issue_id": 7,
+                "_prev": { "output": "done", "name": "triage" },
+            }),
+            output: None,
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+            session_id: None,
+        };
+        let ctx = render_context(&task);
+        assert_eq!(crate::template::render("{{ task.name }}", &ctx), "triage");
+        assert_eq!(crate::template::render("{{ input.issue_id }}", &ctx), "7");
+        assert_eq!(crate::template::render("{{ prev.output }}", &ctx), "done");
     }
 }

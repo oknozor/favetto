@@ -16,6 +16,7 @@ mod scheduler;
 mod server;
 mod state;
 mod tasks;
+mod template;
 mod transport;
 mod tui;
 mod webhooks;

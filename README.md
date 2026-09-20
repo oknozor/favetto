@@ -75,6 +75,8 @@ model = "1.13"                          # optional — model id (uses the agent'
 cwd = "/code/che"                       # optional — repo/checkout the agent works in
 schedule = "0 8 * * * *"                # optional — makes this a recurring task
 needs = "another_task:finished"         # optional — start when `another_task` ends
+spawn = "child_task"                    # optional — fan out from a handoff file
+spawn_file = ".favetto/{{ task.id }}/manifest.json"  # JSON array → one child per item
 ---
 
 You are an engineering agent that implements Linear tickets end-to-end.
@@ -94,7 +96,27 @@ You are an engineering agent that implements Linear tickets end-to-end.
   wins over both.
 - `schedule` registers a recurring cron task.
 - `needs` declares a dependency: this task auto-starts when the named task emits
-  its `finished` event (mutually exclusive with `schedule`).
+  its `finished` event (mutually exclusive with `schedule`). The finished task's
+  result is attached as `input._prev`, reachable in the prompt as
+  `{{ prev.output }}` / `{{ prev.session_id }}`.
+- `spawn` + `spawn_file` chain tasks: when this task succeeds, the JSON file at
+  `spawn_file` is read and its array is fanned out — one `spawn`-named task is
+  enqueued per element, with that element as its `input`. An empty array spawns
+  nothing, so a task can decline to continue.
+
+### Prompt templates
+
+Task prompt bodies and `spawn_file` paths are rendered before use. `{{ dotted.path }}`
+placeholders resolve against a JSON context: `{{ task.id }}`, `{{ task.name }}`,
+`{{ input.* }}` (the task's input JSON), and `{{ prev.* }}` (the `needs`
+predecessor). Strings render raw, objects/arrays as compact JSON, and missing
+paths as empty. Double braces leave single braces in prompt code blocks alone.
+
+This makes a triage → plan → implement pipeline declarative: the triage task
+writes a `manifest.json` array of issues and `spawn`s the planning task once per
+issue; each planning task writes a `handoff.json` and `spawn`s the implementation
+task. See `tasks/triage_cocogitto_issues.md`, `tasks/plan_cocogitto_issue.md`, and
+`tasks/implement_cocogitto_issue.md`.
 
 The daemon loads the catalog from `--tasks-dir` (default `tasks/`). From the TUI,
 the **Catalog** tab lists the catalog and Enter starts a task; the Ctrl+P menu's

@@ -352,6 +352,12 @@ impl AgentManager {
 
         if let Some(cwd) = &cfg.cwd {
             cmd.cwd(cwd);
+            // The child's real working directory is changed above, but tools that
+            // resolve relative paths from `$PWD` (e.g. opencode) would otherwise
+            // still see the daemon's directory. Keep the environment in sync.
+            if let Some(cwd) = cwd.to_str() {
+                cmd.env("PWD", cwd);
+            }
         }
         cmd.env("TERM", "xterm-256color");
         for (k, v) in &cfg.env {
@@ -946,5 +952,36 @@ mod tests {
             mgr.external_session_id(&info.id).as_deref(),
             Some("ses_123")
         );
+    }
+
+    #[tokio::test]
+    async fn headless_child_gets_pwd_matching_cwd() {
+        let dir = std::env::temp_dir().join(format!("favetto-pwd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mgr = AgentManager::new();
+        let mut agent = cfg("sh", &[]);
+        agent.cwd = Some(dir.clone());
+        agent.headless_args = Some(vec!["-c".to_string(), r#"printf 'PWD=%s' "$PWD""#.to_string()]);
+        let info = mgr
+            .start(
+                "sh",
+                &agent,
+                None,
+                Invocation::Headless {
+                    prompt: "ignored",
+                    provider: None,
+                    model: None,
+                },
+                40,
+                120,
+            )
+            .unwrap();
+        assert_eq!(mgr.wait(&info.id).await, Some(0));
+        let output = mgr.output(&info.id);
+        assert!(
+            output.contains(&format!("PWD={}", dir.display())),
+            "output: {output:?}"
+        );
+        let _ = std::fs::remove_dir(&dir);
     }
 }
