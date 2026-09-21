@@ -248,10 +248,16 @@ With favetto focused, **Ctrl+Q** leaves the panel and **Ctrl+N** starts a new
 session. Ctrl+Y is chosen not to clash with opencode's default keybinds.
 
 **Mouse.** Clicks are delivered to both sides without conflict: favetto handles
-clicks on its own regions (the tab bar) and switches tabs, while clicks in the
-terminal area are forwarded to the agent as mouse reports whenever the agent has
-enabled mouse reporting. This requires the daemon to stream `state_formatted`
-frames, which carry the agent's input modes alongside the screen contents.
+clicks on its own regions — the tab bar (switches tabs) and the row lists in the
+Tasks, Catalog, Events, Scheduler and Notifications panels. A left click selects
+a row; a second click on the already-selected row runs its primary action
+(Tasks open their agent, Catalog tasks start). Clicks on headers, borders or empty
+space below the rows are ignored, and all clicks are suppressed while a popup is
+open. The wheel scrolls a list's selection, except over the Catalog preview pane
+where it scrolls the preview. Clicks in the terminal area are forwarded to the
+agent as mouse reports whenever the agent has enabled mouse reporting. This
+requires the daemon to stream `state_formatted` frames, which carry the agent's
+input modes alongside the screen contents.
 
 `prompt_args` seeds the prompt (`{prompt}` is substituted); some agents only
 pre-fill their input, so set `submit_prompt = true` to send Enter once the UI has

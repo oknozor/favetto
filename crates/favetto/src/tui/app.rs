@@ -13,8 +13,8 @@ use base64::Engine as _;
 use favetto_core::model::{
     AgentCatalogEntry, AgentSessionInfo, Event, NotificationRecord, Schedule, Task,
 };
-use favetto_providers::Provider;
 use favetto_core::rpc::{method, push, Notification};
+use favetto_providers::Provider;
 
 use super::term::TerminalView;
 
@@ -82,7 +82,10 @@ pub enum UiAction {
         cwd: Option<String>,
     },
     /// Submit a completed form via an RPC call.
-    Submit { method: &'static str, params: Value },
+    Submit {
+        method: &'static str,
+        params: Value,
+    },
 }
 
 /// The Ctrl+P popup: either the top-level menu, a step-by-step form, or the
@@ -201,6 +204,24 @@ pub enum ClickAction {
     Tab(Tab),
 }
 
+/// The last-rendered geometry of a table, used to map a click to a data row.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ListGeometry {
+    /// The data-rows rectangle (inside the border, below the one-line header).
+    pub inner: Rect,
+    /// `TableState::offset()` after the last render: first visible data-row index.
+    pub offset: usize,
+    /// Number of data rows at the last render.
+    pub len: usize,
+}
+
+impl ListGeometry {
+    /// The data-row index under an absolute `(row, col)`, if any.
+    pub fn row_at(&self, row: u16, col: u16) -> Option<usize> {
+        row_index_at(self.inner, self.offset, self.len, row, col)
+    }
+}
+
 pub struct App {
     pub tab: Tab,
     pub conn: ConnState,
@@ -255,6 +276,17 @@ pub struct App {
     pub schedules: Vec<Schedule>,
     pub notifications: Vec<NotificationRecord>,
 
+    // Last-rendered list geometry, for mouse row hit-testing.
+    pub tasks_geom: ListGeometry,
+    pub catalog_geom: ListGeometry,
+    pub events_geom: ListGeometry,
+
+    // Scheduler + notifications selection (no primary action).
+    pub schedules_selected: usize,
+    pub schedules_geom: ListGeometry,
+    pub notifications_selected: usize,
+    pub notifications_geom: ListGeometry,
+
     /// The daemon's working directory (from `system.ping`), used to prefill the
     /// one-shot wizard's directory step.
     pub daemon_cwd: Option<String>,
@@ -296,6 +328,13 @@ impl App {
             throbber_state: throbber_widgets_tui::ThrobberState::default(),
             schedules: Vec::new(),
             notifications: Vec::new(),
+            tasks_geom: ListGeometry::default(),
+            catalog_geom: ListGeometry::default(),
+            events_geom: ListGeometry::default(),
+            schedules_selected: 0,
+            schedules_geom: ListGeometry::default(),
+            notifications_selected: 0,
+            notifications_geom: ListGeometry::default(),
             daemon_cwd: None,
             popup: Popup::None,
         }
@@ -488,9 +527,16 @@ impl App {
     /// Handle mouse input.
     ///
     /// Favetto's own regions (the tab bar) are handled first so a click switches
-    /// tabs. Any other click on the Agent tab is forwarded to the embedded agent as
-    /// a terminal mouse report when the agent has enabled mouse reporting.
+    /// tabs. A click on a list row selects it, or runs the row's primary action
+    /// when it was already selected. Any other click on the Agent tab is forwarded
+    /// to the embedded agent as a terminal mouse report when the agent has enabled
+    /// mouse reporting.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> UiAction {
+        // A popup owns the screen; ignore clicks so we don't select under it.
+        if !matches!(self.popup, Popup::None) {
+            return UiAction::None;
+        }
+
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             for region in &self.click_regions {
                 if mouse.row == region.row
@@ -501,6 +547,21 @@ impl App {
                     self.tab = tab;
                     return UiAction::None;
                 }
+            }
+            if let Some(action) = self.handle_list_click(mouse.column, mouse.row) {
+                return action;
+            }
+        }
+
+        // The wheel over a list scrolls that list's selection.
+        let wheel_delta = match mouse.kind {
+            MouseEventKind::ScrollUp => Some(-3),
+            MouseEventKind::ScrollDown => Some(3),
+            _ => None,
+        };
+        if let Some(delta) = wheel_delta {
+            if self.scroll_list(mouse.column, mouse.row, delta) {
+                return UiAction::None;
             }
         }
 
@@ -535,6 +596,117 @@ impl App {
             }
         }
         UiAction::None
+    }
+
+    /// The list geometry of the active tab, if that tab has a list.
+    fn active_list_geometry(&self) -> Option<(Tab, ListGeometry)> {
+        match self.tab {
+            Tab::Tasks => Some((Tab::Tasks, self.tasks_geom)),
+            Tab::Catalog => Some((Tab::Catalog, self.catalog_geom)),
+            Tab::Events => Some((Tab::Events, self.events_geom)),
+            Tab::Scheduler => Some((Tab::Scheduler, self.schedules_geom)),
+            Tab::Notifications => Some((Tab::Notifications, self.notifications_geom)),
+            Tab::Agent => None,
+        }
+    }
+
+    /// Handle a left click on a list row. Returns `Some` when the click hit a row
+    /// (the inner action may be `UiAction::None` for selection-only panels).
+    fn handle_list_click(&mut self, col: u16, row: u16) -> Option<UiAction> {
+        let (tab, geom) = self.active_list_geometry()?;
+        let index = geom.row_at(row, col)?;
+        Some(self.select_row(tab, index))
+    }
+
+    /// Select a data row and run the tab's primary action when it was already
+    /// selected (mouse equivalent of Enter).
+    fn select_row(&mut self, tab: Tab, index: usize) -> UiAction {
+        match tab {
+            Tab::Tasks => {
+                if self.tasks.is_empty() {
+                    return UiAction::None;
+                }
+                let already = self.tasks_selected == index;
+                self.tasks_selected = index.min(self.tasks.len() - 1);
+                if already {
+                    if let Some(t) = self.tasks.get(index) {
+                        return UiAction::OpenAgent(t.id.to_string());
+                    }
+                }
+                UiAction::None
+            }
+            Tab::Catalog => {
+                if self.catalog.is_empty() {
+                    return UiAction::None;
+                }
+                let already = self.catalog_selected == index;
+                self.catalog_selected = index.min(self.catalog.len() - 1);
+                self.reset_catalog_preview_scroll();
+                if already {
+                    if let Some(entry) = self.catalog.get(index) {
+                        return UiAction::StartTask(entry.name.clone());
+                    }
+                }
+                UiAction::None
+            }
+            Tab::Events => {
+                if !self.events.is_empty() {
+                    self.events_selected = index.min(self.events.len() - 1);
+                }
+                UiAction::None
+            }
+            Tab::Scheduler => {
+                if !self.schedules.is_empty() {
+                    self.schedules_selected = index.min(self.schedules.len() - 1);
+                }
+                UiAction::None
+            }
+            Tab::Notifications => {
+                if !self.notifications.is_empty() {
+                    self.notifications_selected = index.min(self.notifications.len() - 1);
+                }
+                UiAction::None
+            }
+            Tab::Agent => UiAction::None,
+        }
+    }
+
+    /// Scroll the active list's selection by `delta` rows when the pointer is over
+    /// its rectangle. Returns `true` when the wheel was consumed.
+    fn scroll_list(&mut self, col: u16, row: u16, delta: i32) -> bool {
+        let Some((tab, geom)) = self.active_list_geometry() else {
+            return false;
+        };
+        let over = col >= geom.inner.x
+            && col < geom.inner.x + geom.inner.width
+            && row >= geom.inner.y
+            && row < geom.inner.y + geom.inner.height;
+        if !over {
+            return false;
+        }
+        match tab {
+            Tab::Tasks => {
+                self.tasks_selected = shift_index(self.tasks_selected, delta, self.tasks.len());
+            }
+            Tab::Catalog => {
+                self.catalog_selected =
+                    shift_index(self.catalog_selected, delta, self.catalog.len());
+                self.reset_catalog_preview_scroll();
+            }
+            Tab::Events => {
+                self.events_selected = shift_index(self.events_selected, delta, self.events.len());
+            }
+            Tab::Scheduler => {
+                self.schedules_selected =
+                    shift_index(self.schedules_selected, delta, self.schedules.len());
+            }
+            Tab::Notifications => {
+                self.notifications_selected =
+                    shift_index(self.notifications_selected, delta, self.notifications.len());
+            }
+            Tab::Agent => {}
+        }
+        true
     }
 
     fn handle_menu_key(&mut self, code: KeyCode) -> UiAction {
@@ -854,6 +1026,12 @@ impl App {
                         self.reset_catalog_preview_scroll();
                     }
                     Tab::Events => self.events_selected = self.events_selected.saturating_sub(1),
+                    Tab::Scheduler => {
+                        self.schedules_selected = self.schedules_selected.saturating_sub(1)
+                    }
+                    Tab::Notifications => {
+                        self.notifications_selected = self.notifications_selected.saturating_sub(1)
+                    }
                     _ => {}
                 }
                 UiAction::None
@@ -869,6 +1047,14 @@ impl App {
                     Tab::Events if !self.events.is_empty() => {
                         self.events_selected =
                             (self.events_selected + 1).min(self.events.len() - 1);
+                    }
+                    Tab::Scheduler if !self.schedules.is_empty() => {
+                        self.schedules_selected =
+                            (self.schedules_selected + 1).min(self.schedules.len() - 1);
+                    }
+                    Tab::Notifications if !self.notifications.is_empty() => {
+                        self.notifications_selected =
+                            (self.notifications_selected + 1).min(self.notifications.len() - 1);
                     }
                     _ => {}
                 }
@@ -954,7 +1140,11 @@ impl App {
             }
             push::AGENT_EXIT => {
                 let sid = n.params.get("session_id").and_then(|v| v.as_str());
-                let code = n.params.get("code").and_then(|v| v.as_i64()).map(|c| c as i32);
+                let code = n
+                    .params
+                    .get("code")
+                    .and_then(|v| v.as_i64())
+                    .map(|c| c as i32);
                 if let Some(sid) = sid {
                     self.agent_exit(sid, code);
                 }
@@ -986,6 +1176,50 @@ impl App {
         }
         let offset = self.events_selected.min(n - 1);
         self.events.get(n - 1 - offset)
+    }
+}
+
+/// The rectangle occupied by a bordered table's data rows: inside the border and
+/// below the single-line header.
+pub(super) fn table_rows_area(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(2),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(3),
+    }
+}
+
+/// Map an absolute mouse position to a data-row index of a table.
+///
+/// `inner` is the data-rows rectangle, `offset` the first visible data-row index
+/// recorded from `TableState::offset()`, `len` the row count. Clicks on the
+/// border, the header, empty space below the rows, or past `len` return `None`.
+fn row_index_at(inner: Rect, offset: usize, len: usize, row: u16, col: u16) -> Option<usize> {
+    if len == 0 || inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+    if col < inner.x
+        || col >= inner.x + inner.width
+        || row < inner.y
+        || row >= inner.y + inner.height
+    {
+        return None;
+    }
+    let index = offset + (row - inner.y) as usize;
+    (index < len).then_some(index)
+}
+
+/// Clamp a selection moved by `delta` (negative = up) to `0..len`.
+fn shift_index(current: usize, delta: i32, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let max = len - 1;
+    if delta >= 0 {
+        current.saturating_add(delta as usize).min(max)
+    } else {
+        current.saturating_sub(delta.unsigned_abs() as usize)
     }
 }
 
@@ -1158,9 +1392,52 @@ fn encode_key(key: &KeyEvent) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use favetto_core::model::{EventKind, TaskStatus};
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    fn click(col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    fn geom(inner: Rect, offset: usize, len: usize) -> ListGeometry {
+        ListGeometry { inner, offset, len }
+    }
+
+    fn task(name: &str) -> Task {
+        Task {
+            id: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            status: TaskStatus::Pending,
+            input: serde_json::json!({}),
+            output: None,
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+            session_id: None,
+        }
+    }
+
+    fn catalog_entry(name: &str) -> CatalogEntry {
+        CatalogEntry {
+            name: name.to_string(),
+            agent: None,
+            provider: None,
+            model: None,
+            cwd: None,
+            needs: None,
+            prompt: String::new(),
+        }
     }
 
     #[test]
@@ -1368,7 +1645,9 @@ mod tests {
             },
         ]);
         {
-            let Popup::Wizard(w) = &app.popup else { panic!("wizard") };
+            let Popup::Wizard(w) = &app.popup else {
+                panic!("wizard")
+            };
             assert_eq!(w.step, WizardStep::Provider);
             assert_eq!(
                 w.choices,
@@ -1382,7 +1661,9 @@ mod tests {
         // Pick DeepSeek -> model step lists its models by display name.
         app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
         {
-            let Popup::Wizard(w) = &app.popup else { panic!("wizard") };
+            let Popup::Wizard(w) = &app.popup else {
+                panic!("wizard")
+            };
             assert_eq!(w.step, WizardStep::Model);
             assert_eq!(
                 w.choices[0],
@@ -1396,7 +1677,9 @@ mod tests {
         // Pick the first model -> directory step.
         app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
         {
-            let Popup::Wizard(w) = &app.popup else { panic!("wizard") };
+            let Popup::Wizard(w) = &app.popup else {
+                panic!("wizard")
+            };
             assert_eq!(w.step, WizardStep::Dir);
             assert_eq!(w.model.as_deref(), Some("deepseek-v4-flash"));
             assert_eq!(w.dir, "/code/che");
@@ -1417,5 +1700,303 @@ mod tests {
             _ => panic!("expected WizardStart"),
         }
         assert!(matches!(app.popup, Popup::None));
+    }
+
+    #[test]
+    fn row_index_at_maps_visible_rows_with_offset() {
+        let inner = Rect {
+            x: 0,
+            y: 3,
+            width: 20,
+            height: 5,
+        };
+        assert_eq!(row_index_at(inner, 0, 10, 3, 0), Some(0));
+        assert_eq!(row_index_at(inner, 0, 10, 7, 0), Some(4));
+        assert_eq!(row_index_at(inner, 4, 10, 3, 0), Some(4));
+        assert_eq!(row_index_at(inner, 4, 10, 7, 0), Some(8));
+        // Offset pushes the index past `len`.
+        assert_eq!(row_index_at(inner, 8, 10, 5, 0), None);
+        // Empty table.
+        assert_eq!(row_index_at(inner, 0, 0, 3, 0), None);
+        // Last visible row is past a short list.
+        assert_eq!(row_index_at(inner, 0, 3, 7, 0), None);
+        // Column outside the data area (border/header rows are outside `inner`).
+        assert_eq!(row_index_at(inner, 0, 10, 3, 20), None);
+        assert_eq!(row_index_at(inner, 0, 10, 2, 0), None);
+    }
+
+    #[test]
+    fn table_rows_area_offsets_border_and_header() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+        assert_eq!(
+            table_rows_area(area),
+            Rect {
+                x: 1,
+                y: 2,
+                width: 78,
+                height: 21,
+            }
+        );
+    }
+
+    #[test]
+    fn clicking_tasks_row_selects_then_opens_agent() {
+        let mut app = App::new();
+        app.tab = Tab::Tasks;
+        let tasks = vec![task("a"), task("b")];
+        let second_id = tasks[1].id.to_string();
+        app.tasks = tasks;
+        app.tasks_selected = 0;
+        let inner = Rect {
+            x: 0,
+            y: 2,
+            width: 20,
+            height: 5,
+        };
+        app.tasks_geom = geom(inner, 0, 2);
+
+        // First click selects index 1 (no activation).
+        assert!(matches!(app.handle_mouse(click(5, 3)), UiAction::None));
+        assert_eq!(app.tasks_selected, 1);
+
+        // Second click on the now-selected row opens its agent.
+        match app.handle_mouse(click(5, 3)) {
+            UiAction::OpenAgent(id) => assert_eq!(id, second_id),
+            _ => panic!("expected OpenAgent"),
+        }
+    }
+
+    #[test]
+    fn clicking_catalog_row_selects_resets_scroll_then_starts_task() {
+        let mut app = App::new();
+        app.tab = Tab::Catalog;
+        app.catalog = vec![catalog_entry("a"), catalog_entry("b")];
+        app.catalog_selected = 1;
+        app.catalog_preview_scroll = 7;
+        let inner = Rect {
+            x: 0,
+            y: 2,
+            width: 20,
+            height: 5,
+        };
+        app.catalog_geom = geom(inner, 0, 2);
+
+        assert!(matches!(app.handle_mouse(click(5, 2)), UiAction::None));
+        assert_eq!(app.catalog_selected, 0);
+        assert_eq!(app.catalog_preview_scroll, 0);
+
+        match app.handle_mouse(click(5, 2)) {
+            UiAction::StartTask(name) => assert_eq!(name, "a"),
+            _ => panic!("expected StartTask"),
+        }
+    }
+
+    #[test]
+    fn clicking_events_row_selects_newest_first() {
+        let mut app = App::new();
+        app.tab = Tab::Events;
+        for id in 1..=2 {
+            app.ingest_event(Event {
+                id,
+                kind: EventKind::Synthetic,
+                payload: serde_json::json!({}),
+                created_at: Utc::now(),
+            });
+        }
+        let inner = Rect {
+            x: 0,
+            y: 2,
+            width: 20,
+            height: 5,
+        };
+        app.events_geom = geom(inner, 0, 2);
+
+        assert!(matches!(app.handle_mouse(click(5, 2)), UiAction::None));
+        assert_eq!(app.events_selected, 0);
+        assert_eq!(app.selected_event().map(|e| e.id), Some(2));
+
+        assert!(matches!(app.handle_mouse(click(5, 3)), UiAction::None));
+        assert_eq!(app.events_selected, 1);
+        assert_eq!(app.selected_event().map(|e| e.id), Some(1));
+    }
+
+    #[test]
+    fn clicking_scheduler_and_notifications_rows_selects_only() {
+        let mut app = App::new();
+        app.schedules = vec![Schedule {
+            id: "s1".to_string(),
+            cron: "0 * * * *".to_string(),
+            task: "t".to_string(),
+            input: serde_json::json!({}),
+            enabled: true,
+            last_run: None,
+        }];
+        app.notifications = vec![NotificationRecord {
+            id: 1,
+            channel: "cli".to_string(),
+            subject: "hi".to_string(),
+            body: "body".to_string(),
+            status: "ok".to_string(),
+            sent_at: Utc::now(),
+        }];
+        let inner = Rect {
+            x: 0,
+            y: 2,
+            width: 20,
+            height: 5,
+        };
+
+        app.tab = Tab::Scheduler;
+        app.schedules_geom = geom(inner, 0, 1);
+        assert!(matches!(app.handle_mouse(click(5, 2)), UiAction::None));
+        assert_eq!(app.schedules_selected, 0);
+        assert!(matches!(app.handle_mouse(click(5, 2)), UiAction::None));
+
+        app.tab = Tab::Notifications;
+        app.notifications_geom = geom(inner, 0, 1);
+        assert!(matches!(app.handle_mouse(click(5, 2)), UiAction::None));
+        assert_eq!(app.notifications_selected, 0);
+        assert!(matches!(app.handle_mouse(click(5, 2)), UiAction::None));
+    }
+
+    #[test]
+    fn click_is_ignored_while_popup_open() {
+        let mut app = App::new();
+        app.tab = Tab::Tasks;
+        app.tasks = vec![task("a"), task("b")];
+        app.tasks_selected = 0;
+        let inner = Rect {
+            x: 0,
+            y: 2,
+            width: 20,
+            height: 5,
+        };
+        app.tasks_geom = geom(inner, 0, 2);
+        app.popup = Popup::Menu { selected: 0 };
+
+        assert!(matches!(app.handle_mouse(click(5, 3)), UiAction::None));
+        assert_eq!(app.tasks_selected, 0);
+    }
+
+    #[test]
+    fn wheel_over_list_moves_selection() {
+        let mut app = App::new();
+        app.tab = Tab::Tasks;
+        app.tasks = (0..10).map(|i| task(&format!("t{i}"))).collect();
+        let inner = Rect {
+            x: 0,
+            y: 2,
+            width: 20,
+            height: 5,
+        };
+        app.tasks_geom = geom(inner, 0, 10);
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.tasks_selected, 3);
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 5,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.tasks_selected, 0);
+
+        // The wheel over the Catalog list still resets the preview scroll.
+        app.tab = Tab::Catalog;
+        app.catalog = vec![catalog_entry("a"), catalog_entry("b")];
+        app.catalog_geom = geom(inner, 0, 2);
+        app.catalog_preview_scroll = 5;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.catalog_preview_scroll, 0);
+    }
+
+    #[test]
+    fn click_on_border_or_below_rows_is_noop() {
+        let mut app = App::new();
+        app.tab = Tab::Tasks;
+        app.tasks = vec![task("a"), task("b")];
+        app.tasks_selected = 0;
+        let inner = Rect {
+            x: 1,
+            y: 2,
+            width: 20,
+            height: 5,
+        };
+        app.tasks_geom = geom(inner, 0, 2);
+
+        // Left border, header row, and below the rows all leave the selection be.
+        for (col, row) in [(0, 3), (1, 1), (1, 7)] {
+            assert!(matches!(app.handle_mouse(click(col, row)), UiAction::None));
+            assert_eq!(app.tasks_selected, 0);
+        }
+    }
+
+    #[test]
+    fn keyboard_up_down_moves_scheduler_and_notification_selection() {
+        let mut app = App::new();
+        app.schedules = vec![
+            Schedule {
+                id: "s1".to_string(),
+                cron: "0 * * * *".to_string(),
+                task: "t".to_string(),
+                input: serde_json::json!({}),
+                enabled: true,
+                last_run: None,
+            },
+            Schedule {
+                id: "s2".to_string(),
+                cron: "0 0 * * *".to_string(),
+                task: "u".to_string(),
+                input: serde_json::json!({}),
+                enabled: false,
+                last_run: None,
+            },
+        ];
+        app.notifications = vec![
+            NotificationRecord {
+                id: 1,
+                channel: "cli".to_string(),
+                subject: "a".to_string(),
+                body: String::new(),
+                status: "ok".to_string(),
+                sent_at: Utc::now(),
+            },
+            NotificationRecord {
+                id: 2,
+                channel: "cli".to_string(),
+                subject: "b".to_string(),
+                body: String::new(),
+                status: "ok".to_string(),
+                sent_at: Utc::now(),
+            },
+        ];
+
+        app.tab = Tab::Scheduler;
+        app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+        assert_eq!(app.schedules_selected, 1);
+        app.handle_key(key(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(app.schedules_selected, 0);
+
+        app.tab = Tab::Notifications;
+        app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+        assert_eq!(app.notifications_selected, 1);
+        app.handle_key(key(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(app.notifications_selected, 0);
     }
 }

@@ -11,7 +11,10 @@ use ratatui::Frame;
 
 use favetto_core::model::TaskStatus;
 
-use super::app::{App, ClickAction, ClickRegion, ConnState, Form, Popup, Tab, Wizard, WizardStep, MENU_OPTIONS};
+use super::app::{
+    table_rows_area, App, ClickAction, ClickRegion, ConnState, Form, ListGeometry, Popup, Tab,
+    Wizard, WizardStep, MENU_OPTIONS,
+};
 use super::{json, markdown};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -43,7 +46,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let tabs = Tabs::new(titles)
         .select(Tab::ALL.iter().position(|t| *t == app.tab).unwrap_or(0))
         .block(Block::default().borders(Borders::BOTTOM))
-        .highlight_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
     frame.render_widget(tabs, chunks[0]);
 
     let tab = app.tab;
@@ -106,7 +113,11 @@ fn draw_menu(frame: &mut Frame, selected: usize) {
         .collect();
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" Ctrl+P — New "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Ctrl+P — New "),
+        )
         .highlight_style(Style::default().add_modifier(Modifier::BOLD));
     frame.render_widget(Clear, rect);
     frame.render_widget(list, rect);
@@ -132,7 +143,9 @@ fn draw_form(frame: &mut Frame, form: &Form) {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("> {field}: "),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(form.input.as_str()),
                 Span::styled("█", Style::default().fg(Color::Cyan)),
@@ -169,7 +182,9 @@ fn draw_wizard(frame: &mut Frame, wizard: &Wizard) {
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
         wizard.step.title(),
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from(""));
 
@@ -221,31 +236,35 @@ fn draw_wizard(frame: &mut Frame, wizard: &Wizard) {
     )));
 
     let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" New one-shot task "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" New one-shot task "),
+        )
         .wrap(Wrap { trim: false });
     frame.render_widget(Clear, rect);
     frame.render_widget(paragraph, rect);
 }
 
 fn draw_catalog(frame: &mut Frame, app: &mut App, area: Rect) {
-    let chunks = Layout::horizontal([
-        Constraint::Percentage(42),
-        Constraint::Percentage(58),
-    ])
-    .split(area);
+    let chunks =
+        Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).split(area);
     draw_catalog_table(frame, app, chunks[0]);
     draw_catalog_preview(frame, app, chunks[1]);
 }
 
-fn draw_catalog_table(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_catalog_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let widths = [
         Constraint::Min(14),
         Constraint::Length(10),
         Constraint::Length(18),
         Constraint::Min(0),
     ];
-    let header = Row::new(vec!["NAME", "AGENT", "MODEL", "NEEDS"])
-        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+    let header = Row::new(vec!["NAME", "AGENT", "MODEL", "NEEDS"]).style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    );
 
     let rows: Vec<Row> = app
         .catalog
@@ -262,17 +281,22 @@ fn draw_catalog_table(frame: &mut Frame, app: &App, area: Rect) {
 
     let table = Table::new(rows, widths)
         .header(header)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" Catalog ({}) — Enter to start ", app.catalog.len())),
-        )
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " Catalog ({}) — Enter/click to start ",
+            app.catalog.len()
+        )))
         .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .column_spacing(1);
 
     let mut state = TableState::default();
     state.select(Some(app.catalog_selected));
     frame.render_stateful_widget(table, area, &mut state);
+    let len = app.catalog.len();
+    app.catalog_geom = ListGeometry {
+        inner: table_rows_area(area),
+        offset: state.offset(),
+        len,
+    };
 }
 
 fn draw_catalog_preview(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -325,7 +349,7 @@ fn draw_catalog_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-fn draw_schedules(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_schedules(frame: &mut Frame, app: &mut App, area: Rect) {
     let widths = [
         Constraint::Length(10),
         Constraint::Length(20),
@@ -333,8 +357,11 @@ fn draw_schedules(frame: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(12),
         Constraint::Min(0),
     ];
-    let header = Row::new(vec!["ID", "CRON", "TASK", "ENABLED", "INPUT"])
-        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+    let header = Row::new(vec!["ID", "CRON", "TASK", "ENABLED", "INPUT"]).style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    );
 
     let rows: Vec<Row> = app
         .schedules
@@ -358,16 +385,27 @@ fn draw_schedules(frame: &mut Frame, app: &App, area: Rect) {
 
     let table = Table::new(rows, widths)
         .header(header)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" Schedules ({}) ", app.schedules.len())),
-        )
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " Schedules ({}) — click or ↑/↓ select ",
+            app.schedules.len()
+        )))
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .column_spacing(2);
-    frame.render_widget(table, area);
+
+    let mut state = TableState::default();
+    if !app.schedules.is_empty() {
+        state.select(Some(app.schedules_selected.min(app.schedules.len() - 1)));
+    }
+    frame.render_stateful_widget(table, area, &mut state);
+    let len = app.schedules.len();
+    app.schedules_geom = ListGeometry {
+        inner: table_rows_area(area),
+        offset: state.offset(),
+        len,
+    };
 }
 
-fn draw_notifications(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_notifications(frame: &mut Frame, app: &mut App, area: Rect) {
     let widths = [
         Constraint::Length(8),
         Constraint::Length(12),
@@ -375,8 +413,11 @@ fn draw_notifications(frame: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(28),
         Constraint::Min(0),
     ];
-    let header = Row::new(vec!["ID", "CHANNEL", "STATUS", "SUBJECT", "BODY"])
-        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+    let header = Row::new(vec!["ID", "CHANNEL", "STATUS", "SUBJECT", "BODY"]).style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    );
 
     let rows: Vec<Row> = app
         .notifications
@@ -395,13 +436,26 @@ fn draw_notifications(frame: &mut Frame, app: &App, area: Rect) {
 
     let table = Table::new(rows, widths)
         .header(header)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" Notifications ({}) ", app.notifications.len())),
-        )
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " Notifications ({}) — click or ↑/↓ select ",
+            app.notifications.len()
+        )))
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .column_spacing(2);
-    frame.render_widget(table, area);
+
+    let mut state = TableState::default();
+    if !app.notifications.is_empty() {
+        state.select(Some(
+            app.notifications_selected.min(app.notifications.len() - 1),
+        ));
+    }
+    frame.render_stateful_widget(table, area, &mut state);
+    let len = app.notifications.len();
+    app.notifications_geom = ListGeometry {
+        inner: table_rows_area(area),
+        offset: state.offset(),
+        len,
+    };
 }
 
 fn status_ok(s: &str) -> Span<'static> {
@@ -413,7 +467,7 @@ fn status_ok(s: &str) -> Span<'static> {
     Span::styled(txt.to_string(), Style::default().fg(color))
 }
 
-fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect) {
     let widths = [
         Constraint::Length(10),
         Constraint::Length(22),
@@ -421,8 +475,11 @@ fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(8),
         Constraint::Min(0),
     ];
-    let header = Row::new(vec!["ID", "TASK", "STATUS", "AGE", "ERROR"])
-        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+    let header = Row::new(vec!["ID", "TASK", "STATUS", "AGE", "ERROR"]).style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    );
 
     let rows: Vec<Row> = app
         .tasks
@@ -440,20 +497,22 @@ fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
 
     let table = Table::new(rows, widths)
         .header(header)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(
-                    " Tasks ({}) — ↑/↓ select, Enter to run agent ",
-                    app.tasks.len()
-                )),
-        )
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " Tasks ({}) — click or ↑/↓ select, Enter/click to run agent ",
+            app.tasks.len()
+        )))
         .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .column_spacing(2);
 
     let mut state = TableState::default();
     state.select(Some(app.tasks_selected));
     frame.render_stateful_widget(table, area, &mut state);
+    let len = app.tasks.len();
+    app.tasks_geom = ListGeometry {
+        inner: table_rows_area(area),
+        offset: state.offset(),
+        len,
+    };
 }
 
 fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -475,7 +534,11 @@ fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect) {
         " Agent — no session (Enter on a task) ".to_string()
     } else {
         let name = app.agent_name.as_deref().unwrap_or("agent");
-        let state = if app.agent_running { "running" } else { "stopped" };
+        let state = if app.agent_running {
+            "running"
+        } else {
+            "stopped"
+        };
         let extra = if app.agent_status.is_empty() {
             String::new()
         } else {
@@ -537,10 +600,7 @@ fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // Draw the terminal cursor when the application shows one and it is visible.
     if !hide_cursor && cursor_row < inner_area.height && cursor_col < inner_area.width {
-        frame.set_cursor_position((
-            inner_area.x + cursor_col,
-            inner_area.y + cursor_row,
-        ));
+        frame.set_cursor_position((inner_area.x + cursor_col, inner_area.y + cursor_row));
     }
 }
 
@@ -592,24 +652,24 @@ fn tab_click_regions(x0: u16, _y0: u16) -> Vec<(Tab, u16, u16)> {
     out
 }
 
-fn draw_events(frame: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::horizontal([
-        Constraint::Percentage(40),
-        Constraint::Percentage(60),
-    ])
-    .split(area);
+fn draw_events(frame: &mut Frame, app: &mut App, area: Rect) {
+    let chunks =
+        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).split(area);
     draw_event_list(frame, app, chunks[0]);
     draw_event_payload(frame, app, chunks[1]);
 }
 
-fn draw_event_list(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_event_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let widths = [
         Constraint::Length(8),
         Constraint::Min(18),
         Constraint::Length(8),
     ];
-    let header = Row::new(vec!["ID", "KIND", "AGE"])
-        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+    let header = Row::new(vec!["ID", "KIND", "AGE"]).style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    );
 
     let rows: Vec<Row> = app
         .events
@@ -626,11 +686,10 @@ fn draw_event_list(frame: &mut Frame, app: &App, area: Rect) {
 
     let table = Table::new(rows, widths)
         .header(header)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" Events ({}) — ↑/↓ select ", app.events.len())),
-        )
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " Events ({}) — click or ↑/↓ select ",
+            app.events.len()
+        )))
         .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .column_spacing(1);
 
@@ -639,6 +698,12 @@ fn draw_event_list(frame: &mut Frame, app: &App, area: Rect) {
         state.select(Some(app.events_selected.min(app.events.len() - 1)));
     }
     frame.render_stateful_widget(table, area, &mut state);
+    let len = app.events.len();
+    app.events_geom = ListGeometry {
+        inner: table_rows_area(area),
+        offset: state.offset(),
+        len,
+    };
 }
 
 fn draw_event_payload(frame: &mut Frame, app: &App, area: Rect) {
@@ -688,7 +753,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         "[↑↓] select  [Enter] agent  [Tab] switch  [q] quit"
     };
-    let right = format!("tasks: {}  events: {}  {hint}", app.tasks.len(), app.events.len());
+    let right = format!(
+        "tasks: {}  events: {}  {hint}",
+        app.tasks.len(),
+        app.events.len()
+    );
 
     let line = Line::from(vec![
         Span::styled(left, Style::default().fg(color)),
@@ -787,7 +856,10 @@ mod tests {
                 }
             }
         }
-        assert!(text.contains("hello agent"), "screen not rendered: {text:?}");
+        assert!(
+            text.contains("hello agent"),
+            "screen not rendered: {text:?}"
+        );
     }
 
     #[test]
@@ -825,7 +897,10 @@ mod tests {
             }
         }
         assert!(text.contains("Preview"), "preview title missing: {text:?}");
-        assert!(text.contains("Heading"), "rendered heading missing: {text:?}");
+        assert!(
+            text.contains("Heading"),
+            "rendered heading missing: {text:?}"
+        );
         assert!(text.contains("item"), "rendered list missing: {text:?}");
     }
 
@@ -908,5 +983,86 @@ mod tests {
         assert!(text.contains("Payload"), "payload title missing: {text:?}");
         assert!(text.contains("hello"), "payload key missing: {text:?}");
         assert!(text.contains("world"), "payload value missing: {text:?}");
+    }
+
+    fn geom_task(name: &str) -> favetto_core::model::Task {
+        use chrono::Utc;
+        use favetto_core::model::TaskStatus;
+        favetto_core::model::Task {
+            id: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            status: TaskStatus::Pending,
+            input: serde_json::json!({}),
+            output: None,
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+            session_id: None,
+        }
+    }
+
+    #[test]
+    fn drawn_tasks_record_geometry_and_offset() {
+        let mut app = App::new();
+        app.tab = Tab::Tasks;
+        app.tasks = (0..100).map(|i| geom_task(&format!("t{i}"))).collect();
+        app.tasks_selected = 50;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+        let geom = app.tasks_geom;
+        assert_eq!(geom.len, 100);
+        assert!(geom.offset > 0, "the window should scroll to the selection");
+        assert!(geom.inner.y > 0, "the rows area sits below the header");
+
+        // Round-trip: the selected data row's screen row maps back to it.
+        let screen_row = geom.inner.y + (50 - geom.offset) as u16;
+        assert_eq!(geom.row_at(screen_row, geom.inner.x), Some(50));
+    }
+
+    #[test]
+    fn drawn_schedules_and_notifications_record_geometry() {
+        use chrono::Utc;
+        use favetto_core::model::{NotificationRecord, Schedule};
+
+        let mut app = App::new();
+        app.tab = Tab::Scheduler;
+        app.schedules = vec![Schedule {
+            id: "s1".to_string(),
+            cron: "* * * * *".to_string(),
+            task: "t".to_string(),
+            input: serde_json::json!({}),
+            enabled: true,
+            last_run: None,
+        }];
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(app.schedules_geom.len, 1);
+        assert_eq!(app.schedules_geom.offset, 0);
+        assert!(
+            app.schedules_geom
+                .row_at(app.schedules_geom.inner.y, app.schedules_geom.inner.x)
+                == Some(0)
+        );
+
+        app.tab = Tab::Notifications;
+        app.notifications = vec![NotificationRecord {
+            id: 1,
+            channel: "cli".to_string(),
+            subject: "s".to_string(),
+            body: "b".to_string(),
+            status: "ok".to_string(),
+            sent_at: Utc::now(),
+        }];
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(app.notifications_geom.len, 1);
+        assert_eq!(app.notifications_geom.offset, 0);
     }
 }
