@@ -62,6 +62,11 @@ cargo build
 # configure external agents, then start tasks from the TUI
 ```
 
+**Appearance.** The TUI ships a built-in dark and light style that is selected
+automatically from the terminal background (an OSC 11 query, then `COLORFGBG`,
+then dark). Set `FAVETTO_THEME=dark` or `FAVETTO_THEME=light` to override it.
+There is no theme file or picker.
+
 ## Tasks (catalog)
 
 A task is a Markdown file under `tasks/` with a TOML header and the prompt as the

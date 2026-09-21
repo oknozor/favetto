@@ -15,10 +15,16 @@ use super::app::{
     table_rows_area, App, ClickAction, ClickRegion, ConnState, Form, ListGeometry, Popup, Tab,
     TaskVarsForm, Wizard, WizardStep, MENU_OPTIONS,
 };
+use super::theme::Theme;
 use super::{json, markdown};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     app.click_regions.clear();
+
+    // Paint the themed base surface across the whole frame before any widget.
+    let frame_area = frame.area();
+    frame.buffer_mut().set_style(frame_area, app.theme.base());
+    let theme = app.theme;
 
     let chunks = Layout::vertical([
         Constraint::Length(2),
@@ -45,25 +51,26 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .collect();
     let tabs = Tabs::new(titles)
         .select(Tab::ALL.iter().position(|t| *t == app.tab).unwrap_or(0))
-        .block(Block::default().borders(Borders::BOTTOM))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
+        .style(theme.base())
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(theme.block(false)),
+        )
+        .highlight_style(theme.selected().add_modifier(Modifier::BOLD));
     frame.render_widget(tabs, chunks[0]);
 
     let tab = app.tab;
     match tab {
-        Tab::Tasks => draw_tasks(frame, app, chunks[1]),
-        Tab::Catalog => draw_catalog(frame, app, chunks[1]),
-        Tab::Agent => draw_agent(frame, app, chunks[1]),
-        Tab::Events => draw_events(frame, app, chunks[1]),
-        Tab::Scheduler => draw_schedules(frame, app, chunks[1]),
-        Tab::Notifications => draw_notifications(frame, app, chunks[1]),
+        Tab::Tasks => draw_tasks(frame, app, chunks[1], theme),
+        Tab::Catalog => draw_catalog(frame, app, chunks[1], theme),
+        Tab::Agent => draw_agent(frame, app, chunks[1], theme),
+        Tab::Events => draw_events(frame, app, chunks[1], theme),
+        Tab::Scheduler => draw_schedules(frame, app, chunks[1], theme),
+        Tab::Notifications => draw_notifications(frame, app, chunks[1], theme),
     }
 
-    draw_status(frame, app, chunks[2]);
+    draw_status(frame, app, chunks[2], theme);
 
     if !matches!(app.popup, Popup::None) {
         draw_popup(frame, app);
@@ -71,13 +78,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_popup(frame: &mut Frame, app: &mut App) {
+    // Copy the theme and clone the throbber state before borrowing `popup`, so
+    // the wizard can render a spinner without holding a borrow of `app`.
+    let theme = app.theme;
+    let state = app.throbber_state.clone();
     match &mut app.popup {
         Popup::None => {}
-        Popup::Menu { selected } => draw_menu(frame, *selected),
-        Popup::Form(form) => draw_form(frame, form),
-        Popup::Wizard(wizard) => draw_wizard(frame, wizard),
+        Popup::Menu { selected } => draw_menu(frame, *selected, theme),
+        Popup::Form(form) => draw_form(frame, form, theme),
+        Popup::Wizard(wizard) => draw_wizard(frame, wizard, theme, &state),
         Popup::TaskVars(form) => draw_task_vars(frame, form),
-        Popup::Help { scroll } => draw_help(frame, scroll),
+        Popup::Help { scroll } => draw_help(frame, scroll, theme),
     }
 }
 
@@ -97,7 +108,7 @@ fn centered_rect(area: Rect, width_pct: u16, height: u16) -> Rect {
     }
 }
 
-fn draw_menu(frame: &mut Frame, selected: usize) {
+fn draw_menu(frame: &mut Frame, selected: usize, theme: Theme) {
     let area = frame.area();
     let rect = centered_rect(area, 60, MENU_OPTIONS.len() as u16 + 2);
 
@@ -106,7 +117,7 @@ fn draw_menu(frame: &mut Frame, selected: usize) {
         .enumerate()
         .map(|(i, option)| {
             let style = if i == selected {
-                Style::default().fg(Color::Black).bg(Color::Cyan)
+                theme.selected()
             } else {
                 Style::default()
             };
@@ -118,39 +129,39 @@ fn draw_menu(frame: &mut Frame, selected: usize) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Ctrl+P — New "),
+                .title(" Ctrl+P — New ")
+                .style(theme.surface_style())
+                .border_style(theme.block(true)),
         )
         .highlight_style(Style::default().add_modifier(Modifier::BOLD));
     frame.render_widget(Clear, rect);
+    frame.buffer_mut().set_style(rect, theme.surface_style());
     frame.render_widget(list, rect);
 }
 
-fn draw_form(frame: &mut Frame, form: &Form) {
+fn draw_form(frame: &mut Frame, form: &Form, theme: Theme) {
     let area = frame.area();
     let rect = centered_rect(area, 70, form.fields.len() as u16 + 4);
 
     let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(Span::styled(
-        form.title,
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
+    lines.push(Line::from(Span::styled(form.title, theme.title())));
     lines.push(Line::from(""));
     for (i, field) in form.fields.iter().enumerate() {
         if i < form.current {
             lines.push(Line::from(Span::styled(
                 format!("  ✓ {field}: {}", form.values[i]),
-                Style::default().fg(Color::Green),
+                Style::default().fg(theme.success),
             )));
         } else if i == form.current {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("> {field}: "),
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(theme.accent)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(form.input.as_str()),
-                Span::styled("█", Style::default().fg(Color::Cyan)),
+                Span::styled("█", Style::default().fg(theme.accent)),
             ]));
         } else {
             lines.push(Line::from(format!("  {field}")));
@@ -159,48 +170,51 @@ fn draw_form(frame: &mut Frame, form: &Form) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         " Enter: next · Esc: cancel ",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme.muted),
     )));
 
     let paragraph = Paragraph::new(lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Step-by-step form "),
+                .title(" Step-by-step form ")
+                .style(theme.surface_style())
+                .border_style(theme.block(true)),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(Clear, rect);
+    frame.buffer_mut().set_style(rect, theme.surface_style());
     frame.render_widget(paragraph, rect);
 }
 
 /// Number of list rows the wizard shows at once.
 const WIZARD_VISIBLE: usize = 12;
 
-fn draw_wizard(frame: &mut Frame, wizard: &Wizard) {
+fn draw_wizard(
+    frame: &mut Frame,
+    wizard: &Wizard,
+    theme: Theme,
+    state: &throbber_widgets_tui::ThrobberState,
+) {
     let area = frame.area();
     let rows = wizard.choices.len().min(WIZARD_VISIBLE) as u16;
     let rect = centered_rect(area, 70, rows + 6);
 
     let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(Span::styled(
-        wizard.step.title(),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )));
+    lines.push(Line::from(Span::styled(wizard.step.title(), theme.title())));
     lines.push(Line::from(""));
 
     if wizard.step == WizardStep::Dir {
         lines.push(Line::from(vec![
-            Span::styled("> Directory: ", Style::default().fg(Color::Cyan)),
+            Span::styled("> Directory: ", Style::default().fg(theme.accent)),
             Span::raw(wizard.dir.as_str()),
-            Span::styled("█", Style::default().fg(Color::Cyan)),
+            Span::styled("█", Style::default().fg(theme.accent)),
         ]));
     } else if wizard.loading {
-        lines.push(Line::from(Span::styled(
-            "loading…",
-            Style::default().fg(Color::DarkGray),
-        )));
+        lines.push(Line::from(vec![
+            throbber_span(theme, state),
+            Span::styled("loading…", Style::default().fg(theme.muted)),
+        ]));
     } else {
         let start = wizard.selected.saturating_sub(WIZARD_VISIBLE - 1);
         for (idx, (label, _)) in wizard
@@ -211,7 +225,7 @@ fn draw_wizard(frame: &mut Frame, wizard: &Wizard) {
             .take(WIZARD_VISIBLE)
         {
             let style = if idx == wizard.selected {
-                Style::default().fg(Color::Black).bg(Color::Cyan)
+                theme.selected()
             } else {
                 Style::default()
             };
@@ -220,7 +234,7 @@ fn draw_wizard(frame: &mut Frame, wizard: &Wizard) {
         if wizard.choices.is_empty() {
             lines.push(Line::from(Span::styled(
                 "(nothing available)",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.muted),
             )));
         }
     }
@@ -228,23 +242,26 @@ fn draw_wizard(frame: &mut Frame, wizard: &Wizard) {
     if let Some(err) = &wizard.error {
         lines.push(Line::from(Span::styled(
             err.as_str(),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme.danger),
         )));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         " ↑/↓ select · Enter: next · Esc: cancel ",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme.muted),
     )));
 
     let paragraph = Paragraph::new(lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" New one-shot task "),
+                .title(" New one-shot task ")
+                .style(theme.surface_style())
+                .border_style(theme.block(true)),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(Clear, rect);
+    frame.buffer_mut().set_style(rect, theme.surface_style());
     frame.render_widget(paragraph, rect);
 }
 
@@ -387,16 +404,16 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
 ];
 
 /// Flatten [`HELP_SECTIONS`] into the styled lines rendered by [`draw_help`].
-fn help_lines() -> Vec<Line<'static>> {
+fn help_lines(theme: Theme) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     for (section, rows) in HELP_SECTIONS {
         lines.push(Line::from(Span::styled(
             (*section).to_string(),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            theme.title(),
         )));
         for (k, v) in *rows {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {k} — "), Style::default().fg(Color::Yellow)),
+                Span::styled(format!("  {k} — "), Style::default().fg(theme.accent)),
                 Span::raw((*v).to_string()),
             ]));
         }
@@ -406,15 +423,17 @@ fn help_lines() -> Vec<Line<'static>> {
 }
 
 /// Draw the scrollable `?` keybinding overlay, clamping `scroll` to the content.
-fn draw_help(frame: &mut Frame, scroll: &mut u16) {
+fn draw_help(frame: &mut Frame, scroll: &mut u16, theme: Theme) {
     let area = frame.area();
     let rect = centered_rect(area, 80, area.height.saturating_sub(2));
 
-    let paragraph = Paragraph::new(help_lines())
+    let paragraph = Paragraph::new(help_lines(theme))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Help (?) — ↑/↓ scroll, Esc/? close "),
+                .title(" Help (?) — ↑/↓ scroll, Esc/? close ")
+                .style(theme.surface_style())
+                .border_style(theme.block(true)),
         )
         .wrap(Wrap { trim: false });
     let inner_width = rect.width.saturating_sub(2);
@@ -424,28 +443,25 @@ fn draw_help(frame: &mut Frame, scroll: &mut u16) {
     *scroll = (*scroll).min(max_scroll);
 
     frame.render_widget(Clear, rect);
+    frame.buffer_mut().set_style(rect, theme.surface_style());
     frame.render_widget(paragraph.scroll((*scroll, 0)), rect);
 }
 
-fn draw_catalog(frame: &mut Frame, app: &mut App, area: Rect) {
+fn draw_catalog(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     let chunks =
         Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).split(area);
-    draw_catalog_table(frame, app, chunks[0]);
-    draw_catalog_preview(frame, app, chunks[1]);
+    draw_catalog_table(frame, app, chunks[0], theme);
+    draw_catalog_preview(frame, app, chunks[1], theme);
 }
 
-fn draw_catalog_table(frame: &mut Frame, app: &mut App, area: Rect) {
+fn draw_catalog_table(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     let widths = [
         Constraint::Min(14),
         Constraint::Length(10),
         Constraint::Length(18),
         Constraint::Min(0),
     ];
-    let header = Row::new(vec!["NAME", "AGENT", "MODEL", "NEEDS"]).style(
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    );
+    let header = Row::new(vec!["NAME", "AGENT", "MODEL", "NEEDS"]).style(theme.table_header());
 
     let rows: Vec<Row> = app
         .catalog
@@ -462,11 +478,16 @@ fn draw_catalog_table(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let table = Table::new(rows, widths)
         .header(header)
-        .block(Block::default().borders(Borders::ALL).title(format!(
-            " Catalog ({}) — Enter/click to start ",
-            app.catalog.len()
-        )))
-        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(
+                    " Catalog ({}) — Enter/click to start ",
+                    app.catalog.len()
+                ))
+                .border_style(theme.block(false)),
+        )
+        .row_highlight_style(theme.selected())
         .column_spacing(1);
 
     let mut state = TableState::default();
@@ -480,26 +501,26 @@ fn draw_catalog_table(frame: &mut Frame, app: &mut App, area: Rect) {
     };
 }
 
-fn draw_catalog_preview(frame: &mut Frame, app: &mut App, area: Rect) {
+fn draw_catalog_preview(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     // Remember the pane's rectangle so the mouse wheel can be targeted at it.
     app.catalog_preview_area = Some(area);
 
     let (name, lines) = match app.catalog_preview.as_ref() {
         Some((name, markdown)) if !markdown.trim().is_empty() => {
-            (Some(name.as_str()), markdown::render_task(markdown))
+            (Some(name.as_str()), markdown::render_task(markdown, &theme))
         }
         Some((name, _)) => (
             Some(name.as_str()),
             vec![Line::from(Span::styled(
                 "(no content)",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.muted),
             ))],
         ),
         None => (
             None,
             vec![Line::from(Span::styled(
                 "Select a task to preview its definition.",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.muted),
             ))],
         ),
     };
@@ -525,12 +546,17 @@ fn draw_catalog_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     };
 
     let paragraph = paragraph
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(theme.block(false)),
+        )
         .scroll((app.catalog_preview_scroll, 0));
     frame.render_widget(paragraph, area);
 }
 
-fn draw_schedules(frame: &mut Frame, app: &mut App, area: Rect) {
+fn draw_schedules(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     let widths = [
         Constraint::Length(10),
         Constraint::Length(20),
@@ -538,11 +564,8 @@ fn draw_schedules(frame: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Length(12),
         Constraint::Min(0),
     ];
-    let header = Row::new(vec!["ID", "CRON", "TASK", "ENABLED", "INPUT"]).style(
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    );
+    let header =
+        Row::new(vec!["ID", "CRON", "TASK", "ENABLED", "INPUT"]).style(theme.table_header());
 
     let rows: Vec<Row> = app
         .schedules
@@ -566,11 +589,16 @@ fn draw_schedules(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let table = Table::new(rows, widths)
         .header(header)
-        .block(Block::default().borders(Borders::ALL).title(format!(
-            " Schedules ({}) — click or ↑/↓ select ",
-            app.schedules.len()
-        )))
-        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(
+                    " Schedules ({}) — click or ↑/↓ select ",
+                    app.schedules.len()
+                ))
+                .border_style(theme.block(false)),
+        )
+        .row_highlight_style(theme.selected())
         .column_spacing(2);
 
     let mut state = TableState::default();
@@ -586,7 +614,7 @@ fn draw_schedules(frame: &mut Frame, app: &mut App, area: Rect) {
     };
 }
 
-fn draw_notifications(frame: &mut Frame, app: &mut App, area: Rect) {
+fn draw_notifications(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     let widths = [
         Constraint::Length(8),
         Constraint::Length(12),
@@ -594,11 +622,8 @@ fn draw_notifications(frame: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Length(28),
         Constraint::Min(0),
     ];
-    let header = Row::new(vec!["ID", "CHANNEL", "STATUS", "SUBJECT", "BODY"]).style(
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    );
+    let header =
+        Row::new(vec!["ID", "CHANNEL", "STATUS", "SUBJECT", "BODY"]).style(theme.table_header());
 
     let rows: Vec<Row> = app
         .notifications
@@ -608,7 +633,7 @@ fn draw_notifications(frame: &mut Frame, app: &mut App, area: Rect) {
             Row::new(vec![
                 Cell::from(n.id.to_string()),
                 Cell::from(n.channel.clone()),
-                Cell::from(status_ok(&n.status)),
+                Cell::from(status_ok(&n.status, theme)),
                 Cell::from(n.subject.clone()),
                 Cell::from(body),
             ])
@@ -617,11 +642,16 @@ fn draw_notifications(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let table = Table::new(rows, widths)
         .header(header)
-        .block(Block::default().borders(Borders::ALL).title(format!(
-            " Notifications ({}) — click or ↑/↓ select ",
-            app.notifications.len()
-        )))
-        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(
+                    " Notifications ({}) — click or ↑/↓ select ",
+                    app.notifications.len()
+                ))
+                .border_style(theme.block(false)),
+        )
+        .row_highlight_style(theme.selected())
         .column_spacing(2);
 
     let mut state = TableState::default();
@@ -639,16 +669,19 @@ fn draw_notifications(frame: &mut Frame, app: &mut App, area: Rect) {
     };
 }
 
-fn status_ok(s: &str) -> Span<'static> {
-    let (txt, color) = if s == "ok" {
-        ("ok", Color::Green)
+fn status_ok(s: &str, theme: Theme) -> Line<'static> {
+    let (dot, txt, color) = if s == "ok" {
+        ("●", "ok", theme.success)
     } else {
-        ("error", Color::Red)
+        ("○", "error", theme.danger)
     };
-    Span::styled(txt.to_string(), Style::default().fg(color))
+    Line::from(vec![
+        Span::styled(format!("{dot} "), Style::default().fg(color)),
+        Span::styled(txt.to_string(), Style::default().fg(color)),
+    ])
 }
 
-fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect) {
+fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     let widths = [
         Constraint::Length(10),
         Constraint::Length(22),
@@ -656,12 +689,9 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Length(8),
         Constraint::Min(0),
     ];
-    let header = Row::new(vec!["ID", "TASK", "STATUS", "AGE", "ERROR"]).style(
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    );
+    let header = Row::new(vec!["ID", "TASK", "STATUS", "AGE", "ERROR"]).style(theme.table_header());
 
+    let state = app.throbber_state.clone();
     let rows: Vec<Row> = app
         .tasks
         .iter()
@@ -669,7 +699,7 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect) {
             Row::new(vec![
                 Cell::from(short_id(&t.id)),
                 Cell::from(t.name.clone()),
-                Cell::from(status_span(t.status)),
+                Cell::from(status_line(t.status, theme, &state)),
                 Cell::from(age(t.created_at)),
                 Cell::from(t.error.clone().unwrap_or_default()),
             ])
@@ -678,11 +708,16 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let table = Table::new(rows, widths)
         .header(header)
-        .block(Block::default().borders(Borders::ALL).title(format!(
-            " Tasks ({}) — click or ↑/↓ select, Enter/click to run agent ",
-            app.tasks.len()
-        )))
-        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(
+                    " Tasks ({}) — click or ↑/↓ select, Enter/click to run agent ",
+                    app.tasks.len()
+                ))
+                .border_style(theme.block(false)),
+        )
+        .row_highlight_style(theme.selected())
         .column_spacing(2);
 
     let mut state = TableState::default();
@@ -696,8 +731,10 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect) {
     };
 }
 
-fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect) {
-    let inner = Block::default().borders(Borders::ALL);
+fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
+    let inner = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.block(false));
     let inner_area = inner.inner(area);
     // Remember the terminal's screen rectangle so mouse events can be translated
     // into the agent's coordinate space.
@@ -711,8 +748,8 @@ fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect) {
         app.agent_resize = Some((rows, cols));
     }
 
-    let title = if app.agent_session_id.is_none() {
-        " Agent — no session (Enter on a task) ".to_string()
+    let title: Line = if app.agent_session_id.is_none() {
+        Line::from(Span::raw(" Agent — no session (Enter on a task) "))
     } else {
         let name = app.agent_name.as_deref().unwrap_or("agent");
         let state = if app.agent_running {
@@ -725,16 +762,26 @@ fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect) {
         } else {
             format!(" · {}", app.agent_status)
         };
-        format!(" Agent · {name} · {state}{extra} · Ctrl+N new · Ctrl+Q leave ")
+        let mut spans = vec![Span::raw(" Agent · ")];
+        if app.agent_running {
+            spans.push(throbber_span(theme, &app.throbber_state));
+        }
+        spans.push(Span::raw(format!(
+            "{name} · {state}{extra} · Ctrl+N new · Ctrl+Q leave "
+        )));
+        Line::from(spans)
     };
 
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.block(false))
+        .title(title);
     frame.render_widget(block, area);
 
     if app.agent_session_id.is_none() || inner_area.width == 0 || inner_area.height == 0 {
         let hint = Paragraph::new(Line::from(Span::styled(
             "The embedded agent terminal appears here. Select a task and press Enter to launch the configured agent.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.muted),
         )))
         .wrap(Wrap { trim: true });
         frame.render_widget(hint, inner_area);
@@ -758,7 +805,7 @@ fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect) {
             if cell.is_wide_continuation() {
                 continue;
             }
-            let style = cell_style(cell);
+            let style = cell_style(cell, theme);
             let contents = cell.contents();
             let text = if contents.is_empty() { " " } else { contents };
             if run_style == Some(style) {
@@ -785,10 +832,14 @@ fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-/// Map a vt100 cell's attributes to a ratatui style.
-fn cell_style(cell: &vt100::Cell) -> Style {
+/// Map a vt100 cell's attributes to a ratatui style, defaulting unset colours to
+/// the active theme so the embedded agent adopts the themed surface.
+fn cell_style(cell: &vt100::Cell, theme: Theme) -> Style {
     let mut style = Style::default();
-    let (mut fg, mut bg) = (vt_color(cell.fgcolor()), vt_color(cell.bgcolor()));
+    let (mut fg, mut bg) = (
+        vt_color_or(cell.fgcolor(), theme.fg),
+        vt_color_or(cell.bgcolor(), theme.bg),
+    );
 
     let mut modifier = Modifier::empty();
     if cell.bold() {
@@ -811,10 +862,10 @@ fn cell_style(cell: &vt100::Cell) -> Style {
     style
 }
 
-/// Convert a vt100 colour to a ratatui colour.
-fn vt_color(color: vt100::Color) -> Color {
+/// Convert a vt100 colour to a ratatui colour, substituting the theme default.
+fn vt_color_or(color: vt100::Color, default: Color) -> Color {
     match color {
-        vt100::Color::Default => Color::Reset,
+        vt100::Color::Default => default,
         vt100::Color::Idx(idx) => Color::Indexed(idx),
         vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
     }
@@ -833,24 +884,20 @@ fn tab_click_regions(x0: u16, _y0: u16) -> Vec<(Tab, u16, u16)> {
     out
 }
 
-fn draw_events(frame: &mut Frame, app: &mut App, area: Rect) {
+fn draw_events(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     let chunks =
         Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).split(area);
-    draw_event_list(frame, app, chunks[0]);
-    draw_event_payload(frame, app, chunks[1]);
+    draw_event_list(frame, app, chunks[0], theme);
+    draw_event_payload(frame, app, chunks[1], theme);
 }
 
-fn draw_event_list(frame: &mut Frame, app: &mut App, area: Rect) {
+fn draw_event_list(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     let widths = [
         Constraint::Length(8),
         Constraint::Min(18),
         Constraint::Length(8),
     ];
-    let header = Row::new(vec!["ID", "KIND", "AGE"]).style(
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    );
+    let header = Row::new(vec!["ID", "KIND", "AGE"]).style(theme.table_header());
 
     let rows: Vec<Row> = app
         .events
@@ -867,11 +914,16 @@ fn draw_event_list(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let table = Table::new(rows, widths)
         .header(header)
-        .block(Block::default().borders(Borders::ALL).title(format!(
-            " Events ({}) — click or ↑/↓ select ",
-            app.events.len()
-        )))
-        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(
+                    " Events ({}) — click or ↑/↓ select ",
+                    app.events.len()
+                ))
+                .border_style(theme.block(false)),
+        )
+        .row_highlight_style(theme.selected())
         .column_spacing(1);
 
     let mut state = TableState::default();
@@ -887,41 +939,56 @@ fn draw_event_list(frame: &mut Frame, app: &mut App, area: Rect) {
     };
 }
 
-fn draw_event_payload(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_event_payload(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     let (title, lines) = match app.selected_event() {
         Some(ev) => (
             format!(" Payload · {} #{} ", ev.kind.as_str(), ev.id),
-            json::render(&ev.payload),
+            json::render(&ev.payload, &theme),
         ),
         None => (
             " Payload ".to_string(),
             vec![Line::from(Span::styled(
                 "(no events yet)",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.muted),
             ))],
         ),
     };
 
     let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(theme.block(false)),
+        )
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
-fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
-    let (state_txt, color) = match app.conn {
-        ConnState::Connected => ("connected", Color::Green),
-        ConnState::Connecting => ("connecting", Color::Yellow),
-        ConnState::Disconnected => ("disconnected", Color::Red),
+fn draw_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
+    let (dot, state_txt, color) = match app.conn {
+        ConnState::Connected => ("●", "connected", theme.success),
+        ConnState::Connecting => ("◐", "connecting", theme.warning),
+        ConnState::Disconnected => ("○", "disconnected", theme.danger),
     };
 
     // Keyboard focus: the embedded agent only owns the keyboard while its tab is
     // open and capture is on; otherwise favetto does.
     let agent_focused = app.tab == Tab::Agent && app.agent_capture;
     let (focus_txt, focus_color) = if agent_focused {
-        ("agent", Color::Magenta)
+        ("agent", theme.info)
     } else {
-        ("favetto", Color::Cyan)
+        ("favetto", theme.accent)
+    };
+
+    let hint = if app.tab == Tab::Agent {
+        if agent_focused {
+            "[Ctrl+Y] favetto keys"
+        } else {
+            "[Ctrl+Y] agent keys  [Ctrl+Q] leave  [Ctrl+N] new  [?] help"
+        }
+    } else {
+        "[↑↓] select  [Enter] agent  [Tab] switch  [q] quit  [?] help"
     };
 
     // Sound badge: muted wins visually; a disabled engine shows `sound off`.
@@ -933,55 +1000,78 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         ("sound", Color::Green)
     };
 
-    let left = format!(" {state_txt} · {}", app.conn_detail);
-    let hint = if app.tab == Tab::Agent {
-        if agent_focused {
-            "[Ctrl+Y] favetto keys"
-        } else {
-            "[Ctrl+Y] agent keys  [Ctrl+Q] leave  [Ctrl+N] new  [?] help"
-        }
-    } else {
-        "[↑↓] select  [Enter] agent  [Tab] switch  [q] quit  [?] help"
-    };
-    let right = format!(
-        "tasks: {}  events: {}  {hint}",
-        app.tasks.len(),
-        app.events.len()
-    );
+    let mut spans = vec![
+        Span::raw(" "),
+        Span::styled(format!(" {dot} "), Style::default().fg(color)),
+        Span::styled(state_txt.to_string(), Style::default().fg(color)),
+    ];
+    if matches!(app.conn, ConnState::Connecting) {
+        spans.push(throbber_span(theme, &app.throbber_state));
+    }
+    spans.push(Span::styled(
+        format!("· {}", app.conn_detail),
+        Style::default().fg(theme.muted),
+    ));
 
-    let line = Line::from(vec![
-        Span::styled(left, Style::default().fg(color)),
-        Span::raw("  "),
-        Span::styled(
-            format!(" {focus_txt} "),
-            Style::default()
-                .fg(Color::Black)
-                .bg(focus_color)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!(" {sound_txt} "),
-            Style::default()
-                .fg(Color::Black)
-                .bg(sound_color)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::raw(right),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        format!(" {sound_txt} "),
+        Style::default()
+            .fg(Color::Black)
+            .bg(sound_color)
+            .add_modifier(Modifier::BOLD),
+    ));
+
+    let counts = format!("tasks: {}  events: {}", app.tasks.len(), app.events.len());
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        format!(" {focus_txt} "),
+        Style::default()
+            .fg(theme.selected_fg)
+            .bg(focus_color)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(counts, theme.muted_style()));
+    spans.push(Span::styled(format!("  {hint}"), theme.accent_style()));
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn status_span(s: TaskStatus) -> Span<'static> {
-    let (txt, color) = match s {
-        TaskStatus::Pending => ("pending", Color::Yellow),
-        TaskStatus::Running => ("running", Color::Cyan),
-        TaskStatus::Succeeded => ("succeeded", Color::Green),
-        TaskStatus::Failed => ("failed", Color::Red),
-        TaskStatus::Cancelled => ("cancelled", Color::DarkGray),
+/// A status glyph/colour line for a task row. `Running` renders a throbber.
+fn status_line(
+    s: TaskStatus,
+    theme: Theme,
+    state: &throbber_widgets_tui::ThrobberState,
+) -> Line<'static> {
+    let color = theme.semantic(s);
+    let (glyph, txt) = match s {
+        TaskStatus::Pending => ("○", "pending"),
+        TaskStatus::Running => ("", "running"),
+        TaskStatus::Succeeded => ("✓", "succeeded"),
+        TaskStatus::Failed => ("✗", "failed"),
+        TaskStatus::Cancelled => ("●", "cancelled"),
     };
-    Span::styled(txt.to_string(), Style::default().fg(color))
+    let mut spans = Vec::new();
+    if s == TaskStatus::Running {
+        spans.push(throbber_span(theme, state));
+    } else {
+        spans.push(Span::styled(
+            format!("{glyph} "),
+            Style::default().fg(color),
+        ));
+    }
+    spans.push(Span::styled(txt.to_string(), Style::default().fg(color)));
+    Line::from(spans)
+}
+
+/// A styled throbber symbol span for the active theme.
+fn throbber_span(theme: Theme, state: &throbber_widgets_tui::ThrobberState) -> Span<'static> {
+    let t: throbber_widgets_tui::Throbber<'static> = throbber_widgets_tui::Throbber::default()
+        .throbber_set(throbber_widgets_tui::BRAILLE_SIX)
+        .throbber_style(Style::default().fg(theme.accent))
+        .style(theme.base());
+    t.to_symbol_span(state)
 }
 
 fn short_id(id: &uuid::Uuid) -> String {
@@ -1008,6 +1098,9 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use std::collections::BTreeMap;
+
+    use favetto_core::model::AgentCapabilities;
 
     #[test]
     fn tab_regions_cover_every_tab() {
@@ -1022,13 +1115,139 @@ mod tests {
 
     #[test]
     fn all_tabs_render_without_panic() {
-        for tab in Tab::ALL {
-            let mut app = App::new();
-            app.tab = tab;
-            let backend = TestBackend::new(80, 24);
-            let mut terminal = Terminal::new(backend).unwrap();
-            terminal.draw(|f| draw(f, &mut app)).unwrap();
+        for theme in [Theme::dark(), Theme::light()] {
+            for tab in Tab::ALL {
+                let mut app = App::with_theme(theme);
+                app.tab = tab;
+                let backend = TestBackend::new(80, 24);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal.draw(|f| draw(f, &mut app)).unwrap();
+            }
         }
+    }
+
+    #[test]
+    fn all_popups_render_without_panic() {
+        for theme in [Theme::dark(), Theme::light()] {
+            for popup in [
+                Popup::Menu { selected: 0 },
+                Popup::Form(Form {
+                    kind: super::super::app::FormKind::AddTask,
+                    title: "Add task to catalog",
+                    fields: vec!["Task name", "Prompt"],
+                    current: 0,
+                    values: Vec::new(),
+                    input: String::new(),
+                }),
+                Popup::Wizard(Wizard {
+                    step: WizardStep::Agent,
+                    selected: 0,
+                    choices: vec![("opencode".to_string(), "opencode".to_string())],
+                    providers: Vec::new(),
+                    capabilities: AgentCapabilities::default(),
+                    agent_caps: BTreeMap::new(),
+                    agent: None,
+                    provider: None,
+                    model: None,
+                    dir: String::new(),
+                    loading: false,
+                    error: None,
+                }),
+                Popup::Wizard(Wizard {
+                    step: WizardStep::Provider,
+                    selected: 0,
+                    choices: Vec::new(),
+                    providers: Vec::new(),
+                    capabilities: AgentCapabilities::default(),
+                    agent_caps: BTreeMap::new(),
+                    agent: Some("opencode".to_string()),
+                    provider: None,
+                    model: None,
+                    dir: String::new(),
+                    loading: true,
+                    error: Some("boom".to_string()),
+                }),
+                Popup::Help { scroll: 0 },
+            ] {
+                let mut app = App::with_theme(theme);
+                app.popup = popup;
+                let backend = TestBackend::new(100, 40);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal.draw(|f| draw(f, &mut app)).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn base_surface_paints_theme_background() {
+        let theme = Theme::dark();
+        let mut app = App::with_theme(theme);
+        app.tab = Tab::Notifications;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        // A cell inside an otherwise-empty notifications table row.
+        let cell = buffer.cell((3, 2)).unwrap();
+        assert_eq!(cell.bg, theme.bg);
+        // Guard against a regression to `Color::Reset` on the base paint.
+        assert_ne!(theme.bg, Color::Reset);
+    }
+
+    #[test]
+    fn status_bar_shows_connection_dot() {
+        let mut app = App::new();
+        app.conn = ConnState::Connected;
+        let text = render_text(&mut app, 100, 24);
+        assert!(text.contains('●'), "connected dot missing: {text:?}");
+
+        app.conn = ConnState::Disconnected;
+        let text = render_text(&mut app, 100, 24);
+        assert!(text.contains('○'), "disconnected dot missing: {text:?}");
+    }
+
+    #[test]
+    fn running_task_renders_throbber_and_selection_uses_theme() {
+        let theme = Theme::dark();
+        let mut app = App::with_theme(theme);
+        app.tab = Tab::Tasks;
+        let mut running = geom_task("r");
+        running.status = favetto_core::model::TaskStatus::Running;
+        app.tasks = vec![running];
+
+        let text = render_text(&mut app, 100, 24);
+        // The `BRAILLE_SIX` throbber set used by `throbber_span`.
+        const BRAILLE: [char; 6] = ['⠷', '⠯', '⠟', '⠻', '⠽', '⠾'];
+        assert!(
+            BRAILLE.iter().any(|c| text.contains(*c)),
+            "throbber glyph missing: {text:?}"
+        );
+
+        // The throbber span actually changes across animation steps.
+        let mut state = throbber_widgets_tui::ThrobberState::default();
+        let first = throbber_span(theme, &state).content.to_string();
+        state.calc_next();
+        let second = throbber_span(theme, &state).content.to_string();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn agent_default_colors_adopt_theme() {
+        let theme = Theme::dark();
+        let mut parser = vt100::Parser::new(4, 20, 0);
+        parser.process(b"plain");
+        let cell = parser.screen().cell(0, 0).unwrap();
+        let style = cell_style(cell, theme);
+        assert_eq!(style.fg, Some(theme.fg));
+        assert_eq!(style.bg, Some(theme.bg));
+
+        // Explicit colours are preserved, not replaced by the theme default.
+        let mut parser = vt100::Parser::new(4, 20, 0);
+        parser.process(b"\x1b[31mX");
+        let cell = parser.screen().cell(0, 0).unwrap();
+        let style = cell_style(cell, theme);
+        assert_eq!(style.fg, Some(Color::Indexed(1)));
     }
 
     fn render_text(app: &mut App, width: u16, height: u16) -> String {

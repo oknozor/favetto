@@ -6,6 +6,7 @@ mod json;
 mod markdown;
 mod sound;
 mod term;
+mod theme;
 mod ui;
 
 use std::io;
@@ -77,6 +78,9 @@ pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
     let transport = resolve_transport(&args).await;
 
     enable_raw_mode().context("enable raw mode")?;
+    // Resolve the palette now, before the input-reader thread exists: the OSC 11
+    // query needs to read the terminal's reply from stdin itself.
+    let theme = theme::Theme::detect();
     let mut stdout = io::stdout();
     execute!(
         stdout,
@@ -100,7 +104,7 @@ pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
         }
     });
 
-    let mut app = App::new();
+    let mut app = App::with_theme(theme);
     app.sound_enabled = sound_cfg.enabled;
     let mut backoff = Duration::from_millis(250);
     let result = loop {
@@ -327,9 +331,13 @@ async fn run_session(
     let mut push_rx = client.subscribe();
     let mut closed_rx = client.closed();
     let mut ping = tokio::time::interval(Duration::from_secs(5));
+    let mut anim = tokio::time::interval(Duration::from_millis(80));
+    anim.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
-        app.throbber_state.calc_next();
+        // The tick is only consumed while something on screen animates; an idle
+        // TUI draws solely in response to real events.
+        let animate = app.needs_animation();
         let _ = terminal.draw(|f| ui::draw(f, app));
 
         // Keep the daemon-side PTY in sync with the panel size.
@@ -346,6 +354,9 @@ async fn run_session(
 
         tokio::select! {
             biased;
+            _ = anim.tick(), if animate => {
+                app.throbber_state.calc_next();
+            }
             ev = ev_rx.recv() => {
                 match ev {
                     Some(CEvent::Key(k)) if k.kind == KeyEventKind::Press => {
