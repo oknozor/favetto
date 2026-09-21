@@ -14,7 +14,9 @@ use std::time::Duration;
 use anyhow::Context;
 use base64::Engine as _;
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyEventKind};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyEventKind,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -22,7 +24,9 @@ use ratatui::crossterm::terminal::{
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use favetto_core::model::{AgentCatalogEntry, AgentSessionInfo, Event, NotificationRecord, Schedule, Task};
+use favetto_core::model::{
+    AgentCatalogEntry, AgentSessionInfo, Event, NotificationRecord, Schedule, Task,
+};
 use favetto_core::rpc::method;
 use favetto_providers::Provider;
 
@@ -95,7 +99,11 @@ pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
     };
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
 
     result
 }
@@ -108,7 +116,10 @@ async fn sync_initial(client: &Client, app: &mut App) {
         }
     }
 
-    if let Ok(resp) = client.request(method::TASKS_LIST, serde_json::json!({})).await {
+    if let Ok(resp) = client
+        .request(method::TASKS_LIST, serde_json::json!({}))
+        .await
+    {
         if let Some(v) = resp.result {
             if let Ok(tasks) = serde_json::from_value::<Vec<Task>>(v) {
                 app.tasks = tasks;
@@ -166,7 +177,10 @@ async fn sync_initial(client: &Client, app: &mut App) {
 
 /// Fetch the task catalog.
 async fn fetch_catalog(client: &Client, app: &mut App) {
-    if let Ok(resp) = client.request(method::CATALOG_LIST, serde_json::json!({})).await {
+    if let Ok(resp) = client
+        .request(method::CATALOG_LIST, serde_json::json!({}))
+        .await
+    {
         if let Some(v) = resp.result {
             if let Ok(catalog) = serde_json::from_value::<Vec<CatalogEntry>>(v) {
                 app.set_catalog(catalog);
@@ -187,7 +201,11 @@ async fn maybe_load_catalog_preview(client: &Client, app: &mut App) {
     {
         Ok(resp) => resp
             .result
-            .and_then(|v| v.get("markdown").and_then(|m| m.as_str()).map(str::to_string))
+            .and_then(|v| {
+                v.get("markdown")
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string)
+            })
             .unwrap_or_default(),
         Err(e) => {
             app.logs.push_back(format!("catalog.get failed: {e}"));
@@ -200,14 +218,20 @@ async fn maybe_load_catalog_preview(client: &Client, app: &mut App) {
 
 /// Re-fetch the list-based tabs (used after a form submission).
 async fn refresh_lists(client: &Client, app: &mut App) {
-    if let Ok(resp) = client.request(method::TASKS_LIST, serde_json::json!({})).await {
+    if let Ok(resp) = client
+        .request(method::TASKS_LIST, serde_json::json!({}))
+        .await
+    {
         if let Some(v) = resp.result {
             if let Ok(tasks) = serde_json::from_value::<Vec<Task>>(v) {
                 app.tasks = tasks;
             }
         }
     }
-    if let Ok(resp) = client.request(method::SCHEDULES_LIST, serde_json::json!({})).await {
+    if let Ok(resp) = client
+        .request(method::SCHEDULES_LIST, serde_json::json!({}))
+        .await
+    {
         if let Some(v) = resp.result {
             if let Ok(schedules) = serde_json::from_value::<Vec<Schedule>>(v) {
                 app.schedules = schedules;
@@ -215,7 +239,10 @@ async fn refresh_lists(client: &Client, app: &mut App) {
         }
     }
     if let Ok(resp) = client
-        .request(method::NOTIFICATIONS_LIST, serde_json::json!({ "limit": 100 }))
+        .request(
+            method::NOTIFICATIONS_LIST,
+            serde_json::json!({ "limit": 100 }),
+        )
         .await
     {
         if let Some(v) = resp.result {
@@ -424,7 +451,9 @@ fn apply_agent_response(app: &mut App, resp: favetto_core::rpc::Response) {
                 .unwrap_or_default();
             match session {
                 Some(session) => app.open_agent(session, &frame),
-                None => app.logs.push_back("agent response: malformed session".to_string()),
+                None => app
+                    .logs
+                    .push_back("agent response: malformed session".to_string()),
             }
         }
         None => app.logs.push_back(format!("agent error: {:?}", resp.error)),
@@ -433,22 +462,33 @@ fn apply_agent_response(app: &mut App, resp: favetto_core::rpc::Response) {
 
 /// Fetch the configured agents and open the one-shot wizard.
 async fn fetch_agents(client: &Client, app: &mut App) {
-    match client.request(method::AGENTS_LIST, serde_json::json!({})).await {
+    match client
+        .request(method::AGENTS_LIST, serde_json::json!({}))
+        .await
+    {
         Ok(resp) => match resp.result {
             Some(v) => match serde_json::from_value::<Vec<AgentCatalogEntry>>(v) {
                 Ok(agents) => app.open_wizard(agents),
                 Err(e) => app.logs.push_back(format!("agents.list: {e}")),
             },
-            None => app.logs.push_back(format!("agents.list error: {:?}", resp.error)),
+            None => app
+                .logs
+                .push_back(format!("agents.list error: {:?}", resp.error)),
         },
         Err(e) => app.logs.push_back(format!("agents.list failed: {e}")),
     }
 }
 
-/// Fetch the configured provider/model catalog for the wizard.
+/// Fetch the configured provider/model catalog for the wizard's selected agent.
 async fn load_wizard_providers(client: &Client, app: &mut App) {
+    let Some(agent) = app.wizard_agent() else {
+        return;
+    };
     match client
-        .request(method::PROVIDERS_LIST, serde_json::json!({}))
+        .request(
+            method::PROVIDERS_LIST,
+            serde_json::json!({ "agent": agent }),
+        )
         .await
     {
         Ok(resp) => match resp.result {
@@ -511,7 +551,8 @@ async fn send_agent_input(client: &Client, app: &mut App, bytes: &[u8]) {
 fn drain_quit(ev_rx: &mut mpsc::UnboundedReceiver<CEvent>, app: &mut App) {
     while let Ok(ev) = ev_rx.try_recv() {
         if let CEvent::Key(k) = ev {
-            if k.kind == KeyEventKind::Press && matches!(k.code, KeyCode::Char('q') | KeyCode::Esc) {
+            if k.kind == KeyEventKind::Press && matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)
+            {
                 app.should_quit = true;
             }
         }

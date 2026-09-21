@@ -334,6 +334,19 @@ favetto does not reimplement a coding agent: it runs a configured agent CLI
 (opencode, Claude Code, pi, Mistral Vibe, …) in a PTY on the daemon and embeds
 its live terminal in the TUI's **Agent** tab.
 
+Each CLI is behind a generic `Agent` implementation (`OpenCodeAgent`,
+`ClaudeAgent`, `PiAgent`, `VibeAgent`) selected by a registry. A `[agents.*]`
+entry whose name is one of `opencode`/`claude`/`pi`/`vibe` uses that built-in and
+only needs the fields it wants to override — the shipped defaults are exactly the
+example below. Set `type = "opencode"` (etc.) to bind a built-in to a custom name,
+or `type = "configurable"` to force the template-only agent for any name. An
+entry with no `type` and a non-built-in name is `configurable`. Unknown `type`
+values fail at daemon startup.
+
+The built-ins advertise capability flags (interactive, headless, resume, model
+selection, providers, …) that the daemon and the one-shot wizard use to adapt;
+`agents.list` reports them on the wire.
+
 ```toml
 # ~/.config/favetto/config.toml
 [agent]
@@ -460,13 +473,17 @@ The wizard lists agents from the config, then providers and models from the
 `favetto-providers` catalog: providers are the ones authenticated with opencode
 (read from `~/.local/share/opencode/auth.json`) and their models come from the
 models.dev catalog (`https://models.dev/api.json`, overridable with
-`OPENCODE_MODELS_URL`). The daemon caches the catalog for its lifetime. The
-directory step is prefilled with the daemon's working directory. On completion
-favetto creates a task row (input carries the inline definition, no `.md` file),
-emits `task_idle`/`task_started`, and opens an interactive session using the
-agent's `interactive_model_args` (so a model can be applied even when the agent's
-main TUI has no model flag — for opencode, `mini --model provider/model`). The task
-is marked completed/failed when that session exits.
+`OPENCODE_MODELS_URL`). Provider discovery is **agent-scoped**: `providers.list`
+takes an `agent` and returns an empty list for an agent without a provider source.
+The daemon caches each agent's catalog for its lifetime. The wizard is
+capability-driven: it sends the selected agent's name and skips the provider and
+model steps for an agent whose capabilities do not include them (for example
+`pi`). The directory step is prefilled with the daemon's working directory. On
+completion favetto creates a task row (input carries the inline definition, no
+`.md` file), emits `task_idle`/`task_started`, and opens an interactive session
+using the agent's `interactive_model_args` (so a model can be applied even when
+the agent's main TUI has no model flag — for opencode, `mini --model
+provider/model`). The task is marked completed/failed when that session exits.
 
 ## Remote API
 
@@ -477,8 +494,8 @@ The daemon exposes one wire protocol over two transports:
 
 Methods: `system.ping`, `tasks.list`, `tasks.start`, `tasks.cancel`,
 `events.tail`, `events.subscribe`, `agents.list`, `agents.start`, `agents.input`,
-`agents.resize`, `agents.attach`, `agents.close`, `schedules.list`,
-`schedules.upsert`, `schedules.delete`, `notifications.list`,
+`agents.resize`, `agents.attach`, `agents.close`, `providers.list`,
+`schedules.list`, `schedules.upsert`, `schedules.delete`, `notifications.list`,
 `notifications.test`, `hooks.upsert`. Server pushes:
 `event`, `task.updated`, `catalog.updated`, `log.line`, `agent.output`,
 `agent.exit`.

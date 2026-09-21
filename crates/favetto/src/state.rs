@@ -1,5 +1,6 @@
 //! Shared daemon state passed to every connection handler and background task.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -9,7 +10,7 @@ use favetto_core::model::{Event, EventKind};
 use sqlx::SqlitePool;
 use tokio_cron_scheduler::JobScheduler;
 
-use crate::agents::AgentManager;
+use crate::agents::{AgentManager, AgentRegistry};
 use crate::config::FavettoConfig;
 use crate::db;
 use crate::event_bus::{EventBus, ServerPush};
@@ -28,6 +29,8 @@ pub struct State {
     pub token: Token,
     pub webhooks: WebhookSecrets,
     pub agents: AgentManager,
+    /// Configured external agents, resolved once at startup.
+    pub registry: AgentRegistry,
     /// Live config (external agents, executor/daemon defaults).
     pub config: Arc<RwLock<FavettoConfig>>,
     /// Directory for SQLite + token + worktrees.
@@ -40,8 +43,8 @@ pub struct State {
     pub pair: PairStore,
     /// Live hook list (mutable so the TUI can add notification hooks).
     pub hook_store: Arc<RwLock<Vec<Hook>>>,
-    /// Cached provider/model catalog (fetched lazily from the provider API).
-    pub providers_cache: tokio::sync::Mutex<Option<Vec<favetto_providers::Provider>>>,
+    /// Cached provider/model catalogs, keyed by agent name (fetched lazily).
+    pub providers_cache: tokio::sync::Mutex<HashMap<String, Vec<favetto_providers::Provider>>>,
 }
 
 impl State {
@@ -52,6 +55,7 @@ impl State {
         token: Token,
         webhooks: WebhookSecrets,
         agents: AgentManager,
+        registry: AgentRegistry,
         config: Arc<RwLock<FavettoConfig>>,
         data_dir: PathBuf,
         tasks_dir: PathBuf,
@@ -65,6 +69,7 @@ impl State {
             token,
             webhooks,
             agents,
+            registry,
             config,
             data_dir,
             tasks_dir,
@@ -72,7 +77,7 @@ impl State {
             scheduler,
             pair: PairStore::new(),
             hook_store,
-            providers_cache: tokio::sync::Mutex::new(None),
+            providers_cache: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 

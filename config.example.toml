@@ -22,6 +22,14 @@ default = "opencode"
 # `session_id_json_key` reads the agent's session id from a run's line-delimited
 # JSON output. `prompt_args` seeds an interactive session (otherwise the prompt is
 # written to stdin).
+#
+# `type` selects the implementation explicitly: "opencode", "claude", "pi",
+# "vibe", or "configurable". Omit it to use the built-in whose name matches the
+# entry — these `[agents.opencode]`, `[agents.claude]`, `[agents.pi]`, and
+# `[agents.vibe]` entries are the built-in defaults, so the values below are
+# optional. Use `type = "configurable"` with a custom name (or on a built-in name)
+# to force the template-only agent. Any field you set is merged over the built-in
+# default; omitted fields keep it.
 [agents.opencode]
 command = "opencode"
 args = []

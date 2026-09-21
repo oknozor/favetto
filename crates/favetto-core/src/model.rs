@@ -368,13 +368,53 @@ pub struct AgentSessionInfo {
     pub session_id: Option<String>,
 }
 
+/// What an external agent CLI can do, so the daemon and TUI can adapt without
+/// hard-coding a specific CLI's behaviour.
+///
+/// Every field defaults to `false` and is additive on the wire: an entry written
+/// by an older version decodes with all capabilities off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCapabilities {
+    /// Can run an attachable interactive TUI (the Agent panel).
+    #[serde(default)]
+    pub interactive: bool,
+    /// Can run a task unattended (non-interactively).
+    #[serde(default)]
+    pub headless: bool,
+    /// Can reopen a previous session (`resume_args` / an agent session id).
+    #[serde(default)]
+    pub resume: bool,
+    /// Accepts a provider/model selection.
+    #[serde(default)]
+    pub model_selection: bool,
+    /// Exposes a provider/model catalog (`providers.list`).
+    #[serde(default)]
+    pub providers: bool,
+    /// Produces structured (machine-parseable) output.
+    #[serde(default)]
+    pub structured_output: bool,
+    /// Reports its own session id in the output.
+    #[serde(default)]
+    pub reports_session_id: bool,
+    /// Seeds, but does not submit, a prompt (needs an Enter press).
+    #[serde(default)]
+    pub prompt_prefill: bool,
+}
+
 /// A configured external agent plus its live-session state, as returned by
 /// `agents.list`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentCatalogEntry {
+    /// Configured/built-in key, e.g. `opencode`.
     pub name: String,
+    /// Human-readable CLI name, e.g. `OpenCode`.
+    #[serde(default)]
+    pub display_name: String,
     pub command: String,
     pub default: bool,
+    /// What the agent can do; see [`AgentCapabilities`].
+    #[serde(default)]
+    pub capabilities: AgentCapabilities,
     /// Live sessions launched from this agent.
     pub sessions: Vec<AgentSessionInfo>,
 }
@@ -405,6 +445,41 @@ pub struct NotificationRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_catalog_entry_round_trips_capabilities() {
+        let entry = AgentCatalogEntry {
+            name: "opencode".to_string(),
+            display_name: "OpenCode".to_string(),
+            command: "opencode".to_string(),
+            default: true,
+            capabilities: AgentCapabilities {
+                interactive: true,
+                headless: true,
+                resume: true,
+                model_selection: true,
+                providers: true,
+                structured_output: true,
+                reports_session_id: true,
+                prompt_prefill: true,
+            },
+            sessions: Vec::new(),
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["capabilities"]["providers"], true);
+        let back: AgentCatalogEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(back.name, entry.name);
+        assert_eq!(back.display_name, entry.display_name);
+        assert_eq!(back.capabilities, entry.capabilities);
+        assert!(back.default);
+
+        // Old payloads without the new fields still decode, defaulting them.
+        let legacy: AgentCatalogEntry =
+            serde_json::from_str(r#"{"name":"pi","command":"pi","default":false,"sessions":[]}"#)
+                .unwrap();
+        assert_eq!(legacy.display_name, "");
+        assert_eq!(legacy.capabilities, AgentCapabilities::default());
+    }
 
     #[test]
     fn event_kind_round_trips() {

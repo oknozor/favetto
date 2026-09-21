@@ -19,7 +19,7 @@ use favetto_core::model::{AgentCatalogEntry, AgentSessionInfo, EventKind, Task, 
 use favetto_core::rpc::{error_code, method, push, Frame, Notification, Request, Response};
 use favetto_core::wire::WireError;
 
-use crate::agents::{AgentEvent, Invocation};
+use crate::agents::{AgentContext, AgentEvent, Invocation};
 use crate::db;
 use crate::event_bus::ServerPush;
 use crate::state::State;
@@ -64,7 +64,10 @@ pub async fn serve_connection(state: Arc<State>, mut incoming: BoxIn, mut outgoi
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(n, "client fell behind; events skipped (resume via last_event_id)");
+                    tracing::warn!(
+                        n,
+                        "client fell behind; events skipped (resume via last_event_id)"
+                    );
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -310,7 +313,11 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
                 Some(s) => s.to_string(),
                 None => return Response::err(req.id, error_code::INVALID_PARAMS, "missing name"),
             };
-            let input = req.params.get("input").cloned().unwrap_or(serde_json::Value::Null);
+            let input = req
+                .params
+                .get("input")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             match crate::executor::enqueue_task(state, name, input, None).await {
                 Ok(task) => Ok(serde_json::json!(task)),
                 Err(e) => Err((error_code::INTERNAL, e.to_string())),
@@ -342,23 +349,18 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
             None => Err((error_code::INVALID_PARAMS, "missing 'name'".to_string())),
             Some(name) => {
                 let path = state.tasks_dir.join(format!("{name}.md"));
-                let markdown = std::fs::read_to_string(&path)
-                    .ok()
-                    .or_else(|| {
-                        state
-                            .catalog
-                            .read()
-                            .unwrap()
-                            .iter()
-                            .find(|d| d.name == name)
-                            .map(crate::tasks::to_markdown)
-                    });
+                let markdown = std::fs::read_to_string(&path).ok().or_else(|| {
+                    state
+                        .catalog
+                        .read()
+                        .unwrap()
+                        .iter()
+                        .find(|d| d.name == name)
+                        .map(crate::tasks::to_markdown)
+                });
                 match markdown {
                     Some(markdown) => Ok(serde_json::json!({ "markdown": markdown })),
-                    None => Err((
-                        error_code::INVALID_PARAMS,
-                        format!("unknown task '{name}'"),
-                    )),
+                    None => Err((error_code::INVALID_PARAMS, format!("unknown task '{name}'"))),
                 }
             }
         },
@@ -375,7 +377,7 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
                 "vars": def.vars,
             })),
             Err(e) => Err((error_code::INTERNAL, e.to_string())),
-        }
+        },
 
         method::EVENTS_TAIL => {
             let limit = req
@@ -392,18 +394,23 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
 
         method::AGENTS_LIST => {
             let sessions = state.agents.sessions();
-            let cfg = state.config.read().unwrap();
-            let default = cfg.agent.default.clone();
-            let mut entries: Vec<AgentCatalogEntry> = cfg
-                .agents
+            let default = state
+                .registry
+                .default_agent()
+                .map(|agent| agent.descriptor().id.clone());
+            let mut entries: Vec<AgentCatalogEntry> = state
+                .registry
+                .descriptors()
                 .iter()
-                .map(|(name, a)| AgentCatalogEntry {
-                    name: name.clone(),
-                    command: a.command.clone(),
-                    default: default.as_deref() == Some(name.as_str()),
+                .map(|d| AgentCatalogEntry {
+                    name: d.id.clone(),
+                    display_name: d.name.clone(),
+                    command: d.command.clone(),
+                    default: default.as_deref() == Some(d.id.as_str()),
+                    capabilities: d.capabilities,
                     sessions: sessions
                         .iter()
-                        .filter(|s| &s.agent == name)
+                        .filter(|s| s.agent == d.id)
                         .cloned()
                         .collect(),
                 })
@@ -413,8 +420,10 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
                 if !entries.iter().any(|e| e.name == s.agent) {
                     entries.push(AgentCatalogEntry {
                         name: s.agent.clone(),
+                        display_name: String::new(),
                         command: String::new(),
                         default: false,
+                        capabilities: Default::default(),
                         sessions: vec![s.clone()],
                     });
                 }
@@ -423,9 +432,12 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
             Ok(serde_json::json!(entries))
         }
 
-        method::PROVIDERS_LIST => match list_providers(state).await {
-            Ok(providers) => Ok(serde_json::json!({ "providers": providers })),
-            Err(e) => Err((error_code::INTERNAL, e.to_string())),
+        method::PROVIDERS_LIST => {
+            let agent = req.params.get("agent").and_then(|v| v.as_str());
+            match list_providers(state, agent).await {
+                Ok(providers) => Ok(serde_json::json!({ "providers": providers })),
+                Err(e) => Err((error_code::INTERNAL, e.to_string())),
+            }
         }
 
         method::AGENTS_INPUT => {
@@ -450,8 +462,16 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
                 Ok(s) => s,
                 Err(e) => return Response::err(req.id, error_code::INVALID_PARAMS, e),
             };
-            let rows = req.params.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
-            let cols = req.params.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
+            let rows = req
+                .params
+                .get("rows")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(24) as u16;
+            let cols = req
+                .params
+                .get("cols")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(80) as u16;
             match state.agents.resize(&sid, rows, cols) {
                 Ok(()) => Ok(serde_json::json!({ "rows": rows, "cols": cols })),
                 Err(e) => Err((error_code::INTERNAL, e.to_string())),
@@ -495,9 +515,15 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
         method::NOTIFICATIONS_TEST => {
             let channel = match req.params.get("channel").and_then(|v| v.as_str()) {
                 Some(s) => s.to_string(),
-                None => return Response::err(req.id, error_code::INVALID_PARAMS, "missing channel"),
+                None => {
+                    return Response::err(req.id, error_code::INVALID_PARAMS, "missing channel")
+                }
             };
-            let config = req.params.get("config").cloned().unwrap_or(serde_json::Value::Null);
+            let config = req
+                .params
+                .get("config")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             let subject = req
                 .params
                 .get("subject")
@@ -560,31 +586,33 @@ async fn start_agent(
     let rows = params.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
     let cols = params.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
 
-    let force_new = params
-        .get("new")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let force_new = params.get("new").and_then(|v| v.as_bool()).unwrap_or(false);
 
     // Resolve the agent in a scoped block so the config read guard is dropped
     // before the `await` below (a std `RwLockReadGuard` is not `Send`).
-    let (name, mut agent) = {
+    let name = {
         let cfg = state.config.read().unwrap();
-        let name = requested
+        requested
             .or_else(|| cfg.agent.default.clone())
             .ok_or_else(|| {
                 anyhow::anyhow!("no agent given and no default configured ([agent].default)")
-            })?;
-        let agent = cfg
-            .agents
-            .get(&name)
-            .ok_or_else(|| anyhow::anyhow!("agent '{name}' is not configured under [agents.*]"))?
-            .clone();
-        (name, agent)
+            })?
     };
+    let agent = state
+        .registry
+        .get(&name)
+        .ok_or_else(|| anyhow::anyhow!("agent '{name}' is not configured under [agents.*]"))?;
 
-    if let Some(cwd) = params.get("cwd").and_then(|v| v.as_str()) {
-        agent.cwd = Some(std::path::PathBuf::from(cwd));
-    }
+    let ctx = AgentContext {
+        cwd: params
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .map(std::path::PathBuf::from),
+        session_id: session_id.clone(),
+        rows,
+        cols,
+        ..Default::default()
+    };
 
     if !force_new {
         let live = task_id
@@ -601,7 +629,7 @@ async fn start_agent(
         // Otherwise resume the agent's own session, never the headless run's PTY
         // (whose screen is machine output). The id comes from the request, the
         // task row, or the running run once its output has been parsed.
-        if agent.resume_args.is_some() {
+        if agent.capabilities().resume {
             let sid = match session_id.clone() {
                 Some(sid) => Some(sid),
                 None => match persisted_session_id(state, task_id.as_deref()).await {
@@ -610,14 +638,9 @@ async fn start_agent(
                 },
             };
             if let Some(sid) = sid {
-                return state.agents.start(
-                    &name,
-                    &agent,
-                    task_id,
-                    Invocation::Resume(&sid),
-                    rows,
-                    cols,
-                );
+                return state
+                    .agents
+                    .start(&name, agent, task_id, Invocation::Resume(&sid), ctx);
             }
         }
 
@@ -629,20 +652,17 @@ async fn start_agent(
         }
     }
 
-    state
-        .agents
-        .start(
-            &name,
-            &agent,
-            task_id,
-            Invocation::Interactive {
-                prompt: prompt.as_deref(),
-                provider: None,
-                model: None,
-            },
-            rows,
-            cols,
-        )
+    state.agents.start(
+        &name,
+        agent,
+        task_id,
+        Invocation::Interactive {
+            prompt: prompt.as_deref(),
+            provider: None,
+            model: None,
+        },
+        ctx,
+    )
 }
 
 /// Wait briefly for a still-running headless run to publish its agent session id
@@ -672,24 +692,37 @@ async fn persisted_session_id(state: &Arc<State>, task_id: Option<&str>) -> Opti
         .and_then(|t| t.session_id)
 }
 
-/// Configured providers and their models (opencode `auth.json` + models.dev),
-/// cached for the daemon's lifetime.
-async fn list_providers(state: &Arc<State>) -> anyhow::Result<Vec<favetto_providers::Provider>> {
+/// Providers and models for the requested (or default) agent, cached per agent
+/// for the daemon's lifetime. Returns an empty list for an unknown agent or one
+/// without a provider source.
+async fn list_providers(
+    state: &Arc<State>,
+    requested: Option<&str>,
+) -> anyhow::Result<Vec<favetto_providers::Provider>> {
+    let agent = match requested {
+        Some(name) => state.registry.get(name),
+        None => state.registry.default_agent(),
+    };
+    let Some(agent) = agent else {
+        return Ok(Vec::new());
+    };
+    let Some(source) = agent.provider_source() else {
+        return Ok(Vec::new());
+    };
+    let key = agent.descriptor().id.clone();
+
     {
         let cache = state.providers_cache.lock().await;
-        if let Some(providers) = cache.as_ref() {
+        if let Some(providers) = cache.get(&key) {
             return Ok(providers.clone());
         }
     }
 
-    let configured = favetto_providers::configured_providers()?;
-    let url = std::env::var("OPENCODE_MODELS_URL")
-        .unwrap_or_else(|_| favetto_providers::DEFAULT_CATALOG_URL.to_string());
     let client = reqwest::Client::new();
-    let providers = favetto_providers::fetch_catalog(&client, &configured, &url).await?;
+    let providers = source.fetch(&client).await?;
 
     let mut cache = state.providers_cache.lock().await;
-    *cache = Some(providers.clone());
+    cache.insert(key, providers.clone());
     Ok(providers)
 }
 
@@ -721,21 +754,19 @@ async fn start_oneshot_task(
     let rows = params.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
     let cols = params.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
 
-    let (name, mut agent) = {
+    let name = {
         let cfg = state.config.read().unwrap();
-        let name = requested.or_else(|| cfg.agent.default.clone()).ok_or_else(|| {
-            anyhow::anyhow!("no agent given and no default configured ([agent].default)")
-        })?;
-        let agent = cfg
-            .agents
-            .get(&name)
-            .ok_or_else(|| anyhow::anyhow!("agent '{name}' is not configured under [agents.*]"))?
-            .clone();
-        (name, agent)
+        requested
+            .or_else(|| cfg.agent.default.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!("no agent given and no default configured ([agent].default)")
+            })?
     };
-    if let Some(cwd) = &cwd {
-        agent.cwd = Some(std::path::PathBuf::from(cwd));
-    }
+    let agent = state
+        .registry
+        .get(&name)
+        .ok_or_else(|| anyhow::anyhow!("agent '{name}' is not configured under [agents.*]"))?;
+    let cwd_path = cwd.as_ref().map(std::path::PathBuf::from);
 
     let task = Task {
         id: Uuid::new_v4(),
@@ -746,7 +777,7 @@ async fn start_oneshot_task(
             "agent": name.clone(),
             "provider": provider.clone(),
             "model": model.clone(),
-            "cwd": agent.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            "cwd": cwd_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
         }),
         output: None,
         dedupe_key: None,
@@ -772,17 +803,24 @@ async fn start_oneshot_task(
         )
         .await;
 
+    let ctx = AgentContext {
+        cwd: cwd_path,
+        provider: provider.clone(),
+        model: model.clone(),
+        rows,
+        cols,
+        ..Default::default()
+    };
     let info = state.agents.start(
         &name,
-        &agent,
+        agent,
         Some(task.id.to_string()),
         Invocation::Interactive {
             prompt: None,
             provider: provider.as_deref(),
             model: model.as_deref(),
         },
-        rows,
-        cols,
+        ctx,
     )?;
 
     // Finish the task once the interactive session ends.
@@ -823,7 +861,8 @@ async fn finish_oneshot(state: &Arc<State>, task_id: Uuid, code: Option<i32>) {
     } else {
         Some(format!(
             "agent session exited with {}",
-            code.map(|c| c.to_string()).unwrap_or_else(|| "?".to_string())
+            code.map(|c| c.to_string())
+                .unwrap_or_else(|| "?".to_string())
         ))
     };
     task.finished_at = Some(Utc::now());
@@ -848,7 +887,10 @@ async fn finish_oneshot(state: &Arc<State>, task_id: Uuid, code: Option<i32>) {
 }
 
 /// Create or update a schedule: (re)register its cron job and persist it.
-async fn upsert_schedule(state: &Arc<State>, params: &serde_json::Value) -> anyhow::Result<favetto_core::model::Schedule> {
+async fn upsert_schedule(
+    state: &Arc<State>,
+    params: &serde_json::Value,
+) -> anyhow::Result<favetto_core::model::Schedule> {
     use favetto_core::model::Schedule;
 
     let id = params
@@ -866,8 +908,14 @@ async fn upsert_schedule(state: &Arc<State>, params: &serde_json::Value) -> anyh
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing task"))?
         .to_string();
-    let input = params.get("input").cloned().unwrap_or(serde_json::Value::Null);
-    let enabled = params.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+    let input = params
+        .get("input")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let enabled = params
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
     let schedule = Schedule {
         id,
@@ -883,7 +931,10 @@ async fn upsert_schedule(state: &Arc<State>, params: &serde_json::Value) -> anyh
 }
 
 /// Add a task definition to the catalog (writes the `.md` file + updates memory).
-fn add_catalog_task(state: &Arc<State>, params: &serde_json::Value) -> anyhow::Result<crate::tasks::TaskDef> {
+fn add_catalog_task(
+    state: &Arc<State>,
+    params: &serde_json::Value,
+) -> anyhow::Result<crate::tasks::TaskDef> {
     use crate::tasks::TaskDef;
 
     let name = params
@@ -910,14 +961,27 @@ fn add_catalog_task(state: &Arc<State>, params: &serde_json::Value) -> anyhow::R
     if agent.is_none() {
         anyhow::bail!("a task needs an 'agent'");
     }
-    let schedule = params.get("schedule").and_then(|v| v.as_str()).map(str::to_string);
-    let needs = params.get("needs").and_then(|v| v.as_str()).map(str::to_string);
-    let spawn = params.get("spawn").and_then(|v| v.as_str()).map(str::to_string);
+    let schedule = params
+        .get("schedule")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let needs = params
+        .get("needs")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let spawn = params
+        .get("spawn")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     let spawn_file = params
         .get("spawn_file")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let prompt = params.get("prompt").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let prompt = params
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
 
     let def = TaskDef {
         name,
@@ -961,7 +1025,10 @@ fn upsert_hook(state: &Arc<State>, params: &serde_json::Value) -> anyhow::Result
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'channel'"))?
         .to_string();
-    let config = params.get("config").cloned().unwrap_or(serde_json::Value::Null);
+    let config = params
+        .get("config")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
 
     let hook = crate::hooks::notify_hook(event, channel, config);
     state.hook_store.write().unwrap().push(hook);
@@ -989,8 +1056,13 @@ async fn cancel_task(state: &State, id: Uuid) -> anyhow::Result<favetto_core::mo
         created_at: chrono::Utc::now(),
     };
     if let Ok(event_id) = db::insert_event(&state.db, &event).await {
-        let event = favetto_core::model::Event { id: event_id, ..event };
-        state.bus.publish(crate::event_bus::ServerPush::Event(event));
+        let event = favetto_core::model::Event {
+            id: event_id,
+            ..event
+        };
+        state
+            .bus
+            .publish(crate::event_bus::ServerPush::Event(event));
     }
 
     Ok(task)
