@@ -181,8 +181,9 @@ mod tests {
             pool,
             EventBus::new(64),
             favetto_core::auth::Token::generate(),
-            crate::webhooks::WebhookSecrets::from_env(),
+            crate::webhooks::WebhookSecrets::from_config(&crate::config::FavettoConfig::default()),
             crate::agents::AgentManager::new(),
+            crate::agents::AgentRegistry::default(),
             Arc::new(std::sync::RwLock::new(
                 crate::config::FavettoConfig::default(),
             )),

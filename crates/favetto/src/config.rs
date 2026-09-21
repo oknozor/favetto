@@ -134,6 +134,11 @@ pub struct AgentSettings {
 /// under that key (e.g. `"sessionID"`) and stored on the task.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentConfig {
+    /// Implementation discriminator: `opencode`, `claude`, `pi`, `vibe`, or
+    /// `configurable`. Omit to use the built-in whose name matches the entry (or
+    /// the template-only fallback for a custom name).
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
     /// Executable to launch (looked up on `PATH`).
     pub command: String,
     /// Interactive arguments.
@@ -164,9 +169,10 @@ pub struct AgentConfig {
     pub prompt_args: Option<Vec<String>>,
     /// After starting interactively with a prompt via `prompt_args`, send Enter to
     /// submit it once the agent's UI has settled (some agents, e.g. opencode,
-    /// only pre-fill the input with `--prompt`).
-    #[serde(default)]
-    pub submit_prompt: bool,
+    /// only pre-fill the input with `--prompt`). `None` leaves the built-in
+    /// default in place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submit_prompt: Option<bool>,
     /// Extra environment variables for the process.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -289,5 +295,47 @@ mod tests {
         assert!(rule.enabled);
         assert_eq!(rule.filter.repo.as_deref(), Some("oknozor/*"));
         assert_eq!(rule.filter.labels_contains, vec!["bug".to_string()]);
+    }
+
+    #[test]
+    fn agent_config_type_and_submit_prompt_parse() {
+        let cfg: FavettoConfig = toml::from_str(
+            r#"
+            [agents.opencode]
+            type = "opencode"
+            command = "opencode"
+            submit_prompt = true
+
+            [agents.custom]
+            command = "custom"
+            "#,
+        )
+        .unwrap();
+        let opencode = &cfg.agents["opencode"];
+        assert_eq!(opencode.agent_type.as_deref(), Some("opencode"));
+        assert_eq!(opencode.submit_prompt, Some(true));
+
+        // An absent `type` and `submit_prompt` stay unset.
+        let custom = &cfg.agents["custom"];
+        assert!(custom.agent_type.is_none());
+        assert!(custom.submit_prompt.is_none());
+    }
+
+    #[test]
+    fn agent_config_explicit_configurable_type_parses() {
+        let cfg: FavettoConfig = toml::from_str(
+            r#"
+            [agents.mycli]
+            type = "configurable"
+            command = "mycli"
+            submit_prompt = false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.agents["mycli"].agent_type.as_deref(),
+            Some("configurable")
+        );
+        assert_eq!(cfg.agents["mycli"].submit_prompt, Some(false));
     }
 }

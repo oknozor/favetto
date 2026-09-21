@@ -581,6 +581,7 @@ mod tests {
                 linear: None,
             },
             crate::agents::AgentManager::new(),
+            crate::agents::AgentRegistry::default(),
             Arc::new(RwLock::new(cfg)),
             dir.clone(),
             dir.clone(),

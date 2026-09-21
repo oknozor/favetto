@@ -1,6 +1,6 @@
 //! TUI application state and the logic for folding server pushes into it.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -11,7 +11,8 @@ use serde_json::Value;
 use base64::Engine as _;
 
 use favetto_core::model::{
-    AgentCatalogEntry, AgentSessionInfo, Event, NotificationRecord, Schedule, Task,
+    AgentCapabilities, AgentCatalogEntry, AgentSessionInfo, Event, NotificationRecord, Schedule,
+    Task,
 };
 use favetto_core::rpc::{method, push, Notification};
 use favetto_providers::Provider;
@@ -92,11 +93,15 @@ pub enum UiAction {
 /// one-shot wizard, or the `?` keybinding reference.
 pub enum Popup {
     None,
-    Menu { selected: usize },
+    Menu {
+        selected: usize,
+    },
     Form(Form),
     Wizard(Wizard),
     /// Scrollable keybinding reference, toggled with `?`.
-    Help { scroll: u16 },
+    Help {
+        scroll: u16,
+    },
 }
 
 pub struct Form {
@@ -130,15 +135,16 @@ pub enum WizardStep {
 impl WizardStep {
     pub fn title(self) -> &'static str {
         match self {
-            WizardStep::Agent => "One-shot task · 1/4 — select agent",
-            WizardStep::Provider => "One-shot task · 2/4 — select provider",
-            WizardStep::Model => "One-shot task · 3/4 — select model",
-            WizardStep::Dir => "One-shot task · 4/4 — working directory",
+            WizardStep::Agent => "One-shot task — select agent",
+            WizardStep::Provider => "One-shot task — select provider",
+            WizardStep::Model => "One-shot task — select model",
+            WizardStep::Dir => "One-shot task — working directory",
         }
     }
 }
 
-/// State for the one-shot task wizard (agent → provider → model → directory).
+/// State for the capability-driven one-shot wizard (agent → provider → model →
+/// directory; provider/model steps are skipped for agents that lack them).
 pub struct Wizard {
     pub step: WizardStep,
     pub selected: usize,
@@ -146,6 +152,10 @@ pub struct Wizard {
     pub choices: Vec<(String, String)>,
     /// The configured provider/model catalog (fetched once).
     pub providers: Vec<Provider>,
+    /// Capabilities of the selected agent, used to skip unsupported steps.
+    pub capabilities: AgentCapabilities,
+    /// Agent name → capabilities, so a selection can skip steps.
+    pub agent_caps: BTreeMap<String, AgentCapabilities>,
     pub agent: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -846,11 +856,17 @@ impl App {
             .filter(|a| !a.command.trim().is_empty())
             .map(|a| (a.name.clone(), a.name.clone()))
             .collect();
+        let agent_caps: BTreeMap<String, AgentCapabilities> = agents
+            .iter()
+            .map(|a| (a.name.clone(), a.capabilities))
+            .collect();
         self.popup = Popup::Wizard(Wizard {
             step: WizardStep::Agent,
             selected: 0,
             choices,
             providers: Vec::new(),
+            capabilities: AgentCapabilities::default(),
+            agent_caps,
             agent: None,
             provider: None,
             model: None,
@@ -860,8 +876,17 @@ impl App {
         });
     }
 
+    /// The agent currently selected in an open wizard, if any.
+    pub fn wizard_agent(&self) -> Option<String> {
+        match &self.popup {
+            Popup::Wizard(w) => w.agent.clone(),
+            _ => None,
+        }
+    }
+
     /// Populate the wizard with the configured providers and advance to the
-    /// provider step.
+    /// provider step, skipping straight to the directory step for an agent that
+    /// has no provider catalog.
     pub fn wizard_set_providers(&mut self, providers: Vec<Provider>) {
         let Popup::Wizard(w) = &mut self.popup else {
             return;
@@ -871,10 +896,14 @@ impl App {
             .map(|p| (p.name.clone(), p.id.clone()))
             .collect();
         w.providers = providers;
-        w.step = WizardStep::Provider;
-        w.selected = 0;
         w.loading = false;
         w.error = None;
+        w.selected = 0;
+        if !w.capabilities.providers {
+            w.step = WizardStep::Dir;
+            return;
+        }
+        w.step = WizardStep::Provider;
     }
 
     /// Surface an error in the wizard (e.g. the model list could not be fetched).
@@ -920,30 +949,45 @@ impl App {
                 WizardStep::Agent => match w.choices.get(w.selected).cloned() {
                     Some((_, name)) => {
                         w.agent = Some(name.clone());
-                        w.loading = true;
+                        w.capabilities = w.agent_caps.get(&name).copied().unwrap_or_default();
                         w.error = None;
                         w.choices.clear();
-                        UiAction::WizardLoadProviders
+                        if !w.capabilities.providers {
+                            // No provider catalog: skip straight to the directory.
+                            w.step = WizardStep::Dir;
+                            w.selected = 0;
+                            UiAction::None
+                        } else {
+                            w.loading = true;
+                            UiAction::WizardLoadProviders
+                        }
                     }
                     None => UiAction::None,
                 },
                 WizardStep::Provider => match w.choices.get(w.selected).cloned() {
                     Some((_, provider_id)) => {
-                        w.step = WizardStep::Model;
+                        w.provider = Some(provider_id.clone());
                         w.selected = 0;
-                        w.choices = w
-                            .providers
-                            .iter()
-                            .find(|p| p.id == provider_id)
-                            .map(|p| {
-                                p.models
-                                    .iter()
-                                    .map(|m| (m.name.clone(), m.id.clone()))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        w.provider = Some(provider_id);
-                        UiAction::None
+                        if !w.capabilities.model_selection {
+                            // No model selection: keep the agent default and go on.
+                            w.choices.clear();
+                            w.step = WizardStep::Dir;
+                            UiAction::None
+                        } else {
+                            w.step = WizardStep::Model;
+                            w.choices = w
+                                .providers
+                                .iter()
+                                .find(|p| p.id == provider_id)
+                                .map(|p| {
+                                    p.models
+                                        .iter()
+                                        .map(|m| (m.name.clone(), m.id.clone()))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            UiAction::None
+                        }
                     }
                     None => UiAction::None,
                 },
@@ -1776,9 +1820,62 @@ mod tests {
     fn agent_entry(name: &str) -> AgentCatalogEntry {
         AgentCatalogEntry {
             name: name.to_string(),
+            display_name: name.to_string(),
             command: "opencode".to_string(),
             default: false,
+            capabilities: AgentCapabilities {
+                interactive: true,
+                providers: true,
+                model_selection: true,
+                ..Default::default()
+            },
             sessions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn wizard_skips_provider_model_for_narrow_agent() {
+        let mut app = App::new();
+        app.daemon_cwd = Some("/code/che".to_string());
+        let narrow = AgentCatalogEntry {
+            name: "pi".to_string(),
+            display_name: "Pi".to_string(),
+            command: "pi".to_string(),
+            default: false,
+            capabilities: AgentCapabilities {
+                interactive: true,
+                ..Default::default()
+            },
+            sessions: Vec::new(),
+        };
+        app.open_wizard(vec![narrow]);
+
+        // A narrow agent advances straight from Agent to Dir; no provider fetch.
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())),
+            UiAction::None
+        ));
+        {
+            let Popup::Wizard(w) = &app.popup else {
+                panic!("wizard")
+            };
+            assert_eq!(w.step, WizardStep::Dir);
+            assert_eq!(w.agent.as_deref(), Some("pi"));
+        }
+
+        match app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())) {
+            UiAction::WizardStart {
+                agent,
+                provider,
+                model,
+                cwd,
+            } => {
+                assert_eq!(agent, "pi");
+                assert!(provider.is_none());
+                assert!(model.is_none());
+                assert_eq!(cwd.as_deref(), Some("/code/che"));
+            }
+            _ => panic!("expected WizardStart"),
         }
     }
 

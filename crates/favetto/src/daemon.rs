@@ -21,13 +21,15 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         .config
         .clone()
         .unwrap_or_else(crate::cli::default_config_path);
-    let config = Arc::new(std::sync::RwLock::new(match FavettoConfig::load_from(&config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(error = %e, path = %config_path.display(), "failed to load config; using defaults");
-            FavettoConfig::default()
-        }
-    }));
+    let config = Arc::new(std::sync::RwLock::new(
+        match FavettoConfig::load_from(&config_path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %config_path.display(), "failed to load config; using defaults");
+                FavettoConfig::default()
+            }
+        },
+    ));
 
     // Resolve settings: CLI flag > config > default. Read the config once here.
     let data_dir = {
@@ -84,10 +86,13 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     );
 
     let bus = event_bus::EventBus::new(1024);
-    let catalog = Arc::new(std::sync::RwLock::new(
-        crate::tasks::load_catalog(&tasks_dir)?,
-    ));
+    let catalog = Arc::new(std::sync::RwLock::new(crate::tasks::load_catalog(
+        &tasks_dir,
+    )?));
     let agents = crate::agents::AgentManager::new();
+    // Resolve every configured agent before wiring state: an unknown `type`
+    // fails startup rather than the first launch.
+    let registry = crate::agents::AgentRegistry::from_config(&config.read().unwrap())?;
     let scheduler = tokio_cron_scheduler::JobScheduler::new().await?;
 
     // Resolve webhook secrets from config/env and validate the trigger rules before
@@ -104,6 +109,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         token,
         webhooks,
         agents,
+        registry,
         config,
         data_dir.clone(),
         tasks_dir,

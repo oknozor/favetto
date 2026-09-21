@@ -185,7 +185,7 @@ async fn run_one(
     let agent_name = def.agent.clone().or_else(|| config.agent.default.clone());
     let outcome = match agent_name {
         Some(agent_name) => {
-            run_agent_task(state, &task, &agent_name, &config, &def, &prompt, &plan.cwd).await
+            run_agent_task(state, &task, &agent_name, &def, &prompt, &plan.cwd).await
         }
         None => Err(anyhow::anyhow!(
             "task '{}' has no agent: set `agent` in the task or `[agent].default` in the config",
@@ -316,51 +316,61 @@ async fn run_agent_task(
     state: &Arc<State>,
     task: &Task,
     agent_name: &str,
-    config: &crate::config::FavettoConfig,
     def: &TaskDef,
     prompt: &str,
     cwd: &Path,
 ) -> anyhow::Result<(serde_json::Value, Option<String>)> {
-    let mut agent = config
-        .agents
-        .get(agent_name)
-        .ok_or_else(|| anyhow::anyhow!("agent '{agent_name}' is not configured under [agents.*]"))?
-        .clone();
-    agent.cwd = Some(cwd.to_path_buf());
+    let agent = state.registry.get(agent_name).ok_or_else(|| {
+        anyhow::anyhow!("agent '{agent_name}' is not configured under [agents.*]")
+    })?;
 
+    let ctx = crate::agents::AgentContext {
+        cwd: Some(cwd.to_path_buf()),
+        provider: def.provider.clone(),
+        model: def.model.clone(),
+        prompt: Some(prompt.to_string()),
+        rows: 40,
+        cols: 120,
+        ..Default::default()
+    };
     let info = state.agents.start(
         agent_name,
-        &agent,
+        agent.clone(),
         Some(task.id.to_string()),
         crate::agents::Invocation::Headless {
             prompt,
             provider: def.provider.as_deref(),
             model: def.model.as_deref(),
         },
-        40,
-        120,
+        ctx,
     )?;
 
     let code = state.agents.wait(&info.id).await;
-    let output = state.agents.output(&info.id);
-    let session_id = state.agents.external_session_id(&info.id);
+    let raw = state.agents.output(&info.id);
+    let mut result = agent.parse_output(&raw, code);
+    // The manager also captures the id live from the PTY; prefer it if the
+    // implementation's parser did not find one.
+    if result.session_id.is_none() {
+        result.session_id = state.agents.external_session_id(&info.id);
+    }
     // The run's PTY only carried machine output (e.g. JSON events); drop it once
     // its session id is captured, since reattaching launches a fresh interactive
-    // TUI on that session. Agents without a resume template keep the PTY so its
-    // final screen can still be replayed.
-    if session_id.is_some() && agent.resume_args.is_some() {
+    // TUI on that session. Agents without resume keep the PTY so its final screen
+    // can still be replayed.
+    if result.session_id.is_some() && agent.capabilities().resume {
         let _ = state.agents.close(&info.id);
     }
-    match code {
+    match result.exit_code {
         Some(0) => Ok((
             serde_json::json!({
-                "output": output,
+                "output": result.raw,
                 "agent": agent_name,
-                "session_id": session_id,
+                "session_id": result.session_id,
+                "result": result.output,
             }),
-            session_id,
+            result.session_id,
         )),
-        Some(c) => anyhow::bail!("agent '{agent_name}' exited with {c}:\n{output}"),
+        Some(c) => anyhow::bail!("agent '{agent_name}' exited with {c}:\n{raw}"),
         None => anyhow::bail!("agent '{agent_name}' session disappeared"),
     }
 }

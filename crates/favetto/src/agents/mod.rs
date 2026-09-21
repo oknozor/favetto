@@ -25,7 +25,18 @@ use tokio::sync::broadcast;
 
 use favetto_core::model::AgentSessionInfo;
 
-use crate::config::AgentConfig;
+use agent::extract_session_id_from_line;
+
+mod agent;
+mod claude;
+mod configurable;
+mod opencode;
+mod pi;
+mod registry;
+mod vibe;
+
+pub use agent::{Agent, AgentContext, Invocation, SubmitStrategy};
+pub use registry::AgentRegistry;
 
 /// Scrollback lines retained by each session's server-side emulator.
 const SCROLLBACK: usize = 2000;
@@ -45,39 +56,6 @@ fn agent_exec_program() -> anyhow::Result<PathBuf> {
 /// `FAVETTO_NO_AGENT_WRAP` is set.
 fn wrap_agent() -> bool {
     !cfg!(test) && std::env::var_os("FAVETTO_NO_AGENT_WRAP").is_none()
-}
-
-/// Substitute `{key}` placeholders in an argument template.
-fn substitute(template: &[String], vars: &[(&str, &str)]) -> Vec<String> {
-    template
-        .iter()
-        .map(|a| {
-            let mut s = a.clone();
-            for (k, v) in vars {
-                s = s.replace(k, v);
-            }
-            s
-        })
-        .collect()
-}
-
-/// Extract an agent session id from one line of line-delimited JSON output.
-fn session_id_from_line(line: &str, key: &str) -> Option<String> {
-    let line = line.trim();
-    if !line.starts_with('{') {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    value.get(key)?.as_str().map(str::to_string)
-}
-
-/// Append a rendered argument template, reporting whether it carried `{prompt}`.
-fn append_template(cmd: &mut CommandBuilder, template: &[String], vars: &[(&str, &str)]) -> bool {
-    let saw_prompt = template.iter().any(|a| a.contains("{prompt}"));
-    for a in substitute(template, vars) {
-        cmd.arg(a);
-    }
-    saw_prompt
 }
 
 /// Ask an agent's supervisor to tear down its process group. `SIGTERM` is handled
@@ -114,25 +92,6 @@ impl AgentEvent {
             }
         }
     }
-}
-
-/// How an agent is invoked for a session.
-pub enum Invocation<'a> {
-    /// Interactive TUI: base `args` (or `interactive_model_args` when a model is
-    /// given) plus `prompt_args`, or the prompt on stdin.
-    Interactive {
-        prompt: Option<&'a str>,
-        provider: Option<&'a str>,
-        model: Option<&'a str>,
-    },
-    /// Unattended run: `run_args` when a model is given, else `headless_args`.
-    Headless {
-        prompt: &'a str,
-        provider: Option<&'a str>,
-        model: Option<&'a str>,
-    },
-    /// Interactive reattach to an existing agent session (`resume_args`).
-    Resume(&'a str),
 }
 
 /// A live agent process plus the handles needed to drive it.
@@ -234,24 +193,51 @@ impl AgentManager {
             .map(|s| s.info())
     }
 
-    /// Spawn `cfg` in a PTY for the given invocation.
+    /// Spawn `agent` in a PTY for `invocation`.
+    ///
+    /// The agent builds the [`CommandSpec`]; the manager only owns PTY/emulator
+    /// mechanics, stdin delivery, and session capture.
     pub fn start(
         &self,
         name: &str,
-        cfg: &AgentConfig,
+        agent: Arc<dyn Agent>,
         task_id: Option<String>,
         invocation: Invocation<'_>,
-        rows: u16,
-        cols: u16,
+        mut ctx: AgentContext,
     ) -> anyhow::Result<AgentSessionInfo> {
-        if cfg.command.trim().is_empty() {
-            anyhow::bail!("agent '{name}' has no command configured");
+        // Materialize the per-launch values from the invocation so the agent
+        // implementation can read them from the owned context.
+        match &invocation {
+            Invocation::Interactive {
+                prompt,
+                provider,
+                model,
+            } => {
+                ctx.prompt = prompt.map(str::to_string);
+                ctx.provider = provider.map(str::to_string);
+                ctx.model = model.map(str::to_string);
+            }
+            Invocation::Headless {
+                prompt,
+                provider,
+                model,
+            } => {
+                ctx.prompt = Some((*prompt).to_string());
+                ctx.provider = provider.map(str::to_string);
+                ctx.model = model.map(str::to_string);
+            }
+            Invocation::Resume(session_id) => {
+                ctx.session_id = Some((*session_id).to_string());
+            }
         }
+
+        let spec = agent.command(&invocation, &ctx)?;
+        let headless = matches!(&invocation, Invocation::Headless { .. });
 
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
-            rows: rows.max(1),
-            cols: cols.max(1),
+            rows: ctx.rows.max(1),
+            cols: ctx.cols.max(1),
             pixel_width: 0,
             pixel_height: 0,
         })?;
@@ -260,97 +246,16 @@ impl AgentManager {
             let mut c = CommandBuilder::new(agent_exec_program()?);
             c.arg("__agent-exec");
             c.arg("--");
-            c.arg(&cfg.command);
+            c.arg(&spec.program);
             c
         } else {
-            CommandBuilder::new(&cfg.command)
+            CommandBuilder::new(&spec.program)
         };
-
-        // Build the argument list for the invocation. `prompt_via_args` records
-        // whether the prompt was placed on the command line; otherwise it is fed
-        // over stdin. `headless` controls the EOT sent so a run sees EOF.
-        let mut prompt_via_args = false;
-        let mut stdin_prompt: Option<&str> = None;
-        let mut headless = false;
-        match invocation {
-            Invocation::Interactive {
-                prompt,
-                provider,
-                model,
-            } => {
-                // A selected model may require a different interactive entry point
-                // (e.g. opencode's `mini --model`), since its main TUI has no flag.
-                let base = if model.is_some() && cfg.interactive_model_args.is_some() {
-                    cfg.interactive_model_args.as_deref().unwrap_or(&cfg.args)
-                } else {
-                    cfg.args.as_slice()
-                };
-                for a in substitute(
-                    base,
-                    &[
-                        ("{provider}", provider.unwrap_or("")),
-                        ("{model}", model.unwrap_or("")),
-                    ],
-                ) {
-                    cmd.arg(a);
-                }
-                if let (Some(p), Some(prompt_args)) = (prompt, cfg.prompt_args.as_ref()) {
-                    let vars = [
-                        ("{prompt}", p),
-                        ("{provider}", provider.unwrap_or("")),
-                        ("{model}", model.unwrap_or("")),
-                    ];
-                    prompt_via_args = append_template(&mut cmd, prompt_args, &vars);
-                }
-                if !prompt_via_args {
-                    stdin_prompt = prompt;
-                }
-            }
-            Invocation::Headless {
-                prompt,
-                provider,
-                model,
-            } => {
-                headless = true;
-                let template = if model.is_some() {
-                    cfg.run_args.as_deref().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "agent '{name}' has no `run_args`, so it cannot run a task with a \
-                             model; add one, e.g. run_args = [\"run\", \"--model\", \
-                             \"{{provider}}/{{model}}\", \"--format\", \"json\", \"{{prompt}}\"]"
-                        )
-                    })?
-                } else {
-                    cfg.headless_args.as_deref().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "agent '{name}' has no `headless_args`, so it cannot run a task \
-                             unattended; add one, e.g. headless_args = [\"run\", \"--auto\", \
-                             \"{{prompt}}\"]"
-                        )
-                    })?
-                };
-                let vars = [
-                    ("{prompt}", prompt),
-                    ("{provider}", provider.unwrap_or("")),
-                    ("{model}", model.unwrap_or("")),
-                ];
-                prompt_via_args = append_template(&mut cmd, template, &vars);
-                if !prompt_via_args {
-                    stdin_prompt = Some(prompt);
-                }
-            }
-            Invocation::Resume(session_id) => {
-                let template = cfg.resume_args.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "agent '{name}' has no `resume_args`, so it cannot reattach to a session"
-                    )
-                })?;
-                let vars = [("{session_id}", session_id)];
-                append_template(&mut cmd, template, &vars);
-            }
+        for arg in &spec.args {
+            cmd.arg(arg);
         }
 
-        if let Some(cwd) = &cfg.cwd {
+        if let Some(cwd) = &spec.cwd {
             cmd.cwd(cwd);
             // The child's real working directory is changed above, but tools that
             // resolve relative paths from `$PWD` (e.g. opencode) would otherwise
@@ -360,7 +265,7 @@ impl AgentManager {
             }
         }
         cmd.env("TERM", "xterm-256color");
-        for (k, v) in &cfg.env {
+        for (k, v) in &spec.env {
             cmd.env(k, v);
         }
 
@@ -374,11 +279,11 @@ impl AgentManager {
         // If there is a prompt but no prompt_args, feed it over stdin. For an
         // unattended run also send EOT so an agent reading stdin sees EOF (a PTY
         // cannot half-close).
-        if let Some(prompt) = stdin_prompt {
+        if let Some(prompt) = &spec.stdin_prompt {
             let mut w = writer.lock().unwrap();
             let _ = w.write_all(prompt.as_bytes());
             let _ = w.write_all(b"\r");
-            if headless {
+            if spec.stdin_eof {
                 let _ = w.write_all(&[0x04]);
             }
             let _ = w.flush();
@@ -387,8 +292,8 @@ impl AgentManager {
         let id = uuid::Uuid::new_v4().to_string();
         let order = self.next_order.fetch_add(1, Ordering::SeqCst);
         let parser = Arc::new(Mutex::new(vt100::Parser::new(
-            rows.max(1),
-            cols.max(1),
+            ctx.rows.max(1),
+            ctx.cols.max(1),
             SCROLLBACK,
         )));
         // Counts output chunks; used only to detect activity/quiet for `submit_prompt`.
@@ -397,7 +302,7 @@ impl AgentManager {
         let raw = Arc::new(Mutex::new(Vec::new()));
         let exit_code = Arc::new(std::sync::atomic::AtomicI32::new(-1));
         let external_session_id = Arc::new(Mutex::new(None::<String>));
-        let session_key = cfg.session_id_json_key.clone();
+        let probe = agent.session_id_probe();
         let tx = self.tx.clone();
 
         // Reader thread: feed the emulator, answer terminal queries, broadcast a
@@ -429,12 +334,13 @@ impl AgentManager {
                             }
                             // Capture the agent's own session id from line-delimited
                             // JSON output (e.g. `opencode run --format json`).
-                            if let Some(key) = &session_key {
+                            if let Some(probe) = &probe {
                                 line_buf.extend_from_slice(bytes);
                                 while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
                                     let line: Vec<u8> = line_buf.drain(..=pos).collect();
                                     let line = String::from_utf8_lossy(&line);
-                                    if let Some(found) = session_id_from_line(&line, key) {
+                                    if let Some(found) = extract_session_id_from_line(&line, probe)
+                                    {
                                         let mut slot = external_session_id.lock().unwrap();
                                         if slot.is_none() {
                                             *slot = Some(found);
@@ -449,7 +355,10 @@ impl AgentManager {
                             let (frame, replies) = {
                                 let mut p = parser.lock().unwrap();
                                 p.process(bytes);
-                                (p.screen().state_formatted(), terminal_replies(p.screen(), bytes))
+                                (
+                                    p.screen().state_formatted(),
+                                    terminal_replies(p.screen(), bytes),
+                                )
                             };
                             ticks.fetch_add(1, Ordering::SeqCst);
                             if !replies.is_empty() {
@@ -482,8 +391,16 @@ impl AgentManager {
 
         // If the prompt was only pre-filled via `prompt_args`, submit it once the
         // agent's UI has settled (interactive sessions only).
-        if !headless && cfg.submit_prompt && prompt_via_args {
-            spawn_submit(writer.clone(), ticks.clone(), running.clone());
+        if matches!(&invocation, Invocation::Interactive { .. }) {
+            if let SubmitStrategy::AfterSettle { delay, max_sends } = spec.submit {
+                spawn_submit(
+                    writer.clone(),
+                    ticks.clone(),
+                    running.clone(),
+                    delay,
+                    max_sends,
+                );
+            }
         }
 
         let session = Arc::new(Session {
@@ -509,12 +426,7 @@ impl AgentManager {
     /// The current full-screen frame for a (re)attaching client.
     pub fn attach(&self, session_id: &str) -> anyhow::Result<(AgentSessionInfo, Vec<u8>)> {
         let session = self.get(session_id)?;
-        let frame = session
-            .parser
-            .lock()
-            .unwrap()
-            .screen()
-            .state_formatted();
+        let frame = session.parser.lock().unwrap().screen().state_formatted();
         Ok((session.info(), frame))
     }
 
@@ -569,7 +481,12 @@ impl AgentManager {
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        session.parser.lock().unwrap().screen_mut().set_size(rows, cols);
+        session
+            .parser
+            .lock()
+            .unwrap()
+            .screen_mut()
+            .set_size(rows, cols);
         Ok(())
     }
 
@@ -581,7 +498,6 @@ impl AgentManager {
         }
         Ok(())
     }
-
 
     fn get(&self, session_id: &str) -> anyhow::Result<Arc<Session>> {
         self.sessions
@@ -680,8 +596,14 @@ fn decrqm_reply(bytes: &[u8], out: &mut Vec<u8>) -> Option<usize> {
 
 fn osc_reply(bytes: &[u8], out: &mut Vec<u8>) -> Option<usize> {
     for (prefix, color) in [
-        (b"\x1b]10;?".as_slice(), b"\x1b]10;rgb:ffff/ffff/ffff\x07".as_slice()),
-        (b"\x1b]11;?".as_slice(), b"\x1b]11;rgb:0000/0000/0000\x07".as_slice()),
+        (
+            b"\x1b]10;?".as_slice(),
+            b"\x1b]10;rgb:ffff/ffff/ffff\x07".as_slice(),
+        ),
+        (
+            b"\x1b]11;?".as_slice(),
+            b"\x1b]11;rgb:0000/0000/0000\x07".as_slice(),
+        ),
     ] {
         if bytes.starts_with(prefix) {
             let rest = &bytes[prefix.len()..];
@@ -709,13 +631,13 @@ fn spawn_submit(
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     ticks: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
+    delay: std::time::Duration,
+    max_sends: u32,
 ) {
     use std::time::{Duration, Instant};
 
     const FIRST_OUTPUT_TIMEOUT: Duration = Duration::from_secs(15);
-    const INITIAL_DELAY: Duration = Duration::from_millis(1200);
     const RETRY_INTERVAL: Duration = Duration::from_millis(1200);
-    const MAX_SENDS: u32 = 8;
     const MIN_SENDS: u32 = 2;
     /// Output chunks after a send that indicate the agent reacted (started a turn).
     const REACTED: u64 = 4;
@@ -733,10 +655,10 @@ fn spawn_submit(
             return;
         }
 
-        std::thread::sleep(INITIAL_DELAY);
+        std::thread::sleep(delay);
         let mut sent = 0u32;
         let mut before = ticks.load(Ordering::SeqCst);
-        while running.load(Ordering::SeqCst) && sent < MAX_SENDS {
+        while running.load(Ordering::SeqCst) && sent < max_sends {
             if let Ok(mut w) = writer.lock() {
                 let _ = w.write_all(b"\r");
                 let _ = w.flush();
@@ -755,7 +677,10 @@ fn spawn_submit(
 
 #[cfg(test)]
 mod tests {
+    use super::agent::{AgentDescriptor, CommandSpec, SessionIdProbe};
+    use super::configurable::ConfigurableAgent;
     use super::*;
+    use crate::config::AgentConfig;
 
     fn cfg(command: &str, args: &[&str]) -> AgentConfig {
         AgentConfig {
@@ -765,32 +690,48 @@ mod tests {
         }
     }
 
-    #[test]
-    fn substitute_renders_placeholders() {
-        let template = vec!["run".to_string(), "--model".to_string(), "{provider}/{model}".to_string()];
-        let rendered = substitute(
-            &template,
-            &[("{provider}", "jev"), ("{model}", "1.13")],
-        );
-        assert_eq!(rendered, vec!["run", "--model", "jev/1.13"]);
+    fn template(name: &str, config: AgentConfig) -> Arc<dyn Agent> {
+        Arc::new(ConfigurableAgent::from_config(name, &config))
     }
 
-    #[test]
-    fn session_id_from_line_extracts_key() {
-        let line = r#"{"type":"text","timestamp":1,"sessionID":"ses_abc","part":{}}"#;
-        assert_eq!(
-            session_id_from_line(line, "sessionID").as_deref(),
-            Some("ses_abc")
-        );
-        assert_eq!(session_id_from_line("not json", "sessionID"), None);
-        assert_eq!(session_id_from_line(r#"{"other":1}"#, "sessionID"), None);
+    fn context(cwd: Option<PathBuf>, rows: u16, cols: u16) -> AgentContext {
+        AgentContext {
+            cwd,
+            rows,
+            cols,
+            ..Default::default()
+        }
+    }
+
+    /// An agent that delegates to a template but reports a nested session-id path.
+    struct ProbeAgent {
+        inner: ConfigurableAgent,
+        probe: SessionIdProbe,
+    }
+
+    impl Agent for ProbeAgent {
+        fn descriptor(&self) -> &AgentDescriptor {
+            self.inner.descriptor()
+        }
+
+        fn command(
+            &self,
+            invocation: &Invocation<'_>,
+            ctx: &AgentContext,
+        ) -> anyhow::Result<CommandSpec> {
+            self.inner.command(invocation, ctx)
+        }
+
+        fn session_id_probe(&self) -> Option<SessionIdProbe> {
+            Some(self.probe.clone())
+        }
     }
 
     #[test]
     fn interactive_with_model_uses_interactive_model_args() {
         let mgr = AgentManager::new();
-        let mut agent = cfg("sh", &[]);
-        agent.interactive_model_args = Some(vec![
+        let mut config = cfg("sh", &[]);
+        config.interactive_model_args = Some(vec![
             "-c".to_string(),
             r#"printf 'model:%s/%s' "$1" "$2""#.to_string(),
             "ignored".to_string(),
@@ -800,15 +741,14 @@ mod tests {
         let info = mgr
             .start(
                 "sh",
-                &agent,
+                template("sh", config),
                 None,
                 Invocation::Interactive {
                     prompt: None,
                     provider: Some("jev"),
                     model: Some("1.13"),
                 },
-                24,
-                80,
+                context(None, 24, 80),
             )
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -824,8 +764,20 @@ mod tests {
     #[test]
     fn attach_returns_current_frame() {
         let mgr = AgentManager::new();
-        let agent = cfg("sh", &["-c", "printf hello-pty; sleep 1"]);
-        let info = mgr.start("sh", &agent, None, Invocation::Interactive { prompt: None, provider: None, model: None }, 24, 80).unwrap();
+        let agent = template("sh", cfg("sh", &["-c", "printf hello-pty; sleep 1"]));
+        let info = mgr
+            .start(
+                "sh",
+                agent,
+                None,
+                Invocation::Interactive {
+                    prompt: None,
+                    provider: None,
+                    model: None,
+                },
+                context(None, 24, 80),
+            )
+            .unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(400));
         let (attached, data) = mgr.attach(&info.id).unwrap();
@@ -842,7 +794,17 @@ mod tests {
     fn pty_session_accepts_input() {
         let mgr = AgentManager::new();
         let info = mgr
-            .start("cat", &cfg("cat", &[]), None, Invocation::Interactive { prompt: None, provider: None, model: None }, 24, 80)
+            .start(
+                "cat",
+                template("cat", cfg("cat", &[])),
+                None,
+                Invocation::Interactive {
+                    prompt: None,
+                    provider: None,
+                    model: None,
+                },
+                context(None, 24, 80),
+            )
             .unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -862,7 +824,17 @@ mod tests {
     fn pty_resize_does_not_error() {
         let mgr = AgentManager::new();
         let info = mgr
-            .start("cat", &cfg("cat", &[]), None, Invocation::Interactive { prompt: None, provider: None, model: None }, 24, 80)
+            .start(
+                "cat",
+                template("cat", cfg("cat", &[])),
+                None,
+                Invocation::Interactive {
+                    prompt: None,
+                    provider: None,
+                    model: None,
+                },
+                context(None, 24, 80),
+            )
             .unwrap();
         mgr.resize(&info.id, 40, 120).unwrap();
         mgr.close(&info.id).unwrap();
@@ -871,17 +843,27 @@ mod tests {
     #[test]
     fn submit_prompt_presses_enter_after_quiet() {
         let mgr = AgentManager::new();
-        let mut agent = cfg("sh", &[]);
-        agent.prompt_args = Some(vec![
+        let mut config = cfg("sh", &[]);
+        config.prompt_args = Some(vec![
             "-c".to_string(),
             "printf ready; read x; echo got:$x".to_string(),
             "{prompt}".to_string(),
         ]);
-        agent.submit_prompt = true;
+        config.submit_prompt = Some(true);
         // Prompt goes via prompt_args, so it is not written to stdin; the submit
         // thread must press Enter for `read` to unblock.
         let info = mgr
-            .start("sh", &agent, None, Invocation::Interactive { prompt: Some("ignored"), provider: None, model: None }, 24, 80)
+            .start(
+                "sh",
+                template("sh", config),
+                None,
+                Invocation::Interactive {
+                    prompt: Some("ignored"),
+                    provider: None,
+                    model: None,
+                },
+                context(None, 24, 80),
+            )
             .unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(2500));
@@ -894,20 +876,19 @@ mod tests {
     #[tokio::test]
     async fn headless_session_runs_and_captures_output() {
         let mgr = AgentManager::new();
-        let mut agent = cfg("sh", &[]);
-        agent.headless_args = Some(vec!["-c".to_string(), "cat".to_string()]);
+        let mut config = cfg("sh", &[]);
+        config.headless_args = Some(vec!["-c".to_string(), "cat".to_string()]);
         let info = mgr
             .start(
                 "sh",
-                &agent,
+                template("sh", config),
                 Some("task-1".to_string()),
                 Invocation::Headless {
                     prompt: "hello-headless",
                     provider: None,
                     model: None,
                 },
-                40,
-                120,
+                context(None, 40, 120),
             )
             .unwrap();
         let code = mgr.wait(&info.id).await;
@@ -927,24 +908,23 @@ mod tests {
     #[tokio::test]
     async fn headless_run_uses_run_args_and_captures_session_id() {
         let mgr = AgentManager::new();
-        let mut agent = cfg("sh", &[]);
-        agent.run_args = Some(vec![
+        let mut config = cfg("sh", &[]);
+        config.run_args = Some(vec![
             "-c".to_string(),
             r#"printf '{"sessionID":"ses_123"}\n'"#.to_string(),
         ]);
-        agent.session_id_json_key = Some("sessionID".to_string());
+        config.session_id_json_key = Some("sessionID".to_string());
         let info = mgr
             .start(
                 "sh",
-                &agent,
+                template("sh", config),
                 Some("task-2".to_string()),
                 Invocation::Headless {
                     prompt: "hi",
                     provider: Some("jev"),
                     model: Some("1.13"),
                 },
-                40,
-                120,
+                context(None, 40, 120),
             )
             .unwrap();
         assert_eq!(mgr.wait(&info.id).await, Some(0));
@@ -955,25 +935,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn headless_run_captures_nested_session_id_via_json_path() {
+        let mgr = AgentManager::new();
+        let mut config = cfg("sh", &[]);
+        config.headless_args = Some(vec![
+            "-c".to_string(),
+            r#"printf '{"part":{"session":{"id":"ses_nested"}}}\n'"#.to_string(),
+        ]);
+        let agent: Arc<dyn Agent> = Arc::new(ProbeAgent {
+            inner: ConfigurableAgent::from_config("sh", &config),
+            probe: SessionIdProbe::JsonPath(vec![
+                "part".to_string(),
+                "session".to_string(),
+                "id".to_string(),
+            ]),
+        });
+        let info = mgr
+            .start(
+                "sh",
+                agent,
+                None,
+                Invocation::Headless {
+                    prompt: "hi",
+                    provider: None,
+                    model: None,
+                },
+                context(None, 40, 120),
+            )
+            .unwrap();
+        assert_eq!(mgr.wait(&info.id).await, Some(0));
+        assert_eq!(
+            mgr.external_session_id(&info.id).as_deref(),
+            Some("ses_nested")
+        );
+    }
+
+    #[tokio::test]
     async fn headless_child_gets_pwd_matching_cwd() {
         let dir = std::env::temp_dir().join(format!("favetto-pwd-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mgr = AgentManager::new();
-        let mut agent = cfg("sh", &[]);
-        agent.cwd = Some(dir.clone());
-        agent.headless_args = Some(vec!["-c".to_string(), r#"printf 'PWD=%s' "$PWD""#.to_string()]);
+        let mut config = cfg("sh", &[]);
+        config.headless_args = Some(vec![
+            "-c".to_string(),
+            r#"printf 'PWD=%s' "$PWD""#.to_string(),
+        ]);
         let info = mgr
             .start(
                 "sh",
-                &agent,
+                template("sh", config),
                 None,
                 Invocation::Headless {
                     prompt: "ignored",
                     provider: None,
                     model: None,
                 },
-                40,
-                120,
+                context(Some(dir.clone()), 40, 120),
             )
             .unwrap();
         assert_eq!(mgr.wait(&info.id).await, Some(0));
