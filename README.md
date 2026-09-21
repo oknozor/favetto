@@ -120,8 +120,17 @@ task. See `tasks/triage_cocogitto_issues.md`, `tasks/plan_cocogitto_issue.md`, a
 issues in `tasks/triage_favetto_issues.md`, `tasks/plan_favetto_issue.md`, and
 `tasks/implement_favetto_issue.md`.
 
-The daemon loads the catalog from `--tasks-dir` (default `tasks/`). From the TUI,
-the **Catalog** tab lists the catalog and Enter starts a task; the Ctrl+P menu's
+The daemon loads the catalog from `--tasks-dir` (default `tasks/`). It also
+watches that directory (via `notify`, with a 200 ms debounce): adding, editing,
+or removing a `.md` file reloads the catalog on the fly. A file that fails to
+parse keeps its previous definition (so a half-written edit never drops a task),
+and the recurring tasks derived from `schedule` headers are re-synced — a changed
+cron is re-registered and a removed header deletes the `catalog:<name>` schedule,
+while manually created schedules are left alone. Every reload pushes
+`catalog.updated` so attached TUIs re-fetch the list and refresh the preview.
+Runs already in flight keep the definition they were dispatched with; a queued
+task picks up the freshly loaded definition when it starts. From the TUI, the
+**Catalog** tab lists the catalog and Enter starts a task; the Ctrl+P menu's
 "Add task" writes a new `.md` file (it does not run it). Task lifecycle emits
 `task_idle` / `task_started` / `task_finished` events.
 
@@ -332,7 +341,8 @@ Methods: `system.ping`, `tasks.list`, `tasks.start`, `tasks.cancel`,
 `agents.resize`, `agents.attach`, `agents.close`, `schedules.list`,
 `schedules.upsert`, `schedules.delete`, `notifications.list`,
 `notifications.test`, `hooks.upsert`. Server pushes:
-`event`, `task.updated`, `log.line`, `agent.output`, `agent.exit`.
+`event`, `task.updated`, `catalog.updated`, `log.line`, `agent.output`,
+`agent.exit`.
 
 The daemon also serves HTTP endpoints: `GET /metrics` (Prometheus),
 `POST /pair/generate` and `POST /pair/exchange` (pairing), plus the webhook

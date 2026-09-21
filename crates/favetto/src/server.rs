@@ -943,13 +943,7 @@ fn add_catalog_task(state: &Arc<State>, params: &serde_json::Value) -> anyhow::R
 }
 
 async fn delete_schedule(state: &Arc<State>, id: &str) -> anyhow::Result<()> {
-    if let Some(job_id) = db::get_schedule_job_id(&state.db, id).await? {
-        if let Ok(job_uuid) = Uuid::parse_str(&job_id) {
-            let _ = crate::scheduler::unregister(&state.scheduler, &job_uuid).await;
-        }
-    }
-    db::delete_schedule(&state.db, id).await?;
-    Ok(())
+    crate::scheduler::remove(state, id).await
 }
 
 /// Add a notification hook reacting to an event kind (live, in-memory).
