@@ -116,7 +116,9 @@ This makes a triage → plan → implement pipeline declarative: the triage task
 writes a `manifest.json` array of issues and `spawn`s the planning task once per
 issue; each planning task writes a `handoff.json` and `spawn`s the implementation
 task. See `tasks/triage_cocogitto_issues.md`, `tasks/plan_cocogitto_issue.md`, and
-`tasks/implement_cocogitto_issue.md`.
+`tasks/implement_cocogitto_issue.md`. Favetto ships the same pipeline for its own
+issues in `tasks/triage_favetto_issues.md`, `tasks/plan_favetto_issue.md`, and
+`tasks/implement_favetto_issue.md`.
 
 The daemon loads the catalog from `--tasks-dir` (default `tasks/`). From the TUI,
 the **Catalog** tab lists the catalog and Enter starts a task; the Ctrl+P menu's
