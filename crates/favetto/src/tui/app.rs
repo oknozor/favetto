@@ -12,7 +12,7 @@ use base64::Engine as _;
 
 use favetto_core::model::{
     AgentCapabilities, AgentCatalogEntry, AgentSessionInfo, Event, EventKind, NotificationRecord,
-    Schedule, Task,
+    Schedule, Task, TaskStatus,
 };
 use favetto_core::rpc::{method, push, Notification};
 use favetto_providers::Provider;
@@ -21,6 +21,7 @@ use crate::tasks::TaskVar;
 
 use super::sound::SoundCue;
 use super::term::TerminalView;
+use super::theme::Theme;
 
 /// Tabs shown in the header. Agent hosts the embedded external-agent terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,6 +262,8 @@ impl ListGeometry {
 }
 
 pub struct App {
+    /// The colour palette every widget paints through.
+    pub theme: Theme,
     pub tab: Tab,
     pub conn: ConnState,
     pub conn_detail: String,
@@ -346,8 +349,15 @@ pub struct App {
 }
 
 impl App {
+    /// The default test/initial palette. Production resolves [`Theme::detect`].
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::with_theme(Theme::dark())
+    }
+
+    pub fn with_theme(theme: Theme) -> Self {
         Self {
+            theme,
             tab: Tab::Tasks,
             conn: ConnState::Connecting,
             conn_detail: String::new(),
@@ -393,6 +403,23 @@ impl App {
             sound_suppressed: false,
             sound_enabled: true,
         }
+    }
+
+    /// True while something on screen is animating (throbber) or reconnecting.
+    ///
+    /// The session loop only enables its redraw tick while this holds, so an idle
+    /// TUI never redraws without an event.
+    pub fn needs_animation(&self) -> bool {
+        if self.conn != ConnState::Connected {
+            return true;
+        }
+        if self.agent_running {
+            return true;
+        }
+        if self.tasks.iter().any(|t| t.status == TaskStatus::Running) {
+            return true;
+        }
+        matches!(&self.popup, Popup::Wizard(w) if w.loading)
     }
 
     pub fn next_tab(&mut self) {
@@ -2812,5 +2839,40 @@ mod tests {
         assert!(matches!(app.handle_mouse(click(5, 2)), UiAction::None));
         assert!(matches!(app.handle_mouse(click(5, 2)), UiAction::None));
         assert!(matches!(app.popup, Popup::TaskVars(_)));
+    }
+
+    #[test]
+    fn needs_animation_tracks_activity() {
+        let mut app = App::new();
+        app.conn = ConnState::Connected;
+        assert!(!app.needs_animation());
+
+        // Reconnecting always animates.
+        app.conn = ConnState::Disconnected;
+        assert!(app.needs_animation());
+
+        // A running task animates.
+        app.conn = ConnState::Connected;
+        let mut running = task("r");
+        running.status = TaskStatus::Running;
+        app.tasks = vec![running];
+        assert!(app.needs_animation());
+
+        // A running agent animates.
+        app.tasks.clear();
+        app.agent_running = true;
+        assert!(app.needs_animation());
+
+        // A loading wizard animates, then settles.
+        app.agent_running = false;
+        app.open_wizard(vec![agent_entry("opencode")]);
+        if let Popup::Wizard(w) = &mut app.popup {
+            w.loading = true;
+        }
+        assert!(app.needs_animation());
+        if let Popup::Wizard(w) = &mut app.popup {
+            w.loading = false;
+        }
+        assert!(!app.needs_animation());
     }
 }

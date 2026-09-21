@@ -6,28 +6,30 @@
 //! and inline code/bold/italic/links). It is intentionally small — no external
 //! renderer or highlighter.
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use super::theme::Theme;
+
 /// Render a task file (TOML front-matter + Markdown body) into styled lines.
-pub fn render_task(source: &str) -> Vec<Line<'static>> {
+pub fn render_task(source: &str, theme: &Theme) -> Vec<Line<'static>> {
     let lines: Vec<&str> = source.lines().collect();
     let separator = lines.iter().position(|l| l.trim() == "---");
 
     let Some(sep) = separator else {
         // No front-matter: treat the whole file as Markdown.
-        return render_markdown(&lines);
+        return render_markdown(&lines, theme);
     };
 
     let mut out = Vec::new();
     for line in &lines[..sep] {
-        out.push(highlight_toml(line));
+        out.push(highlight_toml(line, theme));
     }
     out.push(Line::from(Span::styled(
         "---",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme.syn_comment),
     )));
-    out.extend(render_markdown(&lines[sep + 1..]));
+    out.extend(render_markdown(&lines[sep + 1..], theme));
     out
 }
 
@@ -39,33 +41,33 @@ fn plain(text: &str, style: Style) -> Line<'static> {
 // TOML
 // ---------------------------------------------------------------------------
 
-fn highlight_toml(line: &str) -> Line<'static> {
+fn highlight_toml(line: &str, theme: &Theme) -> Line<'static> {
     let trimmed = line.trim_start();
     if trimmed.starts_with('#') {
-        return plain(line, Style::default().fg(Color::DarkGray));
+        return plain(line, Style::default().fg(theme.syn_comment));
     }
     if trimmed.starts_with('[') {
         return plain(
             line,
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.syn_heading)
                 .add_modifier(Modifier::BOLD),
         );
     }
     match line.split_once('=') {
         Some((key, value)) => {
             let mut spans = vec![
-                Span::styled(key.to_string(), Style::default().fg(Color::LightBlue)),
-                Span::styled("=".to_string(), Style::default().fg(Color::DarkGray)),
+                Span::styled(key.to_string(), Style::default().fg(theme.syn_key)),
+                Span::styled("=".to_string(), Style::default().fg(theme.syn_comment)),
             ];
-            spans.extend(toml_value(value));
+            spans.extend(toml_value(value, theme));
             Line::from(spans)
         }
         None => plain(line, Style::default()),
     }
 }
 
-fn toml_value(value: &str) -> Vec<Span<'static>> {
+fn toml_value(value: &str, theme: &Theme) -> Vec<Span<'static>> {
     let chars: Vec<char> = value.chars().collect();
     let mut spans = Vec::new();
     let mut buf = String::new();
@@ -73,7 +75,7 @@ fn toml_value(value: &str) -> Vec<Span<'static>> {
     while i < chars.len() {
         match chars[i] {
             '"' => {
-                flush(&mut buf, &mut spans, Style::default().fg(Color::Yellow));
+                flush(&mut buf, &mut spans, Style::default().fg(theme.syn_number));
                 let mut s = String::from('"');
                 i += 1;
                 while i < chars.len() {
@@ -87,13 +89,13 @@ fn toml_value(value: &str) -> Vec<Span<'static>> {
                     }
                     i += 1;
                 }
-                spans.push(Span::styled(s, Style::default().fg(Color::Green)));
+                spans.push(Span::styled(s, Style::default().fg(theme.syn_string)));
             }
             '[' | ']' | '{' | '}' | ',' => {
-                flush(&mut buf, &mut spans, Style::default().fg(Color::Yellow));
+                flush(&mut buf, &mut spans, Style::default().fg(theme.syn_number));
                 spans.push(Span::styled(
                     chars[i].to_string(),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.syn_comment),
                 ));
                 i += 1;
             }
@@ -103,7 +105,7 @@ fn toml_value(value: &str) -> Vec<Span<'static>> {
             }
         }
     }
-    flush(&mut buf, &mut spans, Style::default().fg(Color::Yellow));
+    flush(&mut buf, &mut spans, Style::default().fg(theme.syn_number));
     spans
 }
 
@@ -117,58 +119,59 @@ fn flush(buf: &mut String, spans: &mut Vec<Span<'static>>, style: Style) {
 // Markdown
 // ---------------------------------------------------------------------------
 
-fn render_markdown(lines: &[&str]) -> Vec<Line<'static>> {
+fn render_markdown(lines: &[&str], theme: &Theme) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let mut in_code = false;
     for line in lines {
         let trimmed = line.trim_start();
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             in_code = !in_code;
-            out.push(plain(line, Style::default().fg(Color::DarkGray)));
+            out.push(plain(line, Style::default().fg(theme.syn_comment)));
             continue;
         }
         if in_code {
-            out.push(plain(line, Style::default().fg(Color::Yellow)));
+            out.push(plain(line, Style::default().fg(theme.syn_code)));
             continue;
         }
-        out.push(render_markdown_line(line));
+        out.push(render_markdown_line(line, theme));
     }
     out
 }
 
-fn render_markdown_line(line: &str) -> Line<'static> {
+fn render_markdown_line(line: &str, theme: &Theme) -> Line<'static> {
     let trimmed = line.trim_start();
 
     // Headings.
     let hashes = trimmed.chars().take_while(|c| *c == '#').count();
     if hashes > 0 && hashes <= 6 && trimmed[hashes..].starts_with(' ') {
-        let color = match hashes {
-            1 => Color::Cyan,
-            2 => Color::LightCyan,
-            _ => Color::LightBlue,
-        };
         return plain(
             trimmed,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.syn_heading)
+                .add_modifier(Modifier::BOLD),
         );
     }
 
     // Horizontal rule.
     if matches!(trimmed, "---" | "***" | "___") {
-        return plain(line, Style::default().fg(Color::DarkGray));
+        return plain(line, Style::default().fg(theme.syn_comment));
     }
 
     // Blockquote.
     if let Some(rest) = trimmed.strip_prefix("> ") {
-        let mut spans = vec![Span::styled("> ", Style::default().fg(Color::DarkGray))];
-        spans.extend(inline(rest, Style::default().add_modifier(Modifier::ITALIC)));
+        let mut spans = vec![Span::styled("> ", Style::default().fg(theme.syn_comment))];
+        spans.extend(inline(
+            rest,
+            Style::default().fg(theme.fg).add_modifier(Modifier::ITALIC),
+            theme,
+        ));
         return Line::from(spans);
     }
 
     // Bullet / numbered list.
     if let Some((marker, content)) = strip_bullet(trimmed) {
-        let mut spans = vec![Span::styled(marker, Style::default().fg(Color::Cyan))];
-        spans.extend(inline(content, Style::default()));
+        let mut spans = vec![Span::styled(marker, Style::default().fg(theme.syn_comment))];
+        spans.extend(inline(content, Style::default().fg(theme.fg), theme));
         return Line::from(spans);
     }
 
@@ -177,7 +180,7 @@ fn render_markdown_line(line: &str) -> Line<'static> {
     if indent > 0 {
         spans.push(Span::raw(line[..indent].to_string()));
     }
-    spans.extend(inline(trimmed, Style::default()));
+    spans.extend(inline(trimmed, Style::default().fg(theme.fg), theme));
     Line::from(spans)
 }
 
@@ -195,7 +198,7 @@ fn strip_bullet(line: &str) -> Option<(String, &str)> {
 }
 
 /// Expand inline Markdown (`code`, **bold**, *italic*, [text](url)).
-fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
+fn inline(text: &str, base: Style, theme: &Theme) -> Vec<Span<'static>> {
     let chars: Vec<char> = text.chars().collect();
     let mut spans = Vec::new();
     let mut buf = String::new();
@@ -205,7 +208,7 @@ fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
             if let Some(end) = find_char(&chars, i + 1, '`') {
                 flush(&mut buf, &mut spans, base);
                 let code: String = chars[i + 1..end].iter().collect();
-                spans.push(Span::styled(code, Style::default().fg(Color::Yellow)));
+                spans.push(Span::styled(code, Style::default().fg(theme.syn_code)));
                 i = end + 1;
                 continue;
             }
@@ -236,7 +239,7 @@ fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
                         let label: String = chars[i + 1..close].iter().collect();
                         spans.push(Span::styled(
                             label,
-                            base.fg(Color::Cyan).add_modifier(Modifier::UNDERLINED),
+                            base.fg(theme.syn_link).add_modifier(Modifier::UNDERLINED),
                         ));
                         i = paren + 1;
                         continue;
@@ -254,7 +257,10 @@ fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
 }
 
 fn find_char(chars: &[char], from: usize, needle: char) -> Option<usize> {
-    chars[from..].iter().position(|c| *c == needle).map(|p| p + from)
+    chars[from..]
+        .iter()
+        .position(|c| *c == needle)
+        .map(|p| p + from)
 }
 
 /// Find a `**` closing pair starting at or after `from`.
@@ -279,7 +285,10 @@ mod tests {
 
     #[test]
     fn splits_front_matter_and_body() {
-        let lines = render_task("agent = \"opencode\"\n---\n# Title\n\n- item\n");
+        let lines = render_task(
+            "agent = \"opencode\"\n---\n# Title\n\n- item\n",
+            &Theme::dark(),
+        );
         let text: Vec<String> = lines.iter().map(text_of).collect();
         assert_eq!(text[0], "agent = \"opencode\"");
         assert_eq!(text[1], "---");
@@ -290,26 +299,49 @@ mod tests {
 
     #[test]
     fn highlights_toml_key_and_string() {
-        let line = highlight_toml("agent = \"opencode\"");
+        let theme = Theme::dark();
+        let line = highlight_toml("agent = \"opencode\"", &theme);
         assert_eq!(text_of(&line), "agent = \"opencode\"");
-        assert_eq!(line.spans[0].style.fg, Some(Color::LightBlue));
+        assert_eq!(line.spans[0].style.fg, Some(theme.syn_key));
         assert!(line
             .spans
             .iter()
-            .any(|s| s.style.fg == Some(Color::Green) && s.content.contains("opencode")));
+            .any(|s| s.style.fg == Some(theme.syn_string) && s.content.contains("opencode")));
     }
 
     #[test]
     fn headings_are_bold() {
-        let line = render_markdown_line("## Plan");
+        let line = render_markdown_line("## Plan", &Theme::dark());
         assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
     fn inline_code_is_highlighted() {
-        let spans = inline("use `cargo test` now", Style::default());
+        let theme = Theme::dark();
+        let spans = inline("use `cargo test` now", Style::default(), &theme);
         assert!(spans
             .iter()
-            .any(|s| s.content == "cargo test" && s.style.fg == Some(Color::Yellow)));
+            .any(|s| s.content == "cargo test" && s.style.fg == Some(theme.syn_code)));
+    }
+
+    #[test]
+    fn light_theme_uses_different_highlight_colors() {
+        let dark = Theme::dark();
+        let light = Theme::light();
+
+        let light_toml = highlight_toml("agent = \"opencode\"", &light);
+        assert_eq!(light_toml.spans[0].style.fg, Some(light.syn_key));
+        assert_ne!(light.syn_key, dark.syn_key);
+        assert!(light_toml
+            .spans
+            .iter()
+            .any(|s| s.style.fg == Some(light.syn_string) && s.content.contains("opencode")));
+        assert_ne!(light.syn_string, dark.syn_string);
+
+        let light_code = inline("use `cargo test` now", Style::default(), &light);
+        assert!(light_code
+            .iter()
+            .any(|s| s.content == "cargo test" && s.style.fg == Some(light.syn_code)));
+        assert_ne!(light.syn_code, dark.syn_code);
     }
 }
