@@ -58,11 +58,6 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             .or_else(|| cfg.daemon.tasks_dir.clone())
             .unwrap_or_else(|| PathBuf::from("tasks"))
     };
-    let hooks_path = args
-        .hooks
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("hooks.toml"));
-
     tokio::fs::create_dir_all(&data_dir).await?;
 
     let db_path = data_dir.join("favetto.db");
@@ -94,13 +89,20 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     ));
     let agents = crate::agents::AgentManager::new();
     let scheduler = tokio_cron_scheduler::JobScheduler::new().await?;
-    let hook_store = Arc::new(std::sync::RwLock::new(hooks::load_hooks(&hooks_path)?));
+
+    // Resolve webhook secrets from config/env and validate the trigger rules before
+    // starting up, so a bad rule (unknown event/task/glob) fails fast.
+    let webhooks = WebhookSecrets::from_config(&config.read().unwrap());
+    crate::webhooks::validate_rules(&config.read().unwrap(), &catalog.read().unwrap())?;
+
+    // Notification hooks start empty; the TUI adds them live via `hooks.upsert`.
+    let hook_store = Arc::new(std::sync::RwLock::new(Vec::new()));
 
     let state = Arc::new(State::new(
         pool,
         bus,
         token,
-        WebhookSecrets::from_env(),
+        webhooks,
         agents,
         config,
         data_dir.clone(),
