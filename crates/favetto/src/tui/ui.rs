@@ -337,6 +337,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Shift+Tab / ←", "previous tab"),
             ("Ctrl+P", "open the action menu"),
             ("?", "open/close this help"),
+            ("M", "mute/unmute sound"),
             ("q / Esc", "quit"),
         ],
     ),
@@ -923,6 +924,15 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         ("favetto", Color::Cyan)
     };
 
+    // Sound badge: muted wins visually; a disabled engine shows `sound off`.
+    let (sound_txt, sound_color) = if !app.sound_enabled {
+        ("sound off", Color::DarkGray)
+    } else if app.sound_muted {
+        ("muted", Color::Yellow)
+    } else {
+        ("sound", Color::Green)
+    };
+
     let left = format!(" {state_txt} · {}", app.conn_detail);
     let hint = if app.tab == Tab::Agent {
         if agent_focused {
@@ -947,6 +957,14 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             Style::default()
                 .fg(Color::Black)
                 .bg(focus_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!(" {sound_txt} "),
+            Style::default()
+                .fg(Color::Black)
+                .bg(sound_color)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
@@ -1038,6 +1056,30 @@ mod tests {
         assert!(text.contains("Help"), "help title missing: {text:?}");
         assert!(text.contains("Global"), "global section missing: {text:?}");
         assert!(text.contains("Ctrl+P"), "Ctrl+P row missing: {text:?}");
+    }
+
+    #[test]
+    fn help_overlay_lists_sound_mute() {
+        let mut app = App::new();
+        app.popup = Popup::Help { scroll: 0 };
+        let text = render_text(&mut app, 100, 40);
+        assert!(
+            text.contains("mute/unmute sound"),
+            "sound help row missing: {text:?}"
+        );
+    }
+
+    #[test]
+    fn status_shows_muted_sound_badge() {
+        let mut app = App::new();
+        app.sound_enabled = true;
+        app.sound_muted = true;
+        let text = render_text(&mut app, 140, 24);
+        assert!(text.contains("muted"), "mute badge missing: {text:?}");
+
+        app.sound_muted = false;
+        let text = render_text(&mut app, 140, 24);
+        assert!(!text.contains("muted"), "stale mute badge: {text:?}");
     }
 
     #[test]

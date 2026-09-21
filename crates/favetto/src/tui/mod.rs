@@ -4,6 +4,7 @@
 mod app;
 mod json;
 mod markdown;
+mod sound;
 mod term;
 mod ui;
 
@@ -15,7 +16,8 @@ use anyhow::Context;
 use base64::Engine as _;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyEventKind,
+    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
+    Event as CEvent, KeyCode, KeyEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -32,7 +34,9 @@ use favetto_providers::Provider;
 
 use crate::cli::TuiArgs;
 use crate::client::{Client, Transport};
+use crate::config::FavettoConfig;
 use app::{App, CatalogEntry, ConnState, UiAction};
+use sound::{CliSound, SoundPlayer};
 
 /// Outcome of a connected session: the user quit, or the link dropped.
 enum SessionOutcome {
@@ -41,11 +45,45 @@ enum SessionOutcome {
 }
 
 pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
+    // Client-local config: CLI --config, else ~/.config/favetto/config.toml. The
+    // daemon parses the same file and ignores the [tui] section.
+    let config_path = args
+        .config
+        .clone()
+        .unwrap_or_else(crate::cli::default_config_path);
+    let config = FavettoConfig::load_from(&config_path).unwrap_or_default();
+
+    let cli_sound = CliSound {
+        enabled: if args.no_sound {
+            Some(false)
+        } else if args.sound {
+            Some(true)
+        } else {
+            None
+        },
+        command: args.sound_command.clone(),
+    };
+    let sound_cfg = sound::resolve_from_env(config.tui.sound.clone(), &cli_sound);
+
+    // `--test-sound` previews every cue and exits before touching the terminal.
+    if args.test_sound {
+        sound::test(&sound_cfg)?;
+        return Ok(());
+    }
+
+    // The player lives across reconnects; its worker never blocks this loop.
+    let player = SoundPlayer::start(sound_cfg.clone());
+
     let transport = resolve_transport(&args).await;
 
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableFocusChange
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("init terminal")?;
 
@@ -63,6 +101,7 @@ pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
     });
 
     let mut app = App::new();
+    app.sound_enabled = sound_cfg.enabled;
     let mut backoff = Duration::from_millis(250);
     let result = loop {
         app.conn = ConnState::Connecting;
@@ -72,7 +111,7 @@ pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
             Ok(client) => {
                 app.conn = ConnState::Connected;
                 sync_initial(&client, &mut app).await;
-                match run_session(&client, &mut app, &mut ev_rx, &mut terminal).await {
+                match run_session(&client, &mut app, &mut ev_rx, &mut terminal, &player).await {
                     SessionOutcome::Quit => break Ok(()),
                     SessionOutcome::Disconnected => {
                         app.conn = ConnState::Disconnected;
@@ -102,6 +141,7 @@ pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
     execute!(
         terminal.backend_mut(),
         DisableMouseCapture,
+        DisableFocusChange,
         LeaveAlternateScreen
     )?;
 
@@ -133,9 +173,12 @@ async fn sync_initial(client: &Client, app: &mut App) {
     {
         if let Some(v) = resp.result {
             if let Ok(events) = serde_json::from_value::<Vec<Event>>(v) {
+                // Replayed history must not fire a burst of stale sounds.
+                app.sound_suppressed = true;
                 for ev in events {
                     app.ingest_event(ev);
                 }
+                app.sound_suppressed = false;
             }
         }
     }
@@ -279,6 +322,7 @@ async fn run_session(
     app: &mut App,
     ev_rx: &mut mpsc::UnboundedReceiver<CEvent>,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    player: &SoundPlayer,
 ) -> SessionOutcome {
     let mut push_rx = client.subscribe();
     let mut closed_rx = client.closed();
@@ -356,6 +400,8 @@ async fn run_session(
                             send_agent_input(client, app, &bytes).await;
                         }
                     }
+                    Some(CEvent::FocusGained) => player.set_focused(true),
+                    Some(CEvent::FocusLost) => player.set_focused(false),
                     Some(_) => {}
                     None => return SessionOutcome::Quit,
                 }
@@ -373,6 +419,19 @@ async fn run_session(
                 if client.request(method::PING, serde_json::json!({})).await.is_err() {
                     return SessionOutcome::Disconnected;
                 }
+            }
+        }
+
+        // Keep the worker's mute/focus state in sync, then forward any cues the
+        // pushes queued. `play` only sends on a channel, so this never blocks.
+        if player.muted() != app.sound_muted {
+            player.set_muted(app.sound_muted);
+        }
+        if app.sound_muted {
+            app.take_sound_cues();
+        } else {
+            for cue in app.take_sound_cues() {
+                player.play(cue);
             }
         }
 

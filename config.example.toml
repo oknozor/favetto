@@ -101,3 +101,22 @@ event = "pull_request"
 action = "opened"
 task = "plan_favetto_issue"
 filter = { labels_contains = ["bug"], base_ref = "main", author = "oknozor" }
+
+# Client-side TUI sound notifications. Ignored by the daemon; sounds play on the
+# machine running `favetto tui`. Overridable with --sound/--no-sound/
+# --sound-command / --test-sound and the FAVETTO_SOUND* env vars.
+[tui.sound]
+enabled = true                 # master switch (default true)
+player = "auto"                # "auto" | "bell" | "command"
+# command = "paplay {file}"    # player = "command"; {file} is the sound path
+# sound_dir = "~/.config/favetto/sounds"
+# min_interval_ms = 400        # coalesce bursts (failure wins)
+# only_when_unfocused = false
+
+# Cue -> sound. Values: a built-in name (success/failure/attention/started),
+# a .wav path (relative to sound_dir), "bell", or "none".
+[tui.sound.events]
+task_finished = "success"      # ascending chime on task success
+task_failed   = "failure"      # descending tone on task failure
+task_started  = "none"
+attention     = "none"         # agent.exit
