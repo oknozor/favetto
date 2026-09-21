@@ -846,6 +846,7 @@ mod tests {
             needs: None,
             spawn: None,
             spawn_file: None,
+            vars: Vec::new(),
             prompt: String::new(),
         }]
     }

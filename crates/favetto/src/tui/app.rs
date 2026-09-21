@@ -16,6 +16,8 @@ use favetto_core::model::{
 use favetto_core::rpc::{method, push, Notification};
 use favetto_providers::Provider;
 
+use crate::tasks::TaskVar;
+
 use super::term::TerminalView;
 
 /// Tabs shown in the header. Agent hosts the embedded external-agent terminal.
@@ -70,6 +72,11 @@ pub enum UiAction {
     AgentInput(Vec<u8>),
     /// Start a catalog task by name (runs headlessly through the configured agent).
     StartTask(String),
+    /// Start a catalog task with collected input variables.
+    StartTaskWithInput {
+        name: String,
+        input: Value,
+    },
     /// Open the one-shot task wizard.
     OpenWizard,
     /// The wizard needs the configured provider/model catalog (`providers.list`).
@@ -92,11 +99,17 @@ pub enum UiAction {
 /// one-shot wizard, or the `?` keybinding reference.
 pub enum Popup {
     None,
-    Menu { selected: usize },
+    Menu {
+        selected: usize,
+    },
     Form(Form),
     Wizard(Wizard),
+    /// Prompt for a catalog task's declared `[[vars]]`.
+    TaskVars(TaskVarsForm),
     /// Scrollable keybinding reference, toggled with `?`.
-    Help { scroll: u16 },
+    Help {
+        scroll: u16,
+    },
 }
 
 pub struct Form {
@@ -154,6 +167,20 @@ pub struct Wizard {
     pub error: Option<String>,
 }
 
+/// State for the floating form that collects a catalog task's `[[vars]]`.
+pub struct TaskVarsForm {
+    /// The catalog task name being started.
+    pub task: String,
+    pub vars: Vec<TaskVar>,
+    /// Index of the variable currently being edited.
+    pub current: usize,
+    /// Typed values, one per variable (initialized from each var's `default`).
+    pub values: Vec<String>,
+    /// Selected index into each variable's `choices` (0 when absent).
+    pub choice_selected: Vec<usize>,
+    pub error: Option<String>,
+}
+
 /// A task-definition entry in the catalog (as returned by `catalog.list`).
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct CatalogEntry {
@@ -168,6 +195,8 @@ pub struct CatalogEntry {
     pub cwd: Option<String>,
     #[serde(default)]
     pub needs: Option<String>,
+    #[serde(default)]
+    pub vars: Vec<TaskVar>,
     #[serde(default)]
     pub prompt: String,
 }
@@ -487,6 +516,7 @@ impl App {
             Popup::Form(_) => return self.handle_form_key(key.code),
             Popup::Menu { .. } => return self.handle_menu_key(key.code),
             Popup::Wizard(_) => return self.handle_wizard_key(key),
+            Popup::TaskVars(_) => return self.handle_task_vars_key(key),
             Popup::Help { .. } => return self.handle_help_key(key.code),
             Popup::None => {}
         }
@@ -669,8 +699,8 @@ impl App {
                 self.catalog_selected = index.min(self.catalog.len() - 1);
                 self.reset_catalog_preview_scroll();
                 if already {
-                    if let Some(entry) = self.catalog.get(index) {
-                        return UiAction::StartTask(entry.name.clone());
+                    if let Some(entry) = self.catalog.get(index).cloned() {
+                        return self.begin_catalog_task(&entry);
                     }
                 }
                 UiAction::None
@@ -979,6 +1009,133 @@ impl App {
         action
     }
 
+    /// Start a catalog task, opening the variable form when it declares `[[vars]]`.
+    fn begin_catalog_task(&mut self, entry: &CatalogEntry) -> UiAction {
+        if entry.vars.is_empty() {
+            return UiAction::StartTask(entry.name.clone());
+        }
+        let values = entry
+            .vars
+            .iter()
+            .map(|v| v.default.clone().unwrap_or_default())
+            .collect();
+        let choice_selected = entry
+            .vars
+            .iter()
+            .map(|v| match (&v.choices, &v.default) {
+                (Some(choices), Some(default)) => {
+                    choices.iter().position(|c| c == default).unwrap_or(0)
+                }
+                _ => 0,
+            })
+            .collect();
+        self.popup = Popup::TaskVars(TaskVarsForm {
+            task: entry.name.clone(),
+            vars: entry.vars.clone(),
+            current: 0,
+            values,
+            choice_selected,
+            error: None,
+        });
+        UiAction::None
+    }
+
+    fn handle_task_vars_key(&mut self, key: KeyEvent) -> UiAction {
+        // Take the form out so the borrow checker lets us restore/clear `self.popup`.
+        let mut popup = std::mem::replace(&mut self.popup, Popup::None);
+        let Popup::TaskVars(form) = &mut popup else {
+            self.popup = popup;
+            return UiAction::None;
+        };
+
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let last = form.vars.len().saturating_sub(1);
+        let has_choices = form
+            .vars
+            .get(form.current)
+            .is_some_and(|v| v.choices.is_some());
+
+        let mut submit = false;
+        match key.code {
+            KeyCode::Esc => return UiAction::None, // popup already cleared
+            KeyCode::Tab => {
+                if form.current >= last {
+                    submit = true;
+                } else {
+                    form.current += 1;
+                }
+            }
+            KeyCode::BackTab => {
+                form.current = form.current.saturating_sub(1);
+            }
+            KeyCode::Down if has_choices => {
+                if let Some(choices) = form.vars[form.current].choices.as_ref() {
+                    let selected = &mut form.choice_selected[form.current];
+                    if !choices.is_empty() {
+                        *selected = (*selected + 1).min(choices.len() - 1);
+                    }
+                }
+            }
+            KeyCode::Up if has_choices => {
+                let selected = &mut form.choice_selected[form.current];
+                *selected = selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Up => {
+                if key.code == KeyCode::Down {
+                    if form.current < last {
+                        form.current += 1;
+                    } else {
+                        submit = true;
+                    }
+                } else {
+                    form.current = form.current.saturating_sub(1);
+                }
+            }
+            KeyCode::Enter if ctrl || alt => submit = true,
+            KeyCode::Enter if form.vars.get(form.current).is_some_and(|v| v.multiline) => {
+                if let Some(value) = form.values.get_mut(form.current) {
+                    value.push('\n');
+                }
+            }
+            KeyCode::Enter => {
+                if form.current < last {
+                    form.current += 1;
+                } else {
+                    submit = true;
+                }
+            }
+            KeyCode::Backspace if !has_choices => {
+                if let Some(value) = form.values.get_mut(form.current) {
+                    value.pop();
+                }
+            }
+            KeyCode::Char(c) if !ctrl && !alt && !has_choices => {
+                if let Some(value) = form.values.get_mut(form.current) {
+                    value.push(c);
+                }
+            }
+            _ => {}
+        }
+
+        if !submit {
+            self.popup = popup;
+            return UiAction::None;
+        }
+
+        match submit_task_vars(form) {
+            Ok(input) => {
+                let name = form.task.clone();
+                UiAction::StartTaskWithInput { name, input }
+            }
+            Err(e) => {
+                form.error = Some(e);
+                self.popup = popup;
+                UiAction::None
+            }
+        }
+    }
+
     fn handle_form_key(&mut self, code: KeyCode) -> UiAction {
         match code {
             KeyCode::Esc => {
@@ -1152,8 +1309,8 @@ impl App {
                     }
                 }
                 if self.tab == Tab::Catalog {
-                    if let Some(entry) = self.catalog.get(self.catalog_selected) {
-                        return UiAction::StartTask(entry.name.clone());
+                    if let Some(entry) = self.catalog.get(self.catalog_selected).cloned() {
+                        return self.begin_catalog_task(&entry);
                     }
                 }
                 UiAction::None
@@ -1281,6 +1438,32 @@ fn shift_index(current: usize, delta: i32, len: usize) -> usize {
     } else {
         current.saturating_sub(delta.unsigned_abs() as usize)
     }
+}
+
+/// Build the `input` object for a completed variable form. Required empty fields
+/// and failed type coercions return an error string that keeps the form open.
+fn submit_task_vars(form: &TaskVarsForm) -> Result<Value, String> {
+    let mut map = serde_json::Map::new();
+    for (i, var) in form.vars.iter().enumerate() {
+        let raw = match &var.choices {
+            Some(choices) => choices
+                .get(form.choice_selected.get(i).copied().unwrap_or(0))
+                .cloned()
+                .unwrap_or_default(),
+            None => form.values.get(i).cloned().unwrap_or_default(),
+        };
+        if raw.is_empty() {
+            if var.required {
+                return Err(format!("{} is required", var.prompt));
+            }
+            continue;
+        }
+        let value = var
+            .coerce(&raw)
+            .map_err(|e| format!("{}: {e}", var.prompt))?;
+        map.insert(var.name.clone(), value);
+    }
+    Ok(Value::Object(map))
 }
 
 /// Ctrl+Y: toggle keyboard focus between the embedded agent and favetto. Chosen
@@ -1455,6 +1638,8 @@ mod tests {
     use chrono::Utc;
     use favetto_core::model::{EventKind, TaskStatus};
 
+    use crate::tasks::VarType;
+
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
     }
@@ -1496,6 +1681,7 @@ mod tests {
             model: None,
             cwd: None,
             needs: None,
+            vars: Vec::new(),
             prompt: String::new(),
         }
     }
@@ -1634,6 +1820,7 @@ mod tests {
                 model: None,
                 cwd: None,
                 needs: None,
+                vars: Vec::new(),
                 prompt: String::new(),
             },
             CatalogEntry {
@@ -1643,6 +1830,7 @@ mod tests {
                 model: None,
                 cwd: None,
                 needs: None,
+                vars: Vec::new(),
                 prompt: String::new(),
             },
         ];
@@ -1705,6 +1893,7 @@ mod tests {
             model: None,
             cwd: None,
             needs: None,
+            vars: Vec::new(),
             prompt: String::new(),
         }]);
 
@@ -2173,5 +2362,216 @@ mod tests {
         assert_eq!(app.notifications_selected, 1);
         app.handle_key(key(KeyCode::Up, KeyModifiers::empty()));
         assert_eq!(app.notifications_selected, 0);
+    }
+
+    fn vars_entry(name: &str) -> CatalogEntry {
+        CatalogEntry {
+            name: name.to_string(),
+            agent: None,
+            provider: None,
+            model: None,
+            cwd: None,
+            needs: None,
+            vars: vec![
+                TaskVar {
+                    name: "description".to_string(),
+                    prompt: "Describe".to_string(),
+                    default: Some("draft".to_string()),
+                    required: true,
+                    multiline: false,
+                    var_type: VarType::String,
+                    choices: None,
+                },
+                TaskVar {
+                    name: "count".to_string(),
+                    prompt: "Count".to_string(),
+                    default: None,
+                    required: false,
+                    multiline: false,
+                    var_type: VarType::Int,
+                    choices: None,
+                },
+            ],
+            prompt: String::new(),
+        }
+    }
+
+    fn open_vars_form(app: &mut App, entry: CatalogEntry) {
+        app.tab = Tab::Catalog;
+        app.catalog = vec![entry];
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::TaskVars(_)));
+    }
+
+    #[test]
+    fn enter_on_catalog_entry_without_vars_returns_start_task() {
+        let mut app = App::new();
+        app.tab = Tab::Catalog;
+        app.catalog = vec![catalog_entry("a")];
+        match app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())) {
+            UiAction::StartTask(name) => assert_eq!(name, "a"),
+            _ => panic!("expected StartTask"),
+        }
+        assert!(matches!(app.popup, Popup::None));
+    }
+
+    #[test]
+    fn enter_on_vars_task_opens_form_with_defaults() {
+        let mut app = App::new();
+        open_vars_form(&mut app, vars_entry("issue"));
+        let Popup::TaskVars(form) = &app.popup else {
+            panic!("expected TaskVars");
+        };
+        assert_eq!(form.task, "issue");
+        assert_eq!(form.values, vec!["draft".to_string(), String::new()]);
+        assert_eq!(form.current, 0);
+        assert!(form.error.is_none());
+    }
+
+    #[test]
+    fn required_var_blocks_submit_until_filled() {
+        let mut app = App::new();
+        open_vars_form(&mut app, vars_entry("issue"));
+        for _ in 0.."draft".len() {
+            app.handle_key(key(KeyCode::Backspace, KeyModifiers::empty()));
+        }
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter, KeyModifiers::CONTROL)),
+            UiAction::None
+        ));
+        match &app.popup {
+            Popup::TaskVars(form) => assert!(form.error.is_some()),
+            _ => panic!("form should stay open with an error"),
+        }
+
+        for c in "hello".chars() {
+            app.handle_key(key(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::empty()));
+        match app.handle_key(key(KeyCode::Enter, KeyModifiers::CONTROL)) {
+            UiAction::StartTaskWithInput { name, input } => {
+                assert_eq!(name, "issue");
+                assert_eq!(input, serde_json::json!({ "description": "hello" }));
+            }
+            _ => panic!("expected StartTaskWithInput"),
+        }
+        assert!(matches!(app.popup, Popup::None));
+    }
+
+    #[test]
+    fn int_var_coerces_and_non_numeric_blocks() {
+        let mut app = App::new();
+        open_vars_form(&mut app, vars_entry("issue"));
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::empty()));
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())),
+            UiAction::None
+        ));
+        assert!(matches!(&app.popup, Popup::TaskVars(form) if form.error.is_some()));
+
+        app.handle_key(key(KeyCode::Backspace, KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::Char('3'), KeyModifiers::empty()));
+        match app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())) {
+            UiAction::StartTaskWithInput { input, .. } => {
+                assert_eq!(
+                    input,
+                    serde_json::json!({ "description": "draft", "count": 3 })
+                );
+            }
+            _ => panic!("expected StartTaskWithInput"),
+        }
+    }
+
+    #[test]
+    fn multiline_enter_inserts_newline_and_ctrl_enter_submits() {
+        let mut app = App::new();
+        let mut entry = vars_entry("issue");
+        entry.vars = vec![TaskVar {
+            name: "body".to_string(),
+            prompt: "Body".to_string(),
+            default: None,
+            required: true,
+            multiline: true,
+            var_type: VarType::String,
+            choices: None,
+        }];
+        open_vars_form(&mut app, entry);
+        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::Char('b'), KeyModifiers::empty()));
+        match &app.popup {
+            Popup::TaskVars(form) => assert_eq!(form.values[0], "a\nb"),
+            _ => panic!("form closed on Enter"),
+        }
+        match app.handle_key(key(KeyCode::Enter, KeyModifiers::CONTROL)) {
+            UiAction::StartTaskWithInput { input, .. } => {
+                assert_eq!(input, serde_json::json!({ "body": "a\nb" }));
+            }
+            _ => panic!("expected StartTaskWithInput"),
+        }
+    }
+
+    #[test]
+    fn esc_cancels_var_form_without_starting() {
+        let mut app = App::new();
+        open_vars_form(&mut app, vars_entry("issue"));
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Esc, KeyModifiers::empty())),
+            UiAction::None
+        ));
+        assert!(matches!(app.popup, Popup::None));
+    }
+
+    #[test]
+    fn choices_arrows_change_selection_and_submit_selected() {
+        let mut app = App::new();
+        let mut entry = vars_entry("issue");
+        entry.vars = vec![TaskVar {
+            name: "flavor".to_string(),
+            prompt: "Flavor".to_string(),
+            default: None,
+            required: false,
+            multiline: false,
+            var_type: VarType::String,
+            choices: Some(vec!["vanilla".to_string(), "mint".to_string()]),
+        }];
+        open_vars_form(&mut app, entry);
+        app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+        match &app.popup {
+            Popup::TaskVars(form) => {
+                assert_eq!(form.choice_selected, vec![1]);
+                assert_eq!(
+                    form.current, 0,
+                    "Down must change the choice, not the field"
+                );
+            }
+            _ => panic!("expected TaskVars"),
+        }
+        match app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())) {
+            UiAction::StartTaskWithInput { input, .. } => {
+                assert_eq!(input, serde_json::json!({ "flavor": "mint" }));
+            }
+            _ => panic!("expected StartTaskWithInput"),
+        }
+    }
+
+    #[test]
+    fn clicking_vars_catalog_row_opens_form() {
+        let mut app = App::new();
+        app.tab = Tab::Catalog;
+        app.catalog = vec![vars_entry("issue")];
+        let inner = Rect {
+            x: 0,
+            y: 2,
+            width: 20,
+            height: 5,
+        };
+        app.catalog_geom = geom(inner, 0, 1);
+
+        // First click selects the row; the second opens the variable form.
+        assert!(matches!(app.handle_mouse(click(5, 2)), UiAction::None));
+        assert!(matches!(app.handle_mouse(click(5, 2)), UiAction::None));
+        assert!(matches!(app.popup, Popup::TaskVars(_)));
     }
 }

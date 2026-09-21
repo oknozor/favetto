@@ -330,6 +330,7 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
                         "cwd": d.cwd,
                         "schedule": d.schedule,
                         "needs": d.needs,
+                        "vars": d.vars,
                         "prompt": d.prompt,
                     })
                 })
@@ -371,6 +372,7 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
                 "cwd": def.cwd,
                 "schedule": def.schedule,
                 "needs": def.needs,
+                "vars": def.vars,
             })),
             Err(e) => Err((error_code::INTERNAL, e.to_string())),
         }
@@ -927,6 +929,7 @@ fn add_catalog_task(state: &Arc<State>, params: &serde_json::Value) -> anyhow::R
         needs,
         spawn,
         spawn_file,
+        vars: Vec::new(),
         prompt,
     };
     crate::tasks::write_task_md(&state.tasks_dir, &def)?;
