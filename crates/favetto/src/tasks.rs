@@ -23,6 +23,68 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+/// The declared type of a manual input variable. `int`/`bool` values are coerced
+/// to JSON numbers/bools before being stored in the task's `input`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VarType {
+    #[default]
+    String,
+    Int,
+    Bool,
+}
+
+/// A manual input variable declared in a task's `[[vars]]` front-matter. The
+/// collected value becomes `input.<name>` and renders through `{{ input.<name> }}`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+pub struct TaskVar {
+    /// The `input` key. `[a-zA-Z0-9_]+`, unique within the file, never `_prev`.
+    pub name: String,
+    /// The label/question shown in the TUI prompt popup.
+    pub prompt: String,
+    /// Optional value pre-filled in the popup.
+    #[serde(default)]
+    pub default: Option<String>,
+    /// When true, submission is blocked while the field is empty.
+    #[serde(default)]
+    pub required: bool,
+    /// When true, `Enter` inserts a newline and the submit chord completes the form.
+    #[serde(default)]
+    pub multiline: bool,
+    /// The value type; `int`/`bool` are parsed before being stored.
+    #[serde(default, rename = "type")]
+    pub var_type: VarType,
+    /// Optional fixed list of options, rendered as a selectable list.
+    #[serde(default)]
+    pub choices: Option<Vec<String>>,
+}
+
+impl TaskVar {
+    /// Coerce a raw string entered by the user into the var's JSON representation.
+    pub fn coerce(&self, raw: &str) -> anyhow::Result<serde_json::Value> {
+        if let Some(choices) = &self.choices {
+            if !choices.iter().any(|c| c == raw) {
+                anyhow::bail!("must be one of: {}", choices.join(", "));
+            }
+        }
+        match self.var_type {
+            VarType::String => Ok(serde_json::Value::String(raw.to_string())),
+            VarType::Int => {
+                let n = raw
+                    .trim()
+                    .parse::<i64>()
+                    .map_err(|_| anyhow::anyhow!("must be an integer"))?;
+                Ok(serde_json::Value::Number(n.into()))
+            }
+            VarType::Bool => match raw.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" => Ok(serde_json::Value::Bool(true)),
+                "false" | "0" => Ok(serde_json::Value::Bool(false)),
+                _ => anyhow::bail!("must be true or false"),
+            },
+        }
+    }
+}
+
 /// A task definition from a `*.md` file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskDef {
@@ -48,6 +110,9 @@ pub struct TaskDef {
     /// Path (relative to the task's working directory, or absolute) of the JSON
     /// handoff file consumed by `spawn`. Rendered as a template at run time.
     pub spawn_file: Option<String>,
+    /// Manual input variables declared with `[[vars]]`; the TUI prompts for these
+    /// before starting the task, and the executor enforces `required` ones.
+    pub vars: Vec<TaskVar>,
     /// The Markdown prompt body.
     pub prompt: String,
 }
@@ -70,6 +135,41 @@ struct Header {
     spawn: Option<String>,
     #[serde(default)]
     spawn_file: Option<String>,
+    #[serde(default)]
+    vars: Vec<TaskVar>,
+}
+
+/// Reject variable declarations that would produce an unusable or ambiguous
+/// `input` object: empty/invalid names, the reserved `_prev`, duplicates, or an
+/// empty prompt. Returning `Err` makes `reload_catalog` keep the previous
+/// definition instead of dropping the task.
+fn validate_vars(vars: &[TaskVar]) -> anyhow::Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for var in vars {
+        if var.name.is_empty() {
+            anyhow::bail!("input variable name must not be empty");
+        }
+        if var.name == "_prev" {
+            anyhow::bail!("input variable name '_prev' is reserved");
+        }
+        if !var
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            anyhow::bail!(
+                "invalid input variable name '{}': use [a-zA-Z0-9_]",
+                var.name
+            );
+        }
+        if !seen.insert(var.name.as_str()) {
+            anyhow::bail!("duplicate input variable name '{}'", var.name);
+        }
+        if var.prompt.trim().is_empty() {
+            anyhow::bail!("input variable '{}' needs a non-empty prompt", var.name);
+        }
+    }
+    Ok(())
 }
 
 /// Parse a task definition from Markdown + TOML front-matter.
@@ -91,6 +191,8 @@ pub fn parse_task_md(name: &str, content: &str) -> anyhow::Result<TaskDef> {
         None => String::new(),
     };
 
+    validate_vars(&header.vars)?;
+
     Ok(TaskDef {
         name: name.to_string(),
         agent: header.agent,
@@ -101,6 +203,7 @@ pub fn parse_task_md(name: &str, content: &str) -> anyhow::Result<TaskDef> {
         needs: header.needs,
         spawn: header.spawn,
         spawn_file: header.spawn_file,
+        vars: header.vars,
         prompt: prompt.trim().to_string(),
     })
 }
@@ -131,6 +234,35 @@ pub fn to_markdown(def: &TaskDef) -> String {
     }
     if let Some(s) = &def.spawn_file {
         out.push_str(&format!("spawn_file = {s:?}\n"));
+    }
+    // Array-of-tables must come after every scalar key, so `[[vars]]` is emitted
+    // last in the header.
+    for var in &def.vars {
+        out.push_str("[[vars]]\n");
+        out.push_str(&format!("name = {:?}\n", var.name));
+        out.push_str(&format!("prompt = {:?}\n", var.prompt));
+        if let Some(d) = &var.default {
+            out.push_str(&format!("default = {d:?}\n"));
+        }
+        if var.required {
+            out.push_str("required = true\n");
+        }
+        if var.multiline {
+            out.push_str("multiline = true\n");
+        }
+        if var.var_type != VarType::String {
+            let ty = match var.var_type {
+                VarType::String => "string",
+                VarType::Int => "int",
+                VarType::Bool => "bool",
+            };
+            out.push_str(&format!("type = {ty:?}\n"));
+        }
+        if let Some(choices) = &var.choices {
+            let rendered: Vec<String> = choices.iter().map(|c| format!("{c:?}")).collect();
+            out.push_str(&format!("choices = [{}]\n", rendered.join(", ")));
+        }
+        out.push('\n');
     }
     out.push_str("---\n\n");
     out.push_str(&def.prompt);
@@ -239,6 +371,35 @@ mod tests {
             needs: None,
             spawn: Some("plan".to_string()),
             spawn_file: Some(".favetto/{{ input.id }}/manifest.json".to_string()),
+            vars: vec![
+                TaskVar {
+                    name: "issue_description".to_string(),
+                    prompt: "Describe the issue".to_string(),
+                    default: None,
+                    required: true,
+                    multiline: true,
+                    var_type: VarType::String,
+                    choices: None,
+                },
+                TaskVar {
+                    name: "count".to_string(),
+                    prompt: "How many".to_string(),
+                    default: Some("3".to_string()),
+                    required: false,
+                    multiline: false,
+                    var_type: VarType::Int,
+                    choices: None,
+                },
+                TaskVar {
+                    name: "flavor".to_string(),
+                    prompt: "Flavor".to_string(),
+                    default: None,
+                    required: false,
+                    multiline: false,
+                    var_type: VarType::String,
+                    choices: Some(vec!["vanilla".to_string(), "mint".to_string()]),
+                },
+            ],
             prompt: "hello".to_string(),
         };
         let md = to_markdown(&def);
@@ -252,7 +413,96 @@ mod tests {
             parsed.spawn_file.as_deref(),
             Some(".favetto/{{ input.id }}/manifest.json")
         );
+        assert_eq!(parsed.vars, def.vars);
         assert_eq!(parsed.prompt, "hello");
+    }
+
+    #[test]
+    fn parses_vars_and_defaults_to_empty() {
+        let def = parse_task_md(
+            "issue",
+            "agent = \"opencode\"\n\
+             [[vars]]\n\
+             name = \"issue_description\"\n\
+             prompt = \"Describe the issue to file\"\n\
+             multiline = true\n\
+             required = true\n\
+             [[vars]]\n\
+             name = \"count\"\n\
+             prompt = \"How many\"\n\
+             default = \"3\"\n\
+             type = \"int\"\n\
+             [[vars]]\n\
+             name = \"flavor\"\n\
+             prompt = \"Flavor\"\n\
+             choices = [\"vanilla\", \"mint\"]\n\
+             ---\n\nfile it\n",
+        )
+        .unwrap();
+        assert_eq!(def.vars.len(), 3);
+        assert_eq!(def.vars[0].name, "issue_description");
+        assert!(def.vars[0].required);
+        assert!(def.vars[0].multiline);
+        assert_eq!(def.vars[0].var_type, VarType::String);
+        assert_eq!(def.vars[1].default.as_deref(), Some("3"));
+        assert_eq!(def.vars[1].var_type, VarType::Int);
+        assert_eq!(
+            def.vars[2].choices.as_deref(),
+            Some(["vanilla".to_string(), "mint".to_string()].as_slice())
+        );
+
+        // A file without `[[vars]]` parses with an empty list.
+        let plain = parse_task_md("plain", "agent = \"x\"\n---\nbody\n").unwrap();
+        assert!(plain.vars.is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_vars() {
+        let parse = |vars: &str| parse_task_md("t", &format!("agent = \"x\"\n{vars}---\nbody\n"));
+        assert!(parse("[[vars]]\nname = \"bad name\"\nprompt = \"p\"\n").is_err());
+        assert!(parse("[[vars]]\nname = \"_prev\"\nprompt = \"p\"\n").is_err());
+        assert!(parse(
+            "[[vars]]\nname = \"a\"\nprompt = \"p\"\n[[vars]]\nname = \"a\"\nprompt = \"q\"\n"
+        )
+        .is_err());
+        assert!(parse("[[vars]]\nname = \"a\"\nprompt = \"\"\n").is_err());
+        assert!(parse("[[vars]]\nname = \"\"\nprompt = \"p\"\n").is_err());
+        assert!(parse("[[vars]]\nname = \"ok\"\nprompt = \"p\"\n").is_ok());
+    }
+
+    #[test]
+    fn coerces_typed_values() {
+        let var = |var_type, choices| TaskVar {
+            name: "v".to_string(),
+            prompt: "p".to_string(),
+            default: None,
+            required: false,
+            multiline: false,
+            var_type,
+            choices,
+        };
+        assert_eq!(
+            var(VarType::String, None).coerce("hi").unwrap(),
+            serde_json::json!("hi")
+        );
+        assert_eq!(
+            var(VarType::Int, None).coerce(" 3 ").unwrap(),
+            serde_json::json!(3)
+        );
+        assert!(var(VarType::Int, None).coerce("not an int").is_err());
+        assert_eq!(
+            var(VarType::Bool, None).coerce("True").unwrap(),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            var(VarType::Bool, None).coerce("0").unwrap(),
+            serde_json::json!(false)
+        );
+        assert!(var(VarType::Bool, None).coerce("maybe").is_err());
+
+        let choices = Some(vec!["a".to_string(), "b".to_string()]);
+        assert!(var(VarType::String, choices.clone()).coerce("a").is_ok());
+        assert!(var(VarType::String, choices).coerce("c").is_err());
     }
 
     /// A unique scratch directory for catalog tests.

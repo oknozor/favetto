@@ -86,6 +86,18 @@ async fn dispatch_loop(state: Arc<State>, cfg: ExecutorSettings) {
                 continue;
             };
 
+            // Required input variables must be present even for unattended starts
+            // (hooks / needs / spawn / schedule / raw RPC), which never prompt.
+            if let Some(missing) = missing_required_vars(&def, &task.input).first() {
+                fail_task(
+                    &state,
+                    task,
+                    &format!("task '{}' requires input variable '{missing}'", def.name),
+                )
+                .await;
+                continue;
+            }
+
             let base = resolve_base_dir(&def, &task);
             let plan = match make_plan(&state, &cfg, &base, &task).await {
                 Ok(p) => p,
@@ -391,6 +403,21 @@ fn lookup_def(state: &State, name: &str) -> Option<TaskDef> {
         .cloned()
 }
 
+/// Names of the task's `required` input variables that are absent, JSON `null`,
+/// or an empty string in `input`. Optional omitted/empty values are left alone.
+pub fn missing_required_vars(def: &TaskDef, input: &serde_json::Value) -> Vec<String> {
+    def.vars
+        .iter()
+        .filter(|v| v.required)
+        .filter(|v| match input.get(&v.name) {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::String(s)) => s.is_empty(),
+            _ => false,
+        })
+        .map(|v| v.name.clone())
+        .collect()
+}
+
 /// The directory a task starts from: per-run `input.cwd`, else the task's `cwd`,
 /// else the daemon's working directory.
 fn resolve_base_dir(def: &TaskDef, task: &Task) -> PathBuf {
@@ -598,6 +625,58 @@ async fn start_dependents(state: &Arc<State>, ev: &Event) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tasks::{TaskVar, VarType};
+
+    fn def_with_vars() -> TaskDef {
+        let var = |name: &str, required: bool| TaskVar {
+            name: name.to_string(),
+            prompt: "p".to_string(),
+            default: None,
+            required,
+            multiline: false,
+            var_type: VarType::String,
+            choices: None,
+        };
+        TaskDef {
+            name: "t".to_string(),
+            agent: None,
+            provider: None,
+            model: None,
+            cwd: None,
+            schedule: None,
+            needs: None,
+            spawn: None,
+            spawn_file: None,
+            vars: vec![var("required_one", true), var("optional_one", false)],
+            prompt: "hello".to_string(),
+        }
+    }
+
+    #[test]
+    fn missing_required_vars_detects_absent_null_and_empty() {
+        let def = def_with_vars();
+        assert_eq!(
+            missing_required_vars(&def, &serde_json::json!({})),
+            ["required_one"]
+        );
+        assert_eq!(
+            missing_required_vars(&def, &serde_json::json!({ "required_one": null })),
+            ["required_one"]
+        );
+        assert_eq!(
+            missing_required_vars(&def, &serde_json::json!({ "required_one": "" })),
+            ["required_one"]
+        );
+        // Present values (including typed ones) satisfy the requirement.
+        assert!(
+            missing_required_vars(&def, &serde_json::json!({ "required_one": "x" })).is_empty()
+        );
+        assert!(missing_required_vars(&def, &serde_json::json!({ "required_one": 3 })).is_empty());
+        // Optional vars never appear.
+        assert!(
+            missing_required_vars(&def, &serde_json::json!({ "required_one": "x" })).is_empty()
+        );
+    }
 
     #[test]
     fn render_context_exposes_task_input_and_prev() {

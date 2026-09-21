@@ -227,6 +227,25 @@ async fn refresh_lists(client: &Client, app: &mut App) {
     fetch_catalog(client, app).await;
 }
 
+/// Send a `tasks.start` request and refresh the list tabs afterwards.
+async fn start_task(client: &Client, app: &mut App, params: serde_json::Value) {
+    let name = params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    match client.request(method::TASKS_START, params).await {
+        Ok(resp) => match resp.result {
+            Some(_) => app.logs.push_back(format!("started task: {name}")),
+            None => app
+                .logs
+                .push_back(format!("start task error: {:?}", resp.error)),
+        },
+        Err(e) => app.logs.push_back(format!("start task failed: {e}")),
+    }
+    refresh_lists(client, app).await;
+}
+
 /// The connected interaction loop: redraw, handle keys, apply pushes, ping.
 async fn run_session(
     client: &Client,
@@ -271,16 +290,15 @@ async fn run_session(
                                 send_agent_input(client, app, &bytes).await;
                             }
                             UiAction::StartTask(name) => {
-                                match client.request(method::TASKS_START, serde_json::json!({ "name": name })).await {
-                                    Ok(resp) => {
-                                        match resp.result {
-                                            Some(_) => app.logs.push_back(format!("started task: {name}")),
-                                            None => app.logs.push_back(format!("start task error: {:?}", resp.error)),
-                                        }
-                                    }
-                                    Err(e) => app.logs.push_back(format!("start task failed: {e}")),
-                                }
-                                refresh_lists(client, app).await;
+                                start_task(client, app, serde_json::json!({ "name": name })).await;
+                            }
+                            UiAction::StartTaskWithInput { name, input } => {
+                                start_task(
+                                    client,
+                                    app,
+                                    serde_json::json!({ "name": name, "input": input }),
+                                )
+                                .await;
                             }
                             UiAction::OpenWizard => {
                                 fetch_agents(client, app).await;

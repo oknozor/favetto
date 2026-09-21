@@ -103,13 +103,70 @@ You are an engineering agent that implements Linear tickets end-to-end.
   enqueued per element, with that element as its `input`. An empty array spawns
   nothing, so a task can decline to continue.
 
+### Input variables (`[[vars]]`)
+
+A task can declare manual input variables in the TOML header. Starting it from
+the TUI opens a floating form that prompts for each one; the collected values
+become the task's `input` and render through `{{ input.<name> }}` exactly like
+the values produced by `spawn`/`needs`:
+
+```toml
+agent = "opencode"
+
+[[vars]]
+name = "issue_description"            # becomes input.issue_description
+prompt = "Describe the issue to file" # label shown in the form
+multiline = true                      # Enter inserts a newline; Ctrl+Enter submits
+required = true
+
+[[vars]]
+name = "repo"
+prompt = "Target repository"
+default = "oknozor/favetto"
+required = false
+
+[[vars]]
+name = "count"
+prompt = "How many items"
+type = "int"                          # string (default) | int | bool
+
+[[vars]]
+name = "flavor"
+prompt = "Flavor"
+choices = ["vanilla", "mint"]         # rendered as a selectable list
+---
+```
+
+- `name` (required) — the `input` key. Must match `[a-zA-Z0-9_]+`, be unique
+  within the file, and must not be `_prev` (reserved for the `needs`
+  predecessor). An invalid declaration makes the whole file fail to parse, so
+  the live catalog keeps the previous definition.
+- `prompt` (required) — the label/question shown in the form.
+- `default` (optional) — the value pre-filled in the form.
+- `required` (optional, default `false`) — submission is blocked while the field
+  is empty, and unattended runs (hook / `needs` / `spawn` / cron / raw RPC) fail
+  with `task '<name>' requires input variable '<var>'` when it is absent.
+- `multiline` (optional, default `false`) — `Enter` inserts a newline and the
+  form is submitted with `Ctrl+Enter` (or `Tab` from the last field).
+- `type` (optional, default `"string"`; one of `string`, `int`, `bool`) — the
+  value is parsed before being stored, so `{{ input.count }}` renders a JSON
+  number/bool rather than a quoted string. A non-numeric `int` blocks submission.
+- `choices` (optional) — a fixed list rendered as a selectable list instead of a
+  free-text field.
+
+Variables share the `input` namespace: omit an optional field and its key is
+left out, so `{{ input.x }}` renders empty (the existing behavior). The form
+never prompts for spawned children or other unattended starts — pass the values
+in the element/payload instead.
+
 ### Prompt templates
 
 Task prompt bodies and `spawn_file` paths are rendered before use. `{{ dotted.path }}`
 placeholders resolve against a JSON context: `{{ task.id }}`, `{{ task.name }}`,
 `{{ input.* }}` (the task's input JSON), and `{{ prev.* }}` (the `needs`
-predecessor). Strings render raw, objects/arrays as compact JSON, and missing
-paths as empty. Double braces leave single braces in prompt code blocks alone.
+predecessor; `input._prev` is reserved). Strings render raw, objects/arrays as
+compact JSON, and missing paths as empty. Double braces leave single braces in
+prompt code blocks alone.
 
 This makes a triage → plan → implement pipeline declarative: the triage task
 writes a `manifest.json` array of issues and `spawn`s the planning task once per
@@ -129,9 +186,11 @@ while manually created schedules are left alone. Every reload pushes
 `catalog.updated` so attached TUIs re-fetch the list and refresh the preview.
 Runs already in flight keep the definition they were dispatched with; a queued
 task picks up the freshly loaded definition when it starts. From the TUI, the
-**Catalog** tab lists the catalog and Enter starts a task; the Ctrl+P menu's
-"Add task" writes a new `.md` file (it does not run it). Task lifecycle emits
-`task_idle` / `task_started` / `task_finished` events.
+**Catalog** tab lists the catalog and Enter starts a task; a task that declares
+`[[vars]]` opens a floating form first (Enter advances, `Ctrl+Enter` submits,
+`Esc` cancels and starts nothing), while a var-free task starts immediately. The
+Ctrl+P menu's "Add task" writes a new `.md` file (it does not run it). Task
+lifecycle emits `task_idle` / `task_started` / `task_finished` events.
 
 The Catalog tab shows a **preview side panel** for the highlighted task: its raw
 `.md` source with the TOML front-matter highlighted as TOML and the prompt rendered

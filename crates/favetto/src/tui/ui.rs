@@ -13,7 +13,7 @@ use favetto_core::model::TaskStatus;
 
 use super::app::{
     table_rows_area, App, ClickAction, ClickRegion, ConnState, Form, ListGeometry, Popup, Tab,
-    Wizard, WizardStep, MENU_OPTIONS,
+    TaskVarsForm, Wizard, WizardStep, MENU_OPTIONS,
 };
 use super::{json, markdown};
 
@@ -76,6 +76,7 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
         Popup::Menu { selected } => draw_menu(frame, *selected),
         Popup::Form(form) => draw_form(frame, form),
         Popup::Wizard(wizard) => draw_wizard(frame, wizard),
+        Popup::TaskVars(form) => draw_task_vars(frame, form),
         Popup::Help { scroll } => draw_help(frame, scroll),
     }
 }
@@ -242,6 +243,86 @@ fn draw_wizard(frame: &mut Frame, wizard: &Wizard) {
                 .borders(Borders::ALL)
                 .title(" New one-shot task "),
         )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(Clear, rect);
+    frame.render_widget(paragraph, rect);
+}
+
+fn draw_task_vars(frame: &mut Frame, form: &TaskVarsForm) {
+    let area = frame.area();
+    let rect = centered_rect(area, 70, form.vars.len() as u16 + 6);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!(" Task input · {} ", form.task),
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    for (i, var) in form.vars.iter().enumerate() {
+        let current = i == form.current;
+        let label = format!("{}{}: ", if current { "> " } else { "  " }, var.prompt);
+        let label_style = if current {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+
+        if let Some(choices) = &var.choices {
+            lines.push(Line::from(Span::styled(label, label_style)));
+            let selected = form.choice_selected.get(i).copied().unwrap_or(0);
+            for (j, choice) in choices.iter().enumerate() {
+                let style = if j == selected {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(Span::styled(format!("    {choice}"), style)));
+            }
+            continue;
+        }
+
+        let value = form.values.get(i).cloned().unwrap_or_default();
+        let segments: Vec<&str> = value.split('\n').collect();
+        let last_segment = segments.len() - 1;
+        for (k, segment) in segments.iter().enumerate() {
+            let mut spans: Vec<Span> = Vec::new();
+            if k == 0 {
+                spans.push(Span::styled(label.clone(), label_style));
+            } else {
+                spans.push(Span::raw("    "));
+            }
+            if segment.is_empty() && !current && segments.len() == 1 {
+                spans.push(Span::styled(
+                    "(empty)",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            } else {
+                spans.push(Span::raw((*segment).to_string()));
+            }
+            if current && k == last_segment {
+                spans.push(Span::styled("█", Style::default().fg(Color::Cyan)));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
+
+    if let Some(err) = &form.error {
+        lines.push(Line::from(Span::styled(
+            err.as_str(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " Tab/↑↓ move · Enter next · Ctrl+Enter submit · Esc cancel ",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(" Task input "))
         .wrap(Wrap { trim: false });
     frame.render_widget(Clear, rect);
     frame.render_widget(paragraph, rect);
@@ -1021,6 +1102,7 @@ mod tests {
             model: Some("deepseek-v4-flash".to_string()),
             cwd: None,
             needs: None,
+            vars: Vec::new(),
             prompt: String::new(),
         }];
         app.catalog_preview = Some((
@@ -1063,6 +1145,7 @@ mod tests {
             model: None,
             cwd: None,
             needs: None,
+            vars: Vec::new(),
             prompt: String::new(),
         }];
         let mut markdown = String::new();
@@ -1210,5 +1293,39 @@ mod tests {
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         assert_eq!(app.notifications_geom.len, 1);
         assert_eq!(app.notifications_geom.offset, 0);
+    }
+
+    #[test]
+    fn task_vars_popup_renders_prompts_and_task_name() {
+        use crate::tasks::{TaskVar, VarType};
+
+        let mut app = App::new();
+        app.popup = Popup::TaskVars(TaskVarsForm {
+            task: "open_github_issue".to_string(),
+            vars: vec![TaskVar {
+                name: "issue_description".to_string(),
+                prompt: "Describe the issue".to_string(),
+                default: Some("placeholder".to_string()),
+                required: true,
+                multiline: true,
+                var_type: VarType::String,
+                choices: None,
+            }],
+            current: 0,
+            values: vec!["placeholder".to_string()],
+            choice_selected: vec![0],
+            error: None,
+        });
+        let text = render_text(&mut app, 100, 30);
+        assert!(text.contains("Task input"), "title missing: {text:?}");
+        assert!(
+            text.contains("open_github_issue"),
+            "task name missing: {text:?}"
+        );
+        assert!(
+            text.contains("Describe the issue"),
+            "prompt missing: {text:?}"
+        );
+        assert!(text.contains("placeholder"), "default missing: {text:?}");
     }
 }
