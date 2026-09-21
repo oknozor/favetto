@@ -169,7 +169,7 @@ async fn fetch_catalog(client: &Client, app: &mut App) {
     if let Ok(resp) = client.request(method::CATALOG_LIST, serde_json::json!({})).await {
         if let Some(v) = resp.result {
             if let Ok(catalog) = serde_json::from_value::<Vec<CatalogEntry>>(v) {
-                app.catalog = catalog;
+                app.set_catalog(catalog);
             }
         }
     }
@@ -332,6 +332,10 @@ async fn run_session(
         }
 
         // Load the Catalog preview for the selected task, if needed.
+        if app.catalog_dirty {
+            app.catalog_dirty = false;
+            fetch_catalog(client, app).await;
+        }
         maybe_load_catalog_preview(client, app).await;
     }
 }

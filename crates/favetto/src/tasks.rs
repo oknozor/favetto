@@ -24,7 +24,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 /// A task definition from a `*.md` file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskDef {
     /// File name without the `.md` extension.
     pub name: String,
@@ -140,9 +140,25 @@ pub fn to_markdown(def: &TaskDef) -> String {
 /// Load all `*.md` task definitions in `dir`. A missing directory yields an empty
 /// catalog.
 pub fn load_catalog(dir: &Path) -> anyhow::Result<Vec<TaskDef>> {
+    Ok(reload_catalog(dir, &[]))
+}
+
+/// Reload the catalog in `dir`, merging the files on disk with `prior`.
+///
+/// Files that fail to parse (or read) keep their previous definition instead of
+/// disappearing, so a half-written or momentarily invalid file never drops a task
+/// from the live catalog. Files removed from disk are dropped and new files are
+/// added. A directory that cannot be read (e.g. momentarily missing during an
+/// atomic replace) keeps `prior` as-is.
+pub fn reload_catalog(dir: &Path, prior: &[TaskDef]) -> Vec<TaskDef> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return Ok(Vec::new()),
+        Err(e) => {
+            if !prior.is_empty() || e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(dir = %dir.display(), error = %e, "failed to read task catalog directory");
+            }
+            return prior.to_vec();
+        }
     };
 
     let mut defs = Vec::new();
@@ -154,15 +170,35 @@ pub fn load_catalog(dir: &Path) -> anyhow::Result<Vec<TaskDef>> {
         let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        let content = std::fs::read_to_string(&path)?;
+        let previous = prior.iter().find(|d| d.name == name);
+
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "failed to read task definition");
+                if let Some(old) = previous {
+                    defs.push(old.clone());
+                }
+                continue;
+            }
+        };
         match parse_task_md(name, &content) {
             Ok(def) => defs.push(def),
-            Err(e) => tracing::warn!(path = %path.display(), error = %e, "skipping invalid task definition"),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "skipping invalid task definition; keeping previous definition"
+                );
+                if let Some(old) = previous {
+                    defs.push(old.clone());
+                }
+            }
         }
     }
 
     defs.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(defs)
+    defs
 }
 
 /// Write a task definition to `<dir>/<name>.md`.
@@ -217,5 +253,70 @@ mod tests {
             Some(".favetto/{{ input.id }}/manifest.json")
         );
         assert_eq!(parsed.prompt, "hello");
+    }
+
+    /// A unique scratch directory for catalog tests.
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "favetto-catalog-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn reload_drops_deleted_files_and_adds_new_ones() {
+        let dir = temp_dir("reload");
+        std::fs::write(dir.join("a.md"), "agent = \"x\"\n---\nprompt a\n").unwrap();
+        std::fs::write(dir.join("b.md"), "agent = \"x\"\n---\nprompt b\n").unwrap();
+        let prior = load_catalog(&dir).unwrap();
+        assert_eq!(prior.len(), 2);
+
+        std::fs::remove_file(dir.join("b.md")).unwrap();
+        std::fs::write(dir.join("c.md"), "agent = \"x\"\n---\nprompt c\n").unwrap();
+        let reloaded = reload_catalog(&dir, &prior);
+        let names: Vec<_> = reloaded.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["a", "c"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reload_keeps_previous_definition_on_parse_error() {
+        let dir = temp_dir("parse-error");
+        let good = "agent = \"x\"\n---\noriginal\n";
+        std::fs::write(dir.join("a.md"), good).unwrap();
+        let prior = load_catalog(&dir).unwrap();
+
+        // A half-written file (invalid TOML header) must not drop the task.
+        std::fs::write(dir.join("a.md"), "agent = \n---\nbroken\n").unwrap();
+        let reloaded = reload_catalog(&dir, &prior);
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded[0].name, "a");
+        assert_eq!(reloaded[0].prompt, "original");
+
+        // Once the file parses again the new definition wins.
+        std::fs::write(dir.join("a.md"), "agent = \"x\"\n---\nupdated\n").unwrap();
+        let reloaded = reload_catalog(&dir, &reloaded);
+        assert_eq!(reloaded[0].prompt, "updated");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reload_missing_dir_keeps_prior_catalog() {
+        let prior = vec![parse_task_md("a", "agent = \"x\"\n---\nprompt\n").unwrap()];
+        let root = temp_dir("missing");
+        let missing = root.join("does-not-exist");
+        let reloaded = reload_catalog(&missing, &prior);
+        assert_eq!(reloaded, prior);
+        // With no prior, a missing directory is an empty catalog.
+        assert!(reload_catalog(&missing, &[]).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -88,13 +88,15 @@ pub enum UiAction {
     },
 }
 
-/// The Ctrl+P popup: either the top-level menu, a step-by-step form, or the
-/// one-shot wizard.
+/// The Ctrl+P popup: either the top-level menu, a step-by-step form, the
+/// one-shot wizard, or the `?` keybinding reference.
 pub enum Popup {
     None,
     Menu { selected: usize },
     Form(Form),
     Wizard(Wizard),
+    /// Scrollable keybinding reference, toggled with `?`.
+    Help { scroll: u16 },
 }
 
 pub struct Form {
@@ -250,6 +252,9 @@ pub struct App {
     pub catalog_preview_max_scroll: u16,
     /// The preview pane's screen rectangle (set during draw) for mouse hit tests.
     pub catalog_preview_area: Option<Rect>,
+    /// Set when the daemon pushes `catalog.updated`; the session loop re-fetches
+    /// the catalog and clears it.
+    pub catalog_dirty: bool,
 
     // Embedded agent terminal.
     pub agent_session_id: Option<String>,
@@ -315,6 +320,7 @@ impl App {
             catalog_preview_scroll: 0,
             catalog_preview_max_scroll: 0,
             catalog_preview_area: None,
+            catalog_dirty: false,
             agent_session_id: None,
             agent_task_id: None,
             agent_name: None,
@@ -358,6 +364,18 @@ impl App {
 
     pub fn select_prev(&mut self) {
         self.tasks_selected = self.tasks_selected.saturating_sub(1);
+    }
+
+    /// Replace the catalog, clamping the selection and dropping the cached
+    /// preview so it is re-fetched (the selected task's source may have changed).
+    pub fn set_catalog(&mut self, catalog: Vec<CatalogEntry>) {
+        self.catalog = catalog;
+        self.catalog_selected = if self.catalog.is_empty() {
+            0
+        } else {
+            self.catalog_selected.min(self.catalog.len() - 1)
+        };
+        self.catalog_preview = None;
     }
 
     /// The catalog task whose preview should be loaded, if the Catalog tab is
@@ -469,12 +487,20 @@ impl App {
             Popup::Form(_) => return self.handle_form_key(key.code),
             Popup::Menu { .. } => return self.handle_menu_key(key.code),
             Popup::Wizard(_) => return self.handle_wizard_key(key),
+            Popup::Help { .. } => return self.handle_help_key(key.code),
             Popup::None => {}
         }
 
         // Agent keyboard focus: everything else is forwarded to the PTY.
         if self.tab == Tab::Agent && self.agent_capture {
             return self.forward_agent_key(&key);
+        }
+
+        // `?` opens help when no popup owns the keyboard and the embedded agent is
+        // not capturing. Popup routing and agent forwarding above take precedence.
+        if key.code == KeyCode::Char('?') {
+            self.popup = Popup::Help { scroll: 0 };
+            return UiAction::None;
         }
 
         if self.tab == Tab::Agent {
@@ -707,6 +733,36 @@ impl App {
             Tab::Agent => {}
         }
         true
+    }
+
+    /// Keys while the Help overlay is open: `?`/`Esc` close, arrows and page keys
+    /// scroll the content.
+    fn handle_help_key(&mut self, code: KeyCode) -> UiAction {
+        match code {
+            KeyCode::Esc | KeyCode::Char('?') => self.popup = Popup::None,
+            KeyCode::Up => {
+                if let Popup::Help { scroll } = &mut self.popup {
+                    *scroll = scroll.saturating_sub(1);
+                }
+            }
+            KeyCode::PageUp => {
+                if let Popup::Help { scroll } = &mut self.popup {
+                    *scroll = scroll.saturating_sub(10);
+                }
+            }
+            KeyCode::Down => {
+                if let Popup::Help { scroll } = &mut self.popup {
+                    *scroll = scroll.saturating_add(1);
+                }
+            }
+            KeyCode::PageDown => {
+                if let Popup::Help { scroll } = &mut self.popup {
+                    *scroll = scroll.saturating_add(10);
+                }
+            }
+            _ => {}
+        }
+        UiAction::None
     }
 
     fn handle_menu_key(&mut self, code: KeyCode) -> UiAction {
@@ -1122,6 +1178,10 @@ impl App {
                     }
                 }
             }
+            push::CATALOG_UPDATED => {
+                // The list is re-fetched by the session loop, which owns the client.
+                self.catalog_dirty = true;
+            }
             push::LOG_LINE => {
                 if let Some(msg) = n.params.get("message").and_then(|m| m.as_str()) {
                     self.logs.push_back(msg.to_string());
@@ -1482,6 +1542,87 @@ mod tests {
     }
 
     #[test]
+    fn question_mark_opens_and_closes_help() {
+        let mut app = App::new();
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('?'), KeyModifiers::empty())),
+            UiAction::None
+        ));
+        assert!(matches!(app.popup, Popup::Help { scroll: 0 }));
+
+        // `?` closes it again.
+        app.handle_key(key(KeyCode::Char('?'), KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::None));
+
+        // `Esc` also closes it.
+        app.handle_key(key(KeyCode::Char('?'), KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::None));
+
+        // Arrows and page keys scroll the content.
+        app.handle_key(key(KeyCode::Char('?'), KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::Help { scroll: 1 }));
+        app.handle_key(key(KeyCode::PageDown, KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::Help { scroll: 11 }));
+        app.handle_key(key(KeyCode::Up, KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::Help { scroll: 10 }));
+        app.handle_key(key(KeyCode::PageUp, KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::Help { scroll: 0 }));
+        // Scrolling up from the top saturates at zero.
+        app.handle_key(key(KeyCode::Up, KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::Help { scroll: 0 }));
+    }
+
+    #[test]
+    fn question_mark_is_forwarded_to_captured_agent() {
+        let mut app = App::new();
+        app.tab = Tab::Agent;
+        app.agent_capture = true;
+        match app.handle_key(key(KeyCode::Char('?'), KeyModifiers::empty())) {
+            UiAction::AgentInput(bytes) => assert_eq!(bytes, b"?".to_vec()),
+            _ => panic!("expected AgentInput"),
+        }
+        assert!(matches!(app.popup, Popup::None));
+    }
+
+    #[test]
+    fn question_mark_opens_help_on_agent_tab_with_favetto_focus() {
+        let mut app = App::new();
+        app.tab = Tab::Agent;
+        app.agent_capture = false;
+        app.handle_key(key(KeyCode::Char('?'), KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::Help { scroll: 0 }));
+    }
+
+    #[test]
+    fn question_mark_is_literal_inside_form() {
+        let mut app = App::new();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
+        let Popup::Form(form) = &app.popup else {
+            panic!("expected form");
+        };
+        assert!(matches!(form.kind, FormKind::AddTask));
+
+        app.handle_key(key(KeyCode::Char('?'), KeyModifiers::empty()));
+        let Popup::Form(form) = &app.popup else {
+            panic!("expected form");
+        };
+        assert_eq!(form.input, "?");
+    }
+
+    #[test]
+    fn question_mark_does_not_open_over_menu() {
+        let mut app = App::new();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(matches!(app.popup, Popup::Menu { .. }));
+        app.handle_key(key(KeyCode::Char('?'), KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::Menu { .. }));
+    }
+
+    #[test]
     fn catalog_preview_scrolls_with_keys_and_wheel() {
         let mut app = App::new();
         app.tab = Tab::Catalog;
@@ -1538,6 +1679,40 @@ mod tests {
         // Changing the selected task resets the scroll to the top.
         app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
         assert_eq!(app.catalog_preview_scroll, 0);
+    }
+
+    #[test]
+    fn catalog_updated_push_marks_catalog_dirty() {
+        let mut app = App::new();
+        assert!(!app.catalog_dirty);
+        app.handle_notification(Notification {
+            method: push::CATALOG_UPDATED.to_string(),
+            params: serde_json::json!({}),
+        });
+        assert!(app.catalog_dirty);
+    }
+
+    #[test]
+    fn set_catalog_clamps_selection_and_refreshes_preview() {
+        let mut app = App::new();
+        app.catalog_selected = 5;
+        app.catalog_preview = Some(("gone".to_string(), "md".to_string()));
+
+        app.set_catalog(vec![CatalogEntry {
+            name: "a".to_string(),
+            agent: None,
+            provider: None,
+            model: None,
+            cwd: None,
+            needs: None,
+            prompt: String::new(),
+        }]);
+
+        assert_eq!(app.catalog_selected, 0);
+        assert!(app.catalog_preview.is_none());
+
+        app.set_catalog(Vec::new());
+        assert_eq!(app.catalog_selected, 0);
     }
 
     #[test]

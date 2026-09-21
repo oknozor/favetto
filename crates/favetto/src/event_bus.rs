@@ -15,6 +15,8 @@ use favetto_core::rpc::{push, Notification};
 pub enum ServerPush {
     Event(Event),
     TaskUpdated(Task),
+    /// The task catalog changed on disk; clients should re-fetch it.
+    CatalogUpdated,
     /// Forward-looking: used once the runtime streams agent logs to clients.
     #[allow(dead_code)]
     LogLine { level: String, message: String },
@@ -26,6 +28,10 @@ impl ServerPush {
         match self {
             ServerPush::Event(ev) => ev.into_notification(),
             ServerPush::TaskUpdated(t) => t.into_notification(),
+            ServerPush::CatalogUpdated => Notification {
+                method: push::CATALOG_UPDATED.to_string(),
+                params: serde_json::json!({}),
+            },
             ServerPush::LogLine { level, message } => Notification {
                 method: push::LOG_LINE.to_string(),
                 params: serde_json::json!({ "level": level, "message": message }),
@@ -55,5 +61,16 @@ impl EventBus {
     /// subscribers the value is dropped.
     pub fn publish(&self, push: ServerPush) {
         let _ = self.tx.send(push);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_updated_push_maps_to_notification() {
+        let n = ServerPush::CatalogUpdated.into_notification();
+        assert_eq!(n.method, push::CATALOG_UPDATED);
     }
 }

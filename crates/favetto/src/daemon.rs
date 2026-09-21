@@ -115,7 +115,13 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     crate::scheduler::start(&state).await?;
     crate::executor::spawn(state.clone());
     hooks::HookEngine::new(hook_store, state.clone()).spawn();
-    crate::scheduler::sync_catalog_schedules(&state).await?;
+    crate::scheduler::reconcile_catalog_schedules(&state).await?;
+
+    // Reload the catalog when task files change on disk. A missing tasks dir
+    // degrades gracefully: the rest of the daemon still runs.
+    if let Err(e) = crate::catalog_watch::spawn(state.clone()) {
+        tracing::warn!(error = %e, dir = %state.tasks_dir.display(), "failed to watch task catalog");
+    }
 
     let unix_state = state.clone();
     let unix_task = tokio::spawn(async move { transport::serve_unix(&socket, unix_state).await });
