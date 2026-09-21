@@ -328,6 +328,60 @@ GitHub webhook secrets resolve from `[webhook.github]` (`secret`, else the env
 var named by `secret_env`, else `GITHUB_WEBHOOK_SECRET`); Linear reads
 `LINEAR_WEBHOOK_SECRET`. See [Webhooks & hooks](#webhooks--hooks).
 
+### Sound notifications
+
+The TUI can play a short cue when tasks finish. Sounds are produced **on the
+client** (the machine running `favetto tui`), work with a remote daemon, and
+never block the render/key loop — cues are queued and played by a background
+worker. They work out of the box: by default, `task_finished` plays an ascending
+chime on success and a descending tone on failure, synthesised to a temporary
+WAV at first use (no bundled audio files). If no player is found on `PATH`, the
+terminal BEL (`\x07`) is used.
+
+Trigger mapping:
+
+| Event | Cue | Default |
+|-------|-----|---------|
+| `task_finished` with `success: true` | success chime | on |
+| `task_finished` with `success: false` | failure tone | on |
+| `task_started` | blip | off |
+| `agent.exit` | attention ping | off |
+
+Only `task_finished` is sounded — `task_completed`/`task_failed` never add a
+duplicate. Cues that arrive within `min_interval_ms` are coalesced (failure wins
+the merge). Press **M** to mute/unmute for the session; the status bar shows a
+`sound`/`muted`/`sound off` badge.
+
+```toml
+# ~/.config/favetto/config.toml
+[tui.sound]
+enabled = true                 # master switch (default true)
+player = "auto"                # "auto" | "bell" | "command"
+# command = "paplay {file}"    # player = "command"; {file} is the sound path
+# sound_dir = "~/.config/favetto/sounds"
+# min_interval_ms = 400        # coalesce bursts
+# only_when_unfocused = false  # play only while the terminal is unfocused
+
+[tui.sound.events]
+task_finished = "success"      # built-in name, .wav path, "bell", or "none"
+task_failed   = "failure"
+task_started  = "none"
+attention     = "none"
+```
+
+Precedence is **CLI flag → env var → `[tui.sound]` → built-in default**:
+
+- `--sound` / `--no-sound` force the master switch;
+  `--sound-command '<cmd> {file}'` sets a custom player.
+- `FAVETTO_SOUND` (`1/true/on/yes` or `0/false/off/no/none`) overrides
+  `enabled`; `FAVETTO_SOUND_DIR` overrides `sound_dir`;
+  `FAVETTO_SOUND_COMMAND` overrides the player.
+- `player = "auto"` detects, in order: Linux `paplay`, `pw-play`, `aplay`,
+  `ffplay`, `canberra-gtk-play`; macOS `afplay`; Windows PowerShell; else BEL.
+
+Run `favetto tui --test-sound` to play every configured cue once, print the
+resolved player and per-cue mapping, and exit.
+
 ## Embedded agents
 
 favetto does not reimplement a coding agent: it runs a configured agent CLI

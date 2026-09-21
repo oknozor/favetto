@@ -42,6 +42,61 @@ pub struct FavettoConfig {
     /// Webhook trigger rules (currently GitHub).
     #[serde(default)]
     pub webhook: WebhookSettings,
+    /// Client-side TUI settings. Ignored by the daemon, which reads the same file.
+    #[serde(default)]
+    pub tui: TuiSettings,
+}
+
+/// TUI-only settings. The daemon parses but ignores this section.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TuiSettings {
+    #[serde(default)]
+    pub sound: SoundSettings,
+}
+
+/// Client-side sound notifications for the TUI.
+///
+/// Precedence is CLI flags (`--sound`/`--no-sound`/`--sound-command`) over the
+/// `FAVETTO_SOUND*` environment variables over this section over built-in
+/// defaults. Sounds are played on the machine running `favetto tui`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SoundSettings {
+    /// Master switch (default true).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// `"auto"` (detect a player on `PATH`), `"bell"`, or `"command"`.
+    #[serde(default = "default_sound_player")]
+    pub player: String,
+    /// Template used when `player = "command"`; `{file}` is the sound path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Directory for relative `.wav` event values. `~` is expanded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sound_dir: Option<PathBuf>,
+    /// Minimum gap between cues; bursts inside it are coalesced (failure wins).
+    #[serde(default = "default_min_interval_ms")]
+    pub min_interval_ms: u64,
+    /// Only play while the terminal is unfocused (best-effort focus reporting).
+    #[serde(default)]
+    pub only_when_unfocused: bool,
+    /// Cue key -> sound spec (`success`/`failure`/`attention`/`started`/`bell`,
+    /// a `.wav` path, or `none`). Unset keys use the built-in default.
+    #[serde(default = "default_sound_events")]
+    pub events: BTreeMap<String, String>,
+}
+
+impl Default for SoundSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            player: default_sound_player(),
+            command: None,
+            sound_dir: None,
+            min_interval_ms: default_min_interval_ms(),
+            only_when_unfocused: false,
+            events: default_sound_events(),
+        }
+    }
 }
 
 /// Webhook trigger settings. Currently only GitHub is supported.
@@ -193,6 +248,23 @@ fn default_true() -> bool {
     true
 }
 
+fn default_sound_player() -> String {
+    "auto".to_string()
+}
+
+fn default_min_interval_ms() -> u64 {
+    400
+}
+
+fn default_sound_events() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("task_finished".to_string(), "success".to_string()),
+        ("task_failed".to_string(), "failure".to_string()),
+        ("task_started".to_string(), "none".to_string()),
+        ("attention".to_string(), "none".to_string()),
+    ])
+}
+
 fn default_max_concurrency() -> usize {
     4
 }
@@ -295,6 +367,73 @@ mod tests {
         assert!(rule.enabled);
         assert_eq!(rule.filter.repo.as_deref(), Some("oknozor/*"));
         assert_eq!(rule.filter.labels_contains, vec!["bug".to_string()]);
+    }
+
+    #[test]
+    fn parses_tui_sound_settings() {
+        let cfg: FavettoConfig = toml::from_str(
+            r#"
+            [tui.sound]
+            enabled = true
+            player = "command"
+            command = "paplay {file}"
+            sound_dir = "/tmp/sounds"
+            min_interval_ms = 250
+            only_when_unfocused = true
+
+            [tui.sound.events]
+            task_finished = "success"
+            task_failed = "bell"
+            attention = "none"
+            "#,
+        )
+        .unwrap();
+
+        let sound = &cfg.tui.sound;
+        assert!(sound.enabled);
+        assert_eq!(sound.player, "command");
+        assert_eq!(sound.command.as_deref(), Some("paplay {file}"));
+        assert_eq!(sound.sound_dir.as_deref(), Some(Path::new("/tmp/sounds")));
+        assert_eq!(sound.min_interval_ms, 250);
+        assert!(sound.only_when_unfocused);
+        assert_eq!(
+            sound.events.get("task_finished").map(String::as_str),
+            Some("success")
+        );
+        assert_eq!(
+            sound.events.get("task_failed").map(String::as_str),
+            Some("bell")
+        );
+        assert_eq!(
+            sound.events.get("attention").map(String::as_str),
+            Some("none")
+        );
+    }
+
+    #[test]
+    fn tui_sound_defaults() {
+        let cfg: FavettoConfig = toml::from_str("").unwrap();
+        let sound = &cfg.tui.sound;
+        assert!(sound.enabled);
+        assert_eq!(sound.player, "auto");
+        assert_eq!(sound.min_interval_ms, 400);
+        assert!(!sound.only_when_unfocused);
+        assert_eq!(
+            sound.events.get("task_finished").map(String::as_str),
+            Some("success")
+        );
+        assert_eq!(
+            sound.events.get("task_failed").map(String::as_str),
+            Some("failure")
+        );
+        assert_eq!(
+            sound.events.get("task_started").map(String::as_str),
+            Some("none")
+        );
+        assert_eq!(
+            sound.events.get("attention").map(String::as_str),
+            Some("none")
+        );
     }
 
     #[test]

@@ -11,14 +11,15 @@ use serde_json::Value;
 use base64::Engine as _;
 
 use favetto_core::model::{
-    AgentCapabilities, AgentCatalogEntry, AgentSessionInfo, Event, NotificationRecord, Schedule,
-    Task,
+    AgentCapabilities, AgentCatalogEntry, AgentSessionInfo, Event, EventKind, NotificationRecord,
+    Schedule, Task,
 };
 use favetto_core::rpc::{method, push, Notification};
 use favetto_providers::Provider;
 
 use crate::tasks::TaskVar;
 
+use super::sound::SoundCue;
 use super::term::TerminalView;
 
 /// Tabs shown in the header. Agent hosts the embedded external-agent terminal.
@@ -333,6 +334,15 @@ pub struct App {
 
     // Ctrl+P popup.
     pub popup: Popup,
+
+    /// Queued sound cues, drained by the session loop.
+    pub sound_cues: Vec<SoundCue>,
+    /// Session-only mute toggle (`M`).
+    pub sound_muted: bool,
+    /// Suppresses cue enqueueing during the initial event replay.
+    pub sound_suppressed: bool,
+    /// Whether sound is enabled by configuration (drives the status badge).
+    pub sound_enabled: bool,
 }
 
 impl App {
@@ -378,6 +388,10 @@ impl App {
             notifications_geom: ListGeometry::default(),
             daemon_cwd: None,
             popup: Popup::None,
+            sound_cues: Vec::new(),
+            sound_muted: false,
+            sound_suppressed: false,
+            sound_enabled: true,
         }
     }
 
@@ -536,6 +550,13 @@ impl App {
         // not capturing. Popup routing and agent forwarding above take precedence.
         if key.code == KeyCode::Char('?') {
             self.popup = Popup::Help { scroll: 0 };
+            return UiAction::None;
+        }
+
+        // `M` mutes/unmutes sound. Like `?`, it is literal inside a popup and is
+        // forwarded to the agent while the embedded agent captures the keyboard.
+        if key.code == KeyCode::Char('m') || key.code == KeyCode::Char('M') {
+            self.toggle_sound_muted();
             return UiAction::None;
         }
 
@@ -1405,6 +1426,9 @@ impl App {
                 if let Some(sid) = sid {
                     self.agent_exit(sid, code);
                 }
+                if !self.sound_suppressed {
+                    self.enqueue_sound(SoundCue::Attention);
+                }
             }
             _ => {}
         }
@@ -1421,8 +1445,32 @@ impl App {
     pub fn ingest_event(&mut self, ev: Event) {
         if ev.id > self.last_event_id {
             self.last_event_id = ev.id;
+            if !self.sound_suppressed {
+                if let Some(cue) = cue_for_event(&ev) {
+                    self.enqueue_sound(cue);
+                }
+            }
             self.events.push_back(ev);
         }
+    }
+
+    /// Queue a cue, keeping the buffer bounded.
+    fn enqueue_sound(&mut self, cue: SoundCue) {
+        const MAX_SOUND_CUES: usize = 64;
+        if self.sound_cues.len() >= MAX_SOUND_CUES {
+            self.sound_cues.remove(0);
+        }
+        self.sound_cues.push(cue);
+    }
+
+    /// Drain the pending sound cues (played by the session loop).
+    pub fn take_sound_cues(&mut self) -> Vec<SoundCue> {
+        std::mem::take(&mut self.sound_cues)
+    }
+
+    /// Toggle sound mute for this session.
+    pub fn toggle_sound_muted(&mut self) {
+        self.sound_muted = !self.sound_muted;
     }
 
     /// The event at the current selection (0 = newest).
@@ -1433,6 +1481,25 @@ impl App {
         }
         let offset = self.events_selected.min(n - 1);
         self.events.get(n - 1 - offset)
+    }
+}
+
+/// Derive the sound cue for an event, if any.
+///
+/// Only `task_finished` is sounded (success/failure), so `task_completed` /
+/// `task_failed` never double up; `task_started` is mapped but defaults off.
+fn cue_for_event(ev: &Event) -> Option<SoundCue> {
+    match &ev.kind {
+        EventKind::TaskFinished => {
+            let success = ev.payload.get("success").and_then(|v| v.as_bool());
+            Some(if success == Some(true) {
+                SoundCue::TaskFinished
+            } else {
+                SoundCue::TaskFailed
+            })
+        }
+        EventKind::TaskStarted => Some(SoundCue::TaskStarted),
+        _ => None,
     }
 }
 
@@ -1724,6 +1791,85 @@ mod tests {
             vars: Vec::new(),
             prompt: String::new(),
         }
+    }
+
+    fn event(id: i64, kind: EventKind, payload: serde_json::Value) -> Event {
+        Event {
+            id,
+            kind,
+            payload,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn task_finished_enqueues_success_or_failure_cue() {
+        let mut app = App::new();
+        app.ingest_event(event(
+            1,
+            EventKind::TaskFinished,
+            serde_json::json!({ "success": true }),
+        ));
+        assert_eq!(app.take_sound_cues(), vec![SoundCue::TaskFinished]);
+
+        app.ingest_event(event(
+            2,
+            EventKind::TaskFinished,
+            serde_json::json!({ "success": false }),
+        ));
+        assert_eq!(app.take_sound_cues(), vec![SoundCue::TaskFailed]);
+    }
+
+    #[test]
+    fn only_task_finished_maps_to_finish_cues() {
+        let mut app = App::new();
+        app.ingest_event(event(1, EventKind::TaskCompleted, serde_json::json!({})));
+        app.ingest_event(event(2, EventKind::TaskFailed, serde_json::json!({})));
+        // `task_started` is mapped; whether it sounds is a player-level concern.
+        app.ingest_event(event(3, EventKind::TaskStarted, serde_json::json!({})));
+        assert_eq!(app.take_sound_cues(), vec![SoundCue::TaskStarted]);
+    }
+
+    #[test]
+    fn agent_exit_push_enqueues_attention() {
+        let mut app = App::new();
+        app.handle_notification(Notification {
+            method: push::AGENT_EXIT.to_string(),
+            params: serde_json::json!({ "session_id": "s1", "code": 0 }),
+        });
+        assert_eq!(app.take_sound_cues(), vec![SoundCue::Attention]);
+    }
+
+    #[test]
+    fn suppressed_replay_does_not_enqueue_cues() {
+        let mut app = App::new();
+        app.sound_suppressed = true;
+        app.ingest_event(event(
+            1,
+            EventKind::TaskFinished,
+            serde_json::json!({ "success": true }),
+        ));
+        assert!(app.take_sound_cues().is_empty());
+        // The event is still recorded, just not sounded.
+        assert_eq!(app.events.len(), 1);
+    }
+
+    #[test]
+    fn m_key_toggles_mute_unless_agent_captures() {
+        let mut app = App::new();
+        app.handle_key(key(KeyCode::Char('m'), KeyModifiers::empty()));
+        assert!(app.sound_muted);
+        app.handle_key(key(KeyCode::Char('M'), KeyModifiers::empty()));
+        assert!(!app.sound_muted);
+
+        // Under agent capture the key goes to the PTY instead.
+        app.tab = Tab::Agent;
+        app.agent_capture = true;
+        match app.handle_key(key(KeyCode::Char('m'), KeyModifiers::empty())) {
+            UiAction::AgentInput(bytes) => assert_eq!(bytes, b"m".to_vec()),
+            _ => panic!("expected AgentInput"),
+        }
+        assert!(!app.sound_muted);
     }
 
     #[test]

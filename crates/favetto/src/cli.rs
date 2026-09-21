@@ -67,6 +67,21 @@ pub struct TuiArgs {
     /// Short-lived pairing code to exchange for a token (remote attach only).
     #[arg(long)]
     pub pair_code: Option<String>,
+    /// Path to the client-local config file (default `~/.config/favetto/config.toml`).
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+    /// Force sound on (overrides config and env).
+    #[arg(long, overrides_with = "no_sound")]
+    pub sound: bool,
+    /// Disable sound (overrides config and env).
+    #[arg(long = "no-sound")]
+    pub no_sound: bool,
+    /// Custom player command; `{file}` is the sound path (implies player = "command").
+    #[arg(long = "sound-command")]
+    pub sound_command: Option<String>,
+    /// Play every configured cue once, print the resolved player, and exit.
+    #[arg(long = "test-sound")]
+    pub test_sound: bool,
 }
 
 #[derive(Args)]
