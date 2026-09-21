@@ -68,3 +68,28 @@ max_concurrency = 4        # slots when parallel
 worktree = true            # when parallel and in a git repo, give each task its own worktree
 # worktree_dir = "~/.local/share/favetto/worktrees"  # absolute or repo-relative
 keep_worktree = true       # keep worktrees after the task (so branches/changes can be inspected)
+
+# GitHub webhook triggers. GitHub POSTs signed events to /webhooks/github;
+# each matching rule enqueues the named catalog task with a truncated summary of
+# the event as its input (reachable in prompts as {{ input.repo }}, etc.).
+# Rules and the secret are read at startup; restart the daemon after editing.
+[webhook.github]
+enabled = true
+secret_env = "GITHUB_WEBHOOK_SECRET"   # preferred
+# secret = "..."                        # literal alternative (discouraged)
+
+# When an issue is opened in any oknozor repo, run the triage task.
+[[webhook.github.rules]]
+name = "triage-opened-issues"
+event = "issues"
+action = "opened"
+task = "triage_favetto_issues"
+filter = { repo = "oknozor/*" }
+
+# When a bug-labelled PR is opened against main by the owner, plan it.
+[[webhook.github.rules]]
+name = "plan-bug-prs"
+event = "pull_request"
+action = "opened"
+task = "plan_favetto_issue"
+filter = { labels_contains = ["bug"], base_ref = "main", author = "oknozor" }

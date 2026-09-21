@@ -58,6 +58,12 @@ CREATE TABLE IF NOT EXISTS notifications (
     status      TEXT NOT NULL,
     sent_at     INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    delivery_id TEXT PRIMARY KEY,
+    provider    TEXT NOT NULL,
+    received_at INTEGER NOT NULL
+);
 "#;
 
 fn ts_ms(dt: DateTime<Utc>) -> i64 {
@@ -356,6 +362,29 @@ fn row_to_notification(row: &SqliteRow) -> NotificationRecord {
 }
 
 // ---------------------------------------------------------------------------
+// Webhook deliveries
+// ---------------------------------------------------------------------------
+
+/// Record a webhook delivery. Returns `true` if this is the first time the
+/// delivery was seen, `false` if it is a redelivery (already recorded).
+pub async fn record_delivery(
+    pool: &SqlitePool,
+    provider: &str,
+    delivery_id: &str,
+) -> anyhow::Result<bool> {
+    let res = sqlx::query(
+        "INSERT OR IGNORE INTO webhook_deliveries (delivery_id, provider, received_at)
+         VALUES (?, ?, ?)",
+    )
+    .bind(delivery_id)
+    .bind(provider)
+    .bind(ts_ms(Utc::now()))
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+// ---------------------------------------------------------------------------
 // Task queue
 // ---------------------------------------------------------------------------
 
@@ -432,6 +461,27 @@ mod tests {
         let tail = tail_events(&pool, 3).await.unwrap();
         assert_eq!(tail.len(), 3);
         assert_eq!(tail[0].id, 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn webhook_delivery_is_recorded_once() {
+        let dir = std::env::temp_dir().join(format!("favetto-delivery-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = open(&dir.join("test.db")).await.unwrap();
+        migrate(&pool).await.unwrap();
+
+        assert!(record_delivery(&pool, "github", "delivery-1")
+            .await
+            .unwrap());
+        assert!(!record_delivery(&pool, "github", "delivery-1")
+            .await
+            .unwrap());
+        assert!(record_delivery(&pool, "github", "delivery-2")
+            .await
+            .unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

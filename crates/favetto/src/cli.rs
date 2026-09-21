@@ -48,9 +48,6 @@ pub struct DaemonArgs {
     /// Directory for SQLite + token (default `~/.local/share/favetto`).
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
-    /// Path to `hooks.toml`.
-    #[arg(long)]
-    pub hooks: Option<PathBuf>,
     /// Directory of task-definition `.md` files (the task catalog).
     #[arg(long)]
     pub tasks_dir: Option<PathBuf>,
