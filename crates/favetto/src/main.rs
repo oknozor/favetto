@@ -1,6 +1,7 @@
 //! `favetto` — LLM-driven agent orchestrator (daemon + remote TUI).
 
 mod agents;
+mod catalog_watch;
 mod cli;
 mod client;
 mod config;

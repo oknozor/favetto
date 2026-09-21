@@ -73,6 +73,8 @@ pub mod method {
 pub mod push {
     pub const EVENT: &str = "event";
     pub const TASK_UPDATED: &str = "task.updated";
+    /// The task catalog changed on disk; clients should re-fetch it.
+    pub const CATALOG_UPDATED: &str = "catalog.updated";
     pub const LOG_LINE: &str = "log.line";
     /// Raw PTY output (base64) from a running agent session.
     pub const AGENT_OUTPUT: &str = "agent.output";
