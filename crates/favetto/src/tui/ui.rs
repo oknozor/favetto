@@ -63,12 +63,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
-fn draw_popup(frame: &mut Frame, app: &App) {
-    match &app.popup {
+fn draw_popup(frame: &mut Frame, app: &mut App) {
+    match &mut app.popup {
         Popup::None => {}
         Popup::Menu { selected } => draw_menu(frame, *selected),
         Popup::Form(form) => draw_form(frame, form),
         Popup::Wizard(wizard) => draw_wizard(frame, wizard),
+        Popup::Help { scroll } => draw_help(frame, scroll),
     }
 }
 
@@ -225,6 +226,104 @@ fn draw_wizard(frame: &mut Frame, wizard: &Wizard) {
         .wrap(Wrap { trim: false });
     frame.render_widget(Clear, rect);
     frame.render_widget(paragraph, rect);
+}
+
+/// Grouped keybinding reference shown by `?`. Each row is `(key, description)`.
+const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Global",
+        &[
+            ("Tab / →", "next tab"),
+            ("Shift+Tab / ←", "previous tab"),
+            ("Ctrl+P", "open the action menu"),
+            ("?", "open/close this help"),
+            ("q / Esc", "quit"),
+        ],
+    ),
+    (
+        "Lists (Tasks, Catalog, Events, Scheduler, Notifications)",
+        &[
+            ("↑ / ↓", "move selection"),
+            ("PageUp / PageDown", "move/scroll by a page"),
+        ],
+    ),
+    (
+        "Tasks tab",
+        &[("Enter", "open the selected task's agent session")],
+    ),
+    (
+        "Catalog tab",
+        &[
+            ("Enter", "start the selected catalog task"),
+            ("PageUp / PageDown / wheel", "scroll the preview pane"),
+        ],
+    ),
+    (
+        "Agent tab",
+        &[
+            ("Ctrl+Y", "toggle focus: agent ↔ favetto"),
+            ("(agent focus)", "every key is forwarded to the agent"),
+            ("(favetto focus) Ctrl+Q", "leave the panel"),
+            ("(favetto focus) Ctrl+N", "start a new session"),
+            ("(favetto focus) Esc", "back to Tasks"),
+        ],
+    ),
+    (
+        "Popups (menu / form / wizard)",
+        &[
+            ("↑ / ↓", "select"),
+            ("Enter", "confirm / next field"),
+            ("Esc", "cancel / close"),
+        ],
+    ),
+    (
+        "Mouse",
+        &[
+            ("click the tab bar", "switch tabs"),
+            ("(Agent) wheel/click", "forwarded when the agent enables it"),
+        ],
+    ),
+];
+
+/// Flatten [`HELP_SECTIONS`] into the styled lines rendered by [`draw_help`].
+fn help_lines() -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = Vec::new();
+    for (section, rows) in HELP_SECTIONS {
+        lines.push(Line::from(Span::styled(
+            (*section).to_string(),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )));
+        for (k, v) in *rows {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {k} — "), Style::default().fg(Color::Yellow)),
+                Span::raw((*v).to_string()),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+    lines
+}
+
+/// Draw the scrollable `?` keybinding overlay, clamping `scroll` to the content.
+fn draw_help(frame: &mut Frame, scroll: &mut u16) {
+    let area = frame.area();
+    let rect = centered_rect(area, 80, area.height.saturating_sub(2));
+
+    let paragraph = Paragraph::new(help_lines())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Help (?) — ↑/↓ scroll, Esc/? close "),
+        )
+        .wrap(Wrap { trim: false });
+    let inner_width = rect.width.saturating_sub(2);
+    let inner_height = rect.height.saturating_sub(2);
+    // `line_count` returns `usize`; the preview pane uses the same conversion.
+    let max_scroll = (paragraph.line_count(inner_width) as u16).saturating_sub(inner_height);
+    *scroll = (*scroll).min(max_scroll);
+
+    frame.render_widget(Clear, rect);
+    frame.render_widget(paragraph.scroll((*scroll, 0)), rect);
 }
 
 fn draw_catalog(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -683,10 +782,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         if agent_focused {
             "[Ctrl+Y] favetto keys"
         } else {
-            "[Ctrl+Y] agent keys  [Ctrl+Q] leave  [Ctrl+N] new"
+            "[Ctrl+Y] agent keys  [Ctrl+Q] leave  [Ctrl+N] new  [?] help"
         }
     } else {
-        "[↑↓] select  [Enter] agent  [Tab] switch  [q] quit"
+        "[↑↓] select  [Enter] agent  [Tab] switch  [q] quit  [?] help"
     };
     let right = format!("tasks: {}  events: {}  {hint}", app.tasks.len(), app.events.len());
 
@@ -762,6 +861,53 @@ mod tests {
             let mut terminal = Terminal::new(backend).unwrap();
             terminal.draw(|f| draw(f, &mut app)).unwrap();
         }
+    }
+
+    fn render_text(app: &mut App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let area = *buffer.area();
+        let mut text = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    text.push_str(cell.symbol());
+                }
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn help_overlay_renders_shortcuts() {
+        let mut app = App::new();
+        app.popup = Popup::Help { scroll: 0 };
+        let text = render_text(&mut app, 100, 40);
+        assert!(text.contains("Help"), "help title missing: {text:?}");
+        assert!(text.contains("Global"), "global section missing: {text:?}");
+        assert!(text.contains("Ctrl+P"), "Ctrl+P row missing: {text:?}");
+    }
+
+    #[test]
+    fn help_overlay_renders_on_small_terminal() {
+        let mut app = App::new();
+        app.popup = Popup::Help { scroll: 0 };
+        // Must not panic when the overlay is larger than the terminal.
+        let _ = render_text(&mut app, 20, 6);
+    }
+
+    #[test]
+    fn help_overlay_scrolls_to_later_content() {
+        let mut app = App::new();
+        app.popup = Popup::Help { scroll: u16::MAX };
+        let text = render_text(&mut app, 100, 12);
+        assert!(text.contains("Mouse"), "late section missing: {text:?}");
+        assert!(
+            !text.contains("Global"),
+            "early section still shown: {text:?}"
+        );
     }
 
     #[test]

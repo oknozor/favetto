@@ -85,13 +85,15 @@ pub enum UiAction {
     Submit { method: &'static str, params: Value },
 }
 
-/// The Ctrl+P popup: either the top-level menu, a step-by-step form, or the
-/// one-shot wizard.
+/// The Ctrl+P popup: either the top-level menu, a step-by-step form, the
+/// one-shot wizard, or the `?` keybinding reference.
 pub enum Popup {
     None,
     Menu { selected: usize },
     Form(Form),
     Wizard(Wizard),
+    /// Scrollable keybinding reference, toggled with `?`.
+    Help { scroll: u16 },
 }
 
 pub struct Form {
@@ -430,12 +432,20 @@ impl App {
             Popup::Form(_) => return self.handle_form_key(key.code),
             Popup::Menu { .. } => return self.handle_menu_key(key.code),
             Popup::Wizard(_) => return self.handle_wizard_key(key),
+            Popup::Help { .. } => return self.handle_help_key(key.code),
             Popup::None => {}
         }
 
         // Agent keyboard focus: everything else is forwarded to the PTY.
         if self.tab == Tab::Agent && self.agent_capture {
             return self.forward_agent_key(&key);
+        }
+
+        // `?` opens help when no popup owns the keyboard and the embedded agent is
+        // not capturing. Popup routing and agent forwarding above take precedence.
+        if key.code == KeyCode::Char('?') {
+            self.popup = Popup::Help { scroll: 0 };
+            return UiAction::None;
         }
 
         if self.tab == Tab::Agent {
@@ -533,6 +543,36 @@ impl App {
                     return UiAction::AgentInput(bytes);
                 }
             }
+        }
+        UiAction::None
+    }
+
+    /// Keys while the Help overlay is open: `?`/`Esc` close, arrows and page keys
+    /// scroll the content.
+    fn handle_help_key(&mut self, code: KeyCode) -> UiAction {
+        match code {
+            KeyCode::Esc | KeyCode::Char('?') => self.popup = Popup::None,
+            KeyCode::Up => {
+                if let Popup::Help { scroll } = &mut self.popup {
+                    *scroll = scroll.saturating_sub(1);
+                }
+            }
+            KeyCode::PageUp => {
+                if let Popup::Help { scroll } = &mut self.popup {
+                    *scroll = scroll.saturating_sub(10);
+                }
+            }
+            KeyCode::Down => {
+                if let Popup::Help { scroll } = &mut self.popup {
+                    *scroll = scroll.saturating_add(1);
+                }
+            }
+            KeyCode::PageDown => {
+                if let Popup::Help { scroll } = &mut self.popup {
+                    *scroll = scroll.saturating_add(10);
+                }
+            }
+            _ => {}
         }
         UiAction::None
     }
@@ -1202,6 +1242,87 @@ mod tests {
             UiAction::None
         ));
         assert_eq!(app.tab, Tab::Tasks);
+    }
+
+    #[test]
+    fn question_mark_opens_and_closes_help() {
+        let mut app = App::new();
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('?'), KeyModifiers::empty())),
+            UiAction::None
+        ));
+        assert!(matches!(app.popup, Popup::Help { scroll: 0 }));
+
+        // `?` closes it again.
+        app.handle_key(key(KeyCode::Char('?'), KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::None));
+
+        // `Esc` also closes it.
+        app.handle_key(key(KeyCode::Char('?'), KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::None));
+
+        // Arrows and page keys scroll the content.
+        app.handle_key(key(KeyCode::Char('?'), KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::Help { scroll: 1 }));
+        app.handle_key(key(KeyCode::PageDown, KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::Help { scroll: 11 }));
+        app.handle_key(key(KeyCode::Up, KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::Help { scroll: 10 }));
+        app.handle_key(key(KeyCode::PageUp, KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::Help { scroll: 0 }));
+        // Scrolling up from the top saturates at zero.
+        app.handle_key(key(KeyCode::Up, KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::Help { scroll: 0 }));
+    }
+
+    #[test]
+    fn question_mark_is_forwarded_to_captured_agent() {
+        let mut app = App::new();
+        app.tab = Tab::Agent;
+        app.agent_capture = true;
+        match app.handle_key(key(KeyCode::Char('?'), KeyModifiers::empty())) {
+            UiAction::AgentInput(bytes) => assert_eq!(bytes, b"?".to_vec()),
+            _ => panic!("expected AgentInput"),
+        }
+        assert!(matches!(app.popup, Popup::None));
+    }
+
+    #[test]
+    fn question_mark_opens_help_on_agent_tab_with_favetto_focus() {
+        let mut app = App::new();
+        app.tab = Tab::Agent;
+        app.agent_capture = false;
+        app.handle_key(key(KeyCode::Char('?'), KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::Help { scroll: 0 }));
+    }
+
+    #[test]
+    fn question_mark_is_literal_inside_form() {
+        let mut app = App::new();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
+        let Popup::Form(form) = &app.popup else {
+            panic!("expected form");
+        };
+        assert!(matches!(form.kind, FormKind::AddTask));
+
+        app.handle_key(key(KeyCode::Char('?'), KeyModifiers::empty()));
+        let Popup::Form(form) = &app.popup else {
+            panic!("expected form");
+        };
+        assert_eq!(form.input, "?");
+    }
+
+    #[test]
+    fn question_mark_does_not_open_over_menu() {
+        let mut app = App::new();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(matches!(app.popup, Popup::Menu { .. }));
+        app.handle_key(key(KeyCode::Char('?'), KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::Menu { .. }));
     }
 
     #[test]

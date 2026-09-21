@@ -306,6 +306,14 @@ forms for:
 - **Create a notification (hook)** — adds a hook that reacts to an event kind and
   sends a notification through a channel.
 
+### Help
+
+Press **?** to open a floating overlay listing every keybinding, grouped by
+context (global, lists, Tasks/Catalog, Agent, popups, mouse). Press **?** or
+**Esc** to close it, and **↑**/**↓** or **PageUp**/**PageDown** to scroll. `?` is
+forwarded to the embedded agent while the Agent panel has keyboard capture, and
+is typed literally into form/wizard fields when one is open.
+
 ### One-shot tasks
 
 The wizard lists agents from the config, then providers and models from the
