@@ -103,7 +103,11 @@ pub struct TokenRotateArgs {
 pub fn default_data_dir() -> PathBuf {
     std::env::var("FAVETTO_DATA_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("favetto"))
+        .unwrap_or_else(|_| {
+            dirs::data_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("favetto")
+        })
 }
 
 /// Default config file: `$FAVETTO_CONFIG`, else `~/.config/favetto/config.toml`.

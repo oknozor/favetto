@@ -12,9 +12,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
-use favetto_core::model::{
-    Event, EventKind, NotificationRecord, Schedule, Task, TaskStatus,
-};
+use favetto_core::model::{Event, EventKind, NotificationRecord, Schedule, Task, TaskStatus};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS tasks (
@@ -185,10 +183,11 @@ pub async fn insert_event(pool: &SqlitePool, event: &Event) -> anyhow::Result<i6
 
 /// The most recent `limit` events, chronological (ascending id).
 pub async fn tail_events(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec<Event>> {
-    let rows = sqlx::query("SELECT id, kind, payload, created_at FROM events ORDER BY id DESC LIMIT ?")
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
+    let rows =
+        sqlx::query("SELECT id, kind, payload, created_at FROM events ORDER BY id DESC LIMIT ?")
+            .bind(limit)
+            .fetch_all(pool)
+            .await?;
     let mut events: Vec<Event> = rows.iter().map(row_to_event).collect();
     events.reverse();
     Ok(events)
@@ -223,7 +222,10 @@ fn row_to_task(row: &SqliteRow) -> Task {
         started_at: row.get::<Option<i64>, _>("started_at").map(from_ms),
         finished_at: row.get::<Option<i64>, _>("finished_at").map(from_ms),
         error: row.get("error"),
-        session_id: row.try_get::<Option<String>, _>("session_id").ok().flatten(),
+        session_id: row
+            .try_get::<Option<String>, _>("session_id")
+            .ok()
+            .flatten(),
     }
 }
 
@@ -245,11 +247,10 @@ fn row_to_event(row: &SqliteRow) -> Event {
 
 /// List schedules (newest first).
 pub async fn list_schedules(pool: &SqlitePool) -> anyhow::Result<Vec<Schedule>> {
-    let rows = sqlx::query(
-        "SELECT id, cron, task, input, enabled, last_run FROM schedules ORDER BY id",
-    )
-    .fetch_all(pool)
-    .await?;
+    let rows =
+        sqlx::query("SELECT id, cron, task, input, enabled, last_run FROM schedules ORDER BY id")
+            .fetch_all(pool)
+            .await?;
     Ok(rows.iter().map(row_to_schedule).collect())
 }
 
@@ -340,7 +341,10 @@ pub async fn insert_notification(
     Ok(res.last_insert_rowid())
 }
 
-pub async fn list_notifications(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec<NotificationRecord>> {
+pub async fn list_notifications(
+    pool: &SqlitePool,
+    limit: i64,
+) -> anyhow::Result<Vec<NotificationRecord>> {
     let rows = sqlx::query(
         "SELECT id, channel, subject, body, status, sent_at FROM notifications ORDER BY id DESC LIMIT ?",
     )

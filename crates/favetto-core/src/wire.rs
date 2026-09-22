@@ -78,8 +78,8 @@ impl Encoder<Frame> for FrameCodec {
     type Error = std::io::Error;
 
     fn encode(&mut self, item: Frame, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        let bytes = encode(&item)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let bytes =
+            encode(&item).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         dst.reserve(4 + bytes.len());
         dst.put_u32_le(bytes.len() as u32);
         dst.put_slice(&bytes);

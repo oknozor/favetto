@@ -77,7 +77,10 @@ struct ExchangeBody {
     code: String,
 }
 
-async fn exchange(AxumState(state): AxumState<Arc<State>>, Json(body): Json<ExchangeBody>) -> Response {
+async fn exchange(
+    AxumState(state): AxumState<Arc<State>>,
+    Json(body): Json<ExchangeBody>,
+) -> Response {
     if state.pair.redeem(&body.code).await {
         Json(json!({ "token": state.token.as_str() })).into_response()
     } else {
