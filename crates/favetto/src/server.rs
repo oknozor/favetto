@@ -369,7 +369,7 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
             }
         },
 
-        method::CATALOG_ADD => match add_catalog_task(state, &req.params) {
+        method::CATALOG_ADD => match add_catalog_task(state, &req.params).await {
             Ok(def) => Ok(serde_json::json!({
                 "name": def.name,
                 "agent": def.agent,
@@ -941,7 +941,7 @@ async fn upsert_schedule(
 }
 
 /// Add a task definition to the catalog (writes the `.md` file + updates memory).
-fn add_catalog_task(
+async fn add_catalog_task(
     state: &Arc<State>,
     params: &serde_json::Value,
 ) -> anyhow::Result<crate::tasks::TaskDef> {
@@ -1021,6 +1021,13 @@ fn add_catalog_task(
     if let Err(e) = crate::workflow::regenerate(&state.catalog.read().unwrap(), &state.data_dir) {
         tracing::warn!(error = %e, "failed to write workflow.dot");
     }
+
+    // Tasks added at runtime must register their cron schedule immediately
+    // (the file watcher early-returns because memory already matches disk).
+    if let Err(e) = crate::scheduler::reconcile_catalog_schedules(state).await {
+        tracing::warn!(error = %e, "failed to reconcile catalog schedules");
+    }
+
     // Tell connected clients (including an open workflow view) to re-fetch.
     state.bus.publish(ServerPush::CatalogUpdated);
 
@@ -1206,7 +1213,7 @@ mod tests {
             "agent": "x",
             "prompt": "hello",
         });
-        let def = add_catalog_task(&state, &params).unwrap();
+        let def = add_catalog_task(&state, &params).await.unwrap();
         assert_eq!(def.name, "newtask");
 
         let dot = std::fs::read_to_string(dir.join("workflow.dot")).unwrap();
@@ -1229,13 +1236,39 @@ mod tests {
             "agent": "x",
             "spawn": "child",
         });
-        add_catalog_task(&state, &params).unwrap();
+        add_catalog_task(&state, &params).await.unwrap();
 
         let dot = std::fs::read_to_string(dir.join("workflow.dot")).unwrap();
         assert!(
             dot.contains("\"parent\" -> \"child\" [label=\"spawn\"];"),
             "{dot}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn add_catalog_task_with_schedule_registers_cron() {
+        let dir = temp_dir("add-schedule");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let state = test_state(&dir, &tasks_dir).await;
+
+        let params = serde_json::json!({
+            "name": "scheduled",
+            "agent": "x",
+            "prompt": "hello",
+            "schedule": "0 0 8 * * *",
+        });
+        add_catalog_task(&state, &params).await.unwrap();
+
+        let scheduled = crate::db::list_schedules(&state.db).await.unwrap();
+        let entry = scheduled
+            .iter()
+            .find(|s| s.id == "catalog:scheduled")
+            .expect("catalog schedule registered on add");
+        assert_eq!(entry.cron, "0 0 8 * * *");
+        assert_eq!(entry.task, "scheduled");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
