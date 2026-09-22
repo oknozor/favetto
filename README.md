@@ -21,6 +21,10 @@ orchestrator never implements its own agent loop.
 └───────────────────────────────────────────────────────────────┘
 ```
 
+> **Documentation:** <https://oknozor.github.io/favetto/> — the full manual,
+> including the annotated configuration reference. This README is the
+> quickstart.
+
 ## Design principles
 
 - **Agents as workers** — favetto orchestrates; the coding loop is an external
