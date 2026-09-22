@@ -36,7 +36,7 @@ unauthenticated/rejected token.
 | `workflow.get` | Fetch the catalog workflow graph as Graphviz DOT (`dot` plus the persisted `path`). |
 | `events.tail` | Tail persisted events. |
 | `events.subscribe` | (Re)subscribe to the live event stream; accepts `last_event_id` to replay missed events before switching to live delivery. |
-| `agents.list` | List configured external agents and live agent sessions. |
+| `agents.list` | List configured external agents and live agent sessions. Each entry carries an `available` boolean (whether the agent's command was found on the daemon's PATH) and its capability flags. |
 | `agents.start` | Start an external agent session (optionally attached to a task). |
 | `agents.input` | Write raw bytes (base64) to a session's PTY. |
 | `agents.resize` | Resize a session's PTY. |

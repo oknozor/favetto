@@ -335,9 +335,7 @@ async fn run_agent_task(
     prompt: &str,
     cwd: &Path,
 ) -> anyhow::Result<(serde_json::Value, Option<String>, Option<String>)> {
-    let agent = state.registry.get(agent_name).ok_or_else(|| {
-        anyhow::anyhow!("agent '{agent_name}' is not configured under [agents.*]")
-    })?;
+    let agent = state.registry.get_checked(agent_name)?;
 
     let ctx = crate::agents::AgentContext {
         cwd: Some(cwd.to_path_buf()),
@@ -661,7 +659,13 @@ async fn start_dependents(state: &Arc<State>, ev: &Event) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::{AgentManager, AgentRegistry};
+    use crate::config::FavettoConfig;
+    use crate::event_bus::EventBus;
     use crate::tasks::{TaskVar, VarType};
+    use crate::webhooks::WebhookSecrets;
+    use favetto_core::auth::Token;
+    use std::sync::RwLock;
 
     fn def_with_vars() -> TaskDef {
         let var = |name: &str, required: bool| TaskVar {
@@ -774,5 +778,58 @@ mod tests {
         assert_eq!(crate::template::render("{{ task.name }}", &ctx), "triage");
         assert_eq!(crate::template::render("{{ input.issue_id }}", &ctx), "7");
         assert_eq!(crate::template::render("{{ prev.output }}", &ctx), "done");
+    }
+
+    #[tokio::test]
+    async fn unavailable_agent_fails_with_clear_error() {
+        let dir = std::env::temp_dir().join(format!("favetto-executor-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = crate::db::open(&dir.join("test.db")).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+
+        let mut cfg = FavettoConfig::default();
+        cfg.agent.default = Some("opencode".to_string());
+        let registry = AgentRegistry::from_config_with(&cfg, &|_| false).unwrap();
+
+        let state = Arc::new(State::new(
+            pool,
+            EventBus::new(64),
+            Token::generate(),
+            WebhookSecrets {
+                github: None,
+                linear: None,
+            },
+            AgentManager::new(),
+            registry,
+            Arc::new(RwLock::new(cfg)),
+            dir.clone(),
+            dir.clone(),
+            Arc::new(RwLock::new(Vec::new())),
+            tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
+            Arc::new(RwLock::new(Vec::new())),
+        ));
+
+        let task = Task {
+            id: Uuid::new_v4(),
+            name: "oneshot".to_string(),
+            status: TaskStatus::Running,
+            input: serde_json::json!({}),
+            output: None,
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+            session_id: None,
+            session_title: None,
+        };
+        let def = def_with_vars();
+        let err = run_agent_task(&state, &task, "opencode", &def, "prompt", Path::new("/tmp"))
+            .await
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("agent 'opencode' is not installed"), "{err}");
+        assert!(err.contains("not found on PATH"), "{err}");
     }
 }

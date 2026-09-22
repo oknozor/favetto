@@ -226,14 +226,23 @@ fn draw_wizard(
         ]));
     } else {
         let start = wizard.selected.saturating_sub(WIZARD_VISIBLE - 1);
-        for (idx, (label, _)) in wizard
+        for (idx, (label, value)) in wizard
             .choices
             .iter()
             .enumerate()
             .skip(start)
             .take(WIZARD_VISIBLE)
         {
-            let style = if idx == wizard.selected {
+            let unavailable =
+                wizard.step == WizardStep::Agent && wizard.available.get(value) == Some(&false);
+            let label = if unavailable {
+                format!("{label} (not installed)")
+            } else {
+                label.clone()
+            };
+            let style = if unavailable {
+                Style::default().fg(theme.muted).add_modifier(Modifier::DIM)
+            } else if idx == wizard.selected {
                 theme.selected()
             } else {
                 Style::default()
@@ -1219,6 +1228,7 @@ mod tests {
                     providers: Vec::new(),
                     capabilities: AgentCapabilities::default(),
                     agent_caps: BTreeMap::new(),
+                    available: BTreeMap::new(),
                     agent: None,
                     provider: None,
                     model: None,
@@ -1233,6 +1243,7 @@ mod tests {
                     providers: Vec::new(),
                     capabilities: AgentCapabilities::default(),
                     agent_caps: BTreeMap::new(),
+                    available: BTreeMap::new(),
                     agent: Some("opencode".to_string()),
                     provider: None,
                     model: None,
@@ -1266,6 +1277,38 @@ mod tests {
                 terminal.draw(|f| draw(f, &mut app)).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn wizard_marks_unavailable_agent() {
+        let mut app = App::new();
+        app.popup = Popup::Wizard(Wizard {
+            step: WizardStep::Agent,
+            selected: 0,
+            choices: vec![
+                ("opencode".to_string(), "opencode".to_string()),
+                ("claude".to_string(), "claude".to_string()),
+            ],
+            providers: Vec::new(),
+            capabilities: AgentCapabilities::default(),
+            agent_caps: BTreeMap::new(),
+            available: BTreeMap::from([
+                ("opencode".to_string(), true),
+                ("claude".to_string(), false),
+            ]),
+            agent: None,
+            provider: None,
+            model: None,
+            dir: String::new(),
+            loading: false,
+            error: None,
+        });
+
+        let text = render_text(&mut app, 100, 40);
+        assert!(
+            text.contains("claude (not installed)"),
+            "unavailable marker missing: {text:?}"
+        );
     }
 
     #[test]

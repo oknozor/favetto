@@ -214,6 +214,7 @@ impl ConfigurableAgent {
             id: name.to_string(),
             name: name.to_string(),
             command: config.command.clone(),
+            available: true,
             capabilities,
         };
         Self {
@@ -241,6 +242,10 @@ impl Agent for ConfigurableAgent {
 
     fn session_id_probe(&self) -> Option<SessionIdProbe> {
         self.template.probe.clone()
+    }
+
+    fn set_available(&mut self, available: bool) {
+        self.template.descriptor.available = available;
     }
 
     fn parse_output(&self, raw: &str, exit_code: Option<i32>) -> super::agent::AgentRunResult {

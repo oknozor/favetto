@@ -173,12 +173,49 @@ pub struct Wizard {
     pub capabilities: AgentCapabilities,
     /// Agent name → capabilities, so a selection can skip steps.
     pub agent_caps: BTreeMap<String, AgentCapabilities>,
+    /// Agent name → whether its executable was found on the daemon's PATH.
+    pub available: BTreeMap<String, bool>,
     pub agent: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub dir: String,
     pub loading: bool,
     pub error: Option<String>,
+}
+
+impl Wizard {
+    /// Move the selection one row in `forward` (Down) or backward (Up) order,
+    /// skipping choices marked unavailable. Stays put when there is no
+    /// selectable choice further in that direction.
+    fn move_selection(&mut self, forward: bool) {
+        let len = self.choices.len();
+        if len == 0 {
+            return;
+        }
+        let mut idx = self.selected;
+        loop {
+            if forward {
+                if idx + 1 >= len {
+                    return;
+                }
+                idx += 1;
+            } else {
+                if idx == 0 {
+                    return;
+                }
+                idx -= 1;
+            }
+            let available = self
+                .available
+                .get(&self.choices[idx].1)
+                .copied()
+                .unwrap_or(true);
+            if available {
+                self.selected = idx;
+                return;
+            }
+        }
+    }
 }
 
 /// State for the floating form that collects a catalog task's `[[vars]]`.
@@ -990,6 +1027,10 @@ impl App {
             .iter()
             .map(|a| (a.name.clone(), a.capabilities))
             .collect();
+        let available: BTreeMap<String, bool> = agents
+            .iter()
+            .map(|a| (a.name.clone(), a.available))
+            .collect();
         self.popup = Popup::Wizard(Wizard {
             step: WizardStep::Agent,
             selected: 0,
@@ -997,6 +1038,7 @@ impl App {
             providers: Vec::new(),
             capabilities: AgentCapabilities::default(),
             agent_caps,
+            available,
             agent: None,
             provider: None,
             model: None,
@@ -1058,11 +1100,17 @@ impl App {
 
         let action = match key.code {
             KeyCode::Up => {
-                w.selected = w.selected.saturating_sub(1);
+                if w.step == WizardStep::Agent {
+                    w.move_selection(false);
+                } else {
+                    w.selected = w.selected.saturating_sub(1);
+                }
                 UiAction::None
             }
             KeyCode::Down => {
-                if !w.choices.is_empty() {
+                if w.step == WizardStep::Agent {
+                    w.move_selection(true);
+                } else if !w.choices.is_empty() {
                     w.selected = (w.selected + 1).min(w.choices.len() - 1);
                 }
                 UiAction::None
@@ -1078,18 +1126,23 @@ impl App {
             KeyCode::Enter if !w.loading => match w.step {
                 WizardStep::Agent => match w.choices.get(w.selected).cloned() {
                     Some((_, name)) => {
-                        w.agent = Some(name.clone());
-                        w.capabilities = w.agent_caps.get(&name).copied().unwrap_or_default();
-                        w.error = None;
-                        w.choices.clear();
-                        if !w.capabilities.providers {
-                            // No provider catalog: skip straight to the directory.
-                            w.step = WizardStep::Dir;
-                            w.selected = 0;
+                        if w.available.get(&name) == Some(&false) {
+                            w.error = Some(format!("agent '{name}' is not installed"));
                             UiAction::None
                         } else {
-                            w.loading = true;
-                            UiAction::WizardLoadProviders
+                            w.agent = Some(name.clone());
+                            w.capabilities = w.agent_caps.get(&name).copied().unwrap_or_default();
+                            w.error = None;
+                            w.choices.clear();
+                            if !w.capabilities.providers {
+                                // No provider catalog: skip straight to the directory.
+                                w.step = WizardStep::Dir;
+                                w.selected = 0;
+                                UiAction::None
+                            } else {
+                                w.loading = true;
+                                UiAction::WizardLoadProviders
+                            }
                         }
                     }
                     None => UiAction::None,
@@ -2307,6 +2360,7 @@ mod tests {
             display_name: name.to_string(),
             command: "opencode".to_string(),
             default: false,
+            available: true,
             capabilities: AgentCapabilities {
                 interactive: true,
                 providers: true,
@@ -2326,6 +2380,7 @@ mod tests {
             display_name: "Pi".to_string(),
             command: "pi".to_string(),
             default: false,
+            available: true,
             capabilities: AgentCapabilities {
                 interactive: true,
                 ..Default::default()
@@ -3000,5 +3055,55 @@ mod tests {
             w.loading = false;
         }
         assert!(!app.needs_animation());
+    }
+
+    #[test]
+    fn wizard_lists_unavailable_agent_but_skips_it() {
+        let mut app = App::new();
+        let mut unavailable = agent_entry("claude");
+        unavailable.available = false;
+        app.open_wizard(vec![agent_entry("opencode"), unavailable]);
+
+        {
+            let Popup::Wizard(w) = &app.popup else {
+                panic!("wizard")
+            };
+            assert_eq!(
+                w.choices,
+                vec![
+                    ("opencode".to_string(), "opencode".to_string()),
+                    ("claude".to_string(), "claude".to_string()),
+                ]
+            );
+            assert_eq!(w.available.get("claude"), Some(&false));
+            assert_eq!(w.available.get("opencode"), Some(&true));
+            assert_eq!(w.selected, 0);
+        }
+
+        // Down skips the unavailable `claude` entry and stays on `opencode`.
+        app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+        {
+            let Popup::Wizard(w) = &app.popup else {
+                panic!("wizard")
+            };
+            assert_eq!(w.selected, 0);
+        }
+
+        // Even a forced selection on the unavailable entry cannot be entered.
+        if let Popup::Wizard(w) = &mut app.popup {
+            w.selected = 1;
+        }
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())),
+            UiAction::None
+        ));
+        {
+            let Popup::Wizard(w) = &app.popup else {
+                panic!("wizard")
+            };
+            assert!(w.agent.is_none());
+            assert_eq!(w.step, WizardStep::Agent);
+            assert!(w.error.is_some());
+        }
     }
 }

@@ -29,6 +29,7 @@ impl PiAgent {
             id: name.to_string(),
             name: "Pi".to_string(),
             command: config.command.clone(),
+            available: true,
             capabilities,
         };
         Self {
@@ -52,6 +53,10 @@ impl Agent for PiAgent {
         ctx: &AgentContext,
     ) -> anyhow::Result<CommandSpec> {
         self.template.command(invocation, ctx)
+    }
+
+    fn set_available(&mut self, available: bool) {
+        self.template.descriptor.available = available;
     }
 }
 

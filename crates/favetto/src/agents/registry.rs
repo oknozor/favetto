@@ -1,15 +1,19 @@
 //! The configured-agent registry.
 //!
-//! Maps every `[agents.<name>]` entry to an implementation. The optional
-//! `type = "…"` discriminator selects a built-in explicitly; without it, an
-//! entry whose name is a built-in (`opencode`, `claude`, `pi`, `vibe`) uses that
-//! built-in, and anything else is a template-only
-//! [`ConfigurableAgent`](super::configurable::ConfigurableAgent).
+//! The four compiled-in agents (`opencode`, `claude`, `pi`, `vibe`) are always
+//! registered as a baseline, so an empty/default config still exposes them.
+//! `[agents.<name>]` entries are an overlay: the optional `type = "…"`
+//! discriminator selects a built-in explicitly; without it, an entry whose name
+//! is a built-in uses that built-in, and anything else is a template-only
+//! [`ConfigurableAgent`](super::configurable::ConfigurableAgent). Each agent's
+//! availability is probed once, at registry build.
 
 use std::collections::BTreeMap;
+use std::env;
+use std::path::Path;
 use std::sync::Arc;
 
-use crate::config::FavettoConfig;
+use crate::config::{AgentConfig, FavettoConfig};
 
 use super::agent::{Agent, AgentDescriptor};
 use super::claude::ClaudeAgent;
@@ -18,44 +22,111 @@ use super::opencode::OpenCodeAgent;
 use super::pi::PiAgent;
 use super::vibe::VibeAgent;
 
+/// The compiled-in agents, always registered unless their name is overridden by
+/// a `[agents.<name>]` entry.
+const BUILT_IN_AGENTS: [&str; 4] = ["opencode", "claude", "pi", "vibe"];
+
+/// Whether `command` names a runnable executable: an executable file when it
+/// contains a path separator (absolute or relative), else a `PATH` lookup.
+pub fn command_available(command: &str) -> bool {
+    let command = command.trim();
+    if command.is_empty() {
+        return false;
+    }
+    let path = Path::new(command);
+    if path.components().count() > 1 {
+        return is_executable(path);
+    }
+    let Some(paths) = env::var_os("PATH") else {
+        return false;
+    };
+    env::split_paths(&paths).any(|dir| is_executable(&dir.join(command)))
+}
+
+/// Whether `path` is a file the current user may execute.
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+/// Build one agent from its `[agents.<name>]` entry (or a built-in's defaults).
+fn build_agent(name: &str, agent_config: &AgentConfig) -> anyhow::Result<Box<dyn Agent>> {
+    let agent: Box<dyn Agent> = match agent_config.agent_type.as_deref() {
+        Some("configurable") => Box::new(ConfigurableAgent::from_config(name, agent_config)),
+        Some("opencode") => Box::new(OpenCodeAgent::from_config(name, agent_config)),
+        Some("claude") => Box::new(ClaudeAgent::from_config(name, agent_config)),
+        Some("pi") => Box::new(PiAgent::from_config(name, agent_config)),
+        Some("vibe") => Box::new(VibeAgent::from_config(name, agent_config)),
+        Some(other) => anyhow::bail!(
+            "agent '{name}': unknown type '{other}' (known types: opencode, claude, \
+             pi, vibe, configurable)"
+        ),
+        None => match name {
+            "opencode" => Box::new(OpenCodeAgent::from_config(name, agent_config)),
+            "claude" => Box::new(ClaudeAgent::from_config(name, agent_config)),
+            "pi" => Box::new(PiAgent::from_config(name, agent_config)),
+            "vibe" => Box::new(VibeAgent::from_config(name, agent_config)),
+            _ => Box::new(ConfigurableAgent::from_config(name, agent_config)),
+        },
+    };
+    Ok(agent)
+}
+
 /// Every configured agent, keyed by its `[agents.*]` name.
-#[derive(Default)]
 pub struct AgentRegistry {
     default: Option<String>,
     agents: BTreeMap<String, Arc<dyn Agent>>,
 }
 
+impl Default for AgentRegistry {
+    fn default() -> Self {
+        Self::from_config(&FavettoConfig::default()).expect("built-in-only registry always builds")
+    }
+}
+
 impl AgentRegistry {
-    /// Build the registry from a loaded config. Unknown `type` values are an
-    /// error so a typo fails at daemon startup rather than at launch time.
+    /// Build the registry from a loaded config, probing the host `PATH` for each
+    /// agent's executable. Unknown `type` values are an error so a typo fails at
+    /// daemon startup rather than at launch time.
     ///
     /// The registry is built once: the daemon never rewrites the config today. If
     /// the config becomes hot-reloadable, rebuild it then.
     pub fn from_config(config: &FavettoConfig) -> anyhow::Result<Self> {
+        Self::from_config_with(config, &command_available)
+    }
+
+    /// Like [`Self::from_config`], but with an injectable availability probe.
+    /// `probe` decides whether an agent's `command` is runnable (used by tests
+    /// so results do not depend on the host's installed CLIs).
+    pub fn from_config_with(
+        config: &FavettoConfig,
+        probe: &dyn Fn(&str) -> bool,
+    ) -> anyhow::Result<Self> {
         let mut agents: BTreeMap<String, Arc<dyn Agent>> = BTreeMap::new();
-        for (name, agent_config) in &config.agents {
-            let agent: Arc<dyn Agent> = match agent_config.agent_type.as_deref() {
-                Some("configurable") => {
-                    Arc::new(ConfigurableAgent::from_config(name, agent_config))
-                }
-                Some("opencode") => Arc::new(OpenCodeAgent::from_config(name, agent_config)),
-                Some("claude") => Arc::new(ClaudeAgent::from_config(name, agent_config)),
-                Some("pi") => Arc::new(PiAgent::from_config(name, agent_config)),
-                Some("vibe") => Arc::new(VibeAgent::from_config(name, agent_config)),
-                Some(other) => anyhow::bail!(
-                    "agent '{name}': unknown type '{other}' (known types: opencode, claude, \
-                     pi, vibe, configurable)"
-                ),
-                None => match name.as_str() {
-                    "opencode" => Arc::new(OpenCodeAgent::from_config(name, agent_config)),
-                    "claude" => Arc::new(ClaudeAgent::from_config(name, agent_config)),
-                    "pi" => Arc::new(PiAgent::from_config(name, agent_config)),
-                    "vibe" => Arc::new(VibeAgent::from_config(name, agent_config)),
-                    _ => Arc::new(ConfigurableAgent::from_config(name, agent_config)),
-                },
-            };
-            agents.insert(name.clone(), agent);
+
+        // Seed the compiled-in agents first; a `[agents.<name>]` entry overlays
+        // the matching built-in below.
+        for name in BUILT_IN_AGENTS {
+            if !config.agents.contains_key(name) {
+                let agent = build_agent(name, &AgentConfig::default())?;
+                insert_agent(&mut agents, name, agent, probe);
+            }
         }
+
+        for (name, agent_config) in &config.agents {
+            let agent = build_agent(name, agent_config)?;
+            insert_agent(&mut agents, name, agent, probe);
+        }
+
         Ok(Self {
             default: config.agent.default.clone(),
             agents,
@@ -65,6 +136,21 @@ impl AgentRegistry {
     /// The agent configured under `name`, if any.
     pub fn get(&self, name: &str) -> Option<Arc<dyn Agent>> {
         self.agents.get(name).cloned()
+    }
+
+    /// The agent configured under `name`, erroring if it is unknown or its
+    /// executable is not on the daemon's `PATH`.
+    pub fn get_checked(&self, name: &str) -> anyhow::Result<Arc<dyn Agent>> {
+        let agent = self
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("agent '{name}' is not configured under [agents.*]"))?;
+        if !agent.descriptor().available {
+            let command = &agent.descriptor().command;
+            anyhow::bail!(
+                "agent '{name}' is not installed (command '{command}' not found on PATH)"
+            );
+        }
+        Ok(agent)
     }
 
     /// The configured default agent, if it resolves to an entry.
@@ -79,6 +165,18 @@ impl AgentRegistry {
             .map(|agent| agent.descriptor())
             .collect()
     }
+}
+
+/// Probe, stamp and insert one built agent.
+fn insert_agent(
+    agents: &mut BTreeMap<String, Arc<dyn Agent>>,
+    name: &str,
+    mut agent: Box<dyn Agent>,
+    probe: &dyn Fn(&str) -> bool,
+) {
+    let available = probe(agent.descriptor().command.as_str());
+    agent.set_available(available);
+    agents.insert(name.to_string(), Arc::from(agent));
 }
 
 #[cfg(test)]
@@ -218,10 +316,100 @@ mod tests {
             .iter()
             .map(|d| d.id.as_str())
             .collect();
-        assert_eq!(names, vec!["opencode", "vibe"]);
+        // The built-ins are always seeded, so the configured entries join them.
+        assert_eq!(names, vec!["claude", "opencode", "pi", "vibe"]);
         assert_eq!(
             registry.default_agent().map(|a| a.descriptor().id.clone()),
             Some("opencode".to_string())
         );
+    }
+
+    #[test]
+    fn empty_config_registers_all_four_built_ins() {
+        let registry =
+            AgentRegistry::from_config_with(&FavettoConfig::default(), &|_| true).unwrap();
+        let names: Vec<&str> = registry
+            .descriptors()
+            .iter()
+            .map(|d| d.id.as_str())
+            .collect();
+        assert_eq!(names, vec!["claude", "opencode", "pi", "vibe"]);
+
+        let opencode = registry.get("opencode").unwrap();
+        assert_eq!(opencode.descriptor().name, "OpenCode");
+        assert!(opencode.capabilities().providers);
+    }
+
+    #[test]
+    fn config_entry_overlays_built_in() {
+        let cfg = config_with(
+            "opencode",
+            AgentConfig {
+                command: "myoc".to_string(),
+                ..Default::default()
+            },
+        );
+        let registry = AgentRegistry::from_config_with(&cfg, &|_| true).unwrap();
+        let agent = registry.get("opencode").unwrap();
+        // The OpenCode implementation is retained; only its invocation is overridden.
+        assert_eq!(agent.descriptor().command, "myoc");
+        assert!(agent.capabilities().providers);
+    }
+
+    #[test]
+    fn injected_probe_sets_available_per_agent() {
+        let registry =
+            AgentRegistry::from_config_with(&FavettoConfig::default(), &|cmd| cmd == "opencode")
+                .unwrap();
+        let flags: Vec<(&str, bool)> = registry
+            .descriptors()
+            .iter()
+            .map(|d| (d.id.as_str(), d.available))
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                ("claude", false),
+                ("opencode", true),
+                ("pi", false),
+                ("vibe", false)
+            ]
+        );
+    }
+
+    #[test]
+    fn get_checked_rejects_unavailable() {
+        let registry =
+            AgentRegistry::from_config_with(&FavettoConfig::default(), &|cmd| cmd == "opencode")
+                .unwrap();
+        let err = registry
+            .get_checked("claude")
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not installed"), "{err}");
+        assert!(err.contains("command 'claude'"), "{err}");
+        assert!(registry.get_checked("opencode").is_ok());
+    }
+
+    #[test]
+    fn get_checked_rejects_unknown() {
+        let registry =
+            AgentRegistry::from_config_with(&FavettoConfig::default(), &|_| true).unwrap();
+        let err = registry
+            .get_checked("nope")
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not configured under [agents.*]"), "{err}");
+    }
+
+    #[test]
+    fn command_available_checks_absolute_paths() {
+        assert!(!command_available(""));
+        assert!(!command_available("   "));
+        assert!(!command_available("/nonexistent/favetto-nope"));
+        let current = std::env::current_exe().unwrap();
+        assert!(command_available(&current.to_string_lossy()));
     }
 }

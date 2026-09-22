@@ -31,6 +31,9 @@ pub struct AgentDescriptor {
     pub name: String,
     /// Resolved executable.
     pub command: String,
+    /// Whether the executable was found on the daemon's PATH. The registry
+    /// overwrites this after construction via [`Agent::set_available`].
+    pub available: bool,
     /// What the agent can do.
     pub capabilities: AgentCapabilities,
 }
@@ -139,6 +142,10 @@ pub trait Agent: Send + Sync {
     fn capabilities(&self) -> AgentCapabilities {
         self.descriptor().capabilities
     }
+
+    /// Record whether the executable was found on PATH. Implementations that own
+    /// an `AgentDescriptor` override this; the default is a no-op.
+    fn set_available(&mut self, _available: bool) {}
 
     /// Build the command to spawn for `invocation`.
     fn command(
