@@ -2,7 +2,7 @@ agent = "opencode"
 provider = "deepseek"  
 model = "deepseek-v4-flash" 
 cwd = "/code/che"
-spawn = "plan_favetto_issue"
+spawn = "favetto/plan_issue"
 spawn_file = ".favetto/triage/{{ task.id }}/manifest.json"
 ---
 
