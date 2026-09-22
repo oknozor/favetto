@@ -166,6 +166,13 @@ pub trait Agent: Send + Sync {
         None
     }
 
+    /// Whether [`Self::session_title`] can ever return a title. Defaults to
+    /// `false`, so callers can skip the retry/backfill loop entirely for agents
+    /// (claude, pi, vibe, custom) that never have titles.
+    fn has_session_titles(&self) -> bool {
+        false
+    }
+
     /// Parse a finished run's raw output.
     fn parse_output(&self, raw: &str, exit_code: Option<i32>) -> AgentRunResult {
         AgentRunResult {
@@ -238,6 +245,46 @@ pub(crate) fn extract_session_id_from_line(line: &str, probe: &SessionIdProbe) -
 pub(crate) fn extract_session_id_from_lines(raw: &str, probe: &SessionIdProbe) -> Option<String> {
     raw.lines()
         .find_map(|line| extract_session_id_from_line(line, probe))
+}
+
+/// Poll policy for [`resolve_session_title`]: opencode writes the title a few
+/// seconds after the first turn, so poll once a second for up to ~20 s.
+pub(crate) const TITLE_POLL_ATTEMPTS: u32 = 20;
+pub(crate) const TITLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// Resolve an agent session's title, re-polling while the CLI may still be
+/// generating it. Returns `None` immediately for agents without a title
+/// source, and `None` after `attempts` polls if no title appears. The blocking
+/// CLI lookup runs off the async runtime.
+pub(crate) async fn resolve_session_title(
+    agent: Arc<dyn Agent>,
+    session_id: &str,
+    cwd: &Path,
+    attempts: u32,
+    interval: std::time::Duration,
+) -> Option<String> {
+    if !agent.has_session_titles() || session_id.is_empty() {
+        return None;
+    }
+    let attempts = attempts.max(1);
+    for attempt in 0..attempts {
+        let agent = agent.clone();
+        let sid = session_id.to_string();
+        let cwd = cwd.to_path_buf();
+        let title = tokio::task::spawn_blocking(move || agent.session_title(&sid, &cwd))
+            .await
+            .ok()
+            .flatten()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        if title.is_some() {
+            return title;
+        }
+        if attempt + 1 < attempts {
+            tokio::time::sleep(interval).await;
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -339,5 +386,98 @@ mod tests {
         assert!(Dummy
             .session_title("ses_1", std::path::Path::new("/tmp"))
             .is_none());
+        assert!(!Dummy.has_session_titles());
+    }
+
+    /// A title-capable fixture: returns `"Late title"` once `fail_first` lookups
+    /// have already failed, counting every lookup.
+    struct TitleAgent {
+        descriptor: AgentDescriptor,
+        calls: std::sync::atomic::AtomicU32,
+        fail_first: u32,
+        has_titles: bool,
+    }
+
+    impl Agent for TitleAgent {
+        fn descriptor(&self) -> &AgentDescriptor {
+            &self.descriptor
+        }
+
+        fn command(&self, _: &Invocation<'_>, _: &AgentContext) -> anyhow::Result<CommandSpec> {
+            unimplemented!()
+        }
+
+        fn has_session_titles(&self) -> bool {
+            self.has_titles
+        }
+
+        fn session_title(&self, _sid: &str, _cwd: &Path) -> Option<String> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (n >= self.fail_first).then(|| "Late title".to_string())
+        }
+    }
+
+    fn title_agent(has_titles: bool, fail_first: u32) -> Arc<TitleAgent> {
+        Arc::new(TitleAgent {
+            descriptor: AgentDescriptor {
+                id: "title".to_string(),
+                name: "Title".to_string(),
+                command: "true".to_string(),
+                available: true,
+                capabilities: AgentCapabilities::default(),
+            },
+            calls: std::sync::atomic::AtomicU32::new(0),
+            fail_first,
+            has_titles,
+        })
+    }
+
+    #[tokio::test]
+    async fn resolve_session_title_retries_until_available() {
+        let agent = title_agent(true, 2);
+        let title = resolve_session_title(
+            agent.clone(),
+            "ses_1",
+            Path::new("/tmp"),
+            5,
+            Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(title.as_deref(), Some("Late title"));
+        assert_eq!(
+            agent.calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "should stop polling as soon as a title appears"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_session_title_gives_up_after_attempts() {
+        let agent = title_agent(true, 99);
+        let title = resolve_session_title(
+            agent.clone(),
+            "ses_1",
+            Path::new("/tmp"),
+            3,
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(title.is_none());
+        assert_eq!(agent.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn resolve_session_title_skips_agents_without_titles() {
+        let agent = title_agent(false, 0);
+        let title = resolve_session_title(
+            agent.clone(),
+            "ses_1",
+            Path::new("/tmp"),
+            5,
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(title.is_none());
+        assert_eq!(agent.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

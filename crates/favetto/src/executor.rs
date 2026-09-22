@@ -22,11 +22,48 @@ use uuid::Uuid;
 
 use favetto_core::model::{Event, EventKind, Task, TaskStatus};
 
+use crate::agents::{resolve_session_title, Agent, TITLE_POLL_ATTEMPTS, TITLE_POLL_INTERVAL};
 use crate::config::ExecutorSettings;
 use crate::db;
 use crate::event_bus::ServerPush;
 use crate::state::State;
 use crate::tasks::TaskDef;
+
+/// The result of an agent run. `error` is `Some` for a non-zero exit or a
+/// missing session; `session_id`/`session_title` are carried either way so a
+/// failed run keeps its reattach handle and its title.
+struct RunOutcome {
+    output: serde_json::Value,
+    session_id: Option<String>,
+    session_title: Option<String>,
+    error: Option<String>,
+}
+
+/// Fold a finished (or failed-to-start) agent run onto the task row. Returns
+/// whether the run succeeded. Session info is assigned on both arms.
+fn record_run_outcome(task: &mut Task, outcome: anyhow::Result<RunOutcome>) -> bool {
+    match outcome {
+        Ok(run) => {
+            task.session_id = run.session_id;
+            task.session_title = run.session_title;
+            if let Some(err) = run.error {
+                task.status = TaskStatus::Failed;
+                task.error = Some(err);
+                false
+            } else {
+                task.status = TaskStatus::Succeeded;
+                task.output = Some(run.output);
+                task.error = None;
+                true
+            }
+        }
+        Err(e) => {
+            task.status = TaskStatus::Failed;
+            task.error = Some(e.to_string());
+            false
+        }
+    }
+}
 
 /// Spawn the dispatcher and the dependency listener.
 pub fn spawn(state: Arc<State>) -> tokio::task::JoinHandle<()> {
@@ -196,10 +233,8 @@ async fn run_one(
     let prompt = crate::template::render(&def.prompt, &context);
 
     let agent_name = def.agent.clone().or_else(|| config.agent.default.clone());
-    let outcome = match agent_name {
-        Some(agent_name) => {
-            run_agent_task(state, &task, &agent_name, &def, &prompt, &plan.cwd).await
-        }
+    let outcome = match agent_name.as_deref() {
+        Some(name) => run_agent_task(state, &task, name, &def, &prompt, &plan.cwd).await,
         None => Err(anyhow::anyhow!(
             "task '{}' has no agent: set `agent` in the task or `[agent].default` in the config",
             def.name
@@ -214,24 +249,32 @@ async fn run_one(
         }
     }
 
-    let success = outcome.is_ok();
-    match outcome {
-        Ok((output, session_id, session_title)) => {
-            task.status = TaskStatus::Succeeded;
-            task.output = Some(output);
-            task.session_id = session_id;
-            task.session_title = session_title;
-            task.error = None;
-        }
-        Err(e) => {
-            task.status = TaskStatus::Failed;
-            task.error = Some(e.to_string());
-        }
-    }
+    let success = record_run_outcome(&mut task, outcome);
     task.finished_at = Some(Utc::now());
 
     let _ = db::upsert_task(&state.db, &task).await;
     state.bus.publish(ServerPush::TaskUpdated(task.clone()));
+
+    // If the CLI had not written the title yet, keep polling in the background and
+    // push the update when it appears, so an open TUI fills the cell live.
+    if task.session_id.is_some() && task.session_title.is_none() {
+        let worktree_removed = plan.worktree.is_some() && !config.executor.keep_worktree;
+        let backfill_cwd = if worktree_removed {
+            plan.worktree
+                .as_ref()
+                .map(|w| w.repo.clone())
+                .unwrap_or_else(|| plan.cwd.clone())
+        } else {
+            plan.cwd.clone()
+        };
+        if let Some(agent) = agent_name.as_deref().and_then(|n| state.registry.get(n)) {
+            if agent.has_session_titles() {
+                if let Some(sid) = task.session_id.clone() {
+                    spawn_title_backfill(state.clone(), task.id, agent, sid, backfill_cwd);
+                }
+            }
+        }
+    }
 
     let kind = if success {
         EventKind::TaskCompleted
@@ -325,8 +368,8 @@ async fn spawn_from_manifest(
 
 /// Run a task through its configured external agent as a real PTY session bound
 /// to the task, so it can be reattached from the TUI and its output captured.
-/// Returns the produced output, the agent's own session id, and its session
-/// title (all optional but the output), if captured.
+/// Returns the produced output plus the agent's own session id and its session
+/// title (both optional), even when the run failed.
 async fn run_agent_task(
     state: &Arc<State>,
     task: &Task,
@@ -334,7 +377,7 @@ async fn run_agent_task(
     def: &TaskDef,
     prompt: &str,
     cwd: &Path,
-) -> anyhow::Result<(serde_json::Value, Option<String>, Option<String>)> {
+) -> anyhow::Result<RunOutcome> {
     let agent = state.registry.get_checked(agent_name)?;
 
     let ctx = crate::agents::AgentContext {
@@ -367,15 +410,19 @@ async fn run_agent_task(
     if result.session_id.is_none() {
         result.session_id = state.agents.external_session_id(&info.id);
     }
-    // Resolve the title synchronously (a subprocess in most CLIs) off the async
-    // runtime; a failure or an agent without titles degrades to `None`.
+    // Resolve the title with a bounded retry (a subprocess lookup in most CLIs)
+    // before the worktree is torn down; a failure or an agent without titles
+    // degrades to `None`.
     let session_title = match result.session_id.clone() {
         Some(sid) => {
-            let agent = agent.clone();
-            let cwd = cwd.to_path_buf();
-            tokio::task::spawn_blocking(move || agent.session_title(&sid, &cwd))
-                .await
-                .unwrap_or(None)
+            resolve_session_title(
+                agent.clone(),
+                &sid,
+                cwd,
+                TITLE_POLL_ATTEMPTS,
+                TITLE_POLL_INTERVAL,
+            )
+            .await
         }
         None => None,
     };
@@ -386,20 +433,76 @@ async fn run_agent_task(
     if result.session_id.is_some() && agent.capabilities().resume {
         let _ = state.agents.close(&info.id);
     }
-    match result.exit_code {
-        Some(0) => Ok((
-            serde_json::json!({
-                "output": result.raw,
-                "agent": agent_name,
-                "session_id": result.session_id,
-                "session_title": session_title,
-                "result": result.output,
-            }),
-            result.session_id,
-            session_title,
-        )),
-        Some(c) => anyhow::bail!("agent '{agent_name}' exited with {c}:\n{raw}"),
-        None => anyhow::bail!("agent '{agent_name}' session disappeared"),
+    let output = serde_json::json!({
+        "output": result.raw,
+        "agent": agent_name,
+        "session_id": result.session_id,
+        "session_title": session_title,
+        "result": result.output,
+    });
+    let error = match result.exit_code {
+        Some(0) => None,
+        Some(c) => Some(format!("agent '{agent_name}' exited with {c}:\n{raw}")),
+        None => Some(format!("agent '{agent_name}' session disappeared")),
+    };
+    Ok(RunOutcome {
+        output,
+        session_id: result.session_id,
+        session_title,
+        error,
+    })
+}
+
+/// Background title poll window (after the synchronous poll gave up): ~60 s.
+const BACKFILL_ATTEMPTS: u32 = 30;
+const BACKFILL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Poll for a missing session title in the background and persist the first one
+/// that appears, publishing a `TaskUpdated` so an open TUI fills the cell live.
+fn spawn_title_backfill(
+    state: Arc<State>,
+    task_id: Uuid,
+    agent: Arc<dyn Agent>,
+    session_id: String,
+    cwd: PathBuf,
+) {
+    tokio::spawn(async move {
+        backfill_title(
+            &state,
+            task_id,
+            agent,
+            session_id,
+            cwd,
+            BACKFILL_ATTEMPTS,
+            BACKFILL_INTERVAL,
+        )
+        .await;
+    });
+}
+
+/// The body of [`spawn_title_backfill`], split out so it can be awaited in tests.
+async fn backfill_title(
+    state: &Arc<State>,
+    task_id: Uuid,
+    agent: Arc<dyn Agent>,
+    session_id: String,
+    cwd: PathBuf,
+    attempts: u32,
+    interval: Duration,
+) {
+    let Some(title) = resolve_session_title(agent, &session_id, &cwd, attempts, interval).await
+    else {
+        return;
+    };
+    let Ok(Some(mut task)) = db::get_task(&state.db, task_id).await else {
+        return;
+    };
+    if task.session_title.is_some() {
+        return; // another path won the race
+    }
+    task.session_title = Some(title);
+    if db::upsert_task(&state.db, &task).await.is_ok() {
+        state.bus.publish(ServerPush::TaskUpdated(task));
     }
 }
 
@@ -834,6 +937,179 @@ mod tests {
             .to_string();
         assert!(err.contains("agent 'opencode' is not installed"), "{err}");
         assert!(err.contains("not found on PATH"), "{err}");
+    }
+
+    fn task_with_session(session_id: Option<&str>, session_title: Option<&str>) -> Task {
+        Task {
+            id: Uuid::new_v4(),
+            name: "t".to_string(),
+            status: TaskStatus::Running,
+            input: serde_json::json!({}),
+            output: None,
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+            session_id: session_id.map(str::to_string),
+            session_title: session_title.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn failed_run_preserves_session_info() {
+        let mut task = task_with_session(None, None);
+        let success = record_run_outcome(
+            &mut task,
+            Ok(RunOutcome {
+                output: serde_json::json!({}),
+                session_id: Some("ses_1".to_string()),
+                session_title: Some("Fix the widget".to_string()),
+                error: Some("exit 1".to_string()),
+            }),
+        );
+        assert!(!success);
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.session_id.as_deref(), Some("ses_1"));
+        assert_eq!(task.session_title.as_deref(), Some("Fix the widget"));
+        assert!(task.error.as_deref().unwrap().contains("exit 1"));
+        assert!(task.output.is_none());
+    }
+
+    #[test]
+    fn successful_run_records_output_and_session() {
+        let mut task = task_with_session(None, None);
+        task.error = Some("stale".to_string());
+        let success = record_run_outcome(
+            &mut task,
+            Ok(RunOutcome {
+                output: serde_json::json!({ "ok": true }),
+                session_id: Some("ses_1".to_string()),
+                session_title: Some("Fix the widget".to_string()),
+                error: None,
+            }),
+        );
+        assert!(success);
+        assert_eq!(task.status, TaskStatus::Succeeded);
+        assert_eq!(task.output, Some(serde_json::json!({ "ok": true })));
+        assert_eq!(task.session_id.as_deref(), Some("ses_1"));
+        assert_eq!(task.session_title.as_deref(), Some("Fix the widget"));
+        assert!(task.error.is_none());
+    }
+
+    #[test]
+    fn run_without_agent_still_fails() {
+        let mut task = task_with_session(Some("ses_keep"), Some("Keep"));
+        let success = record_run_outcome(&mut task, Err(anyhow::anyhow!("no agent")));
+        assert!(!success);
+        assert_eq!(task.status, TaskStatus::Failed);
+        // A pre-run failure never drops an already-resolved session.
+        assert_eq!(task.session_id.as_deref(), Some("ses_keep"));
+        assert_eq!(task.session_title.as_deref(), Some("Keep"));
+        assert!(task.error.as_deref().unwrap().contains("no agent"));
+    }
+
+    /// A fake `opencode session list --format json` executable that ignores its
+    /// arguments and prints `json`.
+    #[cfg(unix)]
+    fn session_list_script(dir: &Path, json: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("opencode-session-list.sh");
+        std::fs::write(&path, format!("#!/bin/sh\nprintf '%s' '{json}'\n")).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    /// A `State` whose `opencode` command is `command` (a title-lookup fixture).
+    #[cfg(unix)]
+    async fn title_state(dir: &Path, command: &Path) -> Arc<State> {
+        let pool = crate::db::open(&dir.join("test.db")).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        let mut cfg = FavettoConfig::default();
+        cfg.agent.default = Some("opencode".to_string());
+        cfg.agents.insert(
+            "opencode".to_string(),
+            crate::config::AgentConfig {
+                command: command.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+        );
+        let registry = AgentRegistry::from_config_with(&cfg, &|_| true).unwrap();
+        Arc::new(State::new(
+            pool,
+            EventBus::new(64),
+            Token::generate(),
+            WebhookSecrets {
+                github: None,
+                linear: None,
+            },
+            AgentManager::new(),
+            registry,
+            Arc::new(RwLock::new(cfg)),
+            dir.to_path_buf(),
+            dir.to_path_buf(),
+            Arc::new(RwLock::new(Vec::new())),
+            tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
+            Arc::new(RwLock::new(Vec::new())),
+        ))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backfill_title_fills_blank_session_title() {
+        let dir = std::env::temp_dir().join(format!("favetto-backfill-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = session_list_script(&dir, r#"[{"id":"ses_1","title":"One shot title"}]"#);
+        let state = title_state(&dir, &script).await;
+
+        let task = task_with_session(Some("ses_1"), None);
+        db::insert_task(&state.db, &task).await.unwrap();
+
+        let agent = state.registry.get("opencode").unwrap();
+        backfill_title(
+            &state,
+            task.id,
+            agent,
+            "ses_1".to_string(),
+            dir.clone(),
+            3,
+            Duration::from_millis(1),
+        )
+        .await;
+
+        let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+        assert_eq!(stored.session_title.as_deref(), Some("One shot title"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backfill_title_does_not_overwrite_existing_title() {
+        let dir = std::env::temp_dir().join(format!("favetto-backfill-keep-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = session_list_script(&dir, r#"[{"id":"ses_1","title":"One shot title"}]"#);
+        let state = title_state(&dir, &script).await;
+
+        let task = task_with_session(Some("ses_1"), Some("Existing"));
+        db::insert_task(&state.db, &task).await.unwrap();
+
+        let agent = state.registry.get("opencode").unwrap();
+        backfill_title(
+            &state,
+            task.id,
+            agent,
+            "ses_1".to_string(),
+            dir.clone(),
+            2,
+            Duration::from_millis(1),
+        )
+        .await;
+
+        let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+        assert_eq!(stored.session_title.as_deref(), Some("Existing"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -12,6 +12,14 @@ focus and mouse handling see [Embedded agents](./agents).
 
 *The Tasks tab: recent runs with status, age, and session title.*
 
+An opencode run writes its session title a few seconds after its first turn. The
+daemon resolves the title with a bounded retry when the run finishes, then keeps
+polling in the background and pushes the result, so the `SESSION` cell can fill in
+a few seconds later without restarting the TUI. A failed run keeps the session id
+and title it captured. One-shot tasks resolve their title the same way when the
+agent reports a session id. Agents that never expose titles (`claude`, `pi`,
+`vibe`, custom) show a blank cell and skip the retry.
+
 ## Keybindings
 
 Press **?** at any time to open the same reference as a floating overlay. `?` or
