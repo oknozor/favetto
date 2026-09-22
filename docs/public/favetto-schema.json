@@ -1,0 +1,527 @@
+{
+  "$defs": {
+    "AgentConfig": {
+      "description": "An external coding-agent CLI (opencode, Claude Code, pi, Mistral Vibe, …).\n\n`args` is the interactive invocation used by the embedded terminal panel.\n`prompt_args`, when present, is appended (with `{prompt}` substituted) so a\nsession can start with the task prompt. `headless_args` drives unattended\ncatalog-task runs; `{prompt}` is substituted there too. When a prompt is given\nbut no `prompt_args`/`headless_args` are configured, the prompt is written to\nthe process's stdin.\n\nModel selection uses `run_args` instead of `headless_args` when a task sets a\n`model`. Both support `{prompt}`, `{provider}`, and `{model}` placeholders, so\nthe flag can be placed where the CLI expects it (e.g. after a `run`\nsubcommand). `resume_args` is the interactive invocation for reopening a\npreviously run session and supports `{session_id}`. When `session_id_json_key`\nis set, the agent's session id is read from a run's line-delimited JSON output\nunder that key (e.g. `\"sessionID\"`) and stored on the task.",
+      "properties": {
+        "args": {
+          "default": [],
+          "description": "Interactive arguments.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "command": {
+          "description": "Executable to launch (looked up on `PATH`).",
+          "type": "string"
+        },
+        "cwd": {
+          "description": "Working directory (defaults to the daemon's cwd).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Extra environment variables for the process.",
+          "type": "object"
+        },
+        "git": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GitSettings"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Per-agent override of the global `[git]` section. Only the fields set\nhere replace the global values; the rest are inherited."
+        },
+        "headless_args": {
+          "description": "Arguments for unattended task runs without a `model`. `{prompt}` is substituted.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "interactive_model_args": {
+          "description": "Interactive arguments used when a model is selected (e.g. for a one-shot\nsession); `{provider}` and `{model}` are substituted. Lets an agent reach a\npath that accepts a model when its plain `args` do not.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "prompt_args": {
+          "description": "Arguments appended to the interactive command when starting with a prompt.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "resume_args": {
+          "description": "Interactive arguments for reopening an existing session; `{session_id}` is\nsubstituted.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "run_args": {
+          "description": "Arguments for unattended task runs with a `model`; `{prompt}`, `{provider}`,\nand `{model}` are substituted.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "session_id_json_key": {
+          "description": "Key under which a run's line-delimited JSON output carries the agent's\nsession id (e.g. `\"sessionID\"`). Unset disables capture.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "submit_prompt": {
+          "description": "After starting interactively with a prompt via `prompt_args`, send Enter to\nsubmit it once the agent's UI has settled (some agents, e.g. opencode,\nonly pre-fill the input with `--prompt`). `None` leaves the built-in\ndefault in place.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "type": {
+          "description": "Implementation discriminator: `opencode`, `claude`, `pi`, `vibe`, or\n`configurable`. Omit to use the built-in whose name matches the entry (or\nthe template-only fallback for a custom name).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "type": "object"
+    },
+    "AgentSettings": {
+      "properties": {
+        "default": {
+          "description": "Name of the default external agent (a key in `[agents.*]`). When set,\ncatalog tasks run through this agent unless a task names its own.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "DaemonSettings": {
+      "properties": {
+        "data_dir": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "listen": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "socket": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tasks_dir": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ExecutorSettings": {
+      "description": "How the executor runs tasks: concurrency and directory/worktree isolation.\n\nWith `parallel = true` each task gets a git worktree when its working\ndirectory is inside a repository (so tasks can run side by side without\nstepping on each other). Tasks that do **not** run in a worktree are\nserialized per working directory.",
+      "properties": {
+        "keep_worktree": {
+          "default": true,
+          "description": "Keep worktrees after the task finishes (default true) so the agent's\nbranch/changes can be inspected; false removes them.",
+          "type": "boolean"
+        },
+        "max_concurrency": {
+          "default": 4,
+          "description": "Maximum concurrent tasks when `parallel` is true.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "parallel": {
+          "default": false,
+          "description": "Run multiple tasks at once (default false: one at a time).",
+          "type": "boolean"
+        },
+        "worktree": {
+          "default": true,
+          "description": "Give each task its own `git worktree` when it runs in a repository.",
+          "type": "boolean"
+        },
+        "worktree_dir": {
+          "description": "Where worktrees are created: absolute, or relative to the repo root.\nDefaults to `<data_dir>/worktrees`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "GitSettings": {
+      "description": "Non-interactive git provisioning for agent processes.\n\n`signing = None` means \"unset\" so a per-agent/per-task override can be merged\nover the global section; the effective default is [`GitSigning::Off`]. The\nsettings are injected into the agent's environment through git's *environment\nconfig* (`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_<i>`/`GIT_CONFIG_VALUE_<i>`, git ≥\n2.31) and `GIT_AUTHOR_*`/`GIT_COMMITTER_*`; the operator's real git config is\nnever touched.",
+      "properties": {
+        "passphrase_command": {
+          "description": "Command (argv list) whose stdout is the passphrase. Embedded in the\ngenerated wrapper script, so the secret never lands in the config file.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "passphrase_env": {
+          "description": "Env var (in the daemon's environment) holding the passphrase. The value is\nforwarded to the agent; prefer this for interactive-daemon setups.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "signing": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GitSigning"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`\"off\"` (default), `\"ssh\"`, or `\"gpg\"`."
+        },
+        "signing_key": {
+          "description": "GPG key id/fingerprint, or SSH public-key path / literal key.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "user_email": {
+          "description": "Commit author/committer email (`user.email` + the matching git env vars).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "user_name": {
+          "description": "Commit author/committer name (`user.name` + `GIT_AUTHOR_NAME`/`GIT_COMMITTER_NAME`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "GitSigning": {
+      "description": "How favetto provisions `git` in an agent process.\n\n`off` is the safe default: agent commits are explicitly unsigned so they can\nnever wait for a passphrase prompt nobody can answer. `ssh`/`gpg` opt into\nsigned agent commits with a dedicated identity/key.",
+      "enum": [
+        "off",
+        "gpg",
+        "ssh"
+      ],
+      "type": "string"
+    },
+    "GithubFilter": {
+      "description": "Optional narrowing for a [`GithubRule`]. Unset fields match anything; all set\nfields must match (AND).\n\n`repo`, `author`, `base_ref`, and `head_ref` are globs; `labels_contains` is\nany-of exact.",
+      "properties": {
+        "author": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "head_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "labels_contains": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "repo": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "GithubRule": {
+      "description": "A single `[[webhook.github.rules]]` entry.",
+      "properties": {
+        "action": {
+          "description": "Optional action; unset matches any action.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "event": {
+          "description": "`X-GitHub-Event` value (e.g. `\"issues\"`). Validated at startup.",
+          "type": "string"
+        },
+        "filter": {
+          "$ref": "#/$defs/GithubFilter",
+          "default": {}
+        },
+        "name": {
+          "type": "string"
+        },
+        "task": {
+          "description": "Catalog task name. Validated at startup.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "event",
+        "task"
+      ],
+      "type": "object"
+    },
+    "GithubWebhookSettings": {
+      "description": "GitHub webhook receiver + trigger rules.\n\nGitHub POSTs signed events to `/webhooks/github`; each matching rule enqueues\nthe named catalog task with a truncated summary of the event as its input.\nRules and the secret are read at daemon startup, so a restart is required after\nediting them.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Opt-in; disabled unless set.",
+          "type": "boolean"
+        },
+        "rules": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/GithubRule"
+          },
+          "type": "array"
+        },
+        "secret": {
+          "description": "Literal secret (accepted but discouraged).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "secret_env": {
+          "description": "Name of the env var holding the signing secret.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "SoundSettings": {
+      "description": "Client-side sound notifications for the TUI.\n\nPrecedence is CLI flags (`--sound`/`--no-sound`/`--sound-command`) over the\n`FAVETTO_SOUND*` environment variables over this section over built-in\ndefaults. Sounds are played on the machine running `favetto tui`.",
+      "properties": {
+        "command": {
+          "description": "Template used when `player = \"command\"`; `{file}` is the sound path.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "default": true,
+          "description": "Master switch (default true).",
+          "type": "boolean"
+        },
+        "events": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {
+            "attention": "none",
+            "task_failed": "failure",
+            "task_finished": "success",
+            "task_started": "none"
+          },
+          "description": "Cue key -> sound spec (`success`/`failure`/`attention`/`started`/`bell`,\na `.wav` path, or `none`). Unset keys use the built-in default.",
+          "type": "object"
+        },
+        "min_interval_ms": {
+          "default": 400,
+          "description": "Minimum gap between cues; bursts inside it are coalesced (failure wins).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "only_when_unfocused": {
+          "default": false,
+          "description": "Only play while the terminal is unfocused (best-effort focus reporting).",
+          "type": "boolean"
+        },
+        "player": {
+          "default": "auto",
+          "description": "`\"auto\"` (detect a player on `PATH`), `\"bell\"`, or `\"command\"`.",
+          "type": "string"
+        },
+        "sound_dir": {
+          "description": "Directory for relative `.wav` event values. `~` is expanded.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "TuiSettings": {
+      "description": "TUI-only settings. The daemon parses but ignores this section.",
+      "properties": {
+        "sound": {
+          "$ref": "#/$defs/SoundSettings",
+          "default": {
+            "enabled": true,
+            "events": {
+              "attention": "none",
+              "task_failed": "failure",
+              "task_finished": "success",
+              "task_started": "none"
+            },
+            "min_interval_ms": 400,
+            "only_when_unfocused": false,
+            "player": "auto"
+          }
+        }
+      },
+      "type": "object"
+    },
+    "WebhookSettings": {
+      "description": "Webhook trigger settings. Currently only GitHub is supported.",
+      "properties": {
+        "github": {
+          "$ref": "#/$defs/GithubWebhookSettings",
+          "default": {
+            "enabled": false,
+            "rules": []
+          }
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "agent": {
+      "$ref": "#/$defs/AgentSettings",
+      "default": {},
+      "description": "Default external agent used for catalog tasks and new agent sessions."
+    },
+    "agents": {
+      "additionalProperties": {
+        "$ref": "#/$defs/AgentConfig"
+      },
+      "default": {},
+      "description": "External coding agents by name (e.g. `claude`, `opencode`, `pi`, `vibe`).",
+      "type": "object"
+    },
+    "daemon": {
+      "$ref": "#/$defs/DaemonSettings",
+      "default": {
+        "data_dir": null,
+        "listen": null,
+        "socket": null,
+        "tasks_dir": null
+      },
+      "description": "Daemon defaults (overridable by CLI flags)."
+    },
+    "executor": {
+      "$ref": "#/$defs/ExecutorSettings",
+      "default": {
+        "keep_worktree": true,
+        "max_concurrency": 4,
+        "parallel": false,
+        "worktree": true
+      },
+      "description": "Task executor concurrency / isolation."
+    },
+    "git": {
+      "$ref": "#/$defs/GitSettings",
+      "default": {},
+      "description": "Non-interactive git provisioning for agent processes. Defaults to\n`signing = \"off\"`, which forces `commit.gpgsign = false` so an agent\ncommit can never block on an interactive pinentry/askpass prompt."
+    },
+    "tui": {
+      "$ref": "#/$defs/TuiSettings",
+      "default": {
+        "sound": {
+          "enabled": true,
+          "events": {
+            "attention": "none",
+            "task_failed": "failure",
+            "task_finished": "success",
+            "task_started": "none"
+          },
+          "min_interval_ms": 400,
+          "only_when_unfocused": false,
+          "player": "auto"
+        }
+      },
+      "description": "Client-side TUI settings. Ignored by the daemon, which reads the same file."
+    },
+    "webhook": {
+      "$ref": "#/$defs/WebhookSettings",
+      "default": {
+        "github": {
+          "enabled": false,
+          "rules": []
+        }
+      },
+      "description": "Webhook trigger rules (currently GitHub)."
+    }
+  },
+  "title": "FavettoConfig",
+  "type": "object"
+}

@@ -23,9 +23,10 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, JsonSchema, Serialize, Deserialize)]
 pub struct FavettoConfig {
     /// Default external agent used for catalog tasks and new agent sessions.
     #[serde(default)]
@@ -53,7 +54,7 @@ pub struct FavettoConfig {
 }
 
 /// TUI-only settings. The daemon parses but ignores this section.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, JsonSchema, Serialize, Deserialize)]
 pub struct TuiSettings {
     #[serde(default)]
     pub sound: SoundSettings,
@@ -64,7 +65,7 @@ pub struct TuiSettings {
 /// Precedence is CLI flags (`--sound`/`--no-sound`/`--sound-command`) over the
 /// `FAVETTO_SOUND*` environment variables over this section over built-in
 /// defaults. Sounds are played on the machine running `favetto tui`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 pub struct SoundSettings {
     /// Master switch (default true).
     #[serde(default = "default_true")]
@@ -105,7 +106,7 @@ impl Default for SoundSettings {
 }
 
 /// Webhook trigger settings. Currently only GitHub is supported.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, JsonSchema, Serialize, Deserialize)]
 pub struct WebhookSettings {
     #[serde(default)]
     pub github: GithubWebhookSettings,
@@ -117,7 +118,7 @@ pub struct WebhookSettings {
 /// the named catalog task with a truncated summary of the event as its input.
 /// Rules and the secret are read at daemon startup, so a restart is required after
 /// editing them.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, JsonSchema, Serialize, Deserialize)]
 pub struct GithubWebhookSettings {
     /// Opt-in; disabled unless set.
     #[serde(default)]
@@ -133,7 +134,7 @@ pub struct GithubWebhookSettings {
 }
 
 /// A single `[[webhook.github.rules]]` entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 pub struct GithubRule {
     pub name: String,
     /// `X-GitHub-Event` value (e.g. `"issues"`). Validated at startup.
@@ -154,7 +155,7 @@ pub struct GithubRule {
 ///
 /// `repo`, `author`, `base_ref`, and `head_ref` are globs; `labels_contains` is
 /// any-of exact.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, JsonSchema, Serialize, Deserialize)]
 pub struct GithubFilter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
@@ -168,7 +169,7 @@ pub struct GithubFilter {
     pub head_ref: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, JsonSchema, Serialize, Deserialize)]
 pub struct AgentSettings {
     /// Name of the default external agent (a key in `[agents.*]`). When set,
     /// catalog tasks run through this agent unless a task names its own.
@@ -192,7 +193,7 @@ pub struct AgentSettings {
 /// previously run session and supports `{session_id}`. When `session_id_json_key`
 /// is set, the agent's session id is read from a run's line-delimited JSON output
 /// under that key (e.g. `"sessionID"`) and stored on the task.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, JsonSchema, Serialize, Deserialize)]
 pub struct AgentConfig {
     /// Implementation discriminator: `opencode`, `claude`, `pi`, `vibe`, or
     /// `configurable`. Omit to use the built-in whose name matches the entry (or
@@ -250,7 +251,7 @@ pub struct AgentConfig {
 /// `off` is the safe default: agent commits are explicitly unsigned so they can
 /// never wait for a passphrase prompt nobody can answer. `ssh`/`gpg` opt into
 /// signed agent commits with a dedicated identity/key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, JsonSchema, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GitSigning {
     #[default]
@@ -267,7 +268,7 @@ pub enum GitSigning {
 /// config* (`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_<i>`/`GIT_CONFIG_VALUE_<i>`, git ≥
 /// 2.31) and `GIT_AUTHOR_*`/`GIT_COMMITTER_*`; the operator's real git config is
 /// never touched.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, JsonSchema, Serialize, Deserialize)]
 pub struct GitSettings {
     /// `"off"` (default), `"ssh"`, or `"gpg"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -298,7 +299,7 @@ impl GitSettings {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, JsonSchema, Serialize, Deserialize)]
 pub struct DaemonSettings {
     pub listen: Option<String>,
     pub socket: Option<PathBuf>,
@@ -337,7 +338,7 @@ fn default_max_concurrency() -> usize {
 /// directory is inside a repository (so tasks can run side by side without
 /// stepping on each other). Tasks that do **not** run in a worktree are
 /// serialized per working directory.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 pub struct ExecutorSettings {
     /// Run multiple tasks at once (default false: one at a time).
     #[serde(default)]

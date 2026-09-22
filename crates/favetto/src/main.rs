@@ -7,6 +7,7 @@ mod client;
 mod config;
 mod daemon;
 mod db;
+mod docgen;
 mod event_bus;
 mod executor;
 mod git;
@@ -45,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Tui(args) => tui::run(args).await,
         Command::Pair(args) => pair(args).await,
         Command::TokenRotate(args) => token_rotate(args),
+        Command::Doc(args) => docgen::run(&args),
         Command::InternalAgentExec { argv } => agent_exec(argv),
     }
 }

@@ -1,57 +1,79 @@
 # Getting started
 
-favetto is a single binary that runs as a **daemon** (scheduler, task queue,
-persistence, remote API) and a **TUI client**. This page gets both running and
-attaches the client, locally or remotely.
+favetto is a single binary that runs in two roles: a long-lived **daemon**
+(scheduler, task queue, persistence, remote API) and a **TUI client**. This page
+starts both and attaches the client. It takes about two minutes.
 
-## Prerequisites
+If you have not built favetto yet, start with [Installation](./installation).
 
-- A Rust toolchain (edition 2021, MSRV 1.92) to build favetto.
-- At least one external coding-agent CLI (opencode, Claude Code, pi, Mistral
-  Vibe, …) installed and configured — see [Embedded agents](./agents).
+## 1. Run the daemon
 
-## Build
-
-From the repository root:
+The daemon owns the database, watches the task catalog, and exposes the API. It
+runs in the foreground, so keep it in its own terminal:
 
 ```bash
-cargo build
+favetto daemon
 ```
 
-## Run the daemon
+By default it listens on a Unix socket (`/tmp/favetto.sock`) for local attach and
+on `127.0.0.1:7878` for authenticated remote attach. Both settings are
+overridable with `--socket` / `--listen`, or from
+`~/.config/favetto/config.toml`.
 
-```bash
-# terminal 1 — the daemon
-./target/debug/favetto daemon
+```text
+INFO favetto::daemon: listening on unix:/tmp/favetto.sock
+INFO favetto::daemon: websocket API on 127.0.0.1:7878
 ```
 
-## Attach the TUI
+## 2. Attach the TUI
+
+In a second terminal, attach to the daemon over the local socket:
 
 ```bash
-# terminal 2 — the TUI (local attach over the unix socket)
-./target/debug/favetto tui
+favetto tui
+```
 
-# or attach remotely over WebSocket (token auto-created in ~/.local/share/favetto/token)
-./target/debug/favetto tui --remote ws://127.0.0.1:7878 \
+![favetto TUI — Catalog tab](/screenshots/tui-catalog.svg)
+
+*The Catalog tab: folder tree + preview pane.*
+
+When the TUI opens you are on the **Catalog** tab. Folders show the structure of
+your task directory, `Enter` starts the highlighted task, and the right pane
+previews its raw Markdown. Press `?` for the full keybinding list and `w` for the
+workflow graph.
+
+## 3. Or attach remotely
+
+The same client attaches over the network. The daemon writes a bearer token to
+`~/.local/share/favetto/token` on first start:
+
+```bash
+favetto tui --remote ws://127.0.0.1:7878 \
     --token-file ~/.local/share/favetto/token
-
-# configure external agents, then start tasks from the TUI
 ```
 
-The daemon exposes one wire protocol over two transports — a Unix socket for
-local attach and a token-authenticated WebSocket for remote attach. See the
-[Remote API reference](/reference/remote-api) for the method list.
+For a short-lived code instead of copying the token, ask the daemon for one and
+pass it with `--pair-code`:
+
+```bash
+favetto pair
+# pairing code (valid 60s): 123456
+# attach with: favetto tui --remote ws://HOST:7878 --pair-code 123456
+
+favetto tui --remote ws://127.0.0.1:7878 --pair-code 123456
+```
+
+See [Remote access](./remote-access) for the full flow.
 
 ## Appearance
 
-The TUI ships a built-in dark and light style that is selected automatically
-from the terminal background (an OSC 11 query, then `COLORFGBG`, then dark). Set
-`FAVETTO_THEME=dark` or `FAVETTO_THEME=light` to override it. There is no theme
-file or picker.
+The TUI selects a dark or light theme from the terminal background (an OSC 11
+query, then `COLORFGBG`, then dark). Override it with `FAVETTO_THEME=dark` or
+`FAVETTO_THEME=light`; there is no theme file or picker.
 
 ## Next steps
 
-- [Tasks & catalog](./tasks) — write declarative tasks with TOML headers.
-- [Configuration](./configuration) — agents, daemon defaults, sound.
-- [TUI](./tui) — sound notifications, the Ctrl+P menu, and help.
-- [Webhooks & hooks](./webhooks) — trigger tasks from GitHub events.
+- [Your first task](./first-task) — create a task and run it end to end.
+- [Catalog](./catalog) — how task files are discovered and started.
+- [Embedded agents](./agents) — configure the agent CLIs favetto drives.
+- [Configuration](./configuration) — daemon, executor, git, and sound settings.

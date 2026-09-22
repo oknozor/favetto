@@ -1,13 +1,14 @@
-# Webhooks & hooks
+# Webhooks and hooks
 
-GitHub signs with `X-Hub-Signature-256`; Linear signs with `Linear-Signature`.
-Both are HMAC-SHA256 over the raw body, verified in constant time.
+favetto can trigger catalog tasks from external events. GitHub POSTs a signed
+delivery to `/webhooks/github` and every matching rule enqueues its task with a
+**truncated summary** of the event as the task's `input`. GitHub signs with
+`X-Hub-Signature-256`; Linear signs with `Linear-Signature`. Both are HMAC-SHA256
+over the raw body, verified in constant time.
 
-## GitHub triggers (config-driven)
+## Trigger a task from GitHub
 
-Declare trigger rules in `config.toml`; GitHub POSTs a signed event to
-`/webhooks/github` and every matching rule enqueues its catalog task with a
-**truncated summary** of the event as the task's `input`:
+Declare rules in `config.toml`:
 
 ```toml
 [webhook.github]
@@ -18,35 +19,50 @@ secret_env = "GITHUB_WEBHOOK_SECRET"   # preferred; or `secret = "…"` (discour
 name = "triage-opened-issues"
 event = "issues"                       # X-GitHub-Event
 action = "opened"                      # optional; unset matches any action
-task = "triage_favetto_issues"         # catalog task to enqueue
+task = "favetto/triage_issues"         # catalog identity
 filter = { repo = "oknozor/*" }        # optional
 
 [[webhook.github.rules]]
 name = "plan-bug-prs"
 event = "pull_request"
 action = "opened"
-task = "plan_favetto_issue"
+task = "favetto/plan_issue"
 filter = { labels_contains = ["bug"], base_ref = "main", author = "oknozor" }
 ```
 
+`task` is the [catalog identity](./catalog) — the path relative to the tasks
+root, without `.md`. Here the rules point at the tasks that ship in
+`tasks/favetto/`: `triage_issues` becomes `favetto/triage_issues`.
+
+A rule naming an unsupported event, an unknown catalog task, or an invalid glob
+is a **startup error**, so a typo fails the daemon rather than silently never
+firing.
+
+### What the task receives
+
+The enqueued task's `input` is a summary, never the raw body:
+
+| Field | Notes |
+|-------|-------|
+| `event`, `action` | The GitHub event and action. |
+| `repo`, `repo_owner`, `repo_name` | Repository identity. |
+| `number`, `title`, `body` | Title capped at 256 bytes, body at 1024, truncated on UTF-8 boundaries. |
+| `author`, `html_url`, `labels` | Sender and links. |
+| `base_ref`, `head_ref`, `ref`, `commit_count` | Branch and push details. |
+| `installation_id`, `organization` | GitHub App context. |
+
+Reach them in the prompt with <span v-pre>`{{ input.repo }}`</span>,
+<span v-pre>`{{ input.number }}`</span>,
+<span v-pre>`{{ input.title }}`</span>,
+<span v-pre>`{{ input.labels }}`</span>, and so on.
+
 - **Secret precedence**: literal `secret`, else the env var named by
-  `secret_env` (default `GITHUB_WEBHOOK_SECRET`). Linear always reads
-  `LINEAR_WEBHOOK_SECRET`. A configured GitHub secret without `enabled = true`
-  leaves the endpoint disabled (404).
+  `secret_env`, else `GITHUB_WEBHOOK_SECRET`. Linear always reads
+  `LINEAR_WEBHOOK_SECRET`. A configured secret without `enabled = true` leaves
+  the endpoint disabled (404).
 - **Supported events**: `issues`, `issue_comment`, `pull_request`,
-  `pull_request_review`, `push`, `workflow_run`, `check_suite`, `check_run`
-  (the issue/PR lifecycle actions map to the `issue_*` / `pr_*` event kinds;
-  `workflow_run/completed` reuses `action_run_completed`). Unrecognised events
-  are ack'd with 200 and ignored; a rule naming an unsupported event, an unknown
-  catalog task, or an invalid glob is a **startup error**.
-- **Summary fields** (never the raw body; title capped at 256 bytes, body at
-  1024, truncated on UTF-8 boundaries): `event`, `action`, `repo`, `repo_owner`,
-  `repo_name`, `number`, `title`, `body`, `author`, `html_url`, `labels`,
-  `base_ref`, `head_ref`, `ref`, `commit_count`, `installation_id`,
-  `organization`. Prompts reach them as <span v-pre>`{{ input.repo }}`</span>,
-  <span v-pre>`{{ input.number }}`</span>, <span v-pre>`{{ input.title }}`</span>,
-  <span v-pre>`{{ input.author }}`</span>, <span v-pre>`{{ input.labels }}`</span>,
-  ….
+  `pull_request_review`, `push`, `workflow_run`, `check_suite`, `check_run`.
+  Unrecognised events are acknowledged with 200 and ignored.
 - **Filters**: `repo` / `author` / `base_ref` / `head_ref` are globs (`*` also
   crosses `/`, so `oknozor/*` matches `oknozor/favetto`); `labels_contains` is
   any-of exact. Unset fields match anything; all set fields must match (AND).
@@ -56,11 +72,13 @@ filter = { labels_contains = ["bug"], base_ref = "main", author = "oknozor" }
 - **Restart required**: rules and the secret are read at daemon startup; editing
   `config.toml` needs a restart (there is no config hot-reload).
 
-## Local testing
+## Test locally
+
+Forward real events with the GitHub CLI, or craft a signed delivery by hand:
 
 ```bash
 # terminal 1
-GITHUB_WEBHOOK_SECRET=topsecret ./target/debug/favetto daemon
+GITHUB_WEBHOOK_SECRET=topsecret favetto daemon
 
 # terminal 2 — forward real events (needs the GitHub CLI)
 gh webhook forward --events=issues --url=http://127.0.0.1:7878/webhooks/github
@@ -73,10 +91,18 @@ curl -X POST http://127.0.0.1:7878/webhooks/github \
   -H "X-Hub-Signature-256: sha256=$SIG" -d "$BODY"
 ```
 
+If the endpoint returns 404, the webhook is not `enabled` or no secret is
+configured. If it returns 401, the signature does not match — check the secret
+and that you signed the exact body.
+
 ## Notification hooks
 
 Notification hooks are **in-memory**: the TUI adds them via the Ctrl+P "Create a
 notification (hook)" wizard (the `hooks.upsert` RPC). They run against every
-persisted event and `notify` sends through a channel (e.g. `channel = "webhook"`,
-`config = { url = "http://…" }`). They are not persisted and are lost on restart;
-task triggers are configured declaratively with `[webhook.github]` above.
+persisted event and `notify` sends through a channel (for example
+`channel = "webhook"`, `config = { url = "http://…" }`). They are not persisted
+and are lost on restart; task triggers are configured declaratively with
+`[webhook.github]` above.
+
+See [Remote API](../reference/remote-api) for the webhook endpoints and
+[Environment variables](../reference/environment) for the secret variables.

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540" role="img" aria-label="favetto tui vars form placeholder">
+  <rect width="960" height="540" fill="#1e1e2e"/>
+  <rect x="16" y="16" width="928" height="508" rx="8" fill="#181825" stroke="#45475a" stroke-width="2"/>
+  <circle cx="44" cy="44" r="6" fill="#f38ba8"/>
+  <circle cx="66" cy="44" r="6" fill="#f9e2af"/>
+  <circle cx="88" cy="44" r="6" fill="#a6e3a1"/>
+  <text x="480" y="248" fill="#cdd6f4" font-family="monospace" font-size="30" text-anchor="middle">favetto</text>
+  <text x="480" y="298" fill="#89b4fa" font-family="monospace" font-size="22" text-anchor="middle">tui vars form</text>
+  <text x="480" y="342" fill="#6c7086" font-family="monospace" font-size="16" text-anchor="middle">placeholder screenshot</text>
+</svg>
