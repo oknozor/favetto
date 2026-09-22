@@ -11,7 +11,7 @@ Every section is optional; favetto falls back to built-in defaults for anything 
 | `agent` | AgentSettings | `{}` | no | Default external agent used for catalog tasks and new agent sessions. |
 | `agents` | Map<String, AgentConfig> | `{}` | no | External coding agents by name (e.g. `claude`, `opencode`, `pi`, `vibe`). |
 | `daemon` | DaemonSettings | `{"data_dir":null,"listen":null,"retention":{"days":30,"min_tasks":1000,"vacuum":true},"socket":null,"tasks_dir":null}` | no | Daemon defaults (overridable by CLI flags). |
-| `executor` | ExecutorSettings | `{"awaiting_input_quiet_ms":8000,"detect_awaiting_input":true,"keep_worktree":true,"max_concurrency":4,"max_output_bytes":262144,"parallel":false,"worktree":true}` | no | Task executor concurrency / isolation. |
+| `executor` | ExecutorSettings | `{"awaiting_input_quiet_ms":8000,"detect_awaiting_input":true,"keep_worktree":false,"max_concurrency":4,"max_output_bytes":262144,"parallel":false,"worktree":true,"worktree_retention":{"days":30,"min_worktrees":0}}` | no | Task executor concurrency / isolation. |
 | `git` | GitSettings | `{}` | no | Non-interactive git provisioning for agent processes. Defaults to `signing = "off"`, which forces `commit.gpgsign = false` so an agent commit can never block on an interactive pinentry/askpass prompt. |
 | `tui` | TuiSettings | `{"sound":{"enabled":true,"events":{"attention":"none","awaiting_input":"attention","task_failed":"failure","task_finished":"success","task_started":"none"},"min_interval_ms":400,"only_when_unfocused":false,"player":"auto"}}` | no | Client-side TUI settings. Ignored by the daemon, which reads the same file. |
 | `webhook` | WebhookSettings | `{"github":{"enabled":false,"rules":[]}}` | no | Webhook trigger rules (currently GitHub). |
@@ -80,12 +80,13 @@ serialized per working directory.
 |-------|------|---------|----------|-------------|
 | `awaiting_input_quiet_ms` | integer | `8000` | no | How long the PTY must be quiet (ms) before the generic prompt detector fires (default 8000). Agent-specific detectors ignore this. |
 | `detect_awaiting_input` | boolean | `true` | no | Detect when a running agent is blocked waiting for user input and surface it as `awaiting_input` on the task (default true). |
-| `keep_worktree` | boolean | `true` | no | Keep worktrees after the task finishes (default true) so the agent's branch/changes can be inspected; false removes them. |
+| `keep_worktree` | boolean | `false` | no | Keep worktrees after the task finishes (default false) so a completed task cleans up after itself. Set true to keep the agent's branch/changes for inspection; the retention sweep still reclaims kept worktrees after `worktree_retention.days`. |
 | `max_concurrency` | integer | `4` | no | Maximum concurrent tasks when `parallel` is true. |
 | `max_output_bytes` | integer | `262144` | no | Cap on the stored `task.output` blob, in bytes (default 256 KiB). Longer output is truncated head+tail and flagged. |
 | `parallel` | boolean | `false` | no | Run multiple tasks at once (default false: one at a time). |
 | `worktree` | boolean | `true` | no | Give each task its own `git worktree` when it runs in a repository. |
 | `worktree_dir` | string (optional) | — | no | Where worktrees are created: absolute, or relative to the repo root. Defaults to `<data_dir>/worktrees`. |
+| `worktree_retention` | WorktreeRetentionSettings | `{"days":30,"min_worktrees":0}` | no | Retention policy for worktrees left on disk. |
 
 ## GitSettings
 
@@ -211,4 +212,18 @@ Webhook trigger settings. Currently only GitHub is supported.
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
 | `github` | GithubWebhookSettings | `{"enabled":false,"rules":[]}` | no |  |
+
+## WorktreeRetentionSettings
+
+Worktree retention policy. At daemon start (and every six hours) recorded
+worktrees whose owning task is finished and older than `days` are removed,
+along with their `favetto/*` branch; orphans whose task row was already
+pruned are reclaimed regardless of age. `days = 0` keeps opt-in worktrees
+forever. Active (`pending`/`running`/`awaiting_input`) tasks are never
+touched.
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `days` | integer | `30` | no | Remove a finished task's worktree older than this many days (0 = keep forever). |
+| `min_worktrees` | integer | `0` | no | Always keep at least this many newest finished worktrees. |
 

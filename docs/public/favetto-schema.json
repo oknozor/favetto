@@ -184,8 +184,8 @@
           "type": "boolean"
         },
         "keep_worktree": {
-          "default": true,
-          "description": "Keep worktrees after the task finishes (default true) so the agent's\nbranch/changes can be inspected; false removes them.",
+          "default": false,
+          "description": "Keep worktrees after the task finishes (default false) so a completed\ntask cleans up after itself. Set true to keep the agent's branch/changes\nfor inspection; the retention sweep still reclaims kept worktrees after\n`worktree_retention.days`.",
           "type": "boolean"
         },
         "max_concurrency": {
@@ -218,6 +218,14 @@
             "string",
             "null"
           ]
+        },
+        "worktree_retention": {
+          "$ref": "#/$defs/WorktreeRetentionSettings",
+          "default": {
+            "days": 30,
+            "min_worktrees": 0
+          },
+          "description": "Retention policy for worktrees left on disk."
         }
       },
       "type": "object"
@@ -513,6 +521,26 @@
         }
       },
       "type": "object"
+    },
+    "WorktreeRetentionSettings": {
+      "description": "Worktree retention policy. At daemon start (and every six hours) recorded\nworktrees whose owning task is finished and older than `days` are removed,\nalong with their `favetto/*` branch; orphans whose task row was already\npruned are reclaimed regardless of age. `days = 0` keeps opt-in worktrees\nforever. Active (`pending`/`running`/`awaiting_input`) tasks are never\ntouched.",
+      "properties": {
+        "days": {
+          "default": 30,
+          "description": "Remove a finished task's worktree older than this many days (0 = keep forever).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_worktrees": {
+          "default": 0,
+          "description": "Always keep at least this many newest finished worktrees.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -550,11 +578,15 @@
       "default": {
         "awaiting_input_quiet_ms": 8000,
         "detect_awaiting_input": true,
-        "keep_worktree": true,
+        "keep_worktree": false,
         "max_concurrency": 4,
         "max_output_bytes": 262144,
         "parallel": false,
-        "worktree": true
+        "worktree": true,
+        "worktree_retention": {
+          "days": 30,
+          "min_worktrees": 0
+        }
       },
       "description": "Task executor concurrency / isolation."
     },

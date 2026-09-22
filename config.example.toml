@@ -95,10 +95,18 @@ parallel = true            # run tasks concurrently (default false = one at a ti
 max_concurrency = 4        # slots when parallel
 worktree = true            # when parallel and in a git repo, give each task its own worktree
 # worktree_dir = "~/.local/share/favetto/worktrees"  # absolute, ~-expanded, or repo-relative
-keep_worktree = true       # keep worktrees after the task (so branches/changes can be inspected)
+keep_worktree = false      # default false = remove the worktree when the task ends; true keeps it for inspection
 # max_output_bytes = 262144  # stored task output cap; longer output is truncated head+tail
 # detect_awaiting_input = true     # surface a blocked agent as `awaiting_input` + notify
 # awaiting_input_quiet_ms = 8000   # PTY quiet time before the generic detector fires
+
+# Worktree retention. At daemon start and every six hours, tracked worktrees
+# whose task is finished are removed once older than `days`, orphaned ones are
+# reclaimed, and `git worktree prune` drops stale entries. Active tasks are
+# never touched; days = 0 keeps opt-in worktrees forever.
+[executor.worktree_retention]
+days = 30          # remove finished-task worktrees older than this many days (0 = keep forever)
+min_worktrees = 0  # always keep the newest N finished worktrees
 
 # Non-interactive git for agent sessions. favetto injects these into every agent
 # PTY through git's environment config only, never touching your real config.

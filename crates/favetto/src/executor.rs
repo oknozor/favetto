@@ -10,12 +10,13 @@
 //!   true`), so tasks don't step on each other. Tasks that do **not** get a
 //!   worktree are serialized per working directory.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
+use sqlx::SqlitePool;
 use tokio::process::Command;
 use tokio::sync::{OwnedMutexGuard, Semaphore};
 use uuid::Uuid;
@@ -155,6 +156,9 @@ async fn dispatch_loop(state: Arc<State>, cfg: ExecutorSettings) {
             };
 
             if !db::claim_task(&state.db, task.id).await.unwrap_or(false) {
+                if let Some(wt) = &plan.worktree {
+                    remove_worktree(&state.db, task.id, &wt.repo, &wt.path, &wt.branch).await;
+                }
                 continue; // already claimed
             }
 
@@ -245,7 +249,7 @@ async fn run_one(
         if config.executor.keep_worktree {
             tracing::info!(path = %wt.path.display(), "worktree kept");
         } else {
-            remove_worktree(&wt.repo, &wt.path, &wt.branch).await;
+            remove_worktree(&state.db, task.id, &wt.repo, &wt.path, &wt.branch).await;
         }
     }
 
@@ -659,6 +663,14 @@ struct Plan {
     worktree: Option<Worktree>,
 }
 
+/// What a [`prune_worktrees`] pass removed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WorktreePruneStats {
+    pub removed: usize,
+    pub orphans: usize,
+    pub repos_pruned: usize,
+}
+
 struct Worktree {
     repo: PathBuf,
     path: PathBuf,
@@ -678,6 +690,20 @@ async fn make_plan(
             let path = worktree_path(state, cfg, &repo, task);
             let branch = branch_name(task);
             create_worktree(&repo, &path, &branch).await?;
+            let record = db::WorktreeRecord {
+                task_id: task.id,
+                repo: repo.clone(),
+                path: path.clone(),
+                branch: branch.clone(),
+                created_at: Utc::now(),
+            };
+            if let Err(e) = db::record_worktree(&state.db, &record).await {
+                tracing::warn!(
+                    error = %e,
+                    task_id = %task.id,
+                    "failed to record worktree; retention will not track it"
+                );
+            }
             return Ok(Plan {
                 cwd: path.clone(),
                 needs_lock: false,
@@ -768,7 +794,7 @@ async fn create_worktree(repo: &Path, path: &Path, branch: &str) -> anyhow::Resu
     Ok(())
 }
 
-async fn remove_worktree(repo: &Path, path: &Path, branch: &str) {
+async fn remove_worktree(pool: &SqlitePool, task_id: Uuid, repo: &Path, path: &Path, branch: &str) {
     let out = Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -786,6 +812,114 @@ async fn remove_worktree(repo: &Path, path: &Path, branch: &str) {
         .args(["branch", "-D", branch])
         .output()
         .await;
+    let _ = db::forget_worktree(pool, task_id).await;
+}
+
+/// A terminal task is finished: its worktree may be reclaimed by retention.
+fn is_terminal(status: TaskStatus) -> bool {
+    matches!(status, TaskStatus::Succeeded | TaskStatus::Failed)
+}
+
+/// Pick the tracked worktrees the retention policy should remove.
+///
+/// - a record whose task row no longer exists is an orphan and is removed;
+/// - a record whose task is not terminal is always kept;
+/// - a terminal task's worktree is removed when `keep_worktree` is false, or
+///   when it is older than `cutoff` (age-based, newest `min_worktrees`
+///   age-eligible ones are kept);
+/// - `cutoff == None` (i.e. `days == 0`) disables age-based removal.
+fn select_prunable(
+    records: &[db::WorktreeRecord],
+    tasks: &HashMap<Uuid, (TaskStatus, Option<chrono::DateTime<Utc>>)>,
+    cutoff: Option<chrono::DateTime<Utc>>,
+    keep_worktree: bool,
+    min_worktrees: usize,
+) -> Vec<db::WorktreeRecord> {
+    let mut unconditional: Vec<db::WorktreeRecord> = Vec::new();
+    let mut age_candidates: Vec<(chrono::DateTime<Utc>, db::WorktreeRecord)> = Vec::new();
+
+    for record in records {
+        match tasks.get(&record.task_id) {
+            // Task row already pruned: orphan, always reclaim it.
+            None => unconditional.push(record.clone()),
+            // Active (`pending`/`running`/`awaiting_input`): never touched.
+            Some((status, _)) if !is_terminal(*status) => {}
+            Some((_, finished_at)) => {
+                if !keep_worktree {
+                    unconditional.push(record.clone());
+                    continue;
+                }
+                if let Some(cutoff) = cutoff {
+                    let when = finished_at.unwrap_or(record.created_at);
+                    if when < cutoff {
+                        age_candidates.push((when, record.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Keep the newest `min_worktrees` age-eligible worktrees.
+    age_candidates.sort_by_key(|b| std::cmp::Reverse(b.0));
+    let mut selected = unconditional;
+    selected.extend(
+        age_candidates
+            .into_iter()
+            .skip(min_worktrees)
+            .map(|(_, record)| record),
+    );
+    // A task id cannot be removed twice even if a future rule overlaps.
+    let mut seen = HashSet::new();
+    selected.retain(|record| seen.insert(record.task_id));
+    selected
+}
+
+/// Remove tracked worktrees the retention policy has expired, drop their
+/// branches, and `git worktree prune` each repo. Never fatal.
+pub async fn prune_worktrees(state: &State) -> anyhow::Result<WorktreePruneStats> {
+    let cfg = state.config.read().unwrap().executor.clone();
+    let retention = cfg.worktree_retention.clone();
+    let records = db::list_worktrees(&state.db).await?;
+
+    let mut tasks = HashMap::new();
+    for r in &records {
+        if let Ok(Some(t)) = db::get_task(&state.db, r.task_id).await {
+            tasks.insert(r.task_id, (t.status, t.finished_at));
+        }
+    }
+
+    let cutoff =
+        (retention.days > 0).then(|| Utc::now() - chrono::Duration::days(retention.days as i64));
+    let selected = select_prunable(
+        &records,
+        &tasks,
+        cutoff,
+        cfg.keep_worktree,
+        retention.min_worktrees as usize,
+    );
+
+    let mut stats = WorktreePruneStats::default();
+    let mut repos: Vec<PathBuf> = Vec::new();
+    for wt in selected {
+        if !tasks.contains_key(&wt.task_id) {
+            stats.orphans += 1;
+        }
+        remove_worktree(&state.db, wt.task_id, &wt.repo, &wt.path, &wt.branch).await;
+        if !repos.contains(&wt.repo) {
+            repos.push(wt.repo.clone());
+        }
+        stats.removed += 1;
+    }
+    for repo in repos {
+        stats.repos_pruned += 1;
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "prune"])
+            .output()
+            .await;
+    }
+    Ok(stats)
 }
 
 /// Per-directory locks, so tasks without worktree isolation serialize.
@@ -1298,5 +1432,134 @@ mod tests {
             branch_name(&task),
             format!("favetto/pipelines-plan-{short}")
         );
+    }
+
+    fn wt_record(task_id: Uuid, created_at: chrono::DateTime<Utc>) -> db::WorktreeRecord {
+        db::WorktreeRecord {
+            task_id,
+            repo: PathBuf::from("/repo"),
+            path: PathBuf::from(format!("/data/worktrees/{task_id}")),
+            branch: format!("favetto/t-{}", &task_id.to_string()[..8]),
+            created_at,
+        }
+    }
+
+    fn selected_ids(selected: &[db::WorktreeRecord]) -> HashSet<Uuid> {
+        selected.iter().map(|r| r.task_id).collect()
+    }
+
+    #[test]
+    fn terminal_status_classification() {
+        assert!(is_terminal(TaskStatus::Succeeded));
+        assert!(is_terminal(TaskStatus::Failed));
+        assert!(!is_terminal(TaskStatus::Pending));
+        assert!(!is_terminal(TaskStatus::Running));
+        assert!(!is_terminal(TaskStatus::AwaitingInput));
+    }
+
+    #[test]
+    fn select_prunable_keeps_active_and_fresh() {
+        let now = Utc::now();
+        let cutoff = Some(now - chrono::Duration::days(30));
+        let fresh = wt_record(Uuid::new_v4(), now);
+        let active = wt_record(Uuid::new_v4(), now - chrono::Duration::days(60));
+
+        let mut tasks = HashMap::new();
+        tasks.insert(fresh.task_id, (TaskStatus::Succeeded, Some(now)));
+        tasks.insert(active.task_id, (TaskStatus::Running, None));
+
+        let selected = select_prunable(&[fresh.clone(), active.clone()], &tasks, cutoff, true, 0);
+        assert!(selected.is_empty(), "got {selected:?}");
+    }
+
+    #[test]
+    fn select_prunable_removes_expired_terminal() {
+        let now = Utc::now();
+        let cutoff = Some(now - chrono::Duration::days(30));
+        let old = wt_record(Uuid::new_v4(), now - chrono::Duration::days(60));
+
+        let mut tasks = HashMap::new();
+        tasks.insert(
+            old.task_id,
+            (
+                TaskStatus::Succeeded,
+                Some(now - chrono::Duration::days(60)),
+            ),
+        );
+
+        let selected = select_prunable(std::slice::from_ref(&old), &tasks, cutoff, true, 0);
+        assert_eq!(selected_ids(&selected), HashSet::from([old.task_id]));
+    }
+
+    #[test]
+    fn select_prunable_honors_min_worktrees() {
+        let now = Utc::now();
+        let cutoff = Some(now - chrono::Duration::days(30));
+        // Three expired, terminal worktrees; the newest one is kept.
+        let newest = wt_record(Uuid::new_v4(), now - chrono::Duration::days(40));
+        let middle = wt_record(Uuid::new_v4(), now - chrono::Duration::days(50));
+        let oldest = wt_record(Uuid::new_v4(), now - chrono::Duration::days(60));
+
+        let mut tasks = HashMap::new();
+        for (record, finished) in [(&newest, 40), (&middle, 50), (&oldest, 60)] {
+            tasks.insert(
+                record.task_id,
+                (
+                    TaskStatus::Failed,
+                    Some(now - chrono::Duration::days(finished)),
+                ),
+            );
+        }
+
+        let selected = select_prunable(
+            &[newest.clone(), middle.clone(), oldest.clone()],
+            &tasks,
+            cutoff,
+            true,
+            1,
+        );
+        assert_eq!(
+            selected_ids(&selected),
+            HashSet::from([middle.task_id, oldest.task_id])
+        );
+        assert!(!selected_ids(&selected).contains(&newest.task_id));
+    }
+
+    #[test]
+    fn select_prunable_removes_orphans_and_non_kept() {
+        let now = Utc::now();
+        let cutoff = Some(now - chrono::Duration::days(30));
+        let orphan = wt_record(Uuid::new_v4(), now);
+        let not_kept = wt_record(Uuid::new_v4(), now);
+
+        let mut tasks = HashMap::new();
+        // The orphan has no task row; the other finished just now.
+        tasks.insert(not_kept.task_id, (TaskStatus::Succeeded, Some(now)));
+
+        let selected = select_prunable(
+            &[orphan.clone(), not_kept.clone()],
+            &tasks,
+            cutoff,
+            false,
+            0,
+        );
+        assert_eq!(
+            selected_ids(&selected),
+            HashSet::from([orphan.task_id, not_kept.task_id])
+        );
+    }
+
+    #[test]
+    fn select_prunable_days_zero_keeps_kept_worktrees() {
+        let now = Utc::now();
+        let kept = wt_record(Uuid::new_v4(), now - chrono::Duration::days(365));
+        let orphan = wt_record(Uuid::new_v4(), now);
+
+        let mut tasks = HashMap::new();
+        tasks.insert(kept.task_id, (TaskStatus::Succeeded, None));
+
+        // `cutoff == None` disables age-based removal, but orphans still go.
+        let selected = select_prunable(&[kept.clone(), orphan.clone()], &tasks, None, true, 0);
+        assert_eq!(selected_ids(&selected), HashSet::from([orphan.task_id]));
     }
 }

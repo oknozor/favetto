@@ -11,15 +11,22 @@ parallel = true          # default false
 max_concurrency = 4
 worktree = true          # default true; used only when `parallel`
 # worktree_dir = "~/.local/share/favetto/worktrees"  # absolute or repo-relative
-keep_worktree = true     # default true; false removes the worktree afterwards
+keep_worktree = false    # default false; true keeps the worktree for inspection
+
+# Retained worktrees are still reclaimed after `days`; active tasks are never
+# touched and `days = 0` keeps opt-in worktrees forever.
+[executor.worktree_retention]
+days = 30
+min_worktrees = 0
 ```
 
 What the modes do:
 
 - **Parallel + git repository** → each task runs in its own `git worktree`
   (branch `favetto/<task>-<id>`, path under the worktree dir), so tasks do not
-  step on each other. Worktrees are kept by default so the agent's branch and
-  changes can be inspected afterwards.
+  step on each other. By default the worktree and its branch are removed when the
+  task finishes; set `keep_worktree = true` to inspect the agent's branch and
+  changes afterwards.
 - **Parallel + not a repository** → tasks that share a working directory are
   serialized (one at a time); tasks in different directories still run
   concurrently.
@@ -33,8 +40,12 @@ daemon's working directory.
 used as-is and a non-`~` relative path is resolved against the repo root.
 `[daemon].data_dir` and `[daemon].tasks_dir` expand `~` the same way.
 
-::: tip Inspect a finished run
-Because worktrees are kept, a completed task leaves a branch you can review:
+::: tip Inspect a running or kept run
+With the default `keep_worktree = false` a finished task cleans up after itself,
+so `git worktree list` shows worktrees only while tasks are running. To review a
+finished run's branch, set `[executor].keep_worktree = true` (the branch
+`favetto/<task>-<id>` is kept, and the retention sweep reclaims it after
+`worktree_retention.days`):
 
 ```bash
 git worktree list

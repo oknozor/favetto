@@ -355,6 +355,35 @@ impl Default for RetentionSettings {
     }
 }
 
+fn default_worktree_retention_days() -> u64 {
+    30
+}
+
+/// Worktree retention policy. At daemon start (and every six hours) recorded
+/// worktrees whose owning task is finished and older than `days` are removed,
+/// along with their `favetto/*` branch; orphans whose task row was already
+/// pruned are reclaimed regardless of age. `days = 0` keeps opt-in worktrees
+/// forever. Active (`pending`/`running`/`awaiting_input`) tasks are never
+/// touched.
+#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
+pub struct WorktreeRetentionSettings {
+    /// Remove a finished task's worktree older than this many days (0 = keep forever).
+    #[serde(default = "default_worktree_retention_days")]
+    pub days: u64,
+    /// Always keep at least this many newest finished worktrees.
+    #[serde(default)]
+    pub min_worktrees: u64,
+}
+
+impl Default for WorktreeRetentionSettings {
+    fn default() -> Self {
+        Self {
+            days: default_worktree_retention_days(),
+            min_worktrees: 0,
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -406,9 +435,14 @@ pub struct ExecutorSettings {
     /// Defaults to `<data_dir>/worktrees`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_dir: Option<PathBuf>,
-    /// Keep worktrees after the task finishes (default true) so the agent's
-    /// branch/changes can be inspected; false removes them.
-    #[serde(default = "default_true")]
+    /// Retention policy for worktrees left on disk.
+    #[serde(default)]
+    pub worktree_retention: WorktreeRetentionSettings,
+    /// Keep worktrees after the task finishes (default false) so a completed
+    /// task cleans up after itself. Set true to keep the agent's branch/changes
+    /// for inspection; the retention sweep still reclaims kept worktrees after
+    /// `worktree_retention.days`.
+    #[serde(default)]
     pub keep_worktree: bool,
     /// Cap on the stored `task.output` blob, in bytes (default 256 KiB). Longer
     /// output is truncated head+tail and flagged.
@@ -431,7 +465,8 @@ impl Default for ExecutorSettings {
             max_concurrency: default_max_concurrency(),
             worktree: true,
             worktree_dir: None,
-            keep_worktree: true,
+            worktree_retention: WorktreeRetentionSettings::default(),
+            keep_worktree: false,
             max_output_bytes: default_max_output_bytes(),
             detect_awaiting_input: true,
             awaiting_input_quiet_ms: default_awaiting_input_quiet_ms(),
@@ -679,6 +714,33 @@ mod tests {
         assert_eq!(cfg.daemon.retention.min_tasks, 1000);
         assert!(cfg.daemon.retention.vacuum);
         assert_eq!(cfg.executor.max_output_bytes, 262_144);
+        assert!(!cfg.executor.keep_worktree);
+    }
+
+    #[test]
+    fn worktree_defaults_changed() {
+        let cfg: FavettoConfig = toml::from_str("").unwrap();
+        assert!(!cfg.executor.keep_worktree);
+        assert_eq!(cfg.executor.worktree_retention.days, 30);
+        assert_eq!(cfg.executor.worktree_retention.min_worktrees, 0);
+    }
+
+    #[test]
+    fn parses_worktree_retention() {
+        let cfg: FavettoConfig = toml::from_str(
+            r#"
+            [executor]
+            keep_worktree = true
+
+            [executor.worktree_retention]
+            days = 2
+            min_worktrees = 5
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.executor.keep_worktree);
+        assert_eq!(cfg.executor.worktree_retention.days, 2);
+        assert_eq!(cfg.executor.worktree_retention.min_worktrees, 5);
     }
 
     #[test]

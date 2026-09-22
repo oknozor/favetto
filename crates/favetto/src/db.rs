@@ -5,7 +5,7 @@
 //! Timestamps are stored as Unix epoch milliseconds (INTEGER) and JSON blobs as TEXT;
 //! the conversion happens at the boundary so the domain model stays clean.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -65,6 +65,14 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
     delivery_id TEXT PRIMARY KEY,
     provider    TEXT NOT NULL,
     received_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS worktrees (
+    task_id    TEXT PRIMARY KEY,
+    repo       TEXT NOT NULL,
+    path       TEXT NOT NULL,
+    branch     TEXT NOT NULL,
+    created_at INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at DESC);
@@ -542,6 +550,68 @@ pub async fn prune(
     Ok(stats)
 }
 
+// ---------------------------------------------------------------------------
+// Worktrees
+// ---------------------------------------------------------------------------
+
+/// A git worktree favetto has created and not yet removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeRecord {
+    pub task_id: Uuid,
+    pub repo: PathBuf,
+    pub path: PathBuf,
+    pub branch: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Insert or refresh the tracking row for a task's worktree.
+///
+/// `INSERT OR REPLACE`: a task id maps to at most one worktree, and a leftover
+/// directory may be reused by `create_worktree`.
+pub async fn record_worktree(pool: &SqlitePool, wt: &WorktreeRecord) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT OR REPLACE INTO worktrees (task_id, repo, path, branch, created_at)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(wt.task_id.to_string())
+    .bind(wt.repo.to_string_lossy().into_owned())
+    .bind(wt.path.to_string_lossy().into_owned())
+    .bind(&wt.branch)
+    .bind(ts_ms(wt.created_at))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Drop the tracking row after a worktree is removed.
+pub async fn forget_worktree(pool: &SqlitePool, task_id: Uuid) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM worktrees WHERE task_id = ?")
+        .bind(task_id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Every tracked worktree, oldest first.
+pub async fn list_worktrees(pool: &SqlitePool) -> anyhow::Result<Vec<WorktreeRecord>> {
+    let rows = sqlx::query(
+        "SELECT task_id, repo, path, branch, created_at FROM worktrees ORDER BY created_at ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(row_to_worktree).collect())
+}
+
+fn row_to_worktree(row: &SqliteRow) -> WorktreeRecord {
+    WorktreeRecord {
+        task_id: Uuid::parse_str(&row.get::<String, _>("task_id")).unwrap_or_default(),
+        repo: PathBuf::from(row.get::<String, _>("repo")),
+        path: PathBuf::from(row.get::<String, _>("path")),
+        branch: row.get("branch"),
+        created_at: from_ms(row.get("created_at")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -882,6 +952,72 @@ mod tests {
             TaskStatus::Succeeded
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn worktree_record_round_trips() {
+        let (dir, pool) = scratch_pool("worktree-roundtrip").await;
+        let now = Utc::now();
+        let first = WorktreeRecord {
+            task_id: Uuid::new_v4(),
+            repo: PathBuf::from("/repo/one"),
+            path: PathBuf::from("/data/worktrees/one"),
+            branch: "favetto/one-1234".to_string(),
+            created_at: now - ChronoDuration::hours(1),
+        };
+        let second = WorktreeRecord {
+            task_id: Uuid::new_v4(),
+            repo: PathBuf::from("/repo/two"),
+            path: PathBuf::from("/data/worktrees/two"),
+            branch: "favetto/two-5678".to_string(),
+            created_at: now,
+        };
+        record_worktree(&pool, &second).await.unwrap();
+        record_worktree(&pool, &first).await.unwrap();
+
+        let listed = list_worktrees(&pool).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        // Oldest first; timestamps round-trip at millisecond precision.
+        assert_eq!(listed[0].task_id, first.task_id);
+        assert_eq!(listed[0].repo, first.repo);
+        assert_eq!(listed[0].path, first.path);
+        assert_eq!(listed[0].branch, first.branch);
+        assert_eq!(
+            listed[0].created_at.timestamp_millis(),
+            first.created_at.timestamp_millis()
+        );
+        assert_eq!(listed[1].task_id, second.task_id);
+
+        // Re-recording the same task id replaces, not appends.
+        let mut replacement = first.clone();
+        replacement.branch = "favetto/one-9999".to_string();
+        record_worktree(&pool, &replacement).await.unwrap();
+        let listed = list_worktrees(&pool).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].branch, "favetto/one-9999");
+
+        // Forgetting removes exactly one row.
+        forget_worktree(&pool, first.task_id).await.unwrap();
+        let listed = list_worktrees(&pool).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].task_id, second.task_id);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn migrate_creates_worktrees_table() {
+        let (dir, pool) = scratch_pool("worktrees-table").await;
+        let names: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(
+            names.iter().any(|n| n == "worktrees"),
+            "missing worktrees table in {names:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
