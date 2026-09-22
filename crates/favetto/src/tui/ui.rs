@@ -1951,6 +1951,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn floating_preview_captures_wheel_over_drawn_rect() {
+        use ratatui::crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+
+        let mut app = App::new();
+        app.tab = Tab::Catalog;
+        app.set_catalog(vec![
+            catalog_entry("a"),
+            catalog_entry("b"),
+            catalog_entry("c"),
+            catalog_entry("d"),
+        ]);
+        let long = (0..80).map(|i| format!("line {i}\n")).collect::<String>();
+        app.catalog_preview = Some(("a".to_string(), long));
+        app.catalog_selected = 0;
+
+        // Draw at a width below the dock threshold: the preview floats over the
+        // tree, so `catalog_preview_area` is inside `catalog_geom.inner`.
+        let _ = render_text(&mut app, CATALOG_PREVIEW_DOCK_MIN_WIDTH - 1, 30);
+        let preview = app.catalog_preview_area.expect("floating preview rect");
+        let before = app.catalog_selected;
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: preview.x + 1,
+            row: preview.y + 1,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert_eq!(app.catalog_selected, before, "tree must not move");
+        assert_eq!(app.catalog_preview_scroll, 3);
+    }
+
     /// A catalog entry with just a name (all optional fields unset).
     fn catalog_entry(name: &str) -> super::super::app::CatalogEntry {
         super::super::app::CatalogEntry {

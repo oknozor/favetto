@@ -932,20 +932,11 @@ impl App {
             }
         }
 
-        // The wheel over a list scrolls that list's selection.
-        let wheel_delta = match mouse.kind {
-            MouseEventKind::ScrollUp => Some(-3),
-            MouseEventKind::ScrollDown => Some(3),
-            _ => None,
-        };
-        if let Some(delta) = wheel_delta {
-            if self.scroll_list(mouse.column, mouse.row, delta) {
-                return UiAction::None;
-            }
-        }
-
         // The wheel scrolls the Catalog preview when the pointer is over it.
-        if self.tab == Tab::Catalog {
+        // This must run before `scroll_list`: on narrow terminals the preview is
+        // a floating overlay drawn inside the tree's full-width hit-test rect, so
+        // offering the wheel to the list first would always steal it.
+        if self.tab == Tab::Catalog && self.catalog_preview_visible {
             if let Some(area) = self.catalog_preview_area {
                 let over = mouse.column >= area.x
                     && mouse.column < area.x + area.width
@@ -964,6 +955,18 @@ impl App {
                         _ => {}
                     }
                 }
+            }
+        }
+
+        // The wheel over a list scrolls that list's selection.
+        let wheel_delta = match mouse.kind {
+            MouseEventKind::ScrollUp => Some(-3),
+            MouseEventKind::ScrollDown => Some(3),
+            _ => None,
+        };
+        if let Some(delta) = wheel_delta {
+            if self.scroll_list(mouse.column, mouse.row, delta) {
+                return UiAction::None;
             }
         }
 
@@ -3348,6 +3351,94 @@ mod tests {
             modifiers: KeyModifiers::empty(),
         });
         assert_eq!(app.catalog_preview_scroll, 0);
+    }
+
+    #[test]
+    fn wheel_over_floating_preview_scrolls_preview_not_tree() {
+        let mut app = App::new();
+        app.tab = Tab::Catalog;
+        app.catalog = (0..6).map(|i| catalog_entry(&format!("t{i}"))).collect();
+        app.catalog_preview_max_scroll = 100;
+        // The floating preview sits inside the full-width tree hit-test rect.
+        let tree_inner = Rect {
+            x: 0,
+            y: 1,
+            width: 79,
+            height: 28,
+        };
+        app.catalog_geom = geom(tree_inner, 0, 6);
+        app.catalog_selected = 1;
+        app.catalog_preview_area = Some(Rect {
+            x: 8,
+            y: 4,
+            width: 60,
+            height: 20,
+        });
+
+        // Wheel over the overlay: preview scrolls, tree does not move.
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 20,
+            row: 10,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.catalog_preview_scroll, 3);
+        assert_eq!(app.catalog_selected, 1, "tree selection must not move");
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 20,
+            row: 10,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.catalog_preview_scroll, 0);
+        assert_eq!(app.catalog_selected, 1);
+
+        // Wheel over the tree, outside the overlay: tree scrolls as before and
+        // the selection change resets the preview scroll.
+        app.catalog_preview_scroll = 5;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 2,
+            row: 2,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.catalog_selected, 4);
+        assert_eq!(app.catalog_preview_scroll, 0);
+    }
+
+    #[test]
+    fn wheel_over_hidden_preview_falls_through_to_tree() {
+        let mut app = App::new();
+        app.tab = Tab::Catalog;
+        app.catalog = (0..6).map(|i| catalog_entry(&format!("t{i}"))).collect();
+        app.catalog_geom = geom(
+            Rect {
+                x: 0,
+                y: 1,
+                width: 79,
+                height: 28,
+            },
+            0,
+            6,
+        );
+        app.catalog_selected = 1;
+        // A stale rect plus visible=false must not capture the wheel.
+        app.catalog_preview_area = Some(Rect {
+            x: 8,
+            y: 4,
+            width: 60,
+            height: 20,
+        });
+        app.catalog_preview_visible = false;
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 20,
+            row: 10,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.catalog_selected, 4);
     }
 
     #[test]
