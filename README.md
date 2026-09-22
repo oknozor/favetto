@@ -412,17 +412,27 @@ favetto does not reimplement a coding agent: it runs a configured agent CLI
 its live terminal in the TUI's **Agent** tab.
 
 Each CLI is behind a generic `Agent` implementation (`OpenCodeAgent`,
-`ClaudeAgent`, `PiAgent`, `VibeAgent`) selected by a registry. A `[agents.*]`
-entry whose name is one of `opencode`/`claude`/`pi`/`vibe` uses that built-in and
-only needs the fields it wants to override — the shipped defaults are exactly the
-example below. Set `type = "opencode"` (etc.) to bind a built-in to a custom name,
-or `type = "configurable"` to force the template-only agent for any name. An
-entry with no `type` and a non-built-in name is `configurable`. Unknown `type`
-values fail at daemon startup.
+`ClaudeAgent`, `PiAgent`, `VibeAgent`) selected by a registry. The four built-ins
+are always registered, so even an empty config exposes them; a `[agents.*]` entry
+overrides one, binds a built-in to a custom name, or adds a custom CLI. A
+`[agents.*]` entry whose name is one of `opencode`/`claude`/`pi`/`vibe` uses that
+built-in and only needs the fields it wants to override — the shipped defaults are
+exactly the example below. Set `type = "opencode"` (etc.) to bind a built-in to a
+custom name, or `type = "configurable"` to force the template-only agent for any
+name. An entry with no `type` and a non-built-in name is `configurable`. Unknown
+`type` values fail at daemon startup.
 
 The built-ins advertise capability flags (interactive, headless, resume, model
 selection, providers, …) that the daemon and the one-shot wizard use to adapt;
-`agents.list` reports them on the wire.
+`agents.list` reports them on the wire. The daemon also probes its `PATH` for each
+agent's executable once at startup and reports an `available` flag: an agent whose
+binary is not installed is still listed but marked unavailable, and launching it
+fails with a clear error. The one-shot wizard dims unavailable agents by appending
+`(not installed)` and skips over them, so they cannot be selected. Availability is
+resolved once, so a `PATH` change needs a daemon restart.
+
+The example below shows overriding the opencode built-in; every field you set is
+merged over the built-in default, and omitted fields keep it.
 
 ```toml
 # ~/.config/favetto/config.toml

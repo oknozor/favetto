@@ -42,6 +42,7 @@ impl ClaudeAgent {
             id: name.to_string(),
             name: "Claude".to_string(),
             command: config.command.clone(),
+            available: true,
             capabilities,
         };
         Self {
@@ -69,6 +70,10 @@ impl Agent for ClaudeAgent {
 
     fn session_id_probe(&self) -> Option<SessionIdProbe> {
         self.template.probe.clone()
+    }
+
+    fn set_available(&mut self, available: bool) {
+        self.template.descriptor.available = available;
     }
 }
 

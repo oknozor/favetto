@@ -415,6 +415,7 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
                     display_name: d.name.clone(),
                     command: d.command.clone(),
                     default: default.as_deref() == Some(d.id.as_str()),
+                    available: d.available,
                     capabilities: d.capabilities,
                     sessions: sessions
                         .iter()
@@ -431,6 +432,7 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
                         display_name: String::new(),
                         command: String::new(),
                         default: false,
+                        available: false,
                         capabilities: Default::default(),
                         sessions: vec![s.clone()],
                     });
@@ -606,10 +608,7 @@ async fn start_agent(
                 anyhow::anyhow!("no agent given and no default configured ([agent].default)")
             })?
     };
-    let agent = state
-        .registry
-        .get(&name)
-        .ok_or_else(|| anyhow::anyhow!("agent '{name}' is not configured under [agents.*]"))?;
+    let agent = state.registry.get_checked(&name)?;
 
     let ctx = AgentContext {
         cwd: params
@@ -770,10 +769,7 @@ async fn start_oneshot_task(
                 anyhow::anyhow!("no agent given and no default configured ([agent].default)")
             })?
     };
-    let agent = state
-        .registry
-        .get(&name)
-        .ok_or_else(|| anyhow::anyhow!("agent '{name}' is not configured under [agents.*]"))?;
+    let agent = state.registry.get_checked(&name)?;
     let cwd_path = cwd.as_ref().map(std::path::PathBuf::from);
 
     let task = Task {

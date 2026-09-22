@@ -65,6 +65,7 @@ impl OpenCodeAgent {
             id: name.to_string(),
             name: "OpenCode".to_string(),
             command: config.command.clone(),
+            available: true,
             capabilities,
         };
         Self {
@@ -104,6 +105,10 @@ impl Agent for OpenCodeAgent {
             return None;
         }
         session_title_from_json(&String::from_utf8_lossy(&out.stdout), session_id)
+    }
+
+    fn set_available(&mut self, available: bool) {
+        self.template.descriptor.available = available;
     }
 
     fn parse_output(&self, raw: &str, exit_code: Option<i32>) -> AgentRunResult {

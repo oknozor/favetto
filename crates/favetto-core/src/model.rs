@@ -406,6 +406,12 @@ pub struct AgentCapabilities {
     pub prompt_prefill: bool,
 }
 
+/// Default for a payload that omits `available`: older daemons/clients only know
+/// about agents they can actually launch, so treat them as available.
+fn default_available() -> bool {
+    true
+}
+
 /// A configured external agent plus its live-session state, as returned by
 /// `agents.list`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -417,6 +423,9 @@ pub struct AgentCatalogEntry {
     pub display_name: String,
     pub command: String,
     pub default: bool,
+    /// Whether the agent's executable was found on the daemon's PATH.
+    #[serde(default = "default_available")]
+    pub available: bool,
     /// What the agent can do; see [`AgentCapabilities`].
     #[serde(default)]
     pub capabilities: AgentCapabilities,
@@ -458,6 +467,7 @@ mod tests {
             display_name: "OpenCode".to_string(),
             command: "opencode".to_string(),
             default: true,
+            available: true,
             capabilities: AgentCapabilities {
                 interactive: true,
                 headless: true,
@@ -472,11 +482,13 @@ mod tests {
         };
         let json = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["capabilities"]["providers"], true);
+        assert_eq!(json["available"], true);
         let back: AgentCatalogEntry = serde_json::from_value(json).unwrap();
         assert_eq!(back.name, entry.name);
         assert_eq!(back.display_name, entry.display_name);
         assert_eq!(back.capabilities, entry.capabilities);
         assert!(back.default);
+        assert!(back.available);
 
         // Old payloads without the new fields still decode, defaulting them.
         let legacy: AgentCatalogEntry =
@@ -484,6 +496,7 @@ mod tests {
                 .unwrap();
         assert_eq!(legacy.display_name, "");
         assert_eq!(legacy.capabilities, AgentCapabilities::default());
+        assert!(legacy.available, "omitted `available` must default to true");
     }
 
     #[test]
