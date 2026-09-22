@@ -944,7 +944,7 @@ mod tests {
         assert_eq!(summary["repo"], "oknozor/favetto");
         assert_eq!(summary["number"], 7);
 
-        let tasks = crate::db::list_tasks(&pool).await.unwrap();
+        let tasks = crate::db::list_tasks(&pool, 500).await.unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].status, TaskStatus::Pending);
         assert_eq!(tasks[0].input["title"], "Fix the thing");
@@ -970,7 +970,7 @@ mod tests {
             handle_github(&state, &headers, &body).await.status(),
             StatusCode::OK
         );
-        assert_eq!(crate::db::list_tasks(&pool).await.unwrap().len(), 2);
+        assert_eq!(crate::db::list_tasks(&pool, 500).await.unwrap().len(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -999,7 +999,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(crate::db::list_tasks(&pool).await.unwrap().len(), 1);
+        assert_eq!(crate::db::list_tasks(&pool, 500).await.unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1016,7 +1016,7 @@ mod tests {
             StatusCode::OK
         );
         assert!(crate::db::tail_events(&pool, 100).await.unwrap().is_empty());
-        assert!(crate::db::list_tasks(&pool).await.unwrap().is_empty());
+        assert!(crate::db::list_tasks(&pool, 500).await.unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1033,7 +1033,7 @@ mod tests {
             StatusCode::UNAUTHORIZED
         );
         assert!(crate::db::tail_events(&pool, 100).await.unwrap().is_empty());
-        assert!(crate::db::list_tasks(&pool).await.unwrap().is_empty());
+        assert!(crate::db::list_tasks(&pool, 500).await.unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

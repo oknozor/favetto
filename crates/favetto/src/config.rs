@@ -305,6 +305,50 @@ pub struct DaemonSettings {
     pub socket: Option<PathBuf>,
     pub tasks_dir: Option<PathBuf>,
     pub data_dir: Option<PathBuf>,
+    /// Bounded database growth. On by default; `days = 0` keeps everything.
+    #[serde(default)]
+    pub retention: RetentionSettings,
+}
+
+fn default_retention_days() -> u64 {
+    30
+}
+
+fn default_retention_min_tasks() -> u64 {
+    1000
+}
+
+fn default_max_output_bytes() -> usize {
+    256 * 1024
+}
+
+/// Database retention policy.
+///
+/// This is the one setting that deletes data: on daemon start (and every six
+/// hours) rows older than `days` are pruned and the database is optionally
+/// `VACUUM`ed. `min_tasks` guarantees the newest N task rows survive regardless
+/// of age. Set `days = 0` to opt out and keep everything forever.
+#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
+pub struct RetentionSettings {
+    /// Delete rows older than this many days (0 = keep forever).
+    #[serde(default = "default_retention_days")]
+    pub days: u64,
+    /// Always keep at least this many newest task rows.
+    #[serde(default = "default_retention_min_tasks")]
+    pub min_tasks: u64,
+    /// VACUUM + WAL checkpoint after a prune that deleted rows.
+    #[serde(default = "default_true")]
+    pub vacuum: bool,
+}
+
+impl Default for RetentionSettings {
+    fn default() -> Self {
+        Self {
+            days: default_retention_days(),
+            min_tasks: default_retention_min_tasks(),
+            vacuum: true,
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -357,6 +401,10 @@ pub struct ExecutorSettings {
     /// branch/changes can be inspected; false removes them.
     #[serde(default = "default_true")]
     pub keep_worktree: bool,
+    /// Cap on the stored `task.output` blob, in bytes (default 256 KiB). Longer
+    /// output is truncated head+tail and flagged.
+    #[serde(default = "default_max_output_bytes")]
+    pub max_output_bytes: usize,
 }
 
 impl Default for ExecutorSettings {
@@ -367,6 +415,7 @@ impl Default for ExecutorSettings {
             worktree: true,
             worktree_dir: None,
             keep_worktree: true,
+            max_output_bytes: default_max_output_bytes(),
         }
     }
 }
@@ -586,6 +635,44 @@ mod tests {
         // An explicit `off` is also accepted.
         let off: FavettoConfig = toml::from_str("[git]\nsigning = \"off\"\n").unwrap();
         assert_eq!(off.git.effective_signing(), GitSigning::Off);
+    }
+
+    #[test]
+    fn retention_and_output_cap_defaults() {
+        let cfg: FavettoConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.daemon.retention.days, 30);
+        assert_eq!(cfg.daemon.retention.min_tasks, 1000);
+        assert!(cfg.daemon.retention.vacuum);
+        assert_eq!(cfg.executor.max_output_bytes, 262_144);
+    }
+
+    #[test]
+    fn parses_retention_and_output_cap() {
+        let cfg: FavettoConfig = toml::from_str(
+            r#"
+            [daemon.retention]
+            days = 7
+            min_tasks = 50
+            vacuum = false
+
+            [executor]
+            max_output_bytes = 4096
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.daemon.retention.days, 7);
+        assert_eq!(cfg.daemon.retention.min_tasks, 50);
+        assert!(!cfg.daemon.retention.vacuum);
+        assert_eq!(cfg.executor.max_output_bytes, 4096);
+    }
+
+    #[test]
+    fn retention_days_zero_disables_pruning() {
+        let cfg: FavettoConfig = toml::from_str("[daemon.retention]\ndays = 0\n").unwrap();
+        assert_eq!(cfg.daemon.retention.days, 0);
+        // Other retention defaults still apply.
+        assert_eq!(cfg.daemon.retention.min_tasks, 1000);
+        assert!(cfg.daemon.retention.vacuum);
     }
 
     #[test]

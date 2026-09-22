@@ -10,8 +10,8 @@ Every section is optional; favetto falls back to built-in defaults for anything 
 |-------|------|---------|----------|-------------|
 | `agent` | AgentSettings | `{}` | no | Default external agent used for catalog tasks and new agent sessions. |
 | `agents` | Map<String, AgentConfig> | `{}` | no | External coding agents by name (e.g. `claude`, `opencode`, `pi`, `vibe`). |
-| `daemon` | DaemonSettings | `{"data_dir":null,"listen":null,"socket":null,"tasks_dir":null}` | no | Daemon defaults (overridable by CLI flags). |
-| `executor` | ExecutorSettings | `{"keep_worktree":true,"max_concurrency":4,"parallel":false,"worktree":true}` | no | Task executor concurrency / isolation. |
+| `daemon` | DaemonSettings | `{"data_dir":null,"listen":null,"retention":{"days":30,"min_tasks":1000,"vacuum":true},"socket":null,"tasks_dir":null}` | no | Daemon defaults (overridable by CLI flags). |
+| `executor` | ExecutorSettings | `{"keep_worktree":true,"max_concurrency":4,"max_output_bytes":262144,"parallel":false,"worktree":true}` | no | Task executor concurrency / isolation. |
 | `git` | GitSettings | `{}` | no | Non-interactive git provisioning for agent processes. Defaults to `signing = "off"`, which forces `commit.gpgsign = false` so an agent commit can never block on an interactive pinentry/askpass prompt. |
 | `tui` | TuiSettings | `{"sound":{"enabled":true,"events":{"attention":"none","task_failed":"failure","task_finished":"success","task_started":"none"},"min_interval_ms":400,"only_when_unfocused":false,"player":"auto"}}` | no | Client-side TUI settings. Ignored by the daemon, which reads the same file. |
 | `webhook` | WebhookSettings | `{"github":{"enabled":false,"rules":[]}}` | no | Webhook trigger rules (currently GitHub). |
@@ -63,6 +63,7 @@ under that key (e.g. `"sessionID"`) and stored on the task.
 |-------|------|---------|----------|-------------|
 | `data_dir` | string (optional) | — | no |  |
 | `listen` | string (optional) | — | no |  |
+| `retention` | RetentionSettings | `{"days":30,"min_tasks":1000,"vacuum":true}` | no | Bounded database growth. On by default; `days = 0` keeps everything. |
 | `socket` | string (optional) | — | no |  |
 | `tasks_dir` | string (optional) | — | no |  |
 
@@ -79,6 +80,7 @@ serialized per working directory.
 |-------|------|---------|----------|-------------|
 | `keep_worktree` | boolean | `true` | no | Keep worktrees after the task finishes (default true) so the agent's branch/changes can be inspected; false removes them. |
 | `max_concurrency` | integer | `4` | no | Maximum concurrent tasks when `parallel` is true. |
+| `max_output_bytes` | integer | `262144` | no | Cap on the stored `task.output` blob, in bytes (default 256 KiB). Longer output is truncated head+tail and flagged. |
 | `parallel` | boolean | `false` | no | Run multiple tasks at once (default false: one at a time). |
 | `worktree` | boolean | `true` | no | Give each task its own `git worktree` when it runs in a repository. |
 | `worktree_dir` | string (optional) | — | no | Where worktrees are created: absolute, or relative to the repo root. Defaults to `<data_dir>/worktrees`. |
@@ -157,6 +159,21 @@ editing them.
 | `rules` | GithubRule[] | `[]` | no |  |
 | `secret` | string (optional) | — | no | Literal secret (accepted but discouraged). |
 | `secret_env` | string (optional) | — | no | Name of the env var holding the signing secret. |
+
+## RetentionSettings
+
+Database retention policy.
+
+This is the one setting that deletes data: on daemon start (and every six
+hours) rows older than `days` are pruned and the database is optionally
+`VACUUM`ed. `min_tasks` guarantees the newest N task rows survive regardless
+of age. Set `days = 0` to opt out and keep everything forever.
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `days` | integer | `30` | no | Delete rows older than this many days (0 = keep forever). |
+| `min_tasks` | integer | `1000` | no | Always keep at least this many newest task rows. |
+| `vacuum` | boolean | `true` | no | VACUUM + WAL checkpoint after a prune that deleted rows. |
 
 ## SoundSettings
 

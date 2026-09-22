@@ -25,6 +25,8 @@ pub mod error_code {
 pub mod method {
     pub const PING: &str = "system.ping";
     pub const TASKS_LIST: &str = "tasks.list";
+    /// Fetch a single task by id, including its stored output blob.
+    pub const TASKS_GET: &str = "tasks.get";
     pub const TASKS_CANCEL: &str = "tasks.cancel";
     /// Start a catalog task by name.
     pub const TASKS_START: &str = "tasks.start";
@@ -89,7 +91,14 @@ pub mod push {
 /// with [`method`].
 pub const CLIENT_METHODS: &[(&str, &str)] = &[
     (method::PING, "Liveness check."),
-    (method::TASKS_LIST, "List tasks."),
+    (
+        method::TASKS_LIST,
+        "List tasks (metadata only; output is omitted).",
+    ),
+    (
+        method::TASKS_GET,
+        "Fetch a single task by id, including its stored output.",
+    ),
     (method::TASKS_CANCEL, "Cancel a task."),
     (method::TASKS_START, "Start a catalog task by name."),
     (
@@ -273,6 +282,7 @@ mod tests {
         let methods: HashSet<&str> = [
             method::PING,
             method::TASKS_LIST,
+            method::TASKS_GET,
             method::TASKS_CANCEL,
             method::TASKS_START,
             method::TASKS_START_ONESHOT,

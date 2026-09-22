@@ -6,9 +6,12 @@
 //! the conversion happens at the boundary so the domain model stays clean.
 
 use std::path::Path;
+use std::time::Duration;
 
-use chrono::{DateTime, Utc};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
+};
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
@@ -63,6 +66,11 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
     provider    TEXT NOT NULL,
     received_at INTEGER NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tasks_status_created_at ON tasks(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);
+CREATE INDEX IF NOT EXISTS idx_notifications_sent_at ON notifications(sent_at);
 "#;
 
 fn ts_ms(dt: DateTime<Utc>) -> i64 {
@@ -77,7 +85,10 @@ fn from_ms(ms: i64) -> DateTime<Utc> {
 pub async fn open(path: &Path) -> anyhow::Result<SqlitePool> {
     let options = SqliteConnectOptions::new()
         .filename(path)
-        .create_if_missing(true);
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(Duration::from_secs(5));
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .connect_with(options)
@@ -167,12 +178,14 @@ pub async fn get_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Option<Task
     Ok(row.as_ref().map(row_to_task))
 }
 
-/// List the most recent tasks (newest first).
-pub async fn list_tasks(pool: &SqlitePool) -> anyhow::Result<Vec<Task>> {
+/// List the most recent tasks (newest first), without their output blobs. Output
+/// is fetched on demand with [`get_task`].
+pub async fn list_tasks(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec<Task>> {
     let rows = sqlx::query(
-        "SELECT id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title \
-         FROM tasks ORDER BY created_at DESC LIMIT 500",
+        "SELECT id, name, status, input, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title \
+         FROM tasks ORDER BY created_at DESC LIMIT ?",
     )
+    .bind(limit.max(1))
     .fetch_all(pool)
     .await?;
     Ok(rows.iter().map(row_to_task).collect())
@@ -223,7 +236,9 @@ fn row_to_task(row: &SqliteRow) -> Task {
             .unwrap_or(TaskStatus::Pending),
         input: serde_json::from_str(&row.get::<String, _>("input")).unwrap_or_default(),
         output: row
-            .get::<Option<String>, _>("output")
+            .try_get::<Option<String>, _>("output")
+            .ok()
+            .flatten()
             .and_then(|s| serde_json::from_str(&s).ok()),
         dedupe_key: row.get("dedupe_key"),
         created_at: from_ms(row.get("created_at")),
@@ -420,7 +435,7 @@ pub async fn fail_interrupted_tasks(pool: &SqlitePool) -> anyhow::Result<u64> {
 /// Up to `limit` pending tasks, oldest first (for the parallel executor).
 pub async fn next_pending_tasks(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec<Task>> {
     let rows = sqlx::query(
-        "SELECT id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title \
+        "SELECT id, name, status, input, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title \
          FROM tasks WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?",
     )
     .bind(limit.max(1))
@@ -440,6 +455,90 @@ pub async fn claim_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<bool> {
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
+}
+
+// ---------------------------------------------------------------------------
+// Retention
+// ---------------------------------------------------------------------------
+
+/// What a [`prune`] pass removed (and whether it reclaimed disk space).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PruneStats {
+    pub outputs_cleared: u64,
+    pub tasks_deleted: u64,
+    pub events_deleted: u64,
+    pub notifications_deleted: u64,
+    pub webhook_deliveries_deleted: u64,
+    pub vacuumed: bool,
+}
+
+/// Delete rows older than `days` (0 disables) while always keeping the newest
+/// `min_tasks` task rows, then optionally reclaim disk space.
+pub async fn prune(
+    pool: &SqlitePool,
+    days: u64,
+    min_tasks: u64,
+    vacuum: bool,
+) -> anyhow::Result<PruneStats> {
+    let mut stats = PruneStats::default();
+    if days == 0 {
+        return Ok(stats);
+    }
+    let cutoff = ts_ms(Utc::now() - ChronoDuration::days(days as i64));
+    // Clear blobs first: cheap space reclaim, keeps task metadata.
+    stats.outputs_cleared = sqlx::query(
+        "UPDATE tasks SET output = NULL WHERE output IS NOT NULL \
+         AND finished_at IS NOT NULL AND finished_at < ?",
+    )
+    .bind(cutoff)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    // Then delete old terminal rows, always keeping the newest `min_tasks`.
+    stats.tasks_deleted = sqlx::query(
+        "DELETE FROM tasks WHERE finished_at IS NOT NULL AND finished_at < ? \
+         AND id NOT IN (SELECT id FROM tasks ORDER BY created_at DESC LIMIT ?)",
+    )
+    .bind(cutoff)
+    .bind(min_tasks as i64)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    stats.events_deleted = sqlx::query("DELETE FROM events WHERE created_at < ?")
+        .bind(cutoff)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    stats.notifications_deleted = sqlx::query("DELETE FROM notifications WHERE sent_at < ?")
+        .bind(cutoff)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    stats.webhook_deliveries_deleted =
+        sqlx::query("DELETE FROM webhook_deliveries WHERE received_at < ?")
+            .bind(cutoff)
+            .execute(pool)
+            .await?
+            .rows_affected();
+    if vacuum
+        && (stats.outputs_cleared
+            + stats.tasks_deleted
+            + stats.events_deleted
+            + stats.notifications_deleted
+            + stats.webhook_deliveries_deleted)
+            > 0
+    {
+        // VACUUM must not run inside a transaction; sqlx executes it in autocommit.
+        if let Err(e) = sqlx::query("VACUUM").execute(pool).await {
+            tracing::warn!(error = %e, "VACUUM failed; database is pruned but not compacted");
+        } else {
+            stats.vacuumed = true;
+        }
+        let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(pool)
+            .await;
+    }
+    Ok(stats)
 }
 
 #[cfg(test)]
@@ -580,6 +679,164 @@ mod tests {
         upsert_task(&pool, &task).await.unwrap();
         let got = get_task(&pool, task.id).await.unwrap().unwrap();
         assert_eq!(got.session_title.as_deref(), Some("Legacy title"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    async fn scratch_pool(tag: &str) -> (std::path::PathBuf, SqlitePool) {
+        let dir = std::env::temp_dir().join(format!(
+            "favetto-{tag}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = open(&dir.join("test.db")).await.unwrap();
+        migrate(&pool).await.unwrap();
+        (dir, pool)
+    }
+
+    fn task_at(
+        created_at: DateTime<Utc>,
+        finished_at: Option<DateTime<Utc>>,
+        output: Option<serde_json::Value>,
+    ) -> Task {
+        Task {
+            id: Uuid::new_v4(),
+            name: "t".to_string(),
+            status: TaskStatus::Succeeded,
+            input: serde_json::json!({}),
+            output,
+            dedupe_key: None,
+            created_at,
+            started_at: Some(created_at),
+            finished_at,
+            error: None,
+            session_id: None,
+            session_title: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_tasks_omits_output_but_get_task_keeps_it() {
+        let (dir, pool) = scratch_pool("list-omits-output").await;
+
+        let task = task_at(
+            Utc::now(),
+            Some(Utc::now()),
+            Some(serde_json::json!({ "output": "x".repeat(50_000) })),
+        );
+        upsert_task(&pool, &task).await.unwrap();
+
+        let listed = list_tasks(&pool, 500).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].output.is_none(), "list must not carry output");
+
+        let fetched = get_task(&pool, task.id).await.unwrap().unwrap();
+        assert!(
+            fetched.output.is_some(),
+            "tasks.get must keep the output blob"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn open_enables_wal() {
+        let (dir, pool) = scratch_pool("wal").await;
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn migrate_creates_task_indexes() {
+        let (dir, pool) = scratch_pool("indexes").await;
+        let names: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'index'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        for expected in [
+            "idx_tasks_created_at",
+            "idx_tasks_status_created_at",
+            "idx_events_created_at",
+            "idx_notifications_sent_at",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "missing index `{expected}` in {names:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn prune_keeps_newest_min_tasks_and_deletes_old_rows() {
+        let (dir, pool) = scratch_pool("prune-tasks").await;
+        let old = Utc::now() - ChronoDuration::days(60);
+        // Four terminal tasks, oldest first. `min_tasks = 2` keeps the newest two.
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            let created = old + ChronoDuration::hours(i);
+            let task = task_at(created, Some(created), None);
+            ids.push(task.id);
+            upsert_task(&pool, &task).await.unwrap();
+        }
+        // An old event and notification, plus one fresh of each.
+        sqlx::query("INSERT INTO events (kind, payload, created_at) VALUES ('synthetic', '{}', ?)")
+            .bind(ts_ms(old))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO notifications (channel, subject, body, status, sent_at) VALUES ('c', 's', 'b', 'sent', ?)")
+            .bind(ts_ms(old))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let stats = prune(&pool, 30, 2, false).await.unwrap();
+        assert_eq!(stats.tasks_deleted, 2);
+        assert_eq!(stats.events_deleted, 1);
+        assert_eq!(stats.notifications_deleted, 1);
+        assert!(!stats.vacuumed);
+
+        let remaining = list_tasks(&pool, 100).await.unwrap();
+        assert_eq!(remaining.len(), 2);
+        let remaining_ids: Vec<Uuid> = remaining.iter().map(|t| t.id).collect();
+        assert!(remaining_ids.contains(&ids[2]));
+        assert!(remaining_ids.contains(&ids[3]));
+
+        // `days = 0` is a no-op.
+        let noop = prune(&pool, 0, 0, true).await.unwrap();
+        assert_eq!(noop, PruneStats::default());
+        assert_eq!(list_tasks(&pool, 100).await.unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn prune_clears_old_outputs() {
+        let (dir, pool) = scratch_pool("prune-outputs").await;
+        let old = Utc::now() - ChronoDuration::days(60);
+        let task = task_at(
+            old,
+            Some(old),
+            Some(serde_json::json!({ "big": "x".repeat(1000) })),
+        );
+        upsert_task(&pool, &task).await.unwrap();
+
+        // A high `min_tasks` keeps the row, but its old output is still cleared.
+        let stats = prune(&pool, 30, 1000, false).await.unwrap();
+        assert_eq!(stats.tasks_deleted, 0);
+        assert_eq!(stats.outputs_cleared, 1);
+
+        let got = get_task(&pool, task.id).await.unwrap().unwrap();
+        assert!(got.output.is_none());
+        assert_eq!(list_tasks(&pool, 100).await.unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -80,6 +80,15 @@ socket = "/tmp/favetto.sock"
 tasks_dir = "tasks"
 # data_dir = "~/.local/share/favetto"
 
+# Bounded database growth. This is the one setting that deletes data: at daemon
+# startup and every six hours, rows older than `days` are pruned and the database
+# is optionally VACUUM'd. The newest `min_tasks` task rows always survive. Set
+# days = 0 to keep everything forever.
+[daemon.retention]
+days = 30          # delete rows older than this many days (0 = keep forever)
+min_tasks = 1000   # always keep the newest N task rows
+vacuum = true      # reclaim disk space after a prune
+
 # Task executor concurrency + isolation.
 [executor]
 parallel = true            # run tasks concurrently (default false = one at a time)
@@ -87,6 +96,7 @@ max_concurrency = 4        # slots when parallel
 worktree = true            # when parallel and in a git repo, give each task its own worktree
 # worktree_dir = "~/.local/share/favetto/worktrees"  # absolute, ~-expanded, or repo-relative
 keep_worktree = true       # keep worktrees after the task (so branches/changes can be inspected)
+# max_output_bytes = 262144  # stored task output cap; longer output is truncated head+tail
 
 # Non-interactive git for agent sessions. favetto injects these into every agent
 # PTY through git's environment config only, never touching your real config.

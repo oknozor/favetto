@@ -285,10 +285,37 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
                 .unwrap_or_default(),
         })),
 
-        method::TASKS_LIST => match db::list_tasks(&state.db).await {
-            Ok(tasks) => Ok(serde_json::json!(tasks)),
-            Err(e) => Err((error_code::INTERNAL, e.to_string())),
-        },
+        method::TASKS_LIST => {
+            let limit = req
+                .params
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(500)
+                .min(2000) as i64;
+            match db::list_tasks(&state.db, limit).await {
+                Ok(tasks) => Ok(serde_json::json!(tasks)),
+                Err(e) => Err((error_code::INTERNAL, e.to_string())),
+            }
+        }
+
+        method::TASKS_GET => {
+            let id = req
+                .params
+                .get("id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok());
+            match id {
+                Some(id) => match db::get_task(&state.db, id).await {
+                    Ok(Some(task)) => Ok(serde_json::json!(task)),
+                    Ok(None) => Err((error_code::INVALID_PARAMS, "task not found".to_string())),
+                    Err(e) => Err((error_code::INTERNAL, e.to_string())),
+                },
+                None => Err((
+                    error_code::INVALID_PARAMS,
+                    "missing or invalid 'id'".to_string(),
+                )),
+            }
+        }
 
         method::TASKS_CANCEL => {
             let id = req
@@ -805,7 +832,7 @@ async fn start_oneshot_task(
     };
     db::insert_task(&state.db, &task).await?;
     crate::metrics::inc_tasks();
-    state.bus.publish(ServerPush::TaskUpdated(task.clone()));
+    state.bus.publish(ServerPush::TaskUpdated(task.summary()));
     state
         .emit_event(
             EventKind::TaskIdle,
@@ -916,7 +943,7 @@ async fn finish_oneshot(
     };
     task.finished_at = Some(Utc::now());
     let _ = db::upsert_task(&state.db, &task).await;
-    state.bus.publish(ServerPush::TaskUpdated(task.clone()));
+    state.bus.publish(ServerPush::TaskUpdated(task.summary()));
     state
         .emit_event(
             if success {
@@ -1111,7 +1138,7 @@ async fn cancel_task(state: &State, id: Uuid) -> anyhow::Result<favetto_core::mo
 
     state
         .bus
-        .publish(crate::event_bus::ServerPush::TaskUpdated(task.clone()));
+        .publish(crate::event_bus::ServerPush::TaskUpdated(task.summary()));
 
     let event = favetto_core::model::Event {
         id: 0,
@@ -1129,7 +1156,7 @@ async fn cancel_task(state: &State, id: Uuid) -> anyhow::Result<favetto_core::mo
             .publish(crate::event_bus::ServerPush::Event(event));
     }
 
-    Ok(task)
+    Ok(task.summary())
 }
 
 /// Build a log-line push (used by later milestones; wired up for completeness).
@@ -1456,6 +1483,89 @@ mod tests {
         assert!(stored.session_id.is_none());
         assert!(stored.session_title.is_none());
         assert!(stored.error.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn tasks_list_omits_output_and_honours_limit_and_get_returns_it() {
+        let dir = temp_dir("tasks-list-get");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let state = test_state(&dir, &tasks_dir).await;
+
+        let make = |name: &str| Task {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            status: TaskStatus::Succeeded,
+            input: serde_json::json!({}),
+            output: Some(serde_json::json!({ "output": "x".repeat(20_000) })),
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: Some(Utc::now()),
+            error: None,
+            session_id: None,
+            session_title: None,
+        };
+        let first = make("one");
+        let second = make("two");
+        db::upsert_task(&state.db, &first).await.unwrap();
+        db::upsert_task(&state.db, &second).await.unwrap();
+
+        // `tasks.list` carries metadata only.
+        let resp = dispatch(
+            &state,
+            Request {
+                id: 1,
+                method: method::TASKS_LIST.to_string(),
+                params: serde_json::json!({}),
+            },
+        )
+        .await;
+        let list = resp.result.expect("tasks.list result");
+        let list = list.as_array().expect("array");
+        assert_eq!(list.len(), 2);
+        assert!(
+            list.iter().all(|t| t.get("output").is_none()),
+            "list must omit output: {list:?}"
+        );
+
+        // `limit` narrows the list.
+        let resp = dispatch(
+            &state,
+            Request {
+                id: 2,
+                method: method::TASKS_LIST.to_string(),
+                params: serde_json::json!({ "limit": 1 }),
+            },
+        )
+        .await;
+        assert_eq!(resp.result.unwrap().as_array().unwrap().len(), 1);
+
+        // `tasks.get` returns the full output blob.
+        let resp = dispatch(
+            &state,
+            Request {
+                id: 3,
+                method: method::TASKS_GET.to_string(),
+                params: serde_json::json!({ "id": first.id }),
+            },
+        )
+        .await;
+        assert!(resp.result.unwrap().get("output").is_some());
+
+        // Unknown ids are an invalid-params error.
+        let resp = dispatch(
+            &state,
+            Request {
+                id: 4,
+                method: method::TASKS_GET.to_string(),
+                params: serde_json::json!({ "id": Uuid::new_v4() }),
+            },
+        )
+        .await;
+        assert_eq!(resp.error.unwrap().code, error_code::INVALID_PARAMS);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
