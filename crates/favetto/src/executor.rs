@@ -485,6 +485,21 @@ async fn run_agent_task(
         ctx,
     )?;
 
+    // Resolve the title as soon as the CLI reports its session id instead of
+    // waiting for the run to end, so an open TUI fills the `SESSION` cell live.
+    let title_watch = if agent.has_session_titles() {
+        let st = state.clone();
+        let ag = agent.clone();
+        let live = info.id.clone();
+        let tid = task.id;
+        let watch_cwd = cwd.to_path_buf();
+        Some(tokio::spawn(async move {
+            watch_title_while_running(&st, tid, ag, &live, &watch_cwd).await
+        }))
+    } else {
+        None
+    };
+
     let (detect, quiet) = {
         let cfg = state.config.read().unwrap();
         (
@@ -504,21 +519,17 @@ async fn run_agent_task(
     if result.session_id.is_none() {
         result.session_id = state.agents.external_session_id(&info.id);
     }
-    // Resolve the title with a bounded retry (a subprocess lookup in most CLIs)
-    // before the worktree is torn down; a failure or an agent without titles
-    // degrades to `None`.
-    let session_title = match result.session_id.clone() {
-        Some(sid) => {
-            resolve_session_title(
-                agent.clone(),
-                &sid,
-                cwd,
-                TITLE_POLL_ATTEMPTS,
-                TITLE_POLL_INTERVAL,
-            )
-            .await
-        }
-        None => None,
+    // Prefer the title resolved (and already published) while the run was still
+    // in progress. Only fall back to a fresh bounded lookup when the watcher
+    // never saw a session id, so the retry budget is never spent twice in a row.
+    let session_title = match title_watch {
+        Some(handle) => match handle.await {
+            Ok(TitleWatch::Observed(title)) => title,
+            Ok(TitleWatch::Skipped) | Err(_) => {
+                resolve_title_fallback(agent.clone(), result.session_id.clone(), cwd).await
+            }
+        },
+        None => resolve_title_fallback(agent.clone(), result.session_id.clone(), cwd).await,
     };
     // The run's PTY only carried machine output (e.g. JSON events); drop it once
     // its session id is captured, since reattaching launches a fresh interactive
@@ -553,6 +564,60 @@ async fn run_agent_task(
 const BACKFILL_ATTEMPTS: u32 = 30;
 const BACKFILL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How often to check whether a running agent has reported its session id yet.
+const SESSION_ID_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// The completion-time safety net: resolve the title from the parsed session id
+/// with a bounded retry before the worktree is torn down.
+async fn resolve_title_fallback(
+    agent: Arc<dyn Agent>,
+    session_id: Option<String>,
+    cwd: &Path,
+) -> Option<String> {
+    let sid = session_id?;
+    resolve_session_title(agent, &sid, cwd, TITLE_POLL_ATTEMPTS, TITLE_POLL_INTERVAL).await
+}
+
+/// What a mid-run title watch produced.
+pub(crate) enum TitleWatch {
+    /// The live session id was seen; the title budget was spent (`Some` when a
+    /// title was found/stored, `None` when it never appeared).
+    Observed(Option<String>),
+    /// The session exited before any external session id was captured.
+    Skipped,
+}
+
+/// While a run is in progress, wait for its live external session id, then
+/// resolve and persist the title (publishing `TaskUpdated`) immediately instead
+/// of waiting for the run to end.
+pub(crate) async fn watch_title_while_running(
+    state: &Arc<State>,
+    task_id: Uuid,
+    agent: Arc<dyn Agent>,
+    live_session: &str,
+    cwd: &Path,
+) -> TitleWatch {
+    loop {
+        if let Some(sid) = state.agents.external_session_id(live_session) {
+            let title = backfill_title(
+                state,
+                task_id,
+                agent,
+                sid,
+                cwd.to_path_buf(),
+                TITLE_POLL_ATTEMPTS,
+                TITLE_POLL_INTERVAL,
+            )
+            .await;
+            return TitleWatch::Observed(title);
+        }
+        if !state.agents.is_running(live_session) {
+            return TitleWatch::Skipped;
+        }
+        tokio::time::sleep(SESSION_ID_POLL_INTERVAL).await;
+    }
+}
+
 /// Poll for a missing session title in the background and persist the first one
 /// that appears, publishing a `TaskUpdated` so an open TUI fills the cell live.
 fn spawn_title_backfill(
@@ -577,6 +642,8 @@ fn spawn_title_backfill(
 }
 
 /// The body of [`spawn_title_backfill`], split out so it can be awaited in tests.
+/// Returns the stored title, if any. Persists the session id when the row that
+/// the live run is attached to has not recorded it yet.
 async fn backfill_title(
     state: &Arc<State>,
     task_id: Uuid,
@@ -585,21 +652,29 @@ async fn backfill_title(
     cwd: PathBuf,
     attempts: u32,
     interval: Duration,
-) {
-    let Some(title) = resolve_session_title(agent, &session_id, &cwd, attempts, interval).await
-    else {
-        return;
-    };
+) -> Option<String> {
     let Ok(Some(mut task)) = db::get_task(&state.db, task_id).await else {
-        return;
+        return None;
     };
-    if task.session_title.is_some() {
-        return; // another path won the race
+    // Already complete: don't do a redundant write/publish.
+    if task.session_id.as_deref() == Some(session_id.as_str()) && task.session_title.is_some() {
+        return task.session_title;
     }
-    task.session_title = Some(title);
+    if task.session_id.is_none() {
+        task.session_id = Some(session_id.clone());
+    }
+    if task.session_title.is_none() {
+        if let Some(title) =
+            resolve_session_title(agent, &session_id, &cwd, attempts, interval).await
+        {
+            task.session_title = Some(title);
+        }
+    }
+    let stored = task.session_title.clone();
     if db::upsert_task(&state.db, &task).await.is_ok() {
         state.bus.publish(ServerPush::TaskUpdated(task.summary()));
     }
+    stored
 }
 
 /// Mark a task failed (used when it can't even be started).
@@ -1279,6 +1354,22 @@ mod tests {
         path
     }
 
+    /// A fake `opencode` that reports a live session id and keeps running unless
+    /// invoked as `session list`, where it prints `title_json`.
+    #[cfg(unix)]
+    fn live_session_script(dir: &Path, title_json: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("opencode-live.sh");
+        let script = format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *\"session list\"*) printf '%s\\n' '{title_json}' ;;\n  *) printf '%s\\n' '{{\"sessionID\":\"ses_live\"}}' ; sleep 30 ;;\nesac\n"
+        );
+        std::fs::write(&path, script).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
     /// A `State` whose `opencode` command is `command` (a title-lookup fixture).
     #[cfg(unix)]
     async fn title_state(dir: &Path, command: &Path) -> Arc<State> {
@@ -1366,6 +1457,102 @@ mod tests {
 
         let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
         assert_eq!(stored.session_title.as_deref(), Some("Existing"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_title_fallback_reads_session_title() {
+        let dir = std::env::temp_dir().join(format!("favetto-fallback-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = session_list_script(&dir, r#"[{"id":"ses_1","title":"Fallback title"}]"#);
+        let state = title_state(&dir, &script).await;
+        let agent = state.registry.get("opencode").unwrap();
+
+        assert_eq!(
+            resolve_title_fallback(agent.clone(), Some("ses_1".to_string()), &dir)
+                .await
+                .as_deref(),
+            Some("Fallback title")
+        );
+        // Without a parsed session id there is nothing to look up.
+        assert_eq!(resolve_title_fallback(agent, None, &dir).await, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn watch_title_while_running_skips_unknown_session() {
+        let dir = std::env::temp_dir().join(format!("favetto-watch-missing-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = session_list_script(&dir, "[]");
+        let state = title_state(&dir, &script).await;
+        let agent = state.registry.get("opencode").unwrap();
+
+        let watch = tokio::time::timeout(
+            Duration::from_secs(2),
+            watch_title_while_running(&state, Uuid::new_v4(), agent, "no-such-session", &dir),
+        )
+        .await
+        .expect("watcher returns promptly for an unknown session");
+        assert!(matches!(watch, TitleWatch::Skipped));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The acceptance test for #55: the title is resolved and persisted while the
+    /// run is still in progress (not only at completion).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn title_is_stored_while_run_is_still_in_progress() {
+        let dir = std::env::temp_dir().join(format!("favetto-live-title-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = live_session_script(&dir, r#"[{"id":"ses_live","title":"Live title"}]"#);
+        let state = title_state(&dir, &script).await;
+
+        let task = task_with_session(None, None);
+        db::insert_task(&state.db, &task).await.unwrap();
+
+        let agent = state.registry.get("opencode").unwrap();
+        let ctx = crate::agents::AgentContext {
+            cwd: Some(dir.clone()),
+            prompt: Some("hi".to_string()),
+            rows: 40,
+            cols: 120,
+            ..Default::default()
+        };
+        let info = state
+            .agents
+            .start(
+                "opencode",
+                agent.clone(),
+                Some(task.id.to_string()),
+                crate::agents::Invocation::Headless {
+                    prompt: "hi",
+                    provider: None,
+                    model: None,
+                },
+                ctx,
+            )
+            .unwrap();
+
+        let watch = tokio::time::timeout(
+            Duration::from_secs(10),
+            watch_title_while_running(&state, task.id, agent, &info.id, &dir),
+        )
+        .await
+        .expect("title resolves while the run is in progress");
+        match watch {
+            TitleWatch::Observed(Some(title)) => assert_eq!(title, "Live title"),
+            _ => panic!("expected the watcher to observe a title"),
+        }
+
+        let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+        assert_eq!(stored.session_id.as_deref(), Some("ses_live"));
+        assert_eq!(stored.session_title.as_deref(), Some("Live title"));
+        // The script is still sleeping: the run has not finished yet.
+        assert!(state.agents.is_running(&info.id));
+
+        let _ = state.agents.close(&info.id);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
