@@ -32,13 +32,13 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     ));
 
     // Resolve settings: CLI flag > config > default. Read the config once here.
-    let data_dir = {
+    let data_dir = crate::paths::expand_tilde({
         let cfg = config.read().unwrap();
         args.data_dir
             .clone()
             .or_else(|| cfg.daemon.data_dir.clone())
             .unwrap_or_else(crate::cli::default_data_dir)
-    };
+    });
     let socket = {
         let cfg = config.read().unwrap();
         args.socket
@@ -53,13 +53,13 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             .or_else(|| cfg.daemon.listen.clone())
             .unwrap_or_else(|| "127.0.0.1:7878".to_string())
     };
-    let tasks_dir = {
+    let tasks_dir = crate::paths::expand_tilde({
         let cfg = config.read().unwrap();
         args.tasks_dir
             .clone()
             .or_else(|| cfg.daemon.tasks_dir.clone())
             .unwrap_or_else(|| PathBuf::from("tasks"))
-    };
+    });
     tokio::fs::create_dir_all(&data_dir).await?;
 
     let db_path = data_dir.join("favetto.db");

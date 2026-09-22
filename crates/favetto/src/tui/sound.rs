@@ -183,7 +183,7 @@ pub fn resolve(
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
         .or_else(|| file.sound_dir.clone())
-        .map(expand_tilde);
+        .map(crate::paths::expand_tilde);
 
     ResolvedSound {
         enabled,
@@ -206,19 +206,6 @@ fn parse_bool(value: &str) -> Option<bool> {
         "0" | "false" | "off" | "no" | "none" => Some(false),
         _ => None,
     }
-}
-
-fn expand_tilde(path: PathBuf) -> PathBuf {
-    if let Some(rest) = path.to_string_lossy().strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    } else if path == Path::new("~") {
-        if let Some(home) = dirs::home_dir() {
-            return home;
-        }
-    }
-    path
 }
 
 /// Seed the built-in per-cue defaults, then apply the user's `events` map.

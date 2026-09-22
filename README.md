@@ -502,6 +502,10 @@ keep_worktree = true     # default true; false removes the worktree afterwards
   serialized (one at a time); different directories still run concurrently.
 - **Not parallel** → strict global serialization, as before.
 
+`worktree_dir` expands a leading `~` to the user's home directory; an absolute
+path is used as-is and a non-`~` relative path is resolved against the repo root.
+`[daemon].data_dir` and `[daemon].tasks_dir` expand `~` the same way.
+
 `worktree` is ignored unless `parallel = true`. The effective directory is
 `input.cwd` → task `cwd` → the daemon's working directory.
 
