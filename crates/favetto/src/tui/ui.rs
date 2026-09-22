@@ -87,7 +87,7 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
         Popup::Menu { selected } => draw_menu(frame, *selected, theme),
         Popup::Form(form) => draw_form(frame, form, theme),
         Popup::Wizard(wizard) => draw_wizard(frame, wizard, theme, &state),
-        Popup::TaskVars(form) => draw_task_vars(frame, form),
+        Popup::TaskVars(form) => draw_task_vars(frame, form, theme),
         Popup::Help { scroll } => draw_help(frame, scroll, theme),
     }
 }
@@ -265,14 +265,14 @@ fn draw_wizard(
     frame.render_widget(paragraph, rect);
 }
 
-fn draw_task_vars(frame: &mut Frame, form: &TaskVarsForm) {
+fn draw_task_vars(frame: &mut Frame, form: &TaskVarsForm, theme: Theme) {
     let area = frame.area();
     let rect = centered_rect(area, 70, form.vars.len() as u16 + 6);
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
         format!(" Task input · {} ", form.task),
-        Style::default().add_modifier(Modifier::BOLD),
+        theme.title(),
     )));
     lines.push(Line::from(""));
 
@@ -281,7 +281,7 @@ fn draw_task_vars(frame: &mut Frame, form: &TaskVarsForm) {
         let label = format!("{}{}: ", if current { "> " } else { "  " }, var.prompt);
         let label_style = if current {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
@@ -292,7 +292,7 @@ fn draw_task_vars(frame: &mut Frame, form: &TaskVarsForm) {
             let selected = form.choice_selected.get(i).copied().unwrap_or(0);
             for (j, choice) in choices.iter().enumerate() {
                 let style = if j == selected {
-                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                    theme.selected()
                 } else {
                     Style::default()
                 };
@@ -312,15 +312,12 @@ fn draw_task_vars(frame: &mut Frame, form: &TaskVarsForm) {
                 spans.push(Span::raw("    "));
             }
             if segment.is_empty() && !current && segments.len() == 1 {
-                spans.push(Span::styled(
-                    "(empty)",
-                    Style::default().fg(Color::DarkGray),
-                ));
+                spans.push(Span::styled("(empty)", Style::default().fg(theme.muted)));
             } else {
                 spans.push(Span::raw((*segment).to_string()));
             }
             if current && k == last_segment {
-                spans.push(Span::styled("█", Style::default().fg(Color::Cyan)));
+                spans.push(Span::styled("█", Style::default().fg(theme.accent)));
             }
             lines.push(Line::from(spans));
         }
@@ -329,19 +326,26 @@ fn draw_task_vars(frame: &mut Frame, form: &TaskVarsForm) {
     if let Some(err) = &form.error {
         lines.push(Line::from(Span::styled(
             err.as_str(),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme.danger),
         )));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         " Tab/↑↓ move · Enter next · Ctrl+Enter submit · Esc cancel ",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme.muted),
     )));
 
     let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" Task input "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Task input ")
+                .style(theme.surface_style())
+                .border_style(theme.block(true)),
+        )
         .wrap(Wrap { trim: false });
     frame.render_widget(Clear, rect);
+    frame.buffer_mut().set_style(rect, theme.surface_style());
     frame.render_widget(paragraph, rect);
 }
 
@@ -993,11 +997,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
 
     // Sound badge: muted wins visually; a disabled engine shows `sound off`.
     let (sound_txt, sound_color) = if !app.sound_enabled {
-        ("sound off", Color::DarkGray)
+        ("sound off", theme.muted)
     } else if app.sound_muted {
-        ("muted", Color::Yellow)
+        ("muted", theme.warning)
     } else {
-        ("sound", Color::Green)
+        ("sound", theme.success)
     };
 
     let mut spans = vec![
@@ -1017,7 +1021,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     spans.push(Span::styled(
         format!(" {sound_txt} "),
         Style::default()
-            .fg(Color::Black)
+            .fg(theme.selected_fg)
             .bg(sound_color)
             .add_modifier(Modifier::BOLD),
     ));
@@ -1166,6 +1170,22 @@ mod tests {
                     dir: String::new(),
                     loading: true,
                     error: Some("boom".to_string()),
+                }),
+                Popup::TaskVars(TaskVarsForm {
+                    task: "issue".to_string(),
+                    vars: vec![crate::tasks::TaskVar {
+                        name: "description".to_string(),
+                        prompt: "Describe".to_string(),
+                        default: Some("draft".to_string()),
+                        required: true,
+                        multiline: false,
+                        var_type: crate::tasks::VarType::String,
+                        choices: None,
+                    }],
+                    current: 0,
+                    values: vec!["draft".to_string()],
+                    choice_selected: vec![0],
+                    error: None,
                 }),
                 Popup::Help { scroll: 0 },
             ] {
