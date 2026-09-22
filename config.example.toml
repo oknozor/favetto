@@ -117,7 +117,7 @@ secret_env = "GITHUB_WEBHOOK_SECRET"   # preferred
 name = "triage-opened-issues"
 event = "issues"
 action = "opened"
-task = "triage_favetto_issues"
+task = "favetto/triage_issues"
 filter = { repo = "oknozor/*" }
 
 # When a bug-labelled PR is opened against main by the owner, plan it.
@@ -125,7 +125,7 @@ filter = { repo = "oknozor/*" }
 name = "plan-bug-prs"
 event = "pull_request"
 action = "opened"
-task = "plan_favetto_issue"
+task = "favetto/plan_issue"
 filter = { labels_contains = ["bug"], base_ref = "main", author = "oknozor" }
 
 # Client-side TUI sound notifications. Ignored by the daemon; sounds play on the

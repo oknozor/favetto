@@ -10,22 +10,37 @@ export default defineConfig({
   lastUpdated: true,
   themeConfig: {
     nav: [
-      { text: "Guide", link: "/guide/getting-started" },
+      { text: "Guide", link: "/guide/installation" },
       { text: "Reference", link: "/reference/architecture" },
       { text: "GitHub", link: "https://github.com/oknozor/favetto" },
     ],
     sidebar: {
       "/guide/": [
         {
-          text: "Guide",
+          text: "Introduction",
           items: [
+            { text: "Installation", link: "/guide/installation" },
             { text: "Getting started", link: "/guide/getting-started" },
-            { text: "Tasks & catalog", link: "/guide/tasks" },
+            { text: "Your first task", link: "/guide/first-task" },
+          ],
+        },
+        {
+          text: "Guides",
+          items: [
+            { text: "Catalog", link: "/guide/catalog" },
+            { text: "Variables & prompts", link: "/guide/variables-and-prompts" },
             { text: "Embedded agents", link: "/guide/agents" },
-            { text: "Configuration", link: "/guide/configuration" },
+            {
+              text: "Schedules & dependencies",
+              link: "/guide/schedules-and-dependencies",
+            },
             { text: "Webhooks & hooks", link: "/guide/webhooks" },
+            { text: "Parallel execution", link: "/guide/parallel-worktrees" },
+            { text: "Git & signing", link: "/guide/git-signing" },
+            { text: "Remote access", link: "/guide/remote-access" },
+            { text: "Configuration", link: "/guide/configuration" },
             { text: "TUI", link: "/guide/tui" },
-            { text: "Execution & worktrees", link: "/guide/execution" },
+            { text: "Troubleshooting", link: "/guide/troubleshooting" },
           ],
         },
       ],
@@ -33,8 +48,13 @@ export default defineConfig({
         {
           text: "Reference",
           items: [
-            { text: "Architecture", link: "/reference/architecture" },
+            { text: "CLI", link: "/reference/cli" },
+            { text: "Configuration", link: "/reference/config" },
+            { text: "Task file format", link: "/reference/tasks" },
+            { text: "Event kinds", link: "/reference/events" },
+            { text: "Environment", link: "/reference/environment" },
             { text: "Remote API", link: "/reference/remote-api" },
+            { text: "Architecture", link: "/reference/architecture" },
           ],
         },
       ],

@@ -84,6 +84,95 @@ pub mod push {
     pub const AGENT_EXIT: &str = "agent.exit";
 }
 
+/// Every client → server method, paired with a one-line purpose. Consumed by the
+/// generated remote-API reference (`docs/reference/remote-api.md`); keep in sync
+/// with [`method`].
+pub const CLIENT_METHODS: &[(&str, &str)] = &[
+    (method::PING, "Liveness check."),
+    (method::TASKS_LIST, "List tasks."),
+    (method::TASKS_CANCEL, "Cancel a task."),
+    (method::TASKS_START, "Start a catalog task by name."),
+    (
+        method::TASKS_START_ONESHOT,
+        "Start a one-shot task from an inline definition (not added to the catalog) \
+         and open its interactive agent session.",
+    ),
+    (method::CATALOG_LIST, "List the task catalog."),
+    (
+        method::CATALOG_GET,
+        "Fetch a catalog task's raw Markdown source (for the preview pane).",
+    ),
+    (
+        method::CATALOG_ADD,
+        "Add a task definition to the catalog (does not run it).",
+    ),
+    (
+        method::WORKFLOW_GET,
+        "Fetch the catalog workflow graph as Graphviz DOT plus a structured graph.",
+    ),
+    (method::EVENTS_TAIL, "Tail persisted events."),
+    (
+        method::EVENTS_SUBSCRIBE,
+        "(Re)subscribe to the live event stream; accepts `last_event_id` to replay \
+         missed events before switching to live delivery.",
+    ),
+    (
+        method::AGENTS_LIST,
+        "List configured external agents and live agent sessions, including each \
+         agent's `available` flag and capability flags.",
+    ),
+    (
+        method::AGENTS_START,
+        "Start an external agent session (optionally attached to a task).",
+    ),
+    (
+        method::AGENTS_INPUT,
+        "Write raw bytes (base64) to a session's PTY.",
+    ),
+    (method::AGENTS_RESIZE, "Resize a session's PTY."),
+    (
+        method::AGENTS_ATTACH,
+        "Attach to a session: returns the session and a replay of its output.",
+    ),
+    (method::AGENTS_CLOSE, "Terminate a session."),
+    (
+        method::PROVIDERS_LIST,
+        "List configured providers and their available models.",
+    ),
+    (method::SCHEDULES_LIST, "List cron schedules."),
+    (
+        method::SCHEDULES_UPSERT,
+        "Create or update a cron schedule.",
+    ),
+    (method::SCHEDULES_DELETE, "Delete a cron schedule."),
+    (method::NOTIFICATIONS_LIST, "List recent notifications."),
+    (
+        method::NOTIFICATIONS_TEST,
+        "Send a test notification through a channel.",
+    ),
+    (
+        method::HOOKS_UPSERT,
+        "Add a notification hook reacting to an event kind.",
+    ),
+];
+
+/// Every server → client push (notification), paired with a one-line purpose.
+/// Consumed by the generated remote-API reference; keep in sync with [`push`].
+pub const SERVER_PUSHES: &[(&str, &str)] = &[
+    (push::EVENT, "A persisted event."),
+    (push::TASK_UPDATED, "A task row changed."),
+    (
+        push::CATALOG_UPDATED,
+        "The task catalog changed on disk; clients should re-fetch it.",
+    ),
+    (push::LOG_LINE, "A daemon log line."),
+    (
+        push::AGENT_OUTPUT,
+        "Raw PTY output (base64) from a running agent session.",
+    ),
+    (push::AGENT_EXIT, "An agent session's child process exited."),
+];
+
 /// A client → server request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
@@ -148,4 +237,85 @@ pub enum Frame {
     Request(Request),
     Response(Response),
     Notification(Notification),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn assert_unique(table: &[(&str, &str)], label: &str) {
+        let mut seen = HashSet::new();
+        for (name, purpose) in table {
+            assert!(!name.is_empty(), "{label}: empty name");
+            assert!(
+                !purpose.trim().is_empty(),
+                "{label}: `{name}` has no purpose"
+            );
+            assert!(seen.insert(*name), "{label}: duplicate name `{name}`");
+        }
+    }
+
+    #[test]
+    fn client_methods_are_unique() {
+        assert_unique(CLIENT_METHODS, "CLIENT_METHODS");
+    }
+
+    #[test]
+    fn server_pushes_are_unique() {
+        assert_unique(SERVER_PUSHES, "SERVER_PUSHES");
+    }
+
+    /// Guards against a typo in the doc tables: every documented name must be one
+    /// of the module constants.
+    #[test]
+    fn doc_tables_match_constants() {
+        let methods: HashSet<&str> = [
+            method::PING,
+            method::TASKS_LIST,
+            method::TASKS_CANCEL,
+            method::TASKS_START,
+            method::TASKS_START_ONESHOT,
+            method::CATALOG_LIST,
+            method::CATALOG_GET,
+            method::CATALOG_ADD,
+            method::WORKFLOW_GET,
+            method::EVENTS_TAIL,
+            method::EVENTS_SUBSCRIBE,
+            method::AGENTS_LIST,
+            method::AGENTS_START,
+            method::AGENTS_INPUT,
+            method::AGENTS_RESIZE,
+            method::AGENTS_ATTACH,
+            method::AGENTS_CLOSE,
+            method::PROVIDERS_LIST,
+            method::SCHEDULES_LIST,
+            method::SCHEDULES_UPSERT,
+            method::SCHEDULES_DELETE,
+            method::NOTIFICATIONS_LIST,
+            method::NOTIFICATIONS_TEST,
+            method::HOOKS_UPSERT,
+        ]
+        .into_iter()
+        .collect();
+        for (name, _) in CLIENT_METHODS {
+            assert!(methods.contains(name), "undocumented constant `{name}`");
+        }
+        assert_eq!(methods.len(), CLIENT_METHODS.len());
+
+        let pushes: HashSet<&str> = [
+            push::EVENT,
+            push::TASK_UPDATED,
+            push::CATALOG_UPDATED,
+            push::LOG_LINE,
+            push::AGENT_OUTPUT,
+            push::AGENT_EXIT,
+        ]
+        .into_iter()
+        .collect();
+        for (name, _) in SERVER_PUSHES {
+            assert!(pushes.contains(name), "undocumented constant `{name}`");
+        }
+        assert_eq!(pushes.len(), SERVER_PUSHES.len());
+    }
 }

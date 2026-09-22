@@ -6,7 +6,9 @@
   "scripts": {
     "docs:dev": "vitepress dev",
     "docs:build": "vitepress build",
-    "docs:preview": "vitepress preview"
+    "docs:preview": "vitepress preview",
+    "docs:gen": "cargo run --manifest-path ../crates/favetto/Cargo.toml -p favetto -- __doc",
+    "docs:check": "vitepress build"
   },
   "devDependencies": { "vitepress": "^1.6.4" }
 }

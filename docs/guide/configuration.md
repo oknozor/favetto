@@ -1,9 +1,12 @@
 # Configuration
 
-favetto reads a global config file (parsed with the `config` crate, located via
-the `dirs` crate) at **`~/.config/favetto/config.toml`** — override with
-`--config <path>` or `$FAVETTO_CONFIG`. It declares the external agents and daemon
-defaults:
+favetto reads a global config file at **`~/.config/favetto/config.toml`** —
+override it with `--config <path>` or `$FAVETTO_CONFIG`. Data (SQLite and the
+bearer token) lives in **`~/.local/share/favetto`** (`$FAVETTO_DATA_DIR`).
+
+Settings resolve in the order **CLI flag → config file → built-in default**, and
+any `FAVETTO__SECTION__KEY` environment variable overrides the file. Every
+section is optional.
 
 ```toml
 # ~/.config/favetto/config.toml
@@ -26,18 +29,21 @@ socket = "/tmp/favetto.sock"
 tasks_dir = "tasks"
 ```
 
-Data (SQLite + bearer token) lives in **`~/.local/share/favetto`** (or
-`$FAVETTO_DATA_DIR`). Settings resolve in the order CLI flag → config file →
-built-in default.
+Where to read next:
 
-GitHub webhook secrets resolve from `[webhook.github]` (`secret`, else the env
-var named by `secret_env`, else `GITHUB_WEBHOOK_SECRET`); Linear reads
-`LINEAR_WEBHOOK_SECRET`. See [Webhooks & hooks](./webhooks).
+- [Configuration reference](../reference/config) — every section, field, type,
+  default, and enum value, generated from the source.
+- [Embedded agents](./agents) — configuring agent invocations.
+- [Parallel execution and worktrees](./parallel-worktrees) — `[executor]`.
+- [Git and commit signing](./git-signing) — `[git]`.
+- [Webhooks and hooks](./webhooks) — `[webhook.github]`.
+- [TUI](./tui) — `[tui.sound]`.
+- [Environment variables](../reference/environment) — the overrides and secrets.
 
 ## Full example
 
 The annotated [`config.example.toml`](https://github.com/oknozor/favetto/blob/main/config.example.toml)
-in the repository is the canonical reference. It is included here verbatim so it
-can never drift from the code:
+in the repository is the canonical starting point. It is included here verbatim
+so it cannot drift from the code:
 
 <<< ../../config.example.toml{toml}

@@ -28,6 +28,7 @@ http = "1"
 libc = "0.2"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 portable-pty = "0.9"
+schemars = { version = "1", features = ["derive"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.11"

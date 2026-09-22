@@ -1,12 +1,13 @@
 # Remote API
 
+Generated from `crates/favetto-core/src/rpc.rs` by the docs generator. Do not edit by hand.
+
 The daemon exposes one wire protocol over two transports:
 
 - **Unix socket** `/tmp/favetto.sock` (local, trusted).
 - **WebSocket** `ws://127.0.0.1:7878/rpc` (bearer token required).
 
-Both carry the same MessagePack-encoded frames. A frame is a tagged envelope with
-one of three shapes:
+Both carry the same MessagePack-encoded frames. A frame is a tagged envelope with one of three shapes:
 
 ```rust
 enum Frame {
@@ -16,10 +17,7 @@ enum Frame {
 }
 ```
 
-A `Request` carries `id`, `method`, and `params`; the matching `Response` carries
-the same `id` plus either `result` or a structured `error` (`code`, `message`,
-optional `data`). Errors use the JSON-RPC codes plus `-32001` for an
-unauthenticated/rejected token.
+A `Request` carries `id`, `method`, and `params`; the matching `Response` carries the same `id` plus either `result` or a structured `error` (`code`, `message`, optional `data`).
 
 ## Client → server methods
 
@@ -27,16 +25,16 @@ unauthenticated/rejected token.
 |--------|---------|
 | `system.ping` | Liveness check. |
 | `tasks.list` | List tasks. |
+| `tasks.cancel` | Cancel a task. |
 | `tasks.start` | Start a catalog task by name. |
 | `tasks.start_oneshot` | Start a one-shot task from an inline definition (not added to the catalog) and open its interactive agent session. |
-| `tasks.cancel` | Cancel a task. |
 | `catalog.list` | List the task catalog. |
 | `catalog.get` | Fetch a catalog task's raw Markdown source (for the preview pane). |
 | `catalog.add` | Add a task definition to the catalog (does not run it). |
-| `workflow.get` | Fetch the catalog workflow graph as Graphviz DOT (`dot` plus the persisted `path`) and a structured `graph` (`nodes` with `name`/`scheduled`/`external`, `edges` with `from`/`to`/`kind`). |
+| `workflow.get` | Fetch the catalog workflow graph as Graphviz DOT plus a structured graph. |
 | `events.tail` | Tail persisted events. |
 | `events.subscribe` | (Re)subscribe to the live event stream; accepts `last_event_id` to replay missed events before switching to live delivery. |
-| `agents.list` | List configured external agents and live agent sessions. Each entry carries an `available` boolean (whether the agent's command was found on the daemon's PATH) and its capability flags. |
+| `agents.list` | List configured external agents and live agent sessions, including each agent's `available` flag and capability flags. |
 | `agents.start` | Start an external agent session (optionally attached to a task). |
 | `agents.input` | Write raw bytes (base64) to a session's PTY. |
 | `agents.resize` | Resize a session's PTY. |
@@ -61,11 +59,38 @@ unauthenticated/rejected token.
 | `agent.output` | Raw PTY output (base64) from a running agent session. |
 | `agent.exit` | An agent session's child process exited. |
 
+## Error codes
+
+| Code | Meaning |
+|------|---------|
+| `-32700` | Invalid JSON / MessagePack frame. |
+| `-32600` | Not a valid request object. |
+| `-32601` | Unknown method. |
+| `-32602` | Invalid method parameters. |
+| `-32603` | Internal server error. |
+| `-32001` | Missing or rejected bearer token. |
+
+## Example
+
+A request is a single MessagePack map; in JSON it looks like:
+
+```json
+{"type":"request","id":1,"method":"tasks.start","params":{"name":"hello"}}
+```
+
+and the reply:
+
+```json
+{"type":"response","id":1,"result":{"task_id":"…","status":"idle"}}
+```
+
+Subscribing with `events.subscribe` and `last_event_id` replays persisted events before switching to live delivery, so a TUI that reconnects never misses a task result.
+
 ## HTTP endpoints
 
 The daemon also serves HTTP endpoints alongside the RPC transports:
 
 - `GET /metrics` — Prometheus metrics.
 - `POST /pair/generate` and `POST /pair/exchange` — pairing.
-- The webhook receivers (`/webhooks/github`, and the Linear receiver) — see
-  [Webhooks & hooks](../guide/webhooks).
+- `POST /webhooks/github` — GitHub webhook receiver (see [Webhooks & hooks](../guide/webhooks)).
+

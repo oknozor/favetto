@@ -25,6 +25,9 @@ pub enum Command {
     Pair(PairArgs),
     /// Rotate the bearer token.
     TokenRotate(TokenRotateArgs),
+    /// Internal: regenerate the generated documentation reference.
+    #[command(name = "__doc", hide = true)]
+    Doc(DocArgs),
     /// Internal: exec an agent process with a parent-death signal (spawned by the daemon).
     #[command(name = "__agent-exec", hide = true)]
     InternalAgentExec {
@@ -82,6 +85,15 @@ pub struct TuiArgs {
     /// Play every configured cue once, print the resolved player, and exit.
     #[arg(long = "test-sound")]
     pub test_sound: bool,
+}
+
+/// Hidden generator: regenerate `docs/reference/{config,cli,events,remote-api}.md`
+/// and `docs/public/favetto-schema.json` from the source of truth.
+#[derive(Args)]
+pub struct DocArgs {
+    /// Output docs directory (defaults to `<repo>/docs`).
+    #[arg(long)]
+    pub docs_dir: Option<PathBuf>,
 }
 
 #[derive(Args)]

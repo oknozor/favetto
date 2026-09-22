@@ -184,6 +184,88 @@ impl EventKind {
     }
 }
 
+impl EventKind {
+    /// Every [`EventKind`], in declaration order. Kept in sync with the enum by
+    /// the `all_covers_every_kind` test.
+    pub const ALL: &'static [EventKind] = &[
+        EventKind::TaskCreated,
+        EventKind::TaskUpdated,
+        EventKind::TaskCompleted,
+        EventKind::TaskFailed,
+        EventKind::TaskCancelled,
+        EventKind::TaskIdle,
+        EventKind::TaskStarted,
+        EventKind::TaskFinished,
+        EventKind::CronTick,
+        EventKind::IssueCreated,
+        EventKind::IssueUpdated,
+        EventKind::IssueClosed,
+        EventKind::IssueReopened,
+        EventKind::IssueLabeled,
+        EventKind::IssueAssigned,
+        EventKind::IssueCommentCreated,
+        EventKind::PrCreated,
+        EventKind::PrMerged,
+        EventKind::PrClosed,
+        EventKind::PrReopened,
+        EventKind::PrSynchronized,
+        EventKind::PrReadyForReview,
+        EventKind::PrReviewRequested,
+        EventKind::PrUpdated,
+        EventKind::PrReviewSubmitted,
+        EventKind::PushReceived,
+        EventKind::TicketCreated,
+        EventKind::TicketUpdated,
+        EventKind::ActionRunCompleted,
+        EventKind::CheckSuiteCompleted,
+        EventKind::CheckRunCompleted,
+        EventKind::EmailReceived,
+        EventKind::Synthetic,
+    ];
+
+    /// A one-line explanation of when this event is emitted, used by the
+    /// generated event-kinds reference.
+    pub fn description(&self) -> &'static str {
+        match self {
+            EventKind::TaskCreated => "A task row was created.",
+            EventKind::TaskUpdated => "A task row changed.",
+            EventKind::TaskCompleted => "A task completed successfully (terminal).",
+            EventKind::TaskFailed => "A task failed (terminal).",
+            EventKind::TaskCancelled => "A task was cancelled (terminal).",
+            EventKind::TaskIdle => "A task was enqueued and is waiting to run.",
+            EventKind::TaskStarted => "A task began running.",
+            EventKind::TaskFinished => {
+                "A task ended (success or failure); used by `needs` dependencies."
+            }
+            EventKind::CronTick => "A scheduled cron job fired.",
+            EventKind::IssueCreated => "An issue was created.",
+            EventKind::IssueUpdated => "An issue was edited.",
+            EventKind::IssueClosed => "An issue was closed.",
+            EventKind::IssueReopened => "An issue was reopened.",
+            EventKind::IssueLabeled => "A label was added to or removed from an issue.",
+            EventKind::IssueAssigned => "An issue was assigned.",
+            EventKind::IssueCommentCreated => "A comment was posted on an issue.",
+            EventKind::PrCreated => "A pull request was opened.",
+            EventKind::PrMerged => "A pull request was merged.",
+            EventKind::PrClosed => "A pull request was closed without merging.",
+            EventKind::PrReopened => "A pull request was reopened.",
+            EventKind::PrSynchronized => "A pull request received new commits.",
+            EventKind::PrReadyForReview => "A draft pull request was marked ready for review.",
+            EventKind::PrReviewRequested => "A review was requested on a pull request.",
+            EventKind::PrUpdated => "A pull request was edited.",
+            EventKind::PrReviewSubmitted => "A review was submitted on a pull request.",
+            EventKind::PushReceived => "A push was received on a branch.",
+            EventKind::TicketCreated => "A ticket was created (integration event).",
+            EventKind::TicketUpdated => "A ticket was updated (integration event).",
+            EventKind::ActionRunCompleted => "A workflow run completed.",
+            EventKind::CheckSuiteCompleted => "A check suite completed.",
+            EventKind::CheckRunCompleted => "A check run completed.",
+            EventKind::EmailReceived => "An email was received (integration event).",
+            EventKind::Synthetic => "A synthetic marker event used before real integrations exist.",
+        }
+    }
+}
+
 impl FromStr for EventKind {
     type Err = ();
 
@@ -541,47 +623,32 @@ mod tests {
 
     #[test]
     fn event_kind_round_trips() {
-        let kinds = [
-            EventKind::TaskCreated,
-            EventKind::TaskUpdated,
-            EventKind::TaskCompleted,
-            EventKind::TaskFailed,
-            EventKind::TaskCancelled,
-            EventKind::TaskIdle,
-            EventKind::TaskStarted,
-            EventKind::TaskFinished,
-            EventKind::CronTick,
-            EventKind::IssueCreated,
-            EventKind::IssueUpdated,
-            EventKind::IssueClosed,
-            EventKind::IssueReopened,
-            EventKind::IssueLabeled,
-            EventKind::IssueAssigned,
-            EventKind::IssueCommentCreated,
-            EventKind::PrCreated,
-            EventKind::PrMerged,
-            EventKind::PrClosed,
-            EventKind::PrReopened,
-            EventKind::PrSynchronized,
-            EventKind::PrReadyForReview,
-            EventKind::PrReviewRequested,
-            EventKind::PrUpdated,
-            EventKind::PrReviewSubmitted,
-            EventKind::PushReceived,
-            EventKind::TicketCreated,
-            EventKind::TicketUpdated,
-            EventKind::ActionRunCompleted,
-            EventKind::CheckSuiteCompleted,
-            EventKind::CheckRunCompleted,
-            EventKind::EmailReceived,
-            EventKind::Synthetic,
-        ];
-        for kind in kinds {
+        for kind in EventKind::ALL {
             assert_eq!(
                 EventKind::from_name(kind.as_str()),
                 Some(kind.clone()),
                 "from_name/as_str mismatch for {:?}",
                 kind
+            );
+        }
+    }
+
+    #[test]
+    fn all_covers_every_kind() {
+        // Every `ALL` entry survives a round-trip, and the list has no duplicates.
+        let mut names: Vec<&str> = EventKind::ALL.iter().map(EventKind::as_str).collect();
+        let len = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), len, "EventKind::ALL contains a duplicate");
+    }
+
+    #[test]
+    fn descriptions_are_non_empty() {
+        for kind in EventKind::ALL {
+            assert!(
+                !kind.description().trim().is_empty(),
+                "{kind:?} has an empty description"
             );
         }
     }
