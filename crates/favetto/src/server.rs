@@ -663,9 +663,11 @@ async fn start_agent(
             .as_deref()
             .and_then(|tid| state.agents.find_latest_by_task(tid));
 
-        // Attach directly to a live interactive TUI already bound to the task.
+        // Attach directly to a live interactive TUI already bound to the task, or
+        // to a headless run that is blocked waiting for the user so keystrokes
+        // reach the live PTY.
         if let Some(existing) = &live {
-            if existing.running && !existing.headless {
+            if should_attach_to_live(existing) {
                 return Ok(existing.clone());
             }
         }
@@ -707,6 +709,13 @@ async fn start_agent(
         },
         ctx,
     )
+}
+
+/// Whether the daemon should reattach to an existing session rather than launch
+/// a fresh one: any live interactive TUI, or a live headless run that is blocked
+/// waiting for the user (so keystrokes can answer the prompt).
+fn should_attach_to_live(info: &AgentSessionInfo) -> bool {
+    info.running && (!info.headless || info.awaiting_input.is_some())
 }
 
 /// Wait briefly for a still-running headless run to publish its agent session id
@@ -861,7 +870,7 @@ async fn start_oneshot_task(
     };
     let info = state.agents.start(
         &name,
-        agent,
+        agent.clone(),
         Some(task.id.to_string()),
         Invocation::Interactive {
             prompt: None,
@@ -879,8 +888,19 @@ async fn start_oneshot_task(
         let session = info.id.clone();
         let agent_name = name.clone();
         let title_cwd = title_cwd.clone();
+        let (detect, quiet) = {
+            let cfg = state.config.read().unwrap();
+            (
+                cfg.executor.detect_awaiting_input,
+                std::time::Duration::from_millis(cfg.executor.awaiting_input_quiet_ms),
+            )
+        };
         tokio::spawn(async move {
-            let code = state.agents.wait(&session).await;
+            let code = if detect {
+                crate::attention::watch(&state, &session, agent, Some(task_id), quiet).await
+            } else {
+                state.agents.wait(&session).await
+            };
             let session_id = state.agents.external_session_id(&session);
             finish_oneshot(&state, task_id, &agent_name, session_id, &title_cwd, code).await;
         });
@@ -911,7 +931,7 @@ async fn finish_oneshot(
     let Ok(Some(mut task)) = db::get_task(&state.db, task_id).await else {
         return;
     };
-    if task.status != TaskStatus::Running {
+    if !matches!(task.status, TaskStatus::Running | TaskStatus::AwaitingInput) {
         return;
     }
     let success = code == Some(0);
@@ -1660,6 +1680,63 @@ mod tests {
         assert!(stored.session_id.is_none());
         assert!(stored.session_title.is_none());
         assert!(stored.error.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn live_session(running: bool, headless: bool, awaiting: bool) -> AgentSessionInfo {
+        AgentSessionInfo {
+            id: "s1".to_string(),
+            agent: "opencode".to_string(),
+            task_id: None,
+            running,
+            headless,
+            session_id: None,
+            awaiting_input: awaiting.then(|| favetto_core::model::AwaitingInputReason {
+                kind: favetto_core::model::AwaitingInputKind::Permission,
+                message: "Allow?".to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn should_attach_to_live_allows_awaiting_headless_session() {
+        // Live interactive TUI: attach.
+        assert!(should_attach_to_live(&live_session(true, false, false)));
+        // Running headless without a prompt: don't attach (resume instead).
+        assert!(!should_attach_to_live(&live_session(true, true, false)));
+        // Headless but blocked on the user: attach so keystrokes reach it.
+        assert!(should_attach_to_live(&live_session(true, true, true)));
+        // Exited sessions are never attached.
+        assert!(!should_attach_to_live(&live_session(false, true, true)));
+        assert!(!should_attach_to_live(&live_session(false, false, false)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finish_oneshot_accepts_awaiting_input() {
+        let dir = temp_dir("oneshot-awaiting");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let script = session_list_script(&dir, r#"[{"id":"ses_1","title":"Fixture title"}]"#);
+        let state = title_state(&dir, &tasks_dir, &script).await;
+
+        let mut task = oneshot_task();
+        task.status = TaskStatus::AwaitingInput;
+        db::insert_task(&state.db, &task).await.unwrap();
+
+        finish_oneshot(
+            &state,
+            task.id,
+            "opencode",
+            Some("ses_1".to_string()),
+            &dir,
+            Some(0),
+        )
+        .await;
+
+        // A task paused on input is still finished once the session exits.
+        let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, TaskStatus::Succeeded);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

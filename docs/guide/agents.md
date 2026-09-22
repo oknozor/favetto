@@ -88,6 +88,11 @@ a task first reattaches to its running session; if the run already finished and 
 session id was captured, it reopens that session with `resume_args`. Press
 **Ctrl+N** to force a new session.
 
+When a task's row shows **awaiting input** (see [Lifecycle](#lifecycle)), pressing
+**Enter** attaches to the *live blocked PTY* rather than launching a fresh
+session, so anything you type — a permission key, a passphrase — reaches the
+prompt the agent is waiting on.
+
 The daemon keeps a `vt100` emulator per session and streams self-contained
 full-screen frames; the panel parses and renders them, keys are forwarded to the
 agent, and the PTY is resized to fit. Common terminal queries (cursor position,
@@ -116,3 +121,15 @@ using `headless_args` (or `run_args` when a model is set); a task with no agent
 and no default fails to start. An external agent **without** the relevant args is
 rejected rather than launched interactively (an interactive TUI would never exit
 and would hang the task).
+
+While a run is in flight the daemon watches its terminal screen. If the agent
+blocks on something only a human can answer — a tool permission dialog, a
+confirmation, a multiple-choice prompt, or a git pinentry/askpass — the task is
+marked **awaiting input** (a non-terminal status), a `task_awaiting_input` event
+is emitted so notification hooks fire, and the TUI plays its attention cue. Once
+you answer in the Agent panel the task returns to **running** and continues. The
+built-in `opencode` and `claude` detectors use each CLI's own dialog wording;
+custom agents fall back to a conservative heuristic that requires the PTY to be
+quiet for `[executor].awaiting_input_quiet_ms` (default 8 s) and the last visible
+lines to look like a prompt. Set `[executor].detect_awaiting_input = false` to
+turn detection off.

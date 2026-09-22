@@ -509,7 +509,11 @@ impl App {
         if self.agent_running {
             return true;
         }
-        if self.tasks.iter().any(|t| t.status == TaskStatus::Running) {
+        if self
+            .tasks
+            .iter()
+            .any(|t| matches!(t.status, TaskStatus::Running | TaskStatus::AwaitingInput))
+        {
             return true;
         }
         matches!(&self.popup, Popup::Wizard(w) if w.loading)
@@ -1865,6 +1869,7 @@ impl App {
 ///
 /// Only `task_finished` is sounded (success/failure), so `task_completed` /
 /// `task_failed` never double up; `task_started` is mapped but defaults off.
+/// `task_awaiting_input` maps to the attention cue (defaults on).
 fn cue_for_event(ev: &Event) -> Option<SoundCue> {
     match &ev.kind {
         EventKind::TaskFinished => {
@@ -1876,6 +1881,7 @@ fn cue_for_event(ev: &Event) -> Option<SoundCue> {
             })
         }
         EventKind::TaskStarted => Some(SoundCue::TaskStarted),
+        EventKind::TaskAwaitingInput => Some(SoundCue::AwaitingInput),
         _ => None,
     }
 }
@@ -2206,6 +2212,26 @@ mod tests {
         // `task_started` is mapped; whether it sounds is a player-level concern.
         app.ingest_event(event(3, EventKind::TaskStarted, serde_json::json!({})));
         assert_eq!(app.take_sound_cues(), vec![SoundCue::TaskStarted]);
+    }
+
+    #[test]
+    fn cue_for_event_maps_awaiting_input() {
+        assert_eq!(
+            cue_for_event(&event(
+                1,
+                EventKind::TaskAwaitingInput,
+                serde_json::json!({})
+            )),
+            Some(SoundCue::AwaitingInput)
+        );
+        // And ingesting it queues the cue on the app.
+        let mut app = App::new();
+        app.ingest_event(event(
+            1,
+            EventKind::TaskAwaitingInput,
+            serde_json::json!({}),
+        ));
+        assert_eq!(app.take_sound_cues(), vec![SoundCue::AwaitingInput]);
     }
 
     #[test]
@@ -3624,6 +3650,12 @@ mod tests {
         let mut running = task("r");
         running.status = TaskStatus::Running;
         app.tasks = vec![running];
+        assert!(app.needs_animation());
+
+        // So does a task awaiting input.
+        let mut awaiting = task("a");
+        awaiting.status = TaskStatus::AwaitingInput;
+        app.tasks = vec![awaiting];
         assert!(app.needs_animation());
 
         // A running agent animates.

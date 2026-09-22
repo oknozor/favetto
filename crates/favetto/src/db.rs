@@ -419,12 +419,13 @@ pub async fn record_delivery(
 // Task queue
 // ---------------------------------------------------------------------------
 
-/// Mark tasks left `running` by a previous daemon instance as failed — they were
-/// interrupted and the agent process is gone. Returns the number reconciled.
+/// Mark tasks left `running` or `awaiting_input` by a previous daemon instance as
+/// failed — they were interrupted and the agent process is gone. Returns the
+/// number reconciled.
 pub async fn fail_interrupted_tasks(pool: &SqlitePool) -> anyhow::Result<u64> {
     let result = sqlx::query(
         "UPDATE tasks SET status = 'failed', error = 'interrupted by daemon restart', finished_at = ? \
-         WHERE status = 'running'",
+         WHERE status IN ('running', 'awaiting_input')",
     )
     .bind(ts_ms(Utc::now()))
     .execute(pool)
@@ -837,6 +838,49 @@ mod tests {
         let got = get_task(&pool, task.id).await.unwrap().unwrap();
         assert!(got.output.is_none());
         assert_eq!(list_tasks(&pool, 100).await.unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn task_awaiting_input_round_trips() {
+        let (dir, pool) = scratch_pool("awaiting-roundtrip").await;
+        let mut task = task_at(Utc::now(), None, None);
+        task.status = TaskStatus::AwaitingInput;
+        upsert_task(&pool, &task).await.unwrap();
+
+        let got = get_task(&pool, task.id).await.unwrap().unwrap();
+        assert_eq!(got.status, TaskStatus::AwaitingInput);
+        // The wire string is stable.
+        assert_eq!(got.status.as_str(), "awaiting_input");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn fail_interrupted_tasks_marks_running_and_awaiting_input() {
+        let (dir, pool) = scratch_pool("interrupted").await;
+        let mut running = task_at(Utc::now(), None, None);
+        running.status = TaskStatus::Running;
+        let mut awaiting = task_at(Utc::now(), None, None);
+        awaiting.status = TaskStatus::AwaitingInput;
+        let done = task_at(Utc::now(), Some(Utc::now()), None);
+        for task in [&running, &awaiting, &done] {
+            upsert_task(&pool, task).await.unwrap();
+        }
+
+        assert_eq!(fail_interrupted_tasks(&pool).await.unwrap(), 2);
+
+        for id in [running.id, awaiting.id] {
+            let got = get_task(&pool, id).await.unwrap().unwrap();
+            assert_eq!(got.status, TaskStatus::Failed);
+            assert_eq!(got.error.as_deref(), Some("interrupted by daemon restart"));
+        }
+        // A terminal task is untouched.
+        assert_eq!(
+            get_task(&pool, done.id).await.unwrap().unwrap().status,
+            TaskStatus::Succeeded
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

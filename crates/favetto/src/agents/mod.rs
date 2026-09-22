@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::broadcast;
 
-use favetto_core::model::AgentSessionInfo;
+use favetto_core::model::{AgentSessionInfo, AwaitingInputReason};
 
 use crate::config::{FavettoConfig, GitSettings};
 
@@ -32,6 +32,7 @@ use agent::extract_session_id_from_line;
 mod agent;
 mod claude;
 mod configurable;
+mod detect;
 mod opencode;
 mod pi;
 mod registry;
@@ -119,6 +120,11 @@ struct Session {
     external_session_id: Arc<Mutex<Option<String>>>,
     /// Whether this is an unattended run (its output is not a TUI).
     headless: bool,
+    /// When the PTY last produced output; used to require quiet before the
+    /// generic awaiting-input fallback fires.
+    last_activity: Arc<Mutex<std::time::Instant>>,
+    /// The current awaiting-input reason, if the detector last saw one.
+    awaiting_input: Arc<Mutex<Option<AwaitingInputReason>>>,
     /// Creation order, so "the task's latest session" is well-defined.
     order: u64,
 }
@@ -132,6 +138,7 @@ impl Session {
             running: self.running.load(Ordering::SeqCst),
             headless: self.headless,
             session_id: self.external_session_id.lock().unwrap().clone(),
+            awaiting_input: self.awaiting_input.lock().unwrap().clone(),
         }
     }
 }
@@ -368,6 +375,8 @@ impl AgentManager {
         let raw = Arc::new(Mutex::new(Vec::new()));
         let exit_code = Arc::new(std::sync::atomic::AtomicI32::new(-1));
         let external_session_id = Arc::new(Mutex::new(None::<String>));
+        let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
+        let awaiting_input = Arc::new(Mutex::new(None::<AwaitingInputReason>));
         let probe = agent.session_id_probe();
         let tx = self.tx.clone();
 
@@ -382,6 +391,7 @@ impl AgentManager {
             let raw_out = raw.clone();
             let exit_code = exit_code.clone();
             let external_session_id = external_session_id.clone();
+            let last_activity = last_activity.clone();
             std::thread::spawn(move || {
                 let mut chunk = [0u8; 8192];
                 let mut line_buf: Vec<u8> = Vec::new();
@@ -390,6 +400,7 @@ impl AgentManager {
                         Ok(0) => break,
                         Ok(n) => {
                             let bytes = &chunk[..n];
+                            *last_activity.lock().unwrap() = std::time::Instant::now();
                             {
                                 let mut buf = raw_out.lock().unwrap();
                                 buf.extend_from_slice(bytes);
@@ -482,6 +493,8 @@ impl AgentManager {
             exit_code,
             external_session_id,
             headless,
+            last_activity,
+            awaiting_input,
             order,
         });
         let info = session.info();
@@ -512,6 +525,55 @@ impl AgentManager {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+    }
+
+    /// Detect whether a running session is blocked on the user. Agent-specific
+    /// detection fires immediately; the generic fallback only fires once the PTY
+    /// has been quiet for `quiet`.
+    pub fn detect_awaiting_input(
+        &self,
+        session_id: &str,
+        agent: &dyn Agent,
+        quiet: std::time::Duration,
+    ) -> Option<AwaitingInputReason> {
+        let session = self.get(session_id).ok()?;
+        if !session.running.load(Ordering::SeqCst) {
+            return None;
+        }
+        let quiet_elapsed = session.last_activity.lock().unwrap().elapsed();
+        let (specific, generic) = {
+            let parser = session.parser.lock().unwrap();
+            let screen = parser.screen();
+            let specific = agent.awaiting_input(screen);
+            let generic = if quiet_elapsed >= quiet {
+                detect::generic_awaiting_input(&screen.contents())
+            } else {
+                None
+            };
+            (specific, generic)
+        };
+        specific.or(generic)
+    }
+
+    /// Record (or clear) a session's awaiting-input reason.
+    pub fn set_awaiting_input(&self, session_id: &str, reason: Option<AwaitingInputReason>) {
+        if let Ok(session) = self.get(session_id) {
+            *session.awaiting_input.lock().unwrap() = reason;
+        }
+    }
+
+    /// Whether the session's child process is still running.
+    pub fn is_running(&self, session_id: &str) -> bool {
+        self.get(session_id)
+            .map(|session| session.running.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+
+    /// The session's exit code, or `None` when the session is unknown.
+    pub fn exit_code(&self, session_id: &str) -> Option<i32> {
+        self.get(session_id)
+            .ok()
+            .map(|session| session.exit_code.load(Ordering::SeqCst))
     }
 
     /// Raw output captured for a session (used to record an unattended task's output).
@@ -1139,5 +1201,115 @@ mod tests {
         let output = mgr.output(&info.id);
         assert!(output.contains("V=false"), "output: {output:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn awaiting_input_slot_is_exposed_on_session_info() {
+        use favetto_core::model::AwaitingInputKind;
+        let mgr = AgentManager::new();
+        let info = mgr
+            .start(
+                "sh",
+                template("sh", cfg("sh", &["-c", "sleep 1"])),
+                Some("task-a".to_string()),
+                Invocation::Interactive {
+                    prompt: None,
+                    provider: None,
+                    model: None,
+                },
+                context(None, 24, 80),
+            )
+            .unwrap();
+        let find = |id: &str| mgr.sessions().into_iter().find(|s| s.id == id).unwrap();
+        assert!(find(&info.id).awaiting_input.is_none());
+
+        let reason = AwaitingInputReason {
+            kind: AwaitingInputKind::Permission,
+            message: "Allow once?".to_string(),
+        };
+        mgr.set_awaiting_input(&info.id, Some(reason.clone()));
+        assert_eq!(find(&info.id).awaiting_input, Some(reason.clone()));
+        assert_eq!(
+            mgr.find_latest_by_task("task-a").unwrap().awaiting_input,
+            Some(reason)
+        );
+
+        mgr.set_awaiting_input(&info.id, None);
+        assert!(find(&info.id).awaiting_input.is_none());
+        mgr.close(&info.id).unwrap();
+    }
+
+    #[test]
+    fn detect_awaiting_input_requires_quiet() {
+        let mgr = AgentManager::new();
+        let agent = template(
+            "sh",
+            cfg(
+                "sh",
+                &["-c", "printf 'Permission required: allow? '; sleep 1"],
+            ),
+        );
+        let info = mgr
+            .start(
+                "sh",
+                agent.clone(),
+                None,
+                Invocation::Interactive {
+                    prompt: None,
+                    provider: None,
+                    model: None,
+                },
+                context(None, 24, 80),
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(250));
+
+        // Fresh output means the quiet gate is not satisfied yet.
+        assert!(mgr
+            .detect_awaiting_input(&info.id, agent.as_ref(), std::time::Duration::from_secs(60))
+            .is_none());
+        // Once quiet, the generic fallback classifies the prompt.
+        let reason = mgr
+            .detect_awaiting_input(
+                &info.id,
+                agent.as_ref(),
+                std::time::Duration::from_millis(1),
+            )
+            .expect("prompt should be detected");
+        assert_eq!(
+            reason.kind,
+            favetto_core::model::AwaitingInputKind::Permission
+        );
+        mgr.close(&info.id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn detect_awaiting_input_is_none_after_exit() {
+        let mgr = AgentManager::new();
+        let agent = template(
+            "sh",
+            cfg(
+                "sh",
+                &["-c", "printf 'Permission required: allow? '; sleep 0.1"],
+            ),
+        );
+        let info = mgr
+            .start(
+                "sh",
+                agent.clone(),
+                None,
+                Invocation::Interactive {
+                    prompt: None,
+                    provider: None,
+                    model: None,
+                },
+                context(None, 24, 80),
+            )
+            .unwrap();
+        assert_eq!(mgr.wait(&info.id).await, Some(0));
+        assert!(mgr
+            .detect_awaiting_input(&info.id, agent.as_ref(), std::time::Duration::ZERO)
+            .is_none());
+        mgr.close(&info.id).unwrap();
     }
 }

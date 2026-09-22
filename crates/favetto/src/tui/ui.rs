@@ -925,7 +925,7 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(format!(
-                    " Tasks ({}) — click or ↑/↓ select, Enter/click to run agent ",
+                    " Tasks ({}) — Enter/click to run or answer an agent ",
                     app.tasks.len()
                 ))
                 .border_style(theme.block(false)),
@@ -1235,6 +1235,21 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
             .add_modifier(Modifier::BOLD),
     ));
 
+    let awaiting = app
+        .tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::AwaitingInput)
+        .count();
+    if awaiting > 0 {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("⚠ {awaiting} awaiting input · [Enter] open agent"),
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     let counts = format!("tasks: {}  events: {}", app.tasks.len(), app.events.len());
     spans.push(Span::raw("  "));
     spans.push(Span::styled(
@@ -1261,6 +1276,7 @@ fn status_line(
     let (glyph, txt) = match s {
         TaskStatus::Pending => ("○", "pending"),
         TaskStatus::Running => ("", "running"),
+        TaskStatus::AwaitingInput => ("!", "awaiting"),
         TaskStatus::Succeeded => ("✓", "succeeded"),
         TaskStatus::Failed => ("✗", "failed"),
         TaskStatus::Cancelled => ("●", "cancelled"),
@@ -1508,6 +1524,32 @@ mod tests {
         state.calc_next();
         let second = throbber_span(theme, &state).content.to_string();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn status_line_shows_awaiting_input() {
+        let theme = Theme::dark();
+        let state = throbber_widgets_tui::ThrobberState::default();
+        let line = status_line(TaskStatus::AwaitingInput, theme, &state);
+        let text: String = line.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains('!'), "glyph missing: {text:?}");
+        assert!(text.contains("awaiting"), "label missing: {text:?}");
+    }
+
+    #[test]
+    fn status_bar_counts_awaiting_input_tasks() {
+        let mut app = App::new();
+        app.tab = Tab::Tasks;
+        let mut blocked = geom_task("blocked");
+        blocked.status = TaskStatus::AwaitingInput;
+        app.tasks = vec![blocked];
+
+        let text = render_text(&mut app, 120, 24);
+        assert!(
+            text.contains("awaiting input"),
+            "status bar missing: {text:?}"
+        );
+        assert!(text.contains("open agent"), "hint missing: {text:?}");
     }
 
     #[test]

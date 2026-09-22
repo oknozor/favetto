@@ -97,6 +97,8 @@ worktree = true            # when parallel and in a git repo, give each task its
 # worktree_dir = "~/.local/share/favetto/worktrees"  # absolute, ~-expanded, or repo-relative
 keep_worktree = true       # keep worktrees after the task (so branches/changes can be inspected)
 # max_output_bytes = 262144  # stored task output cap; longer output is truncated head+tail
+# detect_awaiting_input = true     # surface a blocked agent as `awaiting_input` + notify
+# awaiting_input_quiet_ms = 8000   # PTY quiet time before the generic detector fires
 
 # Non-interactive git for agent sessions. favetto injects these into every agent
 # PTY through git's environment config only, never touching your real config.
@@ -160,3 +162,4 @@ task_finished = "success"      # ascending chime on task success
 task_failed   = "failure"      # descending tone on task failure
 task_started  = "none"
 attention     = "none"         # agent.exit
+awaiting_input = "attention"   # agent blocked on a permission/choice/pinentry prompt

@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use favetto_core::model::AwaitingInputReason;
 use futures_util::future::BoxFuture;
 
 use crate::config::AgentConfig;
@@ -149,6 +150,10 @@ impl Agent for OpenCodeAgent {
 
     fn provider_source(&self) -> Option<Arc<dyn ProviderSource>> {
         Some(Arc::new(OpenCodeProviderSource))
+    }
+
+    fn awaiting_input(&self, screen: &vt100::Screen) -> Option<AwaitingInputReason> {
+        super::detect::opencode_awaiting_input(&screen.contents())
     }
 }
 
@@ -354,5 +359,23 @@ mod tests {
         // opencode v2.0.8 at t=0 lists the session before a title key exists.
         let raw = r#"[{"id":"ses_1","updated":1,"created":0,"projectId":"p","directory":"/tmp"}]"#;
         assert!(session_title_from_json(raw, "ses_1").is_none());
+    }
+
+    #[test]
+    fn detects_permission_dialog_once_screen_rendered() {
+        use favetto_core::model::AwaitingInputKind;
+        let mut parser = vt100::Parser::new(10, 60, 0);
+        parser.process(
+            "Permission required\r\n❯ Allow once\r\n  Allow always\r\n  Reject".as_bytes(),
+        );
+        let reason = agent().awaiting_input(parser.screen());
+        assert_eq!(reason.map(|r| r.kind), Some(AwaitingInputKind::Permission));
+    }
+
+    #[test]
+    fn idle_screen_is_not_awaiting() {
+        let mut parser = vt100::Parser::new(10, 60, 0);
+        parser.process(b"Ask anything...");
+        assert!(agent().awaiting_input(parser.screen()).is_none());
     }
 }
