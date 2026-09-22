@@ -144,6 +144,10 @@ async fn reload(state: &Arc<State>) {
     );
     *state.catalog.write().unwrap() = updated;
 
+    if let Err(e) = crate::workflow::regenerate(&state.catalog.read().unwrap(), &state.data_dir) {
+        tracing::warn!(error = %e, "failed to write workflow.dot");
+    }
+
     if let Err(e) = crate::scheduler::reconcile_catalog_schedules(state).await {
         tracing::warn!(error = %e, "failed to reconcile catalog schedules");
     }
@@ -235,6 +239,29 @@ mod tests {
         .unwrap();
         assert!(pushed, "expected a catalog.updated push");
         assert!(state.catalog.read().unwrap().iter().any(|d| d.name == "b"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reload_rewrites_workflow_dot() {
+        let dir = temp_dir("workflow");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::write(
+            tasks_dir.join("a.md"),
+            "agent = \"x\"\nspawn = \"b\"\n---\nprompt a\n",
+        )
+        .unwrap();
+
+        let state = test_state(&dir, &tasks_dir).await;
+        // Force a change so `reload` actually regenerates the graph.
+        std::fs::write(tasks_dir.join("b.md"), "agent = \"x\"\n---\nprompt b\n").unwrap();
+        super::reload(&state).await;
+
+        let dot = std::fs::read_to_string(dir.join("workflow.dot")).unwrap();
+        assert!(dot.contains("\"a\" -> \"b\" [label=\"spawn\"];"), "{dot}");
+        assert!(dot.contains("\"b\" [label=\"b\"];"), "{dot}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

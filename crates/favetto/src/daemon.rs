@@ -121,6 +121,12 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         hook_store.clone(),
     ));
 
+    // Materialize the catalog graph once at startup so `<data_dir>/workflow.dot`
+    // exists even before the first catalog change.
+    if let Err(e) = crate::workflow::regenerate(&state.catalog.read().unwrap(), &state.data_dir) {
+        tracing::warn!(error = %e, "failed to write workflow.dot");
+    }
+
     // Start the scheduler, executor, and hook engine, then register catalog
     // schedules (recurring tasks) with the scheduler.
     crate::scheduler::start(&state).await?;

@@ -36,7 +36,7 @@ use favetto_providers::Provider;
 use crate::cli::TuiArgs;
 use crate::client::{Client, Transport};
 use crate::config::FavettoConfig;
-use app::{App, CatalogEntry, ConnState, UiAction};
+use app::{App, CatalogEntry, ConnState, Popup, UiAction};
 use sound::{CliSound, SoundPlayer};
 
 /// Outcome of a connected session: the user quit, or the link dropped.
@@ -236,6 +236,31 @@ async fn fetch_catalog(client: &Client, app: &mut App) {
     }
 }
 
+/// Fetch the catalog workflow graph (DOT) for the workflow overlay.
+async fn fetch_workflow(client: &Client, app: &mut App) {
+    match client
+        .request(method::WORKFLOW_GET, serde_json::json!({}))
+        .await
+    {
+        Ok(resp) => match resp.result {
+            Some(v) => {
+                let dot = v
+                    .get("dot")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let path = v.get("path").and_then(|p| p.as_str()).map(str::to_string);
+                app.set_workflow(dot, path);
+            }
+            None => app.set_workflow(String::new(), None),
+        },
+        Err(e) => {
+            app.logs.push_back(format!("workflow.get failed: {e}"));
+            app.set_workflow(format!("<failed to fetch workflow: {e}>"), None);
+        }
+    }
+}
+
 /// Load the raw Markdown for the selected catalog task, if the preview needs it.
 async fn maybe_load_catalog_preview(client: &Client, app: &mut App) {
     let Some(name) = app.catalog_preview_target() else {
@@ -385,6 +410,9 @@ async fn run_session(
                             UiAction::OpenWizard => {
                                 fetch_agents(client, app).await;
                             }
+                            UiAction::OpenWorkflow => {
+                                fetch_workflow(client, app).await;
+                            }
                             UiAction::WizardLoadProviders => {
                                 load_wizard_providers(client, app).await;
                             }
@@ -450,6 +478,9 @@ async fn run_session(
         if app.catalog_dirty {
             app.catalog_dirty = false;
             fetch_catalog(client, app).await;
+            if matches!(app.popup, Popup::Workflow { .. }) {
+                fetch_workflow(client, app).await;
+            }
         }
         maybe_load_catalog_preview(client, app).await;
     }

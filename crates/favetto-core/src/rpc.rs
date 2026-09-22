@@ -37,6 +37,8 @@ pub mod method {
     pub const CATALOG_GET: &str = "catalog.get";
     /// Add a task definition to the catalog (does not run it).
     pub const CATALOG_ADD: &str = "catalog.add";
+    /// Fetch the catalog workflow graph as Graphviz DOT (`dot` + persisted `path`).
+    pub const WORKFLOW_GET: &str = "workflow.get";
     pub const EVENTS_TAIL: &str = "events.tail";
     /// (Re)subscribe to the live event stream. Accepts `last_event_id` to replay
     /// missed events before switching to live delivery.

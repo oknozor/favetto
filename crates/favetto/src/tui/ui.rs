@@ -82,6 +82,8 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
     // the wizard can render a spinner without holding a borrow of `app`.
     let theme = app.theme;
     let state = app.throbber_state.clone();
+    let workflow_dot = app.workflow_dot.clone();
+    let workflow_path = app.workflow_path.clone();
     match &mut app.popup {
         Popup::None => {}
         Popup::Menu { selected } => draw_menu(frame, *selected, theme),
@@ -89,6 +91,13 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
         Popup::Wizard(wizard) => draw_wizard(frame, wizard, theme, &state),
         Popup::TaskVars(form) => draw_task_vars(frame, form, theme),
         Popup::Help { scroll } => draw_help(frame, scroll, theme),
+        Popup::Workflow { scroll } => draw_workflow(
+            frame,
+            scroll,
+            workflow_dot.as_deref(),
+            workflow_path.as_deref(),
+            theme,
+        ),
     }
 }
 
@@ -358,6 +367,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Shift+Tab / ←", "previous tab"),
             ("Ctrl+P", "open the action menu"),
             ("?", "open/close this help"),
+            ("w", "open/close the workflow graph"),
             ("M", "mute/unmute sound"),
             ("q / Esc", "quit"),
         ],
@@ -396,6 +406,13 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("↑ / ↓", "select"),
             ("Enter", "confirm / next field"),
             ("Esc", "cancel / close"),
+        ],
+    ),
+    (
+        "Workflow overlay (w)",
+        &[
+            ("↑ / ↓ / PageUp / PageDown", "scroll the graph source"),
+            ("Esc / w", "close"),
         ],
     ),
     (
@@ -443,6 +460,41 @@ fn draw_help(frame: &mut Frame, scroll: &mut u16, theme: Theme) {
     let inner_width = rect.width.saturating_sub(2);
     let inner_height = rect.height.saturating_sub(2);
     // `line_count` returns `usize`; the preview pane uses the same conversion.
+    let max_scroll = (paragraph.line_count(inner_width) as u16).saturating_sub(inner_height);
+    *scroll = (*scroll).min(max_scroll);
+
+    frame.render_widget(Clear, rect);
+    frame.buffer_mut().set_style(rect, theme.surface_style());
+    frame.render_widget(paragraph.scroll((*scroll, 0)), rect);
+}
+
+/// Draw the floating workflow overlay. Renders the fetched DOT source (the
+/// remote-safe fallback) and clamps `scroll` to the content.
+fn draw_workflow(
+    frame: &mut Frame,
+    scroll: &mut u16,
+    dot: Option<&str>,
+    path: Option<&str>,
+    theme: Theme,
+) {
+    let area = frame.area();
+    let rect = centered_rect(area, 90, area.height.saturating_sub(2));
+    let hint = " Workflow (w) — ↑/↓/PgUp/PgDn scroll, Esc/w close ";
+    let title = match path {
+        Some(p) => format!("{hint}— {p} "),
+        None => hint.to_string(),
+    };
+    let paragraph = Paragraph::new(dot.unwrap_or("Loading workflow graph…"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .style(theme.surface_style())
+                .border_style(theme.block(true)),
+        )
+        .wrap(Wrap { trim: false });
+    let inner_width = rect.width.saturating_sub(2);
+    let inner_height = rect.height.saturating_sub(2);
     let max_scroll = (paragraph.line_count(inner_width) as u16).saturating_sub(inner_height);
     *scroll = (*scroll).min(max_scroll);
 
@@ -1205,6 +1257,7 @@ mod tests {
                     error: None,
                 }),
                 Popup::Help { scroll: 0 },
+                Popup::Workflow { scroll: 0 },
             ] {
                 let mut app = App::with_theme(theme);
                 app.popup = popup;
@@ -1358,6 +1411,47 @@ mod tests {
         assert!(
             text.contains("mute/unmute sound"),
             "sound help row missing: {text:?}"
+        );
+    }
+
+    #[test]
+    fn help_overlay_lists_workflow_key() {
+        let mut app = App::new();
+        app.popup = Popup::Help { scroll: 0 };
+        let text = render_text(&mut app, 100, 40);
+        assert!(
+            text.contains("workflow graph"),
+            "workflow help row missing: {text:?}"
+        );
+    }
+
+    #[test]
+    fn workflow_overlay_renders_dot() {
+        let mut app = App::new();
+        app.popup = Popup::Workflow { scroll: 0 };
+        app.workflow_dot =
+            Some("digraph workflow {\n  \"a\" -> \"b\" [label=\"spawn\"];\n}".to_string());
+        app.workflow_path = Some("/data/workflow.dot".to_string());
+        let text = render_text(&mut app, 100, 40);
+        assert!(
+            text.contains("Workflow"),
+            "workflow title missing: {text:?}"
+        );
+        assert!(
+            text.contains("digraph workflow"),
+            "dot source missing: {text:?}"
+        );
+        assert!(text.contains("\"a\""), "node missing: {text:?}");
+    }
+
+    #[test]
+    fn workflow_overlay_renders_loading_state() {
+        let mut app = App::new();
+        app.popup = Popup::Workflow { scroll: 0 };
+        let text = render_text(&mut app, 100, 24);
+        assert!(
+            text.contains("Loading workflow graph"),
+            "loading placeholder missing: {text:?}"
         );
     }
 
