@@ -158,6 +158,7 @@ pub async fn enqueue_task(
         finished_at: None,
         error: None,
         session_id: None,
+        session_title: None,
     };
     db::insert_task(&state.db, &task).await?;
     crate::metrics::inc_tasks();
@@ -215,10 +216,11 @@ async fn run_one(
 
     let success = outcome.is_ok();
     match outcome {
-        Ok((output, session_id)) => {
+        Ok((output, session_id, session_title)) => {
             task.status = TaskStatus::Succeeded;
             task.output = Some(output);
             task.session_id = session_id;
+            task.session_title = session_title;
             task.error = None;
         }
         Err(e) => {
@@ -323,7 +325,8 @@ async fn spawn_from_manifest(
 
 /// Run a task through its configured external agent as a real PTY session bound
 /// to the task, so it can be reattached from the TUI and its output captured.
-/// Returns the produced output and the agent's own session id, if captured.
+/// Returns the produced output, the agent's own session id, and its session
+/// title (all optional but the output), if captured.
 async fn run_agent_task(
     state: &Arc<State>,
     task: &Task,
@@ -331,7 +334,7 @@ async fn run_agent_task(
     def: &TaskDef,
     prompt: &str,
     cwd: &Path,
-) -> anyhow::Result<(serde_json::Value, Option<String>)> {
+) -> anyhow::Result<(serde_json::Value, Option<String>, Option<String>)> {
     let agent = state.registry.get(agent_name).ok_or_else(|| {
         anyhow::anyhow!("agent '{agent_name}' is not configured under [agents.*]")
     })?;
@@ -366,6 +369,18 @@ async fn run_agent_task(
     if result.session_id.is_none() {
         result.session_id = state.agents.external_session_id(&info.id);
     }
+    // Resolve the title synchronously (a subprocess in most CLIs) off the async
+    // runtime; a failure or an agent without titles degrades to `None`.
+    let session_title = match result.session_id.clone() {
+        Some(sid) => {
+            let agent = agent.clone();
+            let cwd = cwd.to_path_buf();
+            tokio::task::spawn_blocking(move || agent.session_title(&sid, &cwd))
+                .await
+                .unwrap_or(None)
+        }
+        None => None,
+    };
     // The run's PTY only carried machine output (e.g. JSON events); drop it once
     // its session id is captured, since reattaching launches a fresh interactive
     // TUI on that session. Agents without resume keep the PTY so its final screen
@@ -379,9 +394,11 @@ async fn run_agent_task(
                 "output": result.raw,
                 "agent": agent_name,
                 "session_id": result.session_id,
+                "session_title": session_title,
                 "result": result.output,
             }),
             result.session_id,
+            session_title,
         )),
         Some(c) => anyhow::bail!("agent '{agent_name}' exited with {c}:\n{raw}"),
         None => anyhow::bail!("agent '{agent_name}' session disappeared"),
@@ -751,6 +768,7 @@ mod tests {
             finished_at: None,
             error: None,
             session_id: None,
+            session_title: None,
         };
         let ctx = render_context(&task);
         assert_eq!(crate::template::render("{{ task.name }}", &ctx), "triage");

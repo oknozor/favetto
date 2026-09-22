@@ -78,6 +78,11 @@ pub struct Task {
     /// task run's output so the session can be reattached later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// The agent's human-readable session title (e.g. opencode's generated title),
+    /// resolved once at run completion from the agent's session store. Absent until
+    /// a run finishes or when the agent reports no title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_title: Option<String>,
 }
 
 impl Task {
@@ -479,6 +484,46 @@ mod tests {
                 .unwrap();
         assert_eq!(legacy.display_name, "");
         assert_eq!(legacy.capabilities, AgentCapabilities::default());
+    }
+
+    #[test]
+    fn task_session_title_round_trips_and_defaults() {
+        let task = Task {
+            id: Uuid::new_v4(),
+            name: "t".to_string(),
+            status: TaskStatus::Succeeded,
+            input: serde_json::json!({}),
+            output: None,
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+            session_id: Some("ses_1".to_string()),
+            session_title: Some("Fix the widget".to_string()),
+        };
+        let json = serde_json::to_value(&task).unwrap();
+        assert_eq!(json["session_title"], "Fix the widget");
+        let back: Task = serde_json::from_value(json).unwrap();
+        assert_eq!(back.session_title.as_deref(), Some("Fix the widget"));
+
+        // Legacy payloads without `session_title` still decode, defaulting to None.
+        let legacy: Task = serde_json::from_str(
+            r#"{
+                "id": "00000000-0000-0000-0000-000000000000",
+                "name": "t",
+                "status": "succeeded",
+                "input": {},
+                "output": null,
+                "dedupe_key": null,
+                "created_at": "2024-01-01T00:00:00Z",
+                "started_at": null,
+                "finished_at": null,
+                "error": null
+            }"#,
+        )
+        .unwrap();
+        assert!(legacy.session_title.is_none());
     }
 
     #[test]

@@ -4,6 +4,14 @@ This page covers the client-side TUI behaviors: theme, sound notifications, the
 Ctrl+P menu, help, and one-shot tasks. For the Agent panel's focus and mouse
 handling see [Embedded agents](./agents).
 
+## Tasks list
+
+The **Tasks** tab lists recent runs with their status, age, and error. Once a
+headless run finishes, the agent's own session title (for opencode, from
+`session list --format json`) is shown in a truncated `SESSION` column, so
+repeated runs of the same catalog task stay distinguishable. The cell is blank
+for agents that do not report titles, or until the title becomes available.
+
 ## Theme
 
 The TUI ships a built-in dark and light style that is selected automatically from

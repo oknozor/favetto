@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     started_at  INTEGER,
     finished_at INTEGER,
     error       TEXT,
-    session_id  TEXT
+    session_id  TEXT,
+    session_title TEXT
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -87,10 +88,14 @@ pub async fn open(path: &Path) -> anyhow::Result<SqlitePool> {
 /// Apply the M1 schema.
 pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query(SCHEMA).execute(pool).await?;
-    // Additive migration for databases created before `session_id` existed.
-    // `ALTER TABLE ... ADD COLUMN` errors if the column is already present; that
-    // is the expected case for new databases, so the error is ignored.
+    // Additive migration for databases created before `session_id` /
+    // `session_title` existed. `ALTER TABLE ... ADD COLUMN` errors if the column
+    // is already present; that is the expected case for new databases, so the
+    // error is ignored.
     let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN session_id TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN session_title TEXT")
         .execute(pool)
         .await;
     Ok(())
@@ -99,8 +104,8 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
 /// Insert a task, silently ignoring a duplicate dedupe key.
 pub async fn insert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT OR IGNORE INTO tasks (id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO tasks (id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(task.id.to_string())
     .bind(&task.name)
@@ -113,6 +118,7 @@ pub async fn insert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
     .bind(task.finished_at.map(ts_ms))
     .bind(&task.error)
     .bind(&task.session_id)
+    .bind(&task.session_title)
     .execute(pool)
     .await?;
     Ok(())
@@ -121,15 +127,16 @@ pub async fn insert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
 /// Insert-or-update a task (full overwrite of mutable fields).
 pub async fn upsert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO tasks (id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "INSERT INTO tasks (id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
              status = excluded.status,
              output = excluded.output,
              started_at = excluded.started_at,
              finished_at = excluded.finished_at,
              error = excluded.error,
-             session_id = excluded.session_id",
+             session_id = excluded.session_id,
+             session_title = excluded.session_title",
     )
     .bind(task.id.to_string())
     .bind(&task.name)
@@ -142,6 +149,7 @@ pub async fn upsert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
     .bind(task.finished_at.map(ts_ms))
     .bind(&task.error)
     .bind(&task.session_id)
+    .bind(&task.session_title)
     .execute(pool)
     .await?;
     Ok(())
@@ -150,7 +158,7 @@ pub async fn upsert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
 /// Fetch a single task by id.
 pub async fn get_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Option<Task>> {
     let row = sqlx::query(
-        "SELECT id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id \
+        "SELECT id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title \
          FROM tasks WHERE id = ?",
     )
     .bind(id.to_string())
@@ -162,7 +170,7 @@ pub async fn get_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Option<Task
 /// List the most recent tasks (newest first).
 pub async fn list_tasks(pool: &SqlitePool) -> anyhow::Result<Vec<Task>> {
     let rows = sqlx::query(
-        "SELECT id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id \
+        "SELECT id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title \
          FROM tasks ORDER BY created_at DESC LIMIT 500",
     )
     .fetch_all(pool)
@@ -224,6 +232,10 @@ fn row_to_task(row: &SqliteRow) -> Task {
         error: row.get("error"),
         session_id: row
             .try_get::<Option<String>, _>("session_id")
+            .ok()
+            .flatten(),
+        session_title: row
+            .try_get::<Option<String>, _>("session_title")
             .ok()
             .flatten(),
     }
@@ -408,7 +420,7 @@ pub async fn fail_interrupted_tasks(pool: &SqlitePool) -> anyhow::Result<u64> {
 /// Up to `limit` pending tasks, oldest first (for the parallel executor).
 pub async fn next_pending_tasks(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec<Task>> {
     let rows = sqlx::query(
-        "SELECT id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id \
+        "SELECT id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title \
          FROM tasks WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?",
     )
     .bind(limit.max(1))
@@ -510,10 +522,64 @@ mod tests {
             finished_at: None,
             error: None,
             session_id: Some("ses_123".to_string()),
+            session_title: Some("Fix the widget".to_string()),
         };
         upsert_task(&pool, &task).await.unwrap();
         let got = get_task(&pool, task.id).await.unwrap().unwrap();
         assert_eq!(got.session_id.as_deref(), Some("ses_123"));
+        assert_eq!(got.session_title.as_deref(), Some("Fix the widget"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn migrate_adds_session_title_to_legacy_database() {
+        let dir = std::env::temp_dir().join(format!("favetto-legacy-tasks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = open(&dir.join("test.db")).await.unwrap();
+
+        // A pre-migration database: the tasks table predates `session_title`.
+        sqlx::query(
+            "CREATE TABLE tasks (
+                id          TEXT PRIMARY KEY,
+                name        TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                input       TEXT NOT NULL,
+                output      TEXT,
+                dedupe_key  TEXT UNIQUE,
+                created_at  INTEGER NOT NULL,
+                started_at  INTEGER,
+                finished_at INTEGER,
+                error       TEXT,
+                session_id  TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Running the migration twice is a no-op the second time.
+        migrate(&pool).await.unwrap();
+        migrate(&pool).await.unwrap();
+
+        let task = Task {
+            id: Uuid::new_v4(),
+            name: "t".to_string(),
+            status: TaskStatus::Succeeded,
+            input: serde_json::json!({}),
+            output: None,
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+            session_id: Some("ses_legacy".to_string()),
+            session_title: Some("Legacy title".to_string()),
+        };
+        upsert_task(&pool, &task).await.unwrap();
+        let got = get_task(&pool, task.id).await.unwrap().unwrap();
+        assert_eq!(got.session_title.as_deref(), Some("Legacy title"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -786,6 +786,7 @@ async fn start_oneshot_task(
         finished_at: None,
         error: None,
         session_id: None,
+        session_title: None,
     };
     db::insert_task(&state.db, &task).await?;
     crate::metrics::inc_tasks();

@@ -1,5 +1,6 @@
 //! Built-in agent for [opencode](https://opencode.ai).
 
+use std::path::Path;
 use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
@@ -93,6 +94,18 @@ impl Agent for OpenCodeAgent {
         self.template.probe.clone()
     }
 
+    fn session_title(&self, session_id: &str, cwd: &Path) -> Option<String> {
+        let out = std::process::Command::new(&self.template.config.command)
+            .args(["session", "list", "--format", "json"])
+            .current_dir(cwd)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        session_title_from_json(&String::from_utf8_lossy(&out.stdout), session_id)
+    }
+
     fn parse_output(&self, raw: &str, exit_code: Option<i32>) -> AgentRunResult {
         let mut events = Vec::new();
         let mut session_id = None;
@@ -128,6 +141,18 @@ impl Agent for OpenCodeAgent {
     fn provider_source(&self) -> Option<Arc<dyn ProviderSource>> {
         Some(Arc::new(OpenCodeProviderSource))
     }
+}
+
+/// Find `session_id`'s title in `opencode session list --format json` output:
+/// a JSON array of `{ "id", "title", … }`.
+fn session_title_from_json(raw: &str, session_id: &str) -> Option<String> {
+    let sessions: Vec<serde_json::Value> = serde_json::from_str(raw).ok()?;
+    sessions
+        .iter()
+        .find(|s| s.get("id").and_then(|v| v.as_str()) == Some(session_id))
+        .and_then(|s| s.get("title").and_then(|v| v.as_str()))
+        .map(str::to_string)
+        .filter(|t| !t.trim().is_empty())
 }
 
 /// Providers authenticated with opencode (`auth.json` + models.dev).
@@ -291,5 +316,26 @@ mod tests {
         let result = agent().parse_output("plain output", Some(1));
         assert_eq!(result.output, serde_json::json!({ "text": "plain output" }));
         assert!(result.session_id.is_none());
+    }
+
+    #[test]
+    fn session_title_from_json_matches_by_id() {
+        let raw = r#"[
+            {"id":"ses_1","title":"First session","updated":1},
+            {"id":"ses_2","title":"Fix the widget","updated":2}
+        ]"#;
+        assert_eq!(
+            session_title_from_json(raw, "ses_2").as_deref(),
+            Some("Fix the widget")
+        );
+        // Unknown id and empty title both yield no title.
+        assert!(session_title_from_json(raw, "ses_missing").is_none());
+        assert!(session_title_from_json(r#"[{"id":"ses_1","title":"  "}]"#, "ses_1").is_none());
+    }
+
+    #[test]
+    fn session_title_from_json_rejects_malformed() {
+        assert!(session_title_from_json("not json", "ses_1").is_none());
+        assert!(session_title_from_json(r#"{"id":"ses_1","title":"x"}"#, "ses_1").is_none());
     }
 }

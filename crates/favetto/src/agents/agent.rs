@@ -9,6 +9,7 @@
 //! [`ConfigurableAgent`](super::configurable::ConfigurableAgent).
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -148,6 +149,13 @@ pub trait Agent: Send + Sync {
 
     /// Where to read the agent's session id from its output, if it reports one.
     fn session_id_probe(&self) -> Option<SessionIdProbe> {
+        None
+    }
+
+    /// Look up the human-readable title of one of this agent's sessions, if its
+    /// CLI exposes one. `cwd` is the directory the session ran in, for CLIs that
+    /// scope their session store per project. The default is "no title".
+    fn session_title(&self, _session_id: &str, _cwd: &Path) -> Option<String> {
         None
     }
 
@@ -319,5 +327,10 @@ mod tests {
         assert_eq!(result.raw, "hello");
         assert_eq!(result.exit_code, Some(0));
         assert!(result.session_id.is_none());
+
+        // The default title lookup is always "no title".
+        assert!(Dummy
+            .session_title("ses_1", std::path::Path::new("/tmp"))
+            .is_none());
     }
 }
