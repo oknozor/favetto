@@ -80,6 +80,8 @@ pub enum UiAction {
         name: String,
         input: Value,
     },
+    /// Open the selected Catalog task's Markdown in the user's editor.
+    EditCatalog(String),
     /// Open the one-shot task wizard.
     OpenWizard,
     /// Fetch the catalog workflow graph (`workflow.get`) and show the overlay.
@@ -1741,6 +1743,16 @@ impl App {
                 self.toggle_catalog_folder();
                 UiAction::None
             }
+            // `e` edits the selected Catalog task; a folder row is a no-op.
+            KeyCode::Char('e') if self.tab == Tab::Catalog => {
+                match self
+                    .selected_catalog_task()
+                    .and_then(|i| self.catalog.get(i))
+                {
+                    Some(entry) => UiAction::EditCatalog(entry.name.clone()),
+                    None => UiAction::None,
+                }
+            }
             _ => UiAction::None,
         }
     }
@@ -2594,6 +2606,61 @@ mod tests {
         };
         assert_eq!(form.input, "p");
         assert!(app.catalog_preview_visible);
+    }
+
+    #[test]
+    fn catalog_edit_key_maps_to_edit_action() {
+        let mut app = App::new();
+        app.tab = Tab::Catalog;
+        app.set_catalog(vec![catalog_entry("demo")]);
+
+        match app.handle_key(key(KeyCode::Char('e'), KeyModifiers::empty())) {
+            UiAction::EditCatalog(name) => assert_eq!(name, "demo"),
+            _ => panic!("expected EditCatalog"),
+        }
+
+        // The binding is Catalog-only: `e` does nothing on the Tasks tab.
+        app.tab = Tab::Tasks;
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('e'), KeyModifiers::empty())),
+            UiAction::None
+        ));
+    }
+
+    #[test]
+    fn catalog_edit_key_is_noop_on_folder() {
+        let mut app = App::new();
+        app.tab = Tab::Catalog;
+        app.set_catalog(nested_catalog());
+        // Row 1 is the `pipelines` folder header.
+        app.catalog_selected = 1;
+        assert!(matches!(
+            app.catalog_rows().get(1),
+            Some(CatalogRow::Folder { .. })
+        ));
+
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('e'), KeyModifiers::empty())),
+            UiAction::None
+        ));
+    }
+
+    #[test]
+    fn catalog_edit_key_literal_inside_form() {
+        let mut app = App::new();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
+        let Popup::Form(form) = &app.popup else {
+            panic!("expected form");
+        };
+        assert!(matches!(form.kind, FormKind::AddTask));
+
+        app.handle_key(key(KeyCode::Char('e'), KeyModifiers::empty()));
+        let Popup::Form(form) = &app.popup else {
+            panic!("expected form");
+        };
+        assert_eq!(form.input, "e");
     }
 
     #[test]

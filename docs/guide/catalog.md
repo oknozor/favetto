@@ -53,6 +53,26 @@ Collapse state lasts for the session and survives live reloads. On terminals
 where the emoji render double-width, set `FAVETTO_PLAIN_ICONS=1` for an ASCII
 fallback (`[-]`/`[+]`/`-`).
 
+## Edit a task
+
+Press **`e`** on a selected task to open its `.md` file in an editor. The TUI
+suspends (leaves the alternate screen and restores your terminal), runs the
+editor, and restores itself when the editor exits. On save the file is validated
+and written back through `catalog.update`, then the catalog and preview refresh;
+a malformed save is rejected with an error in the log and the file on disk is
+left untouched. Folder rows are a no-op.
+
+The editor is resolved in this order:
+
+1. `[tui].editor` from the config file, when set,
+2. `$VISUAL`,
+3. `$EDITOR`,
+4. `vi`.
+
+The value may contain arguments (for example `code --wait` or `nvim -f`). The
+editor runs on the machine running `favetto tui`, so this works with a remote
+daemon too.
+
 ## Preview a task
 
 The right side of the Catalog tab previews the highlighted task: its raw `.md`

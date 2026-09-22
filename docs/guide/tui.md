@@ -38,6 +38,7 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 | Lists | `PageUp` / `PageDown` | move or scroll by a page |
 | Tasks | `Enter` | open the selected task's agent session |
 | Catalog | `Enter` | start the task; on a folder, fold/unfold |
+| Catalog | `e` | edit the selected task in `$VISUAL`/`$EDITOR` |
 | Catalog | `Space` | fold/unfold the selected folder |
 | Catalog | `p` | show/hide the preview pane |
 | Catalog | `PageUp` / `PageDown` / wheel | scroll the preview pane |
@@ -55,9 +56,9 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 | Mouse | click a catalog folder | fold/unfold it |
 | Mouse | click a catalog/task row | select; click again starts it |
 
-`?`, `w`, and `p` are forwarded to the embedded agent while the Agent panel has
-keyboard capture, and are typed literally into form/wizard fields when one is
-open. `p` only toggles the preview on the Catalog tab.
+`?`, `w`, `p`, and `e` are forwarded to the embedded agent while the Agent panel
+has keyboard capture, and are typed literally into form/wizard fields when one is
+open. `p` only toggles the preview and `e` only edits on the Catalog tab.
 
 ## Ctrl+P menu
 

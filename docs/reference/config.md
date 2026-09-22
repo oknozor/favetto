@@ -199,6 +199,7 @@ TUI-only settings. The daemon parses but ignores this section.
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
+| `editor` | string (optional) | — | no | Editor command for `e` on a Catalog task. Unset -> `$VISUAL`, then `$EDITOR`, then `vi`. May include arguments (e.g. `code --wait`). |
 | `sound` | SoundSettings | `{"enabled":true,"events":{"attention":"none","task_failed":"failure","task_finished":"success","task_started":"none"},"min_interval_ms":400,"only_when_unfocused":false,"player":"auto"}` | no |  |
 
 ## WebhookSettings

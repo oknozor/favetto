@@ -138,6 +138,10 @@ action = "opened"
 task = "favetto/plan_issue"
 filter = { labels_contains = ["bug"], base_ref = "main", author = "oknozor" }
 
+# Editor opened by `e` on a Catalog task. Unset -> $VISUAL, then $EDITOR, then vi.
+# [tui]
+# editor = "code --wait"
+
 # Client-side TUI sound notifications. Ignored by the daemon; sounds play on the
 # machine running `favetto tui`. Overridable with --sound/--no-sound/
 # --sound-command / --test-sound and the FAVETTO_SOUND* env vars.

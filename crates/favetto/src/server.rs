@@ -410,6 +410,11 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
             Err(e) => Err((error_code::INTERNAL, e.to_string())),
         },
 
+        method::CATALOG_UPDATE => match update_catalog_task(state, &req.params).await {
+            Ok(()) => Ok(serde_json::json!({ "updated": true })),
+            Err(e) => Err((error_code::INVALID_PARAMS, e.to_string())),
+        },
+
         method::WORKFLOW_GET => {
             let catalog = state.catalog.read().unwrap().clone();
             Ok(serde_json::json!({
@@ -1100,6 +1105,36 @@ async fn add_catalog_task(
     Ok(def)
 }
 
+/// Replace an existing catalog task's `.md` file with `markdown` and reload.
+///
+/// Validates the path and the Markdown before writing so a malformed save can
+/// never clobber a good task file; the raw bytes are written unchanged so the
+/// user's formatting is preserved.
+async fn update_catalog_task(state: &Arc<State>, params: &serde_json::Value) -> anyhow::Result<()> {
+    let name = params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing 'name'"))?
+        .to_string();
+    crate::tasks::validate_task_path(&name)?;
+    let markdown = params
+        .get("markdown")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing 'markdown'"))?;
+    if !state.catalog.read().unwrap().iter().any(|d| d.name == name) {
+        anyhow::bail!("unknown task '{name}'");
+    }
+    crate::tasks::parse_task_md(&name, markdown)
+        .map_err(|e| anyhow::anyhow!("invalid task '{name}': {e}"))?;
+    let path = state.tasks_dir.join(format!("{name}.md"));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, markdown)?;
+    crate::catalog_watch::reload(state).await;
+    Ok(())
+}
+
 async fn delete_schedule(state: &Arc<State>, id: &str) -> anyhow::Result<()> {
     crate::scheduler::remove(state, id).await
 }
@@ -1335,6 +1370,148 @@ mod tests {
             .expect("catalog schedule registered on add");
         assert_eq!(entry.cron, "0 0 8 * * *");
         assert_eq!(entry.task, "scheduled");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn update_catalog_task_rewrites_file_and_publishes() {
+        let dir = temp_dir("update");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::write(tasks_dir.join("a.md"), "agent = \"x\"\n---\noriginal\n").unwrap();
+        let state = test_state(&dir, &tasks_dir).await;
+        let mut rx = state.bus.subscribe();
+
+        let updated = "agent = \"x\"\n---\nupdated body\n";
+        let params = serde_json::json!({ "name": "a", "markdown": updated });
+        update_catalog_task(&state, &params).await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(tasks_dir.join("a.md")).unwrap(),
+            updated
+        );
+        let prompt = state
+            .catalog
+            .read()
+            .unwrap()
+            .iter()
+            .find(|d| d.name == "a")
+            .map(|d| d.prompt.clone())
+            .unwrap();
+        assert_eq!(prompt, "updated body");
+        assert!(matches!(rx.try_recv(), Ok(ServerPush::CatalogUpdated)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn update_catalog_task_nested_path() {
+        let dir = temp_dir("update-nested");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(tasks_dir.join("pipelines")).unwrap();
+        std::fs::write(
+            tasks_dir.join("pipelines/plan.md"),
+            "agent = \"x\"\n---\none\n",
+        )
+        .unwrap();
+        let state = test_state(&dir, &tasks_dir).await;
+
+        let updated = "agent = \"x\"\n---\ntwo\n";
+        let params = serde_json::json!({ "name": "pipelines/plan", "markdown": updated });
+        update_catalog_task(&state, &params).await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(tasks_dir.join("pipelines/plan.md")).unwrap(),
+            updated
+        );
+        assert!(state
+            .catalog
+            .read()
+            .unwrap()
+            .iter()
+            .any(|d| d.name == "pipelines/plan" && d.prompt == "two"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn update_catalog_task_rejects_unknown_name() {
+        let dir = temp_dir("update-unknown");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let state = test_state(&dir, &tasks_dir).await;
+
+        let params = serde_json::json!({
+            "name": "ghost",
+            "markdown": "agent = \"x\"\n---\nhi\n",
+        });
+        let err = update_catalog_task(&state, &params).await.unwrap_err();
+        assert!(err.to_string().contains("unknown task"), "{err}");
+        assert!(!tasks_dir.join("ghost.md").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn update_catalog_task_rejects_invalid_markdown() {
+        let dir = temp_dir("update-invalid");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let original = "agent = \"x\"\n---\noriginal\n";
+        std::fs::write(tasks_dir.join("a.md"), original).unwrap();
+        let state = test_state(&dir, &tasks_dir).await;
+
+        let params = serde_json::json!({ "name": "a", "markdown": "agent = \n---\nbroken\n" });
+        let err = update_catalog_task(&state, &params).await.unwrap_err();
+        assert!(err.to_string().contains("invalid task"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(tasks_dir.join("a.md")).unwrap(),
+            original
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn update_catalog_task_rejects_traversal() {
+        let dir = temp_dir("update-traversal");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let state = test_state(&dir, &tasks_dir).await;
+
+        let params = serde_json::json!({
+            "name": "../escape",
+            "markdown": "agent = \"x\"\n---\nhi\n",
+        });
+        let err = update_catalog_task(&state, &params).await.unwrap_err();
+        assert!(err.to_string().contains("invalid task path"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn dispatch_catalog_update_returns_updated() {
+        let dir = temp_dir("update-dispatch");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::write(tasks_dir.join("a.md"), "agent = \"x\"\n---\noriginal\n").unwrap();
+        let state = test_state(&dir, &tasks_dir).await;
+
+        let req = Request {
+            id: 1,
+            method: method::CATALOG_UPDATE.to_string(),
+            params: serde_json::json!({
+                "name": "a",
+                "markdown": "agent = \"x\"\n---\nnew\n",
+            }),
+        };
+        let resp = dispatch(&state, req).await;
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        assert_eq!(
+            resp.result.and_then(|v| v.get("updated").cloned()),
+            Some(serde_json::json!(true))
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
