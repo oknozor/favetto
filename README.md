@@ -62,6 +62,16 @@ cargo build
 # configure external agents, then start tasks from the TUI
 ```
 
+### Checks
+
+CI runs the same three gates locally:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo nextest run --locked --workspace   # install: cargo install cargo-nextest
+```
+
 **Appearance.** The TUI ships a built-in dark and light style that is selected
 automatically from the terminal background (an OSC 11 query, then `COLORFGBG`,
 then dark). Set `FAVETTO_THEME=dark` or `FAVETTO_THEME=light` to override it.
