@@ -65,7 +65,9 @@ pub struct Task {
     pub status: TaskStatus,
     /// Arbitrary input passed to the task's prompt.
     pub input: serde_json::Value,
-    /// Produced by the task on completion.
+    /// Produced by the task on completion. Omitted from list and push payloads;
+    /// fetch it on demand with `tasks.get`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<serde_json::Value>,
     /// Optional dedupe key. Inserting a second task with the same key is a no-op.
     pub dedupe_key: Option<String>,
@@ -92,6 +94,14 @@ impl Task {
             method: push::TASK_UPDATED.to_string(),
             params: serde_json::to_value(self).unwrap_or_default(),
         }
+    }
+
+    /// A copy without the (potentially large) `output` blob. Used by list and
+    /// push payloads, which never carry output.
+    pub fn summary(&self) -> Task {
+        let mut task = self.clone();
+        task.output = None;
+        task
     }
 }
 
@@ -619,6 +629,37 @@ mod tests {
         )
         .unwrap();
         assert!(legacy.session_title.is_none());
+    }
+
+    #[test]
+    fn task_output_omitted_decodes_and_summary_clears_it() {
+        // A compact payload without an `output` key still decodes.
+        let compact: Task = serde_json::from_str(
+            r#"{
+                "id": "00000000-0000-0000-0000-000000000000",
+                "name": "t",
+                "status": "succeeded",
+                "input": {},
+                "dedupe_key": null,
+                "created_at": "2024-01-01T00:00:00Z",
+                "started_at": null,
+                "finished_at": null,
+                "error": null
+            }"#,
+        )
+        .unwrap();
+        assert!(compact.output.is_none());
+
+        // `summary()` drops the output blob but keeps the rest of the task.
+        let task = Task {
+            output: Some(serde_json::json!({ "huge": "x".repeat(10_000) })),
+            ..compact
+        };
+        let summary = task.summary();
+        assert!(summary.output.is_none());
+        assert_eq!(summary.id, task.id);
+        assert_eq!(summary.name, task.name);
+        assert_eq!(summary.status, task.status);
     }
 
     #[test]

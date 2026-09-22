@@ -199,7 +199,7 @@ pub async fn enqueue_task(
     };
     db::insert_task(&state.db, &task).await?;
     crate::metrics::inc_tasks();
-    state.bus.publish(ServerPush::TaskUpdated(task.clone()));
+    state.bus.publish(ServerPush::TaskUpdated(task.summary()));
     state
         .emit_event(
             EventKind::TaskIdle,
@@ -219,7 +219,7 @@ async fn run_one(
     // `claim_task` already persisted Running; mirror it on our copy.
     task.status = TaskStatus::Running;
     task.started_at = Some(Utc::now());
-    state.bus.publish(ServerPush::TaskUpdated(task.clone()));
+    state.bus.publish(ServerPush::TaskUpdated(task.summary()));
     state
         .emit_event(
             EventKind::TaskStarted,
@@ -253,7 +253,7 @@ async fn run_one(
     task.finished_at = Some(Utc::now());
 
     let _ = db::upsert_task(&state.db, &task).await;
-    state.bus.publish(ServerPush::TaskUpdated(task.clone()));
+    state.bus.publish(ServerPush::TaskUpdated(task.summary()));
 
     // If the CLI had not written the title yet, keep polling in the background and
     // push the update when it appears, so an open TUI fills the cell live.
@@ -312,6 +312,85 @@ fn render_context(task: &Task) -> serde_json::Value {
         ctx["prev"] = prev.clone();
     }
     ctx
+}
+
+/// Largest char boundary `<= idx` (clamped to the string length).
+fn floor_char_boundary(s: &str, idx: usize) -> usize {
+    let mut i = idx.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Smallest char boundary `>= idx` (clamped to the string length).
+fn ceil_char_boundary(s: &str, idx: usize) -> usize {
+    let mut i = idx.min(s.len());
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// Cap `s` to `max` bytes on UTF-8 boundaries, keeping the head and the tail.
+/// Returns the (possibly truncated) string and whether truncation happened.
+fn truncate_text(s: &str, max: usize) -> (String, bool) {
+    if s.len() <= max || max == 0 {
+        return (s.to_string(), false);
+    }
+    let head_budget = max * 3 / 4;
+    let tail_budget = max - head_budget;
+    let head_end = floor_char_boundary(s, head_budget);
+    let tail_start = ceil_char_boundary(s, s.len() - tail_budget);
+    let removed = s.len() - head_end - (s.len() - tail_start);
+    (
+        format!(
+            "{}\n… [truncated {removed} bytes] …\n{}",
+            &s[..head_end],
+            &s[tail_start..]
+        ),
+        true,
+    )
+}
+
+/// Build the persisted `task.output` value from a finished run. Caps the raw
+/// text, records the original size, and drops the default parser's
+/// `{"text": raw}` duplicate.
+fn build_task_output(
+    raw: &str,
+    parsed: &serde_json::Value,
+    agent: &str,
+    session_id: Option<String>,
+    session_title: Option<String>,
+    max: usize,
+) -> serde_json::Value {
+    let (capped_raw, truncated) = truncate_text(raw, max);
+    // The default parser wraps the raw text as `{"text": raw}`; that is a
+    // byte-for-byte duplicate of `output`, so store `null` instead.
+    let result = if parsed
+        .as_object()
+        .map(|o| o.len() == 1 && o.get("text").and_then(|v| v.as_str()) == Some(raw))
+        .unwrap_or(false)
+    {
+        serde_json::Value::Null
+    } else {
+        let serialized = parsed.to_string();
+        if serialized.len() > max {
+            let (preview, _) = truncate_text(&serialized, max);
+            serde_json::json!({ "preview": preview, "truncated": true })
+        } else {
+            parsed.clone()
+        }
+    };
+    serde_json::json!({
+        "agent": agent,
+        "session_id": session_id,
+        "session_title": session_title,
+        "output_bytes": raw.len(),
+        "truncated": truncated,
+        "output": capped_raw,
+        "result": result,
+    })
 }
 
 /// Read the task's `spawn_file` (rendered template), parse it as a JSON array,
@@ -433,13 +512,15 @@ async fn run_agent_task(
     if result.session_id.is_some() && agent.capabilities().resume {
         let _ = state.agents.close(&info.id);
     }
-    let output = serde_json::json!({
-        "output": result.raw,
-        "agent": agent_name,
-        "session_id": result.session_id,
-        "session_title": session_title,
-        "result": result.output,
-    });
+    let max = state.config.read().unwrap().executor.max_output_bytes;
+    let output = build_task_output(
+        &result.raw,
+        &result.output,
+        agent_name,
+        result.session_id.clone(),
+        session_title.clone(),
+        max,
+    );
     let error = match result.exit_code {
         Some(0) => None,
         Some(c) => Some(format!("agent '{agent_name}' exited with {c}:\n{raw}")),
@@ -502,7 +583,7 @@ async fn backfill_title(
     }
     task.session_title = Some(title);
     if db::upsert_task(&state.db, &task).await.is_ok() {
-        state.bus.publish(ServerPush::TaskUpdated(task));
+        state.bus.publish(ServerPush::TaskUpdated(task.summary()));
     }
 }
 
@@ -513,7 +594,7 @@ async fn fail_task(state: &State, task: Task, error: &str) {
     task.error = Some(error.to_string());
     task.finished_at = Some(Utc::now());
     let _ = db::upsert_task(&state.db, &task).await;
-    state.bus.publish(ServerPush::TaskUpdated(task.clone()));
+    state.bus.publish(ServerPush::TaskUpdated(task.summary()));
     state
         .emit_event(
             EventKind::TaskFinished,
@@ -1110,6 +1191,48 @@ mod tests {
         let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
         assert_eq!(stored.session_title.as_deref(), Some("Existing"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncate_text_keeps_head_and_tail_on_char_boundaries() {
+        // Multi-byte input: truncation must not split a UTF-8 char.
+        let s = "é".repeat(400);
+        let (out, truncated) = truncate_text(&s, 100);
+        assert!(truncated);
+        assert!(out.starts_with('é'), "head preserved");
+        assert!(out.ends_with('é'), "tail preserved");
+        assert!(out.contains("truncated"), "marker present: {out}");
+        // Head + tail stay within the cap; only the marker is added on top.
+        assert!(out.len() <= 100 + 60, "capped: {} bytes", out.len());
+        // A short input is returned unchanged.
+        let (short, truncated) = truncate_text("hello", 100);
+        assert_eq!(short, "hello");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn build_task_output_caps_and_dedupes() {
+        let raw = "x".repeat(10_000);
+        let parsed = serde_json::json!({ "text": raw });
+        let value = build_task_output(&raw, &parsed, "opencode", None, None, 1000);
+        assert_eq!(value["result"], serde_json::Value::Null);
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["output_bytes"], 10_000);
+        assert_eq!(value["agent"], "opencode");
+        // The whole stored blob stays in the same order of magnitude as the cap.
+        let encoded = serde_json::to_string(&value).unwrap();
+        assert!(encoded.len() < 2 * 1000, "bounded blob: {encoded}");
+    }
+
+    #[test]
+    fn build_task_output_keeps_structured_result() {
+        let raw = "done";
+        let parsed = serde_json::json!([{ "event": "x" }]);
+        let value = build_task_output(raw, &parsed, "opencode", Some("ses_1".into()), None, 1000);
+        assert_eq!(value["truncated"], false);
+        assert_eq!(value["output"], "done");
+        assert_eq!(value["result"], parsed);
+        assert_eq!(value["session_id"], "ses_1");
     }
 
     #[test]

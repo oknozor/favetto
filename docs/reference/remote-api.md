@@ -24,7 +24,8 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | Method | Purpose |
 |--------|---------|
 | `system.ping` | Liveness check. |
-| `tasks.list` | List tasks. |
+| `tasks.list` | List tasks (metadata only; output is omitted). |
+| `tasks.get` | Fetch a single task by id, including its stored output. |
 | `tasks.cancel` | Cancel a task. |
 | `tasks.start` | Start a catalog task by name. |
 | `tasks.start_oneshot` | Start a one-shot task from an inline definition (not added to the catalog) and open its interactive agent session. |

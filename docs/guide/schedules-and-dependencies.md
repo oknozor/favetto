@@ -39,6 +39,14 @@ A triage run just finished. Its output was:
 Write a plan based on it.
 ```
 
+`prev.output` is the predecessor's stored output object (`agent`, `output`,
+`output_bytes`, `truncated`, `result`, …), not a bare string. Stored output is
+capped (default 256 KiB, `[executor].max_output_bytes`); longer runs are
+truncated head+tail and have `truncated = true`. When the agent produced no
+structured result of its own, the default parser's `{"text": raw}` duplicate is
+dropped and `result` is `null` — read `output` for the raw text, or `result` for
+structured JSON.
+
 A `needs` successor is an unattended run: no `[[vars]]` form is shown, so
 `required` variables must be provided by the predecessor or the run fails fast.
 

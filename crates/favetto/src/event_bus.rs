@@ -14,6 +14,8 @@ use favetto_core::rpc::{push, Notification};
 #[derive(Debug, Clone)]
 pub enum ServerPush {
     Event(Event),
+    /// A task changed. Carries [`Task::summary`] — never the output blob; fetch
+    /// output on demand with `tasks.get`.
     TaskUpdated(Task),
     /// The task catalog changed on disk; clients should re-fetch it.
     CatalogUpdated,

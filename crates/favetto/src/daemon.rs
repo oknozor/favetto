@@ -77,6 +77,16 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         Err(e) => tracing::warn!(error = %e, "failed to reconcile interrupted tasks"),
     }
 
+    // Bounded growth: run one retention pass at startup. Never fatal.
+    let retention = config.read().unwrap().daemon.retention.clone();
+    match db::prune(&pool, retention.days, retention.min_tasks, retention.vacuum).await {
+        Ok(stats) if stats != db::PruneStats::default() => {
+            tracing::info!(?stats, "pruned database")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "database prune failed"),
+    }
+
     let token = Token::load_or_create(&token_path)?;
     tracing::info!(
         data_dir = %data_dir.display(),
@@ -133,6 +143,24 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     crate::executor::spawn(state.clone());
     hooks::HookEngine::new(hook_store, state.clone()).spawn();
     crate::scheduler::reconcile_catalog_schedules(&state).await?;
+
+    // Re-run retention every six hours so a long-lived daemon stays bounded.
+    if retention.days > 0 {
+        let pool = state.db.clone();
+        let retention = retention.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));
+            tick.tick().await; // consume the immediate first tick
+            loop {
+                tick.tick().await;
+                if let Err(e) =
+                    db::prune(&pool, retention.days, retention.min_tasks, retention.vacuum).await
+                {
+                    tracing::warn!(error = %e, "periodic database prune failed");
+                }
+            }
+        });
+    }
 
     // Reload the catalog when task files change on disk. A missing tasks dir
     // degrades gracefully: the rest of the daemon still runs.

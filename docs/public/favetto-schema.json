@@ -144,6 +144,15 @@
             "null"
           ]
         },
+        "retention": {
+          "$ref": "#/$defs/RetentionSettings",
+          "default": {
+            "days": 30,
+            "min_tasks": 1000,
+            "vacuum": true
+          },
+          "description": "Bounded database growth. On by default; `days = 0` keeps everything."
+        },
         "socket": {
           "type": [
             "string",
@@ -170,6 +179,13 @@
         "max_concurrency": {
           "default": 4,
           "description": "Maximum concurrent tasks when `parallel` is true.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_output_bytes": {
+          "default": 262144,
+          "description": "Cap on the stored `task.output` blob, in bytes (default 256 KiB). Longer\noutput is truncated head+tail and flagged.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
@@ -363,6 +379,31 @@
       },
       "type": "object"
     },
+    "RetentionSettings": {
+      "description": "Database retention policy.\n\nThis is the one setting that deletes data: on daemon start (and every six\nhours) rows older than `days` are pruned and the database is optionally\n`VACUUM`ed. `min_tasks` guarantees the newest N task rows survive regardless\nof age. Set `days = 0` to opt out and keep everything forever.",
+      "properties": {
+        "days": {
+          "default": 30,
+          "description": "Delete rows older than this many days (0 = keep forever).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_tasks": {
+          "default": 1000,
+          "description": "Always keep at least this many newest task rows.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "vacuum": {
+          "default": true,
+          "description": "VACUUM + WAL checkpoint after a prune that deleted rows.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "SoundSettings": {
       "description": "Client-side sound notifications for the TUI.\n\nPrecedence is CLI flags (`--sound`/`--no-sound`/`--sound-command`) over the\n`FAVETTO_SOUND*` environment variables over this section over built-in\ndefaults. Sounds are played on the machine running `favetto tui`.",
       "properties": {
@@ -473,6 +514,11 @@
       "default": {
         "data_dir": null,
         "listen": null,
+        "retention": {
+          "days": 30,
+          "min_tasks": 1000,
+          "vacuum": true
+        },
         "socket": null,
         "tasks_dir": null
       },
@@ -483,6 +529,7 @@
       "default": {
         "keep_worktree": true,
         "max_concurrency": 4,
+        "max_output_bytes": 262144,
         "parallel": false,
         "worktree": true
       },
