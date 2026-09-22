@@ -82,7 +82,10 @@ mod tests {
         term.process(b"\x1b[2J\x1b[Hfirst\x1b[2J\x1b[Hsecond");
         let text = screen_text(&term, 5, 20);
         assert!(text.contains("second"));
-        assert!(!text.contains("first"), "frame should clear previous content");
+        assert!(
+            !text.contains("first"),
+            "frame should clear previous content"
+        );
     }
 
     #[test]

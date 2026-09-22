@@ -84,13 +84,12 @@ async fn serve_socket(state: Arc<State>, socket: WebSocket) {
         }
     }));
 
-    let outgoing: BoxOut = Box::pin(
-        sink.sink_map_err(|e| WireError::Other(e.to_string()))
-            .with(|frame: Frame| async move {
-                let bytes = encode(&frame)?;
-                Ok::<_, WireError>(Message::Binary(bytes.into()))
-            }),
-    );
+    let outgoing: BoxOut = Box::pin(sink.sink_map_err(|e| WireError::Other(e.to_string())).with(
+        |frame: Frame| async move {
+            let bytes = encode(&frame)?;
+            Ok::<_, WireError>(Message::Binary(bytes.into()))
+        },
+    ));
 
     server::serve_connection(state, incoming, outgoing).await;
 }

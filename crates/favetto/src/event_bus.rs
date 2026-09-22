@@ -19,7 +19,10 @@ pub enum ServerPush {
     CatalogUpdated,
     /// Forward-looking: used once the runtime streams agent logs to clients.
     #[allow(dead_code)]
-    LogLine { level: String, message: String },
+    LogLine {
+        level: String,
+        message: String,
+    },
 }
 
 impl ServerPush {

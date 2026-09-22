@@ -70,7 +70,10 @@ pub fn inc_rpc() {
 pub async fn metrics_handler() -> impl axum::response::IntoResponse {
     (
         axum::http::StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
         METRICS.render(),
     )
 }

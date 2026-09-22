@@ -131,17 +131,18 @@ mod tests {
 
     #[test]
     fn parse_keeps_only_configured_providers() {
-        let providers = parse_catalog(
-            SAMPLE,
-            &["deepseek".to_string(), "mistral".to_string()],
-        )
-        .unwrap();
+        let providers =
+            parse_catalog(SAMPLE, &["deepseek".to_string(), "mistral".to_string()]).unwrap();
         assert_eq!(providers.len(), 2);
         // Sorted by display name: DeepSeek, Mistral.
         assert_eq!(providers[0].id, "deepseek");
         assert_eq!(providers[0].name, "DeepSeek");
         assert_eq!(
-            providers[0].models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            providers[0]
+                .models
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["deepseek-v4-flash", "deepseek-v4-pro"]
         );
         // Missing `id`/`name` fall back to the map key / display name.

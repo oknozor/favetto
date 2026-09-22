@@ -16,7 +16,11 @@ use crate::executor;
 use crate::state::State;
 
 /// Register a schedule's job with the scheduler. Returns the job id.
-pub async fn register(scheduler: &JobScheduler, state: Arc<State>, schedule: &Schedule) -> anyhow::Result<Uuid> {
+pub async fn register(
+    scheduler: &JobScheduler,
+    state: Arc<State>,
+    schedule: &Schedule,
+) -> anyhow::Result<Uuid> {
     let cron = schedule.cron.clone();
     let state2 = state.clone();
     let task = schedule.task.clone();
@@ -137,11 +141,15 @@ pub async fn start(state: &Arc<State>) -> anyhow::Result<()> {
         }
         match register(&state.scheduler, state.clone(), schedule).await {
             Ok(job_id) => {
-                if let Err(e) = db::set_schedule_job_id(&state.db, &schedule.id, &job_id.to_string()).await {
+                if let Err(e) =
+                    db::set_schedule_job_id(&state.db, &schedule.id, &job_id.to_string()).await
+                {
                     tracing::warn!(error = %e, schedule = %schedule.id, "failed to persist job id");
                 }
             }
-            Err(e) => tracing::warn!(error = %e, schedule = %schedule.id, "failed to register schedule"),
+            Err(e) => {
+                tracing::warn!(error = %e, schedule = %schedule.id, "failed to register schedule")
+            }
         }
     }
 

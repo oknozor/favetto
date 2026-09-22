@@ -104,7 +104,11 @@ impl Client {
     }
 
     /// Send a request and await its response (5s timeout).
-    pub async fn request(&self, method: &str, params: serde_json::Value) -> anyhow::Result<Response> {
+    pub async fn request(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> anyhow::Result<Response> {
         self.request_with_timeout(method, params, Duration::from_secs(5))
             .await
     }
@@ -143,7 +147,9 @@ impl Client {
 }
 
 async fn unix_connect(path: &PathBuf) -> anyhow::Result<(ClientStream, ClientSink)> {
-    let stream = UnixStream::connect(path).await.context("connect unix socket")?;
+    let stream = UnixStream::connect(path)
+        .await
+        .context("connect unix socket")?;
     let framed = Framed::new(stream, FrameCodec);
     let (sink, stream) = framed.split();
     let incoming: ClientStream = Box::pin(stream.map(|r| r.map_err(|e| anyhow::anyhow!(e))));
@@ -162,7 +168,9 @@ async fn ws_connect(url: &str, token: Option<&str>) -> anyhow::Result<(ClientStr
     if let Some(t) = token {
         builder = builder.header(http::header::AUTHORIZATION, format!("Bearer {t}"));
     }
-    let request = builder.body(()).map_err(|e| anyhow::anyhow!("bad URL: {e}"))?;
+    let request = builder
+        .body(())
+        .map_err(|e| anyhow::anyhow!("bad URL: {e}"))?;
     let (ws, _) = tokio_tungstenite::connect_async(request)
         .await
         .context("connect websocket")?;

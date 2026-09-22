@@ -15,13 +15,7 @@ use crate::db;
 use crate::state::State;
 
 /// Send a notification through `channel` and record it.
-pub async fn send(
-    state: &State,
-    channel: &str,
-    config: &Value,
-    subject: &str,
-    body: &str,
-) {
+pub async fn send(state: &State, channel: &str, config: &Value, subject: &str, body: &str) {
     let result = match channel {
         "log" => {
             tracing::info!(subject, body, "notification (log)");
