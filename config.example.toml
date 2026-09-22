@@ -75,7 +75,7 @@ tasks_dir = "tasks"
 parallel = true            # run tasks concurrently (default false = one at a time)
 max_concurrency = 4        # slots when parallel
 worktree = true            # when parallel and in a git repo, give each task its own worktree
-# worktree_dir = "~/.local/share/favetto/worktrees"  # absolute or repo-relative
+# worktree_dir = "~/.local/share/favetto/worktrees"  # absolute, ~-expanded, or repo-relative
 keep_worktree = true       # keep worktrees after the task (so branches/changes can be inspected)
 
 # Non-interactive git for agent sessions. favetto injects these into every agent

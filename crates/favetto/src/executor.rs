@@ -515,16 +515,24 @@ fn branch_name(task: &Task) -> String {
 }
 
 fn worktree_path(state: &State, cfg: &ExecutorSettings, repo: &Path, task: &Task) -> PathBuf {
+    worktree_root(cfg, &state.data_dir, repo).join(task.id.to_string())
+}
+
+/// Resolve the configured worktree root. A leading `~` is expanded to the home
+/// directory; an absolute path is used as-is; a non-`~` relative path (the
+/// documented "repo-relative" form) is resolved against the repo root. Unset
+/// falls back to `<data_dir>/worktrees`.
+fn worktree_root(cfg: &ExecutorSettings, data_dir: &Path, repo: &Path) -> PathBuf {
     let root = cfg
         .worktree_dir
         .clone()
-        .unwrap_or_else(|| state.data_dir.join("worktrees"));
-    let root = if root.is_absolute() {
+        .map(crate::paths::expand_tilde)
+        .unwrap_or_else(|| data_dir.join("worktrees"));
+    if root.is_absolute() {
         root
     } else {
         repo.join(root)
-    };
-    root.join(task.id.to_string())
+    }
 }
 
 async fn create_worktree(repo: &Path, path: &Path, branch: &str) -> anyhow::Result<()> {
@@ -688,6 +696,42 @@ mod tests {
         assert!(
             missing_required_vars(&def, &serde_json::json!({ "required_one": "x" })).is_empty()
         );
+    }
+
+    #[test]
+    fn worktree_root_expands_tilde_and_resolves_relative() {
+        let home = dirs::home_dir().expect("home directory");
+        let data_dir = Path::new("/data");
+        let repo = Path::new("/repo");
+        let root_for = |dir: Option<&str>| {
+            let cfg = ExecutorSettings {
+                worktree_dir: dir.map(PathBuf::from),
+                ..Default::default()
+            };
+            worktree_root(&cfg, data_dir, repo)
+        };
+
+        // `~` expands to the home directory before the absolute/relative decision,
+        // so it is never joined onto the repo root.
+        assert_eq!(
+            root_for(Some("~/.local/share/favetto/worktrees")),
+            home.join(".local/share/favetto/worktrees")
+        );
+
+        // A non-`~` relative value stays repo-relative.
+        assert_eq!(
+            root_for(Some(".favetto/worktrees")),
+            Path::new("/repo/.favetto/worktrees")
+        );
+
+        // An absolute value is used as-is.
+        assert_eq!(
+            root_for(Some("/abs/worktrees")),
+            Path::new("/abs/worktrees")
+        );
+
+        // Unset falls back to `<data_dir>/worktrees`.
+        assert_eq!(root_for(None), Path::new("/data/worktrees"));
     }
 
     #[test]

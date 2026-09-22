@@ -14,6 +14,7 @@ mod hooks;
 mod metrics;
 mod notify;
 mod pair;
+mod paths;
 mod scheduler;
 mod server;
 mod state;
@@ -121,7 +122,7 @@ async fn pair(args: cli::PairArgs) -> anyhow::Result<()> {
 }
 
 fn token_rotate(args: cli::TokenRotateArgs) -> anyhow::Result<()> {
-    let data_dir = args.data_dir.unwrap_or_else(cli::default_data_dir);
+    let data_dir = paths::expand_tilde(args.data_dir.unwrap_or_else(cli::default_data_dir));
     let path = data_dir.join("token");
     let token = favetto_core::auth::Token::generate();
 
