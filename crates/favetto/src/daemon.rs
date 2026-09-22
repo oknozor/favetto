@@ -144,6 +144,15 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     hooks::HookEngine::new(hook_store, state.clone()).spawn();
     crate::scheduler::reconcile_catalog_schedules(&state).await?;
 
+    // Reclaim worktrees left by finished tasks once at startup. Never fatal.
+    match crate::executor::prune_worktrees(&state).await {
+        Ok(stats) if stats != crate::executor::WorktreePruneStats::default() => {
+            tracing::info!(?stats, "pruned worktrees");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "worktree prune failed"),
+    }
+
     // Re-run retention every six hours so a long-lived daemon stays bounded.
     if retention.days > 0 {
         let pool = state.db.clone();
@@ -157,6 +166,21 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
                     db::prune(&pool, retention.days, retention.min_tasks, retention.vacuum).await
                 {
                     tracing::warn!(error = %e, "periodic database prune failed");
+                }
+            }
+        });
+    }
+
+    // Re-run the worktree sweep every six hours as well.
+    if state.config.read().unwrap().executor.worktree {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));
+            tick.tick().await; // consume the immediate first tick
+            loop {
+                tick.tick().await;
+                if let Err(e) = crate::executor::prune_worktrees(&state).await {
+                    tracing::warn!(error = %e, "periodic worktree prune failed");
                 }
             }
         });
