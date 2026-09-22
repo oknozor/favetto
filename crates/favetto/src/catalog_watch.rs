@@ -37,7 +37,7 @@ pub fn spawn(state: Arc<State>) -> anyhow::Result<()> {
             Err(e) => tracing::warn!(error = %e, "catalog watch error"),
         })?;
     let watching = watch_target(&state.tasks_dir);
-    watcher.watch(&watching, RecursiveMode::NonRecursive)?;
+    watcher.watch(&watching, RecursiveMode::Recursive)?;
     tracing::info!(
         dir = %watching.display(),
         tasks_dir = %state.tasks_dir.display(),
@@ -74,7 +74,7 @@ fn retarget(watcher: &mut RecommendedWatcher, watching: &mut PathBuf, tasks_dir:
     if target == *watching {
         return;
     }
-    match watcher.watch(&target, RecursiveMode::NonRecursive) {
+    match watcher.watch(&target, RecursiveMode::Recursive) {
         Ok(()) => {
             let _ = watcher.unwatch(watching);
             tracing::info!(dir = %target.display(), "catalog watch re-targeted");
@@ -301,6 +301,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watcher_picks_up_nested_file_and_edit_and_delete() {
+        let dir = temp_dir("nested");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(tasks_dir.join("pipelines")).unwrap();
+        std::fs::write(
+            tasks_dir.join("pipelines/plan.md"),
+            "agent = \"x\"\n---\none\n",
+        )
+        .unwrap();
+
+        let state = test_state(&dir, &tasks_dir).await;
+        spawn(state.clone()).unwrap();
+
+        // Create a new file inside the subfolder: the recursive watcher sees it.
+        std::fs::write(
+            tasks_dir.join("pipelines/new.md"),
+            "agent = \"x\"\n---\nnew\n",
+        )
+        .unwrap();
+        let added = wait_for(Duration::from_secs(5), || {
+            state
+                .catalog
+                .read()
+                .unwrap()
+                .iter()
+                .any(|d| d.name == "pipelines/new")
+        })
+        .await;
+        assert!(added, "nested file should be discovered");
+
+        // Edit it: the catalog picks up the new body.
+        std::fs::write(
+            tasks_dir.join("pipelines/plan.md"),
+            "agent = \"x\"\n---\ntwo\n",
+        )
+        .unwrap();
+        let edited = wait_for(Duration::from_secs(5), || {
+            state
+                .catalog
+                .read()
+                .unwrap()
+                .iter()
+                .any(|d| d.name == "pipelines/plan" && d.prompt == "two")
+        })
+        .await;
+        assert!(edited, "nested edit should reach the catalog");
+
+        // Delete it: the task is dropped.
+        std::fs::remove_file(tasks_dir.join("pipelines/plan.md")).unwrap();
+        let removed = wait_for(Duration::from_secs(5), || {
+            !state
+                .catalog
+                .read()
+                .unwrap()
+                .iter()
+                .any(|d| d.name == "pipelines/plan")
+        })
+        .await;
+        assert!(removed, "deleted nested task should leave the catalog");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn watcher_picks_up_a_directory_created_later() {
         let dir = temp_dir("later");
         let tasks_dir = dir.join("tasks");
@@ -366,6 +430,31 @@ mod tests {
 
         let scheduled = crate::db::list_schedules(&state.db).await.unwrap();
         assert!(!scheduled.iter().any(|s| s.id == "catalog:a"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn catalog_schedule_id_includes_folder() {
+        let dir = temp_dir("nested-schedules");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(tasks_dir.join("pipelines")).unwrap();
+        std::fs::write(
+            tasks_dir.join("pipelines/plan.md"),
+            "agent = \"x\"\nschedule = \"0 0 8 * * *\"\n---\nprompt\n",
+        )
+        .unwrap();
+
+        let state = test_state(&dir, &tasks_dir).await;
+        crate::scheduler::reconcile_catalog_schedules(&state)
+            .await
+            .unwrap();
+        let scheduled = crate::db::list_schedules(&state.db).await.unwrap();
+        let entry = scheduled
+            .iter()
+            .find(|s| s.id == "catalog:pipelines/plan")
+            .expect("folder-qualified schedule id");
+        assert_eq!(entry.task, "pipelines/plan");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

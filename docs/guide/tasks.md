@@ -1,7 +1,7 @@
 # Tasks & catalog
 
-A task is a Markdown file under `tasks/` with a TOML header and the prompt as the
-body:
+A task is a Markdown file under `tasks/` (at the root or in any subfolder) with a
+TOML header and the prompt as the body:
 
 ```md
 agent = "opencode"                      # optional — run through this external agent
@@ -117,26 +117,47 @@ issues in `tasks/triage_favetto_issues.md`, `tasks/plan_favetto_issue.md`, and
 
 ## Catalog reload & preview
 
-The daemon loads the catalog from `--tasks-dir` (default `tasks/`). It also
-watches that directory (via `notify`, with a 200 ms debounce): adding, editing,
-or removing a `.md` file reloads the catalog on the fly. A file that fails to
-parse keeps its previous definition (so a half-written edit never drops a task),
-and the recurring tasks derived from `schedule` headers are re-synced — a changed
-cron is re-registered and a removed header deletes the `catalog:<name>` schedule,
-while manually created schedules are left alone. Every reload pushes
-`catalog.updated` so attached TUIs re-fetch the list and refresh the preview.
-Runs already in flight keep the definition they were dispatched with; a queued
-task picks up the freshly loaded definition when it starts. From the TUI, the
-**Catalog** tab lists the catalog and Enter starts a task; a task that declares
+The daemon loads the catalog from `--tasks-dir` (default `tasks/`)
+**recursively**: tasks may live at the root or in any subfolder, and a task's
+identity is its path relative to that root, without the `.md` extension, with `/`
+separators. So `tasks/pipelines/plan.md` is the task `pipelines/plan`, while a
+root-level `tasks/triage.md` keeps its bare stem `triage`. That same relative
+path is what `tasks.start`/`catalog.get` take, what `catalog.add`'s `name` may
+contain (type `pipelines/plan` to create the folder), and what `needs`/`spawn`,
+webhook `rule.task`, `catalog:<name>` schedule ids and <span v-pre>`{{ task.name }}`</span>
+refer to — so two files with the same stem in different folders are distinct
+tasks. **Moving a task into a subfolder changes its identity**: an existing
+`catalog:<old>` schedule is dropped and recreated, and any `needs`/`spawn` or
+webhook rule that named the bare stem must be updated to the relative path.
+
+The daemon watches that directory and its subfolders (via `notify`, with a 200 ms
+debounce): adding, editing, or removing a `.md` file — at the root or nested —
+reloads the catalog on the fly. A file that fails to parse keeps its previous
+definition (so a half-written edit never drops a task), and the recurring tasks
+derived from `schedule` headers are re-synced — a changed cron is re-registered and
+a removed header deletes the `catalog:<name>` schedule, while manually created
+schedules are left alone. Every reload pushes `catalog.updated` so attached TUIs
+re-fetch the list and refresh the preview. Runs already in flight keep the
+definition they were dispatched with; a queued task picks up the freshly loaded
+definition when it starts. From the TUI, the **Catalog** tab renders the catalog as
+a collapsible folder/task tree; Enter starts a task and a task that declares
 `[[vars]]` opens a floating form first (Enter advances, `Ctrl+Enter` submits,
 `Esc` cancels and starts nothing), while a var-free task starts immediately. The
 Ctrl+P menu's "Add task" writes a new `.md` file (it does not run it). Task
 lifecycle emits `task_idle` / `task_started` / `task_finished` events.
 
+The Catalog tree shows a folder glyph (`📂`/`📁`) before each folder and a file
+glyph (`📄`) before each task, indented by depth. Fold a folder with a mouse click
+on its row, `Space`, or `Enter` on the folder; clicking a task selects it and a
+second click (or `Enter`) starts it. `Enter` on a folder only folds/unfolds, never
+starts a task. Terminals that render the emoji as double width can set
+`FAVETTO_PLAIN_ICONS=1` for an ASCII fallback (`[-]`/`[+]`/`-`).
+
 The Catalog tab shows a **preview side panel** for the highlighted task: its raw
 `.md` source with the TOML front-matter highlighted as TOML and the prompt rendered
 as Markdown (headings, lists, blockquotes, fenced code, inline code/bold/italic/
-links). Moving the selection with ↑/↓ loads the preview for the new task.
+links). Moving the selection with ↑/↓ loads the preview for the new task (a folder
+row clears it).
 
 The Events tab is a selectable, scrolling list (↑/↓, PageUp/PageDown) with a
 **payload side panel** that pretty-prints the selected event's JSON with syntax

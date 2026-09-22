@@ -1,6 +1,6 @@
 //! TUI application state and the logic for folding server pushes into it.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -252,7 +252,29 @@ pub struct CatalogEntry {
     pub prompt: String,
 }
 
+/// One visible row of the Catalog tree: a folder header or a task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogRow {
+    Folder {
+        /// Folder path relative to the tasks root, `/`-separated.
+        path: String,
+        depth: usize,
+        collapsed: bool,
+    },
+    Task {
+        /// Index into [`App::catalog`].
+        index: usize,
+        depth: usize,
+    },
+}
+
 impl CatalogEntry {
+    /// The last `/`-separated segment of the task's relative path (its file
+    /// stem), shown under its folder row.
+    pub fn stem(&self) -> &str {
+        self.name.rsplit('/').next().unwrap_or(self.name.as_str())
+    }
+
     /// The `provider/model` selector shown in the catalog, or `—` when unset.
     pub fn model_display(&self) -> String {
         match (&self.provider, &self.model) {
@@ -323,7 +345,13 @@ pub struct App {
 
     // Task catalog.
     pub catalog: Vec<CatalogEntry>,
+    /// Index into the *visible* rows of the Catalog tree (see
+    /// [`App::catalog_rows`]), not into [`App::catalog`].
     pub catalog_selected: usize,
+    /// Folder paths (relative, `/`-separated) collapsed in the Catalog tree.
+    /// Session-scoped: deliberately not cleared by [`App::set_catalog`], so it
+    /// survives `catalog.updated` reloads.
+    pub catalog_collapsed: HashSet<String>,
     /// Raw Markdown of the selected catalog task as `(name, source)`.
     pub catalog_preview: Option<(String, String)>,
     /// Name currently being fetched for the preview (avoids duplicate requests).
@@ -418,6 +446,7 @@ impl App {
             tasks_selected: 0,
             catalog: Vec::new(),
             catalog_selected: 0,
+            catalog_collapsed: HashSet::new(),
             catalog_preview: None,
             catalog_preview_pending: None,
             catalog_preview_scroll: 0,
@@ -492,14 +521,17 @@ impl App {
         self.tasks_selected = self.tasks_selected.saturating_sub(1);
     }
 
-    /// Replace the catalog, clamping the selection and dropping the cached
-    /// preview so it is re-fetched (the selected task's source may have changed).
+    /// Replace the catalog, clamping the selection to the new visible rows and
+    /// dropping the cached preview so it is re-fetched (the selected task's
+    /// source may have changed). Collapsed-folder state is kept, so it survives a
+    /// live reload.
     pub fn set_catalog(&mut self, catalog: Vec<CatalogEntry>) {
         self.catalog = catalog;
-        self.catalog_selected = if self.catalog.is_empty() {
+        let rows = self.catalog_rows().len();
+        self.catalog_selected = if rows == 0 {
             0
         } else {
-            self.catalog_selected.min(self.catalog.len() - 1)
+            self.catalog_selected.min(rows - 1)
         };
         self.catalog_preview = None;
     }
@@ -510,13 +542,121 @@ impl App {
         self.workflow_path = path;
     }
 
+    /// The visible rows of the Catalog tree: folder headers and tasks, with every
+    /// descendant of a collapsed folder hidden. Folders sort before a same-named
+    /// task (so `a.md` and `a/` render folder-first) and `depth` is the number of
+    /// `/` segments above the row.
+    pub fn catalog_rows(&self) -> Vec<CatalogRow> {
+        // (key, is_task, catalog index) records for folders and tasks.
+        let folders: HashSet<&str> = self
+            .catalog
+            .iter()
+            .flat_map(|e| {
+                let mut out = Vec::new();
+                let mut cur = e.name.as_str();
+                while let Some((prefix, _)) = cur.rsplit_once('/') {
+                    out.push(prefix);
+                    cur = prefix;
+                }
+                out
+            })
+            .collect();
+
+        let mut records: Vec<(String, bool, usize)> = folders
+            .iter()
+            .map(|f| ((*f).to_string(), false, 0))
+            .collect();
+        records.extend(
+            self.catalog
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (e.name.clone(), true, i)),
+        );
+        records.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+        let mut rows = Vec::with_capacity(records.len());
+        for (key, is_task, index) in records {
+            // Hide a row when it is a strict descendant of a collapsed folder.
+            let hidden = self
+                .catalog_collapsed
+                .iter()
+                .any(|c| key.starts_with(&format!("{c}/")));
+            if hidden {
+                continue;
+            }
+            let depth = key.matches('/').count();
+            if is_task {
+                rows.push(CatalogRow::Task { index, depth });
+            } else {
+                let collapsed = self.catalog_collapsed.contains(&key);
+                rows.push(CatalogRow::Folder {
+                    path: key,
+                    depth,
+                    collapsed,
+                });
+            }
+        }
+        rows
+    }
+
+    /// Index into [`App::catalog`] for the selected row, or `None` when a folder
+    /// (or nothing) is selected.
+    pub fn selected_catalog_task(&self) -> Option<usize> {
+        match self.catalog_rows().get(self.catalog_selected) {
+            Some(CatalogRow::Task { index, .. }) => Some(*index),
+            _ => None,
+        }
+    }
+
+    /// Move the Catalog selection to a visible row, clamping it, resetting the
+    /// preview scroll, and clearing the preview when a folder is selected.
+    fn select_catalog_row(&mut self, index: usize) {
+        let rows = self.catalog_rows();
+        if rows.is_empty() {
+            self.catalog_selected = 0;
+            return;
+        }
+        let index = index.min(rows.len() - 1);
+        self.catalog_selected = index;
+        self.reset_catalog_preview_scroll();
+        if matches!(rows.get(index), Some(CatalogRow::Folder { .. })) {
+            self.catalog_preview = None;
+        }
+    }
+
+    /// Fold/unfold the selected folder row. Returns `true` when a folder was
+    /// selected (and toggled), `false` for a task row.
+    fn toggle_catalog_folder(&mut self) -> bool {
+        let rows = self.catalog_rows();
+        let Some(CatalogRow::Folder { path, .. }) = rows.get(self.catalog_selected) else {
+            return false;
+        };
+        let path = path.clone();
+        if !self.catalog_collapsed.remove(&path) {
+            self.catalog_collapsed.insert(path);
+        }
+        // Collapsing can shrink the row list below the selection; re-clamp.
+        let rows = self.catalog_rows().len();
+        self.catalog_selected = if rows == 0 {
+            0
+        } else {
+            self.catalog_selected.min(rows - 1)
+        };
+        true
+    }
+
     /// The catalog task whose preview should be loaded, if the Catalog tab is
-    /// showing a task that isn't already loaded or being fetched.
+    /// showing a task that isn't already loaded or being fetched. Folder rows
+    /// never fetch a preview.
     pub fn catalog_preview_target(&self) -> Option<String> {
         if self.tab != Tab::Catalog {
             return None;
         }
-        let name = self.catalog.get(self.catalog_selected)?.name.clone();
+        let name = self
+            .catalog
+            .get(self.selected_catalog_task()?)?
+            .name
+            .clone();
         if self
             .catalog_preview
             .as_ref()
@@ -809,16 +949,25 @@ impl App {
                 UiAction::None
             }
             Tab::Catalog => {
-                if self.catalog.is_empty() {
-                    return UiAction::None;
-                }
-                let already = self.catalog_selected == index;
-                self.catalog_selected = index.min(self.catalog.len() - 1);
-                self.reset_catalog_preview_scroll();
-                if already {
-                    if let Some(entry) = self.catalog.get(index).cloned() {
-                        return self.begin_catalog_task(&entry);
+                let row = self.catalog_rows().get(index).cloned();
+                match row {
+                    // Clicking a folder selects it and folds/unfolds it.
+                    Some(CatalogRow::Folder { .. }) => {
+                        self.select_catalog_row(index);
+                        self.toggle_catalog_folder();
                     }
+                    Some(CatalogRow::Task {
+                        index: task_index, ..
+                    }) => {
+                        let already = self.catalog_selected == index;
+                        self.select_catalog_row(index);
+                        if already {
+                            if let Some(entry) = self.catalog.get(task_index).cloned() {
+                                return self.begin_catalog_task(&entry);
+                            }
+                        }
+                    }
+                    None => {}
                 }
                 UiAction::None
             }
@@ -862,9 +1011,9 @@ impl App {
                 self.tasks_selected = shift_index(self.tasks_selected, delta, self.tasks.len());
             }
             Tab::Catalog => {
-                self.catalog_selected =
-                    shift_index(self.catalog_selected, delta, self.catalog.len());
-                self.reset_catalog_preview_scroll();
+                let len = self.catalog_rows().len();
+                let next = shift_index(self.catalog_selected, delta, len);
+                self.select_catalog_row(next);
             }
             Tab::Events => {
                 self.events_selected = shift_index(self.events_selected, delta, self.events.len());
@@ -1432,8 +1581,8 @@ impl App {
                 match self.tab {
                     Tab::Tasks => self.select_prev(),
                     Tab::Catalog => {
-                        self.catalog_selected = self.catalog_selected.saturating_sub(1);
-                        self.reset_catalog_preview_scroll();
+                        let prev = self.catalog_selected.saturating_sub(1);
+                        self.select_catalog_row(prev);
                     }
                     Tab::Events => self.events_selected = self.events_selected.saturating_sub(1),
                     Tab::Scheduler => {
@@ -1450,9 +1599,8 @@ impl App {
                 match self.tab {
                     Tab::Tasks => self.select_next(),
                     Tab::Catalog if !self.catalog.is_empty() => {
-                        self.catalog_selected =
-                            (self.catalog_selected + 1).min(self.catalog.len() - 1);
-                        self.reset_catalog_preview_scroll();
+                        let next = self.catalog_selected + 1;
+                        self.select_catalog_row(next);
                     }
                     Tab::Events if !self.events.is_empty() => {
                         self.events_selected =
@@ -1506,10 +1654,21 @@ impl App {
                     }
                 }
                 if self.tab == Tab::Catalog {
-                    if let Some(entry) = self.catalog.get(self.catalog_selected).cloned() {
-                        return self.begin_catalog_task(&entry);
+                    // Enter on a folder folds/unfolds it; only a task row starts.
+                    if !self.toggle_catalog_folder() {
+                        if let Some(index) = self.selected_catalog_task() {
+                            if let Some(entry) = self.catalog.get(index).cloned() {
+                                return self.begin_catalog_task(&entry);
+                            }
+                        }
                     }
                 }
+                UiAction::None
+            }
+            // Space folds/unfolds the selected Catalog folder (Left/Right already
+            // switch tabs, so they would conflict with tree navigation).
+            KeyCode::Char(' ') if self.tab == Tab::Catalog => {
+                self.toggle_catalog_folder();
                 UiAction::None
             }
             _ => UiAction::None,
@@ -2294,6 +2453,191 @@ mod tests {
 
         app.set_catalog(Vec::new());
         assert_eq!(app.catalog_selected, 0);
+    }
+
+    /// A catalog with a root task, nested tasks, and a nested folder.
+    fn nested_catalog() -> Vec<CatalogEntry> {
+        vec![
+            catalog_entry("b"),
+            catalog_entry("pipelines/sub/deep"),
+            catalog_entry("pipelines/triage"),
+            catalog_entry("pipelines/plan"),
+        ]
+    }
+
+    #[test]
+    fn catalog_rows_groups_folders_and_tasks() {
+        let mut app = App::new();
+        app.set_catalog(nested_catalog());
+        assert_eq!(
+            app.catalog_rows(),
+            vec![
+                CatalogRow::Task { index: 0, depth: 0 },
+                CatalogRow::Folder {
+                    path: "pipelines".to_string(),
+                    depth: 0,
+                    collapsed: false,
+                },
+                CatalogRow::Task { index: 3, depth: 1 },
+                CatalogRow::Folder {
+                    path: "pipelines/sub".to_string(),
+                    depth: 1,
+                    collapsed: false,
+                },
+                CatalogRow::Task { index: 1, depth: 2 },
+                CatalogRow::Task { index: 2, depth: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn collapsed_folder_hides_descendants_and_nested_folders() {
+        let mut app = App::new();
+        app.set_catalog(nested_catalog());
+
+        // Collapsing the nested folder keeps its own row but hides its task.
+        app.catalog_collapsed.insert("pipelines/sub".to_string());
+        let rows = app.catalog_rows();
+        assert!(rows.contains(&CatalogRow::Folder {
+            path: "pipelines/sub".to_string(),
+            depth: 1,
+            collapsed: true,
+        }));
+        assert!(!rows
+            .iter()
+            .any(|r| matches!(r, CatalogRow::Task { index, .. } if *index == 1)));
+
+        // Collapsing the parent hides the nested folder too.
+        app.catalog_collapsed.insert("pipelines".to_string());
+        assert_eq!(
+            app.catalog_rows(),
+            vec![
+                CatalogRow::Task { index: 0, depth: 0 },
+                CatalogRow::Folder {
+                    path: "pipelines".to_string(),
+                    depth: 0,
+                    collapsed: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn enter_on_folder_toggles_and_never_starts() {
+        let mut app = App::new();
+        app.tab = Tab::Catalog;
+        app.set_catalog(vec![catalog_entry("pipelines/plan")]);
+        assert_eq!(app.catalog_selected, 0);
+
+        // Selected row is the folder: Enter folds, it never starts a task.
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())),
+            UiAction::None
+        ));
+        assert!(app.catalog_collapsed.contains("pipelines"));
+
+        // A second Enter unfolds it.
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())),
+            UiAction::None
+        ));
+        assert!(!app.catalog_collapsed.contains("pipelines"));
+
+        // On the task row, Enter starts the folder-qualified task.
+        app.select_catalog_row(1);
+        match app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())) {
+            UiAction::StartTask(name) => assert_eq!(name, "pipelines/plan"),
+            _ => panic!("expected StartTask"),
+        }
+    }
+
+    #[test]
+    fn space_toggles_selected_folder_only() {
+        let mut app = App::new();
+        app.tab = Tab::Catalog;
+        app.set_catalog(vec![catalog_entry("pipelines/plan")]);
+
+        app.handle_key(key(KeyCode::Char(' '), KeyModifiers::empty()));
+        assert!(app.catalog_collapsed.contains("pipelines"));
+        app.handle_key(key(KeyCode::Char(' '), KeyModifiers::empty()));
+        assert!(!app.catalog_collapsed.contains("pipelines"));
+
+        // On a task row Space is a no-op.
+        app.select_catalog_row(1);
+        app.handle_key(key(KeyCode::Char(' '), KeyModifiers::empty()));
+        assert!(app.catalog_collapsed.is_empty());
+    }
+
+    #[test]
+    fn catalog_navigation_walks_folder_and_task_rows() {
+        let mut app = App::new();
+        app.tab = Tab::Catalog;
+        app.set_catalog(nested_catalog());
+        assert_eq!(app.catalog_selected, 0);
+
+        for expected in [1, 2, 3, 4, 5, 5] {
+            app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+            assert_eq!(app.catalog_selected, expected);
+        }
+        for expected in [4, 3, 2, 1, 0, 0] {
+            app.handle_key(key(KeyCode::Up, KeyModifiers::empty()));
+            assert_eq!(app.catalog_selected, expected);
+        }
+
+        // Selecting a folder clears the (stale) preview so the pane shows its
+        // placeholder instead of the previously highlighted task.
+        app.catalog_preview = Some(("pipelines/triage".to_string(), "md".to_string()));
+        app.select_catalog_row(1); // the `pipelines` folder
+        assert!(app.catalog_preview.is_none());
+    }
+
+    #[test]
+    fn set_catalog_clamps_selection_against_visible_rows() {
+        let mut app = App::new();
+        app.catalog_selected = 99;
+        app.set_catalog(vec![catalog_entry("a"), catalog_entry("pipelines/plan")]);
+        // Three visible rows (`a`, `pipelines` folder, `pipelines/plan`) even
+        // though the catalog holds two entries.
+        assert_eq!(app.catalog_rows().len(), 3);
+        assert_eq!(app.catalog_selected, 2);
+    }
+
+    #[test]
+    fn catalog_preview_target_is_none_on_folder_row() {
+        let mut app = App::new();
+        app.tab = Tab::Catalog;
+        app.set_catalog(vec![catalog_entry("pipelines/plan")]);
+
+        app.select_catalog_row(0); // folder
+        assert_eq!(app.catalog_preview_target(), None);
+
+        app.select_catalog_row(1); // task
+        assert_eq!(
+            app.catalog_preview_target().as_deref(),
+            Some("pipelines/plan")
+        );
+    }
+
+    #[test]
+    fn clicking_catalog_folder_toggles_it() {
+        let mut app = App::new();
+        app.tab = Tab::Catalog;
+        app.set_catalog(vec![catalog_entry("pipelines/plan")]);
+        let inner = Rect {
+            x: 0,
+            y: 2,
+            width: 20,
+            height: 5,
+        };
+        app.catalog_geom = geom(inner, 0, 2);
+
+        // First click on the folder row (index 0) folds it.
+        assert!(matches!(app.handle_mouse(click(5, 2)), UiAction::None));
+        assert!(app.catalog_collapsed.contains("pipelines"));
+
+        // A second click unfolds it.
+        assert!(matches!(app.handle_mouse(click(5, 2)), UiAction::None));
+        assert!(!app.catalog_collapsed.contains("pipelines"));
     }
 
     #[test]

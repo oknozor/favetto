@@ -12,8 +12,8 @@ use ratatui::Frame;
 use favetto_core::model::TaskStatus;
 
 use super::app::{
-    table_rows_area, App, ClickAction, ClickRegion, ConnState, Form, ListGeometry, Popup, Tab,
-    TaskVarsForm, Wizard, WizardStep, MENU_OPTIONS,
+    table_rows_area, App, CatalogRow, ClickAction, ClickRegion, ConnState, Form, ListGeometry,
+    Popup, Tab, TaskVarsForm, Wizard, WizardStep, MENU_OPTIONS,
 };
 use super::theme::Theme;
 use super::{json, markdown};
@@ -395,7 +395,8 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
     (
         "Catalog tab",
         &[
-            ("Enter", "start the selected catalog task"),
+            ("Enter", "start the selected task; on a folder, fold/unfold"),
+            ("Space", "fold/unfold the selected folder"),
             ("PageUp / PageDown / wheel", "scroll the preview pane"),
         ],
     ),
@@ -428,6 +429,8 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         "Mouse",
         &[
             ("click the tab bar", "switch tabs"),
+            ("click a catalog folder", "fold/unfold it"),
+            ("click a catalog/task row", "select; click again starts it"),
             ("(Agent) wheel/click", "forwarded when the agent enables it"),
         ],
     ),
@@ -519,6 +522,37 @@ fn draw_catalog(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     draw_catalog_preview(frame, app, chunks[1], theme);
 }
 
+/// Folder/task glyphs for the Catalog tree. Terminals that render the emoji at
+/// double width and misalign the columns can set `FAVETTO_PLAIN_ICONS=1` for an
+/// ASCII fallback.
+const FOLDER_OPEN: &str = "📂";
+const FOLDER_CLOSED: &str = "📁";
+const TASK_ICON: &str = "📄";
+
+/// Whether the ASCII icon fallback is requested via `FAVETTO_PLAIN_ICONS`.
+fn plain_icons() -> bool {
+    std::env::var("FAVETTO_PLAIN_ICONS")
+        .map(|v| v != "0")
+        .unwrap_or(false)
+}
+
+fn folder_icon(collapsed: bool, plain: bool) -> &'static str {
+    match (plain, collapsed) {
+        (true, true) => "[+]",
+        (true, false) => "[-]",
+        (false, true) => FOLDER_CLOSED,
+        (false, false) => FOLDER_OPEN,
+    }
+}
+
+fn task_icon(plain: bool) -> &'static str {
+    if plain {
+        "-"
+    } else {
+        TASK_ICON
+    }
+}
+
 fn draw_catalog_table(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     let widths = [
         Constraint::Min(14),
@@ -527,27 +561,58 @@ fn draw_catalog_table(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme
         Constraint::Min(0),
     ];
     let header = Row::new(vec!["NAME", "AGENT", "MODEL", "NEEDS"]).style(theme.table_header());
+    let plain = plain_icons();
 
     let rows: Vec<Row> = app
-        .catalog
-        .iter()
-        .map(|e| {
-            Row::new(vec![
-                Cell::from(e.name.clone()),
-                Cell::from(e.agent.clone().unwrap_or_else(|| "—".to_string())),
-                Cell::from(e.model_display()),
-                Cell::from(e.needs.clone().unwrap_or_default()),
-            ])
+        .catalog_rows()
+        .into_iter()
+        .map(|row| match row {
+            CatalogRow::Folder {
+                path,
+                depth,
+                collapsed,
+            } => {
+                let label = path.rsplit('/').next().unwrap_or(path.as_str());
+                let name = format!(
+                    "{} {} {}",
+                    "  ".repeat(depth),
+                    folder_icon(collapsed, plain),
+                    label
+                );
+                let style = if collapsed {
+                    theme.muted_style()
+                } else {
+                    theme.accent_style().add_modifier(Modifier::BOLD)
+                };
+                Row::new(vec![
+                    Cell::from(name),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                ])
+                .style(style)
+            }
+            CatalogRow::Task { index, depth } => {
+                let e = &app.catalog[index];
+                let name = format!("{} {} {}", "  ".repeat(depth), task_icon(plain), e.stem());
+                Row::new(vec![
+                    Cell::from(name),
+                    Cell::from(e.agent.clone().unwrap_or_else(|| "—".to_string())),
+                    Cell::from(e.model_display()),
+                    Cell::from(e.needs.clone().unwrap_or_default()),
+                ])
+            }
         })
         .collect();
 
+    let visible = app.catalog_rows().len();
     let table = Table::new(rows, widths)
         .header(header)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(format!(
-                    " Catalog ({}) — Enter/click to start ",
+                    " Catalog ({}) — Enter/click start · Space fold ",
                     app.catalog.len()
                 ))
                 .border_style(theme.block(false)),
@@ -558,11 +623,10 @@ fn draw_catalog_table(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme
     let mut state = TableState::default();
     state.select(Some(app.catalog_selected));
     frame.render_stateful_widget(table, area, &mut state);
-    let len = app.catalog.len();
     app.catalog_geom = ListGeometry {
         inner: table_rows_area(area),
         offset: state.offset(),
-        len,
+        len: visible,
     };
 }
 
@@ -1524,7 +1588,10 @@ mod tests {
         let mut app = App::new();
         app.popup = Popup::Help { scroll: u16::MAX };
         let text = render_text(&mut app, 100, 12);
-        assert!(text.contains("Mouse"), "late section missing: {text:?}");
+        assert!(
+            text.contains("(Agent) wheel/click"),
+            "late section missing: {text:?}"
+        );
         assert!(
             !text.contains("Global"),
             "early section still shown: {text:?}"
@@ -1649,6 +1716,62 @@ mod tests {
         assert!(
             text.contains("line 79"),
             "scrolled content missing: {text:?}"
+        );
+    }
+
+    /// A catalog entry with just a name (all optional fields unset).
+    fn catalog_entry(name: &str) -> super::super::app::CatalogEntry {
+        super::super::app::CatalogEntry {
+            name: name.to_string(),
+            agent: None,
+            provider: None,
+            model: None,
+            cwd: None,
+            needs: None,
+            vars: Vec::new(),
+            prompt: String::new(),
+        }
+    }
+
+    #[test]
+    fn catalog_renders_folder_and_task_icons() {
+        let mut app = App::new();
+        app.tab = Tab::Catalog;
+        app.set_catalog(vec![
+            catalog_entry("triage"),
+            catalog_entry("pipelines/plan"),
+        ]);
+
+        let text = render_text(&mut app, 100, 30);
+        assert!(text.contains("Catalog"), "catalog title missing: {text:?}");
+        assert!(text.contains("pipelines"), "folder label missing: {text:?}");
+        assert!(text.contains("plan"), "task label missing: {text:?}");
+        assert!(
+            text.contains(FOLDER_OPEN),
+            "open-folder icon missing: {text:?}"
+        );
+        assert!(text.contains(TASK_ICON), "task icon missing: {text:?}");
+    }
+
+    #[test]
+    fn collapsed_folder_hides_task_in_render() {
+        let mut app = App::new();
+        app.tab = Tab::Catalog;
+        app.set_catalog(vec![catalog_entry("pipelines/plan")]);
+        app.catalog_collapsed.insert("pipelines".to_string());
+
+        let text = render_text(&mut app, 100, 30);
+        assert!(
+            text.contains("pipelines"),
+            "collapsed folder label missing: {text:?}"
+        );
+        assert!(
+            text.contains(FOLDER_CLOSED),
+            "closed-folder icon missing: {text:?}"
+        );
+        assert!(
+            !text.contains("plan"),
+            "collapsed folder should hide its task: {text:?}"
         );
     }
 

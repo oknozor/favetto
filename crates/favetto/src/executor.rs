@@ -611,6 +611,9 @@ impl DirLocks {
 }
 
 /// Start every catalog task whose `needs` matches `name:finished`.
+///
+/// `needs` (and `spawn`) values are relative-path names, so a dependency on a
+/// task in a subfolder is written as `pipelines/plan:finished`.
 async fn start_dependents(state: &Arc<State>, ev: &Event) {
     let Some(name) = ev.payload.get("name").and_then(|n| n.as_str()) else {
         return;
@@ -831,5 +834,28 @@ mod tests {
             .to_string();
         assert!(err.contains("agent 'opencode' is not installed"), "{err}");
         assert!(err.contains("not found on PATH"), "{err}");
+    }
+
+    #[test]
+    fn branch_name_slugifies_folder_qualified_task() {
+        let task = Task {
+            id: Uuid::new_v4(),
+            name: "pipelines/plan".to_string(),
+            status: TaskStatus::Pending,
+            input: serde_json::json!({}),
+            output: None,
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+            session_id: None,
+            session_title: None,
+        };
+        let short = &task.id.to_string()[..8];
+        assert_eq!(
+            branch_name(&task),
+            format!("favetto/pipelines-plan-{short}")
+        );
     }
 }

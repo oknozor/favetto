@@ -199,21 +199,27 @@ task. See `tasks/triage_cocogitto_issues.md`, `tasks/plan_cocogitto_issue.md`, a
 issues in `tasks/triage_favetto_issues.md`, `tasks/plan_favetto_issue.md`, and
 `tasks/implement_favetto_issue.md`.
 
-The daemon loads the catalog from `--tasks-dir` (default `tasks/`). It also
-watches that directory (via `notify`, with a 200 ms debounce): adding, editing,
-or removing a `.md` file reloads the catalog on the fly. A file that fails to
-parse keeps its previous definition (so a half-written edit never drops a task),
-and the recurring tasks derived from `schedule` headers are re-synced — a changed
-cron is re-registered and a removed header deletes the `catalog:<name>` schedule,
-while manually created schedules are left alone. Every reload pushes
-`catalog.updated` so attached TUIs re-fetch the list and refresh the preview.
-Runs already in flight keep the definition they were dispatched with; a queued
-task picks up the freshly loaded definition when it starts. From the TUI, the
-**Catalog** tab lists the catalog and Enter starts a task; a task that declares
-`[[vars]]` opens a floating form first (Enter advances, `Ctrl+Enter` submits,
-`Esc` cancels and starts nothing), while a var-free task starts immediately. The
-Ctrl+P menu's "Add task" writes a new `.md` file (it does not run it). Task
-lifecycle emits `task_idle` / `task_started` / `task_finished` events.
+The daemon loads the catalog from `--tasks-dir` (default `tasks/`) **recursively**:
+tasks may live at the root or in any subfolder, and a task's identity is its path
+relative to that root without the `.md` extension (e.g. `pipelines/plan`), used
+consistently by `tasks.start`, `catalog.get`, `needs`/`spawn`, webhook `rule.task`,
+`catalog:<name>` schedules and `{{ task.name }}`. It also watches that directory
+(and its subfolders, via `notify`, with a 200 ms debounce): adding, editing, or
+removing a `.md` file reloads the catalog on the fly. A file that fails to parse
+keeps its previous definition (so a half-written edit never drops a task), and the
+recurring tasks derived from `schedule` headers are re-synced — a changed cron is
+re-registered and a removed header deletes the `catalog:<name>` schedule, while
+manually created schedules are left alone. Every reload pushes `catalog.updated`
+so attached TUIs re-fetch the list and refresh the preview. Runs already in flight
+keep the definition they were dispatched with; a queued task picks up the freshly
+loaded definition when it starts. From the TUI, the **Catalog** tab shows the
+catalog as a collapsible folder/task tree (icons; click a folder or press `Space`
+to fold/unfold) and Enter starts a task; a task that declares `[[vars]]` opens a
+floating form first (Enter advances, `Ctrl+Enter` submits, `Esc` cancels and
+starts nothing), while a var-free task starts immediately. The Ctrl+P menu's "Add
+task" writes a new `.md` file (it does not run it); its name may contain `/` to
+place the file in a subfolder. Task lifecycle emits `task_idle` / `task_started` /
+`task_finished` events.
 
 The Catalog tab shows a **preview side panel** for the highlighted task: its raw
 `.md` source with the TOML front-matter highlighted as TOML and the prompt rendered
