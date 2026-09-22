@@ -104,5 +104,15 @@ persisted event and `notify` sends through a channel (for example
 and are lost on restart; task triggers are configured declaratively with
 `[webhook.github]` above.
 
+For example, to be notified when a task's agent is blocked on user input:
+
+```text
+hooks.upsert { event = "task_awaiting_input", channel = "webhook", config = { url = "http://…" } }
+```
+
+`task_awaiting_input` carries `task_id`, `name`, `session_id`, and a `reason`
+object (`kind` plus the prompt `message`), so a filter can narrow to a specific
+task or prompt kind.
+
 See [Remote API](../reference/remote-api) for the webhook endpoints and
 [Environment variables](../reference/environment) for the secret variables.

@@ -11,9 +11,9 @@ Every section is optional; favetto falls back to built-in defaults for anything 
 | `agent` | AgentSettings | `{}` | no | Default external agent used for catalog tasks and new agent sessions. |
 | `agents` | Map<String, AgentConfig> | `{}` | no | External coding agents by name (e.g. `claude`, `opencode`, `pi`, `vibe`). |
 | `daemon` | DaemonSettings | `{"data_dir":null,"listen":null,"retention":{"days":30,"min_tasks":1000,"vacuum":true},"socket":null,"tasks_dir":null}` | no | Daemon defaults (overridable by CLI flags). |
-| `executor` | ExecutorSettings | `{"keep_worktree":true,"max_concurrency":4,"max_output_bytes":262144,"parallel":false,"worktree":true}` | no | Task executor concurrency / isolation. |
+| `executor` | ExecutorSettings | `{"awaiting_input_quiet_ms":8000,"detect_awaiting_input":true,"keep_worktree":true,"max_concurrency":4,"max_output_bytes":262144,"parallel":false,"worktree":true}` | no | Task executor concurrency / isolation. |
 | `git` | GitSettings | `{}` | no | Non-interactive git provisioning for agent processes. Defaults to `signing = "off"`, which forces `commit.gpgsign = false` so an agent commit can never block on an interactive pinentry/askpass prompt. |
-| `tui` | TuiSettings | `{"sound":{"enabled":true,"events":{"attention":"none","task_failed":"failure","task_finished":"success","task_started":"none"},"min_interval_ms":400,"only_when_unfocused":false,"player":"auto"}}` | no | Client-side TUI settings. Ignored by the daemon, which reads the same file. |
+| `tui` | TuiSettings | `{"sound":{"enabled":true,"events":{"attention":"none","awaiting_input":"attention","task_failed":"failure","task_finished":"success","task_started":"none"},"min_interval_ms":400,"only_when_unfocused":false,"player":"auto"}}` | no | Client-side TUI settings. Ignored by the daemon, which reads the same file. |
 | `webhook` | WebhookSettings | `{"github":{"enabled":false,"rules":[]}}` | no | Webhook trigger rules (currently GitHub). |
 
 ## AgentConfig
@@ -78,6 +78,8 @@ serialized per working directory.
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
+| `awaiting_input_quiet_ms` | integer | `8000` | no | How long the PTY must be quiet (ms) before the generic prompt detector fires (default 8000). Agent-specific detectors ignore this. |
+| `detect_awaiting_input` | boolean | `true` | no | Detect when a running agent is blocked waiting for user input and surface it as `awaiting_input` on the task (default true). |
 | `keep_worktree` | boolean | `true` | no | Keep worktrees after the task finishes (default true) so the agent's branch/changes can be inspected; false removes them. |
 | `max_concurrency` | integer | `4` | no | Maximum concurrent tasks when `parallel` is true. |
 | `max_output_bytes` | integer | `262144` | no | Cap on the stored `task.output` blob, in bytes (default 256 KiB). Longer output is truncated head+tail and flagged. |
@@ -187,7 +189,7 @@ defaults. Sounds are played on the machine running `favetto tui`.
 |-------|------|---------|----------|-------------|
 | `command` | string (optional) | — | no | Template used when `player = "command"`; `{file}` is the sound path. |
 | `enabled` | boolean | `true` | no | Master switch (default true). |
-| `events` | Map<String, string> | `{"attention":"none","task_failed":"failure","task_finished":"success","task_started":"none"}` | no | Cue key -> sound spec (`success`/`failure`/`attention`/`started`/`bell`, a `.wav` path, or `none`). Unset keys use the built-in default. |
+| `events` | Map<String, string> | `{"attention":"none","awaiting_input":"attention","task_failed":"failure","task_finished":"success","task_started":"none"}` | no | Cue key -> sound spec (`success`/`failure`/`attention`/`started`/`bell`, a `.wav` path, or `none`). Unset keys use the built-in default. |
 | `min_interval_ms` | integer | `400` | no | Minimum gap between cues; bursts inside it are coalesced (failure wins). |
 | `only_when_unfocused` | boolean | `false` | no | Only play while the terminal is unfocused (best-effort focus reporting). |
 | `player` | string | `auto` | no | `"auto"` (detect a player on `PATH`), `"bell"`, or `"command"`. |
@@ -200,7 +202,7 @@ TUI-only settings. The daemon parses but ignores this section.
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
 | `editor` | string (optional) | — | no | Editor command for `e` on a Catalog task. Unset -> `$VISUAL`, then `$EDITOR`, then `vi`. May include arguments (e.g. `code --wait`). |
-| `sound` | SoundSettings | `{"enabled":true,"events":{"attention":"none","task_failed":"failure","task_finished":"success","task_started":"none"},"min_interval_ms":400,"only_when_unfocused":false,"player":"auto"}` | no |  |
+| `sound` | SoundSettings | `{"enabled":true,"events":{"attention":"none","awaiting_input":"attention","task_failed":"failure","task_finished":"success","task_started":"none"},"min_interval_ms":400,"only_when_unfocused":false,"player":"auto"}` | no |  |
 
 ## WebhookSettings
 

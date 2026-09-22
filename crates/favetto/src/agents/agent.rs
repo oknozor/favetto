@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use futures_util::future::BoxFuture;
 
-use favetto_core::model::AgentCapabilities;
+use favetto_core::model::{AgentCapabilities, AwaitingInputReason};
 
 /// Delay before the first submit-Enter, and the maximum number of sends.
 pub(crate) const SUBMIT_DELAY: Duration = Duration::from_millis(1200);
@@ -185,6 +185,13 @@ pub trait Agent: Send + Sync {
 
     /// The agent's provider/model catalog source, if it has one.
     fn provider_source(&self) -> Option<Arc<dyn ProviderSource>> {
+        None
+    }
+
+    /// Detect that the session's *visible screen* is blocked waiting on the user
+    /// (a permission dialog, confirmation, choice, …). Defaults to `None`; the
+    /// generic fallback in `AgentManager` still applies.
+    fn awaiting_input(&self, _screen: &vt100::Screen) -> Option<AwaitingInputReason> {
         None
     }
 }
@@ -387,6 +394,10 @@ mod tests {
             .session_title("ses_1", std::path::Path::new("/tmp"))
             .is_none());
         assert!(!Dummy.has_session_titles());
+
+        // The default awaiting-input detector never fires.
+        let parser = vt100::Parser::new(4, 20, 0);
+        assert!(Dummy.awaiting_input(parser.screen()).is_none());
     }
 
     /// A title-capable fixture: returns `"Late title"` once `fail_first` lookups

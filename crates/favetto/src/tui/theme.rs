@@ -213,6 +213,7 @@ impl Theme {
         match status {
             TaskStatus::Pending => self.warning,
             TaskStatus::Running => self.accent,
+            TaskStatus::AwaitingInput => self.warning,
             TaskStatus::Succeeded => self.success,
             TaskStatus::Failed => self.danger,
             TaskStatus::Cancelled => self.muted,
@@ -327,5 +328,16 @@ mod tests {
             Theme::light()
         );
         assert_eq!(Theme::detect_from(None, None, Some("15;0")), Theme::dark());
+    }
+
+    #[test]
+    fn semantic_covers_all_statuses() {
+        let theme = Theme::dark();
+        assert_eq!(theme.semantic(TaskStatus::Pending), theme.warning);
+        assert_eq!(theme.semantic(TaskStatus::Running), theme.accent);
+        assert_eq!(theme.semantic(TaskStatus::AwaitingInput), theme.warning);
+        assert_eq!(theme.semantic(TaskStatus::Succeeded), theme.success);
+        assert_eq!(theme.semantic(TaskStatus::Failed), theme.danger);
+        assert_eq!(theme.semantic(TaskStatus::Cancelled), theme.muted);
     }
 }

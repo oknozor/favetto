@@ -1,5 +1,7 @@
 //! Built-in agent for Claude Code.
 
+use favetto_core::model::AwaitingInputReason;
+
 use crate::config::AgentConfig;
 
 use super::agent::{Agent, AgentContext, AgentDescriptor, CommandSpec, Invocation, SessionIdProbe};
@@ -74,6 +76,10 @@ impl Agent for ClaudeAgent {
 
     fn set_available(&mut self, available: bool) {
         self.template.descriptor.available = available;
+    }
+
+    fn awaiting_input(&self, screen: &vt100::Screen) -> Option<AwaitingInputReason> {
+        super::detect::claude_awaiting_input(&screen.contents())
     }
 }
 
@@ -176,5 +182,25 @@ mod tests {
             )
             .unwrap();
         assert_eq!(with_model.args, vec!["-p", "--model", "sonnet", "do it"]);
+    }
+
+    #[test]
+    fn detects_confirmation_dialog_once_screen_rendered() {
+        use favetto_core::model::AwaitingInputKind;
+        let mut parser = vt100::Parser::new(12, 70, 0);
+        parser
+            .process("Do you want to proceed?\r\n❯ 1. Yes\r\n  2. No\r\nEsc to cancel".as_bytes());
+        let reason = agent().awaiting_input(parser.screen());
+        assert_eq!(
+            reason.map(|r| r.kind),
+            Some(AwaitingInputKind::Confirmation)
+        );
+    }
+
+    #[test]
+    fn idle_screen_is_not_awaiting() {
+        let mut parser = vt100::Parser::new(12, 70, 0);
+        parser.process(b"Ready for your next task");
+        assert!(agent().awaiting_input(parser.screen()).is_none());
     }
 }

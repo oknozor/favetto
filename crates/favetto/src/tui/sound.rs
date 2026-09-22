@@ -37,13 +37,16 @@ pub enum SoundCue {
     TaskFailed,
     /// A `task_started` event (cue defaults to `none`).
     TaskStarted,
+    /// A `task_awaiting_input` event (agent blocked on the user).
+    AwaitingInput,
     /// An `agent.exit` push (cue defaults to `none`).
     Attention,
 }
 
 impl SoundCue {
     /// Every cue, in the canonical precedence order used to seed the event map.
-    pub const ALL: [SoundCue; 4] = [
+    pub const ALL: [SoundCue; 5] = [
+        SoundCue::AwaitingInput,
         SoundCue::TaskFinished,
         SoundCue::TaskFailed,
         SoundCue::TaskStarted,
@@ -56,6 +59,7 @@ impl SoundCue {
             SoundCue::TaskFinished => "task_finished",
             SoundCue::TaskFailed => "task_failed",
             SoundCue::TaskStarted => "task_started",
+            SoundCue::AwaitingInput => "awaiting_input",
             SoundCue::Attention => "attention",
         }
     }
@@ -63,6 +67,7 @@ impl SoundCue {
     /// Higher wins when cues are coalesced within the debounce window.
     pub fn priority(self) -> u8 {
         match self {
+            SoundCue::AwaitingInput => 5,
             SoundCue::TaskFailed => 4,
             SoundCue::TaskFinished => 3,
             SoundCue::Attention => 2,
@@ -236,6 +241,7 @@ fn default_spec(key: &str) -> SoundSpec {
     match key {
         "task_finished" => SoundSpec::Builtin(BuiltinSound::Success),
         "task_failed" => SoundSpec::Builtin(BuiltinSound::Failure),
+        "awaiting_input" => SoundSpec::Builtin(BuiltinSound::Attention),
         _ => SoundSpec::None,
     }
 }
@@ -597,7 +603,8 @@ impl SoundPlayer {
                     }
                 }
                 // Trailing debounce: wait out the rest of the window, coalescing
-                // anything that arrives meanwhile. Failure wins in the merge.
+                // anything that arrives meanwhile. The highest-priority cue wins
+                // (awaiting-input outranks failure).
                 if let Some(last) = last_play {
                     let mut remaining = min_interval.saturating_sub(last.elapsed());
                     while !remaining.is_zero() {
@@ -942,5 +949,33 @@ mod tests {
         let second = cache.path(BuiltinSound::Success).unwrap();
         assert_eq!(first, second);
         assert!(first.exists());
+    }
+
+    #[test]
+    fn awaiting_input_cue_defaults_on() {
+        let resolved = resolve(SoundSettings::default(), &no_env, &CliSound::default());
+        assert_eq!(
+            resolved.events["awaiting_input"],
+            SoundSpec::Builtin(BuiltinSound::Attention)
+        );
+        assert_eq!(SoundCue::AwaitingInput.key(), "awaiting_input");
+        assert!(SoundCue::AwaitingInput.priority() > SoundCue::TaskFailed.priority());
+        assert_eq!(SoundCue::ALL.len(), 5);
+    }
+
+    #[test]
+    fn coalesce_prefers_awaiting_input_over_failure() {
+        assert_eq!(
+            SoundCue::merge(SoundCue::TaskFailed, SoundCue::AwaitingInput),
+            SoundCue::AwaitingInput
+        );
+        assert_eq!(
+            coalesce_batch(&[
+                SoundCue::TaskStarted,
+                SoundCue::TaskFailed,
+                SoundCue::AwaitingInput,
+            ]),
+            Some(SoundCue::AwaitingInput)
+        );
     }
 }

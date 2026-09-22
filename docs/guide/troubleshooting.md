@@ -30,6 +30,13 @@ injects `commit.gpgsign = false` and prevents this. If you opted into `ssh` or
 `gpg` signing, use a passphrase-less key (or one held by `ssh-agent`), or provide
 a passphrase source. See [Git and commit signing](./git-signing).
 
+If a prompt does appear, the task no longer silently stays `running`: it flips to
+**awaiting input**, the TUI plays the attention cue, and a `task_awaiting_input`
+event fires. Select the task and press **Enter** to open the Agent panel and
+answer the prompt in the live session. The task returns to `running` once the
+agent continues. Detection is configurable under `[executor]`
+(`detect_awaiting_input`, `awaiting_input_quiet_ms`).
+
 ## A webhook returns 404 or 401
 
 - **404** — the endpoint is disabled. Set `enabled = true` and configure a

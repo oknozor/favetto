@@ -171,6 +171,18 @@
     "ExecutorSettings": {
       "description": "How the executor runs tasks: concurrency and directory/worktree isolation.\n\nWith `parallel = true` each task gets a git worktree when its working\ndirectory is inside a repository (so tasks can run side by side without\nstepping on each other). Tasks that do **not** run in a worktree are\nserialized per working directory.",
       "properties": {
+        "awaiting_input_quiet_ms": {
+          "default": 8000,
+          "description": "How long the PTY must be quiet (ms) before the generic prompt detector\nfires (default 8000). Agent-specific detectors ignore this.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "detect_awaiting_input": {
+          "default": true,
+          "description": "Detect when a running agent is blocked waiting for user input and surface\nit as `awaiting_input` on the task (default true).",
+          "type": "boolean"
+        },
         "keep_worktree": {
           "default": true,
           "description": "Keep worktrees after the task finishes (default true) so the agent's\nbranch/changes can be inspected; false removes them.",
@@ -425,6 +437,7 @@
           },
           "default": {
             "attention": "none",
+            "awaiting_input": "attention",
             "task_failed": "failure",
             "task_finished": "success",
             "task_started": "none"
@@ -475,6 +488,7 @@
             "enabled": true,
             "events": {
               "attention": "none",
+              "awaiting_input": "attention",
               "task_failed": "failure",
               "task_finished": "success",
               "task_started": "none"
@@ -534,6 +548,8 @@
     "executor": {
       "$ref": "#/$defs/ExecutorSettings",
       "default": {
+        "awaiting_input_quiet_ms": 8000,
+        "detect_awaiting_input": true,
         "keep_worktree": true,
         "max_concurrency": 4,
         "max_output_bytes": 262144,
@@ -554,6 +570,7 @@
           "enabled": true,
           "events": {
             "attention": "none",
+            "awaiting_input": "attention",
             "task_failed": "failure",
             "task_finished": "success",
             "task_started": "none"

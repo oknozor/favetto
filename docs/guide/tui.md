@@ -20,6 +20,12 @@ and title it captured. One-shot tasks resolve their title the same way when the
 agent reports a session id. Agents that never expose titles (`claude`, `pi`,
 `vibe`, custom) show a blank cell and skip the retry.
 
+A task whose agent blocks on a permission prompt, confirmation, choice, or git
+pinentry is shown as **awaiting input** (glyph `!`, warning colour) instead of
+silently staying `running`, and the status bar counts them. Press **Enter** on
+that row to open the Agent panel and answer the prompt; the task returns to
+`running` once the agent continues.
+
 ## Keybindings
 
 Press **?** at any time to open the same reference as a floating overlay. `?` or
@@ -137,12 +143,13 @@ terminal BEL (`\x07`) is used.
 | `task_finished` with `success: true` | success chime | on |
 | `task_finished` with `success: false` | failure tone | on |
 | `task_started` | blip | off |
+| `task_awaiting_input` | attention ping | on |
 | `agent.exit` | attention ping | off |
 
 Only `task_finished` is sounded — `task_completed`/`task_failed` never add a
-duplicate. Cues within `min_interval_ms` are coalesced (failure wins the merge).
-Press **M** to mute/unmute for the session; the status bar shows a
-`sound`/`muted`/`sound off` badge.
+duplicate. Cues within `min_interval_ms` are coalesced (the highest-priority cue
+wins; `task_awaiting_input` outranks a failure). Press **M** to mute/unmute for
+the session; the status bar shows a `sound`/`muted`/`sound off` badge.
 
 ```toml
 # ~/.config/favetto/config.toml
@@ -159,6 +166,7 @@ task_finished = "success"      # built-in name, .wav path, "bell", or "none"
 task_failed   = "failure"
 task_started  = "none"
 attention     = "none"
+awaiting_input = "attention"   # agent blocked on a prompt
 ```
 
 Precedence is **CLI flag → env var → `[tui.sound]` → built-in default**:

@@ -481,7 +481,18 @@ async fn run_agent_task(
         ctx,
     )?;
 
-    let code = state.agents.wait(&info.id).await;
+    let (detect, quiet) = {
+        let cfg = state.config.read().unwrap();
+        (
+            cfg.executor.detect_awaiting_input,
+            Duration::from_millis(cfg.executor.awaiting_input_quiet_ms),
+        )
+    };
+    let code = if detect {
+        crate::attention::watch(state, &info.id, agent.clone(), Some(task.id), quiet).await
+    } else {
+        state.agents.wait(&info.id).await
+    };
     let raw = state.agents.output(&info.id);
     let mut result = agent.parse_output(&raw, code);
     // The manager also captures the id live from the PTY; prefer it if the
@@ -1088,6 +1099,37 @@ mod tests {
         assert_eq!(task.session_id.as_deref(), Some("ses_keep"));
         assert_eq!(task.session_title.as_deref(), Some("Keep"));
         assert!(task.error.as_deref().unwrap().contains("no agent"));
+    }
+
+    #[test]
+    fn terminal_outcome_overrides_awaiting_input_status() {
+        let mut task = task_with_session(None, None);
+        task.status = TaskStatus::AwaitingInput;
+        let success = record_run_outcome(
+            &mut task,
+            Ok(RunOutcome {
+                output: serde_json::json!({}),
+                session_id: None,
+                session_title: None,
+                error: None,
+            }),
+        );
+        assert!(success);
+        assert_eq!(task.status, TaskStatus::Succeeded);
+
+        let mut failed = task_with_session(None, None);
+        failed.status = TaskStatus::AwaitingInput;
+        let success = record_run_outcome(
+            &mut failed,
+            Ok(RunOutcome {
+                output: serde_json::json!({}),
+                session_id: None,
+                session_title: None,
+                error: Some("exit 1".to_string()),
+            }),
+        );
+        assert!(!success);
+        assert_eq!(failed.status, TaskStatus::Failed);
     }
 
     /// A fake `opencode session list --format json` executable that ignores its

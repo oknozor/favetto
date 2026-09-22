@@ -373,11 +373,16 @@ fn default_sound_events() -> BTreeMap<String, String> {
         ("task_failed".to_string(), "failure".to_string()),
         ("task_started".to_string(), "none".to_string()),
         ("attention".to_string(), "none".to_string()),
+        ("awaiting_input".to_string(), "attention".to_string()),
     ])
 }
 
 fn default_max_concurrency() -> usize {
     4
+}
+
+fn default_awaiting_input_quiet_ms() -> u64 {
+    8000
 }
 
 /// How the executor runs tasks: concurrency and directory/worktree isolation.
@@ -409,6 +414,14 @@ pub struct ExecutorSettings {
     /// output is truncated head+tail and flagged.
     #[serde(default = "default_max_output_bytes")]
     pub max_output_bytes: usize,
+    /// Detect when a running agent is blocked waiting for user input and surface
+    /// it as `awaiting_input` on the task (default true).
+    #[serde(default = "default_true")]
+    pub detect_awaiting_input: bool,
+    /// How long the PTY must be quiet (ms) before the generic prompt detector
+    /// fires (default 8000). Agent-specific detectors ignore this.
+    #[serde(default = "default_awaiting_input_quiet_ms")]
+    pub awaiting_input_quiet_ms: u64,
 }
 
 impl Default for ExecutorSettings {
@@ -420,6 +433,8 @@ impl Default for ExecutorSettings {
             worktree_dir: None,
             keep_worktree: true,
             max_output_bytes: default_max_output_bytes(),
+            detect_awaiting_input: true,
+            awaiting_input_quiet_ms: default_awaiting_input_quiet_ms(),
         }
     }
 }
@@ -718,5 +733,32 @@ mod tests {
         assert_eq!(git.signing_key.as_deref(), Some("~/.ssh/agent_ed25519.pub"));
         // The global section is untouched by the per-agent override.
         assert_eq!(cfg.git.effective_signing(), GitSigning::Off);
+    }
+
+    #[test]
+    fn awaiting_input_defaults_and_overrides() {
+        let cfg: FavettoConfig = toml::from_str("").unwrap();
+        assert!(cfg.executor.detect_awaiting_input);
+        assert_eq!(cfg.executor.awaiting_input_quiet_ms, 8000);
+
+        let overridden: FavettoConfig = toml::from_str(
+            r#"
+            [executor]
+            detect_awaiting_input = false
+            awaiting_input_quiet_ms = 250
+            "#,
+        )
+        .unwrap();
+        assert!(!overridden.executor.detect_awaiting_input);
+        assert_eq!(overridden.executor.awaiting_input_quiet_ms, 250);
+    }
+
+    #[test]
+    fn default_sound_events_includes_awaiting_input() {
+        let cfg = SoundSettings::default();
+        assert_eq!(
+            cfg.events.get("awaiting_input").map(String::as_str),
+            Some("attention")
+        );
     }
 }

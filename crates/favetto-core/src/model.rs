@@ -16,6 +16,10 @@ pub enum TaskStatus {
     Pending,
     /// Currently being executed by the agent runtime.
     Running,
+    /// Running, but the agent is blocked waiting for the user to answer a
+    /// permission prompt, confirmation, choice, or pinentry. Non-terminal: the
+    /// task resumes running once the input is provided.
+    AwaitingInput,
     /// Completed successfully.
     Succeeded,
     /// Terminated with an error.
@@ -30,6 +34,7 @@ impl TaskStatus {
         match self {
             TaskStatus::Pending => "pending",
             TaskStatus::Running => "running",
+            TaskStatus::AwaitingInput => "awaiting_input",
             TaskStatus::Succeeded => "succeeded",
             TaskStatus::Failed => "failed",
             TaskStatus::Cancelled => "cancelled",
@@ -44,6 +49,7 @@ impl FromStr for TaskStatus {
         Ok(match s {
             "pending" => TaskStatus::Pending,
             "running" => TaskStatus::Running,
+            "awaiting_input" => TaskStatus::AwaitingInput,
             "succeeded" => TaskStatus::Succeeded,
             "failed" => TaskStatus::Failed,
             "cancelled" => TaskStatus::Cancelled,
@@ -121,6 +127,8 @@ pub enum EventKind {
     TaskIdle,
     /// A task began running.
     TaskStarted,
+    /// A running task's agent is blocked waiting for user input.
+    TaskAwaitingInput,
     /// A task ended (success or failure) — used by `needs` dependencies.
     TaskFinished,
     CronTick,
@@ -164,6 +172,7 @@ impl EventKind {
             EventKind::TaskCancelled => "task_cancelled",
             EventKind::TaskIdle => "task_idle",
             EventKind::TaskStarted => "task_started",
+            EventKind::TaskAwaitingInput => "task_awaiting_input",
             EventKind::TaskFinished => "task_finished",
             EventKind::CronTick => "cron_tick",
             EventKind::IssueCreated => "issue_created",
@@ -205,6 +214,7 @@ impl EventKind {
         EventKind::TaskCancelled,
         EventKind::TaskIdle,
         EventKind::TaskStarted,
+        EventKind::TaskAwaitingInput,
         EventKind::TaskFinished,
         EventKind::CronTick,
         EventKind::IssueCreated,
@@ -244,6 +254,9 @@ impl EventKind {
             EventKind::TaskCancelled => "A task was cancelled (terminal).",
             EventKind::TaskIdle => "A task was enqueued and is waiting to run.",
             EventKind::TaskStarted => "A task began running.",
+            EventKind::TaskAwaitingInput => {
+                "A running task's agent is blocked waiting for user input."
+            }
             EventKind::TaskFinished => {
                 "A task ended (success or failure); used by `needs` dependencies."
             }
@@ -296,6 +309,7 @@ impl EventKind {
             "task_cancelled" => EventKind::TaskCancelled,
             "task_idle" => EventKind::TaskIdle,
             "task_started" => EventKind::TaskStarted,
+            "task_awaiting_input" => EventKind::TaskAwaitingInput,
             "task_finished" => EventKind::TaskFinished,
             "cron_tick" => EventKind::CronTick,
             "issue_created" => EventKind::IssueCreated,
@@ -329,6 +343,7 @@ impl EventKind {
             "TaskCancelled" => EventKind::TaskCancelled,
             "TaskIdle" => EventKind::TaskIdle,
             "TaskStarted" => EventKind::TaskStarted,
+            "TaskAwaitingInput" => EventKind::TaskAwaitingInput,
             "TaskFinished" => EventKind::TaskFinished,
             "CronTick" => EventKind::CronTick,
             "IssueCreated" => EventKind::IssueCreated,
@@ -446,6 +461,30 @@ impl ChatMessage {
     }
 }
 
+/// What kind of decision an agent is blocked on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AwaitingInputKind {
+    /// A tool/command permission prompt.
+    Permission,
+    /// A yes/no confirmation.
+    Confirmation,
+    /// A multiple-choice selection.
+    Choice,
+    /// A passphrase/pinentry prompt (e.g. `git` signing).
+    Pinentry,
+    /// A prompt was detected but could not be classified further.
+    Other,
+}
+
+/// Why a session is considered blocked on the user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AwaitingInputReason {
+    pub kind: AwaitingInputKind,
+    /// The prompt text (the last visible lines), for context.
+    pub message: String,
+}
+
 /// A live external-agent session (a PTY running an agent CLI on the daemon).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSessionInfo {
@@ -463,6 +502,9 @@ pub struct AgentSessionInfo {
     /// The agent's own session id (e.g. opencode's), captured from its output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Set while the session is blocked waiting for the user to answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awaiting_input: Option<AwaitingInputReason>,
 }
 
 /// What an external agent CLI can do, so the daemon and TUI can adapt without
@@ -692,5 +734,78 @@ mod tests {
                 "{kind:?} has an empty description"
             );
         }
+    }
+
+    #[test]
+    fn task_status_round_trips() {
+        for status in [
+            TaskStatus::Pending,
+            TaskStatus::Running,
+            TaskStatus::AwaitingInput,
+            TaskStatus::Succeeded,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+        ] {
+            assert_eq!(
+                status.as_str().parse::<TaskStatus>(),
+                Ok(status),
+                "from_str/as_str mismatch for {status:?}"
+            );
+        }
+        assert_eq!(TaskStatus::AwaitingInput.as_str(), "awaiting_input");
+    }
+
+    #[test]
+    fn awaiting_input_reason_round_trips() {
+        for kind in [
+            AwaitingInputKind::Permission,
+            AwaitingInputKind::Confirmation,
+            AwaitingInputKind::Choice,
+            AwaitingInputKind::Pinentry,
+            AwaitingInputKind::Other,
+        ] {
+            let reason = AwaitingInputReason {
+                kind,
+                message: "Allow once / Allow always / Reject".to_string(),
+            };
+            let json = serde_json::to_value(&reason).unwrap();
+            assert_eq!(json["kind"], serde_json::to_value(kind).unwrap());
+            let back: AwaitingInputReason = serde_json::from_value(json).unwrap();
+            assert_eq!(back, reason);
+        }
+    }
+
+    #[test]
+    fn agent_session_info_awaiting_input_defaults_and_round_trips() {
+        // Legacy payloads without the key decode to `None`.
+        let legacy: AgentSessionInfo = serde_json::from_str(
+            r#"{"id":"s1","agent":"opencode","task_id":null,"running":true,"headless":true}"#,
+        )
+        .unwrap();
+        assert!(legacy.awaiting_input.is_none());
+
+        let with_reason = AgentSessionInfo {
+            awaiting_input: Some(AwaitingInputReason {
+                kind: AwaitingInputKind::Pinentry,
+                message: "Enter passphrase:".to_string(),
+            }),
+            ..legacy
+        };
+        let json = serde_json::to_value(&with_reason).unwrap();
+        assert_eq!(json["awaiting_input"]["kind"], "pinentry");
+        let back: AgentSessionInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(back.awaiting_input, with_reason.awaiting_input);
+    }
+
+    #[test]
+    fn event_kind_from_name_accepts_pascal_case() {
+        assert_eq!(
+            EventKind::from_name("TaskAwaitingInput"),
+            Some(EventKind::TaskAwaitingInput)
+        );
+        assert_eq!(
+            EventKind::from_name("task_awaiting_input"),
+            Some(EventKind::TaskAwaitingInput)
+        );
     }
 }
