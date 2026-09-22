@@ -776,6 +776,12 @@ async fn start_oneshot_task(
     };
     let agent = state.registry.get_checked(&name)?;
     let cwd_path = cwd.as_ref().map(std::path::PathBuf::from);
+    // Keep a directory for the session-title lookup after `cwd_path` is moved
+    // into the launch context below.
+    let title_cwd = cwd_path
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
 
     let task = Task {
         id: Uuid::new_v4(),
@@ -833,14 +839,18 @@ async fn start_oneshot_task(
         ctx,
     )?;
 
-    // Finish the task once the interactive session ends.
+    // Finish the task once the interactive session ends, capturing the agent's
+    // own session id (when the CLI reported one) to resolve its title.
     {
         let state = state.clone();
         let task_id = task.id;
         let session = info.id.clone();
+        let agent_name = name.clone();
+        let title_cwd = title_cwd.clone();
         tokio::spawn(async move {
             let code = state.agents.wait(&session).await;
-            finish_oneshot(&state, task_id, code).await;
+            let session_id = state.agents.external_session_id(&session);
+            finish_oneshot(&state, task_id, &agent_name, session_id, &title_cwd, code).await;
         });
     }
 
@@ -853,7 +863,19 @@ async fn start_oneshot_task(
 }
 
 /// Mark a one-shot task finished once its interactive session exits.
-async fn finish_oneshot(state: &Arc<State>, task_id: Uuid, code: Option<i32>) {
+///
+/// An interactive opencode session may not emit a JSON `sessionID` on its PTY,
+/// so `session_id` can be `None`; the task then keeps a blank title. When the
+/// agent did provide one, the title is resolved with a bounded retry and kept on
+/// both success and failure.
+async fn finish_oneshot(
+    state: &Arc<State>,
+    task_id: Uuid,
+    agent_name: &str,
+    session_id: Option<String>,
+    cwd: &std::path::Path,
+    code: Option<i32>,
+) {
     let Ok(Some(mut task)) = db::get_task(&state.db, task_id).await else {
         return;
     };
@@ -861,6 +883,23 @@ async fn finish_oneshot(state: &Arc<State>, task_id: Uuid, code: Option<i32>) {
         return;
     }
     let success = code == Some(0);
+
+    // Persist the session even if the agent did not title it, and resolve the
+    // title (with retry) when there is an id.
+    task.session_id = session_id.clone();
+    if let Some(sid) = session_id.as_deref() {
+        if let Some(agent) = state.registry.get(agent_name) {
+            task.session_title = crate::agents::resolve_session_title(
+                agent,
+                sid,
+                cwd,
+                crate::agents::TITLE_POLL_ATTEMPTS,
+                crate::agents::TITLE_POLL_INTERVAL,
+            )
+            .await;
+        }
+    }
+
     task.status = if success {
         TaskStatus::Succeeded
     } else {
@@ -1270,6 +1309,153 @@ mod tests {
         assert_eq!(entry.cron, "0 0 8 * * *");
         assert_eq!(entry.task, "scheduled");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fake `opencode session list --format json` executable that ignores its
+    /// arguments and prints `json`.
+    #[cfg(unix)]
+    fn session_list_script(dir: &Path, json: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("opencode-session-list.sh");
+        std::fs::write(&path, format!("#!/bin/sh\nprintf '%s' '{json}'\n")).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    /// A `State` whose `opencode` command is `command` (a title-lookup fixture).
+    #[cfg(unix)]
+    async fn title_state(dir: &Path, tasks_dir: &Path, command: &Path) -> Arc<State> {
+        let pool = crate::db::open(&dir.join("test.db")).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        let mut cfg = crate::config::FavettoConfig::default();
+        cfg.agent.default = Some("opencode".to_string());
+        cfg.agents.insert(
+            "opencode".to_string(),
+            crate::config::AgentConfig {
+                command: command.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+        );
+        let registry = crate::agents::AgentRegistry::from_config_with(&cfg, &|_| true).unwrap();
+        let catalog = Arc::new(std::sync::RwLock::new(
+            crate::tasks::load_catalog(tasks_dir).unwrap(),
+        ));
+        let scheduler = tokio_cron_scheduler::JobScheduler::new().await.unwrap();
+        Arc::new(State::new(
+            pool,
+            crate::event_bus::EventBus::new(64),
+            favetto_core::auth::Token::generate(),
+            crate::webhooks::WebhookSecrets::from_config(&cfg),
+            crate::agents::AgentManager::new(),
+            registry,
+            Arc::new(std::sync::RwLock::new(cfg)),
+            dir.to_path_buf(),
+            tasks_dir.to_path_buf(),
+            catalog,
+            scheduler,
+            Arc::new(std::sync::RwLock::new(Vec::new())),
+        ))
+    }
+
+    fn oneshot_task() -> Task {
+        Task {
+            id: Uuid::new_v4(),
+            name: "one-shot".to_string(),
+            status: TaskStatus::Running,
+            input: serde_json::json!({ "oneshot": true }),
+            output: None,
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: Some(Utc::now()),
+            finished_at: None,
+            error: None,
+            session_id: None,
+            session_title: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finish_oneshot_records_session_id_and_title() {
+        let dir = temp_dir("oneshot-title");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let script = session_list_script(&dir, r#"[{"id":"ses_1","title":"Fixture title"}]"#);
+        let state = title_state(&dir, &tasks_dir, &script).await;
+
+        let task = oneshot_task();
+        db::insert_task(&state.db, &task).await.unwrap();
+
+        finish_oneshot(
+            &state,
+            task.id,
+            "opencode",
+            Some("ses_1".to_string()),
+            &dir,
+            Some(0),
+        )
+        .await;
+
+        let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, TaskStatus::Succeeded);
+        assert_eq!(stored.session_id.as_deref(), Some("ses_1"));
+        assert_eq!(stored.session_title.as_deref(), Some("Fixture title"));
+        assert!(stored.error.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finish_oneshot_failure_keeps_session_info() {
+        let dir = temp_dir("oneshot-title-fail");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let script = session_list_script(&dir, r#"[{"id":"ses_1","title":"Fixture title"}]"#);
+        let state = title_state(&dir, &tasks_dir, &script).await;
+
+        let task = oneshot_task();
+        db::insert_task(&state.db, &task).await.unwrap();
+
+        finish_oneshot(
+            &state,
+            task.id,
+            "opencode",
+            Some("ses_1".to_string()),
+            &dir,
+            Some(1),
+        )
+        .await;
+
+        let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, TaskStatus::Failed);
+        assert_eq!(stored.session_id.as_deref(), Some("ses_1"));
+        assert_eq!(stored.session_title.as_deref(), Some("Fixture title"));
+        assert!(stored.error.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finish_oneshot_without_session_id_is_blank() {
+        let dir = temp_dir("oneshot-no-session");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let script = session_list_script(&dir, r#"[{"id":"ses_1","title":"Fixture title"}]"#);
+        let state = title_state(&dir, &tasks_dir, &script).await;
+
+        let task = oneshot_task();
+        db::insert_task(&state.db, &task).await.unwrap();
+
+        finish_oneshot(&state, task.id, "opencode", None, &dir, Some(0)).await;
+
+        let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, TaskStatus::Succeeded);
+        assert!(stored.session_id.is_none());
+        assert!(stored.session_title.is_none());
+        assert!(stored.error.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

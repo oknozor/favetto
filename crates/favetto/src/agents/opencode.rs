@@ -95,6 +95,10 @@ impl Agent for OpenCodeAgent {
         self.template.probe.clone()
     }
 
+    fn has_session_titles(&self) -> bool {
+        true
+    }
+
     fn session_title(&self, session_id: &str, cwd: &Path) -> Option<String> {
         let out = std::process::Command::new(&self.template.config.command)
             .args(["session", "list", "--format", "json"])
@@ -305,6 +309,7 @@ mod tests {
         assert!(caps.structured_output);
         assert!(caps.reports_session_id);
         assert!(caps.prompt_prefill);
+        assert!(agent().has_session_titles());
     }
 
     #[test]
@@ -342,5 +347,12 @@ mod tests {
     fn session_title_from_json_rejects_malformed() {
         assert!(session_title_from_json("not json", "ses_1").is_none());
         assert!(session_title_from_json(r#"{"id":"ses_1","title":"x"}"#, "ses_1").is_none());
+    }
+
+    #[test]
+    fn session_title_from_json_absent_title_is_none() {
+        // opencode v2.0.8 at t=0 lists the session before a title key exists.
+        let raw = r#"[{"id":"ses_1","updated":1,"created":0,"projectId":"p","directory":"/tmp"}]"#;
+        assert!(session_title_from_json(raw, "ses_1").is_none());
     }
 }

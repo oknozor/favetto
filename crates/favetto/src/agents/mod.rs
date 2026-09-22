@@ -37,6 +37,7 @@ mod pi;
 mod registry;
 mod vibe;
 
+pub(crate) use agent::{resolve_session_title, TITLE_POLL_ATTEMPTS, TITLE_POLL_INTERVAL};
 pub use agent::{Agent, AgentContext, Invocation, SubmitStrategy};
 pub use registry::AgentRegistry;
 
