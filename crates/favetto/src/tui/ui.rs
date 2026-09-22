@@ -689,11 +689,13 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     let widths = [
         Constraint::Length(10),
         Constraint::Length(22),
+        Constraint::Length(30),
         Constraint::Length(12),
         Constraint::Length(8),
         Constraint::Min(0),
     ];
-    let header = Row::new(vec!["ID", "TASK", "STATUS", "AGE", "ERROR"]).style(theme.table_header());
+    let header = Row::new(vec!["ID", "TASK", "SESSION", "STATUS", "AGE", "ERROR"])
+        .style(theme.table_header());
 
     let state = app.throbber_state.clone();
     let rows: Vec<Row> = app
@@ -703,6 +705,10 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
             Row::new(vec![
                 Cell::from(short_id(&t.id)),
                 Cell::from(t.name.clone()),
+                Cell::from(truncate_ellipsis(
+                    t.session_title.as_deref().unwrap_or(""),
+                    28,
+                )),
                 Cell::from(status_line(t.status, theme, &state)),
                 Cell::from(age(t.created_at)),
                 Cell::from(t.error.clone().unwrap_or_default()),
@@ -1086,6 +1092,17 @@ fn short_str(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
+/// Truncate to `max` chars, appending `…` when shortened.
+fn truncate_ellipsis(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    format!(
+        "{}…",
+        s.chars().take(max.saturating_sub(1)).collect::<String>()
+    )
+}
+
 fn age(ts: DateTime<Utc>) -> String {
     let secs = (Utc::now() - ts).num_seconds().max(0);
     if secs < 60 {
@@ -1250,6 +1267,42 @@ mod tests {
         state.calc_next();
         let second = throbber_span(theme, &state).content.to_string();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn task_session_title_renders_in_session_column() {
+        let mut app = App::new();
+        app.tab = Tab::Tasks;
+        let mut task = geom_task("implement_favetto_issue");
+        task.session_title = Some("Implement issue 31 title column".to_string());
+        app.tasks = vec![task];
+
+        let text = render_text(&mut app, 120, 24);
+        assert!(text.contains("SESSION"), "header missing: {text:?}");
+        assert!(
+            text.contains("Implement issue 31"),
+            "title missing: {text:?}"
+        );
+    }
+
+    #[test]
+    fn task_without_session_title_renders_blank_cell() {
+        let mut app = App::new();
+        app.tab = Tab::Tasks;
+        app.tasks = vec![geom_task("no_title")];
+
+        // No panic and no stray title text.
+        let text = render_text(&mut app, 100, 24);
+        assert!(text.contains("SESSION"), "header missing: {text:?}");
+    }
+
+    #[test]
+    fn truncate_ellipsis_shortens_with_marker() {
+        assert_eq!(truncate_ellipsis("short", 28), "short");
+        let long = "a".repeat(40);
+        let truncated = truncate_ellipsis(&long, 28);
+        assert_eq!(truncated.chars().count(), 28);
+        assert!(truncated.ends_with('…'));
     }
 
     #[test]
@@ -1510,6 +1563,7 @@ mod tests {
             finished_at: None,
             error: None,
             session_id: None,
+            session_title: None,
         }
     }
 

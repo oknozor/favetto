@@ -1804,6 +1804,7 @@ mod tests {
             finished_at: None,
             error: None,
             session_id: None,
+            session_title: None,
         }
     }
 
