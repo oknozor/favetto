@@ -84,6 +84,8 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
     let state = app.throbber_state.clone();
     let workflow_dot = app.workflow_dot.clone();
     let workflow_path = app.workflow_path.clone();
+    let workflow_lines = app.workflow_lines.clone();
+    let workflow_note = app.workflow_note.clone();
     match &mut app.popup {
         Popup::None => {}
         Popup::Menu { selected } => draw_menu(frame, *selected, theme),
@@ -91,9 +93,12 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
         Popup::Wizard(wizard) => draw_wizard(frame, wizard, theme, &state),
         Popup::TaskVars(form) => draw_task_vars(frame, form, theme),
         Popup::Help { scroll } => draw_help(frame, scroll, theme),
-        Popup::Workflow { scroll } => draw_workflow(
+        Popup::Workflow { scroll, hscroll } => draw_workflow(
             frame,
             scroll,
+            hscroll,
+            workflow_lines.as_deref(),
+            workflow_note.as_deref(),
             workflow_dot.as_deref(),
             workflow_path.as_deref(),
             theme,
@@ -480,23 +485,72 @@ fn draw_help(frame: &mut Frame, scroll: &mut u16, theme: Theme) {
     frame.render_widget(paragraph.scroll((*scroll, 0)), rect);
 }
 
-/// Draw the floating workflow overlay. Renders the fetched DOT source (the
-/// remote-safe fallback) and clamps `scroll` to the content.
+/// Draw the floating workflow overlay. When the structured graph was rendered,
+/// shows the cached box-drawing rows and scrolls both axes; otherwise falls back
+/// to the wrapped raw DOT (with the reason as a leading note line).
+#[allow(clippy::too_many_arguments)]
 fn draw_workflow(
     frame: &mut Frame,
     scroll: &mut u16,
+    hscroll: &mut u16,
+    lines: Option<&[String]>,
+    note: Option<&str>,
     dot: Option<&str>,
     path: Option<&str>,
     theme: Theme,
 ) {
     let area = frame.area();
     let rect = centered_rect(area, 90, area.height.saturating_sub(2));
-    let hint = " Workflow (w) — ↑/↓/PgUp/PgDn scroll, Esc/w close ";
+    let hint = " Workflow (w) — ↑/↓/←/→/PgUp/PgDn scroll, Esc/w close ";
     let title = match path {
         Some(p) => format!("{hint}— {p} "),
         None => hint.to_string(),
     };
-    let paragraph = Paragraph::new(dot.unwrap_or("Loading workflow graph…"))
+    let inner_width = rect.width.saturating_sub(2);
+    let inner_height = rect.height.saturating_sub(2);
+
+    frame.render_widget(Clear, rect);
+    frame.buffer_mut().set_style(rect, theme.surface_style());
+
+    if let Some(lines) = lines {
+        // Cached render: keep the art intact (no wrapping) and scroll both axes.
+        let mut content: Vec<Line> = Vec::with_capacity(lines.len() + 1);
+        if let Some(note) = note {
+            content.push(Line::from(Span::styled(
+                note,
+                Style::default().fg(theme.muted),
+            )));
+        }
+        content.extend(lines.iter().map(|line| Line::from(line.as_str())));
+        let max_line = content.iter().map(Line::width).max().unwrap_or(0) as u16;
+        let max_scroll = (content.len() as u16).saturating_sub(inner_height);
+        let max_hscroll = max_line.saturating_sub(inner_width);
+        *scroll = (*scroll).min(max_scroll);
+        *hscroll = (*hscroll).min(max_hscroll);
+
+        let paragraph = Paragraph::new(content)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .style(theme.surface_style())
+                    .border_style(theme.block(true)),
+            )
+            .scroll((*scroll, *hscroll));
+        frame.render_widget(paragraph, rect);
+        return;
+    }
+
+    // Fallback: raw DOT (wrapped), preceded by the failure reason when present.
+    let mut content: Vec<Line> = Vec::new();
+    if let Some(note) = note {
+        content.push(Line::from(Span::styled(
+            note,
+            Style::default().fg(theme.muted),
+        )));
+    }
+    content.push(Line::from(dot.unwrap_or("Loading workflow graph…")));
+    let paragraph = Paragraph::new(content)
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -505,13 +559,9 @@ fn draw_workflow(
                 .border_style(theme.block(true)),
         )
         .wrap(Wrap { trim: false });
-    let inner_width = rect.width.saturating_sub(2);
-    let inner_height = rect.height.saturating_sub(2);
     let max_scroll = (paragraph.line_count(inner_width) as u16).saturating_sub(inner_height);
     *scroll = (*scroll).min(max_scroll);
 
-    frame.render_widget(Clear, rect);
-    frame.buffer_mut().set_style(rect, theme.surface_style());
     frame.render_widget(paragraph.scroll((*scroll, 0)), rect);
 }
 
@@ -1332,7 +1382,10 @@ mod tests {
                     error: None,
                 }),
                 Popup::Help { scroll: 0 },
-                Popup::Workflow { scroll: 0 },
+                Popup::Workflow {
+                    scroll: 0,
+                    hscroll: 0,
+                },
             ] {
                 let mut app = App::with_theme(theme);
                 app.popup = popup;
@@ -1533,28 +1586,62 @@ mod tests {
     }
 
     #[test]
-    fn workflow_overlay_renders_dot() {
+    fn workflow_overlay_renders_graph() {
         let mut app = App::new();
-        app.popup = Popup::Workflow { scroll: 0 };
-        app.workflow_dot =
-            Some("digraph workflow {\n  \"a\" -> \"b\" [label=\"spawn\"];\n}".to_string());
+        app.popup = Popup::Workflow {
+            scroll: 0,
+            hscroll: 0,
+        };
+        app.workflow_lines = Some(vec![
+            "┌────────┐  ┌──────────────┐".to_string(),
+            "│ a      │  │ ghost        │".to_string(),
+            "└────────┘  └──────────────┘".to_string(),
+            "      \"spawn\"   \"needs\"".to_string(),
+        ]);
+        app.workflow_dot = Some("digraph workflow { }".to_string());
         app.workflow_path = Some("/data/workflow.dot".to_string());
         let text = render_text(&mut app, 100, 40);
         assert!(
             text.contains("Workflow"),
             "workflow title missing: {text:?}"
         );
+        assert!(text.contains('┌'), "box drawing missing: {text:?}");
+        assert!(text.contains("spawn"), "spawn label missing: {text:?}");
+        assert!(text.contains("needs"), "needs label missing: {text:?}");
+        assert!(
+            !text.contains("digraph"),
+            "raw DOT leaked into graph render: {text:?}"
+        );
+    }
+
+    #[test]
+    fn workflow_overlay_falls_back_to_dot() {
+        let mut app = App::new();
+        app.popup = Popup::Workflow {
+            scroll: 0,
+            hscroll: 0,
+        };
+        app.workflow_dot =
+            Some("digraph workflow {\n  \"a\" -> \"b\" [label=\"spawn\"];\n}".to_string());
+        app.workflow_note = Some("structured graph unavailable; showing raw DOT".to_string());
+        let text = render_text(&mut app, 100, 40);
+        assert!(
+            text.contains("structured graph unavailable"),
+            "fallback note missing: {text:?}"
+        );
         assert!(
             text.contains("digraph workflow"),
             "dot source missing: {text:?}"
         );
-        assert!(text.contains("\"a\""), "node missing: {text:?}");
     }
 
     #[test]
     fn workflow_overlay_renders_loading_state() {
         let mut app = App::new();
-        app.popup = Popup::Workflow { scroll: 0 };
+        app.popup = Popup::Workflow {
+            scroll: 0,
+            hscroll: 0,
+        };
         let text = render_text(&mut app, 100, 24);
         assert!(
             text.contains("Loading workflow graph"),

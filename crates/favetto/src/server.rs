@@ -388,6 +388,7 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
             Ok(serde_json::json!({
                 "dot": crate::workflow::build_dot(&catalog),
                 "path": crate::workflow::dot_path(&state.data_dir).to_string_lossy(),
+                "graph": crate::workflow::build_graph(&catalog),
             }))
         }
 
@@ -1162,6 +1163,32 @@ mod tests {
         assert!(dot.contains("\"a\" -> \"b\" [label=\"spawn\"];"), "{dot}");
         let path = result.get("path").and_then(|p| p.as_str()).unwrap();
         assert!(path.ends_with("workflow.dot"), "{path}");
+
+        let graph = result.get("graph").expect("graph field");
+        let nodes = graph
+            .get("nodes")
+            .and_then(|n| n.as_array())
+            .expect("graph nodes");
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n["name"] == "a" && n["scheduled"] == false && n["external"] == false),
+            "{graph}"
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n["name"] == "b" && n["external"] == true),
+            "{graph}"
+        );
+        let edges = graph
+            .get("edges")
+            .and_then(|e| e.as_array())
+            .expect("graph edges");
+        assert_eq!(
+            edges[0],
+            serde_json::json!({ "from": "a", "to": "b", "kind": "spawn" })
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

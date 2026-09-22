@@ -433,7 +433,7 @@ impl GithubRule {
     fn matches(&self, event: &str, action: &str, summary: &Value) -> bool {
         self.enabled
             && self.event == event
-            && self.action.as_deref().map_or(true, |a| a == action)
+            && self.action.as_deref().is_none_or(|a| a == action)
             && self.filter.matches(summary)
     }
 }

@@ -33,7 +33,7 @@ unauthenticated/rejected token.
 | `catalog.list` | List the task catalog. |
 | `catalog.get` | Fetch a catalog task's raw Markdown source (for the preview pane). |
 | `catalog.add` | Add a task definition to the catalog (does not run it). |
-| `workflow.get` | Fetch the catalog workflow graph as Graphviz DOT (`dot` plus the persisted `path`). |
+| `workflow.get` | Fetch the catalog workflow graph as Graphviz DOT (`dot` plus the persisted `path`) and a structured `graph` (`nodes` with `name`/`scheduled`/`external`, `edges` with `from`/`to`/`kind`). |
 | `events.tail` | Tail persisted events. |
 | `events.subscribe` | (Re)subscribe to the live event stream; accepts `last_event_id` to replay missed events before switching to live delivery. |
 | `agents.list` | List configured external agents and live agent sessions. Each entry carries an `available` boolean (whether the agent's command was found on the daemon's PATH) and its capability flags. |

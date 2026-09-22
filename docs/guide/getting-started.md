@@ -6,7 +6,7 @@ attaches the client, locally or remotely.
 
 ## Prerequisites
 
-- A Rust toolchain (edition 2021, MSRV 1.80) to build favetto.
+- A Rust toolchain (edition 2021, MSRV 1.92) to build favetto.
 - At least one external coding-agent CLI (opencode, Claude Code, pi, Mistral
   Vibe, …) installed and configured — see [Embedded agents](./agents).
 

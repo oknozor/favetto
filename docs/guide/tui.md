@@ -105,12 +105,16 @@ context (global, lists, Tasks/Catalog, Agent, popups, mouse). Press **?** or
 forwarded to the embedded agent while the Agent panel has keyboard capture, and
 is typed literally into form/wizard fields when one is open.
 
-Press **w** to open a floating workflow graph overlay listing the catalog's
-`needs`/`spawn` edges as Graphviz DOT (also persisted to
-`<data_dir>/workflow.dot`). Press **w** or **Esc** to close it, and scroll it with
-**↑**/**↓** or **PageUp**/**PageDown**. It refreshes while open when the catalog
-changes. `w` is likewise forwarded to a capturing agent and typed literally into
-form fields.
+Press **w** to open a floating workflow graph overlay rendering the catalog's
+`needs`/`spawn` edges as box-drawing art (the same graph is persisted as
+Graphviz DOT to `<data_dir>/workflow.dot`). Nodes are labelled with their task
+name, scheduled tasks show `(scheduled)`, and references to names outside the
+catalog show `(external)`; `spawn` and `needs` edges keep their labels. Scroll
+with **↑**/**↓**/**←**/**→** (and **PageUp**/**PageDown**). If the structured
+graph is unavailable (an older daemon) or cannot be rendered, the overlay falls
+back to the raw DOT with a short explanation. Press **w** or **Esc** to close
+it. It refreshes while open when the catalog changes. `w` is likewise forwarded
+to a capturing agent and typed literally into form fields.
 
 ### One-shot tasks
 

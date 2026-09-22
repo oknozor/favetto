@@ -11,6 +11,8 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::tasks::TaskDef;
 
 /// Escape a name/label for inclusion in a quoted DOT id or label.
@@ -18,32 +20,66 @@ fn dot_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Render the catalog's `needs`/`spawn` graph as Graphviz DOT.
+/// One node of the structured workflow graph: a catalog task or an `external`
+/// reference to a name absent from the catalog. `scheduled` mirrors
+/// `TaskDef::schedule`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowNode {
+    pub name: String,
+    #[serde(default)]
+    pub scheduled: bool,
+    #[serde(default)]
+    pub external: bool,
+}
+
+/// The two edge kinds: `spawn = "child"` is [`Spawn`](Self::Spawn),
+/// `needs = "other:finished"` is [`Needs`](Self::Needs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkflowEdgeKind {
+    Spawn,
+    Needs,
+}
+
+/// One directed edge of the workflow graph (`from -> to`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowEdge {
+    pub from: String,
+    pub to: String,
+    pub kind: WorkflowEdgeKind,
+}
+
+/// Structured, deterministic counterpart of [`build_dot`] — the graph the TUI
+/// lays out instead of parsing DOT.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowGraph {
+    pub nodes: Vec<WorkflowNode>,
+    pub edges: Vec<WorkflowEdge>,
+}
+
+/// Build the catalog's `needs`/`spawn` graph as structured data.
 ///
-/// The output is deterministic regardless of the order of `tasks`.
-pub fn build_dot(tasks: &[TaskDef]) -> String {
+/// Deterministic regardless of the order of `tasks`: catalog nodes are sorted by
+/// name, external nodes follow sorted by name, and each catalog task's `spawn`
+/// edge is emitted before its `needs` edge.
+pub fn build_graph(tasks: &[TaskDef]) -> WorkflowGraph {
     let mut sorted: Vec<&TaskDef> = tasks.iter().collect();
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
 
     let names: BTreeSet<&str> = tasks.iter().map(|d| d.name.as_str()).collect();
 
-    let mut out = String::new();
-    out.push_str("digraph workflow {\n");
-    out.push_str("  rankdir=LR;\n");
-    out.push_str("  node [shape=box, style=rounded];\n");
+    // Catalog task nodes, sorted by name. Scheduled tasks are marked.
+    let mut nodes: Vec<WorkflowNode> = sorted
+        .iter()
+        .map(|def| WorkflowNode {
+            name: def.name.clone(),
+            scheduled: def.schedule.is_some(),
+            external: false,
+        })
+        .collect();
 
-    // Catalog task nodes, sorted by name. Scheduled tasks get a double border.
-    for def in &sorted {
-        let id = dot_escape(&def.name);
-        if def.schedule.is_some() {
-            out.push_str(&format!("  \"{id}\" [label=\"{id}\", peripheries=2];\n"));
-        } else {
-            out.push_str(&format!("  \"{id}\" [label=\"{id}\"];\n"));
-        }
-    }
-
-    // External nodes: `spawn` targets and resolved `needs` sources that are not in
-    // the catalog. Declared once each, sorted.
+    // External nodes: `spawn` targets and resolved `needs` sources that are not
+    // in the catalog. Declared once each, sorted.
     let mut external: BTreeSet<&str> = BTreeSet::new();
     for def in &sorted {
         if let Some(spawn) = &def.spawn {
@@ -58,26 +94,71 @@ pub fn build_dot(tasks: &[TaskDef]) -> String {
             }
         }
     }
-    for name in &external {
-        let id = dot_escape(name);
-        out.push_str(&format!(
-            "  \"{id}\" [label=\"{id} (external)\", style=\"rounded,dashed\"];\n"
-        ));
-    }
+    nodes.extend(external.iter().map(|name| WorkflowNode {
+        name: (*name).to_string(),
+        scheduled: false,
+        external: true,
+    }));
 
     // Edges, spawn first then needs, both in task-name order.
+    let mut edges: Vec<WorkflowEdge> = Vec::new();
     for def in &sorted {
-        let this = dot_escape(&def.name);
         if let Some(spawn) = &def.spawn {
-            let child = dot_escape(spawn);
-            out.push_str(&format!("  \"{this}\" -> \"{child}\" [label=\"spawn\"];\n"));
+            edges.push(WorkflowEdge {
+                from: def.name.clone(),
+                to: spawn.clone(),
+                kind: WorkflowEdgeKind::Spawn,
+            });
         }
         if let Some(needs) = &def.needs {
             let source = needs.split(':').next().unwrap_or(needs.as_str());
-            let src = dot_escape(source);
+            edges.push(WorkflowEdge {
+                from: source.to_string(),
+                to: def.name.clone(),
+                kind: WorkflowEdgeKind::Needs,
+            });
+        }
+    }
+
+    WorkflowGraph { nodes, edges }
+}
+
+/// Render the catalog's `needs`/`spawn` graph as Graphviz DOT.
+///
+/// The output is deterministic regardless of the order of `tasks`.
+pub fn build_dot(tasks: &[TaskDef]) -> String {
+    let graph = build_graph(tasks);
+
+    let mut out = String::new();
+    out.push_str("digraph workflow {\n");
+    out.push_str("  rankdir=LR;\n");
+    out.push_str("  node [shape=box, style=rounded];\n");
+
+    for node in &graph.nodes {
+        let id = dot_escape(&node.name);
+        if node.external {
             out.push_str(&format!(
-                "  \"{src}\" -> \"{this}\" [label=\"needs\", style=dashed];\n"
+                "  \"{id}\" [label=\"{id} (external)\", style=\"rounded,dashed\"];\n"
             ));
+        } else if node.scheduled {
+            out.push_str(&format!("  \"{id}\" [label=\"{id}\", peripheries=2];\n"));
+        } else {
+            out.push_str(&format!("  \"{id}\" [label=\"{id}\"];\n"));
+        }
+    }
+
+    for edge in &graph.edges {
+        let from = dot_escape(&edge.from);
+        let to = dot_escape(&edge.to);
+        match edge.kind {
+            WorkflowEdgeKind::Spawn => {
+                out.push_str(&format!("  \"{from}\" -> \"{to}\" [label=\"spawn\"];\n"));
+            }
+            WorkflowEdgeKind::Needs => {
+                out.push_str(&format!(
+                    "  \"{from}\" -> \"{to}\" [label=\"needs\", style=dashed];\n"
+                ));
+            }
         }
     }
 
@@ -239,6 +320,66 @@ mod tests {
         let one = build_dot(&[a.clone(), task("b"), c.clone()]);
         let two = build_dot(&[c, task("b"), a]);
         assert_eq!(one, two);
+    }
+
+    #[test]
+    fn build_graph_has_a_node_per_task_and_marks_scheduled() {
+        let mut s = task("s");
+        s.schedule = Some("0 0 8 * * *".to_string());
+        let graph = build_graph(&[s, task("a"), task("b")]);
+
+        assert_eq!(graph.nodes.len(), 3);
+        assert_eq!(graph.nodes[0].name, "a");
+        assert!(!graph.nodes[0].scheduled);
+        assert_eq!(graph.nodes[1].name, "b");
+        assert_eq!(graph.nodes[2].name, "s");
+        assert!(graph.nodes[2].scheduled);
+        assert!(!graph.nodes[2].external);
+        // Isolated tasks are nodes with no edges.
+        assert!(graph.edges.is_empty(), "{graph:?}");
+    }
+
+    #[test]
+    fn build_graph_marks_external_targets() {
+        let mut a = task("a");
+        a.spawn = Some("ghost".to_string());
+        a.needs = Some("missing:finished".to_string());
+        let graph = build_graph(&[a]);
+
+        assert_eq!(graph.nodes.len(), 3);
+        assert_eq!(graph.nodes[0].name, "a");
+        assert!(!graph.nodes[0].external);
+        let ghost = graph.nodes.iter().find(|n| n.name == "ghost").unwrap();
+        assert!(ghost.external);
+        let missing = graph.nodes.iter().find(|n| n.name == "missing").unwrap();
+        assert!(missing.external);
+        // The `:finished` suffix is stripped from the external node name.
+        assert!(!graph.nodes.iter().any(|n| n.name.contains(':')));
+    }
+
+    #[test]
+    fn build_graph_edges_are_spawn_then_needs_in_name_order() {
+        let mut a = task("a");
+        a.spawn = Some("b".to_string());
+        let mut c = task("c");
+        c.needs = Some("a:finished".to_string());
+
+        let graph = build_graph(&[c.clone(), task("b"), a.clone()]);
+        let edges: Vec<_> = graph
+            .edges
+            .iter()
+            .map(|e| (e.from.as_str(), e.to.as_str(), e.kind))
+            .collect();
+        assert_eq!(
+            edges,
+            vec![
+                ("a", "b", WorkflowEdgeKind::Spawn),
+                ("a", "c", WorkflowEdgeKind::Needs),
+            ]
+        );
+
+        // Same graph regardless of input order.
+        assert_eq!(graph, build_graph(&[a, task("b"), c]));
     }
 
     #[test]
