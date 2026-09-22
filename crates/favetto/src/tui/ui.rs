@@ -89,9 +89,15 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
     match &mut app.popup {
         Popup::None => {}
         Popup::Menu { selected } => draw_menu(frame, *selected, theme),
-        Popup::Form(form) => draw_form(frame, form, theme),
-        Popup::Wizard(wizard) => draw_wizard(frame, wizard, theme, &state),
-        Popup::TaskVars(form) => draw_task_vars(frame, form, theme),
+        Popup::Form(form) => {
+            draw_form(frame, form, theme);
+        }
+        Popup::Wizard(wizard) => {
+            draw_wizard(frame, wizard, theme, &state);
+        }
+        Popup::TaskVars(form) => {
+            draw_task_vars(frame, form, theme);
+        }
         Popup::Help { scroll } => draw_help(frame, scroll, theme),
         Popup::Workflow { scroll, hscroll } => draw_workflow(
             frame,
@@ -120,6 +126,95 @@ fn centered_rect(area: Rect, width_pct: u16, height: u16) -> Rect {
         width: w,
         height: h,
     }
+}
+
+/// Rendered height (rows) of `lines` wrapped at `width`, excluding any block.
+fn wrapped_height(lines: &[Line<'_>], width: u16) -> u16 {
+    Paragraph::new(lines.to_vec())
+        .wrap(Wrap { trim: false })
+        .line_count(width) as u16
+}
+
+/// Wrapped content row (0-based) of the logical line holding the cursor/selection.
+fn focus_row(content: &[Line<'_>], focus_line: usize, width: u16) -> u16 {
+    let split = focus_line.min(content.len());
+    let before = wrapped_height(&content[..split], width);
+    let own = if split < content.len() {
+        wrapped_height(&content[split..=split], width)
+    } else {
+        0
+    };
+    before.saturating_add(own.saturating_sub(1))
+}
+
+/// Popup rect sized from the rendered content plus a docked footer, together with
+/// the scroll offset that keeps `focus` (a wrapped row) visible.
+fn scrolling_body_layout(
+    area: Rect,
+    width_pct: u16,
+    content_height: u16,
+    footer_height: u16,
+    focus: u16,
+) -> (Rect, u16) {
+    let desired = content_height
+        .saturating_add(footer_height)
+        .saturating_add(2); // top + bottom border
+    let rect = centered_rect(area, width_pct, desired);
+    let inner_height = rect.height.saturating_sub(2);
+    let viewport = inner_height.saturating_sub(footer_height);
+    let max_scroll = content_height.saturating_sub(viewport);
+    let scroll = if viewport == 0 || focus < viewport {
+        0
+    } else {
+        focus
+            .saturating_add(1)
+            .saturating_sub(viewport)
+            .min(max_scroll)
+    };
+    (rect, scroll)
+}
+
+/// Render a growing, scrolling popup whose footer stays docked, returning its
+/// rect so callers/tests can inspect the geometry.
+#[allow(clippy::too_many_arguments)]
+fn draw_growing_popup(
+    frame: &mut Frame,
+    area: Rect,
+    width_pct: u16,
+    title: String,
+    content: Vec<Line<'static>>,
+    footer: Vec<Line<'static>>,
+    focus_line: usize,
+    theme: Theme,
+) -> Rect {
+    let inner_width = centered_rect(area, width_pct, 0).width.saturating_sub(2);
+    let content_height = wrapped_height(&content, inner_width);
+    let footer_height = wrapped_height(&footer, inner_width); // may wrap too
+    let focus = focus_row(&content, focus_line, inner_width);
+    let (rect, scroll) =
+        scrolling_body_layout(area, width_pct, content_height, footer_height, focus);
+
+    frame.render_widget(Clear, rect);
+    frame.buffer_mut().set_style(rect, theme.surface_style());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .style(theme.surface_style())
+        .border_style(theme.block(true));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    // Content scrolls; footer is a separate, docked row block.
+    let chunks =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(footer_height)]).split(inner);
+    frame.render_widget(
+        Paragraph::new(content)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        chunks[0],
+    );
+    frame.render_widget(Paragraph::new(footer).wrap(Wrap { trim: false }), chunks[1]);
+    rect
 }
 
 fn draw_menu(frame: &mut Frame, selected: usize, theme: Theme) {
@@ -153,52 +248,54 @@ fn draw_menu(frame: &mut Frame, selected: usize, theme: Theme) {
     frame.render_widget(list, rect);
 }
 
-fn draw_form(frame: &mut Frame, form: &Form, theme: Theme) {
+fn draw_form(frame: &mut Frame, form: &Form, theme: Theme) -> Rect {
     let area = frame.area();
-    let rect = centered_rect(area, 70, form.fields.len() as u16 + 4);
 
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(Span::styled(form.title, theme.title())));
-    lines.push(Line::from(""));
+    let mut content: Vec<Line<'static>> = Vec::new();
+    content.push(Line::from(Span::styled(form.title, theme.title())));
+    content.push(Line::from(""));
+    let mut focus_line = 0usize;
     for (i, field) in form.fields.iter().enumerate() {
         if i < form.current {
-            lines.push(Line::from(Span::styled(
+            content.push(Line::from(Span::styled(
                 format!("  ✓ {field}: {}", form.values[i]),
                 Style::default().fg(theme.success),
             )));
         } else if i == form.current {
-            lines.push(Line::from(vec![
+            focus_line = content.len();
+            content.push(Line::from(vec![
                 Span::styled(
                     format!("> {field}: "),
                     Style::default()
                         .fg(theme.accent)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(form.input.as_str()),
+                Span::raw(form.input.clone()),
                 Span::styled("█", Style::default().fg(theme.accent)),
             ]));
         } else {
-            lines.push(Line::from(format!("  {field}")));
+            content.push(Line::from(format!("  {field}")));
         }
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        " Enter: next · Esc: cancel ",
-        Style::default().fg(theme.muted),
-    )));
 
-    let paragraph = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Step-by-step form ")
-                .style(theme.surface_style())
-                .border_style(theme.block(true)),
-        )
-        .wrap(Wrap { trim: false });
-    frame.render_widget(Clear, rect);
-    frame.buffer_mut().set_style(rect, theme.surface_style());
-    frame.render_widget(paragraph, rect);
+    let footer = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            " Enter: next · Esc: cancel ",
+            Style::default().fg(theme.muted),
+        )),
+    ];
+
+    draw_growing_popup(
+        frame,
+        area,
+        70,
+        " Step-by-step form ".to_string(),
+        content,
+        footer,
+        focus_line,
+        theme,
+    )
 }
 
 /// Number of list rows the wizard shows at once.
@@ -209,23 +306,23 @@ fn draw_wizard(
     wizard: &Wizard,
     theme: Theme,
     state: &throbber_widgets_tui::ThrobberState,
-) {
+) -> Rect {
     let area = frame.area();
-    let rows = wizard.choices.len().min(WIZARD_VISIBLE) as u16;
-    let rect = centered_rect(area, 70, rows + 6);
 
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(Span::styled(wizard.step.title(), theme.title())));
-    lines.push(Line::from(""));
+    let mut content: Vec<Line<'static>> = Vec::new();
+    content.push(Line::from(Span::styled(wizard.step.title(), theme.title())));
+    content.push(Line::from(""));
+    let mut focus_line = 0usize;
 
     if wizard.step == WizardStep::Dir {
-        lines.push(Line::from(vec![
+        focus_line = content.len();
+        content.push(Line::from(vec![
             Span::styled("> Directory: ", Style::default().fg(theme.accent)),
-            Span::raw(wizard.dir.as_str()),
+            Span::raw(wizard.dir.clone()),
             Span::styled("█", Style::default().fg(theme.accent)),
         ]));
     } else if wizard.loading {
-        lines.push(Line::from(vec![
+        content.push(Line::from(vec![
             throbber_span(theme, state),
             Span::styled("loading…", Style::default().fg(theme.muted)),
         ]));
@@ -252,10 +349,13 @@ fn draw_wizard(
             } else {
                 Style::default()
             };
-            lines.push(Line::from(Span::styled(format!(" {label} "), style)));
+            if idx == wizard.selected {
+                focus_line = content.len();
+            }
+            content.push(Line::from(Span::styled(format!(" {label} "), style)));
         }
         if wizard.choices.is_empty() {
-            lines.push(Line::from(Span::styled(
+            content.push(Line::from(Span::styled(
                 "(nothing available)",
                 Style::default().fg(theme.muted),
             )));
@@ -263,42 +363,43 @@ fn draw_wizard(
     }
 
     if let Some(err) = &wizard.error {
-        lines.push(Line::from(Span::styled(
-            err.as_str(),
+        content.push(Line::from(Span::styled(
+            err.clone(),
             Style::default().fg(theme.danger),
         )));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        " ↑/↓ select · Enter: next · Esc: cancel ",
-        Style::default().fg(theme.muted),
-    )));
 
-    let paragraph = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" New one-shot task ")
-                .style(theme.surface_style())
-                .border_style(theme.block(true)),
-        )
-        .wrap(Wrap { trim: false });
-    frame.render_widget(Clear, rect);
-    frame.buffer_mut().set_style(rect, theme.surface_style());
-    frame.render_widget(paragraph, rect);
+    let footer = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            " ↑/↓ select · Enter: next · Esc: cancel ",
+            Style::default().fg(theme.muted),
+        )),
+    ];
+
+    draw_growing_popup(
+        frame,
+        area,
+        70,
+        " New one-shot task ".to_string(),
+        content,
+        footer,
+        focus_line,
+        theme,
+    )
 }
 
-fn draw_task_vars(frame: &mut Frame, form: &TaskVarsForm, theme: Theme) {
+fn draw_task_vars(frame: &mut Frame, form: &TaskVarsForm, theme: Theme) -> Rect {
     let area = frame.area();
-    let rect = centered_rect(area, 70, form.vars.len() as u16 + 6);
 
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(Span::styled(
+    let mut content: Vec<Line<'static>> = Vec::new();
+    content.push(Line::from(Span::styled(
         format!(" Task input · {} ", form.task),
         theme.title(),
     )));
-    lines.push(Line::from(""));
+    content.push(Line::from(""));
 
+    let mut focus_line = 0usize;
     for (i, var) in form.vars.iter().enumerate() {
         let current = i == form.current;
         let label = format!("{}{}: ", if current { "> " } else { "  " }, var.prompt);
@@ -311,7 +412,10 @@ fn draw_task_vars(frame: &mut Frame, form: &TaskVarsForm, theme: Theme) {
         };
 
         if let Some(choices) = &var.choices {
-            lines.push(Line::from(Span::styled(label, label_style)));
+            if current {
+                focus_line = content.len();
+            }
+            content.push(Line::from(Span::styled(label, label_style)));
             let selected = form.choice_selected.get(i).copied().unwrap_or(0);
             for (j, choice) in choices.iter().enumerate() {
                 let style = if j == selected {
@@ -319,7 +423,7 @@ fn draw_task_vars(frame: &mut Frame, form: &TaskVarsForm, theme: Theme) {
                 } else {
                     Style::default()
                 };
-                lines.push(Line::from(Span::styled(format!("    {choice}"), style)));
+                content.push(Line::from(Span::styled(format!("    {choice}"), style)));
             }
             continue;
         }
@@ -328,6 +432,9 @@ fn draw_task_vars(frame: &mut Frame, form: &TaskVarsForm, theme: Theme) {
         let segments: Vec<&str> = value.split('\n').collect();
         let last_segment = segments.len() - 1;
         for (k, segment) in segments.iter().enumerate() {
+            if current && k == last_segment {
+                focus_line = content.len();
+            }
             let mut spans: Vec<Span> = Vec::new();
             if k == 0 {
                 spans.push(Span::styled(label.clone(), label_style));
@@ -342,34 +449,35 @@ fn draw_task_vars(frame: &mut Frame, form: &TaskVarsForm, theme: Theme) {
             if current && k == last_segment {
                 spans.push(Span::styled("█", Style::default().fg(theme.accent)));
             }
-            lines.push(Line::from(spans));
+            content.push(Line::from(spans));
         }
     }
 
     if let Some(err) = &form.error {
-        lines.push(Line::from(Span::styled(
-            err.as_str(),
+        content.push(Line::from(Span::styled(
+            err.clone(),
             Style::default().fg(theme.danger),
         )));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        " Tab/↑↓ move · Enter next · Ctrl+Enter submit · Esc cancel ",
-        Style::default().fg(theme.muted),
-    )));
 
-    let paragraph = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Task input ")
-                .style(theme.surface_style())
-                .border_style(theme.block(true)),
-        )
-        .wrap(Wrap { trim: false });
-    frame.render_widget(Clear, rect);
-    frame.buffer_mut().set_style(rect, theme.surface_style());
-    frame.render_widget(paragraph, rect);
+    let footer = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            " Tab/↑↓ move · Enter next · Ctrl+Enter submit · Esc cancel ",
+            Style::default().fg(theme.muted),
+        )),
+    ];
+
+    draw_growing_popup(
+        frame,
+        area,
+        70,
+        " Task input ".to_string(),
+        content,
+        footer,
+        focus_line,
+        theme,
+    )
 }
 
 /// Grouped keybinding reference shown by `?`. Each row is `(key, description)`.
@@ -2154,5 +2262,129 @@ mod tests {
             "prompt missing: {text:?}"
         );
         assert!(text.contains("placeholder"), "default missing: {text:?}");
+    }
+
+    #[test]
+    fn task_vars_popup_keeps_cursor_visible_for_long_multiline_value() {
+        use crate::tasks::{TaskVar, VarType};
+
+        let mut value = (0..30)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        value.push_str("\nZZZTAILZZZ");
+
+        let mut app = App::new();
+        app.popup = Popup::TaskVars(TaskVarsForm {
+            task: "open_github_issue".to_string(),
+            vars: vec![TaskVar {
+                name: "body".to_string(),
+                prompt: "Body".to_string(),
+                default: None,
+                required: true,
+                multiline: true,
+                var_type: VarType::String,
+                choices: None,
+            }],
+            current: 0,
+            values: vec![value],
+            choice_selected: vec![0],
+            error: None,
+        });
+
+        let text = render_text(&mut app, 80, 24);
+        assert!(text.contains('█'), "cursor missing: {text:?}");
+        assert!(text.contains("ZZZTAILZZZ"), "tail clipped: {text:?}");
+        assert!(text.contains("Ctrl+Enter"), "footer not docked: {text:?}");
+    }
+
+    #[test]
+    fn task_vars_short_value_keeps_fixed_height() {
+        use crate::tasks::{TaskVar, VarType};
+
+        let mut app = App::new();
+        app.popup = Popup::TaskVars(TaskVarsForm {
+            task: "open_github_issue".to_string(),
+            vars: vec![TaskVar {
+                name: "title".to_string(),
+                prompt: "Title".to_string(),
+                default: Some("hi".to_string()),
+                required: true,
+                multiline: false,
+                var_type: VarType::String,
+                choices: None,
+            }],
+            current: 0,
+            values: vec!["hi".to_string()],
+            choice_selected: vec![0],
+            error: None,
+        });
+
+        let theme = app.theme;
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut rect = Rect::new(0, 0, 0, 0);
+        if let Popup::TaskVars(form) = &app.popup {
+            terminal
+                .draw(|f| rect = draw_task_vars(f, form, theme))
+                .unwrap();
+        } else {
+            panic!("expected task vars popup");
+        }
+        assert_eq!(rect.height, 7, "short var height changed: {rect:?}");
+
+        let text = render_text(&mut app, 100, 40);
+        assert!(text.contains('█'), "cursor missing: {text:?}");
+        assert!(text.contains("hi"), "value missing: {text:?}");
+    }
+
+    #[test]
+    fn form_popup_long_prompt_keeps_cursor_visible() {
+        use super::super::app::FormKind;
+
+        let fields = vec!["Task name", "Prompt"];
+        let mut input = String::new();
+        for i in 0..40 {
+            input.push_str(&format!("word{i} "));
+        }
+        input.push_str("ZZZTAILZZZ");
+
+        let form = Form {
+            kind: FormKind::AddTask,
+            title: "Add task to catalog",
+            fields,
+            current: 1,
+            values: vec!["my-task".to_string()],
+            input,
+        };
+
+        let mut app = App::new();
+        app.popup = Popup::Form(form);
+        let text = render_text(&mut app, 80, 24);
+        assert!(text.contains('█'), "cursor missing: {text:?}");
+        assert!(text.contains("ZZZTAILZZZ"), "tail clipped: {text:?}");
+        assert!(text.contains("Enter: next"), "footer not docked: {text:?}");
+
+        let theme = app.theme;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut rect = Rect::new(0, 0, 0, 0);
+        if let Popup::Form(form) = &app.popup {
+            terminal.draw(|f| rect = draw_form(f, form, theme)).unwrap();
+        } else {
+            panic!("expected form popup");
+        }
+        assert!(rect.y + rect.height <= 24, "form overflows frame: {rect:?}");
+        assert!(rect.x + rect.width <= 80, "form overflows frame: {rect:?}");
+    }
+
+    #[test]
+    fn scrolling_body_layout_clamps_scroll() {
+        let (rect, scroll) = scrolling_body_layout(Rect::new(0, 0, 80, 24), 70, 40, 2, 39);
+        assert!(rect.height <= 20, "popup exceeds frame: {rect:?}");
+        let viewport = rect.height.saturating_sub(2).saturating_sub(2);
+        assert!(viewport > 0);
+        assert!(scroll + viewport > 39);
+        assert!(scroll <= 40 - viewport);
     }
 }
