@@ -379,6 +379,14 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
             Err(e) => Err((error_code::INTERNAL, e.to_string())),
         },
 
+        method::WORKFLOW_GET => {
+            let catalog = state.catalog.read().unwrap().clone();
+            Ok(serde_json::json!({
+                "dot": crate::workflow::build_dot(&catalog),
+                "path": crate::workflow::dot_path(&state.data_dir).to_string_lossy(),
+            }))
+        }
+
         method::EVENTS_TAIL => {
             let limit = req
                 .params
@@ -1007,6 +1015,12 @@ fn add_catalog_task(
         catalog.sort_by(|a, b| a.name.cmp(&b.name));
     }
 
+    if let Err(e) = crate::workflow::regenerate(&state.catalog.read().unwrap(), &state.data_dir) {
+        tracing::warn!(error = %e, "failed to write workflow.dot");
+    }
+    // Tell connected clients (including an open workflow view) to re-fetch.
+    state.bus.publish(ServerPush::CatalogUpdated);
+
     Ok(def)
 }
 
@@ -1075,5 +1089,125 @@ pub fn log_line(level: &str, message: impl Into<String>) -> Notification {
     Notification {
         method: push::LOG_LINE.to_string(),
         params: serde_json::json!({ "level": level, "message": message.into() }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// A unique scratch directory for server tests.
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "favetto-server-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A `State` backed by a scratch SQLite database and the given tasks dir.
+    async fn test_state(dir: &Path, tasks_dir: &Path) -> Arc<State> {
+        let pool = crate::db::open(&dir.join("test.db")).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        let catalog = Arc::new(std::sync::RwLock::new(
+            crate::tasks::load_catalog(tasks_dir).unwrap(),
+        ));
+        let scheduler = tokio_cron_scheduler::JobScheduler::new().await.unwrap();
+        Arc::new(State::new(
+            pool,
+            crate::event_bus::EventBus::new(64),
+            favetto_core::auth::Token::generate(),
+            crate::webhooks::WebhookSecrets::from_config(&crate::config::FavettoConfig::default()),
+            crate::agents::AgentManager::new(),
+            crate::agents::AgentRegistry::default(),
+            Arc::new(std::sync::RwLock::new(
+                crate::config::FavettoConfig::default(),
+            )),
+            dir.to_path_buf(),
+            tasks_dir.to_path_buf(),
+            catalog,
+            scheduler,
+            Arc::new(std::sync::RwLock::new(Vec::new())),
+        ))
+    }
+
+    #[tokio::test]
+    async fn workflow_get_returns_dot_and_path() {
+        let dir = temp_dir("workflow-get");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::write(
+            tasks_dir.join("a.md"),
+            "agent = \"x\"\nspawn = \"b\"\n---\nprompt a\n",
+        )
+        .unwrap();
+        let state = test_state(&dir, &tasks_dir).await;
+
+        let req = Request {
+            id: 1,
+            method: method::WORKFLOW_GET.to_string(),
+            params: serde_json::json!({}),
+        };
+        let resp = dispatch(&state, req).await;
+        let result = resp.result.expect("workflow.get result");
+        let dot = result.get("dot").and_then(|d| d.as_str()).unwrap();
+        assert!(dot.contains("\"a\" -> \"b\" [label=\"spawn\"];"), "{dot}");
+        let path = result.get("path").and_then(|p| p.as_str()).unwrap();
+        assert!(path.ends_with("workflow.dot"), "{path}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn add_catalog_task_writes_dot_and_pushes_catalog_updated() {
+        let dir = temp_dir("add");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let state = test_state(&dir, &tasks_dir).await;
+        let mut rx = state.bus.subscribe();
+
+        let params = serde_json::json!({
+            "name": "newtask",
+            "agent": "x",
+            "prompt": "hello",
+        });
+        let def = add_catalog_task(&state, &params).unwrap();
+        assert_eq!(def.name, "newtask");
+
+        let dot = std::fs::read_to_string(dir.join("workflow.dot")).unwrap();
+        assert!(dot.contains("\"newtask\" [label=\"newtask\"];"), "{dot}");
+        assert!(matches!(rx.try_recv(), Ok(ServerPush::CatalogUpdated)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn add_catalog_task_dot_reflects_spawn() {
+        let dir = temp_dir("add-spawn");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::write(tasks_dir.join("child.md"), "agent = \"x\"\n---\nbody\n").unwrap();
+        let state = test_state(&dir, &tasks_dir).await;
+
+        let params = serde_json::json!({
+            "name": "parent",
+            "agent": "x",
+            "spawn": "child",
+        });
+        add_catalog_task(&state, &params).unwrap();
+
+        let dot = std::fs::read_to_string(dir.join("workflow.dot")).unwrap();
+        assert!(
+            dot.contains("\"parent\" -> \"child\" [label=\"spawn\"];"),
+            "{dot}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

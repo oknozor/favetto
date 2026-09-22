@@ -86,6 +86,13 @@ context (global, lists, Tasks/Catalog, Agent, popups, mouse). Press **?** or
 forwarded to the embedded agent while the Agent panel has keyboard capture, and
 is typed literally into form/wizard fields when one is open.
 
+Press **w** to open a floating workflow graph overlay listing the catalog's
+`needs`/`spawn` edges as Graphviz DOT (also persisted to
+`<data_dir>/workflow.dot`). Press **w** or **Esc** to close it, and scroll it with
+**↑**/**↓** or **PageUp**/**PageDown**. It refreshes while open when the catalog
+changes. `w` is likewise forwarded to a capturing agent and typed literally into
+form fields.
+
 ### One-shot tasks
 
 The wizard lists agents from the config, then providers and models from the

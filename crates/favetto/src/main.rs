@@ -23,6 +23,7 @@ mod template;
 mod transport;
 mod tui;
 mod webhooks;
+mod workflow;
 
 use clap::Parser;
 

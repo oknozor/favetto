@@ -82,6 +82,8 @@ pub enum UiAction {
     },
     /// Open the one-shot task wizard.
     OpenWizard,
+    /// Fetch the catalog workflow graph (`workflow.get`) and show the overlay.
+    OpenWorkflow,
     /// The wizard needs the configured provider/model catalog (`providers.list`).
     WizardLoadProviders,
     /// The wizard completed: start an inline, interactive one-shot task.
@@ -111,6 +113,10 @@ pub enum Popup {
     TaskVars(TaskVarsForm),
     /// Scrollable keybinding reference, toggled with `?`.
     Help {
+        scroll: u16,
+    },
+    /// Scrollable floating workflow graph (Graphviz DOT), toggled with `w`.
+    Workflow {
         scroll: u16,
     },
 }
@@ -295,6 +301,11 @@ pub struct App {
     /// the catalog and clears it.
     pub catalog_dirty: bool,
 
+    /// The catalog workflow graph in DOT, fetched for the workflow overlay.
+    pub workflow_dot: Option<String>,
+    /// Path of the daemon's persisted `<data_dir>/workflow.dot`, if reported.
+    pub workflow_path: Option<String>,
+
     // Embedded agent terminal.
     pub agent_session_id: Option<String>,
     pub agent_task_id: Option<String>,
@@ -376,6 +387,8 @@ impl App {
             catalog_preview_max_scroll: 0,
             catalog_preview_area: None,
             catalog_dirty: false,
+            workflow_dot: None,
+            workflow_path: None,
             agent_session_id: None,
             agent_task_id: None,
             agent_name: None,
@@ -452,6 +465,12 @@ impl App {
             self.catalog_selected.min(self.catalog.len() - 1)
         };
         self.catalog_preview = None;
+    }
+
+    /// Store the fetched workflow graph (DOT + persisted path) for the overlay.
+    pub fn set_workflow(&mut self, dot: String, path: Option<String>) {
+        self.workflow_dot = Some(dot);
+        self.workflow_path = path;
     }
 
     /// The catalog task whose preview should be loaded, if the Catalog tab is
@@ -565,6 +584,7 @@ impl App {
             Popup::Wizard(_) => return self.handle_wizard_key(key),
             Popup::TaskVars(_) => return self.handle_task_vars_key(key),
             Popup::Help { .. } => return self.handle_help_key(key.code),
+            Popup::Workflow { .. } => return self.handle_workflow_key(key.code),
             Popup::None => {}
         }
 
@@ -585,6 +605,12 @@ impl App {
         if key.code == KeyCode::Char('m') || key.code == KeyCode::Char('M') {
             self.toggle_sound_muted();
             return UiAction::None;
+        }
+
+        // `w` toggles the floating workflow graph, like `?`/`M`.
+        if key.code == KeyCode::Char('w') || key.code == KeyCode::Char('W') {
+            self.popup = Popup::Workflow { scroll: 0 };
+            return UiAction::OpenWorkflow;
         }
 
         if self.tab == Tab::Agent {
@@ -841,6 +867,36 @@ impl App {
             }
             KeyCode::PageDown => {
                 if let Popup::Help { scroll } = &mut self.popup {
+                    *scroll = scroll.saturating_add(10);
+                }
+            }
+            _ => {}
+        }
+        UiAction::None
+    }
+
+    /// Keys while the workflow overlay is open: `w`/`Esc` close, arrows and page
+    /// keys scroll the DOT source.
+    fn handle_workflow_key(&mut self, code: KeyCode) -> UiAction {
+        match code {
+            KeyCode::Esc | KeyCode::Char('w') | KeyCode::Char('W') => self.popup = Popup::None,
+            KeyCode::Up => {
+                if let Popup::Workflow { scroll } = &mut self.popup {
+                    *scroll = scroll.saturating_sub(1);
+                }
+            }
+            KeyCode::PageUp => {
+                if let Popup::Workflow { scroll } = &mut self.popup {
+                    *scroll = scroll.saturating_sub(10);
+                }
+            }
+            KeyCode::Down => {
+                if let Popup::Workflow { scroll } = &mut self.popup {
+                    *scroll = scroll.saturating_add(1);
+                }
+            }
+            KeyCode::PageDown => {
+                if let Popup::Workflow { scroll } = &mut self.popup {
                     *scroll = scroll.saturating_add(10);
                 }
             }
@@ -2019,6 +2075,75 @@ mod tests {
         assert!(matches!(app.popup, Popup::Menu { .. }));
         app.handle_key(key(KeyCode::Char('?'), KeyModifiers::empty()));
         assert!(matches!(app.popup, Popup::Menu { .. }));
+    }
+
+    #[test]
+    fn workflow_key_opens_and_closes() {
+        let mut app = App::new();
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('w'), KeyModifiers::empty())),
+            UiAction::OpenWorkflow
+        ));
+        assert!(matches!(app.popup, Popup::Workflow { scroll: 0 }));
+
+        // `w` closes it again.
+        app.handle_key(key(KeyCode::Char('w'), KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::None));
+
+        // `Esc` also closes it.
+        app.handle_key(key(KeyCode::Char('w'), KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::None));
+    }
+
+    #[test]
+    fn workflow_key_is_forwarded_to_captured_agent() {
+        let mut app = App::new();
+        app.tab = Tab::Agent;
+        app.agent_capture = true;
+        match app.handle_key(key(KeyCode::Char('w'), KeyModifiers::empty())) {
+            UiAction::AgentInput(bytes) => assert_eq!(bytes, b"w".to_vec()),
+            _ => panic!("expected AgentInput"),
+        }
+        assert!(matches!(app.popup, Popup::None));
+    }
+
+    #[test]
+    fn workflow_key_is_literal_inside_another_popup() {
+        let mut app = App::new();
+        app.popup = Popup::Help { scroll: 0 };
+        app.handle_key(key(KeyCode::Char('w'), KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::Help { scroll: 0 }));
+    }
+
+    #[test]
+    fn set_workflow_stores_dot_and_path() {
+        let mut app = App::new();
+        assert!(app.workflow_dot.is_none());
+        assert!(app.workflow_path.is_none());
+        app.set_workflow(
+            "digraph workflow {}".to_string(),
+            Some("/tmp/workflow.dot".to_string()),
+        );
+        assert_eq!(app.workflow_dot.as_deref(), Some("digraph workflow {}"));
+        assert_eq!(app.workflow_path.as_deref(), Some("/tmp/workflow.dot"));
+    }
+
+    #[test]
+    fn workflow_scroll_via_arrow_keys() {
+        let mut app = App::new();
+        app.popup = Popup::Workflow { scroll: 0 };
+        app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::Workflow { scroll: 1 }));
+        app.handle_key(key(KeyCode::PageDown, KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::Workflow { scroll: 11 }));
+        app.handle_key(key(KeyCode::Up, KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::Workflow { scroll: 10 }));
+        app.handle_key(key(KeyCode::PageUp, KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::Workflow { scroll: 0 }));
+        // Scrolling up from the top saturates at zero.
+        app.handle_key(key(KeyCode::Up, KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::Workflow { scroll: 0 }));
     }
 
     #[test]
