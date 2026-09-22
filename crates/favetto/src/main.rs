@@ -9,6 +9,7 @@ mod daemon;
 mod db;
 mod event_bus;
 mod executor;
+mod git;
 mod hooks;
 mod metrics;
 mod notify;

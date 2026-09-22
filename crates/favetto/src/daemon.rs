@@ -89,10 +89,13 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let catalog = Arc::new(std::sync::RwLock::new(crate::tasks::load_catalog(
         &tasks_dir,
     )?));
-    let agents = crate::agents::AgentManager::new();
+    let mut agents = crate::agents::AgentManager::new();
     // Resolve every configured agent before wiring state: an unknown `type`
     // fails startup rather than the first launch.
     let registry = crate::agents::AgentRegistry::from_config(&config.read().unwrap())?;
+    // Resolve `[git]` (global + per-agent) and materialize any generated scripts
+    // once, so a malformed section fails startup like an unknown agent type.
+    agents.configure_git(&config.read().unwrap(), data_dir.clone())?;
     let scheduler = tokio_cron_scheduler::JobScheduler::new().await?;
 
     // Resolve webhook secrets from config/env and validate the trigger rules before

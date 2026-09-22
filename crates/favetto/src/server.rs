@@ -993,6 +993,7 @@ fn add_catalog_task(
         needs,
         spawn,
         spawn_file,
+        sign: None,
         vars: Vec::new(),
         prompt,
     };

@@ -23,6 +23,8 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use crate::config::GitSigning;
+
 /// The declared type of a manual input variable. `int`/`bool` values are coerced
 /// to JSON numbers/bools before being stored in the task's `input`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, serde::Serialize)]
@@ -110,6 +112,8 @@ pub struct TaskDef {
     /// Path (relative to the task's working directory, or absolute) of the JSON
     /// handoff file consumed by `spawn`. Rendered as a template at run time.
     pub spawn_file: Option<String>,
+    /// Optional per-task override of the `[git] signing` mode for this run.
+    pub sign: Option<GitSigning>,
     /// Manual input variables declared with `[[vars]]`; the TUI prompts for these
     /// before starting the task, and the executor enforces `required` ones.
     pub vars: Vec<TaskVar>,
@@ -135,6 +139,8 @@ struct Header {
     spawn: Option<String>,
     #[serde(default)]
     spawn_file: Option<String>,
+    #[serde(default)]
+    sign: Option<GitSigning>,
     #[serde(default)]
     vars: Vec<TaskVar>,
 }
@@ -203,6 +209,7 @@ pub fn parse_task_md(name: &str, content: &str) -> anyhow::Result<TaskDef> {
         needs: header.needs,
         spawn: header.spawn,
         spawn_file: header.spawn_file,
+        sign: header.sign,
         vars: header.vars,
         prompt: prompt.trim().to_string(),
     })
@@ -234,6 +241,14 @@ pub fn to_markdown(def: &TaskDef) -> String {
     }
     if let Some(s) = &def.spawn_file {
         out.push_str(&format!("spawn_file = {s:?}\n"));
+    }
+    if let Some(sign) = &def.sign {
+        let sign = match sign {
+            GitSigning::Off => "off",
+            GitSigning::Gpg => "gpg",
+            GitSigning::Ssh => "ssh",
+        };
+        out.push_str(&format!("sign = {sign:?}\n"));
     }
     // Array-of-tables must come after every scalar key, so `[[vars]]` is emitted
     // last in the header.
@@ -360,6 +375,38 @@ mod tests {
     }
 
     #[test]
+    fn parses_task_sign_header() {
+        assert_eq!(
+            parse_task_md("t", "sign = \"off\"\n---\nbody\n")
+                .unwrap()
+                .sign,
+            Some(GitSigning::Off)
+        );
+        assert_eq!(
+            parse_task_md("t", "sign = \"ssh\"\n---\nbody\n")
+                .unwrap()
+                .sign,
+            Some(GitSigning::Ssh)
+        );
+        assert_eq!(
+            parse_task_md("t", "sign = \"gpg\"\n---\nbody\n")
+                .unwrap()
+                .sign,
+            Some(GitSigning::Gpg)
+        );
+        // No `sign` key -> no override.
+        assert_eq!(
+            parse_task_md("t", "agent = \"x\"\n---\nbody\n")
+                .unwrap()
+                .sign,
+            None
+        );
+        // An invalid mode makes the whole file fail to parse, so `reload_catalog`
+        // keeps the previous definition rather than silently changing behavior.
+        assert!(parse_task_md("t", "sign = \"bogus\"\n---\nbody\n").is_err());
+    }
+
+    #[test]
     fn round_trips_through_markdown() {
         let def = TaskDef {
             name: "t".to_string(),
@@ -371,6 +418,7 @@ mod tests {
             needs: None,
             spawn: Some("plan".to_string()),
             spawn_file: Some(".favetto/{{ input.id }}/manifest.json".to_string()),
+            sign: Some(GitSigning::Off),
             vars: vec![
                 TaskVar {
                     name: "issue_description".to_string(),
@@ -413,6 +461,7 @@ mod tests {
             parsed.spawn_file.as_deref(),
             Some(".favetto/{{ input.id }}/manifest.json")
         );
+        assert_eq!(parsed.sign, Some(GitSigning::Off));
         assert_eq!(parsed.vars, def.vars);
         assert_eq!(parsed.prompt, "hello");
     }

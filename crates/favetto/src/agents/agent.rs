@@ -44,6 +44,9 @@ pub struct AgentContext {
     pub session_id: Option<String>,
     pub cols: u16,
     pub rows: u16,
+    /// Per-task override of the global/agent `[git] signing` mode. `None` uses
+    /// the agent's configured (or global default) settings.
+    pub git_signing: Option<crate::config::GitSigning>,
 }
 
 /// A concrete command to spawn in the PTY.
