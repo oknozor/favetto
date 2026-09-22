@@ -39,6 +39,8 @@ pub mod method {
     pub const CATALOG_GET: &str = "catalog.get";
     /// Add a task definition to the catalog (does not run it).
     pub const CATALOG_ADD: &str = "catalog.add";
+    /// Replace an existing catalog task's raw Markdown source (does not run it).
+    pub const CATALOG_UPDATE: &str = "catalog.update";
     /// Fetch the catalog workflow graph as Graphviz DOT (`dot` + persisted `path`).
     pub const WORKFLOW_GET: &str = "workflow.get";
     pub const EVENTS_TAIL: &str = "events.tail";
@@ -114,6 +116,10 @@ pub const CLIENT_METHODS: &[(&str, &str)] = &[
     (
         method::CATALOG_ADD,
         "Add a task definition to the catalog (does not run it).",
+    ),
+    (
+        method::CATALOG_UPDATE,
+        "Replace an existing catalog task's raw Markdown source (does not run it).",
     ),
     (
         method::WORKFLOW_GET,
@@ -289,6 +295,7 @@ mod tests {
             method::CATALOG_LIST,
             method::CATALOG_GET,
             method::CATALOG_ADD,
+            method::CATALOG_UPDATE,
             method::WORKFLOW_GET,
             method::EVENTS_TAIL,
             method::EVENTS_SUBSCRIBE,

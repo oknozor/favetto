@@ -401,6 +401,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         "Catalog tab",
         &[
             ("Enter", "start the selected task; on a folder, fold/unfold"),
+            ("e", "edit the selected task in your editor"),
             ("Space", "fold/unfold the selected folder"),
             ("p", "show/hide the preview pane"),
             ("PageUp / PageDown / wheel", "scroll the preview pane"),
@@ -689,7 +690,7 @@ fn draw_catalog_table(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme
             Block::default()
                 .borders(Borders::ALL)
                 .title(format!(
-                    " Catalog ({}) — Enter/click start · Space fold ",
+                    " Catalog ({}) — Enter/click start · e edit · Space fold ",
                     app.catalog.len()
                 ))
                 .border_style(theme.block(false)),
@@ -1609,6 +1610,17 @@ mod tests {
         assert!(
             text.contains("workflow graph"),
             "workflow help row missing: {text:?}"
+        );
+    }
+
+    #[test]
+    fn help_overlay_lists_editor_key() {
+        let mut app = App::new();
+        app.popup = Popup::Help { scroll: 0 };
+        let text = render_text(&mut app, 100, 40);
+        assert!(
+            text.contains("edit the selected task"),
+            "editor help row missing: {text:?}"
         );
     }
 

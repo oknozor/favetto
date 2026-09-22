@@ -2,6 +2,7 @@
 //! wire protocol whether attached locally (Unix socket) or remotely (WebSocket).
 
 mod app;
+mod editor;
 mod json;
 mod markdown;
 mod sound;
@@ -12,6 +13,8 @@ mod workflow_view;
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -46,6 +49,41 @@ enum SessionOutcome {
     Disconnected,
 }
 
+/// Pause/resume handshake for the input-reader thread. Before handing the
+/// terminal to an editor we must guarantee the reader is not consuming keys;
+/// `pause` blocks (bounded) until the thread acknowledges `paused`.
+#[derive(Clone)]
+struct InputPause {
+    paused: Arc<AtomicBool>,
+    acked: Arc<AtomicBool>,
+}
+
+impl InputPause {
+    fn new() -> Self {
+        Self {
+            paused: Arc::new(AtomicBool::new(false)),
+            acked: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Block (bounded) until the reader thread observes the pause.
+    fn pause(&self) {
+        self.acked.store(false, Ordering::SeqCst);
+        self.paused.store(true, Ordering::SeqCst);
+        for _ in 0..100 {
+            if self.acked.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        self.acked.store(false, Ordering::SeqCst);
+    }
+}
+
 pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
     // Client-local config: CLI --config, else ~/.config/favetto/config.toml. The
     // daemon parses the same file and ignores the [tui] section.
@@ -54,6 +92,13 @@ pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(crate::cli::default_config_path);
     let config = FavettoConfig::load_from(&config_path).unwrap_or_default();
+
+    // Editor precedence: `[tui].editor` > `$VISUAL` > `$EDITOR` > `vi`.
+    let editor = editor::resolve_editor_command(
+        config.tui.editor.as_deref(),
+        std::env::var("VISUAL").ok().as_deref(),
+        std::env::var("EDITOR").ok().as_deref(),
+    );
 
     let cli_sound = CliSound {
         enabled: if args.no_sound {
@@ -93,9 +138,17 @@ pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend).context("init terminal")?;
 
     // Input on a dedicated thread so the async loop can select between key presses,
-    // pushes, and pings.
+    // pushes, and pings. The thread can be paused while an editor owns the terminal.
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<CEvent>();
+    let input = InputPause::new();
+    let reader_control = input.clone();
     std::thread::spawn(move || loop {
+        if reader_control.paused.load(Ordering::SeqCst) {
+            reader_control.acked.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        reader_control.acked.store(false, Ordering::SeqCst);
         if event::poll(Duration::from_millis(50)).unwrap_or(false) {
             if let Ok(ev) = event::read() {
                 if ev_tx.send(ev).is_err() {
@@ -116,7 +169,17 @@ pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
             Ok(client) => {
                 app.conn = ConnState::Connected;
                 sync_initial(&client, &mut app).await;
-                match run_session(&client, &mut app, &mut ev_rx, &mut terminal, &player).await {
+                match run_session(
+                    &client,
+                    &mut app,
+                    &mut ev_rx,
+                    &mut terminal,
+                    &player,
+                    &input,
+                    &editor,
+                )
+                .await
+                {
                     SessionOutcome::Quit => break Ok(()),
                     SessionOutcome::Disconnected => {
                         app.conn = ConnState::Disconnected;
@@ -351,6 +414,146 @@ async fn start_task(client: &Client, app: &mut App, params: serde_json::Value) {
     refresh_lists(client, app).await;
 }
 
+/// Disable raw mode / alt screen / mouse / focus so a child owns the terminal.
+fn suspend_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::Result<()> {
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableFocusChange
+    )?;
+    Ok(())
+}
+
+/// Restore the TUI after the child exits and force a full repaint.
+fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::Result<()> {
+    enable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableFocusChange
+    )?;
+    terminal.clear()?;
+    Ok(())
+}
+
+/// Open the selected catalog task's Markdown in the user's editor, then persist
+/// it over `catalog.update` and refresh the list/preview.
+///
+/// The editor runs on the client with a client-local temp file (so remote attach
+/// works without a shared filesystem). The input reader is paused and the
+/// terminal suspended for the child's lifetime, and the TUI is restored on every
+/// path before this returns.
+async fn edit_catalog_task(
+    client: &Client,
+    app: &mut App,
+    name: &str,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ev_rx: &mut mpsc::UnboundedReceiver<CEvent>,
+    input: &InputPause,
+    editor: &[String],
+) {
+    // Fetch the raw Markdown; an empty body is treated as a failure rather than
+    // opening a blank editor over a missing file.
+    let markdown = match client
+        .request(method::CATALOG_GET, serde_json::json!({ "name": name }))
+        .await
+    {
+        Ok(resp) => resp
+            .result
+            .and_then(|v| {
+                v.get("markdown")
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default(),
+        Err(e) => {
+            app.logs.push_back(format!("catalog.get failed: {e}"));
+            return;
+        }
+    };
+    if markdown.is_empty() {
+        app.logs
+            .push_back(format!("catalog.get: no markdown for '{name}'"));
+        return;
+    }
+
+    let tmp = editor::temp_edit_path(name);
+    if let Err(e) = std::fs::write(&tmp, &markdown) {
+        app.logs
+            .push_back(format!("edit: cannot write {}: {e}", tmp.display()));
+        return;
+    }
+
+    // Stop the reader before disabling raw mode, then drop any key it queued in
+    // the ~50 ms between the `e` press and the pause taking effect.
+    input.pause();
+    while ev_rx.try_recv().is_ok() {}
+
+    if let Err(e) = suspend_terminal(terminal) {
+        input.resume();
+        let _ = std::fs::remove_file(&tmp);
+        app.logs.push_back(format!("edit: suspend failed: {e}"));
+        return;
+    }
+
+    // Run the editor on the client with a client-local temp file. The terminal
+    // is now owned by the child.
+    let status = tokio::process::Command::new(&editor[0])
+        .args(&editor[1..])
+        .arg(&tmp)
+        .status()
+        .await;
+
+    // Always restore, even when the editor failed to start.
+    if let Err(e) = restore_terminal(terminal) {
+        app.logs.push_back(format!("edit: restore failed: {e}"));
+    }
+    input.resume();
+
+    let edited = std::fs::read_to_string(&tmp);
+    let _ = std::fs::remove_file(&tmp);
+    let edited = match edited {
+        Ok(s) => s,
+        Err(e) => {
+            app.logs
+                .push_back(format!("edit: cannot read {}: {e}", tmp.display()));
+            return;
+        }
+    };
+
+    match status {
+        Err(e) => app.logs.push_back(format!("editor failed to start: {e}")),
+        Ok(s) if !s.success() => app.logs.push_back(format!("editor exited with status {s}")),
+        Ok(_) => {}
+    }
+
+    // A no-op editor quit (or a failed start) leaves the file untouched.
+    if edited == markdown {
+        return;
+    }
+    match client
+        .request(
+            method::CATALOG_UPDATE,
+            serde_json::json!({ "name": name, "markdown": edited }),
+        )
+        .await
+    {
+        Ok(resp) => match resp.result {
+            Some(_) => {
+                app.logs.push_back(format!("updated task: {name}"));
+                fetch_catalog(client, app).await;
+            }
+            None => app
+                .logs
+                .push_back(format!("catalog.update error: {:?}", resp.error)),
+        },
+        Err(e) => app.logs.push_back(format!("catalog.update failed: {e}")),
+    }
+}
+
 /// The connected interaction loop: redraw, handle keys, apply pushes, ping.
 async fn run_session(
     client: &Client,
@@ -358,6 +561,8 @@ async fn run_session(
     ev_rx: &mut mpsc::UnboundedReceiver<CEvent>,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     player: &SoundPlayer,
+    input: &InputPause,
+    editor: &[String],
 ) -> SessionOutcome {
     let mut push_rx = client.subscribe();
     let mut closed_rx = client.closed();
@@ -410,6 +615,12 @@ async fn run_session(
                                     client,
                                     app,
                                     serde_json::json!({ "name": name, "input": input }),
+                                )
+                                .await;
+                            }
+                            UiAction::EditCatalog(name) => {
+                                edit_catalog_task(
+                                    client, app, &name, terminal, ev_rx, input, editor,
                                 )
                                 .await;
                             }

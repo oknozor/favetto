@@ -462,6 +462,13 @@
     "TuiSettings": {
       "description": "TUI-only settings. The daemon parses but ignores this section.",
       "properties": {
+        "editor": {
+          "description": "Editor command for `e` on a Catalog task. Unset -> `$VISUAL`, then\n`$EDITOR`, then `vi`. May include arguments (e.g. `code --wait`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "sound": {
           "$ref": "#/$defs/SoundSettings",
           "default": {

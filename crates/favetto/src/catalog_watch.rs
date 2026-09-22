@@ -131,7 +131,7 @@ fn event_relevant(ev: &notify::Event) -> bool {
 
 /// Merge-reload the catalog from disk and reconcile its schedules. When nothing
 /// changed, no client push is emitted.
-async fn reload(state: &Arc<State>) {
+pub(crate) async fn reload(state: &Arc<State>) {
     let prior = state.catalog.read().unwrap().clone();
     let updated = crate::tasks::reload_catalog(&state.tasks_dir, &prior);
     if updated == prior {

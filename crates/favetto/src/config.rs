@@ -58,6 +58,10 @@ pub struct FavettoConfig {
 pub struct TuiSettings {
     #[serde(default)]
     pub sound: SoundSettings,
+    /// Editor command for `e` on a Catalog task. Unset -> `$VISUAL`, then
+    /// `$EDITOR`, then `vi`. May include arguments (e.g. `code --wait`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor: Option<String>,
 }
 
 /// Client-side sound notifications for the TUI.
@@ -520,6 +524,22 @@ mod tests {
             sound.events.get("attention").map(String::as_str),
             Some("none")
         );
+    }
+
+    #[test]
+    fn parses_tui_editor() {
+        let cfg: FavettoConfig = toml::from_str(
+            r#"
+            [tui]
+            editor = "code --wait"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.tui.editor.as_deref(), Some("code --wait"));
+
+        // Unset stays `None` so resolution can fall back to `$VISUAL`/`$EDITOR`.
+        let default: FavettoConfig = toml::from_str("").unwrap();
+        assert!(default.tui.editor.is_none());
     }
 
     #[test]
