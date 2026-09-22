@@ -20,8 +20,9 @@ You are filing a GitHub issue with the GitHub MCP server.
 
 Target repository: `{{ input.repo }}`.
 
-Derive a concise, specific title from the description below, then use the MCP to
+From the description below, you will refine an issue then use the MCP to
 create the issue with that title and the description as the body.
+You MUST explore the repository to provide a detailed and accurate issue.
 
 ## Description
 
