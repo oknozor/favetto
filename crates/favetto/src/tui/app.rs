@@ -363,6 +363,10 @@ pub struct App {
     pub catalog_preview_max_scroll: u16,
     /// The preview pane's screen rectangle (set during draw) for mouse hit tests.
     pub catalog_preview_area: Option<Rect>,
+    /// Whether the Catalog preview pane is shown. Toggled with `p` on the
+    /// Catalog tab; when hidden the tree takes the full width and no preview is
+    /// fetched.
+    pub catalog_preview_visible: bool,
     /// Set when the daemon pushes `catalog.updated`; the session loop re-fetches
     /// the catalog and clears it.
     pub catalog_dirty: bool,
@@ -457,6 +461,7 @@ impl App {
             catalog_preview_scroll: 0,
             catalog_preview_max_scroll: 0,
             catalog_preview_area: None,
+            catalog_preview_visible: true,
             catalog_dirty: false,
             workflow_dot: None,
             workflow_path: None,
@@ -679,6 +684,9 @@ impl App {
     /// showing a task that isn't already loaded or being fetched. Folder rows
     /// never fetch a preview.
     pub fn catalog_preview_target(&self) -> Option<String> {
+        if !self.catalog_preview_visible {
+            return None;
+        }
         if self.tab != Tab::Catalog {
             return None;
         }
@@ -698,6 +706,17 @@ impl App {
             return None;
         }
         Some(name)
+    }
+
+    /// Toggle the Catalog preview pane (`p`). Hiding it drops the recorded pane
+    /// rectangle so the mouse wheel/PageUp/PageDown stop targeting it; the tree
+    /// expands to the full width. Re-showing lets [`App::catalog_preview_target`]
+    /// re-request the preview lazily.
+    pub fn toggle_catalog_preview(&mut self) {
+        self.catalog_preview_visible = !self.catalog_preview_visible;
+        if !self.catalog_preview_visible {
+            self.catalog_preview_area = None;
+        }
     }
 
     /// Scroll the catalog preview by `delta` rendered lines (negative scrolls up),
@@ -821,6 +840,14 @@ impl App {
                 hscroll: 0,
             };
             return UiAction::OpenWorkflow;
+        }
+
+        // `p` toggles the Catalog preview pane, but only on the Catalog tab.
+        if self.tab == Tab::Catalog
+            && (key.code == KeyCode::Char('p') || key.code == KeyCode::Char('P'))
+        {
+            self.toggle_catalog_preview();
+            return UiAction::None;
         }
 
         if self.tab == Tab::Agent {
@@ -2496,6 +2523,77 @@ mod tests {
         // Changing the selected task resets the scroll to the top.
         app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
         assert_eq!(app.catalog_preview_scroll, 0);
+    }
+
+    #[test]
+    fn catalog_preview_toggle_key_flips_and_clears_area() {
+        let mut app = App::new();
+        app.tab = Tab::Catalog;
+        app.catalog_preview_area = Some(Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        });
+        assert!(app.catalog_preview_visible);
+
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::empty()));
+        assert!(!app.catalog_preview_visible);
+        assert!(app.catalog_preview_area.is_none());
+
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::empty()));
+        assert!(app.catalog_preview_visible);
+
+        // Uppercase works too.
+        app.handle_key(key(KeyCode::Char('P'), KeyModifiers::empty()));
+        assert!(!app.catalog_preview_visible);
+    }
+
+    #[test]
+    fn catalog_preview_toggle_only_applies_to_catalog_tab() {
+        let mut app = App::new();
+        app.tab = Tab::Tasks;
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::empty()));
+        assert!(app.catalog_preview_visible);
+
+        // With the agent capturing keys, `p` is forwarded instead.
+        app.tab = Tab::Agent;
+        app.agent_capture = true;
+        match app.handle_key(key(KeyCode::Char('p'), KeyModifiers::empty())) {
+            UiAction::AgentInput(bytes) => assert_eq!(bytes, b"p".to_vec()),
+            _ => panic!("expected AgentInput"),
+        }
+        assert!(app.catalog_preview_visible);
+    }
+
+    #[test]
+    fn catalog_preview_target_is_none_while_hidden() {
+        let mut app = App::new();
+        app.tab = Tab::Catalog;
+        app.set_catalog(vec![catalog_entry("demo")]);
+
+        assert_eq!(app.catalog_preview_target().as_deref(), Some("demo"));
+        app.catalog_preview_visible = false;
+        assert_eq!(app.catalog_preview_target(), None);
+    }
+
+    #[test]
+    fn catalog_preview_is_literal_inside_form() {
+        let mut app = App::new();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
+        let Popup::Form(form) = &app.popup else {
+            panic!("expected form");
+        };
+        assert!(matches!(form.kind, FormKind::AddTask));
+
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::empty()));
+        let Popup::Form(form) = &app.popup else {
+            panic!("expected form");
+        };
+        assert_eq!(form.input, "p");
+        assert!(app.catalog_preview_visible);
     }
 
     #[test]

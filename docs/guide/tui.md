@@ -31,6 +31,7 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 | Tasks | `Enter` | open the selected task's agent session |
 | Catalog | `Enter` | start the task; on a folder, fold/unfold |
 | Catalog | `Space` | fold/unfold the selected folder |
+| Catalog | `p` | show/hide the preview pane |
 | Catalog | `PageUp` / `PageDown` / wheel | scroll the preview pane |
 | Agent | `Ctrl+Y` | toggle focus: agent ↔ favetto |
 | Agent | *(agent focus)* | every key is forwarded to the agent |
@@ -46,9 +47,9 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 | Mouse | click a catalog folder | fold/unfold it |
 | Mouse | click a catalog/task row | select; click again starts it |
 
-`?` and `w` are forwarded to the embedded agent while the Agent panel has
+`?`, `w`, and `p` are forwarded to the embedded agent while the Agent panel has
 keyboard capture, and are typed literally into form/wizard fields when one is
-open.
+open. `p` only toggles the preview on the Catalog tab.
 
 ## Ctrl+P menu
 

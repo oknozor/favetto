@@ -402,6 +402,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("Enter", "start the selected task; on a folder, fold/unfold"),
             ("Space", "fold/unfold the selected folder"),
+            ("p", "show/hide the preview pane"),
             ("PageUp / PageDown / wheel", "scroll the preview pane"),
         ],
     ),
@@ -565,9 +566,35 @@ fn draw_workflow(
     frame.render_widget(paragraph.scroll((*scroll, 0)), rect);
 }
 
+/// Minimum Catalog content width at which the tree and preview are docked
+/// side-by-side. Below this the preview is drawn as a centered floating overlay
+/// so neither pane becomes unusably cramped.
+const CATALOG_PREVIEW_DOCK_MIN_WIDTH: u16 = 100;
+
 fn draw_catalog(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
+    // Hidden preview: the tree owns the full width and the pane rect is dropped
+    // so wheel/PageUp/PageDown stop targeting it.
+    if !app.catalog_preview_visible {
+        app.catalog_preview_area = None;
+        draw_catalog_table(frame, app, area, theme);
+        return;
+    }
+
+    // Too narrow to dock: keep the tree full-width and float the preview above
+    // it. The overlay stays scrollable but does not own the keyboard, so the
+    // tree remains navigable behind it.
+    if area.width < CATALOG_PREVIEW_DOCK_MIN_WIDTH {
+        draw_catalog_table(frame, app, area, theme);
+        let rect = centered_rect(area, 80, area.height.saturating_sub(2));
+        frame.render_widget(Clear, rect);
+        frame.buffer_mut().set_style(rect, theme.surface_style());
+        draw_catalog_preview(frame, app, rect, theme);
+        return;
+    }
+
+    // Wide enough: an even 50/50 split.
     let chunks =
-        Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).split(area);
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
     draw_catalog_table(frame, app, chunks[0], theme);
     draw_catalog_preview(frame, app, chunks[1], theme);
 }
@@ -1803,6 +1830,70 @@ mod tests {
         assert!(
             text.contains("line 79"),
             "scrolled content missing: {text:?}"
+        );
+    }
+
+    #[test]
+    fn catalog_docks_preview_at_half_width_when_wide() {
+        let mut app = App::new();
+        app.tab = Tab::Catalog;
+        app.catalog = vec![catalog_entry("demo")];
+        app.catalog_preview = Some(("demo".to_string(), "# Heading\n".to_string()));
+
+        let _ = render_text(&mut app, 120, 30);
+        let area = app.catalog_preview_area.expect("preview pane rect");
+        // The content spans the full 120 columns, so a 50/50 split starts at 60.
+        assert_eq!(area.x, 60, "preview should start at the midpoint");
+        assert_eq!(area.width, 60, "preview should take half the width");
+    }
+
+    #[test]
+    fn catalog_preview_hidden_takes_no_space() {
+        let mut app = App::new();
+        app.tab = Tab::Catalog;
+        app.set_catalog(vec![catalog_entry("pipelines/plan")]);
+        app.catalog_preview = Some(("pipelines/plan".to_string(), "# Heading\n".to_string()));
+        app.catalog_preview_visible = false;
+
+        let text = render_text(&mut app, 120, 30);
+        assert!(text.contains("Catalog"), "catalog tree missing: {text:?}");
+        assert!(
+            !text.contains("Preview"),
+            "hidden preview should not render: {text:?}"
+        );
+        assert!(
+            app.catalog_preview_area.is_none(),
+            "hidden preview must clear its hit-test rect"
+        );
+    }
+
+    #[test]
+    fn catalog_preview_floats_when_narrow() {
+        let mut app = App::new();
+        app.tab = Tab::Catalog;
+        app.set_catalog(vec![catalog_entry("demo")]);
+        app.catalog_preview = Some(("demo".to_string(), "# Heading\n".to_string()));
+
+        // Below the dock threshold the tree stays full-width and the preview
+        // floats centered above it.
+        let text = render_text(&mut app, CATALOG_PREVIEW_DOCK_MIN_WIDTH - 1, 30);
+        assert!(text.contains("Catalog"), "catalog tree missing: {text:?}");
+        assert!(
+            text.contains("Preview"),
+            "floating preview missing: {text:?}"
+        );
+        assert!(
+            text.contains("Heading"),
+            "preview content missing: {text:?}"
+        );
+        let area = app.catalog_preview_area.expect("preview pane rect");
+        assert!(
+            area.width < CATALOG_PREVIEW_DOCK_MIN_WIDTH,
+            "floating preview should be inset: {area:?}"
+        );
+        assert!(
+            area.x > 0,
+            "floating preview should be centered horizontally: {area:?}"
         );
     }
 

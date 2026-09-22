@@ -57,9 +57,17 @@ fallback (`[-]`/`[+]`/`-`).
 
 The right side of the Catalog tab previews the highlighted task: its raw `.md`
 source with the TOML header highlighted and the prompt rendered as Markdown
-(headings, lists, blockquotes, fenced code, inline formatting, and links).
-Moving the selection with `↑`/`↓` updates the preview; selecting a folder row
-clears it. Scroll the preview with `PageUp`/`PageDown` or the mouse wheel.
+(headings, lists, blockquotes, fenced code, inline formatting, and links). The
+tree and preview split the width **50/50**. Moving the selection with `↑`/`↓`
+updates the preview; selecting a folder row clears it. Scroll the preview with
+`PageUp`/`PageDown` or the mouse wheel.
+
+Press **`p`** to show or hide the preview pane. When hidden the tree takes the
+full width and no preview is fetched; showing it again loads the selected task
+lazily. On terminals narrower than 100 columns there is no room for a usable
+side-by-side split, so the tree stays full-width and the preview is drawn as a
+centered floating window instead. The window stays scrollable but does not take
+the keyboard, so you can keep navigating the tree behind it.
 
 ## Live reload
 
