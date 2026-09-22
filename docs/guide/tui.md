@@ -12,13 +12,15 @@ focus and mouse handling see [Embedded agents](./agents).
 
 *The Tasks tab: recent runs with status, age, and session title.*
 
-An opencode run writes its session title a few seconds after its first turn. The
-daemon resolves the title with a bounded retry when the run finishes, then keeps
-polling in the background and pushes the result, so the `SESSION` cell can fill in
-a few seconds later without restarting the TUI. A failed run keeps the session id
-and title it captured. One-shot tasks resolve their title the same way when the
-agent reports a session id. Agents that never expose titles (`claude`, `pi`,
-`vibe`, custom) show a blank cell and skip the retry.
+An opencode run writes its session title a few seconds after its first turn. As
+soon as the agent reports its session id **during** the run, the daemon resolves
+the title and pushes it to connected clients, so the `SESSION` cell fills in
+live without restarting the TUI. If the title is not available in time, the
+completion-time bounded retry and the background backfill still fill it a few
+seconds later. A failed run keeps the session id and title it captured. One-shot
+tasks resolve their title the same way when the agent reports a session id.
+Agents that never expose titles (`claude`, `pi`, `vibe`, custom) show a blank
+cell and skip the retry.
 
 A task whose agent blocks on a permission prompt, confirmation, choice, or git
 pinentry is shown as **awaiting input** (glyph `!`, warning colour) instead of

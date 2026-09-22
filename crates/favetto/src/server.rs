@@ -880,6 +880,20 @@ async fn start_oneshot_task(
         ctx,
     )?;
 
+    // Best effort: some interactive CLIs do report a session id mid-run; if so the
+    // title fills in live. If not, `finish_oneshot` still handles it at exit.
+    if agent.has_session_titles() {
+        let st = state.clone();
+        let ag = agent.clone();
+        let live = info.id.clone();
+        let tid = task.id;
+        let watch_cwd = title_cwd.clone();
+        tokio::spawn(async move {
+            let _ =
+                crate::executor::watch_title_while_running(&st, tid, ag, &live, &watch_cwd).await;
+        });
+    }
+
     // Finish the task once the interactive session ends, capturing the agent's
     // own session id (when the CLI reported one) to resolve its title.
     {
@@ -937,18 +951,23 @@ async fn finish_oneshot(
     let success = code == Some(0);
 
     // Persist the session even if the agent did not title it, and resolve the
-    // title (with retry) when there is an id.
+    // title (with retry) when there is an id. Only overwrite the title when the
+    // exit-time lookup actually found one, so a title persisted mid-run by the
+    // watcher is preserved.
     task.session_id = session_id.clone();
     if let Some(sid) = session_id.as_deref() {
         if let Some(agent) = state.registry.get(agent_name) {
-            task.session_title = crate::agents::resolve_session_title(
+            if let Some(title) = crate::agents::resolve_session_title(
                 agent,
                 sid,
                 cwd,
                 crate::agents::TITLE_POLL_ATTEMPTS,
                 crate::agents::TITLE_POLL_INTERVAL,
             )
-            .await;
+            .await
+            {
+                task.session_title = Some(title);
+            }
         }
     }
 
@@ -1680,6 +1699,40 @@ mod tests {
         assert!(stored.session_id.is_none());
         assert!(stored.session_title.is_none());
         assert!(stored.error.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A title persisted mid-run by the watcher must survive `finish_oneshot`
+    /// when the exit-time lookup finds nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finish_oneshot_preserves_mid_run_title() {
+        let dir = temp_dir("oneshot-preserve");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        // The exit-time lookup finds no sessions, so it yields no title.
+        let script = session_list_script(&dir, "[]");
+        let state = title_state(&dir, &tasks_dir, &script).await;
+
+        let mut task = oneshot_task();
+        task.session_id = Some("ses_1".to_string());
+        task.session_title = Some("Persisted mid-run".to_string());
+        db::insert_task(&state.db, &task).await.unwrap();
+
+        finish_oneshot(
+            &state,
+            task.id,
+            "opencode",
+            Some("ses_1".to_string()),
+            &dir,
+            Some(0),
+        )
+        .await;
+
+        let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, TaskStatus::Succeeded);
+        assert_eq!(stored.session_id.as_deref(), Some("ses_1"));
+        assert_eq!(stored.session_title.as_deref(), Some("Persisted mid-run"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
