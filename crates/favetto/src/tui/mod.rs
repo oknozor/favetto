@@ -8,6 +8,7 @@ mod sound;
 mod term;
 mod theme;
 mod ui;
+mod workflow_view;
 
 use std::io;
 use std::path::PathBuf;
@@ -250,13 +251,18 @@ async fn fetch_workflow(client: &Client, app: &mut App) {
                     .unwrap_or_default()
                     .to_string();
                 let path = v.get("path").and_then(|p| p.as_str()).map(str::to_string);
-                app.set_workflow(dot, path);
+                // Additive field: older daemons omit it, so fall back to DOT.
+                let graph = v
+                    .get("graph")
+                    .cloned()
+                    .and_then(|g| serde_json::from_value::<crate::workflow::WorkflowGraph>(g).ok());
+                app.set_workflow(dot, path, graph);
             }
-            None => app.set_workflow(String::new(), None),
+            None => app.set_workflow(String::new(), None, None),
         },
         Err(e) => {
             app.logs.push_back(format!("workflow.get failed: {e}"));
-            app.set_workflow(format!("<failed to fetch workflow: {e}>"), None);
+            app.set_workflow(format!("<failed to fetch workflow: {e}>"), None, None);
         }
     }
 }
