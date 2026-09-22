@@ -2,3 +2,8 @@
 **/*.rs.bk
 .favetto/
 workdir/SUMMARY.md
+
+# VitePress docs
+docs/node_modules/
+docs/.vitepress/cache/
+docs/.vitepress/dist/
