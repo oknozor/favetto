@@ -29,7 +29,8 @@ default = "opencode"
 # `[agents.vibe]` entries are the built-in defaults, so the values below are
 # optional. Use `type = "configurable"` with a custom name (or on a built-in name)
 # to force the template-only agent. Any field you set is merged over the built-in
-# default; omitted fields keep it.
+# default; omitted fields keep it. Add `[agents.<name>.git]` to override the
+# global `[git]` section for that agent (same keys as `[git]`).
 [agents.opencode]
 command = "opencode"
 args = []
@@ -76,6 +77,21 @@ max_concurrency = 4        # slots when parallel
 worktree = true            # when parallel and in a git repo, give each task its own worktree
 # worktree_dir = "~/.local/share/favetto/worktrees"  # absolute or repo-relative
 keep_worktree = true       # keep worktrees after the task (so branches/changes can be inspected)
+
+# Non-interactive git for agent sessions. favetto injects these into every agent
+# PTY through git's environment config only, never touching your real config.
+# Default `signing = "off"` forces commit.gpgsign=false so an agent commit can
+# never block on pinentry/askpass. Opt into "ssh" (recommended) or "gpg" for
+# signed agent commits; prefer a passphrase-less key or one held by ssh-agent.
+# Requires git >= 2.31. Any agent may add `[agents.<name>.git]` with the same keys
+# to override the global section, and a task header may set `sign = "off"|"ssh"|"gpg"`.
+[git]
+# signing = "off"                 # "off" (default) | "ssh" | "gpg"
+# user_name = "favetto agent"
+# user_email = "agent@favetto.local"
+# signing_key = "~/.config/favetto/agent_signing.pub"   # required for ssh/gpg
+# passphrase_env = "FAVETTO_GIT_SIGNING_PASSPHRASE"     # never store secrets here
+# passphrase_command = ["secret-tool", "lookup", "service", "favetto-git-signing"]
 
 # GitHub webhook triggers. GitHub POSTs signed events to /webhooks/github;
 # each matching rule enqueues the named catalog task with a truncated summary of

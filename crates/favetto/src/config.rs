@@ -39,6 +39,11 @@ pub struct FavettoConfig {
     /// Task executor concurrency / isolation.
     #[serde(default)]
     pub executor: ExecutorSettings,
+    /// Non-interactive git provisioning for agent processes. Defaults to
+    /// `signing = "off"`, which forces `commit.gpgsign = false` so an agent
+    /// commit can never block on an interactive pinentry/askpass prompt.
+    #[serde(default)]
+    pub git: GitSettings,
     /// Webhook trigger rules (currently GitHub).
     #[serde(default)]
     pub webhook: WebhookSettings,
@@ -234,6 +239,63 @@ pub struct AgentConfig {
     /// Working directory (defaults to the daemon's cwd).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
+    /// Per-agent override of the global `[git]` section. Only the fields set
+    /// here replace the global values; the rest are inherited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<GitSettings>,
+}
+
+/// How favetto provisions `git` in an agent process.
+///
+/// `off` is the safe default: agent commits are explicitly unsigned so they can
+/// never wait for a passphrase prompt nobody can answer. `ssh`/`gpg` opt into
+/// signed agent commits with a dedicated identity/key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GitSigning {
+    #[default]
+    Off,
+    Gpg,
+    Ssh,
+}
+
+/// Non-interactive git provisioning for agent processes.
+///
+/// `signing = None` means "unset" so a per-agent/per-task override can be merged
+/// over the global section; the effective default is [`GitSigning::Off`]. The
+/// settings are injected into the agent's environment through git's *environment
+/// config* (`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_<i>`/`GIT_CONFIG_VALUE_<i>`, git ≥
+/// 2.31) and `GIT_AUTHOR_*`/`GIT_COMMITTER_*`; the operator's real git config is
+/// never touched.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GitSettings {
+    /// `"off"` (default), `"ssh"`, or `"gpg"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing: Option<GitSigning>,
+    /// Commit author/committer name (`user.name` + `GIT_AUTHOR_NAME`/`GIT_COMMITTER_NAME`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
+    /// Commit author/committer email (`user.email` + the matching git env vars).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_email: Option<String>,
+    /// GPG key id/fingerprint, or SSH public-key path / literal key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key: Option<String>,
+    /// Env var (in the daemon's environment) holding the passphrase. The value is
+    /// forwarded to the agent; prefer this for interactive-daemon setups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passphrase_env: Option<String>,
+    /// Command (argv list) whose stdout is the passphrase. Embedded in the
+    /// generated wrapper script, so the secret never lands in the config file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passphrase_command: Option<Vec<String>>,
+}
+
+impl GitSettings {
+    /// The effective signing mode, defaulting to [`GitSigning::Off`] when unset.
+    pub fn effective_signing(&self) -> GitSigning {
+        self.signing.unwrap_or(GitSigning::Off)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -476,5 +538,77 @@ mod tests {
             Some("configurable")
         );
         assert_eq!(cfg.agents["mycli"].submit_prompt, Some(false));
+    }
+
+    #[test]
+    fn parses_git_settings() {
+        let cfg: FavettoConfig = toml::from_str(
+            r#"
+            [git]
+            signing = "ssh"
+            user_name = "favetto agent"
+            user_email = "agent@favetto.local"
+            signing_key = "~/.config/favetto/agent_signing.pub"
+            passphrase_env = "FAVETTO_GIT_SIGNING_PASSPHRASE"
+            passphrase_command = ["secret-tool", "lookup", "service", "favetto"]
+            "#,
+        )
+        .unwrap();
+
+        let git = &cfg.git;
+        assert_eq!(git.effective_signing(), GitSigning::Ssh);
+        assert_eq!(git.user_name.as_deref(), Some("favetto agent"));
+        assert_eq!(git.user_email.as_deref(), Some("agent@favetto.local"));
+        assert_eq!(
+            git.signing_key.as_deref(),
+            Some("~/.config/favetto/agent_signing.pub")
+        );
+        assert_eq!(
+            git.passphrase_env.as_deref(),
+            Some("FAVETTO_GIT_SIGNING_PASSPHRASE")
+        );
+        assert_eq!(
+            git.passphrase_command.as_deref(),
+            Some(
+                ["secret-tool", "lookup", "service", "favetto"]
+                    .map(str::to_string)
+                    .as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn git_signing_defaults_off_when_absent() {
+        let cfg: FavettoConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.git.effective_signing(), GitSigning::Off);
+        assert!(cfg.git.signing.is_none());
+        // An explicit `off` is also accepted.
+        let off: FavettoConfig = toml::from_str("[git]\nsigning = \"off\"\n").unwrap();
+        assert_eq!(off.git.effective_signing(), GitSigning::Off);
+    }
+
+    #[test]
+    fn parses_per_agent_git_override() {
+        let cfg: FavettoConfig = toml::from_str(
+            r#"
+            [git]
+            signing = "off"
+
+            [agents.opencode]
+            command = "opencode"
+
+            [agents.opencode.git]
+            signing = "ssh"
+            signing_key = "~/.ssh/agent_ed25519.pub"
+            "#,
+        )
+        .unwrap();
+
+        let agent = &cfg.agents["opencode"];
+        let git = agent.git.as_ref().expect("agent override parsed");
+        assert_eq!(git.effective_signing(), GitSigning::Ssh);
+        assert_eq!(git.signing_key.as_deref(), Some("~/.ssh/agent_ed25519.pub"));
+        // The global section is untouched by the per-agent override.
+        assert_eq!(cfg.git.effective_signing(), GitSigning::Off);
     }
 }

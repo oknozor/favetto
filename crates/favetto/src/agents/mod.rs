@@ -25,6 +25,8 @@ use tokio::sync::broadcast;
 
 use favetto_core::model::AgentSessionInfo;
 
+use crate::config::{FavettoConfig, GitSettings};
+
 use agent::extract_session_id_from_line;
 
 mod agent;
@@ -133,11 +135,32 @@ impl Session {
     }
 }
 
+/// Resolved `[git]` settings for every launch, keyed by agent name.
+///
+/// Built once at daemon startup by [`AgentManager::configure_git`]; the default
+/// (signing off) keeps unit tests that never configure git from writing files.
+struct GitRuntime {
+    data_dir: PathBuf,
+    default: GitSettings,
+    per_agent: HashMap<String, GitSettings>,
+}
+
+impl Default for GitRuntime {
+    fn default() -> Self {
+        Self {
+            data_dir: std::env::temp_dir(),
+            default: GitSettings::default(),
+            per_agent: HashMap::new(),
+        }
+    }
+}
+
 /// Owns every live external-agent session on the daemon.
 pub struct AgentManager {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     tx: broadcast::Sender<AgentEvent>,
     next_order: AtomicU64,
+    git: GitRuntime,
 }
 
 impl Default for AgentManager {
@@ -165,7 +188,33 @@ impl AgentManager {
             sessions: Mutex::new(HashMap::new()),
             tx,
             next_order: AtomicU64::new(0),
+            git: GitRuntime::default(),
         }
+    }
+
+    /// Resolve the global and per-agent `[git]` settings, materializing any
+    /// generated scripts once so a bad `[git]` section (e.g. `signing = "ssh"`
+    /// with no key, or an unset `passphrase_env`) fails daemon startup rather
+    /// than the first agent launch.
+    pub fn configure_git(
+        &mut self,
+        config: &FavettoConfig,
+        data_dir: PathBuf,
+    ) -> anyhow::Result<()> {
+        self.git.data_dir = data_dir;
+        self.git.default = config.git.clone();
+        self.git.per_agent.clear();
+
+        crate::git::resolve_env(&self.git.default, &self.git.data_dir)?;
+        for (name, agent) in &config.agents {
+            let mut merged = config.git.clone();
+            if let Some(over) = &agent.git {
+                merged = crate::git::overlay(&merged, over);
+            }
+            crate::git::resolve_env(&merged, &self.git.data_dir)?;
+            self.git.per_agent.insert(name.clone(), merged);
+        }
+        Ok(())
     }
 
     /// Subscribe to every session's output; callers filter by `session_id`.
@@ -266,6 +315,22 @@ impl AgentManager {
         }
         cmd.env("TERM", "xterm-256color");
         for (k, v) in &spec.env {
+            cmd.env(k, v);
+        }
+
+        // `[git]` provisioning is applied last so it is authoritative: a raw
+        // `[agents.x.env]` `commit.gpgsign` cannot silently re-enable an
+        // interactive signer. A per-task `sign` wins over both.
+        let mut git_settings = self
+            .git
+            .per_agent
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| self.git.default.clone());
+        if let Some(mode) = ctx.git_signing {
+            git_settings.signing = Some(mode);
+        }
+        for (k, v) in crate::git::resolve_env(&git_settings, &self.git.data_dir)? {
             cmd.env(k, v);
         }
 
@@ -680,7 +745,7 @@ mod tests {
     use super::agent::{AgentDescriptor, CommandSpec, SessionIdProbe};
     use super::configurable::ConfigurableAgent;
     use super::*;
-    use crate::config::AgentConfig;
+    use crate::config::{AgentConfig, FavettoConfig, GitSigning};
 
     fn cfg(command: &str, args: &[&str]) -> AgentConfig {
         AgentConfig {
@@ -1000,5 +1065,78 @@ mod tests {
             "output: {output:?}"
         );
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[tokio::test]
+    async fn headless_child_gets_git_signing_env() {
+        let dir = std::env::temp_dir().join(format!("favetto-git-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut mgr = AgentManager::new();
+        let mut fc = FavettoConfig::default();
+        fc.git.signing = Some(GitSigning::Off);
+        mgr.configure_git(&fc, dir.clone()).unwrap();
+
+        let mut config = cfg("sh", &[]);
+        config.headless_args = Some(vec![
+            "-c".to_string(),
+            r#"printf 'COUNT=%s K=%s V=%s' "$GIT_CONFIG_COUNT" "$GIT_CONFIG_KEY_0" "$GIT_CONFIG_VALUE_0""#
+                .to_string(),
+        ]);
+        let info = mgr
+            .start(
+                "sh",
+                template("sh", config),
+                None,
+                Invocation::Headless {
+                    prompt: "ignored",
+                    provider: None,
+                    model: None,
+                },
+                context(None, 40, 120),
+            )
+            .unwrap();
+        assert_eq!(mgr.wait(&info.id).await, Some(0));
+        let output = mgr.output(&info.id);
+        assert!(output.contains("commit.gpgsign"), "output: {output:?}");
+        assert!(output.contains("false"), "output: {output:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn task_signing_override_wins() {
+        let dir = std::env::temp_dir().join(format!("favetto-git-override-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut mgr = AgentManager::new();
+        let mut fc = FavettoConfig::default();
+        fc.git.signing = Some(GitSigning::Ssh);
+        fc.git.signing_key = Some("k".to_string());
+        mgr.configure_git(&fc, dir.clone()).unwrap();
+
+        let mut config = cfg("sh", &[]);
+        config.headless_args = Some(vec![
+            "-c".to_string(),
+            r#"printf 'V=%s' "$GIT_CONFIG_VALUE_0""#.to_string(),
+        ]);
+        let mut ctx = context(None, 40, 120);
+        ctx.git_signing = Some(GitSigning::Off);
+        let info = mgr
+            .start(
+                "sh",
+                template("sh", config),
+                None,
+                Invocation::Headless {
+                    prompt: "ignored",
+                    provider: None,
+                    model: None,
+                },
+                ctx,
+            )
+            .unwrap();
+        assert_eq!(mgr.wait(&info.id).await, Some(0));
+        let output = mgr.output(&info.id);
+        assert!(output.contains("V=false"), "output: {output:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

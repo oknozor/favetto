@@ -343,6 +343,7 @@ async fn run_agent_task(
         prompt: Some(prompt.to_string()),
         rows: 40,
         cols: 120,
+        git_signing: def.sign,
         ..Default::default()
     };
     let info = state.agents.start(
@@ -657,6 +658,7 @@ mod tests {
             needs: None,
             spawn: None,
             spawn_file: None,
+            sign: None,
             vars: vec![var("required_one", true), var("optional_one", false)],
             prompt: "hello".to_string(),
         }
