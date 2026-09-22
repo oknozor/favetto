@@ -448,7 +448,9 @@ fn glob_match(pattern: &str, value: &str) -> bool {
 /// Validate `[webhook.github]` rules at daemon startup.
 ///
 /// Unknown events, unknown catalog tasks, and invalid globs are fatal so a typo is
-/// caught at boot rather than silently dropping deliveries.
+/// caught at boot rather than silently dropping deliveries. `rule.task` is
+/// matched against a task's relative-path name, so a task in a subfolder must be
+/// named with its folder (e.g. `pipelines/triage`).
 pub fn validate_rules(cfg: &FavettoConfig, catalog: &[TaskDef]) -> anyhow::Result<()> {
     let gh = &cfg.webhook.github;
     if !gh.enabled && gh.rules.is_empty() {
@@ -900,6 +902,22 @@ mod tests {
 
         // Disabled with no rules is fine even with an empty catalog.
         assert!(validate_rules(&FavettoConfig::default(), &[]).is_ok());
+    }
+
+    #[test]
+    fn validate_rules_accepts_folder_qualified_task() {
+        let mut nested = catalog();
+        nested[0].name = "pipelines/triage".to_string();
+
+        // A rule targeting the relative path (subfolder included) is valid.
+        let mut r = rule("r", None, GithubFilter::default());
+        r.task = "pipelines/triage".to_string();
+        assert!(validate_rules(&cfg_with(vec![r]), &nested).is_ok());
+
+        // The bare stem of a nested task is not a valid target.
+        let mut r = rule("r", None, GithubFilter::default());
+        r.task = "triage".to_string();
+        assert!(validate_rules(&cfg_with(vec![r]), &nested).is_err());
     }
 
     #[tokio::test]

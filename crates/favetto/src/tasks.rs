@@ -17,9 +17,17 @@
 //! Everything before the first `---` line is TOML; everything after is the prompt.
 //! The prompt and `spawn_file` are rendered against a small context
 //! (`{{ task.id }}`, `{{ input.* }}`, `{{ prev.output }}`) before use.
-//! The catalog lives in a directory (`tasks/` by default) of `*.md` files.
+//!
+//! The catalog is loaded **recursively** from a directory (`tasks/` by default):
+//! `*.md` files may live at the root or in any subfolder. A task's identity is
+//! its path relative to that root, without the `.md` extension, with `/`
+//! separators (e.g. `pipelines/plan`); a root-level file keeps its bare stem
+//! (`triage`). The same relative path is used by `catalog.get`, `tasks.start`,
+//! `needs`/`spawn`, webhook rules, `catalog:<name>` schedule ids and
+//! `{{ task.name }}`, so two files with the same stem in different folders are
+//! distinct tasks.
 
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -90,7 +98,9 @@ impl TaskVar {
 /// A task definition from a `*.md` file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskDef {
-    /// File name without the `.md` extension.
+    /// Path relative to the tasks root, without the `.md` extension,
+    /// `/`-separated (e.g. `pipelines/plan`). A root-level file keeps its bare
+    /// stem.
     pub name: String,
     /// Optional external agent name from `[agents.*]`. Overrides the global default.
     pub agent: Option<String>,
@@ -284,37 +294,88 @@ pub fn to_markdown(def: &TaskDef) -> String {
     out
 }
 
-/// Load all `*.md` task definitions in `dir`. A missing directory yields an empty
-/// catalog.
+/// Load all `*.md` task definitions under `dir` (recursively). A missing
+/// directory yields an empty catalog.
 pub fn load_catalog(dir: &Path) -> anyhow::Result<Vec<TaskDef>> {
     Ok(reload_catalog(dir, &[]))
 }
 
-/// Reload the catalog in `dir`, merging the files on disk with `prior`.
+/// Reject a task name that would escape the tasks root or is otherwise unusable
+/// as a relative task path. Used by `catalog.get` / `catalog.add` and
+/// [`write_task_md`] (defense in depth: the RPC handlers are remotely reachable).
+pub fn validate_task_path(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("task name must not be empty");
+    }
+    if name.contains('\\') {
+        anyhow::bail!("task name must use '/' separators");
+    }
+    let path = Path::new(name);
+    if path.is_absolute() {
+        anyhow::bail!("task name must be relative");
+    }
+    if path
+        .components()
+        .any(|c| !matches!(c, Component::Normal(_)))
+    {
+        anyhow::bail!("invalid task path '{name}'");
+    }
+    Ok(())
+}
+
+/// The path of `file` relative to `root`, `.md` stripped, `/`-separated.
+fn relative_task_name(root: &Path, file: &Path) -> Option<String> {
+    let rel = file.strip_prefix(root).ok()?;
+    let rel = rel.with_extension(""); // drop `.md`
+    let mut parts = Vec::new();
+    for c in rel.components() {
+        parts.push(c.as_os_str().to_str()?.to_string());
+    }
+    Some(parts.join("/"))
+}
+
+/// Collect `*.md` files under `dir`, recursively. Subdirectory read errors are
+/// skipped; symlinked directories are not followed (`DirEntry::file_type` does
+/// not resolve the link) so cycles cannot occur.
+fn collect_task_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(ft) if ft.is_dir() => collect_task_files(&path, out),
+            _ => {
+                if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                    out.push(path);
+                }
+            }
+        }
+    }
+}
+
+/// Reload the catalog under `dir`, merging the files on disk with `prior`.
 ///
 /// Files that fail to parse (or read) keep their previous definition instead of
 /// disappearing, so a half-written or momentarily invalid file never drops a task
 /// from the live catalog. Files removed from disk are dropped and new files are
 /// added. A directory that cannot be read (e.g. momentarily missing during an
-/// atomic replace) keeps `prior` as-is.
+/// atomic replace) keeps `prior` as-is. Discovery is recursive; each task's name
+/// is its path relative to `dir` without the `.md` extension.
 pub fn reload_catalog(dir: &Path, prior: &[TaskDef]) -> Vec<TaskDef> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) => {
-            if !prior.is_empty() || e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(dir = %dir.display(), error = %e, "failed to read task catalog directory");
-            }
-            return prior.to_vec();
+    if let Err(e) = std::fs::read_dir(dir) {
+        if !prior.is_empty() || e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(dir = %dir.display(), error = %e, "failed to read task catalog directory");
         }
-    };
+        return prior.to_vec();
+    }
+
+    let mut files = Vec::new();
+    collect_task_files(dir, &mut files);
 
     let mut defs = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+    for path in files {
+        let Some(name) = relative_task_name(dir, &path) else {
             continue;
         };
         let previous = prior.iter().find(|d| d.name == name);
@@ -329,7 +390,7 @@ pub fn reload_catalog(dir: &Path, prior: &[TaskDef]) -> Vec<TaskDef> {
                 continue;
             }
         };
-        match parse_task_md(name, &content) {
+        match parse_task_md(&name, &content) {
             Ok(def) => defs.push(def),
             Err(e) => {
                 tracing::warn!(
@@ -348,10 +409,13 @@ pub fn reload_catalog(dir: &Path, prior: &[TaskDef]) -> Vec<TaskDef> {
     defs
 }
 
-/// Write a task definition to `<dir>/<name>.md`.
+/// Write a task definition to `<dir>/<name>.md`, creating parent folders.
 pub fn write_task_md(dir: &Path, def: &TaskDef) -> anyhow::Result<()> {
-    std::fs::create_dir_all(dir)?;
+    validate_task_path(&def.name)?;
     let path = dir.join(format!("{}.md", def.name));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     std::fs::write(path, to_markdown(def))?;
     Ok(())
 }
@@ -617,5 +681,112 @@ mod tests {
         // With no prior, a missing directory is an empty catalog.
         assert!(reload_catalog(&missing, &[]).is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Write a task file at `dir/<name>.md`, creating parent folders.
+    fn write_nested(dir: &Path, name: &str, prompt: &str) {
+        let path = dir.join(format!("{name}.md"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("agent = \"x\"\n---\n{prompt}\n")).unwrap();
+    }
+
+    #[test]
+    fn loads_nested_tasks_with_relative_names() {
+        let dir = temp_dir("nested");
+        write_nested(&dir, "a", "root");
+        write_nested(&dir, "pipelines/plan", "nested");
+        let defs = load_catalog(&dir).unwrap();
+        let names: Vec<_> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["a", "pipelines/plan"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_stem_in_two_folders_coexist() {
+        let dir = temp_dir("same-stem");
+        write_nested(&dir, "one/dup", "one");
+        write_nested(&dir, "two/dup", "two");
+        let defs = load_catalog(&dir).unwrap();
+        let names: Vec<_> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["one/dup", "two/dup"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reload_drops_deleted_nested_file_and_keeps_invalid_one() {
+        let dir = temp_dir("nested-reload");
+        write_nested(&dir, "pipelines/a", "a");
+        write_nested(&dir, "pipelines/b", "b");
+        let prior = load_catalog(&dir).unwrap();
+
+        std::fs::remove_file(dir.join("pipelines/a.md")).unwrap();
+        // Break `b`'s header: the previous definition must survive.
+        std::fs::write(dir.join("pipelines/b.md"), "agent = \n---\nbroken\n").unwrap();
+        let reloaded = reload_catalog(&dir, &prior);
+        let names: Vec<_> = reloaded.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["pipelines/b"]);
+        assert_eq!(reloaded[0].prompt, "b");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_task_md_creates_subfolders_and_round_trips() {
+        let dir = temp_dir("nested-write");
+        let def = TaskDef {
+            name: "pipelines/plan".to_string(),
+            agent: Some("x".to_string()),
+            provider: None,
+            model: None,
+            cwd: None,
+            schedule: None,
+            needs: None,
+            spawn: None,
+            spawn_file: None,
+            sign: None,
+            vars: Vec::new(),
+            prompt: "nested body".to_string(),
+        };
+        write_task_md(&dir, &def).unwrap();
+        assert!(dir.join("pipelines/plan.md").exists());
+
+        let reloaded = load_catalog(&dir).unwrap();
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded[0].name, "pipelines/plan");
+        assert_eq!(reloaded[0].prompt, "nested body");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_task_path_rejects_traversal() {
+        assert!(validate_task_path("../x").is_err());
+        assert!(validate_task_path("/abs").is_err());
+        assert!(validate_task_path("a/../../b").is_err());
+        assert!(validate_task_path("a\\b").is_err());
+        assert!(validate_task_path("").is_err());
+        assert!(validate_task_path(".").is_err());
+        assert!(validate_task_path("pipelines/plan").is_ok());
+        assert!(validate_task_path("plan").is_ok());
+    }
+
+    #[test]
+    fn write_task_md_rejects_traversal() {
+        let dir = temp_dir("write-traversal");
+        let def = TaskDef {
+            name: "../escape".to_string(),
+            agent: None,
+            provider: None,
+            model: None,
+            cwd: None,
+            schedule: None,
+            needs: None,
+            spawn: None,
+            spawn_file: None,
+            sign: None,
+            vars: Vec::new(),
+            prompt: String::new(),
+        };
+        assert!(write_task_md(&dir, &def).is_err());
+        assert!(!dir.join("..").join("escape.md").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -348,19 +348,23 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
         method::CATALOG_GET => match req.params.get("name").and_then(|v| v.as_str()) {
             None => Err((error_code::INVALID_PARAMS, "missing 'name'".to_string())),
             Some(name) => {
-                let path = state.tasks_dir.join(format!("{name}.md"));
-                let markdown = std::fs::read_to_string(&path).ok().or_else(|| {
-                    state
-                        .catalog
-                        .read()
-                        .unwrap()
-                        .iter()
-                        .find(|d| d.name == name)
-                        .map(crate::tasks::to_markdown)
-                });
-                match markdown {
-                    Some(markdown) => Ok(serde_json::json!({ "markdown": markdown })),
-                    None => Err((error_code::INVALID_PARAMS, format!("unknown task '{name}'"))),
+                if let Err(e) = crate::tasks::validate_task_path(name) {
+                    Err((error_code::INVALID_PARAMS, e.to_string()))
+                } else {
+                    let path = state.tasks_dir.join(format!("{name}.md"));
+                    let markdown = std::fs::read_to_string(&path).ok().or_else(|| {
+                        state
+                            .catalog
+                            .read()
+                            .unwrap()
+                            .iter()
+                            .find(|d| d.name == name)
+                            .map(crate::tasks::to_markdown)
+                    });
+                    match markdown {
+                        Some(markdown) => Ok(serde_json::json!({ "markdown": markdown })),
+                        None => Err((error_code::INVALID_PARAMS, format!("unknown task '{name}'"))),
+                    }
                 }
             }
         },
@@ -947,6 +951,7 @@ fn add_catalog_task(
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'name'"))?
         .to_string();
+    crate::tasks::validate_task_path(&name)?;
     let agent = params
         .get("agent")
         .and_then(|v| v.as_str())

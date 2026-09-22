@@ -73,6 +73,17 @@ Precedence is **CLI flag → env var → `[tui.sound]` → built-in default**:
 Run `favetto tui --test-sound` to play every configured cue once, print the
 resolved player and per-cue mapping, and exit.
 
+## Catalog tree
+
+The **Catalog** tab lists task definitions as a collapsible tree: each subfolder
+under the tasks directory is a folder row (`📂` expanded, `📁` collapsed) and each
+task is a file row (`📄`), indented by depth. Fold or unfold a folder by clicking
+its row or pressing `Space`; with the folder selected, `Enter` does the same (it
+never starts a task). `Enter` on a task row starts it — after its `[[vars]]` form,
+if it declares any — and clicking a task twice does the same. Collapse state lasts
+for the session and survives live catalog reloads; set `FAVETTO_PLAIN_ICONS=1` for
+an ASCII fallback on terminals where the emoji render double-width.
+
 ## Ctrl+P menu
 
 Press **Ctrl+P** in the TUI to open a floating menu with guided, step-by-step
