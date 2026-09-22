@@ -63,6 +63,10 @@ default = "opencode"
 # [agents.pi]
 # command = "pi"
 # args = []
+# prompt_args = ["{prompt}"]                     # seed an interactive session
+# headless_args = ["-p", "{prompt}"]             # unattended, agent default model
+# run_args = ["-p", "--provider", "{provider}", "--model", "{model}", "{prompt}"]
+# interactive_model_args = ["--provider", "{provider}", "--model", "{model}"]
 #
 # [agents.vibe]
 # command = "vibe"
