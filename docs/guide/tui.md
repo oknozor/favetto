@@ -89,8 +89,10 @@ takes an `agent` and returns an empty list for an agent without a provider
 source, and the daemon caches each agent's catalog for its lifetime.
 
 The wizard is capability-driven: it sends the selected agent's name and skips the
-provider and model steps for an agent whose capabilities do not include them (for
-example `pi`). The directory step is prefilled with the daemon's working
+provider and model steps for an agent without a provider catalog (for example
+`pi`, `claude`, or `vibe`). Catalog tasks for those agents can still select a
+model through the task's `provider`/`model` header keys, which render
+`run_args`. The directory step is prefilled with the daemon's working
 directory. On completion favetto creates a task row (the input carries the inline
 definition — no `.md` file), emits `task_idle`/`task_started`, and opens an
 interactive session using the agent's `interactive_model_args`. The task is
