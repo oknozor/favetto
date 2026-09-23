@@ -649,15 +649,40 @@ async fn start_agent(
 
     // A catalog task's prompt is a template over its collected `input`. Render it
     // here so a freshly seeded interactive session sees the same text a headless
-    // run would, instead of raw `{{ input.* }}` placeholders. Fall back to the
-    // caller-provided prompt when the task (or its definition) can't be resolved.
-    let prompt = match task_id.as_deref() {
-        Some(tid) => match rendered_task_prompt(state, tid).await {
-            Some(rendered) if !rendered.is_empty() => Some(rendered),
-            _ => prompt,
+    // run would, instead of raw `{{ input.* }}` placeholders. Pick up the task's
+    // `provider`/`model` too, so the panel session matches the run instead of
+    // silently falling back to the agent default. The request wins; the task
+    // definition fills in whatever it didn't send.
+    let requested_provider = params
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let requested_model = params
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let (prompt, task_provider, task_model) = match task_id.as_deref() {
+        Some(tid) => match task_and_definition(state, tid).await {
+            Some((task, def)) => {
+                let rendered = crate::executor::render_task_prompt(&def, &task);
+                (
+                    if rendered.is_empty() {
+                        prompt
+                    } else {
+                        Some(rendered)
+                    },
+                    def.provider,
+                    def.model,
+                )
+            }
+            // Fall back to the caller-provided prompt when the task (or its
+            // definition) can't be resolved.
+            None => (prompt, None, None),
         },
-        None => prompt,
+        None => (prompt, None, None),
     };
+    let provider = requested_provider.or(task_provider);
+    let model = requested_model.or(task_model);
 
     let ctx = AgentContext {
         cwd: params
@@ -708,6 +733,22 @@ async fn start_agent(
                 return Ok(existing.clone());
             }
         }
+
+        // A still-running headless run owns this task. Its PTY carries machine
+        // output, so it cannot be shown in the panel, and seeding a fresh
+        // interactive session here would start a duplicate run that re-submits
+        // the prompt. If its agent session id never surfaced (the resume/wait
+        // above), report that instead of racing a second run.
+        if let Some(existing) = task_id
+            .as_deref()
+            .and_then(|tid| state.agents.find_latest_by_task(tid))
+        {
+            if existing.running && existing.headless {
+                return Err(anyhow::anyhow!(
+                    "task is already running headless; its agent session is not ready to attach yet"
+                ));
+            }
+        }
     }
 
     state.agents.start(
@@ -716,8 +757,8 @@ async fn start_agent(
         task_id,
         Invocation::Interactive {
             prompt: prompt.as_deref(),
-            provider: None,
-            model: None,
+            provider: provider.as_deref(),
+            model: model.as_deref(),
         },
         ctx,
     )
@@ -757,9 +798,12 @@ async fn persisted_session_id(state: &Arc<State>, task_id: Option<&str>) -> Opti
         .and_then(|t| t.session_id)
 }
 
-/// Render a catalog task's prompt against its persisted `input`. `None` when the
-/// task row or its catalog definition cannot be found.
-async fn rendered_task_prompt(state: &Arc<State>, task_id: &str) -> Option<String> {
+/// The persisted task row plus the catalog definition backing it, by task id.
+/// `None` when the id is malformed or either side cannot be resolved.
+async fn task_and_definition(
+    state: &Arc<State>,
+    task_id: &str,
+) -> Option<(Task, crate::tasks::TaskDef)> {
     let id = Uuid::parse_str(task_id).ok()?;
     let task = db::get_task(&state.db, id).await.ok().flatten()?;
     let def = state
@@ -769,7 +813,7 @@ async fn rendered_task_prompt(state: &Arc<State>, task_id: &str) -> Option<Strin
         .iter()
         .find(|d| d.name == task.name)
         .cloned()?;
-    Some(crate::executor::render_task_prompt(&def, &task))
+    Some((task, def))
 }
 
 /// Providers and models for the requested (or default) agent, cached per agent
@@ -1595,20 +1639,41 @@ mod tests {
         path
     }
 
-    /// A `State` whose `opencode` command is `command` (a title-lookup fixture).
+    /// A fake opencode that appends its argv to `capture` and exits 0.
     #[cfg(unix)]
-    async fn title_state(dir: &Path, tasks_dir: &Path, command: &Path) -> Arc<State> {
+    fn argv_capture_script(dir: &Path, capture: &Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-opencode.sh");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n",
+                capture.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    /// A `State` whose registry carries the given `[agents.*]` entries and whose
+    /// `[agent].default` is `default`.
+    #[cfg(unix)]
+    async fn agent_state(
+        dir: &Path,
+        tasks_dir: &Path,
+        default: &str,
+        agents: Vec<(&str, crate::config::AgentConfig)>,
+    ) -> Arc<State> {
         let pool = crate::db::open(&dir.join("test.db")).await.unwrap();
         crate::db::migrate(&pool).await.unwrap();
         let mut cfg = crate::config::FavettoConfig::default();
-        cfg.agent.default = Some("opencode".to_string());
-        cfg.agents.insert(
-            "opencode".to_string(),
-            crate::config::AgentConfig {
-                command: command.to_string_lossy().into_owned(),
-                ..Default::default()
-            },
-        );
+        cfg.agent.default = Some(default.to_string());
+        for (name, agent) in agents {
+            cfg.agents.insert(name.to_string(), agent);
+        }
         let registry = crate::agents::AgentRegistry::from_config_with(&cfg, &|_| true).unwrap();
         let catalog = Arc::new(std::sync::RwLock::new(
             crate::tasks::load_catalog(tasks_dir).unwrap(),
@@ -1628,6 +1693,24 @@ mod tests {
             scheduler,
             Arc::new(std::sync::RwLock::new(Vec::new())),
         ))
+    }
+
+    /// A `State` whose `opencode` command is `command` (a title-lookup fixture).
+    #[cfg(unix)]
+    async fn title_state(dir: &Path, tasks_dir: &Path, command: &Path) -> Arc<State> {
+        agent_state(
+            dir,
+            tasks_dir,
+            "opencode",
+            vec![(
+                "opencode",
+                crate::config::AgentConfig {
+                    command: command.to_string_lossy().into_owned(),
+                    ..Default::default()
+                },
+            )],
+        )
+        .await
     }
 
     fn oneshot_task() -> Task {
@@ -1900,6 +1983,224 @@ mod tests {
             "a raw placeholder survived into the seeded prompt: {captured}"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The panel session must inherit the catalog task's `provider`/`model`, so
+    /// an interactive reattach uses the same route as the headless run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agents_start_uses_catalog_provider_and_model() {
+        let dir = temp_dir("start-model");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::write(
+            tasks_dir.join("issue.md"),
+            "agent = \"opencode\"\nprovider = \"acme\"\nmodel = \"big\"\n---\nHello\n",
+        )
+        .unwrap();
+
+        let capture = dir.join("captured-args.txt");
+        let script = argv_capture_script(&dir, &capture);
+        let state = title_state(&dir, &tasks_dir, &script).await;
+
+        let task = Task {
+            id: Uuid::new_v4(),
+            name: "issue".to_string(),
+            status: TaskStatus::Failed,
+            input: serde_json::json!({}),
+            output: None,
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+            session_id: None,
+            session_title: None,
+        };
+        db::insert_task(&state.db, &task).await.unwrap();
+
+        start_agent(
+            &state,
+            &serde_json::json!({ "task_id": task.id.to_string() }),
+        )
+        .await
+        .expect("start_agent");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let captured = loop {
+            let text = std::fs::read_to_string(&capture).unwrap_or_default();
+            if !text.is_empty() || std::time::Instant::now() >= deadline {
+                break text;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert!(
+            captured.contains("--model acme/big"),
+            "the task's provider/model did not reach the seeded session: {captured}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end regression for issue #69: starting a catalog task through
+    /// `tasks.start` alone runs it headlessly and submits the rendered prompt —
+    /// no `agents.start` / Agent-panel attach is needed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tasks_start_submits_rendered_prompt_without_attach() {
+        let dir = temp_dir("tasks-start-no-attach");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::write(
+            tasks_dir.join("issue.md"),
+            "agent = \"opencode\"\n\
+             [[vars]]\nname = \"repo\"\nprompt = \"Repo\"\nrequired = true\n\
+             ---\nTarget repository: `{{ input.repo }}`\n",
+        )
+        .unwrap();
+
+        let capture = dir.join("captured-args.txt");
+        let script = argv_capture_script(&dir, &capture);
+        let state = title_state(&dir, &tasks_dir, &script).await;
+
+        // The same RPC the TUI sends: enqueue only, never `agents.start`.
+        let resp = dispatch(
+            &state,
+            Request {
+                id: 1,
+                method: method::TASKS_START.to_string(),
+                params: serde_json::json!({
+                    "name": "issue",
+                    "input": { "repo": "acme/widgets" },
+                }),
+            },
+        )
+        .await;
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+
+        // The background dispatcher claims and runs the queued task.
+        let executor = crate::executor::spawn(state.clone());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let captured = loop {
+            let text = std::fs::read_to_string(&capture).unwrap_or_default();
+            if !text.is_empty() || std::time::Instant::now() >= deadline {
+                break text;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        executor.abort();
+
+        assert!(
+            captured.contains("acme/widgets"),
+            "the rendered prompt was not submitted by the headless run: {captured}"
+        );
+        assert!(
+            !captured.contains("{{ input."),
+            "a raw placeholder survived into the headless prompt: {captured}"
+        );
+        assert!(
+            state.agents.sessions().iter().all(|s| s.headless),
+            "an interactive session was launched: {:?}",
+            state.agents.sessions()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Opening the panel on a live unattended run must not seed a duplicate
+    /// session (and re-submit the prompt) for the same task.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agents_start_does_not_duplicate_a_live_headless_run() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("start-no-dup");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::write(tasks_dir.join("issue.md"), "agent = \"plain\"\n---\nbody\n").unwrap();
+
+        // A non-resuming agent whose runs stay alive: a live headless session
+        // with no captured agent session id to resume.
+        let script = dir.join("fake-plain.sh");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let state = agent_state(
+            &dir,
+            &tasks_dir,
+            "plain",
+            vec![(
+                "plain",
+                crate::config::AgentConfig {
+                    command: script.to_string_lossy().into_owned(),
+                    headless_args: Some(vec!["run".to_string(), "{prompt}".to_string()]),
+                    ..Default::default()
+                },
+            )],
+        )
+        .await;
+
+        let task = Task {
+            id: Uuid::new_v4(),
+            name: "issue".to_string(),
+            status: TaskStatus::Running,
+            input: serde_json::json!({}),
+            output: None,
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: Some(Utc::now()),
+            finished_at: None,
+            error: None,
+            session_id: None,
+            session_title: None,
+        };
+        db::insert_task(&state.db, &task).await.unwrap();
+
+        let agent = state.registry.get_checked("plain").unwrap();
+        let info = state
+            .agents
+            .start(
+                "plain",
+                agent,
+                Some(task.id.to_string()),
+                Invocation::Headless {
+                    prompt: "body",
+                    provider: None,
+                    model: None,
+                },
+                AgentContext {
+                    rows: 24,
+                    cols: 80,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(info.headless && info.running);
+
+        let err = start_agent(
+            &state,
+            &serde_json::json!({ "task_id": task.id.to_string(), "agent": "plain" }),
+        )
+        .await
+        .expect_err("a live headless run must not be duplicated");
+        assert!(
+            err.to_string().contains("already running headless"),
+            "{err}"
+        );
+
+        let sessions = state.agents.sessions();
+        assert_eq!(
+            sessions.len(),
+            1,
+            "a duplicate session was launched: {sessions:?}"
+        );
+        assert_eq!(sessions[0].id, info.id);
+
+        state.agents.close(&info.id).ok();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

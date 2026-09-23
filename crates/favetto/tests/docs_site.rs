@@ -147,8 +147,8 @@ fn deploy_workflow_watches_reference_sources() {
 fn logo_and_screenshot_placeholders_exist() {
     let root = repo_root();
     assert!(
-        root.join("docs/public/logo.svg").is_file(),
-        "docs/public/logo.svg is missing"
+        root.join("docs/public/logo.png").is_file(),
+        "docs/public/logo.png is missing"
     );
     assert!(
         root.join("docs/public/screenshots").is_dir(),
