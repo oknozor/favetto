@@ -42,7 +42,7 @@ In a second terminal:
 favetto tui
 ```
 
-![favetto TUI — Catalog tab](/screenshots/tui-catalog.svg)
+![favetto TUI — Catalog tab](/screenshots/tui-catalog.png)
 
 *The Catalog tab lists `hello` under the task root.*
 
@@ -53,7 +53,7 @@ row — press `↓` to move to it and `Space` (or `Enter` on the folder) to fold
 unfold. When `hello` is highlighted, the right pane previews its header and
 prompt.
 
-![favetto TUI — variables form](/screenshots/tui-vars-form.svg)
+![favetto TUI — variables form](/screenshots/tui-vars-form.png)
 
 *A task that declares `[[vars]]` opens a form first; `hello` has none, so it
 starts immediately.*
@@ -70,7 +70,7 @@ Press `Enter` on the task. This is what happens:
 
 The run opens in the **Agent** tab, which embeds the agent's live terminal.
 
-![favetto TUI — Agent tab](/screenshots/tui-agent.svg)
+![favetto TUI — Agent tab](/screenshots/tui-agent.png)
 
 *The Agent tab: the embedded agent session, seeded with the task prompt.*
 
@@ -82,14 +82,14 @@ stopping the session on the daemon.
 
 Return to the **Tasks** tab to see the run's status and its agent session title.
 
-![favetto TUI — Tasks tab](/screenshots/tui-tasks.svg)
+![favetto TUI — Tasks tab](/screenshots/tui-tasks.png)
 
 *The Tasks tab lists recent runs with status, age, and session title.*
 
 Switch to the **Events** tab to see the persisted event stream. Select a row to
 pretty-print its JSON payload in the side panel.
 
-![favetto TUI — Events tab](/screenshots/tui-events.svg)
+![favetto TUI — Events tab](/screenshots/tui-events.png)
 
 *The Events tab with the payload panel.*
 

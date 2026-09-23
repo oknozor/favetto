@@ -84,7 +84,7 @@ Press `w` in the TUI to render the catalog's `needs`/`spawn` edges as a
 box-drawing graph (also persisted as Graphviz DOT at `<data_dir>/workflow.dot`).
 :::
 
-![favetto workflow graph](/screenshots/workflow-graph.svg)
+![favetto workflow graph](/screenshots/workflow-graph.png)
 
 *The `w` workflow overlay: `needs` and `spawn` edges between tasks.*
 
