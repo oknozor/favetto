@@ -896,7 +896,7 @@ async fn make_plan(
 pub async fn resume_cwd(state: &State, task_id: Uuid) -> Option<PathBuf> {
     let task = db::get_task(&state.db, task_id).await.ok().flatten()?;
     let def = lookup_def(state, &task.name)?;
-    let cfg = state.config.read().unwrap().executor.clone();
+    let cfg = state.config.read().executor.clone();
     let base = resolve_base_dir(&def, &task);
     match make_plan(state, &cfg, &base, &task).await {
         Ok(plan) => Some(plan.cwd),
