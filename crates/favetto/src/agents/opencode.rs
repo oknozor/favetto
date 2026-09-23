@@ -8,11 +8,8 @@ use futures_util::future::BoxFuture;
 
 use crate::config::AgentConfig;
 
-use super::agent::{
-    extract_session_id, Agent, AgentContext, AgentDescriptor, AgentRunResult, CommandSpec,
-    Invocation, ProviderSource, SessionIdProbe,
-};
-use super::configurable::{capabilities_from_config, overlay, TemplateAgent};
+use super::agent::{extract_session_id, Agent, AgentRunResult, ProviderSource};
+use super::configurable::{delegate_to_template, overlay, TemplateAgent};
 
 /// The built-in defaults, matching `config.example.toml`.
 fn base_config() -> AgentConfig {
@@ -56,45 +53,15 @@ impl OpenCodeAgent {
     pub fn from_config(name: &str, overrides: &AgentConfig) -> Self {
         let mut config = base_config();
         overlay(&mut config, overrides);
-        let mut capabilities = capabilities_from_config(&config);
-        capabilities.providers = true;
-        let probe = config
-            .session_id_json_key
-            .clone()
-            .map(SessionIdProbe::JsonKey);
-        let descriptor = AgentDescriptor {
-            id: name.to_string(),
-            name: "OpenCode".to_string(),
-            command: config.command.clone(),
-            available: true,
-            capabilities,
-        };
-        Self {
-            template: TemplateAgent {
-                descriptor,
-                config,
-                probe,
-            },
-        }
+        let mut template = TemplateAgent::new(name, "OpenCode", config);
+        // opencode is the only built-in that exposes a provider/model catalog.
+        template.descriptor.capabilities.providers = true;
+        Self { template }
     }
 }
 
 impl Agent for OpenCodeAgent {
-    fn descriptor(&self) -> &AgentDescriptor {
-        &self.template.descriptor
-    }
-
-    fn command(
-        &self,
-        invocation: &Invocation<'_>,
-        ctx: &AgentContext,
-    ) -> anyhow::Result<CommandSpec> {
-        self.template.command(invocation, ctx)
-    }
-
-    fn session_id_probe(&self) -> Option<SessionIdProbe> {
-        self.template.probe.clone()
-    }
+    delegate_to_template!();
 
     fn has_session_titles(&self) -> bool {
         true
@@ -110,10 +77,6 @@ impl Agent for OpenCodeAgent {
             return None;
         }
         session_title_from_json(&String::from_utf8_lossy(&out.stdout), session_id)
-    }
-
-    fn set_available(&mut self, available: bool) {
-        self.template.descriptor.available = available;
     }
 
     fn parse_output(&self, raw: &str, exit_code: Option<i32>) -> AgentRunResult {
@@ -193,7 +156,7 @@ impl ProviderSource for OpenCodeProviderSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::agent::SubmitStrategy;
+    use crate::agents::agent::{AgentContext, Invocation, SubmitStrategy};
 
     fn ctx(prompt: Option<&str>, provider: Option<&str>, model: Option<&str>) -> AgentContext {
         AgentContext {
