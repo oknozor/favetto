@@ -2,7 +2,7 @@
 # selection so the preview shows the model headers (Agents guide).
 agent = "opencode"
 provider = "deepseek"
-model = "deepseek-v4-flash"
+model = "deepseek-flash"
 
 [[vars]]
 name = "pr_number"

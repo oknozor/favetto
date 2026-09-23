@@ -2,7 +2,7 @@
 # `provider`/`model` in the header.
 agent = "opencode"
 provider = "deepseek"
-model = "deepseek-v4-flash"
+model = "deepseek-flash"
 ---
 
 You are an implementation agent for the `examples/workflow` demo pipeline.
