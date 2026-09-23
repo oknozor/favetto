@@ -634,6 +634,12 @@ async fn run_session(
                             UiAction::NewAgent(task_id) => {
                                 open_agent(client, app, task_id, true).await;
                             }
+                            UiAction::OpenSessions => {
+                                fetch_sessions(client, app).await;
+                            }
+                            UiAction::AttachSession(session_id) => {
+                                attach_session(client, app, session_id).await;
+                            }
                             UiAction::AgentInput(bytes) => {
                                 send_agent_input(client, app, &bytes).await;
                             }
@@ -782,7 +788,7 @@ async fn open_agent(client: &Client, app: &mut App, task_id: String, force_new: 
 
     match client.request(method::AGENTS_START, params).await {
         Ok(resp) => apply_agent_response(app, resp),
-        Err(e) => app.logs.push_back(format!("agents.start failed: {e}")),
+        Err(e) => agent_request_failed(app, "agents.start", &e.to_string()),
     }
 }
 
@@ -802,13 +808,25 @@ fn apply_agent_response(app: &mut App, resp: favetto_core::rpc::Response) {
                 .unwrap_or_default();
             match session {
                 Some(session) => app.open_agent(session, &frame),
-                None => app
-                    .logs
-                    .push_back("agent response: malformed session".to_string()),
+                None => agent_request_failed(app, "agent response", "malformed session"),
             }
         }
-        None => app.logs.push_back(format!("agent error: {:?}", resp.error)),
+        None => {
+            let message = resp
+                .error
+                .as_ref()
+                .map(|e| e.message.clone())
+                .unwrap_or_else(|| "agent request failed".to_string());
+            agent_request_failed(app, "agent", &message);
+        }
     }
+}
+
+/// Surface a failed `agents.start` / `agents.attach` (or malformed response) in
+/// the status bar, and keep a copy in the (unrendered) log ring for debugging.
+fn agent_request_failed(app: &mut App, context: &str, message: &str) {
+    app.agent_error = Some(message.to_string());
+    app.logs.push_back(format!("{context}: {message}"));
 }
 
 /// Fetch the configured agents and open the one-shot wizard.
@@ -827,6 +845,51 @@ async fn fetch_agents(client: &Client, app: &mut App) {
                 .push_back(format!("agents.list error: {:?}", resp.error)),
         },
         Err(e) => app.logs.push_back(format!("agents.list failed: {e}")),
+    }
+}
+
+/// Fetch `agents.list` and open the Ctrl+O session picker, flattening every
+/// configured agent's live and retained sessions.
+async fn fetch_sessions(client: &Client, app: &mut App) {
+    match client
+        .request(method::AGENTS_LIST, serde_json::json!({}))
+        .await
+    {
+        Ok(resp) => match resp.result {
+            Some(v) => match serde_json::from_value::<Vec<AgentCatalogEntry>>(v) {
+                Ok(agents) => {
+                    let sessions = agents
+                        .into_iter()
+                        .flat_map(|agent| agent.sessions)
+                        .collect();
+                    app.open_sessions(sessions);
+                }
+                Err(e) => agent_request_failed(app, "agents.list", &e.to_string()),
+            },
+            None => {
+                let message = resp
+                    .error
+                    .as_ref()
+                    .map(|e| e.message.clone())
+                    .unwrap_or_else(|| "agents.list failed".to_string());
+                agent_request_failed(app, "agents.list", &message);
+            }
+        },
+        Err(e) => agent_request_failed(app, "agents.list", &e.to_string()),
+    }
+}
+
+/// Attach the Agent panel to an existing session by id (`agents.attach`).
+async fn attach_session(client: &Client, app: &mut App, session_id: String) {
+    match client
+        .request(
+            method::AGENTS_ATTACH,
+            serde_json::json!({ "session_id": session_id }),
+        )
+        .await
+    {
+        Ok(resp) => apply_agent_response(app, resp),
+        Err(e) => agent_request_failed(app, "agents.attach", &e.to_string()),
     }
 }
 
@@ -1109,6 +1172,17 @@ mod tests {
             DisconnectedAction::Continue
         );
         assert_eq!(app.tab, before, "Shift+Tab must go back while disconnected");
+    }
+
+    #[test]
+    fn apply_agent_response_surfaces_errors_in_the_status_bar() {
+        let mut app = App::new();
+        let resp = favetto_core::rpc::Response::err(1, -32603, "task is already running headless");
+        apply_agent_response(&mut app, resp);
+        assert_eq!(
+            app.agent_error.as_deref(),
+            Some("task is already running headless")
+        );
     }
 
     #[test]

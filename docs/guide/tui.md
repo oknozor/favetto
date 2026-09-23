@@ -38,6 +38,7 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 | Global | `Tab` / `→` | next tab |
 | Global | `Shift+Tab` / `←` | previous tab |
 | Global | `Ctrl+P` | open the action menu |
+| Global | `Ctrl+O` | pick a live/retained agent session |
 | Global | `?` | open/close help |
 | Global | `w` | open/close the workflow graph |
 | Global | `M` | mute/unmute sound |
@@ -52,6 +53,7 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 | Catalog | `PageUp` / `PageDown` / wheel | scroll the preview pane |
 | Agent | `Ctrl+Y` | toggle focus: agent ↔ favetto |
 | Agent | *(agent focus)* | every key is forwarded to the agent |
+| Agent | *(favetto focus)* `Ctrl+O` | switch to another session |
 | Agent | *(favetto focus)* `Ctrl+Q` | leave the panel |
 | Agent | *(favetto focus)* `Ctrl+N` | start a new session |
 | Agent | *(favetto focus)* `Esc` | back to Tasks |
@@ -67,6 +69,20 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 `?`, `w`, `p`, and `e` are forwarded to the embedded agent while the Agent panel
 has keyboard capture, and are typed literally into form/wizard fields when one is
 open. `p` only toggles the preview and `e` only edits on the Catalog tab.
+
+## Agent session picker
+
+Press **Ctrl+O** to list every live and retained agent session on the daemon
+(`agents.list`) and hop between concurrent runs — for example an `opencode` task
+and a `pi` task running at the same time. `↑`/`↓` moves the selection, **Enter**
+attaches the Agent panel to the chosen session (`agents.attach`), and `Esc` (or
+`Ctrl+O` again) closes the picker. Each row shows the session's agent, whether it
+is running or finished, and whether it is a headless run. `Ctrl+O` is forwarded to
+the agent while the panel has keyboard capture, like the other favetto keys.
+
+If accepting the picker or opening a task fails, the error is shown in the status
+bar (the same place the connection state and counts live) rather than only in the
+internal log ring.
 
 ## Ctrl+P menu
 

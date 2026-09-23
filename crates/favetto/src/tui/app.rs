@@ -71,6 +71,10 @@ pub enum UiAction {
     OpenAgent(String),
     /// Start a brand-new agent session for a task, ignoring any existing one.
     NewAgent(String),
+    /// Open the Ctrl+O agent-session picker (needs an async `agents.list`).
+    OpenSessions,
+    /// Attach the Agent panel to an existing session id (`agents.attach`).
+    AttachSession(String),
     /// Forward raw keystrokes to the active agent session.
     AgentInput(Vec<u8>),
     /// Start a catalog task by name (runs headlessly through the configured agent).
@@ -121,6 +125,12 @@ pub enum Popup {
     Workflow {
         scroll: u16,
         hscroll: u16,
+    },
+    /// The Ctrl+O session picker: the daemon's live/retained agent sessions,
+    /// listed so the Agent panel can hop between concurrent runs.
+    Sessions {
+        selected: usize,
+        sessions: Vec<AgentSessionInfo>,
     },
 }
 
@@ -391,6 +401,11 @@ pub struct App {
     /// When true, keystrokes are forwarded to the embedded agent; when false they
     /// are handled by the favetto TUI. Toggled with Ctrl+Y.
     pub agent_capture: bool,
+    /// True when the panel is showing a retained headless PTY that must not
+    /// receive keystrokes (a read-only replay or a live unattended run).
+    pub agent_read_only: bool,
+    /// The last `agents.start` / `agents.attach` error, shown in the status bar.
+    pub agent_error: Option<String>,
     /// The embedded terminal's inner screen rectangle (set during draw), used to
     /// translate mouse events into the agent's coordinate space.
     pub agent_area: Option<Rect>,
@@ -475,6 +490,8 @@ impl App {
             agent_running: false,
             agent_status: String::new(),
             agent_capture: false,
+            agent_read_only: false,
+            agent_error: None,
             agent_area: None,
             agent_resize: None,
             term: TerminalView::default(),
@@ -748,7 +765,23 @@ impl App {
     /// Adopt a newly started agent session (with its current screen frame) and
     /// switch to the Agent tab. Re-opening the same session keeps the existing
     /// emulator (and its size) rather than resetting it.
+    ///
+    /// A retained headless PTY (an unattended run, or a finished run being
+    /// replayed) is shown **read-only**: it is displayed but never receives
+    /// keystrokes. A headless run that is blocked on the user is the exception —
+    /// attaching is what lets the answer reach its prompt.
     pub fn open_agent(&mut self, session: AgentSessionInfo, frame: &[u8]) {
+        let read_only = session.headless && session.awaiting_input.is_none();
+        let status = if !session.headless {
+            String::new()
+        } else if session.awaiting_input.is_some() {
+            "headless run (awaiting input)".to_string()
+        } else if session.running {
+            "headless run (read-only)".to_string()
+        } else {
+            "headless run (replay, read-only)".to_string()
+        };
+
         if self.agent_session_id.as_deref() != Some(session.id.as_str()) {
             self.term = TerminalView::default();
         }
@@ -757,10 +790,27 @@ impl App {
         self.agent_task_id = session.task_id;
         self.agent_name = Some(session.agent);
         self.agent_running = session.running;
-        self.agent_status.clear();
-        // The embedded agent owns the keyboard as soon as the panel is opened.
-        self.agent_capture = true;
+        self.agent_read_only = read_only;
+        self.agent_status = status;
+        self.agent_error = None;
+        // The embedded agent owns the keyboard as soon as the panel is opened,
+        // unless the PTY is read-only.
+        self.agent_capture = !read_only;
         self.tab = Tab::Agent;
+    }
+
+    /// Replace the popup with the Ctrl+O agent-session picker. An empty list is
+    /// reported in the status bar rather than opening an empty overlay.
+    pub fn open_sessions(&mut self, sessions: Vec<AgentSessionInfo>) {
+        if sessions.is_empty() {
+            self.popup = Popup::None;
+            self.agent_error = Some("no agent sessions to switch to".to_string());
+            return;
+        }
+        self.popup = Popup::Sessions {
+            selected: 0,
+            sessions,
+        };
     }
 
     /// Feed a full-screen frame to the active session's terminal.
@@ -788,16 +838,19 @@ impl App {
     /// forwarded to the agent PTY. With favetto focused, an open popup owns the
     /// keyboard, Ctrl+P toggles the menu, and the Agent tab handles its own keys.
     pub fn handle_key(&mut self, key: KeyEvent) -> UiAction {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
         if is_focus_toggle(&key) {
-            self.agent_capture = !self.agent_capture;
+            // A read-only PTY never takes the keyboard, so focus cannot move to it.
+            if !self.agent_read_only {
+                self.agent_capture = !self.agent_capture;
+            }
             return UiAction::None;
         }
 
         // Ctrl+P closes an open popup, or opens the menu under favetto focus. While
         // the agent captures keys it is forwarded to the agent instead.
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
-        {
+        if ctrl && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P')) {
             if matches!(self.popup, Popup::None) {
                 if self.tab == Tab::Agent && self.agent_capture {
                     return self.forward_agent_key(&key);
@@ -809,6 +862,25 @@ impl App {
             return UiAction::None;
         }
 
+        // Ctrl+O opens the session picker (or closes it again). It never clobbers
+        // an unrelated popup, and is forwarded while the agent captures keys.
+        if ctrl && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O')) {
+            return match self.popup {
+                Popup::None => {
+                    if self.tab == Tab::Agent && self.agent_capture {
+                        self.forward_agent_key(&key)
+                    } else {
+                        UiAction::OpenSessions
+                    }
+                }
+                Popup::Sessions { .. } => {
+                    self.popup = Popup::None;
+                    UiAction::None
+                }
+                _ => UiAction::None,
+            };
+        }
+
         // A popup owns the keyboard while it is open.
         match &self.popup {
             Popup::Form(_) => return self.handle_form_key(key.code),
@@ -817,11 +889,12 @@ impl App {
             Popup::TaskVars(_) => return self.handle_task_vars_key(key),
             Popup::Help { .. } => return self.handle_help_key(key.code),
             Popup::Workflow { .. } => return self.handle_workflow_key(key.code),
+            Popup::Sessions { .. } => return self.handle_sessions_key(key.code),
             Popup::None => {}
         }
 
         // Agent keyboard focus: everything else is forwarded to the PTY.
-        if self.tab == Tab::Agent && self.agent_capture {
+        if self.tab == Tab::Agent && self.agent_capture && !self.agent_read_only {
             return self.forward_agent_key(&key);
         }
 
@@ -970,7 +1043,11 @@ impl App {
             }
         }
 
-        if self.tab == Tab::Agent && self.agent_running && self.agent_session_id.is_some() {
+        if self.tab == Tab::Agent
+            && self.agent_running
+            && self.agent_session_id.is_some()
+            && !self.agent_read_only
+        {
             if let Some(area) = self.agent_area {
                 if let Some(bytes) = encode_mouse(mouse, area, self.term.screen()) {
                     return UiAction::AgentInput(bytes);
@@ -1168,6 +1245,45 @@ impl App {
             _ => {}
         }
         UiAction::None
+    }
+
+    /// Keys while the Ctrl+O session picker is open: arrows move, Enter attaches,
+    /// Esc (or Ctrl+O) closes.
+    fn handle_sessions_key(&mut self, code: KeyCode) -> UiAction {
+        match code {
+            KeyCode::Esc => {
+                self.popup = Popup::None;
+                UiAction::None
+            }
+            KeyCode::Up => {
+                if let Popup::Sessions { selected, .. } = &mut self.popup {
+                    *selected = selected.saturating_sub(1);
+                }
+                UiAction::None
+            }
+            KeyCode::Down => {
+                if let Popup::Sessions { selected, sessions } = &mut self.popup {
+                    *selected = (*selected + 1).min(sessions.len().saturating_sub(1));
+                }
+                UiAction::None
+            }
+            KeyCode::Enter => {
+                let sid = match &self.popup {
+                    Popup::Sessions { selected, sessions } => {
+                        sessions.get(*selected).map(|s| s.id.clone())
+                    }
+                    _ => None,
+                };
+                match sid {
+                    Some(sid) => {
+                        self.popup = Popup::None;
+                        UiAction::AttachSession(sid)
+                    }
+                    None => UiAction::None,
+                }
+            }
+            _ => UiAction::None,
+        }
     }
 
     fn handle_menu_key(&mut self, code: KeyCode) -> UiAction {
@@ -2180,6 +2296,114 @@ mod tests {
             vars: Vec::new(),
             prompt: String::new(),
         }
+    }
+
+    fn agent_session(id: &str, headless: bool, running: bool, awaiting: bool) -> AgentSessionInfo {
+        AgentSessionInfo {
+            id: id.to_string(),
+            agent: "demo".to_string(),
+            task_id: None,
+            running,
+            headless,
+            session_id: None,
+            awaiting_input: awaiting.then(|| favetto_core::model::AwaitingInputReason {
+                kind: favetto_core::model::AwaitingInputKind::Other,
+                message: "allow?".to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn open_agent_marks_headless_runs_read_only() {
+        let mut app = App::new();
+        app.open_agent(agent_session("s1", true, true, false), b"");
+        assert!(app.agent_read_only);
+        assert!(!app.agent_capture);
+        assert_eq!(app.agent_session_id.as_deref(), Some("s1"));
+        assert!(app.agent_status.contains("read-only"));
+
+        // Ctrl+Y cannot hand a read-only PTY the keyboard, and keys go nowhere.
+        app.handle_key(key(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert!(!app.agent_capture);
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('x'), KeyModifiers::empty())),
+            UiAction::None
+        ));
+    }
+
+    #[test]
+    fn open_agent_keeps_a_blocked_headless_run_writable() {
+        let mut app = App::new();
+        app.open_agent(agent_session("s2", true, true, true), b"");
+        assert!(!app.agent_read_only);
+        assert!(app.agent_capture);
+        match app.handle_key(key(KeyCode::Char('y'), KeyModifiers::empty())) {
+            UiAction::AgentInput(bytes) => assert_eq!(bytes, b"y".to_vec()),
+            _ => panic!("expected AgentInput"),
+        }
+    }
+
+    #[test]
+    fn open_agent_keeps_interactive_sessions_writable() {
+        let mut app = App::new();
+        app.open_agent(agent_session("s3", false, true, false), b"");
+        assert!(!app.agent_read_only);
+        assert!(app.agent_capture);
+        assert!(app.agent_status.is_empty());
+    }
+
+    #[test]
+    fn open_agent_clears_a_previous_error() {
+        let mut app = App::new();
+        app.agent_error = Some("boom".to_string());
+        app.open_agent(agent_session("s4", false, true, false), b"");
+        assert!(app.agent_error.is_none());
+    }
+
+    #[test]
+    fn ctrl_o_opens_session_picker_action() {
+        let mut app = App::new();
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+            UiAction::OpenSessions
+        ));
+    }
+
+    #[test]
+    fn ctrl_o_is_forwarded_to_captured_agent() {
+        let mut app = App::new();
+        app.tab = Tab::Agent;
+        app.agent_capture = true;
+        match app.handle_key(key(KeyCode::Char('o'), KeyModifiers::CONTROL)) {
+            UiAction::AgentInput(bytes) => assert_eq!(bytes, vec![0x0f]),
+            _ => panic!("expected AgentInput"),
+        }
+        assert!(matches!(app.popup, Popup::None));
+    }
+
+    #[test]
+    fn session_picker_attaches_the_selected_session() {
+        let mut app = App::new();
+        app.open_sessions(vec![
+            agent_session("a", false, true, false),
+            agent_session("b", true, true, false),
+        ]);
+        assert!(matches!(app.popup, Popup::Sessions { selected: 0, .. }));
+
+        app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+        match app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())) {
+            UiAction::AttachSession(sid) => assert_eq!(sid, "b"),
+            _ => panic!("expected AttachSession"),
+        }
+        assert!(matches!(app.popup, Popup::None));
+    }
+
+    #[test]
+    fn session_picker_closes_and_reports_when_empty() {
+        let mut app = App::new();
+        app.open_sessions(Vec::new());
+        assert!(matches!(app.popup, Popup::None));
+        assert!(app.agent_error.is_some());
     }
 
     fn event(id: i64, kind: EventKind, payload: serde_json::Value) -> Event {
