@@ -91,6 +91,16 @@ pub struct Task {
     /// a run finishes or when the agent reports no title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_title: Option<String>,
+    /// The task that directly enqueued this one (a `spawn` parent, a `needs`
+    /// predecessor, …). `None` for a task started directly (manual, scheduled,
+    /// RPC, hook, webhook).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<Uuid>,
+    /// The workflow origin this run belongs to. A directly-started task has no
+    /// root of its own (it *is* the root, so [`Task::root_or_self`] falls back to
+    /// its id); a spawned child inherits its parent's root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_id: Option<Uuid>,
 }
 
 impl Task {
@@ -108,6 +118,12 @@ impl Task {
         let mut task = self.clone();
         task.output = None;
         task
+    }
+
+    /// The workflow root this run belongs to: its `root_id` when set, else its
+    /// own id (a directly-started task is its own root).
+    pub fn root_or_self(&self) -> Uuid {
+        self.root_id.unwrap_or(self.id)
     }
 }
 
@@ -648,6 +664,8 @@ mod tests {
             error: None,
             session_id: Some("ses_1".to_string()),
             session_title: Some("Fix the widget".to_string()),
+            parent_id: None,
+            root_id: None,
         };
         let json = serde_json::to_value(&task).unwrap();
         assert_eq!(json["session_title"], "Fix the widget");
@@ -671,6 +689,39 @@ mod tests {
         )
         .unwrap();
         assert!(legacy.session_title.is_none());
+        // Legacy payloads without lineage still decode and are their own root.
+        assert!(legacy.parent_id.is_none());
+        assert!(legacy.root_id.is_none());
+        assert_eq!(legacy.root_or_self(), legacy.id);
+    }
+
+    #[test]
+    fn task_lineage_round_trips() {
+        let parent = Uuid::new_v4();
+        let root = Uuid::new_v4();
+        let task = Task {
+            id: Uuid::new_v4(),
+            name: "t".to_string(),
+            status: TaskStatus::Succeeded,
+            input: serde_json::json!({}),
+            output: None,
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+            session_id: None,
+            session_title: None,
+            parent_id: Some(parent),
+            root_id: Some(root),
+        };
+        let json = serde_json::to_value(&task).unwrap();
+        assert_eq!(json["parent_id"], parent.to_string());
+        assert_eq!(json["root_id"], root.to_string());
+        let back: Task = serde_json::from_value(json).unwrap();
+        assert_eq!(back.parent_id, Some(parent));
+        assert_eq!(back.root_id, Some(root));
+        assert_eq!(back.root_or_self(), root);
     }
 
     #[test]

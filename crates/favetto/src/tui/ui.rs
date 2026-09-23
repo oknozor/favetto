@@ -2197,6 +2197,8 @@ mod tests {
             error: None,
             session_id: None,
             session_title: None,
+            parent_id: None,
+            root_id: None,
         }
     }
 

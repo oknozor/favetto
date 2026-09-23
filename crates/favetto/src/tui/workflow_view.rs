@@ -51,6 +51,7 @@ pub fn render(graph: &WorkflowGraph) -> Result<String, String> {
         let label = match edge.kind {
             WorkflowEdgeKind::Spawn => "spawn",
             WorkflowEdgeKind::Needs => "needs",
+            WorkflowEdgeKind::Join => "join",
         };
         dag.add_edge(from, to, Some(label));
     }
@@ -119,6 +120,16 @@ mod tests {
         assert!(text.contains("(scheduled)"), "{text}");
         assert!(text.contains("(external)"), "{text}");
         assert!(text.contains("needs"), "{text}");
+    }
+
+    #[test]
+    fn render_labels_join_edge() {
+        let graph = WorkflowGraph {
+            nodes: vec![node("a"), node("b")],
+            edges: vec![edge("a", "b", WorkflowEdgeKind::Join)],
+        };
+        let text = render(&graph).unwrap();
+        assert!(text.contains("join"), "{text}");
     }
 
     #[test]

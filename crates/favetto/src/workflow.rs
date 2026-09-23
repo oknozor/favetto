@@ -2,9 +2,11 @@
 //!
 //! Nodes are catalog tasks. Edges: `spawn = "child"` → parent→child (solid,
 //! labelled `spawn`); `needs = "other:finished"` → other→this (dashed, labelled
-//! `needs`, source resolved by stripping the suffix after `:`). Isolated tasks are
-//! still nodes; references to names absent from the catalog become dashed
-//! "external" nodes; `schedule` marks a node with `peripheries=2`.
+//! `needs`, source resolved by stripping the suffix after `:`);
+//! `needs = "other:all_finished"` → other→this (dashed, labelled `join`) as a
+//! distinct fan-in edge. Isolated tasks are still nodes; references to names
+//! absent from the catalog become dashed "external" nodes; `schedule` marks a
+//! node with `peripheries=2`.
 //!
 //! `build_dot` is pure and deterministic: task order does not affect the output.
 
@@ -13,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::tasks::TaskDef;
+use crate::tasks::{needs_parts, NeedsKind, TaskDef};
 
 /// Escape a name/label for inclusion in a quoted DOT id or label.
 fn dot_escape(s: &str) -> String {
@@ -32,13 +34,15 @@ pub struct WorkflowNode {
     pub external: bool,
 }
 
-/// The two edge kinds: `spawn = "child"` is [`Spawn`](Self::Spawn),
-/// `needs = "other:finished"` is [`Needs`](Self::Needs).
+/// The edge kinds: `spawn = "child"` is [`Spawn`](Self::Spawn),
+/// `needs = "other:finished"` is [`Needs`](Self::Needs), and the root-scoped
+/// fan-in `needs = "other:all_finished"` is [`Join`](Self::Join).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkflowEdgeKind {
     Spawn,
     Needs,
+    Join,
 }
 
 /// One directed edge of the workflow graph (`from -> to`).
@@ -88,7 +92,7 @@ pub fn build_graph(tasks: &[TaskDef]) -> WorkflowGraph {
             }
         }
         if let Some(needs) = &def.needs {
-            let source = needs.split(':').next().unwrap_or(needs.as_str());
+            let (source, _) = needs_parts(needs);
             if !names.contains(source) {
                 external.insert(source);
             }
@@ -111,11 +115,14 @@ pub fn build_graph(tasks: &[TaskDef]) -> WorkflowGraph {
             });
         }
         if let Some(needs) = &def.needs {
-            let source = needs.split(':').next().unwrap_or(needs.as_str());
+            let (source, kind) = needs_parts(needs);
             edges.push(WorkflowEdge {
                 from: source.to_string(),
                 to: def.name.clone(),
-                kind: WorkflowEdgeKind::Needs,
+                kind: match kind {
+                    NeedsKind::Finished => WorkflowEdgeKind::Needs,
+                    NeedsKind::AllFinished => WorkflowEdgeKind::Join,
+                },
             });
         }
     }
@@ -157,6 +164,11 @@ pub fn build_dot(tasks: &[TaskDef]) -> String {
             WorkflowEdgeKind::Needs => {
                 out.push_str(&format!(
                     "  \"{from}\" -> \"{to}\" [label=\"needs\", style=dashed];\n"
+                ));
+            }
+            WorkflowEdgeKind::Join => {
+                out.push_str(&format!(
+                    "  \"{from}\" -> \"{to}\" [label=\"join\", style=dashed];\n"
                 ));
             }
         }
@@ -276,6 +288,39 @@ mod tests {
             dot.contains("  \"a\" -> \"b\" [label=\"needs\", style=dashed];"),
             "{dot}"
         );
+    }
+
+    #[test]
+    fn all_finished_needs_is_a_distinct_join_edge() {
+        let mut b = task("b");
+        b.needs = Some("a:all_finished".to_string());
+        let dot = build_dot(&[task("a"), b.clone()]);
+        assert!(
+            dot.contains("  \"a\" -> \"b\" [label=\"join\", style=dashed];"),
+            "{dot}"
+        );
+        assert!(!dot.contains(":all_finished"), "{dot}");
+
+        // The structured graph uses the `Join` kind, not `Needs`.
+        let graph = build_graph(&[task("a"), b]);
+        assert_eq!(
+            graph.edges,
+            vec![WorkflowEdge {
+                from: "a".to_string(),
+                to: "b".to_string(),
+                kind: WorkflowEdgeKind::Join,
+            }]
+        );
+    }
+
+    #[test]
+    fn unknown_all_finished_target_is_an_external_node() {
+        let mut b = task("b");
+        b.needs = Some("ghost:all_finished".to_string());
+        let graph = build_graph(&[b]);
+        let ghost = graph.nodes.iter().find(|n| n.name == "ghost").unwrap();
+        assert!(ghost.external);
+        assert!(!graph.nodes.iter().any(|n| n.name.contains(':')));
     }
 
     #[test]

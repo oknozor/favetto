@@ -914,10 +914,14 @@ async fn start_oneshot_task(
         error: None,
         session_id: None,
         session_title: None,
+        parent_id: None,
+        root_id: None,
     };
     db::insert_task(&state.db, &task).await?;
     crate::metrics::inc_tasks();
-    state.bus.publish(ServerPush::TaskUpdated(task.summary()));
+    state
+        .bus
+        .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
     state
         .emit_event(
             EventKind::TaskIdle,
@@ -1058,7 +1062,9 @@ async fn finish_oneshot(
     };
     task.finished_at = Some(Utc::now());
     let _ = db::upsert_task(&state.db, &task).await;
-    state.bus.publish(ServerPush::TaskUpdated(task.summary()));
+    state
+        .bus
+        .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
     state
         .emit_event(
             if success {
@@ -1283,7 +1289,9 @@ async fn cancel_task(state: &State, id: Uuid) -> anyhow::Result<favetto_core::mo
 
     state
         .bus
-        .publish(crate::event_bus::ServerPush::TaskUpdated(task.summary()));
+        .publish(crate::event_bus::ServerPush::TaskUpdated(Box::new(
+            task.summary(),
+        )));
 
     let event = favetto_core::model::Event {
         id: 0,
@@ -1727,6 +1735,8 @@ mod tests {
             error: None,
             session_id: None,
             session_title: None,
+            parent_id: None,
+            root_id: None,
         }
     }
 
@@ -1949,6 +1959,8 @@ mod tests {
             error: None,
             session_id: None,
             session_title: None,
+            parent_id: None,
+            root_id: None,
         };
         db::insert_task(&state.db, &task).await.unwrap();
 
@@ -2017,6 +2029,8 @@ mod tests {
             error: None,
             session_id: None,
             session_title: None,
+            parent_id: None,
+            root_id: None,
         };
         db::insert_task(&state.db, &task).await.unwrap();
 
@@ -2157,6 +2171,8 @@ mod tests {
             error: None,
             session_id: None,
             session_title: None,
+            parent_id: None,
+            root_id: None,
         };
         db::insert_task(&state.db, &task).await.unwrap();
 
@@ -2224,6 +2240,8 @@ mod tests {
             error: None,
             session_id: None,
             session_title: None,
+            parent_id: None,
+            root_id: None,
         };
         let first = make("one");
         let second = make("two");

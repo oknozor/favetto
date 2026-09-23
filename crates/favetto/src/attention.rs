@@ -107,7 +107,9 @@ async fn mark_awaiting(
     }
     task.status = TaskStatus::AwaitingInput;
     if db::upsert_task(&state.db, &task).await.is_ok() {
-        state.bus.publish(ServerPush::TaskUpdated(task.summary()));
+        state
+            .bus
+            .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
     }
     state
         .emit_event(
@@ -132,7 +134,9 @@ async fn resume_task(state: &Arc<State>, task_id: Uuid) {
     }
     task.status = TaskStatus::Running;
     if db::upsert_task(&state.db, &task).await.is_ok() {
-        state.bus.publish(ServerPush::TaskUpdated(task.summary()));
+        state
+            .bus
+            .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
     }
 }
 
@@ -242,6 +246,8 @@ mod tests {
             error: None,
             session_id: None,
             session_title: None,
+            parent_id: None,
+            root_id: None,
         };
         db::insert_task(&state.db, &task).await.unwrap();
 

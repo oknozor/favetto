@@ -15,8 +15,9 @@ use favetto_core::rpc::{push, Notification};
 pub enum ServerPush {
     Event(Event),
     /// A task changed. Carries [`Task::summary`] — never the output blob; fetch
-    /// output on demand with `tasks.get`.
-    TaskUpdated(Task),
+    /// output on demand with `tasks.get`. Boxed so the (much smaller) `Event`
+    /// and `CatalogUpdated` pushes do not inherit `Task`'s size.
+    TaskUpdated(Box<Task>),
     /// The task catalog changed on disk; clients should re-fetch it.
     CatalogUpdated,
     /// Forward-looking: used once the runtime streams agent logs to clients.
@@ -32,7 +33,7 @@ impl ServerPush {
     pub fn into_notification(self) -> Notification {
         match self {
             ServerPush::Event(ev) => ev.into_notification(),
-            ServerPush::TaskUpdated(t) => t.into_notification(),
+            ServerPush::TaskUpdated(t) => (*t).into_notification(),
             ServerPush::CatalogUpdated => Notification {
                 method: push::CATALOG_UPDATED.to_string(),
                 params: serde_json::json!({}),

@@ -1,6 +1,8 @@
 //! Task executor: drains the pending task queue and runs each task through its
 //! configured external agent, plus reacts to `TaskFinished` events to start tasks
-//! that depend on them (`needs = "other:finished"`).
+//! that depend on them (`needs = "other:finished"`). A root-scoped fan-in
+//! (`needs = "other:all_finished"`) starts once after every `other` run in the
+//! same workflow root reaches a terminal state.
 //!
 //! Concurrency and isolation are configurable (`[executor]`):
 //!
@@ -28,7 +30,7 @@ use crate::config::ExecutorSettings;
 use crate::db;
 use crate::event_bus::ServerPush;
 use crate::state::State;
-use crate::tasks::TaskDef;
+use crate::tasks::{needs_parts, NeedsKind, TaskDef};
 
 /// The result of an agent run. `error` is `Some` for a non-zero exit or a
 /// missing session; `session_id`/`session_title` are carried either way so a
@@ -180,12 +182,44 @@ async fn dispatch_loop(state: Arc<State>, cfg: ExecutorSettings) {
     }
 }
 
-/// Enqueue a task (idle), announcing it on the bus and emitting `TaskIdle`.
+/// Workflow lineage for a task enqueued by another task. Empty for a task
+/// started directly (manual, scheduled, RPC, hook, webhook).
+#[derive(Debug, Clone, Copy, Default)]
+struct Lineage {
+    parent_id: Option<Uuid>,
+    root_id: Option<Uuid>,
+}
+
+impl Lineage {
+    /// The lineage of a task spawned/depended-on by `parent` (which may be the
+    /// root itself); its workflow root is inherited, falling back to the parent.
+    fn child_of(parent: &Task) -> Self {
+        Self {
+            parent_id: Some(parent.id),
+            root_id: Some(parent.root_or_self()),
+        }
+    }
+}
+
+/// Enqueue a task (idle), announcing it on the bus and emitting `TaskIdle`. The
+/// task is its own workflow root (no lineage).
 pub async fn enqueue_task(
     state: &State,
     name: String,
     input: serde_json::Value,
     dedupe_key: Option<String>,
+) -> anyhow::Result<Task> {
+    enqueue_with_lineage(state, name, input, dedupe_key, Lineage::default()).await
+}
+
+/// Enqueue a task with workflow lineage, announcing it on the bus and emitting
+/// `TaskIdle`.
+async fn enqueue_with_lineage(
+    state: &State,
+    name: String,
+    input: serde_json::Value,
+    dedupe_key: Option<String>,
+    lineage: Lineage,
 ) -> anyhow::Result<Task> {
     let task = Task {
         id: Uuid::new_v4(),
@@ -200,10 +234,14 @@ pub async fn enqueue_task(
         error: None,
         session_id: None,
         session_title: None,
+        parent_id: lineage.parent_id,
+        root_id: lineage.root_id,
     };
     db::insert_task(&state.db, &task).await?;
     crate::metrics::inc_tasks();
-    state.bus.publish(ServerPush::TaskUpdated(task.summary()));
+    state
+        .bus
+        .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
     state
         .emit_event(
             EventKind::TaskIdle,
@@ -223,7 +261,9 @@ async fn run_one(
     // `claim_task` already persisted Running; mirror it on our copy.
     task.status = TaskStatus::Running;
     task.started_at = Some(Utc::now());
-    state.bus.publish(ServerPush::TaskUpdated(task.summary()));
+    state
+        .bus
+        .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
     state
         .emit_event(
             EventKind::TaskStarted,
@@ -248,7 +288,9 @@ async fn run_one(
     task.finished_at = Some(Utc::now());
 
     let _ = db::upsert_task(&state.db, &task).await;
-    state.bus.publish(ServerPush::TaskUpdated(task.summary()));
+    state
+        .bus
+        .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
 
     // If the CLI had not written the title yet, keep polling in the background and
     // push the update when it appears, so an open TUI fills the cell live.
@@ -286,9 +328,16 @@ async fn run_one(
         )
         .await;
 
-    if success && def.spawn.is_some() {
-        if let Err(e) = spawn_from_manifest(state, &task, &def, &plan.cwd).await {
-            tracing::warn!(task = %task.name, error = %e, "failed to spawn tasks from handoff");
+    if success {
+        if let Some(spawn_task) = def.spawn.clone() {
+            if let Err(e) = spawn_from_manifest(state, &task, &def, &plan.cwd).await {
+                tracing::warn!(task = %task.name, error = %e, "failed to spawn tasks from handoff");
+            }
+            // The parent's own `TaskFinished` was emitted above, before the
+            // manifest was read, so a fan-in on the spawned child is evaluated
+            // here instead. This is also what lets an empty manifest (`[]`)
+            // resolve the barrier.
+            evaluate_join_barriers(state, &spawn_task, task.root_or_self(), Some(task.id)).await;
         }
     }
 
@@ -447,9 +496,11 @@ async fn spawn_from_manifest(
         return Ok(());
     }
 
+    let lineage = Lineage::child_of(task);
     for (i, item) in items.into_iter().enumerate() {
         let dedupe = format!("spawn:{}:{i}", task.id);
-        match enqueue_task(state, spawn_task.to_string(), item, Some(dedupe)).await {
+        match enqueue_with_lineage(state, spawn_task.to_string(), item, Some(dedupe), lineage).await
+        {
             Ok(enqueued) => {
                 tracing::info!(task = %task.name, spawned = %enqueued.id, "spawned task");
             }
@@ -682,7 +733,9 @@ async fn backfill_title(
     }
     let stored = task.session_title.clone();
     if db::upsert_task(&state.db, &task).await.is_ok() {
-        state.bus.publish(ServerPush::TaskUpdated(task.summary()));
+        state
+            .bus
+            .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
     }
     stored
 }
@@ -694,7 +747,9 @@ async fn fail_task(state: &State, task: Task, error: &str) {
     task.error = Some(error.to_string());
     task.finished_at = Some(Utc::now());
     let _ = db::upsert_task(&state.db, &task).await;
-    state.bus.publish(ServerPush::TaskUpdated(task.summary()));
+    state
+        .bus
+        .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
     state
         .emit_event(
             EventKind::TaskFinished,
@@ -1024,7 +1079,9 @@ impl DirLocks {
     }
 }
 
-/// Start every catalog task whose `needs` matches `name:finished`.
+/// React to a `TaskFinished` event: start the `:finished` dependents (once per
+/// finished instance) and resolve any `:all_finished` fan-in barriers targeting
+/// the finished task's name.
 ///
 /// `needs` (and `spawn`) values are relative-path names, so a dependency on a
 /// task in a subfolder is written as `pipelines/plan:finished`.
@@ -1032,25 +1089,40 @@ async fn start_dependents(state: &Arc<State>, ev: &Event) {
     let Some(name) = ev.payload.get("name").and_then(|n| n.as_str()) else {
         return;
     };
-    let dependents: Vec<String> = state
-        .catalog
-        .read()
-        .unwrap()
-        .iter()
-        .filter(|d| d.needs.as_deref() == Some(&format!("{name}:finished")))
-        .map(|d| d.name.clone())
-        .collect();
 
-    // Attach the finished task's result as `input._prev` so dependent prompts can
-    // reach it as `{{ prev.output }}` / `{{ prev.session_id }}`.
-    let input = match ev
+    let catalog = state.catalog.read().unwrap().clone();
+    let mut finished: Vec<String> = Vec::new();
+    let mut joins: Vec<String> = Vec::new();
+    for def in &catalog {
+        let Some(needs) = def.needs.as_deref() else {
+            continue;
+        };
+        let (source, kind) = needs_parts(needs);
+        if source != name {
+            continue;
+        }
+        match kind {
+            NeedsKind::Finished => finished.push(def.name.clone()),
+            NeedsKind::AllFinished => joins.push(def.name.clone()),
+        }
+    }
+
+    // Resolve the finished task row once; both dependency kinds need it.
+    let prev = match ev
         .payload
         .get("task_id")
         .and_then(|v| v.as_str())
         .and_then(|s| Uuid::parse_str(s).ok())
     {
-        Some(id) => match db::get_task(&state.db, id).await {
-            Ok(Some(prev)) => serde_json::json!({
+        Some(id) => db::get_task(&state.db, id).await.ok().flatten(),
+        None => None,
+    };
+
+    if !finished.is_empty() {
+        // Attach the finished task's result as `input._prev` so dependent prompts
+        // can reach it as `{{ prev.output }}` / `{{ prev.session_id }}`.
+        let input = match &prev {
+            Some(prev) => serde_json::json!({
                 "_prev": {
                     "name": prev.name,
                     "task_id": prev.id.to_string(),
@@ -1059,18 +1131,160 @@ async fn start_dependents(state: &Arc<State>, ev: &Event) {
                     "session_id": prev.session_id,
                 }
             }),
-            _ => serde_json::json!({}),
-        },
-        None => serde_json::json!({}),
-    };
-
-    for dep in dependents {
-        tracing::info!(task = %dep, trigger = %name, "auto-starting dependent task");
-        let dedupe = format!("needs:{}:{}", dep, ev.id);
-        if let Err(e) = enqueue_task(state, dep, input.clone(), Some(dedupe)).await {
-            tracing::warn!(error = %e, "failed to enqueue dependent task");
+            None => serde_json::json!({}),
+        };
+        let lineage = prev.as_ref().map(Lineage::child_of).unwrap_or_default();
+        for dep in finished {
+            tracing::info!(task = %dep, trigger = %name, "auto-starting dependent task");
+            let dedupe = format!("needs:{}:{}", dep, ev.id);
+            if let Err(e) =
+                enqueue_with_lineage(state, dep, input.clone(), Some(dedupe), lineage).await
+            {
+                tracing::warn!(error = %e, "failed to enqueue dependent task");
+            }
         }
     }
+
+    if !joins.is_empty() {
+        let Some(prev) = &prev else {
+            return;
+        };
+        let root = prev.root_or_self();
+        for dep in joins {
+            maybe_start_join(state, &dep, name, root, Some(prev.id)).await;
+        }
+    }
+}
+
+/// After a `spawn` run completes — including an empty manifest — resolve the
+/// `:all_finished` barriers that target the spawned child task. The parent's own
+/// `TaskFinished` fires before the manifest is read, so this path is what makes
+/// an empty fan-out (`[]`) still start its join.
+async fn evaluate_join_barriers(
+    state: &Arc<State>,
+    target: &str,
+    root_id: Uuid,
+    parent_id: Option<Uuid>,
+) {
+    let joins: Vec<String> = state
+        .catalog
+        .read()
+        .unwrap()
+        .iter()
+        .filter(|d| {
+            d.needs.as_deref().is_some_and(|needs| {
+                let (source, kind) = needs_parts(needs);
+                source == target && kind == NeedsKind::AllFinished
+            })
+        })
+        .map(|d| d.name.clone())
+        .collect();
+    for dep in joins {
+        maybe_start_join(state, &dep, target, root_id, parent_id).await;
+    }
+}
+
+/// Start `dep` once if every task named `target` in the workflow root `root_id`
+/// is terminal. The barrier is derived from the database, so it is race-free and
+/// survives a daemon restart; `dedupe = "join:{dep}:{root_id}"` keeps concurrent
+/// last-finishers and event replays from enqueueing it twice.
+async fn maybe_start_join(
+    state: &Arc<State>,
+    dep: &str,
+    target: &str,
+    root_id: Uuid,
+    parent_id: Option<Uuid>,
+) {
+    match db::list_active_tasks_in_root(&state.db, root_id, target).await {
+        Ok(active) if active.is_empty() => {}
+        Ok(_) => return, // siblings are still pending/running
+        Err(e) => {
+            tracing::warn!(error = %e, root = %root_id, target, "failed to check fan-in barrier");
+            return;
+        }
+    }
+
+    let tasks = match db::list_tasks_in_root(&state.db, root_id, target).await {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            tracing::warn!(error = %e, root = %root_id, target, "failed to read fan-in results");
+            return;
+        }
+    };
+    let input = join_context(state, root_id, target, &tasks).await;
+    tracing::info!(task = %dep, trigger = %target, root = %root_id, count = tasks.len(), "auto-starting fan-in task");
+    let dedupe = format!("join:{dep}:{root_id}");
+    if let Err(e) = enqueue_with_lineage(
+        state,
+        dep.to_string(),
+        input,
+        Some(dedupe),
+        Lineage {
+            parent_id,
+            root_id: Some(root_id),
+        },
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "failed to enqueue fan-in task");
+    }
+}
+
+/// Build the `input._prev` aggregate exposed to a fan-in successor as
+/// `{{ prev.* }}`: the root, the target name, counts, and one entry per run.
+async fn join_context(
+    state: &Arc<State>,
+    root_id: Uuid,
+    target: &str,
+    tasks: &[Task],
+) -> serde_json::Value {
+    let root_name = db::get_task(&state.db, root_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|t| t.name);
+    let count = tasks.len();
+    let succeeded = tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Succeeded)
+        .count();
+    let failed = tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Failed)
+        .count();
+    let cancelled = tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Cancelled)
+        .count();
+    let entries: Vec<serde_json::Value> = tasks
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "task_id": t.id.to_string(),
+                "name": t.name,
+                "status": t.status.as_str(),
+                "success": t.status == TaskStatus::Succeeded,
+                "session_id": t.session_id,
+                "input": t.input,
+                "output": t.output,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "_prev": {
+            "kind": "all_finished",
+            "root": {
+                "task_id": root_id.to_string(),
+                "name": root_name,
+            },
+            "target": target,
+            "count": count,
+            "succeeded": succeeded,
+            "failed": failed,
+            "cancelled": cancelled,
+            "tasks": entries,
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1190,6 +1404,8 @@ mod tests {
             error: None,
             session_id: None,
             session_title: None,
+            parent_id: None,
+            root_id: None,
         };
         let ctx = render_context(&task);
         assert_eq!(crate::template::render("{{ task.name }}", &ctx), "triage");
@@ -1239,6 +1455,8 @@ mod tests {
             error: None,
             session_id: None,
             session_title: None,
+            parent_id: None,
+            root_id: None,
         };
         let def = def_with_vars();
         let err = run_agent_task(&state, &task, "opencode", &def, "prompt", Path::new("/tmp"))
@@ -1264,6 +1482,8 @@ mod tests {
             error: None,
             session_id: session_id.map(str::to_string),
             session_title: session_title.map(str::to_string),
+            parent_id: None,
+            root_id: None,
         }
     }
 
@@ -1623,6 +1843,8 @@ mod tests {
             error: None,
             session_id: None,
             session_title: None,
+            parent_id: None,
+            root_id: None,
         };
         let short = &task.id.to_string()[..8];
         assert_eq!(
@@ -1841,6 +2063,8 @@ mod tests {
             error: None,
             session_id: None,
             session_title: None,
+            parent_id: None,
+            root_id: None,
         };
         db::insert_task(&state.db, &task).await.unwrap();
 
@@ -1987,6 +2211,8 @@ mod tests {
             error: None,
             session_id: None,
             session_title: None,
+            parent_id: None,
+            root_id: None,
         };
         db::insert_task(&state.db, &task).await.unwrap();
 
@@ -1999,25 +2225,295 @@ mod tests {
                 branch: branch.to_string(),
             }),
         };
+        let spawner_id = task.id;
         run_one(&state, task, def, plan, None).await;
 
         let pending = db::next_pending_tasks(&state.db, 10).await.unwrap();
-        assert!(
-            pending.iter().any(|t| {
+        let spawned = pending
+            .iter()
+            .find(|t| {
                 t.name == "favetto/plan_issue"
                     && t.input.get("issue_id").and_then(|v| v.as_i64()) == Some(7)
-            }),
-            "spawn handoff was not enqueued; pending = {:?}",
-            pending
-                .iter()
-                .map(|t| (t.name.clone(), t.input.clone()))
-                .collect::<Vec<_>>()
-        );
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "spawn handoff was not enqueued; pending = {:?}",
+                    pending
+                        .iter()
+                        .map(|t| (t.name.clone(), t.input.clone()))
+                        .collect::<Vec<_>>()
+                )
+            });
+        // The child carries workflow lineage: its parent is the spawner and the
+        // spawner (started directly) is its own root.
+        assert_eq!(spawned.parent_id, Some(spawner_id));
+        assert_eq!(spawned.root_id, Some(spawner_id));
         assert!(
             !worktree.exists(),
             "the worktree should be reclaimed after the handoff is read"
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `State` whose live catalog is `catalog`, with no usable agent.
+    async fn join_state(dir: &Path, catalog: Vec<TaskDef>) -> Arc<State> {
+        let pool = crate::db::open(&dir.join("test.db")).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        let cfg = FavettoConfig::default();
+        let registry = AgentRegistry::from_config_with(&cfg, &|_| true).unwrap();
+        Arc::new(State::new(
+            pool,
+            EventBus::new(64),
+            Token::generate(),
+            WebhookSecrets {
+                github: None,
+                linear: None,
+            },
+            AgentManager::new(),
+            registry,
+            Arc::new(RwLock::new(cfg)),
+            dir.to_path_buf(),
+            dir.to_path_buf(),
+            Arc::new(RwLock::new(catalog)),
+            tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
+            Arc::new(RwLock::new(Vec::new())),
+        ))
+    }
+
+    /// A catalog task with the given `needs` value.
+    fn needs_def(name: &str, needs: &str) -> TaskDef {
+        crate::tasks::parse_task_md(
+            name,
+            &format!("agent = \"x\"\nneeds = {needs:?}\n---\nbody\n"),
+        )
+        .unwrap()
+    }
+
+    /// A task row with explicit lineage. `root = None` makes it its own root.
+    fn lineage_task(
+        name: &str,
+        status: TaskStatus,
+        root: Option<Uuid>,
+        parent: Option<Uuid>,
+    ) -> Task {
+        Task {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            status,
+            input: serde_json::json!({}),
+            output: None,
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+            session_id: None,
+            session_title: None,
+            parent_id: parent,
+            root_id: root,
+        }
+    }
+
+    fn finished_event(name: &str, id: Uuid) -> Event {
+        Event {
+            id: 1,
+            kind: EventKind::TaskFinished,
+            payload: serde_json::json!({
+                "name": name,
+                "task_id": id.to_string(),
+                "success": true,
+            }),
+            created_at: Utc::now(),
+        }
+    }
+
+    async fn pending_named(state: &State, name: &str) -> Vec<Task> {
+        db::next_pending_tasks(&state.db, 50)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.name == name)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn finished_dependency_fires_per_instance_with_lineage() {
+        let dir = std::env::temp_dir().join(format!("favetto-needs-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = join_state(&dir, vec![needs_def("follower", "target:finished")]).await;
+
+        let mut target = lineage_task("target", TaskStatus::Succeeded, None, None);
+        target.output = Some(serde_json::json!({ "ok": true }));
+        db::insert_task(&state.db, &target).await.unwrap();
+
+        start_dependents(&state, &finished_event("target", target.id)).await;
+
+        let followers = pending_named(&state, "follower").await;
+        assert_eq!(followers.len(), 1);
+        assert_eq!(
+            followers[0].input["_prev"]["task_id"],
+            target.id.to_string()
+        );
+        assert_eq!(followers[0].input["_prev"]["output"]["ok"], true);
+        // A dependency is a child of its predecessor; the predecessor is its own
+        // root here, so the root is inherited.
+        assert_eq!(followers[0].parent_id, Some(target.id));
+        assert_eq!(followers[0].root_id, Some(target.id));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn join_waits_for_all_siblings_then_fires_once() {
+        let dir = std::env::temp_dir().join(format!("favetto-join-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = join_state(&dir, vec![needs_def("join", "target:all_finished")]).await;
+
+        let root = lineage_task("root", TaskStatus::Succeeded, None, None);
+        db::insert_task(&state.db, &root).await.unwrap();
+        let a = lineage_task(
+            "target",
+            TaskStatus::Succeeded,
+            Some(root.id),
+            Some(root.id),
+        );
+        let b = lineage_task("target", TaskStatus::Running, Some(root.id), Some(root.id));
+        db::insert_task(&state.db, &a).await.unwrap();
+        db::insert_task(&state.db, &b).await.unwrap();
+
+        start_dependents(&state, &finished_event("target", a.id)).await;
+        assert!(
+            pending_named(&state, "join").await.is_empty(),
+            "the join fired while a sibling was still running"
+        );
+
+        let mut b_done = b.clone();
+        b_done.status = TaskStatus::Succeeded;
+        db::upsert_task(&state.db, &b_done).await.unwrap();
+        start_dependents(&state, &finished_event("target", b.id)).await;
+
+        let joins = pending_named(&state, "join").await;
+        assert_eq!(joins.len(), 1);
+        let prev = &joins[0].input["_prev"];
+        assert_eq!(prev["kind"], "all_finished");
+        assert_eq!(prev["target"], "target");
+        assert_eq!(prev["count"], 2);
+        assert_eq!(prev["succeeded"], 2);
+        assert_eq!(prev["failed"], 0);
+        assert_eq!(prev["root"]["task_id"], root.id.to_string());
+        assert_eq!(prev["root"]["name"], "root");
+        assert_eq!(prev["tasks"].as_array().unwrap().len(), 2);
+        // The join inherits the root and records the last finisher as parent.
+        assert_eq!(joins[0].parent_id, Some(b.id));
+        assert_eq!(joins[0].root_id, Some(root.id));
+
+        // Replaying the same finish event cannot enqueue the join twice.
+        start_dependents(&state, &finished_event("target", b.id)).await;
+        assert_eq!(pending_named(&state, "join").await.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn joins_are_root_scoped() {
+        let dir = std::env::temp_dir().join(format!("favetto-join-roots-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = join_state(&dir, vec![needs_def("join", "target:all_finished")]).await;
+
+        let root1 = lineage_task("root1", TaskStatus::Succeeded, None, None);
+        let root2 = lineage_task("root2", TaskStatus::Succeeded, None, None);
+        db::insert_task(&state.db, &root1).await.unwrap();
+        db::insert_task(&state.db, &root2).await.unwrap();
+        let a1 = lineage_task(
+            "target",
+            TaskStatus::Succeeded,
+            Some(root1.id),
+            Some(root1.id),
+        );
+        let b2 = lineage_task(
+            "target",
+            TaskStatus::Running,
+            Some(root2.id),
+            Some(root2.id),
+        );
+        db::insert_task(&state.db, &a1).await.unwrap();
+        db::insert_task(&state.db, &b2).await.unwrap();
+
+        // Root 1's only target finished: its join starts, root 2 is untouched.
+        start_dependents(&state, &finished_event("target", a1.id)).await;
+        let joins = pending_named(&state, "join").await;
+        assert_eq!(joins.len(), 1);
+        assert_eq!(joins[0].root_id, Some(root1.id));
+
+        // A stale finish event while root 2's target is still running must not
+        // resolve root 2's barrier (the check is derived from the database).
+        start_dependents(&state, &finished_event("target", b2.id)).await;
+        assert_eq!(pending_named(&state, "join").await.len(), 1);
+
+        let mut b2_done = b2.clone();
+        b2_done.status = TaskStatus::Succeeded;
+        db::upsert_task(&state.db, &b2_done).await.unwrap();
+        start_dependents(&state, &finished_event("target", b2.id)).await;
+        let joins = pending_named(&state, "join").await;
+        assert_eq!(joins.len(), 2);
+        let roots: Vec<Uuid> = joins.iter().filter_map(|t| t.root_id).collect();
+        assert!(roots.contains(&root1.id));
+        assert!(roots.contains(&root2.id));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn empty_fan_out_resolves_barrier() {
+        let dir = std::env::temp_dir().join(format!("favetto-join-empty-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = join_state(&dir, vec![needs_def("join", "target:all_finished")]).await;
+        let root = lineage_task("root", TaskStatus::Succeeded, None, None);
+        db::insert_task(&state.db, &root).await.unwrap();
+
+        // No `target` run was ever spawned: the empty barrier still resolves.
+        evaluate_join_barriers(&state, "target", root.id, Some(root.id)).await;
+        let joins = pending_named(&state, "join").await;
+        assert_eq!(joins.len(), 1);
+        let prev = &joins[0].input["_prev"];
+        assert_eq!(prev["count"], 0);
+        assert_eq!(prev["tasks"].as_array().unwrap().len(), 0);
+        assert_eq!(prev["succeeded"], 0);
+
+        // The dedupe key keeps a re-evaluation from enqueueing another join.
+        evaluate_join_barriers(&state, "target", root.id, Some(root.id)).await;
+        assert_eq!(pending_named(&state, "join").await.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn failed_and_cancelled_children_satisfy_barrier() {
+        let dir = std::env::temp_dir().join(format!("favetto-join-fail-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = join_state(&dir, vec![needs_def("join", "target:all_finished")]).await;
+        let root = lineage_task("root", TaskStatus::Succeeded, None, None);
+        db::insert_task(&state.db, &root).await.unwrap();
+        let failed = lineage_task("target", TaskStatus::Failed, Some(root.id), Some(root.id));
+        let cancelled = lineage_task(
+            "target",
+            TaskStatus::Cancelled,
+            Some(root.id),
+            Some(root.id),
+        );
+        db::insert_task(&state.db, &failed).await.unwrap();
+        db::insert_task(&state.db, &cancelled).await.unwrap();
+
+        start_dependents(&state, &finished_event("target", failed.id)).await;
+        let joins = pending_named(&state, "join").await;
+        assert_eq!(joins.len(), 1);
+        let prev = &joins[0].input["_prev"];
+        assert_eq!(prev["count"], 2);
+        assert_eq!(prev["succeeded"], 0);
+        assert_eq!(prev["failed"], 1);
+        assert_eq!(prev["cancelled"], 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -30,7 +30,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     finished_at INTEGER,
     error       TEXT,
     session_id  TEXT,
-    session_title TEXT
+    session_title TEXT,
+    parent_id   TEXT,
+    root_id     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -117,14 +119,26 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN session_title TEXT")
         .execute(pool)
         .await;
+    // Workflow lineage for `needs = "<task>:all_finished"` fan-in. Created here
+    // (not in `SCHEMA`) because the index references `root_id`, which does not
+    // exist yet on a legacy database until the `ALTER TABLE` above runs.
+    let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN parent_id TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN root_id TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_tasks_root_id ON tasks(root_id)")
+        .execute(pool)
+        .await;
     Ok(())
 }
 
 /// Insert a task, silently ignoring a duplicate dedupe key.
 pub async fn insert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT OR IGNORE INTO tasks (id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO tasks (id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title, parent_id, root_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(task.id.to_string())
     .bind(&task.name)
@@ -138,6 +152,8 @@ pub async fn insert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
     .bind(&task.error)
     .bind(&task.session_id)
     .bind(&task.session_title)
+    .bind(task.parent_id.map(|id| id.to_string()))
+    .bind(task.root_id.map(|id| id.to_string()))
     .execute(pool)
     .await?;
     Ok(())
@@ -146,8 +162,8 @@ pub async fn insert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
 /// Insert-or-update a task (full overwrite of mutable fields).
 pub async fn upsert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO tasks (id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "INSERT INTO tasks (id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title, parent_id, root_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
              status = excluded.status,
              output = excluded.output,
@@ -169,6 +185,8 @@ pub async fn upsert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
     .bind(&task.error)
     .bind(&task.session_id)
     .bind(&task.session_title)
+    .bind(task.parent_id.map(|id| id.to_string()))
+    .bind(task.root_id.map(|id| id.to_string()))
     .execute(pool)
     .await?;
     Ok(())
@@ -177,7 +195,7 @@ pub async fn upsert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
 /// Fetch a single task by id.
 pub async fn get_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Option<Task>> {
     let row = sqlx::query(
-        "SELECT id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title \
+        "SELECT id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title, parent_id, root_id \
          FROM tasks WHERE id = ?",
     )
     .bind(id.to_string())
@@ -190,7 +208,7 @@ pub async fn get_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Option<Task
 /// is fetched on demand with [`get_task`].
 pub async fn list_tasks(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec<Task>> {
     let rows = sqlx::query(
-        "SELECT id, name, status, input, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title \
+        "SELECT id, name, status, input, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title, parent_id, root_id \
          FROM tasks ORDER BY created_at DESC LIMIT ?",
     )
     .bind(limit.max(1))
@@ -261,6 +279,16 @@ fn row_to_task(row: &SqliteRow) -> Task {
             .try_get::<Option<String>, _>("session_title")
             .ok()
             .flatten(),
+        parent_id: row
+            .try_get::<Option<String>, _>("parent_id")
+            .ok()
+            .flatten()
+            .and_then(|s| Uuid::parse_str(&s).ok()),
+        root_id: row
+            .try_get::<Option<String>, _>("root_id")
+            .ok()
+            .flatten()
+            .and_then(|s| Uuid::parse_str(&s).ok()),
     }
 }
 
@@ -444,7 +472,7 @@ pub async fn fail_interrupted_tasks(pool: &SqlitePool) -> anyhow::Result<u64> {
 /// Up to `limit` pending tasks, oldest first (for the parallel executor).
 pub async fn next_pending_tasks(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec<Task>> {
     let rows = sqlx::query(
-        "SELECT id, name, status, input, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title \
+        "SELECT id, name, status, input, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title, parent_id, root_id \
          FROM tasks WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?",
     )
     .bind(limit.max(1))
@@ -464,6 +492,45 @@ pub async fn claim_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<bool> {
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
+}
+
+/// Tasks named `name` that belong to workflow root `root_id`, oldest first,
+/// including their output blobs. The root task itself is included when its name
+/// matches (`id = root_id`), since a directly-started task is its own root.
+pub async fn list_tasks_in_root(
+    pool: &SqlitePool,
+    root_id: Uuid,
+    name: &str,
+) -> anyhow::Result<Vec<Task>> {
+    let rows = sqlx::query(
+        "SELECT id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title, parent_id, root_id \
+         FROM tasks WHERE (root_id = ? OR id = ?) AND name = ? ORDER BY created_at ASC",
+    )
+    .bind(root_id.to_string())
+    .bind(root_id.to_string())
+    .bind(name)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(row_to_task).collect())
+}
+
+/// Non-terminal (`pending`/`running`/`awaiting_input`) tasks named `name` in the
+/// workflow root `root_id`. An empty result means a fan-in barrier is satisfied.
+pub async fn list_active_tasks_in_root(
+    pool: &SqlitePool,
+    root_id: Uuid,
+    name: &str,
+) -> anyhow::Result<Vec<Task>> {
+    let rows = sqlx::query(
+        "SELECT id, name, status, input, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title, parent_id, root_id \
+         FROM tasks WHERE (root_id = ? OR id = ?) AND name = ? AND status IN ('pending', 'running', 'awaiting_input') ORDER BY created_at ASC",
+    )
+    .bind(root_id.to_string())
+    .bind(root_id.to_string())
+    .bind(name)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(row_to_task).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -693,6 +760,8 @@ mod tests {
             error: None,
             session_id: Some("ses_123".to_string()),
             session_title: Some("Fix the widget".to_string()),
+            parent_id: None,
+            root_id: None,
         };
         upsert_task(&pool, &task).await.unwrap();
         let got = get_task(&pool, task.id).await.unwrap().unwrap();
@@ -746,10 +815,14 @@ mod tests {
             error: None,
             session_id: Some("ses_legacy".to_string()),
             session_title: Some("Legacy title".to_string()),
+            parent_id: Some(Uuid::new_v4()),
+            root_id: Some(Uuid::new_v4()),
         };
         upsert_task(&pool, &task).await.unwrap();
         let got = get_task(&pool, task.id).await.unwrap().unwrap();
         assert_eq!(got.session_title.as_deref(), Some("Legacy title"));
+        assert_eq!(got.parent_id, task.parent_id);
+        assert_eq!(got.root_id, task.root_id);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -785,6 +858,8 @@ mod tests {
             error: None,
             session_id: None,
             session_title: None,
+            parent_id: None,
+            root_id: None,
         }
     }
 
@@ -834,6 +909,7 @@ mod tests {
         for expected in [
             "idx_tasks_created_at",
             "idx_tasks_status_created_at",
+            "idx_tasks_root_id",
             "idx_events_created_at",
             "idx_notifications_sent_at",
         ] {
@@ -923,6 +999,88 @@ mod tests {
         assert_eq!(got.status, TaskStatus::AwaitingInput);
         // The wire string is stable.
         assert_eq!(got.status.as_str(), "awaiting_input");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn task_lineage_round_trips() {
+        let (dir, pool) = scratch_pool("lineage-roundtrip").await;
+        let root = Uuid::new_v4();
+        let parent = Uuid::new_v4();
+        let mut task = task_at(Utc::now(), None, None);
+        task.name = "target".to_string();
+        task.parent_id = Some(parent);
+        task.root_id = Some(root);
+        upsert_task(&pool, &task).await.unwrap();
+
+        let got = get_task(&pool, task.id).await.unwrap().unwrap();
+        assert_eq!(got.parent_id, Some(parent));
+        assert_eq!(got.root_id, Some(root));
+
+        // The root task itself has no `root_id` but is its own root.
+        let mut root_task = task_at(Utc::now(), Some(Utc::now()), None);
+        root_task.name = "target".to_string();
+        root_task.status = TaskStatus::Succeeded;
+        upsert_task(&pool, &root_task).await.unwrap();
+        assert_eq!(root_task.root_or_self(), root_task.id);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn list_tasks_in_root_scopes_by_root_and_name() {
+        let (dir, pool) = scratch_pool("root-queries").await;
+        let root_a = Uuid::new_v4();
+        let root_b = Uuid::new_v4();
+
+        // Two `target` children of root A (one terminal, one active) plus one of
+        // root B, and an unrelated name in root A.
+        let mut done = task_at(
+            Utc::now(),
+            Some(Utc::now()),
+            Some(serde_json::json!({ "ok": true })),
+        );
+        done.name = "target".to_string();
+        done.root_id = Some(root_a);
+        done.parent_id = Some(root_a);
+        let mut running = task_at(Utc::now(), None, None);
+        running.name = "target".to_string();
+        running.status = TaskStatus::Running;
+        running.root_id = Some(root_a);
+        running.parent_id = Some(root_a);
+        let mut other_root = task_at(Utc::now(), Some(Utc::now()), None);
+        other_root.name = "target".to_string();
+        other_root.root_id = Some(root_b);
+        other_root.parent_id = Some(root_b);
+        let mut noise = task_at(Utc::now(), Some(Utc::now()), None);
+        noise.name = "unrelated".to_string();
+        noise.root_id = Some(root_a);
+        for task in [&done, &running, &other_root, &noise] {
+            upsert_task(&pool, task).await.unwrap();
+        }
+
+        let all = list_tasks_in_root(&pool, root_a, "target").await.unwrap();
+        assert_eq!(all.len(), 2);
+        // Output blobs are included for the aggregate.
+        assert!(all.iter().any(|t| t.id == done.id && t.output.is_some()));
+
+        let active = list_active_tasks_in_root(&pool, root_a, "target")
+            .await
+            .unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, running.id);
+
+        // A terminal-only root has an empty barrier.
+        let root_c = Uuid::new_v4();
+        let mut only_done = task_at(Utc::now(), Some(Utc::now()), None);
+        only_done.name = "target".to_string();
+        only_done.root_id = Some(root_c);
+        upsert_task(&pool, &only_done).await.unwrap();
+        assert!(list_active_tasks_in_root(&pool, root_c, "target")
+            .await
+            .unwrap()
+            .is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

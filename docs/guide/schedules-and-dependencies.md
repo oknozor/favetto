@@ -79,14 +79,69 @@ triage → plan → implement pipeline fully declarative:
 2. each **plan** writes a handoff file and `spawn`s **implement**;
 3. **implement** opens the pull request.
 
+## Wait for every instance (fan-in)
+
+A fan-out has no built-in join: `needs = "<task>:finished"` starts its successor
+**once per finished instance**. When a step must run **once** after *all* the
+instances descended from the same run are done, use the root-scoped fan-in
+`needs = "<task>:all_finished"`:
+
+```md
+agent = "opencode"
+needs = "implement:all_finished"
+---
+Every implementation spawned by this workflow run has finished.
+
+Results (JSON): {{ prev.tasks }}
+
+Summarise the pull requests and flag the failures.
+```
+
+The join starts exactly once per **workflow root** — the task run that started
+the fan-out, tracked through `spawn` lineage and persisted across daemon
+restarts. Two concurrent fan-outs from the same catalog task stay independent:
+each resolves its own join.
+
+The barrier counts every **terminal** state (success, failure, cancelled), and an
+empty fan-out (`[]`) still resolves it. The aggregated results are attached as
+`input._prev`, reachable as <span v-pre>`{{ prev.* }}`</span>:
+
+```json
+{
+  "kind": "all_finished",
+  "root": { "task_id": "…", "name": "triage" },
+  "target": "implement",
+  "count": 5,
+  "succeeded": 4,
+  "failed": 1,
+  "cancelled": 0,
+  "tasks": [
+    {
+      "task_id": "…",
+      "name": "implement",
+      "status": "succeeded",
+      "success": true,
+      "session_id": "…",
+      "input": { "issue_id": 123 },
+      "output": { "…": "…" }
+    }
+  ]
+}
+```
+
+<span v-pre>`{{ prev.tasks }}`</span> renders the whole array, so the successor can
+review every child's output and react to `prev.failed`. A fan-in whose target is
+never spawned in a root never fires; only the "spawned zero" case is covered.
+
 ::: tip Inspect the graph
-Press `w` in the TUI to render the catalog's `needs`/`spawn` edges as a
-box-drawing graph (also persisted as Graphviz DOT at `<data_dir>/workflow.dot`).
+Press `w` in the TUI to render the catalog's `needs`, `spawn`, and fan-in `join`
+edges as a box-drawing graph (also persisted as Graphviz DOT at
+`<data_dir>/workflow.dot`).
 :::
 
 ![favetto workflow graph](/screenshots/workflow-graph.png)
 
-*The `w` workflow overlay: `needs` and `spawn` edges between tasks.*
+*The `w` workflow overlay: `needs`, `spawn`, and `join` edges between tasks.*
 
 See the [task file format reference](../reference/tasks) for the exact header
 keys, and [Events](../reference/events) for `task_finished` and the other
