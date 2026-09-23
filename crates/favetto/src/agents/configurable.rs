@@ -270,7 +270,10 @@ impl Agent for ConfigurableAgent {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+    use crate::config::GitSettings;
 
     fn config() -> AgentConfig {
         AgentConfig {
@@ -339,5 +342,127 @@ mod tests {
         assert!(!caps.providers);
         assert!(!caps.model_selection);
         assert!(agent.provider_source().is_none());
+    }
+
+    #[test]
+    fn overlay_copies_every_template_field() {
+        // Exhaustive literal on purpose: no `..Default::default()`, so adding a
+        // field to `AgentConfig` breaks compilation here until `overlay` and the
+        // copy assertions below are updated. `agent_type` and `git` are listed
+        // too even though they are deliberately *not* overlaid (dispatch and git
+        // provisioning are handled elsewhere).
+        let overrides = AgentConfig {
+            agent_type: Some("override-type".to_string()),
+            command: "override".to_string(),
+            args: vec!["--override".to_string()],
+            headless_args: Some(vec!["override-headless".to_string()]),
+            run_args: Some(vec!["override-run".to_string()]),
+            resume_args: Some(vec!["override-resume".to_string()]),
+            interactive_model_args: Some(vec!["override-model".to_string()]),
+            session_id_json_key: Some("overrideSessionId".to_string()),
+            prompt_args: Some(vec!["override-prompt".to_string()]),
+            submit_prompt: Some(true),
+            env: BTreeMap::from([
+                ("SHARED".to_string(), "override".to_string()),
+                ("OVERRIDE_ONLY".to_string(), "1".to_string()),
+            ]),
+            cwd: Some(PathBuf::from("/override")),
+            git: Some(GitSettings {
+                user_name: Some("override".to_string()),
+                ..Default::default()
+            }),
+        };
+
+        let base = AgentConfig {
+            agent_type: Some("base-type".to_string()),
+            command: "base".to_string(),
+            args: vec!["--base".to_string()],
+            headless_args: Some(vec!["base-headless".to_string()]),
+            run_args: Some(vec!["base-run".to_string()]),
+            resume_args: Some(vec!["base-resume".to_string()]),
+            interactive_model_args: Some(vec!["base-model".to_string()]),
+            session_id_json_key: Some("baseSessionId".to_string()),
+            prompt_args: Some(vec!["base-prompt".to_string()]),
+            submit_prompt: Some(false),
+            env: BTreeMap::from([
+                ("SHARED".to_string(), "base".to_string()),
+                ("BASE_ONLY".to_string(), "1".to_string()),
+            ]),
+            cwd: Some(PathBuf::from("/base")),
+            git: Some(GitSettings {
+                user_name: Some("base".to_string()),
+                ..Default::default()
+            }),
+        };
+        let base_before = base.clone();
+
+        let mut merged = base;
+        overlay(&mut merged, &overrides);
+
+        // Every template field is copied from the override.
+        assert_eq!(merged.command, "override");
+        assert_eq!(merged.args, vec!["--override"]);
+        assert_eq!(merged.headless_args, overrides.headless_args);
+        assert_eq!(merged.run_args, overrides.run_args);
+        assert_eq!(merged.resume_args, overrides.resume_args);
+        assert_eq!(
+            merged.interactive_model_args,
+            overrides.interactive_model_args
+        );
+        assert_eq!(merged.session_id_json_key, overrides.session_id_json_key);
+        assert_eq!(merged.prompt_args, overrides.prompt_args);
+        assert_eq!(merged.submit_prompt, Some(true));
+        assert_eq!(merged.cwd, overrides.cwd);
+
+        // `env` merges key-by-key: the override wins for shared keys, new keys
+        // are added, and base-only keys survive.
+        assert_eq!(
+            merged.env.get("SHARED").map(String::as_str),
+            Some("override")
+        );
+        assert_eq!(merged.env.get("BASE_ONLY").map(String::as_str), Some("1"));
+        assert_eq!(
+            merged.env.get("OVERRIDE_ONLY").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(merged.env.len(), 3);
+
+        // Intentional non-overlays keep their base values.
+        assert_eq!(merged.agent_type.as_deref(), Some("base-type"));
+        assert_eq!(merged.git, base_before.git);
+    }
+
+    #[test]
+    fn overlay_absent_template_fields_keep_base() {
+        let base = AgentConfig {
+            command: "base".to_string(),
+            args: vec!["--base".to_string()],
+            headless_args: Some(vec!["base-headless".to_string()]),
+            run_args: Some(vec!["base-run".to_string()]),
+            resume_args: Some(vec!["base-resume".to_string()]),
+            interactive_model_args: Some(vec!["base-model".to_string()]),
+            session_id_json_key: Some("baseSessionId".to_string()),
+            prompt_args: Some(vec!["base-prompt".to_string()]),
+            submit_prompt: Some(false),
+            env: BTreeMap::from([("BASE_ONLY".to_string(), "1".to_string())]),
+            cwd: Some(PathBuf::from("/base")),
+            ..Default::default()
+        };
+
+        let mut merged = base.clone();
+        // An all-default override must not clobber any base value.
+        overlay(&mut merged, &AgentConfig::default());
+
+        assert_eq!(merged.command, base.command);
+        assert_eq!(merged.args, base.args);
+        assert_eq!(merged.headless_args, base.headless_args);
+        assert_eq!(merged.run_args, base.run_args);
+        assert_eq!(merged.resume_args, base.resume_args);
+        assert_eq!(merged.interactive_model_args, base.interactive_model_args);
+        assert_eq!(merged.session_id_json_key, base.session_id_json_key);
+        assert_eq!(merged.prompt_args, base.prompt_args);
+        assert_eq!(merged.submit_prompt, base.submit_prompt);
+        assert_eq!(merged.env, base.env);
+        assert_eq!(merged.cwd, base.cwd);
     }
 }
