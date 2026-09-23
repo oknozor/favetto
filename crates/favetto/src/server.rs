@@ -607,10 +607,11 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
 /// Resolve the requested (or default) agent and spawn a PTY session.
 ///
 /// Task runs are headless (their PTY carries machine output such as JSON), so
-/// when a session id is known — from the task row or captured from a still-running
-/// run — the agent's `resume_args` open a real interactive TUI. A live interactive
-/// session is attached directly. An agent that cannot resume keeps its retained
-/// PTY: a finished run is replayed and a still-running run is attached read-only
+/// once the run has exited and a session id is known — from the request, the task
+/// row, or the exited run — the agent's `resume_args` open a real interactive TUI.
+/// A live interactive session is attached directly. A headless run still in
+/// flight (or an agent that cannot resume) keeps its retained PTY: a finished run
+/// is replayed and a still-running run is attached read-only
 /// (`AgentSessionInfo::headless` tells the client not to forward keystrokes).
 async fn start_agent(
     state: &Arc<State>,
@@ -711,15 +712,25 @@ async fn start_agent(
             }
         }
 
+        // A headless run that is still in flight owns its session file: resuming
+        // it here would race two writers on the same agent session. Attach the
+        // retained PTY read-only until it exits (or blocks on the user, above).
+        if let Some(existing) = &live {
+            if existing.running && existing.headless {
+                return Ok(existing.clone());
+            }
+        }
+
         // Otherwise resume the agent's own session, never the headless run's PTY
         // (whose screen is machine output). The id comes from the request, the
-        // task row, or the running run once its output has been parsed.
+        // task row, or an exited run whose session id was captured (the row write
+        // may not have landed yet).
         if agent.capabilities().resume {
             let sid = match session_id.clone() {
                 Some(sid) => Some(sid),
                 None => match persisted_session_id(state, task_id.as_deref()).await {
                     Some(sid) => Some(sid),
-                    None => wait_for_run_session_id(state, task_id.as_deref()).await,
+                    None => live.as_ref().and_then(|s| s.session_id.clone()),
                 },
             };
             if let Some(sid) = sid {
@@ -757,23 +768,6 @@ async fn start_agent(
 /// waiting for the user (so keystrokes can answer the prompt).
 fn should_attach_to_live(info: &AgentSessionInfo) -> bool {
     info.running && (!info.headless || info.awaiting_input.is_some())
-}
-
-/// Wait briefly for a still-running headless run to publish its agent session id
-/// (parsed from its JSON output). Returns `None` if there is no running run.
-async fn wait_for_run_session_id(state: &Arc<State>, task_id: Option<&str>) -> Option<String> {
-    let task_id = task_id?;
-    for _ in 0..50 {
-        let session = state.agents.find_latest_by_task(task_id)?;
-        if !session.running {
-            return None;
-        }
-        if let Some(sid) = state.agents.external_session_id(&session.id) {
-            return Some(sid);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    None
 }
 
 /// The agent session id persisted on a task row, if any.
@@ -1863,7 +1857,8 @@ mod tests {
     fn should_attach_to_live_allows_awaiting_headless_session() {
         // Live interactive TUI: attach.
         assert!(should_attach_to_live(&live_session(true, false, false)));
-        // Running headless without a prompt: don't attach (resume instead).
+        // Running headless without a prompt: this check declines; `start_agent`
+        // keeps the retained PTY read-only until the run exits.
         assert!(!should_attach_to_live(&live_session(true, true, false)));
         // Headless but blocked on the user: attach so keystrokes reach it.
         assert!(should_attach_to_live(&live_session(true, true, true)));
@@ -2207,6 +2202,117 @@ mod tests {
         assert_eq!(sessions[0].id, info.id);
 
         state.agents.close(&info.id).ok();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A resumable agent whose headless run is still writing its session must not
+    /// be resumed concurrently: `start_agent` attaches the retained PTY instead.
+    /// Once the run is gone, a persisted session id resumes the interactive TUI.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agents_start_does_not_resume_a_live_headless_writer() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("start-live-resume");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::write(tasks_dir.join("issue.md"), "agent = \"rsm\"\n---\nbody\n").unwrap();
+
+        // A resumable agent (it has `resume_args`) whose run stays alive.
+        let script = dir.join("fake-rsm.sh");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let state = agent_state(
+            &dir,
+            &tasks_dir,
+            "rsm",
+            vec![(
+                "rsm",
+                crate::config::AgentConfig {
+                    command: script.to_string_lossy().into_owned(),
+                    headless_args: Some(vec!["run".to_string(), "{prompt}".to_string()]),
+                    resume_args: Some(vec!["resume".to_string(), "{session_id}".to_string()]),
+                    ..Default::default()
+                },
+            )],
+        )
+        .await;
+
+        let task = Task {
+            id: Uuid::new_v4(),
+            name: "issue".to_string(),
+            status: TaskStatus::Running,
+            input: serde_json::json!({}),
+            output: None,
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: Some(Utc::now()),
+            finished_at: None,
+            error: None,
+            session_id: Some("ses-live".to_string()),
+            session_title: None,
+            parent_id: None,
+            root_id: None,
+        };
+        db::insert_task(&state.db, &task).await.unwrap();
+
+        let agent = state.registry.get_checked("rsm").unwrap();
+        assert!(agent.capabilities().resume);
+        let info = state
+            .agents
+            .start(
+                "rsm",
+                agent,
+                Some(task.id.to_string()),
+                Invocation::Headless {
+                    prompt: "body",
+                    provider: None,
+                    model: None,
+                },
+                AgentContext {
+                    session_id: Some("ses-live".to_string()),
+                    rows: 24,
+                    cols: 80,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(info.headless && info.running);
+        assert_eq!(info.session_id.as_deref(), Some("ses-live"));
+
+        let attached = start_agent(
+            &state,
+            &serde_json::json!({ "task_id": task.id.to_string(), "agent": "rsm" }),
+        )
+        .await
+        .expect("a live headless writer must be attached, not resumed");
+        assert_eq!(attached.id, info.id);
+        assert!(attached.headless && attached.running);
+        assert_eq!(
+            state.agents.sessions().len(),
+            1,
+            "a duplicate/resumed session was launched: {:?}",
+            state.agents.sessions()
+        );
+
+        // Once the writer is gone, the persisted id opens the interactive TUI.
+        state.agents.close(&info.id).ok();
+        let resumed = start_agent(
+            &state,
+            &serde_json::json!({ "task_id": task.id.to_string(), "agent": "rsm" }),
+        )
+        .await
+        .expect("a finished resumable run must resume");
+        assert_ne!(resumed.id, info.id);
+        assert!(
+            !resumed.headless,
+            "resume must launch an interactive session"
+        );
+
+        state.agents.close(&resumed.id).ok();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

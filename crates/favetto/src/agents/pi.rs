@@ -13,15 +13,25 @@ fn base_config() -> AgentConfig {
         // pi submits a positional initial message itself, so `submit_prompt`
         // stays unset (same as `claude`).
         prompt_args: Some(vec!["{prompt}".to_string()]),
-        headless_args: Some(vec!["-p".to_string(), "{prompt}".to_string()]),
+        // A deterministic `{session_id}` is bound to every headless run so the
+        // created session can later be reopened with `resume_args`.
+        headless_args: Some(vec![
+            "-p".to_string(),
+            "--session-id".to_string(),
+            "{session_id}".to_string(),
+            "{prompt}".to_string(),
+        ]),
         run_args: Some(vec![
             "-p".to_string(),
             "--provider".to_string(),
             "{provider}".to_string(),
             "--model".to_string(),
             "{model}".to_string(),
+            "--session-id".to_string(),
+            "{session_id}".to_string(),
             "{prompt}".to_string(),
         ]),
+        resume_args: Some(vec!["--session".to_string(), "{session_id}".to_string()]),
         interactive_model_args: Some(vec![
             "--provider".to_string(),
             "{provider}".to_string(),
@@ -88,6 +98,8 @@ mod tests {
             prompt: prompt.map(str::to_string),
             provider: provider.map(str::to_string),
             model: model.map(str::to_string),
+            // A headless run always carries a deterministic id.
+            session_id: Some("ses-1234".to_string()),
             ..Default::default()
         }
     }
@@ -102,7 +114,7 @@ mod tests {
         assert!(caps.interactive);
         assert!(caps.headless);
         assert!(caps.model_selection);
-        assert!(!caps.resume);
+        assert!(caps.resume);
         assert!(!caps.providers);
         assert!(!caps.structured_output);
         assert!(!caps.reports_session_id);
@@ -169,7 +181,7 @@ mod tests {
                 &ctx(Some("do it"), None, None),
             )
             .unwrap();
-        assert_eq!(spec.args, vec!["-p", "do it"]);
+        assert_eq!(spec.args, vec!["-p", "--session-id", "ses-1234", "do it"]);
         assert!(spec.stdin_eof);
         assert!(spec.stdin_prompt.is_none());
     }
@@ -188,7 +200,25 @@ mod tests {
             .unwrap();
         assert_eq!(
             spec.args,
-            vec!["-p", "--provider", "mistral", "--model", "large", "do it"]
+            vec![
+                "-p",
+                "--provider",
+                "mistral",
+                "--model",
+                "large",
+                "--session-id",
+                "ses-1234",
+                "do it"
+            ]
         );
+    }
+
+    #[test]
+    fn resume_reopens_a_session_interactively() {
+        let spec = agent()
+            .command(&Invocation::Resume("ses-1234"), &ctx(None, None, None))
+            .unwrap();
+        assert_eq!(spec.args, vec!["--session", "ses-1234"]);
+        assert!(spec.stdin_prompt.is_none());
     }
 }

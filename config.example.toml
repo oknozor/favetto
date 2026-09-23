@@ -64,8 +64,9 @@ default = "opencode"
 # command = "pi"
 # args = []
 # prompt_args = ["{prompt}"]                     # seed an interactive session
-# headless_args = ["-p", "{prompt}"]             # unattended, agent default model
-# run_args = ["-p", "--provider", "{provider}", "--model", "{model}", "{prompt}"]
+# headless_args = ["-p", "--session-id", "{session_id}", "{prompt}"]  # unattended
+# run_args = ["-p", "--provider", "{provider}", "--model", "{model}", "--session-id", "{session_id}", "{prompt}"]
+# resume_args = ["--session", "{session_id}"]    # reopen the run in the TUI
 # interactive_model_args = ["--provider", "{provider}", "--model", "{model}"]
 #
 # [agents.vibe]

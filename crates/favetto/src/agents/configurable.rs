@@ -107,6 +107,7 @@ impl TemplateAgent {
                     ("{prompt}", prompt.unwrap_or("")),
                     ("{provider}", provider),
                     ("{model}", model.unwrap_or("")),
+                    ("{session_id}", ctx.session_id.as_deref().unwrap_or("")),
                 ];
                 let prompt_via_args = append_template(&mut args, template, &vars);
                 if !prompt_via_args {
@@ -294,6 +295,34 @@ mod tests {
         assert!(caps.structured_output);
         assert!(caps.reports_session_id);
         assert!(caps.prompt_prefill);
+    }
+
+    #[test]
+    fn headless_substitutes_session_id() {
+        let mut config = config();
+        config.headless_args = Some(vec![
+            "run".to_string(),
+            "--session-id".to_string(),
+            "{session_id}".to_string(),
+            "{prompt}".to_string(),
+        ]);
+        let agent = ConfigurableAgent::from_config("mycli", &config);
+        let ctx = AgentContext {
+            prompt: Some("hi".to_string()),
+            session_id: Some("ses-9".to_string()),
+            ..Default::default()
+        };
+        let spec = agent
+            .command(
+                &Invocation::Headless {
+                    prompt: "hi",
+                    provider: None,
+                    model: None,
+                },
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(spec.args, vec!["run", "--session-id", "ses-9", "hi"]);
     }
 
     #[test]
