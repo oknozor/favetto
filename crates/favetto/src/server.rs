@@ -55,11 +55,14 @@ pub async fn serve_connection(state: Arc<State>, mut incoming: BoxIn, mut outgoi
         loop {
             match push_rx.recv().await {
                 Ok(push) => {
-                    if push_tx
-                        .send(Frame::Notification(push.into_notification()))
-                        .await
-                        .is_err()
-                    {
+                    let frame = match push.into_notification() {
+                        Ok(n) => Frame::Notification(n),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "dropping push: serialization failed");
+                            continue;
+                        }
+                    };
+                    if push_tx.send(frame).await.is_err() {
                         break;
                     }
                 }
@@ -167,11 +170,17 @@ async fn handle_request(
             match db::events_after(&state.db, last, 500).await {
                 Ok(events) => {
                     for ev in events {
-                        if out_tx
-                            .send(Frame::Notification(ev.into_notification()))
-                            .await
-                            .is_err()
-                        {
+                        let frame = match ev.into_notification() {
+                            Ok(n) => Frame::Notification(n),
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "dropping replayed event: serialization failed"
+                                );
+                                continue;
+                            }
+                        };
+                        if out_tx.send(frame).await.is_err() {
                             break;
                         }
                     }

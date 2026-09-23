@@ -30,6 +30,7 @@ use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::Terminal;
+use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 
 use favetto_core::model::{
@@ -247,87 +248,106 @@ pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
     result
 }
 
+/// Best-effort RPC fetch: decode the result, logging (and swallowing) any
+/// transport, RPC, or decode failure with the method name.
+///
+/// The initial sync is deliberately tolerant — one failing method must not abort
+/// the snapshot — but a partial snapshot used to be indistinguishable from an
+/// empty daemon. Logging every failure with its method keeps that visible.
+async fn fetch_rpc<T: DeserializeOwned>(
+    client: &Client,
+    method: &str,
+    params: serde_json::Value,
+) -> Option<T> {
+    let resp = match client.request(method, params).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::warn!(method, error = %e, "rpc request failed");
+            return None;
+        }
+    };
+    let value = match resp.result {
+        Some(v) => v,
+        None => {
+            match resp.error {
+                Some(e) => {
+                    tracing::warn!(method, code = e.code, message = %e.message, "rpc returned an error")
+                }
+                None => tracing::warn!(method, "rpc returned no result"),
+            }
+            return None;
+        }
+    };
+    match serde_json::from_value::<T>(value) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(method, error = %e, "rpc result decode failed");
+            None
+        }
+    }
+}
+
 /// Fetch the initial snapshot and subscribe for live pushes.
 async fn sync_initial(client: &Client, app: &mut App) {
-    if let Ok(resp) = client.request(method::PING, serde_json::json!({})).await {
-        if let Some(v) = resp.result {
-            app.daemon_cwd = v.get("cwd").and_then(|c| c.as_str()).map(str::to_string);
-        }
-    }
-
-    if let Ok(resp) = client
-        .request(method::TASKS_LIST, serde_json::json!({}))
-        .await
+    if let Some(v) =
+        fetch_rpc::<serde_json::Value>(client, method::PING, serde_json::json!({})).await
     {
-        if let Some(v) = resp.result {
-            if let Ok(tasks) = serde_json::from_value::<Vec<Task>>(v) {
-                app.tasks = tasks;
-            }
-        }
+        app.daemon_cwd = v.get("cwd").and_then(|c| c.as_str()).map(str::to_string);
     }
 
-    if let Ok(resp) = client
-        .request(method::EVENTS_TAIL, serde_json::json!({ "limit": 100 }))
-        .await
+    if let Some(tasks) =
+        fetch_rpc::<Vec<Task>>(client, method::TASKS_LIST, serde_json::json!({})).await
     {
-        if let Some(v) = resp.result {
-            if let Ok(events) = serde_json::from_value::<Vec<Event>>(v) {
-                // Replayed history must not fire a burst of stale sounds.
-                app.sound_suppressed = true;
-                for ev in events {
-                    app.ingest_event(ev);
-                }
-                app.sound_suppressed = false;
-            }
-        }
+        app.tasks = tasks;
     }
 
-    if let Ok(resp) = client
-        .request(method::SCHEDULES_LIST, serde_json::json!({}))
-        .await
+    if let Some(events) = fetch_rpc::<Vec<Event>>(
+        client,
+        method::EVENTS_TAIL,
+        serde_json::json!({ "limit": 100 }),
+    )
+    .await
     {
-        if let Some(v) = resp.result {
-            if let Ok(schedules) = serde_json::from_value::<Vec<Schedule>>(v) {
-                app.schedules = schedules;
-            }
+        // Replayed history must not fire a burst of stale sounds.
+        app.sound_suppressed = true;
+        for ev in events {
+            app.ingest_event(ev);
         }
+        app.sound_suppressed = false;
     }
 
-    if let Ok(resp) = client
-        .request(
-            method::NOTIFICATIONS_LIST,
-            serde_json::json!({ "limit": 100 }),
-        )
-        .await
+    if let Some(schedules) =
+        fetch_rpc::<Vec<Schedule>>(client, method::SCHEDULES_LIST, serde_json::json!({})).await
     {
-        if let Some(v) = resp.result {
-            if let Ok(notifications) = serde_json::from_value::<Vec<NotificationRecord>>(v) {
-                app.notifications = notifications;
-            }
-        }
+        app.schedules = schedules;
     }
 
-    let _ = client
-        .request(
-            method::EVENTS_SUBSCRIBE,
-            serde_json::json!({ "last_event_id": app.last_event_id }),
-        )
-        .await;
+    if let Some(notifications) = fetch_rpc::<Vec<NotificationRecord>>(
+        client,
+        method::NOTIFICATIONS_LIST,
+        serde_json::json!({ "limit": 100 }),
+    )
+    .await
+    {
+        app.notifications = notifications;
+    }
+
+    let _ = fetch_rpc::<serde_json::Value>(
+        client,
+        method::EVENTS_SUBSCRIBE,
+        serde_json::json!({ "last_event_id": app.last_event_id }),
+    )
+    .await;
 
     fetch_catalog(client, app).await;
 }
 
 /// Fetch the task catalog.
 async fn fetch_catalog(client: &Client, app: &mut App) {
-    if let Ok(resp) = client
-        .request(method::CATALOG_LIST, serde_json::json!({}))
-        .await
+    if let Some(catalog) =
+        fetch_rpc::<Vec<CatalogEntry>>(client, method::CATALOG_LIST, serde_json::json!({})).await
     {
-        if let Some(v) = resp.result {
-            if let Ok(catalog) = serde_json::from_value::<Vec<CatalogEntry>>(v) {
-                app.set_catalog(catalog);
-            }
-        }
+        app.set_catalog(catalog);
     }
 }
 
