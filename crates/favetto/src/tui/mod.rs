@@ -753,6 +753,9 @@ async fn open_agent(client: &Client, app: &mut App, task_id: String, force_new: 
     if let Some(agent) = entry.as_ref().and_then(|e| e.agent.clone()) {
         params["agent"] = serde_json::json!(agent);
     }
+    if let Some(provider) = entry.as_ref().and_then(|e| e.provider.clone()) {
+        params["provider"] = serde_json::json!(provider);
+    }
     if let Some(model) = entry.as_ref().and_then(|e| e.model.clone()) {
         params["model"] = serde_json::json!(model);
     }
