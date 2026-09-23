@@ -32,33 +32,60 @@ fn numbered_option(line: &str) -> bool {
     )
 }
 
-/// The shared "does this look like a prompt" gate. Requires an interrogative or
-/// selection marker in the tail so ordinary output that merely contains a
-/// keyword (e.g. "permission" in a log line) is not matched.
+/// Explicit yes/no confirmation tokens. Matched case-insensitively anywhere in a
+/// line; these are unambiguous dialog evidence.
+const CONFIRM_MARKERS: &[&str] = &[
+    "[y/n]",
+    "(y/n)",
+    "[Y/n]",
+    "[yes/no]",
+    "(yes/no)",
+    "yes/no",
+    "press enter",
+    "press any key",
+    "press a key",
+    "esc to cancel",
+];
+
+/// Words/phrases that turn an interrogative or colon-terminated line into a
+/// prompt. Deliberately NOT matched on their own (that was the false-positive
+/// source).
+const PROMPT_VERBS: &[&str] = &[
+    "permission",
+    "allow",
+    "deny",
+    "reject",
+    "approve",
+    "passphrase",
+    "pinentry",
+    "password",
+    "enter pass",
+    "enter your",
+    "do you want",
+    "are you sure",
+    "proceed",
+    "continue",
+    "select an option",
+    "choose an option",
+    "confirm",
+];
+
+/// The shared "does this look like a prompt" gate. Requires real dialog evidence:
+/// an explicit confirmation token, a prompt verb on a question/colon-terminated
+/// line, or two or more numbered options. Bare composer glyphs, any `?`, and any
+/// line ending in `:` are no longer enough on their own.
 pub(crate) fn has_prompt_marker(lines: &[String]) -> bool {
-    const MARKERS: &[&str] = &[
-        "[y/n]",
-        "(y/n)",
-        "[y/N]",
-        "(Y/n)",
-        "[yes/no]",
-        "(yes/no)",
-        "yes/no",
-        "press enter",
-        "press any key",
-        "press a key",
-        "esc to cancel",
-        "enter to ",
-        "❯",
-        "▶",
-        "»",
-    ];
+    // A real menu / choice: two or more numbered options.
+    if lines.iter().filter(|line| numbered_option(line)).count() >= 2 {
+        return true;
+    }
     lines.iter().any(|line| {
         let lower = line.to_lowercase();
-        lower.contains('?')
-            || MARKERS.iter().any(|marker| lower.contains(marker))
-            || line.ends_with(':')
-            || numbered_option(line)
+        // Explicit confirmation tokens anywhere.
+        CONFIRM_MARKERS.iter().any(|marker| lower.contains(marker))
+            // A prompt verb only on a question or a colon-terminated line.
+            || ((lower.contains('?') || line.ends_with(':'))
+                && PROMPT_VERBS.iter().any(|verb| lower.contains(verb)))
     })
 }
 
@@ -130,11 +157,18 @@ pub(crate) fn generic_awaiting_input(text: &str) -> Option<AwaitingInputReason> 
 pub(crate) fn opencode_awaiting_input(text: &str) -> Option<AwaitingInputReason> {
     let lines = prompt_lines(text, 6);
     let joined = lines.join("\n").to_lowercase();
-    let is_dialog = joined.contains("permission")
-        || joined.contains("allow once")
-        || joined.contains("allow always")
-        || joined.contains("reject");
-    if !(is_dialog && has_prompt_marker(&lines)) {
+    // Require a permission/per-option block, not a passing mention.
+    let option_lines = lines
+        .iter()
+        .filter(|line| {
+            let line = line.to_lowercase();
+            line.contains("allow once") || line.contains("allow always") || line.contains("reject")
+        })
+        .count();
+    let is_dialog =
+        (joined.contains("permission") || joined.contains("allow") || joined.contains("reject"))
+            && option_lines >= 2;
+    if !is_dialog {
         return None;
     }
     Some(classify(&lines))
@@ -144,9 +178,10 @@ pub(crate) fn opencode_awaiting_input(text: &str) -> Option<AwaitingInputReason>
 pub(crate) fn claude_awaiting_input(text: &str) -> Option<AwaitingInputReason> {
     let lines = prompt_lines(text, 8);
     let joined = lines.join("\n").to_lowercase();
-    let is_dialog = joined.contains("do you want to proceed")
-        || (joined.contains("esc to cancel") && (joined.contains("yes") || joined.contains("no")));
-    if !(is_dialog && has_prompt_marker(&lines)) {
+    let numbered = lines.iter().filter(|line| numbered_option(line)).count() >= 2;
+    let is_dialog =
+        joined.contains("do you want to proceed") || (joined.contains("esc to cancel") && numbered);
+    if !is_dialog {
         return None;
     }
     Some(classify(&lines))
@@ -165,10 +200,6 @@ mod tests {
         let cases = [
             (
                 "Permission required: allow this tool?",
-                AwaitingInputKind::Permission,
-            ),
-            (
-                "Permission\n❯ Allow once\n  Allow always\n  Reject",
                 AwaitingInputKind::Permission,
             ),
             ("Do you want to proceed?", AwaitingInputKind::Confirmation),
@@ -206,6 +237,15 @@ mod tests {
             "Compiling foo v0.1.0",
             "the permission check is documented in the guide",
             "Select the repository from the list below", // no numbered options
+            "Steps:",
+            "Error:",
+            "func main() {",
+            "1. First step", // a single numbered item is not a menu
+            "❯",
+            "❯ Ask anything…",
+            "Here's what I'll do:",
+            "Compiling favetto v0.1.0",
+            "Done.",
             "",
         ] {
             assert!(
@@ -217,11 +257,13 @@ mod tests {
 
     #[test]
     fn match_prompt_requires_a_marker() {
-        // A keyword alone (no `?`/`:`/menu marker) is not a prompt.
+        // A keyword alone (no confirmation token or `?`/`:` line) is not a prompt.
         assert!(match_prompt(&lines("permission denied")).is_none());
-        // A marker alone classifies as `Other`.
+        // A bare question without a prompt verb is no longer a marker either.
+        assert!(match_prompt(&lines("waiting for you?")).is_none());
+        // A confirmation token classifies as `Other` when nothing else fits.
         assert_eq!(
-            match_prompt(&lines("waiting for you?")).map(|r| r.kind),
+            match_prompt(&lines("press enter")).map(|r| r.kind),
             Some(AwaitingInputKind::Other)
         );
     }
@@ -242,11 +284,13 @@ mod tests {
             Some(AwaitingInputKind::Permission)
         );
         assert!(opencode_awaiting_input("let me explain the permission model").is_none());
+        assert!(opencode_awaiting_input("I will allow it and reject the rest").is_none());
 
         assert_eq!(
             claude_awaiting_input("Do you want to proceed?\n ❯ 1. Yes\n   2. No").map(|r| r.kind),
             Some(AwaitingInputKind::Confirmation)
         );
         assert!(claude_awaiting_input("I will proceed with the change").is_none());
+        assert!(claude_awaiting_input("esc to cancel").is_none());
     }
 }
