@@ -533,6 +533,48 @@ pub async fn list_active_tasks_in_root(
     Ok(rows.iter().map(row_to_task).collect())
 }
 
+/// Set a task's status only when it currently has `from`. Targeted, so it can
+/// never overwrite `session_id`, `session_title`, `output`, or terminal fields
+/// written concurrently. Returns whether a row changed.
+pub async fn set_task_status_if(
+    pool: &SqlitePool,
+    id: Uuid,
+    to: TaskStatus,
+    from: TaskStatus,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query("UPDATE tasks SET status = ? WHERE id = ? AND status = ?")
+        .bind(to.as_str())
+        .bind(id.to_string())
+        .bind(from.as_str())
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Persist a run's session id/title without touching `status`, `output`, or any
+/// other column. `session_id` is written only when currently NULL;
+/// `session_title` only when currently NULL and `title` is `Some`. Returns
+/// whether a row matched.
+pub async fn set_task_session(
+    pool: &SqlitePool,
+    id: Uuid,
+    session_id: &str,
+    title: Option<&str>,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        "UPDATE tasks SET
+             session_id = COALESCE(session_id, ?),
+             session_title = COALESCE(session_title, ?)
+         WHERE id = ?",
+    )
+    .bind(session_id)
+    .bind(title)
+    .bind(id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 // ---------------------------------------------------------------------------
 // Retention
 // ---------------------------------------------------------------------------
@@ -1029,6 +1071,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_task_status_if_is_conditional() {
+        let (dir, pool) = scratch_pool("status-if").await;
+        let mut task = task_at(Utc::now(), None, None);
+        task.status = TaskStatus::Running;
+        upsert_task(&pool, &task).await.unwrap();
+
+        assert!(set_task_status_if(
+            &pool,
+            task.id,
+            TaskStatus::AwaitingInput,
+            TaskStatus::Running
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            get_task(&pool, task.id).await.unwrap().unwrap().status,
+            TaskStatus::AwaitingInput
+        );
+
+        // Wrong source status: no-op.
+        assert!(!set_task_status_if(
+            &pool,
+            task.id,
+            TaskStatus::AwaitingInput,
+            TaskStatus::Running
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            get_task(&pool, task.id).await.unwrap().unwrap().status,
+            TaskStatus::AwaitingInput
+        );
+
+        assert!(set_task_status_if(
+            &pool,
+            task.id,
+            TaskStatus::Running,
+            TaskStatus::AwaitingInput
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            get_task(&pool, task.id).await.unwrap().unwrap().status,
+            TaskStatus::Running
+        );
+
+        // Unknown id: no row matched.
+        assert!(!set_task_status_if(
+            &pool,
+            Uuid::new_v4(),
+            TaskStatus::Running,
+            TaskStatus::AwaitingInput,
+        )
+        .await
+        .unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn list_tasks_in_root_scopes_by_root_and_name() {
         let (dir, pool) = scratch_pool("root-queries").await;
         let root_a = Uuid::new_v4();
@@ -1081,6 +1183,39 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn set_task_session_never_touches_status() {
+        let (dir, pool) = scratch_pool("set-session").await;
+        let mut task = task_at(Utc::now(), None, None);
+        task.status = TaskStatus::AwaitingInput;
+        task.output = Some(serde_json::json!({ "keep": true }));
+        upsert_task(&pool, &task).await.unwrap();
+
+        assert!(set_task_session(&pool, task.id, "ses_1", Some("Title"))
+            .await
+            .unwrap());
+        let got = get_task(&pool, task.id).await.unwrap().unwrap();
+        assert_eq!(got.status, TaskStatus::AwaitingInput);
+        assert_eq!(got.session_id.as_deref(), Some("ses_1"));
+        assert_eq!(got.session_title.as_deref(), Some("Title"));
+        assert_eq!(got.output, Some(serde_json::json!({ "keep": true })));
+
+        // A second call must not overwrite the already-stored values (COALESCE).
+        set_task_session(&pool, task.id, "ses_2", Some("Other"))
+            .await
+            .unwrap();
+        let got = get_task(&pool, task.id).await.unwrap().unwrap();
+        assert_eq!(got.session_id.as_deref(), Some("ses_1"));
+        assert_eq!(got.session_title.as_deref(), Some("Title"));
+
+        // Unknown id: no row matched.
+        assert!(!set_task_session(&pool, Uuid::new_v4(), "ses_x", None)
+            .await
+            .unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

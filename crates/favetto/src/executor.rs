@@ -714,30 +714,42 @@ async fn backfill_title(
     attempts: u32,
     interval: Duration,
 ) -> Option<String> {
-    let Ok(Some(mut task)) = db::get_task(&state.db, task_id).await else {
+    // Fast read for the idempotence check only; do NOT keep this snapshot across
+    // the long `resolve_session_title` await below.
+    let Ok(Some(existing)) = db::get_task(&state.db, task_id).await else {
         return None;
     };
     // Already complete: don't do a redundant write/publish.
-    if task.session_id.as_deref() == Some(session_id.as_str()) && task.session_title.is_some() {
-        return task.session_title;
+    if existing.session_id.as_deref() == Some(session_id.as_str())
+        && existing.session_title.is_some()
+    {
+        return existing.session_title;
     }
-    if task.session_id.is_none() {
-        task.session_id = Some(session_id.clone());
-    }
-    if task.session_title.is_none() {
-        if let Some(title) =
-            resolve_session_title(agent, &session_id, &cwd, attempts, interval).await
-        {
-            task.session_title = Some(title);
+
+    // The long await happens with no snapshot held.
+    let title = if existing.session_title.is_none() {
+        resolve_session_title(agent, &session_id, &cwd, attempts, interval).await
+    } else {
+        None
+    };
+
+    // Targeted write: never touches status, so a concurrent mark/resume stands.
+    let changed = db::set_task_session(&state.db, task_id, &session_id, title.as_deref())
+        .await
+        .unwrap_or(false);
+    if changed {
+        if let Ok(Some(task)) = db::get_task(&state.db, task_id).await {
+            state
+                .bus
+                .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
         }
     }
-    let stored = task.session_title.clone();
-    if db::upsert_task(&state.db, &task).await.is_ok() {
-        state
-            .bus
-            .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
-    }
-    stored
+    // Re-read so the returned value is the authoritative stored title.
+    db::get_task(&state.db, task_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|t| t.session_title)
 }
 
 /// Mark a task failed (used when it can't even be started).
@@ -1687,6 +1699,101 @@ mod tests {
 
         let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
         assert_eq!(stored.session_title.as_deref(), Some("Existing"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fake `opencode` title lookup that blocks until `release` exists, then
+    /// prints `json` — lets a test observe the task row mid-`resolve_session_title`.
+    #[cfg(unix)]
+    fn blocked_session_list_script(
+        dir: &Path,
+        json: &str,
+        started: &Path,
+        release: &Path,
+    ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("opencode-blocked-session-list.sh");
+        let script = format!(
+            "#!/bin/sh\ntouch '{}'\nwhile [ ! -e '{}' ]; do sleep 0.02; done\nprintf '%s' '{json}'\n",
+            started.display(),
+            release.display(),
+        );
+        std::fs::write(&path, script).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    /// Regression test for #77: a concurrent `mark_awaiting` must survive a
+    /// `backfill_title` that captured the row while it was still `Running`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backfill_title_does_not_resurrect_awaiting_input() {
+        let dir = std::env::temp_dir().join(format!("favetto-backfill-race-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let started = dir.join("started");
+        let release = dir.join("release");
+        let script = blocked_session_list_script(
+            &dir,
+            r#"[{"id":"ses_1","title":"Late title"}]"#,
+            &started,
+            &release,
+        );
+        let state = title_state(&dir, &script).await;
+
+        let task = task_with_session(None, None);
+        db::insert_task(&state.db, &task).await.unwrap();
+
+        let agent = state.registry.get("opencode").unwrap();
+        let handle = tokio::spawn({
+            let state = state.clone();
+            let agent = agent.clone();
+            let dir = dir.clone();
+            async move {
+                backfill_title(
+                    &state,
+                    task.id,
+                    agent,
+                    "ses_1".to_string(),
+                    dir,
+                    1,
+                    Duration::from_millis(1),
+                )
+                .await
+            }
+        });
+
+        // Wait until the title lookup is actually blocked. At this point the
+        // backfill has already captured its `existing` snapshot as `Running`.
+        for _ in 0..200 {
+            if started.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(started.exists(), "title lookup never started");
+
+        // The watcher marks the task awaiting input while the lookup is in flight.
+        assert!(db::set_task_status_if(
+            &state.db,
+            task.id,
+            TaskStatus::AwaitingInput,
+            TaskStatus::Running,
+        )
+        .await
+        .unwrap());
+        std::fs::write(&release, b"go").unwrap();
+
+        let title = handle.await.unwrap();
+        assert_eq!(title.as_deref(), Some("Late title"));
+
+        // The stale `Running` snapshot must not have resurrected the status.
+        let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, TaskStatus::AwaitingInput);
+        assert_eq!(stored.session_id.as_deref(), Some("ses_1"));
+        assert_eq!(stored.session_title.as_deref(), Some("Late title"));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -23,25 +23,67 @@ use crate::state::State;
 /// How often the watcher polls the session's screen.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// The direction of an awaiting-input transition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Transition {
+/// Consecutive matching polls required before marking (≥2 = 1 s at
+/// [`POLL_INTERVAL`]).
+pub const MARK_STREAK: u32 = 2;
+/// Consecutive non-matching polls required before clearing (hysteresis).
+pub const CLEAR_STREAK: u32 = 3;
+
+/// A confirmed debounced edge for one session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Edge {
     /// `None -> Some(reason)`: mark the task as awaiting input.
-    Mark,
+    Mark(AwaitingInputReason),
     /// `Some(_) -> None`: the agent answered and resumed.
     Clear,
-    /// No terminal status change (including a reason changing kind).
-    None,
 }
 
-fn classify(
-    current: &Option<AwaitingInputReason>,
-    next: &Option<AwaitingInputReason>,
-) -> Transition {
-    match (current.is_some(), next.is_some()) {
-        (false, true) => Transition::Mark,
-        (true, false) => Transition::Clear,
-        _ => Transition::None,
+/// Temporal hysteresis over raw per-poll detection. A single transient frame
+/// neither raises nor clears the signal.
+#[derive(Default)]
+struct Debouncer {
+    confirmed: Option<AwaitingInputReason>,
+    match_streak: u32,
+    clear_streak: u32,
+}
+
+impl Debouncer {
+    fn confirmed(&self) -> Option<&AwaitingInputReason> {
+        self.confirmed.as_ref()
+    }
+
+    /// Feed one poll's raw detection; return a confirmed edge, if any. A reason
+    /// change while already confirmed refreshes the stored reason but never
+    /// re-emits `Mark`.
+    fn observe(&mut self, next: Option<AwaitingInputReason>) -> Option<Edge> {
+        match next {
+            Some(reason) => {
+                self.clear_streak = 0;
+                if self.confirmed.is_some() {
+                    self.match_streak = 0;
+                    self.confirmed = Some(reason);
+                    return None;
+                }
+                self.match_streak += 1;
+                if self.match_streak >= MARK_STREAK {
+                    self.match_streak = 0;
+                    self.confirmed = Some(reason.clone());
+                    return Some(Edge::Mark(reason));
+                }
+                None
+            }
+            None => {
+                self.match_streak = 0;
+                self.confirmed.as_ref()?;
+                self.clear_streak += 1;
+                if self.clear_streak >= CLEAR_STREAK {
+                    self.clear_streak = 0;
+                    self.confirmed = None;
+                    return Some(Edge::Clear);
+                }
+                None
+            }
+        }
     }
 }
 
@@ -57,28 +99,31 @@ pub async fn watch(
     task_id: Option<Uuid>,
     quiet: Duration,
 ) -> Option<i32> {
-    let mut current: Option<AwaitingInputReason> = None;
+    let mut debouncer = Debouncer::default();
     loop {
         if !state.agents.is_running(session) {
             break;
         }
-        let reason = state
+        let next = state
             .agents
             .detect_awaiting_input(session, agent.as_ref(), quiet);
-        if reason != current {
-            state.agents.set_awaiting_input(session, reason.clone());
+        if let Some(edge) = debouncer.observe(next) {
             if let Some(task_id) = task_id {
-                match classify(&current, &reason) {
-                    Transition::Mark => {
-                        if let Some(reason) = &reason {
-                            mark_awaiting(state, task_id, session, reason).await;
-                        }
+                match edge {
+                    Edge::Mark(reason) => mark_awaiting(state, task_id, session, &reason).await,
+                    Edge::Clear => {
+                        resume_task(state, task_id).await;
                     }
-                    Transition::Clear => resume_task(state, task_id).await,
-                    Transition::None => {}
                 }
             }
-            current = reason;
+        }
+        state
+            .agents
+            .set_awaiting_input(session, debouncer.confirmed().cloned());
+        if let Some(task_id) = task_id {
+            // Self-heal: re-assert the confirmed state every poll so an external
+            // overwrite (or resurrection) is repaired within POLL_INTERVAL.
+            reconcile_task(state, task_id, debouncer.confirmed().is_some()).await;
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -92,6 +137,24 @@ pub async fn watch(
     state.agents.exit_code(session)
 }
 
+/// Conditional status write + push. Returns true when a row changed.
+async fn reconcile_task(state: &Arc<State>, task_id: Uuid, awaiting: bool) -> bool {
+    let (to, from) = if awaiting {
+        (TaskStatus::AwaitingInput, TaskStatus::Running)
+    } else {
+        (TaskStatus::Running, TaskStatus::AwaitingInput)
+    };
+    let Ok(true) = db::set_task_status_if(&state.db, task_id, to, from).await else {
+        return false;
+    };
+    if let Ok(Some(task)) = db::get_task(&state.db, task_id).await {
+        state
+            .bus
+            .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
+    }
+    true
+}
+
 /// Persist a task as `AwaitingInput` and announce the event.
 async fn mark_awaiting(
     state: &Arc<State>,
@@ -99,45 +162,27 @@ async fn mark_awaiting(
     session: &str,
     reason: &AwaitingInputReason,
 ) {
-    let Ok(Some(mut task)) = db::get_task(&state.db, task_id).await else {
-        return;
-    };
-    if task.status != TaskStatus::Running {
-        return;
+    if !reconcile_task(state, task_id, true).await {
+        return; // was not Running: another writer owns the row
     }
-    task.status = TaskStatus::AwaitingInput;
-    if db::upsert_task(&state.db, &task).await.is_ok() {
+    if let Ok(Some(task)) = db::get_task(&state.db, task_id).await {
         state
-            .bus
-            .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
+            .emit_event(
+                EventKind::TaskAwaitingInput,
+                serde_json::json!({
+                    "task_id": task.id.to_string(),
+                    "name": task.name,
+                    "session_id": session,
+                    "reason": reason,
+                }),
+            )
+            .await;
     }
-    state
-        .emit_event(
-            EventKind::TaskAwaitingInput,
-            serde_json::json!({
-                "task_id": task.id.to_string(),
-                "name": task.name,
-                "session_id": session,
-                "reason": reason,
-            }),
-        )
-        .await;
 }
 
 /// Restore an awaiting-input task to `Running` once the agent resumes.
-async fn resume_task(state: &Arc<State>, task_id: Uuid) {
-    let Ok(Some(mut task)) = db::get_task(&state.db, task_id).await else {
-        return;
-    };
-    if task.status != TaskStatus::AwaitingInput {
-        return;
-    }
-    task.status = TaskStatus::Running;
-    if db::upsert_task(&state.db, &task).await.is_ok() {
-        state
-            .bus
-            .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
-    }
+async fn resume_task(state: &Arc<State>, task_id: Uuid) -> bool {
+    reconcile_task(state, task_id, false).await
 }
 
 #[cfg(test)]
@@ -158,23 +203,65 @@ mod tests {
     }
 
     #[test]
-    fn transition_classification() {
+    fn one_match_then_miss_does_not_mark() {
         use favetto_core::model::AwaitingInputKind;
+        let mut debouncer = Debouncer::default();
         assert_eq!(
-            classify(&None, &Some(reason(AwaitingInputKind::Permission))),
-            Transition::Mark
+            debouncer.observe(Some(reason(AwaitingInputKind::Permission))),
+            None
+        );
+        assert_eq!(debouncer.observe(None), None);
+        assert!(debouncer.confirmed().is_none());
+    }
+
+    #[test]
+    fn mark_requires_two_consecutive_matches() {
+        use favetto_core::model::AwaitingInputKind;
+        let mut debouncer = Debouncer::default();
+        assert_eq!(debouncer.observe(None), None);
+        assert_eq!(
+            debouncer.observe(Some(reason(AwaitingInputKind::Permission))),
+            None
+        );
+        let edge = debouncer.observe(Some(reason(AwaitingInputKind::Permission)));
+        assert_eq!(
+            edge,
+            Some(Edge::Mark(reason(AwaitingInputKind::Permission)))
         );
         assert_eq!(
-            classify(&Some(reason(AwaitingInputKind::Permission)), &None),
-            Transition::Clear
+            debouncer.confirmed().map(|r| r.kind),
+            Some(AwaitingInputKind::Permission)
         );
-        assert_eq!(classify(&None, &None), Transition::None);
+    }
+
+    #[test]
+    fn clear_requires_three_consecutive_misses() {
+        use favetto_core::model::AwaitingInputKind;
+        let mut debouncer = Debouncer::default();
+        debouncer.observe(Some(reason(AwaitingInputKind::Permission)));
+        assert!(matches!(
+            debouncer.observe(Some(reason(AwaitingInputKind::Permission))),
+            Some(Edge::Mark(_))
+        ));
+        assert_eq!(debouncer.observe(None), None);
+        assert_eq!(debouncer.observe(None), None);
+        assert_eq!(debouncer.observe(None), Some(Edge::Clear));
+        assert!(debouncer.confirmed().is_none());
+    }
+
+    #[test]
+    fn reason_change_while_confirmed_does_not_remark() {
+        use favetto_core::model::AwaitingInputKind;
+        let mut debouncer = Debouncer::default();
+        debouncer.observe(Some(reason(AwaitingInputKind::Permission)));
+        debouncer.observe(Some(reason(AwaitingInputKind::Permission)));
         assert_eq!(
-            classify(
-                &Some(reason(AwaitingInputKind::Permission)),
-                &Some(reason(AwaitingInputKind::Choice))
-            ),
-            Transition::None
+            debouncer.observe(Some(reason(AwaitingInputKind::Choice))),
+            None
+        );
+        assert_eq!(
+            debouncer.confirmed().map(|r| r.kind),
+            Some(AwaitingInputKind::Choice)
         );
     }
 
@@ -318,5 +405,57 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&release);
+    }
+
+    #[tokio::test]
+    async fn reconcile_task_self_heals_awaiting_input() {
+        let state = state_with_sh("exit 0").await;
+        let task = favetto_core::model::Task {
+            id: Uuid::new_v4(),
+            name: "oneshot".to_string(),
+            status: TaskStatus::Running,
+            input: serde_json::json!({}),
+            output: None,
+            dedupe_key: None,
+            created_at: chrono::Utc::now(),
+            started_at: Some(chrono::Utc::now()),
+            finished_at: None,
+            error: None,
+            session_id: None,
+            session_title: None,
+            parent_id: None,
+            root_id: None,
+        };
+        db::insert_task(&state.db, &task).await.unwrap();
+
+        // An external writer (e.g. a stale full-row backfill) marks the task
+        // awaiting input.
+        assert!(db::set_task_status_if(
+            &state.db,
+            task.id,
+            TaskStatus::AwaitingInput,
+            TaskStatus::Running,
+        )
+        .await
+        .unwrap());
+
+        // The watcher reconciles against the live session state and repairs it.
+        let mut rx = state.bus.subscribe();
+        assert!(reconcile_task(&state, task.id, false).await);
+        let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, TaskStatus::Running);
+        assert!(matches!(rx.try_recv(), Ok(ServerPush::TaskUpdated(_))));
+
+        // The converse: marking is also a targeted conditional write.
+        let mut rx = state.bus.subscribe();
+        assert!(reconcile_task(&state, task.id, true).await);
+        let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, TaskStatus::AwaitingInput);
+        assert!(matches!(rx.try_recv(), Ok(ServerPush::TaskUpdated(_))));
+
+        // A no-op reconcile changes nothing and publishes nothing.
+        let mut rx = state.bus.subscribe();
+        assert!(!reconcile_task(&state, task.id, true).await);
+        assert!(rx.try_recv().is_err());
     }
 }
