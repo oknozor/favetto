@@ -22,7 +22,7 @@ use base64::Engine as _;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
     self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
-    Event as CEvent, KeyCode, KeyEventKind,
+    Event as CEvent, KeyEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -48,6 +48,15 @@ enum SessionOutcome {
     Quit,
     Disconnected,
 }
+
+/// Initial reconnect backoff after a dropped or failed connection.
+const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+/// Upper bound on the reconnect backoff.
+const MAX_BACKOFF: Duration = Duration::from_secs(10);
+/// Upper bound on the initial snapshot fetch. Six sequential RPCs at the default
+/// 5s request timeout could otherwise stall a half-dead peer for ~30s before the
+/// interaction loop even starts.
+const INITIAL_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Pause/resume handshake for the input-reader thread. Before handing the
 /// terminal to an editor we must guarantee the reader is not consuming keys;
@@ -160,33 +169,48 @@ pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
 
     let mut app = App::with_theme(theme);
     app.sound_enabled = sound_cfg.enabled;
-    let mut backoff = Duration::from_millis(250);
+    let mut backoff = INITIAL_BACKOFF;
     let result = loop {
         app.conn = ConnState::Connecting;
         app.conn_detail = transport_desc(&transport);
+        // Paint the connecting state before the (bounded) connect attempt.
+        let _ = terminal.draw(|f| ui::draw(f, &mut app));
 
+        // `Client::connect` is bounded by a connect timeout, so a dead or
+        // black-holed peer cannot wedge the loop for the OS TCP timeout.
         match Client::connect(transport.clone()).await {
             Ok(client) => {
                 app.conn = ConnState::Connected;
-                sync_initial(&client, &mut app).await;
-                match run_session(
-                    &client,
-                    &mut app,
-                    &mut ev_rx,
-                    &mut terminal,
-                    &player,
-                    &input,
-                    &editor,
-                )
-                .await
+                app.conn_detail = transport_desc(&transport);
+                if tokio::time::timeout(INITIAL_SYNC_TIMEOUT, sync_initial(&client, &mut app))
+                    .await
+                    .is_ok()
                 {
-                    SessionOutcome::Quit => break Ok(()),
-                    SessionOutcome::Disconnected => {
-                        app.conn = ConnState::Disconnected;
-                        app.conn_detail = "reconnecting…".to_string();
+                    match run_session(
+                        &client,
+                        &mut app,
+                        &mut ev_rx,
+                        &mut terminal,
+                        &player,
+                        &input,
+                        &editor,
+                    )
+                    .await
+                    {
+                        SessionOutcome::Quit => break Ok(()),
+                        SessionOutcome::Disconnected => {
+                            app.conn = ConnState::Disconnected;
+                            app.conn_detail = "reconnecting…".to_string();
+                            // A live session dropped: retry promptly.
+                            backoff = INITIAL_BACKOFF;
+                        }
                     }
+                } else {
+                    // The peer accepted the connection but stalled the initial
+                    // sync; treat it as a failed attempt and keep backing off.
+                    app.conn = ConnState::Disconnected;
+                    app.conn_detail = "reconnecting…".to_string();
                 }
-                backoff = Duration::from_millis(250);
             }
             Err(e) => {
                 app.conn = ConnState::Disconnected;
@@ -194,15 +218,21 @@ pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
             }
         }
 
-        // Allow quitting while disconnected.
-        drain_quit(&mut ev_rx, &mut app);
         if app.should_quit {
             break Ok(());
         }
 
-        let _ = terminal.draw(|f| ui::draw(f, &mut app));
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(Duration::from_secs(10));
+        // Wait out the backoff without freezing the UI: keep processing global
+        // keys against the last snapshot, quit immediately, and reconnect at
+        // once if the user does something that needs the daemon.
+        match disconnected_pump(&mut app, &mut ev_rx, &mut terminal, &player, backoff).await {
+            PumpOutcome::Quit => break Ok(()),
+            // Both a finished wait and an input-triggered retry grow the backoff
+            // so a repeated failure cannot hammer the peer.
+            PumpOutcome::Retry | PumpOutcome::Reconnect => {
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
+        }
     };
 
     disable_raw_mode()?;
@@ -865,13 +895,103 @@ async fn send_agent_input(client: &Client, app: &mut App, bytes: &[u8]) {
     }
 }
 
-/// Non-blocking check for a quit key while disconnected (between reconnect attempts).
-fn drain_quit(ev_rx: &mut mpsc::UnboundedReceiver<CEvent>, app: &mut App) {
-    while let Ok(ev) = ev_rx.try_recv() {
-        if let CEvent::Key(k) = ev {
-            if k.kind == KeyEventKind::Press && matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)
-            {
-                app.should_quit = true;
+/// What [`disconnected_pump`] decided to do next.
+enum PumpOutcome {
+    /// The backoff elapsed; retry the connection.
+    Retry,
+    /// An input event needs the daemon; retry now instead of waiting it out.
+    Reconnect,
+    /// The user asked to quit.
+    Quit,
+}
+
+/// What a single input event means while disconnected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisconnectedAction {
+    /// The event was handled locally (or is irrelevant); keep waiting.
+    Continue,
+    /// The event needs the daemon; reconnect at once.
+    Reconnect,
+    /// The user asked to quit.
+    Quit,
+}
+
+/// Apply one input event while disconnected.
+///
+/// Keeps the TUI interactive offline: the normal global bindings run against the
+/// last known snapshot, `q`/`Esc` set [`App::should_quit`], and anything that
+/// would need a round-trip is reported so the caller can reconnect immediately
+/// rather than drop the key into the backoff sleep.
+fn handle_disconnected_event(app: &mut App, event: CEvent) -> DisconnectedAction {
+    let action = match event {
+        CEvent::Key(k) if k.kind == KeyEventKind::Press => app.handle_key(k),
+        CEvent::Mouse(m) => app.handle_mouse(m),
+        _ => return DisconnectedAction::Continue,
+    };
+    match action {
+        UiAction::None => DisconnectedAction::Continue,
+        UiAction::Quit => {
+            app.should_quit = true;
+            DisconnectedAction::Quit
+        }
+        _ => DisconnectedAction::Reconnect,
+    }
+}
+
+/// Wait out the reconnect backoff while keeping the UI responsive.
+///
+/// Unlike a raw `sleep`, this services input the whole time: it redraws, applies
+/// global keys to the last snapshot, and returns early on `q`/`Esc` or on
+/// daemon-backed input (which triggers an immediate reconnect). Key events are
+/// never left unread in the channel.
+async fn disconnected_pump<B: ratatui::backend::Backend>(
+    app: &mut App,
+    ev_rx: &mut mpsc::UnboundedReceiver<CEvent>,
+    terminal: &mut Terminal<B>,
+    player: &SoundPlayer,
+    backoff: Duration,
+) -> PumpOutcome {
+    let deadline = tokio::time::sleep(backoff);
+    tokio::pin!(deadline);
+    let mut anim = tokio::time::interval(Duration::from_millis(80));
+    anim.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        if app.should_quit {
+            return PumpOutcome::Quit;
+        }
+
+        let animate = app.needs_animation();
+        let _ = terminal.draw(|f| ui::draw(f, app));
+        if animate {
+            app.throbber_state.calc_next();
+        }
+
+        tokio::select! {
+            biased;
+            _ = anim.tick(), if animate => {}
+            _ = &mut deadline => return PumpOutcome::Retry,
+            ev = ev_rx.recv() => match ev {
+                None => return PumpOutcome::Quit,
+                Some(CEvent::FocusGained) => player.set_focused(true),
+                Some(CEvent::FocusLost) => player.set_focused(false),
+                Some(ev) => match handle_disconnected_event(app, ev) {
+                    DisconnectedAction::Continue => {}
+                    DisconnectedAction::Reconnect => return PumpOutcome::Reconnect,
+                    DisconnectedAction::Quit => return PumpOutcome::Quit,
+                },
+            },
+        }
+
+        // Keep the sound worker's mute/focus state in sync while offline.
+        if player.muted() != app.sound_muted {
+            player.set_muted(app.sound_muted);
+        }
+        if app.sound_muted {
+            app.take_sound_cues();
+        } else {
+            for cue in app.take_sound_cues() {
+                player.play(cue);
             }
         }
     }
@@ -938,5 +1058,114 @@ fn transport_desc(t: &Transport) -> String {
     match t {
         Transport::Unix(p) => format!("unix://{}", p.display()),
         Transport::Ws { url, .. } => url.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::collections::BTreeMap;
+
+    fn key(code: KeyCode) -> CEvent {
+        CEvent::Key(KeyEvent::new(code, KeyModifiers::empty()))
+    }
+
+    /// A player that never touches the terminal or spawns a worker.
+    fn silent_player() -> SoundPlayer {
+        SoundPlayer::start(sound::ResolvedSound {
+            enabled: false,
+            player: sound::PlayerMode::Bell,
+            sound_dir: None,
+            min_interval: Duration::ZERO,
+            only_when_unfocused: false,
+            events: BTreeMap::new(),
+        })
+    }
+
+    fn disconnected_app() -> App {
+        let mut app = App::new();
+        app.conn = ConnState::Disconnected;
+        app
+    }
+
+    #[test]
+    fn disconnected_tab_keys_stay_live() {
+        let mut app = disconnected_app();
+        let before = app.tab;
+
+        assert_eq!(
+            handle_disconnected_event(&mut app, key(KeyCode::Tab)),
+            DisconnectedAction::Continue
+        );
+        assert_ne!(app.tab, before, "Tab must switch tabs while disconnected");
+
+        assert_eq!(
+            handle_disconnected_event(&mut app, key(KeyCode::BackTab)),
+            DisconnectedAction::Continue
+        );
+        assert_eq!(app.tab, before, "Shift+Tab must go back while disconnected");
+    }
+
+    #[test]
+    fn disconnected_quit_keys_are_honoured() {
+        for code in [KeyCode::Char('q'), KeyCode::Esc] {
+            let mut app = disconnected_app();
+            assert_eq!(
+                handle_disconnected_event(&mut app, key(code)),
+                DisconnectedAction::Quit
+            );
+            assert!(app.should_quit, "{code:?} must request a quit");
+        }
+    }
+
+    #[test]
+    fn disconnected_daemon_backed_keys_request_reconnect() {
+        let mut app = disconnected_app();
+        // `w` opens the workflow overlay, which is fetched over RPC.
+        assert_eq!(
+            handle_disconnected_event(&mut app, key(KeyCode::Char('w'))),
+            DisconnectedAction::Reconnect
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnected_pump_applies_keys_and_quits_without_waiting_out_backoff() {
+        let mut app = disconnected_app();
+        let before = app.tab;
+        let player = silent_player();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let (tx, mut ev_rx) = mpsc::unbounded_channel();
+        tx.send(key(KeyCode::Tab)).unwrap();
+        tx.send(key(KeyCode::Char('q'))).unwrap();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(1000),
+            disconnected_pump(&mut app, &mut ev_rx, &mut terminal, &player, MAX_BACKOFF),
+        )
+        .await
+        .expect("q must not wait out the backoff");
+
+        assert!(matches!(outcome, PumpOutcome::Quit));
+        assert_ne!(app.tab, before, "Tab was dropped while disconnected");
+    }
+
+    #[tokio::test]
+    async fn disconnected_pump_reconnects_on_daemon_backed_input() {
+        let mut app = disconnected_app();
+        let player = silent_player();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let (tx, mut ev_rx) = mpsc::unbounded_channel();
+        tx.send(key(KeyCode::Char('w'))).unwrap();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(1000),
+            disconnected_pump(&mut app, &mut ev_rx, &mut terminal, &player, MAX_BACKOFF),
+        )
+        .await
+        .expect("daemon-backed input must not wait out the backoff");
+
+        assert!(matches!(outcome, PumpOutcome::Reconnect));
     }
 }
