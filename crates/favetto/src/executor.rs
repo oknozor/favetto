@@ -886,6 +886,31 @@ async fn make_plan(
     })
 }
 
+/// The directory a reopened panel session should be launched in.
+///
+/// A headless run executes inside the task's worktree and some agents (pi)
+/// scope their session store to the project directory, so resuming from the
+/// daemon's cwd cannot find the run's session. Reuse [`make_plan`] to resolve
+/// the same directory, recreating the worktree when retention already reclaimed
+/// it. Returns `None` when the task or its catalog definition is missing.
+pub async fn resume_cwd(state: &State, task_id: Uuid) -> Option<PathBuf> {
+    let task = db::get_task(&state.db, task_id).await.ok().flatten()?;
+    let def = lookup_def(state, &task.name)?;
+    let cfg = state.config.read().unwrap().executor.clone();
+    let base = resolve_base_dir(&def, &task);
+    match make_plan(state, &cfg, &base, &task).await {
+        Ok(plan) => Some(plan.cwd),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                task_id = %task_id,
+                "failed to resolve the resumed session's working directory"
+            );
+            None
+        }
+    }
+}
+
 async fn git_toplevel(dir: &Path) -> Option<PathBuf> {
     let out = Command::new("git")
         .arg("-C")
@@ -2507,6 +2532,80 @@ mod tests {
             tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
             Arc::new(RwLock::new(Vec::new())),
         ))
+    }
+
+    /// Regression for issue #91: resuming an agent session must run in the run's
+    /// worktree, and a worktree reclaimed by retention is recreated so a
+    /// per-project session store (pi) can find the session again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resume_cwd_recreates_a_reclaimed_worktree() {
+        let dir = std::env::temp_dir().join(format!("favetto-resume-cwd-{}", Uuid::new_v4()));
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let run_git = |args: Vec<String>| {
+            let repo = repo.clone();
+            async move {
+                let out = Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(&args)
+                    .output()
+                    .await
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "git {args:?}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        };
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "t"],
+        ] {
+            run_git(args.into_iter().map(String::from).collect()).await;
+        }
+        std::fs::write(repo.join("README.md"), "seed").unwrap();
+        for args in [vec!["add", "-A"], vec!["commit", "-qm", "init"]] {
+            run_git(args.into_iter().map(String::from).collect()).await;
+        }
+
+        let def = crate::tasks::parse_task_md(
+            "issue",
+            &format!(
+                "agent = \"x\"\ncwd = {:?}\n---\nbody\n",
+                repo.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let state = join_state(&dir, vec![def]).await;
+        state.config.write().unwrap().executor.parallel = true;
+
+        let mut task = lineage_task("issue", TaskStatus::Succeeded, None, None);
+        task.session_id = Some("ses_1".to_string());
+        db::insert_task(&state.db, &task).await.unwrap();
+
+        let expected = dir.join("worktrees").join(task.id.to_string());
+        let cwd = resume_cwd(&state, task.id).await.expect("resume cwd");
+        assert_eq!(cwd, expected);
+        assert!(cwd.exists(), "the worktree was not created");
+
+        // Simulate retention reclaiming the worktree (removes the directory,
+        // the branch, and the tracking row).
+        remove_worktree(&state.db, task.id, &repo, &cwd, &branch_name(&task)).await;
+        assert!(!cwd.exists(), "remove_worktree must delete the directory");
+
+        let recreated = resume_cwd(&state, task.id).await.expect("resume cwd");
+        assert_eq!(recreated, expected);
+        assert!(
+            recreated.exists(),
+            "the reclaimed worktree was not recreated"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A catalog task with the given `needs` value.

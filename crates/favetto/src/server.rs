@@ -687,7 +687,7 @@ async fn start_agent(
     let provider = requested_provider.or(task_provider);
     let model = requested_model.or(task_model);
 
-    let ctx = AgentContext {
+    let mut ctx = AgentContext {
         cwd: params
             .get("cwd")
             .and_then(|v| v.as_str())
@@ -734,6 +734,17 @@ async fn start_agent(
                 },
             };
             if let Some(sid) = sid {
+                // A headless run lives in the task's worktree, and some agents
+                // (pi) scope their session store to the project directory, so the
+                // run's directory is authoritative when reopening its session.
+                // This overrides any base `cwd` the client sent (the task's repo
+                // root, not the worktree) and recreates the worktree if retention
+                // has already reclaimed it.
+                if let Some(tid) = task_id.as_deref().and_then(|tid| Uuid::parse_str(tid).ok()) {
+                    if let Some(cwd) = crate::executor::resume_cwd(state, tid).await {
+                        ctx.cwd = Some(cwd);
+                    }
+                }
                 return state
                     .agents
                     .start(&name, agent, task_id, Invocation::Resume(&sid), ctx);
@@ -2318,6 +2329,134 @@ mod tests {
         );
 
         state.agents.close(&resumed.id).ok();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for issue #91: resuming a run's session launches the agent in
+    /// the run's worktree (recreating a reclaimed one), not the daemon's cwd, so
+    /// an agent whose session store is per-project can reopen the session.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agents_start_resumes_in_the_runs_worktree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("resume-cwd");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let run_git = |args: Vec<String>| {
+            let repo = repo.clone();
+            async move {
+                let out = tokio::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(&args)
+                    .output()
+                    .await
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "git {args:?}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        };
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "t"],
+        ] {
+            run_git(args.into_iter().map(String::from).collect()).await;
+        }
+        std::fs::write(repo.join("README.md"), "seed").unwrap();
+        for args in [vec!["add", "-A"], vec!["commit", "-qm", "init"]] {
+            run_git(args.into_iter().map(String::from).collect()).await;
+        }
+
+        std::fs::write(
+            tasks_dir.join("issue.md"),
+            format!(
+                "agent = \"rsm\"\ncwd = {:?}\n---\nbody\n",
+                repo.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        // A resumable agent that records the directory the panel session opens in.
+        let capture = dir.join("resume-pwd.txt");
+        let script = dir.join("fake-rsm.sh");
+        std::fs::write(&script, format!("#!/bin/sh\npwd > {}\n", capture.display())).unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let state = agent_state(
+            &dir,
+            &tasks_dir,
+            "rsm",
+            vec![(
+                "rsm",
+                crate::config::AgentConfig {
+                    command: script.to_string_lossy().into_owned(),
+                    resume_args: Some(vec!["resume".to_string(), "{session_id}".to_string()]),
+                    ..Default::default()
+                },
+            )],
+        )
+        .await;
+        state.config.write().unwrap().executor.parallel = true;
+
+        let task = Task {
+            id: Uuid::new_v4(),
+            name: "issue".to_string(),
+            status: TaskStatus::Failed,
+            input: serde_json::json!({}),
+            output: None,
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+            session_id: Some("ses-1".to_string()),
+            session_title: None,
+            parent_id: None,
+            root_id: None,
+        };
+        db::insert_task(&state.db, &task).await.unwrap();
+
+        let info = start_agent(
+            &state,
+            &serde_json::json!({
+                "task_id": task.id.to_string(),
+                "agent": "rsm",
+                // The TUI sends the task's base repo as `cwd`; resume must ignore
+                // it in favour of the run's worktree.
+                "cwd": repo.to_string_lossy(),
+            }),
+        )
+        .await
+        .expect("start_agent");
+        assert!(!info.headless, "resume must launch an interactive session");
+
+        let expected = dir.join("worktrees").join(task.id.to_string());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let captured = loop {
+            let text = std::fs::read_to_string(&capture).unwrap_or_default();
+            if !text.trim().is_empty() || std::time::Instant::now() >= deadline {
+                break text;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!(
+            std::fs::canonicalize(captured.trim()).ok(),
+            std::fs::canonicalize(&expected).ok(),
+            "the resumed session did not open in the run's worktree: {captured:?}"
+        );
+        assert!(expected.exists(), "the run's worktree was not recreated");
+
+        state.agents.close(&info.id).ok();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
