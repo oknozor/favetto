@@ -39,5 +39,5 @@ Every event persisted on the bus is one of the kinds below. The **Event** column
 | `check_suite_completed` | A check suite completed. |
 | `check_run_completed` | A check run completed. |
 | `email_received` | An email was received (integration event). |
-| `synthetic` | A synthetic marker event used before real integrations exist. |
+| `unknown` | An unrecognised persisted event kind (decode fallback). |
 

@@ -2365,7 +2365,7 @@ mod tests {
         app.tab = Tab::Events;
         app.ingest_event(Event {
             id: 1,
-            kind: EventKind::Synthetic,
+            kind: EventKind::Unknown,
             payload: serde_json::json!({ "hello": "world", "n": 3 }),
             created_at: Utc::now(),
         });
