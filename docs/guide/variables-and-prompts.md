@@ -32,7 +32,7 @@ Starting it from the Catalog tab opens a floating form. `Enter` advances to the
 next field and submits on the last one; a multiline field inserts a newline on
 `Enter`, so submit with `Ctrl+Enter`. `Esc` cancels and starts nothing.
 
-![favetto TUI — variables form](/screenshots/tui-vars-form.svg)
+![favetto TUI — variables form](/screenshots/tui-vars-form.png)
 
 *The `[[vars]]` form opened by starting a task.*
 

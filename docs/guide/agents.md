@@ -9,7 +9,7 @@ its live terminal in the TUI's **Agent** tab.
 favetto daemon   # then, in the TUI, the Tasks tab lists agents and sessions
 ```
 
-![favetto TUI — Agent tab](/screenshots/tui-agent.svg)
+![favetto TUI — Agent tab](/screenshots/tui-agent.png)
 
 *The Agent tab: the embedded agent session, seeded with the task prompt.*
 

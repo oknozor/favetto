@@ -4,11 +4,11 @@ The TUI is a client of the daemon. This page covers its tabs, keybindings, and
 client-side behaviours (theme, sound, the Ctrl+P menu). For the Agent panel's
 focus and mouse handling see [Embedded agents](./agents).
 
-![favetto TUI — Catalog tab](/screenshots/tui-catalog.svg)
+![favetto TUI — Catalog tab](/screenshots/tui-catalog.png)
 
 *The Catalog tab: folder tree + preview pane.*
 
-![favetto TUI — Tasks tab](/screenshots/tui-tasks.svg)
+![favetto TUI — Tasks tab](/screenshots/tui-tasks.png)
 
 *The Tasks tab: recent runs with status, age, and session title.*
 
@@ -105,7 +105,7 @@ marked completed/failed when that session exits.
 Press **w** to render the catalog's `needs`/`spawn` edges as box-drawing art (the
 same graph is persisted as Graphviz DOT to `<data_dir>/workflow.dot`).
 
-![favetto workflow graph](/screenshots/workflow-graph.svg)
+![favetto workflow graph](/screenshots/workflow-graph.png)
 
 *The workflow overlay: `needs` and `spawn` edges between tasks.*
 
@@ -122,7 +122,7 @@ The **Events** tab is a selectable, scrolling list (`↑`/`↓`, `PageUp`/`PageD
 with a **payload side panel** that pretty-prints the selected event's JSON with
 syntax highlighting.
 
-![favetto TUI — Events tab](/screenshots/tui-events.svg)
+![favetto TUI — Events tab](/screenshots/tui-events.png)
 
 *The Events tab with the payload panel.*
 
@@ -186,6 +186,6 @@ Precedence is **CLI flag → env var → `[tui.sound]` → built-in default**:
 Run `favetto tui --test-sound` to play every configured cue once, print the
 resolved player and per-cue mapping, and exit.
 
-![favetto help overlay](/screenshots/tui-help-overlay.svg)
+![favetto help overlay](/screenshots/tui-help-overlay.png)
 
 *The `?` help overlay, grouped by context.*

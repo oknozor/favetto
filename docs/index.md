@@ -6,7 +6,7 @@ hero:
   text: Remote-TUI-first agent orchestration
   tagline: A long-running, LLM-driven agent orchestrator that schedules and runs declarative tasks by delegating to external coding-agent CLIs — the orchestrator never implements its own agent loop.
   image:
-    src: /logo.svg
+    src: /logo.png
     alt: favetto
   actions:
     - theme: brand
@@ -30,7 +30,7 @@ features:
     details: Tasks and events persist across restarts; the append-only event log doubles as the TUI's resume cursor.
 ---
 
-![favetto TUI — Catalog tab](/screenshots/tui-catalog.svg)
+![favetto TUI — Catalog tab](/screenshots/tui-catalog.png)
 
 *The Catalog tab: folder tree + preview pane.*
 

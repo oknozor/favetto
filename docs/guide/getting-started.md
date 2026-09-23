@@ -33,7 +33,7 @@ In a second terminal, attach to the daemon over the local socket:
 favetto tui
 ```
 
-![favetto TUI — Catalog tab](/screenshots/tui-catalog.svg)
+![favetto TUI — Catalog tab](/screenshots/tui-catalog.png)
 
 *The Catalog tab: folder tree + preview pane.*
 
