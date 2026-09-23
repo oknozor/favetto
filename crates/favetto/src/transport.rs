@@ -15,10 +15,11 @@ use tokio::net::UnixListener;
 use tokio_util::codec::Framed;
 
 use favetto_core::rpc::Frame;
-use favetto_core::wire::{decode, encode, FrameCodec, WireError};
+use favetto_core::wire::{FrameCodec, WireError};
 
 use crate::server::{self, BoxIn, BoxOut};
 use crate::state::State;
+use crate::ws;
 
 /// Serve the wire protocol over a Unix domain socket for local TUI attach.
 pub async fn serve_unix(path: &Path, state: Arc<State>) -> anyhow::Result<()> {
@@ -76,20 +77,20 @@ async fn serve_socket(state: Arc<State>, socket: WebSocket) {
 
     let incoming: BoxIn = Box::pin(stream.filter_map(|res| async {
         match res {
-            Ok(Message::Binary(b)) => Some(decode(b.as_ref())),
-            Ok(Message::Text(t)) => Some(decode(t.as_bytes())),
-            Ok(Message::Close(_)) => Some(Err(WireError::Other("closed".to_string()))),
+            Ok(Message::Binary(b)) => Some(ws::inbound_binary(b.as_ref())),
+            Ok(Message::Text(t)) => Some(ws::inbound_text(&t)),
+            Ok(Message::Close(_)) => Some(Err(ws::closed())),
             Ok(_) => None,
             Err(e) => Some(Err(WireError::Other(e.to_string()))),
         }
     }));
 
-    let outgoing: BoxOut = Box::pin(sink.sink_map_err(|e| WireError::Other(e.to_string())).with(
-        |frame: Frame| async move {
-            let bytes = encode(&frame)?;
-            Ok::<_, WireError>(Message::Binary(bytes.into()))
-        },
-    ));
+    let outgoing: BoxOut = Box::pin(
+        sink.sink_map_err(|e| WireError::Other(e.to_string()))
+            .with(|frame: Frame| async move {
+                Ok::<_, WireError>(Message::Binary(ws::outbound(&frame)?.into()))
+            }),
+    );
 
     server::serve_connection(state, incoming, outgoing).await;
 }
