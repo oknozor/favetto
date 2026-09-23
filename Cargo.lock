@@ -970,6 +970,7 @@ dependencies = [
  "http",
  "libc",
  "notify",
+ "parking_lot",
  "portable-pty",
  "ratatui",
  "reqwest",

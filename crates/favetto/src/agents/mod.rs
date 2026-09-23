@@ -18,8 +18,9 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use parking_lot::Mutex;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::broadcast;
 
@@ -137,8 +138,8 @@ impl Session {
             task_id: self.task_id.clone(),
             running: self.running.load(Ordering::SeqCst),
             headless: self.headless,
-            session_id: self.external_session_id.lock().unwrap().clone(),
-            awaiting_input: self.awaiting_input.lock().unwrap().clone(),
+            session_id: self.external_session_id.lock().clone(),
+            awaiting_input: self.awaiting_input.lock().clone(),
         }
     }
 }
@@ -180,11 +181,10 @@ impl Default for AgentManager {
 impl Drop for AgentManager {
     fn drop(&mut self) {
         // Don't leave agent children running after the daemon exits.
-        if let Ok(mut sessions) = self.sessions.lock() {
-            for (_, session) in sessions.drain() {
-                session.running.store(false, Ordering::SeqCst);
-                terminate(session.pid);
-            }
+        let mut sessions = self.sessions.lock();
+        for (_, session) in sessions.drain() {
+            session.running.store(false, Ordering::SeqCst);
+            terminate(session.pid);
         }
     }
 }
@@ -232,7 +232,7 @@ impl AgentManager {
 
     /// Snapshot of all live (and recently exited) sessions.
     pub fn sessions(&self) -> Vec<AgentSessionInfo> {
-        let sessions = self.sessions.lock().unwrap();
+        let sessions = self.sessions.lock();
         let mut out: Vec<_> = sessions.values().map(|s| s.info()).collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
         out
@@ -243,7 +243,6 @@ impl AgentManager {
     pub fn find_latest_by_task(&self, task_id: &str) -> Option<AgentSessionInfo> {
         self.sessions
             .lock()
-            .unwrap()
             .values()
             .filter(|s| s.task_id.as_deref() == Some(task_id))
             .max_by_key(|s| s.order)
@@ -353,7 +352,7 @@ impl AgentManager {
         // unattended run also send EOT so an agent reading stdin sees EOF (a PTY
         // cannot half-close).
         if let Some(prompt) = &spec.stdin_prompt {
-            let mut w = writer.lock().unwrap();
+            let mut w = writer.lock();
             let _ = w.write_all(prompt.as_bytes());
             let _ = w.write_all(b"\r");
             if spec.stdin_eof {
@@ -409,9 +408,9 @@ impl AgentManager {
                         Ok(0) => break,
                         Ok(n) => {
                             let bytes = &chunk[..n];
-                            *last_activity.lock().unwrap() = std::time::Instant::now();
+                            *last_activity.lock() = std::time::Instant::now();
                             {
-                                let mut buf = raw_out.lock().unwrap();
+                                let mut buf = raw_out.lock();
                                 buf.extend_from_slice(bytes);
                                 if buf.len() > MAX_RAW {
                                     let excess = buf.len() - MAX_RAW;
@@ -427,7 +426,7 @@ impl AgentManager {
                                     let line = String::from_utf8_lossy(&line);
                                     if let Some(found) = extract_session_id_from_line(&line, probe)
                                     {
-                                        let mut slot = external_session_id.lock().unwrap();
+                                        let mut slot = external_session_id.lock();
                                         if slot.is_none() {
                                             *slot = Some(found);
                                         }
@@ -439,7 +438,7 @@ impl AgentManager {
                                 }
                             }
                             let (frame, replies) = {
-                                let mut p = parser.lock().unwrap();
+                                let mut p = parser.lock();
                                 p.process(bytes);
                                 (
                                     p.screen().state_formatted(),
@@ -448,10 +447,9 @@ impl AgentManager {
                             };
                             ticks.fetch_add(1, Ordering::SeqCst);
                             if !replies.is_empty() {
-                                if let Ok(mut w) = writer.lock() {
-                                    let _ = w.write_all(&replies);
-                                    let _ = w.flush();
-                                }
+                                let mut w = writer.lock();
+                                let _ = w.write_all(&replies);
+                                let _ = w.flush();
                             }
                             let _ = tx.send(AgentEvent::Output {
                                 session_id: id.clone(),
@@ -507,14 +505,14 @@ impl AgentManager {
             order,
         });
         let info = session.info();
-        self.sessions.lock().unwrap().insert(id, session);
+        self.sessions.lock().insert(id, session);
         Ok(info)
     }
 
     /// The current full-screen frame for a (re)attaching client.
     pub fn attach(&self, session_id: &str) -> anyhow::Result<(AgentSessionInfo, Vec<u8>)> {
         let session = self.get(session_id)?;
-        let frame = session.parser.lock().unwrap().screen().state_formatted();
+        let frame = session.parser.lock().screen().state_formatted();
         Ok((session.info(), frame))
     }
 
@@ -549,9 +547,9 @@ impl AgentManager {
         if !session.running.load(Ordering::SeqCst) {
             return None;
         }
-        let quiet_elapsed = session.last_activity.lock().unwrap().elapsed();
+        let quiet_elapsed = session.last_activity.lock().elapsed();
         let (specific, generic) = {
-            let parser = session.parser.lock().unwrap();
+            let parser = session.parser.lock();
             let screen = parser.screen();
             let specific = agent.awaiting_input(screen);
             let generic = if quiet_elapsed >= quiet {
@@ -567,7 +565,7 @@ impl AgentManager {
     /// Record (or clear) a session's awaiting-input reason.
     pub fn set_awaiting_input(&self, session_id: &str, reason: Option<AwaitingInputReason>) {
         if let Ok(session) = self.get(session_id) {
-            *session.awaiting_input.lock().unwrap() = reason;
+            *session.awaiting_input.lock() = reason;
         }
     }
 
@@ -588,7 +586,7 @@ impl AgentManager {
     /// Raw output captured for a session (used to record an unattended task's output).
     pub fn output(&self, session_id: &str) -> String {
         self.get(session_id)
-            .map(|s| String::from_utf8_lossy(&s.raw.lock().unwrap()).to_string())
+            .map(|s| String::from_utf8_lossy(&s.raw.lock()).to_string())
             .unwrap_or_default()
     }
 
@@ -596,13 +594,13 @@ impl AgentManager {
     pub fn external_session_id(&self, session_id: &str) -> Option<String> {
         self.get(session_id)
             .ok()
-            .and_then(|s| s.external_session_id.lock().unwrap().clone())
+            .and_then(|s| s.external_session_id.lock().clone())
     }
 
     /// Write raw bytes to the session's PTY (keystrokes from the TUI).
     pub fn input(&self, session_id: &str, data: &[u8]) -> anyhow::Result<()> {
         let session = self.get(session_id)?;
-        let mut writer = session.writer.lock().unwrap();
+        let mut writer = session.writer.lock();
         writer.write_all(data)?;
         writer.flush()?;
         Ok(())
@@ -612,24 +610,19 @@ impl AgentManager {
     pub fn resize(&self, session_id: &str, rows: u16, cols: u16) -> anyhow::Result<()> {
         let session = self.get(session_id)?;
         let (rows, cols) = (rows.max(1), cols.max(1));
-        session.master.lock().unwrap().resize(PtySize {
+        session.master.lock().resize(PtySize {
             rows,
             cols,
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        session
-            .parser
-            .lock()
-            .unwrap()
-            .screen_mut()
-            .set_size(rows, cols);
+        session.parser.lock().screen_mut().set_size(rows, cols);
         Ok(())
     }
 
     /// Terminate a session and drop it from the registry.
     pub fn close(&self, session_id: &str) -> anyhow::Result<()> {
-        if let Some(session) = self.sessions.lock().unwrap().remove(session_id) {
+        if let Some(session) = self.sessions.lock().remove(session_id) {
             session.running.store(false, Ordering::SeqCst);
             terminate(session.pid);
         }
@@ -639,7 +632,6 @@ impl AgentManager {
     fn get(&self, session_id: &str) -> anyhow::Result<Arc<Session>> {
         self.sessions
             .lock()
-            .unwrap()
             .get(session_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("no agent session '{session_id}'"))
@@ -796,10 +788,9 @@ fn spawn_submit(
         let mut sent = 0u32;
         let mut before = ticks.load(Ordering::SeqCst);
         while running.load(Ordering::SeqCst) && sent < max_sends {
-            if let Ok(mut w) = writer.lock() {
-                let _ = w.write_all(b"\r");
-                let _ = w.flush();
-            }
+            let mut w = writer.lock();
+            let _ = w.write_all(b"\r");
+            let _ = w.flush();
             sent += 1;
             std::thread::sleep(RETRY_INTERVAL);
 
@@ -1386,5 +1377,25 @@ mod tests {
             .detect_awaiting_input(&info.id, agent.as_ref(), std::time::Duration::ZERO)
             .is_none());
         mgr.close(&info.id).unwrap();
+    }
+
+    /// A panic while holding the sessions lock must not poison it: with
+    /// `parking_lot` the manager stays usable, unlike the old `std::sync::Mutex`
+    /// whose every later `lock().unwrap()` would also panic and take down the
+    /// daemon.
+    #[test]
+    fn sessions_lock_survives_a_panicking_holder() {
+        let mgr = Arc::new(AgentManager::new());
+        let holder = mgr.clone();
+        let panicked = std::thread::spawn(move || {
+            let _guard = holder.sessions.lock();
+            panic!("simulated panic while holding the sessions lock");
+        });
+        assert!(panicked.join().is_err());
+
+        // Still lockable, readable, and usable after the panic.
+        assert!(mgr.sessions().is_empty());
+        assert!(mgr.get("missing").is_err());
+        assert!(mgr.close("missing").is_ok());
     }
 }

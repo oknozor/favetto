@@ -9,8 +9,9 @@
 //! hooks.upsert { event = "TicketCreated", channel = "webhook", config = { url = "…" } }
 //! ```
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
+use parking_lot::RwLock;
 use serde_json::Value;
 
 use favetto_core::model::{Event, EventKind};
@@ -75,7 +76,7 @@ impl HookEngine {
     }
 
     async fn evaluate(&self, ev: Event) {
-        let hooks = self.hooks.read().unwrap().clone();
+        let hooks = self.hooks.read().clone();
         for hook in &hooks {
             if !hook.enabled || hook.event != ev.kind || !hook.matches(&ev.payload) {
                 continue;

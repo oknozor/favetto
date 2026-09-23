@@ -87,7 +87,7 @@ pub async fn upsert(state: &Arc<State>, schedule: &Schedule) -> anyhow::Result<(
 /// `schedule` header): register new or changed `catalog:<name>` schedules and
 /// drop schedules whose task vanished or lost its `schedule` header.
 pub async fn reconcile_catalog_schedules(state: &Arc<State>) -> anyhow::Result<()> {
-    let catalog = state.catalog.read().unwrap().clone();
+    let catalog = state.catalog.read().clone();
 
     // Desired schedules, derived from the current catalog.
     let mut desired: Vec<Schedule> = Vec::new();

@@ -5,11 +5,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
+use parking_lot::Mutex;
 use tokio::net::UnixStream;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::codec::Framed;
@@ -97,7 +98,7 @@ impl Client {
                 };
                 match frame {
                     Frame::Response(resp) => {
-                        if let Some(tx) = pending2.lock().unwrap().remove(&resp.id) {
+                        if let Some(tx) = pending2.lock().remove(&resp.id) {
                             let _ = tx.send(resp);
                         }
                     }
@@ -145,7 +146,7 @@ impl Client {
     ) -> anyhow::Result<Response> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, tx);
+        self.pending.lock().insert(id, tx);
         let req = Request {
             id,
             method: method.to_string(),
