@@ -30,18 +30,21 @@ pub enum ServerPush {
 
 impl ServerPush {
     /// Convert into the wire [`Notification`] the TUI client understands.
-    pub fn into_notification(self) -> Notification {
+    ///
+    /// Returns the serialization error instead of emitting an empty payload so
+    /// callers can log and skip a push they cannot encode.
+    pub fn into_notification(self) -> Result<Notification, serde_json::Error> {
         match self {
             ServerPush::Event(ev) => ev.into_notification(),
             ServerPush::TaskUpdated(t) => (*t).into_notification(),
-            ServerPush::CatalogUpdated => Notification {
+            ServerPush::CatalogUpdated => Ok(Notification {
                 method: push::CATALOG_UPDATED.to_string(),
                 params: serde_json::json!({}),
-            },
-            ServerPush::LogLine { level, message } => Notification {
+            }),
+            ServerPush::LogLine { level, message } => Ok(Notification {
                 method: push::LOG_LINE.to_string(),
                 params: serde_json::json!({ "level": level, "message": message }),
-            },
+            }),
         }
     }
 }
@@ -76,7 +79,47 @@ mod tests {
 
     #[test]
     fn catalog_updated_push_maps_to_notification() {
-        let n = ServerPush::CatalogUpdated.into_notification();
+        let n = ServerPush::CatalogUpdated
+            .into_notification()
+            .expect("catalog push serialization");
         assert_eq!(n.method, push::CATALOG_UPDATED);
+    }
+
+    #[test]
+    fn task_updated_push_carries_the_task() {
+        let task = favetto_core::model::Task {
+            id: uuid::Uuid::new_v4(),
+            name: "t".to_string(),
+            status: favetto_core::model::TaskStatus::Pending,
+            input: serde_json::json!({}),
+            output: None,
+            dedupe_key: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+            session_id: None,
+            session_title: None,
+            parent_id: None,
+            root_id: None,
+        };
+        let n = ServerPush::TaskUpdated(Box::new(task))
+            .into_notification()
+            .expect("task push serialization");
+        assert_eq!(n.method, push::TASK_UPDATED);
+        assert_eq!(n.params["name"], "t");
+    }
+
+    #[test]
+    fn log_line_push_serializes_params() {
+        let n = ServerPush::LogLine {
+            level: "info".to_string(),
+            message: "hi".to_string(),
+        }
+        .into_notification()
+        .expect("log line push serialization");
+        assert_eq!(n.method, push::LOG_LINE);
+        assert_eq!(n.params["level"], "info");
+        assert_eq!(n.params["message"], "hi");
     }
 }

@@ -105,11 +105,14 @@ pub struct Task {
 
 impl Task {
     /// Wrap this task as a server push so the daemon can broadcast it to TUI clients.
-    pub fn into_notification(self) -> Notification {
-        Notification {
+    ///
+    /// `favetto-core` cannot log, so serialization failures are returned instead
+    /// of being turned into an empty payload; the caller logs and skips the push.
+    pub fn into_notification(self) -> Result<Notification, serde_json::Error> {
+        Ok(Notification {
             method: push::TASK_UPDATED.to_string(),
-            params: serde_json::to_value(self).unwrap_or_default(),
-        }
+            params: serde_json::to_value(self)?,
+        })
     }
 
     /// A copy without the (potentially large) `output` blob. Used by list and
@@ -407,11 +410,14 @@ pub struct Event {
 
 impl Event {
     /// Wrap this event as a server push so the daemon can broadcast it to TUI clients.
-    pub fn into_notification(self) -> Notification {
-        Notification {
+    ///
+    /// `favetto-core` cannot log, so serialization failures are returned instead
+    /// of being turned into an empty payload; the caller logs and skips the push.
+    pub fn into_notification(self) -> Result<Notification, serde_json::Error> {
+        Ok(Notification {
             method: push::EVENT.to_string(),
-            params: serde_json::to_value(self).unwrap_or_default(),
-        }
+            params: serde_json::to_value(self)?,
+        })
     }
 }
 
@@ -858,5 +864,44 @@ mod tests {
             EventKind::from_name("task_awaiting_input"),
             Some(EventKind::TaskAwaitingInput)
         );
+    }
+
+    #[test]
+    fn task_into_notification_serializes_the_task() {
+        let id = Uuid::new_v4();
+        let task = Task {
+            id,
+            name: "t".to_string(),
+            status: TaskStatus::Pending,
+            input: serde_json::json!({}),
+            output: None,
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+            session_id: None,
+            session_title: None,
+            parent_id: None,
+            root_id: None,
+        };
+        let n = task.into_notification().expect("task serialization");
+        assert_eq!(n.method, push::TASK_UPDATED);
+        assert_eq!(n.params["id"], id.to_string());
+        assert_eq!(n.params["status"], "pending");
+    }
+
+    #[test]
+    fn event_into_notification_serializes_the_event() {
+        let event = Event {
+            id: 7,
+            kind: EventKind::TaskUpdated,
+            payload: serde_json::json!({ "k": "v" }),
+            created_at: Utc::now(),
+        };
+        let n = event.into_notification().expect("event serialization");
+        assert_eq!(n.method, push::EVENT);
+        assert_eq!(n.params["id"], 7);
+        assert_eq!(n.params["kind"], "task_updated");
     }
 }
