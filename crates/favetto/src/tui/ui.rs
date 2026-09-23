@@ -15,6 +15,7 @@ use super::app::{
     table_rows_area, App, CatalogRow, ClickAction, ClickRegion, ConnState, Form, ListGeometry,
     Popup, Tab, TaskVarsForm, Wizard, WizardStep, MENU_OPTIONS,
 };
+use super::text_buffer::TextBuffer;
 use super::theme::Theme;
 use super::{json, markdown};
 
@@ -217,6 +218,56 @@ fn draw_growing_popup(
     rect
 }
 
+/// A text buffer line split around the caret, for rendering.
+struct DisplayLine {
+    /// Text before the caret (the whole line when the caret is elsewhere).
+    before: String,
+    /// Text after the caret (empty when the caret is elsewhere).
+    after: String,
+    /// Whether the caret is on this line.
+    caret: bool,
+}
+
+/// Split `buf` into displayable lines, marking the caret's line and the text on
+/// each side of the caret within it. Always returns at least one line.
+fn display_lines(buf: &TextBuffer) -> Vec<DisplayLine> {
+    let value = buf.value();
+    let caret = buf.caret();
+    let caret_line = value[..caret].matches('\n').count();
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    for (idx, segment) in value.split('\n').enumerate() {
+        if idx == caret_line {
+            let col = caret - start;
+            lines.push(DisplayLine {
+                before: segment[..col].to_string(),
+                after: segment[col..].to_string(),
+                caret: true,
+            });
+        } else {
+            lines.push(DisplayLine {
+                before: segment.to_string(),
+                after: String::new(),
+                caret: false,
+            });
+        }
+        start += segment.len() + 1;
+    }
+    lines
+}
+
+/// Append the caret-annotated text of a single-line `buf` to `spans`, rendering
+/// the caret between the text before and after it. Extra lines are ignored.
+fn push_caret_line(spans: &mut Vec<Span<'static>>, buf: &TextBuffer, caret: Style) {
+    if let Some(line) = display_lines(buf).into_iter().next() {
+        spans.push(Span::raw(line.before));
+        if line.caret {
+            spans.push(Span::styled("█", caret));
+        }
+        spans.push(Span::raw(line.after));
+    }
+}
+
 fn draw_menu(frame: &mut Frame, selected: usize, theme: Theme) {
     let area = frame.area();
     let rect = centered_rect(area, 60, MENU_OPTIONS.len() as u16 + 2);
@@ -263,16 +314,14 @@ fn draw_form(frame: &mut Frame, form: &Form, theme: Theme) -> Rect {
             )));
         } else if i == form.current {
             focus_line = content.len();
-            content.push(Line::from(vec![
-                Span::styled(
-                    format!("> {field}: "),
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(form.input.clone()),
-                Span::styled("█", Style::default().fg(theme.accent)),
-            ]));
+            let mut spans = vec![Span::styled(
+                format!("> {field}: "),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            )];
+            push_caret_line(&mut spans, &form.input, Style::default().fg(theme.accent));
+            content.push(Line::from(spans));
         } else {
             content.push(Line::from(format!("  {field}")));
         }
@@ -316,11 +365,12 @@ fn draw_wizard(
 
     if wizard.step == WizardStep::Dir {
         focus_line = content.len();
-        content.push(Line::from(vec![
-            Span::styled("> Directory: ", Style::default().fg(theme.accent)),
-            Span::raw(wizard.dir.clone()),
-            Span::styled("█", Style::default().fg(theme.accent)),
-        ]));
+        let mut spans = vec![Span::styled(
+            "> Directory: ",
+            Style::default().fg(theme.accent),
+        )];
+        push_caret_line(&mut spans, &wizard.dir, Style::default().fg(theme.accent));
+        content.push(Line::from(spans));
     } else if wizard.loading {
         content.push(Line::from(vec![
             throbber_span(theme, state),
@@ -428,11 +478,11 @@ fn draw_task_vars(frame: &mut Frame, form: &TaskVarsForm, theme: Theme) -> Rect 
             continue;
         }
 
-        let value = form.values.get(i).cloned().unwrap_or_default();
-        let segments: Vec<&str> = value.split('\n').collect();
-        let last_segment = segments.len() - 1;
-        for (k, segment) in segments.iter().enumerate() {
-            if current && k == last_segment {
+        let empty = TextBuffer::default();
+        let buf = form.values.get(i).unwrap_or(&empty);
+        let lines = display_lines(buf);
+        for (k, line) in lines.iter().enumerate() {
+            if current && line.caret {
                 focus_line = content.len();
             }
             let mut spans: Vec<Span> = Vec::new();
@@ -441,13 +491,14 @@ fn draw_task_vars(frame: &mut Frame, form: &TaskVarsForm, theme: Theme) -> Rect 
             } else {
                 spans.push(Span::raw("    "));
             }
-            if segment.is_empty() && !current && segments.len() == 1 {
+            if buf.is_empty() && !current && lines.len() == 1 {
                 spans.push(Span::styled("(empty)", Style::default().fg(theme.muted)));
             } else {
-                spans.push(Span::raw((*segment).to_string()));
-            }
-            if current && k == last_segment {
-                spans.push(Span::styled("█", Style::default().fg(theme.accent)));
+                spans.push(Span::raw(line.before.clone()));
+                if current && line.caret {
+                    spans.push(Span::styled("█", Style::default().fg(theme.accent)));
+                }
+                spans.push(Span::raw(line.after.clone()));
             }
             content.push(Line::from(spans));
         }
@@ -523,6 +574,23 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("(favetto focus) Ctrl+Q", "leave the panel"),
             ("(favetto focus) Ctrl+N", "start a new session"),
             ("(favetto focus) Esc", "back to Tasks"),
+        ],
+    ),
+    (
+        "Text fields (task input / forms / wizard)",
+        &[
+            ("← / →", "move the caret by character"),
+            ("Alt+← / Alt+→ (or Ctrl+←/→)", "move by word"),
+            ("Home / End (or Ctrl+A / Ctrl+E)", "start / end of line"),
+            (
+                "↑ / ↓",
+                "move line in multiline values, else previous/next field",
+            ),
+            ("Backspace / Delete", "delete before / at the caret"),
+            ("Alt+Backspace / Ctrl+W", "delete the word before"),
+            ("Ctrl+U / Ctrl+K", "delete to line start / end"),
+            ("Shift+Enter / Alt+Enter", "newline in multiline values"),
+            ("Ctrl+Enter", "submit the form"),
         ],
     ),
     (
@@ -1485,7 +1553,7 @@ mod tests {
                     fields: vec!["Task name", "Prompt"],
                     current: 0,
                     values: Vec::new(),
-                    input: String::new(),
+                    input: TextBuffer::default(),
                 }),
                 Popup::Wizard(Wizard {
                     step: WizardStep::Agent,
@@ -1498,7 +1566,7 @@ mod tests {
                     agent: None,
                     provider: None,
                     model: None,
-                    dir: String::new(),
+                    dir: TextBuffer::default(),
                     loading: false,
                     error: None,
                 }),
@@ -1513,7 +1581,7 @@ mod tests {
                     agent: Some("opencode".to_string()),
                     provider: None,
                     model: None,
-                    dir: String::new(),
+                    dir: TextBuffer::default(),
                     loading: true,
                     error: Some("boom".to_string()),
                 }),
@@ -1529,7 +1597,7 @@ mod tests {
                         choices: None,
                     }],
                     current: 0,
-                    values: vec!["draft".to_string()],
+                    values: vec![TextBuffer::new("draft")],
                     choice_selected: vec![0],
                     error: None,
                 }),
@@ -1568,7 +1636,7 @@ mod tests {
             agent: None,
             provider: None,
             model: None,
-            dir: String::new(),
+            dir: TextBuffer::default(),
             loading: false,
             error: None,
         });
@@ -2280,7 +2348,7 @@ mod tests {
                 choices: None,
             }],
             current: 0,
-            values: vec!["placeholder".to_string()],
+            values: vec![TextBuffer::new("placeholder")],
             choice_selected: vec![0],
             error: None,
         });
@@ -2320,7 +2388,7 @@ mod tests {
                 choices: None,
             }],
             current: 0,
-            values: vec![value],
+            values: vec![TextBuffer::new(value)],
             choice_selected: vec![0],
             error: None,
         });
@@ -2348,7 +2416,7 @@ mod tests {
                 choices: None,
             }],
             current: 0,
-            values: vec!["hi".to_string()],
+            values: vec![TextBuffer::new("hi")],
             choice_selected: vec![0],
             error: None,
         });
@@ -2372,6 +2440,52 @@ mod tests {
     }
 
     #[test]
+    fn task_vars_renders_caret_in_the_middle_of_a_value() {
+        use crate::tasks::{TaskVar, VarType};
+
+        let mut buffer = TextBuffer::new("abcd");
+        buffer.move_left(); // caret before the trailing 'd'
+        let mut app = App::new();
+        app.popup = Popup::TaskVars(TaskVarsForm {
+            task: "issue".to_string(),
+            vars: vec![TaskVar {
+                name: "title".to_string(),
+                prompt: "Title".to_string(),
+                default: None,
+                required: true,
+                multiline: false,
+                var_type: VarType::String,
+                choices: None,
+            }],
+            current: 0,
+            values: vec![buffer],
+            choice_selected: vec![0],
+            error: None,
+        });
+        let text = render_text(&mut app, 100, 40);
+        assert!(text.contains("abc█d"), "caret not mid-line: {text:?}");
+    }
+
+    #[test]
+    fn form_renders_caret_in_the_middle_of_the_input() {
+        use super::super::app::FormKind;
+
+        let mut input = TextBuffer::new("abcd");
+        input.move_left(); // caret before the trailing 'd'
+        let mut app = App::new();
+        app.popup = Popup::Form(Form {
+            kind: FormKind::AddTask,
+            title: "Add task to catalog",
+            fields: vec!["Task name", "Prompt"],
+            current: 1,
+            values: vec!["my-task".to_string()],
+            input,
+        });
+        let text = render_text(&mut app, 80, 24);
+        assert!(text.contains("abc█d"), "caret not mid-line: {text:?}");
+    }
+
+    #[test]
     fn form_popup_long_prompt_keeps_cursor_visible() {
         use super::super::app::FormKind;
 
@@ -2388,7 +2502,7 @@ mod tests {
             fields,
             current: 1,
             values: vec!["my-task".to_string()],
-            input,
+            input: TextBuffer::new(input),
         };
 
         let mut app = App::new();

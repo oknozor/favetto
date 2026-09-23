@@ -7,6 +7,7 @@ mod json;
 mod markdown;
 mod sound;
 mod term;
+mod text_buffer;
 mod theme;
 mod ui;
 mod workflow_view;
