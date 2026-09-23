@@ -90,7 +90,7 @@ async fn github_webhook(
 
 /// GitHub webhook handler, factored out so it is directly testable.
 async fn handle_github(state: &State, headers: &HeaderMap, body: &[u8]) -> Response {
-    let gh = state.config.read().unwrap().webhook.github.clone();
+    let gh = state.config.read().webhook.github.clone();
     if !gh.enabled {
         return (StatusCode::NOT_FOUND, "github webhooks disabled").into_response();
     }
@@ -535,9 +535,9 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue};
     use favetto_core::auth::Token;
     use favetto_core::model::{EventKind, TaskStatus};
+    use parking_lot::RwLock;
     use sqlx::SqlitePool;
     use std::path::PathBuf;
-    use std::sync::RwLock;
 
     const SECRET: &str = "topsecret";
 

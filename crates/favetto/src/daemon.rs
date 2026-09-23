@@ -21,7 +21,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         .config
         .clone()
         .unwrap_or_else(crate::cli::default_config_path);
-    let config = Arc::new(std::sync::RwLock::new(
+    let config = Arc::new(parking_lot::RwLock::new(
         match FavettoConfig::load_from(&config_path) {
             Ok(c) => c,
             Err(e) => {
@@ -33,28 +33,28 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
 
     // Resolve settings: CLI flag > config > default. Read the config once here.
     let data_dir = crate::paths::expand_tilde({
-        let cfg = config.read().unwrap();
+        let cfg = config.read();
         args.data_dir
             .clone()
             .or_else(|| cfg.daemon.data_dir.clone())
             .unwrap_or_else(crate::cli::default_data_dir)
     });
     let socket = {
-        let cfg = config.read().unwrap();
+        let cfg = config.read();
         args.socket
             .clone()
             .or_else(|| cfg.daemon.socket.clone())
             .unwrap_or_else(|| PathBuf::from("/tmp/favetto.sock"))
     };
     let listen = {
-        let cfg = config.read().unwrap();
+        let cfg = config.read();
         args.listen
             .clone()
             .or_else(|| cfg.daemon.listen.clone())
             .unwrap_or_else(|| "127.0.0.1:7878".to_string())
     };
     let tasks_dir = crate::paths::expand_tilde({
-        let cfg = config.read().unwrap();
+        let cfg = config.read();
         args.tasks_dir
             .clone()
             .or_else(|| cfg.daemon.tasks_dir.clone())
@@ -78,7 +78,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     }
 
     // Bounded growth: run one retention pass at startup. Never fatal.
-    let retention = config.read().unwrap().daemon.retention.clone();
+    let retention = config.read().daemon.retention.clone();
     match db::prune(&pool, retention.days, retention.min_tasks, retention.vacuum).await {
         Ok(stats) if stats != db::PruneStats::default() => {
             tracing::info!(?stats, "pruned database")
@@ -96,25 +96,25 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     );
 
     let bus = event_bus::EventBus::new(1024);
-    let catalog = Arc::new(std::sync::RwLock::new(crate::tasks::load_catalog(
+    let catalog = Arc::new(parking_lot::RwLock::new(crate::tasks::load_catalog(
         &tasks_dir,
     )?));
     let mut agents = crate::agents::AgentManager::new();
     // Resolve every configured agent before wiring state: an unknown `type`
     // fails startup rather than the first launch.
-    let registry = crate::agents::AgentRegistry::from_config(&config.read().unwrap())?;
+    let registry = crate::agents::AgentRegistry::from_config(&config.read())?;
     // Resolve `[git]` (global + per-agent) and materialize any generated scripts
     // once, so a malformed section fails startup like an unknown agent type.
-    agents.configure_git(&config.read().unwrap(), data_dir.clone())?;
+    agents.configure_git(&config.read(), data_dir.clone())?;
     let scheduler = tokio_cron_scheduler::JobScheduler::new().await?;
 
     // Resolve webhook secrets from config/env and validate the trigger rules before
     // starting up, so a bad rule (unknown event/task/glob) fails fast.
-    let webhooks = WebhookSecrets::from_config(&config.read().unwrap());
-    crate::webhooks::validate_rules(&config.read().unwrap(), &catalog.read().unwrap())?;
+    let webhooks = WebhookSecrets::from_config(&config.read());
+    crate::webhooks::validate_rules(&config.read(), &catalog.read())?;
 
     // Notification hooks start empty; the TUI adds them live via `hooks.upsert`.
-    let hook_store = Arc::new(std::sync::RwLock::new(Vec::new()));
+    let hook_store = Arc::new(parking_lot::RwLock::new(Vec::new()));
 
     let state = Arc::new(State::new(
         pool,
@@ -133,7 +133,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
 
     // Materialize the catalog graph once at startup so `<data_dir>/workflow.dot`
     // exists even before the first catalog change.
-    if let Err(e) = crate::workflow::regenerate(&state.catalog.read().unwrap(), &state.data_dir) {
+    if let Err(e) = crate::workflow::regenerate(&state.catalog.read(), &state.data_dir) {
         tracing::warn!(error = %e, "failed to write workflow.dot");
     }
 
@@ -172,7 +172,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     }
 
     // Re-run the worktree sweep every six hours as well.
-    if state.config.read().unwrap().executor.worktree {
+    if state.config.read().executor.worktree {
         let state = state.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));

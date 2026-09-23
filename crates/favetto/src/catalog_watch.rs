@@ -132,7 +132,7 @@ fn event_relevant(ev: &notify::Event) -> bool {
 /// Merge-reload the catalog from disk and reconcile its schedules. When nothing
 /// changed, no client push is emitted.
 pub(crate) async fn reload(state: &Arc<State>) {
-    let prior = state.catalog.read().unwrap().clone();
+    let prior = state.catalog.read().clone();
     let updated = crate::tasks::reload_catalog(&state.tasks_dir, &prior);
     if updated == prior {
         return;
@@ -142,9 +142,9 @@ pub(crate) async fn reload(state: &Arc<State>) {
         after = updated.len(),
         "task catalog reloaded"
     );
-    *state.catalog.write().unwrap() = updated;
+    *state.catalog.write() = updated;
 
-    if let Err(e) = crate::workflow::regenerate(&state.catalog.read().unwrap(), &state.data_dir) {
+    if let Err(e) = crate::workflow::regenerate(&state.catalog.read(), &state.data_dir) {
         tracing::warn!(error = %e, "failed to write workflow.dot");
     }
 
@@ -177,7 +177,7 @@ mod tests {
     async fn test_state(dir: &std::path::Path, tasks_dir: &std::path::Path) -> Arc<State> {
         let pool = crate::db::open(&dir.join("test.db")).await.unwrap();
         crate::db::migrate(&pool).await.unwrap();
-        let catalog = Arc::new(std::sync::RwLock::new(
+        let catalog = Arc::new(parking_lot::RwLock::new(
             crate::tasks::load_catalog(tasks_dir).unwrap(),
         ));
         let scheduler = tokio_cron_scheduler::JobScheduler::new().await.unwrap();
@@ -188,14 +188,14 @@ mod tests {
             crate::webhooks::WebhookSecrets::from_config(&crate::config::FavettoConfig::default()),
             crate::agents::AgentManager::new(),
             crate::agents::AgentRegistry::default(),
-            Arc::new(std::sync::RwLock::new(
+            Arc::new(parking_lot::RwLock::new(
                 crate::config::FavettoConfig::default(),
             )),
             dir.to_path_buf(),
             tasks_dir.to_path_buf(),
             catalog,
             scheduler,
-            Arc::new(std::sync::RwLock::new(Vec::new())),
+            Arc::new(parking_lot::RwLock::new(Vec::new())),
         ))
     }
 
@@ -238,7 +238,7 @@ mod tests {
         .await
         .unwrap();
         assert!(pushed, "expected a catalog.updated push");
-        assert!(state.catalog.read().unwrap().iter().any(|d| d.name == "b"));
+        assert!(state.catalog.read().iter().any(|d| d.name == "b"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -282,7 +282,6 @@ mod tests {
             state
                 .catalog
                 .read()
-                .unwrap()
                 .iter()
                 .any(|d| d.name == "a" && d.prompt == "two")
         })
@@ -291,10 +290,7 @@ mod tests {
 
         // Delete the file: the task is dropped.
         std::fs::remove_file(tasks_dir.join("a.md")).unwrap();
-        let removed = wait_for(Duration::from_secs(5), || {
-            state.catalog.read().unwrap().is_empty()
-        })
-        .await;
+        let removed = wait_for(Duration::from_secs(5), || state.catalog.read().is_empty()).await;
         assert!(removed, "deleted task should leave the catalog");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -324,7 +320,6 @@ mod tests {
             state
                 .catalog
                 .read()
-                .unwrap()
                 .iter()
                 .any(|d| d.name == "pipelines/new")
         })
@@ -341,7 +336,6 @@ mod tests {
             state
                 .catalog
                 .read()
-                .unwrap()
                 .iter()
                 .any(|d| d.name == "pipelines/plan" && d.prompt == "two")
         })
@@ -354,7 +348,6 @@ mod tests {
             !state
                 .catalog
                 .read()
-                .unwrap()
                 .iter()
                 .any(|d| d.name == "pipelines/plan")
         })
@@ -376,7 +369,7 @@ mod tests {
         std::fs::write(tasks_dir.join("a.md"), "agent = \"x\"\n---\nprompt\n").unwrap();
 
         let found = wait_for(Duration::from_secs(5), || {
-            state.catalog.read().unwrap().iter().any(|d| d.name == "a")
+            state.catalog.read().iter().any(|d| d.name == "a")
         })
         .await;
         assert!(
@@ -395,13 +388,13 @@ mod tests {
         std::fs::write(tasks_dir.join("a.md"), "agent = \"x\"\n---\noriginal\n").unwrap();
 
         let state = test_state(&dir, &tasks_dir).await;
-        let before = state.catalog.read().unwrap().clone();
+        let before = state.catalog.read().clone();
 
         // Break the header: the task must survive with its previous prompt.
         std::fs::write(tasks_dir.join("a.md"), "agent = \n---\nbroken\n").unwrap();
         super::reload(&state).await;
 
-        assert_eq!(*state.catalog.read().unwrap(), before);
+        assert_eq!(*state.catalog.read(), before);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

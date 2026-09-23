@@ -193,7 +193,7 @@ mod tests {
     use crate::event_bus::EventBus;
     use crate::webhooks::WebhookSecrets;
     use favetto_core::auth::Token;
-    use std::sync::RwLock;
+    use parking_lot::RwLock;
 
     fn reason(kind: favetto_core::model::AwaitingInputKind) -> AwaitingInputReason {
         AwaitingInputReason {

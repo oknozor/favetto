@@ -7,11 +7,12 @@
 
 use std::collections::HashSet;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use base64::Engine as _;
 use chrono::Utc;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
+use parking_lot::Mutex;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
@@ -86,7 +87,7 @@ pub async fn serve_connection(state: Arc<State>, mut incoming: BoxIn, mut outgoi
                 match agent_rx.recv().await {
                     Ok(ev) => {
                         let sid = ev.session_id().to_string();
-                        if !subscribed.lock().unwrap().contains(&sid) {
+                        if !subscribed.lock().contains(&sid) {
                             continue;
                         }
                         let (method, params) = match ev {
@@ -188,7 +189,7 @@ async fn handle_request(
         let resp = match start_agent(state, &req.params).await {
             Ok(session) => match state.agents.attach(&session.id) {
                 Ok((session, data)) => {
-                    subscribed.lock().unwrap().insert(session.id.clone());
+                    subscribed.lock().insert(session.id.clone());
                     Response::ok(
                         id,
                         serde_json::json!({
@@ -215,7 +216,7 @@ async fn handle_request(
                     .and_then(|s| s.get("id"))
                     .and_then(|v| v.as_str())
                 {
-                    subscribed.lock().unwrap().insert(sid.to_string());
+                    subscribed.lock().insert(sid.to_string());
                 }
                 Response::ok(id, value)
             }
@@ -230,7 +231,7 @@ async fn handle_request(
         let resp = match session_id(&req.params) {
             Ok(sid) => match state.agents.attach(&sid) {
                 Ok((session, data)) => {
-                    subscribed.lock().unwrap().insert(sid);
+                    subscribed.lock().insert(sid);
                     Response::ok(
                         id,
                         serde_json::json!({
@@ -250,7 +251,7 @@ async fn handle_request(
     if req.method == method::AGENTS_CLOSE {
         let resp = match session_id(&req.params) {
             Ok(sid) => {
-                subscribed.lock().unwrap().remove(&sid);
+                subscribed.lock().remove(&sid);
                 match state.agents.close(&sid) {
                     Ok(()) => Response::ok(id, serde_json::json!({ "closed": sid })),
                     Err(e) => Response::err(id, error_code::INTERNAL, e.to_string()),
@@ -352,7 +353,7 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
         }
 
         method::CATALOG_LIST => {
-            let catalog = state.catalog.read().unwrap().clone();
+            let catalog = state.catalog.read().clone();
             let list: Vec<serde_json::Value> = catalog
                 .iter()
                 .map(|d| {
@@ -383,7 +384,6 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
                         state
                             .catalog
                             .read()
-                            .unwrap()
                             .iter()
                             .find(|d| d.name == name)
                             .map(crate::tasks::to_markdown)
@@ -416,7 +416,7 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
         },
 
         method::WORKFLOW_GET => {
-            let catalog = state.catalog.read().unwrap().clone();
+            let catalog = state.catalog.read().clone();
             Ok(serde_json::json!({
                 "dot": crate::workflow::build_dot(&catalog),
                 "path": crate::workflow::dot_path(&state.data_dir).to_string_lossy(),
@@ -639,9 +639,9 @@ async fn start_agent(
     let force_new = params.get("new").and_then(|v| v.as_bool()).unwrap_or(false);
 
     // Resolve the agent in a scoped block so the config read guard is dropped
-    // before the `await` below (a std `RwLockReadGuard` is not `Send`).
+    // before the `await` below (a `parking_lot::RwLockReadGuard` is not `Send`).
     let name = {
-        let cfg = state.config.read().unwrap();
+        let cfg = state.config.read();
         requested
             .or_else(|| cfg.agent.default.clone())
             .ok_or_else(|| {
@@ -791,7 +791,6 @@ async fn task_and_definition(
     let def = state
         .catalog
         .read()
-        .unwrap()
         .iter()
         .find(|d| d.name == task.name)
         .cloned()?;
@@ -861,7 +860,7 @@ async fn start_oneshot_task(
     let cols = params.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
 
     let name = {
-        let cfg = state.config.read().unwrap();
+        let cfg = state.config.read();
         requested
             .or_else(|| cfg.agent.default.clone())
             .ok_or_else(|| {
@@ -960,7 +959,7 @@ async fn start_oneshot_task(
         let agent_name = name.clone();
         let title_cwd = title_cwd.clone();
         let (detect, quiet) = {
-            let cfg = state.config.read().unwrap();
+            let cfg = state.config.read();
             (
                 cfg.executor.detect_awaiting_input,
                 std::time::Duration::from_millis(cfg.executor.awaiting_input_quiet_ms),
@@ -1181,13 +1180,13 @@ async fn add_catalog_task(
 
     // Update the live catalog.
     {
-        let mut catalog = state.catalog.write().unwrap();
+        let mut catalog = state.catalog.write();
         catalog.retain(|d| d.name != def.name);
         catalog.push(def.clone());
         catalog.sort_by(|a, b| a.name.cmp(&b.name));
     }
 
-    if let Err(e) = crate::workflow::regenerate(&state.catalog.read().unwrap(), &state.data_dir) {
+    if let Err(e) = crate::workflow::regenerate(&state.catalog.read(), &state.data_dir) {
         tracing::warn!(error = %e, "failed to write workflow.dot");
     }
 
@@ -1219,7 +1218,7 @@ async fn update_catalog_task(state: &Arc<State>, params: &serde_json::Value) -> 
         .get("markdown")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'markdown'"))?;
-    if !state.catalog.read().unwrap().iter().any(|d| d.name == name) {
+    if !state.catalog.read().iter().any(|d| d.name == name) {
         anyhow::bail!("unknown task '{name}'");
     }
     crate::tasks::parse_task_md(&name, markdown)
@@ -1255,7 +1254,7 @@ fn upsert_hook(state: &Arc<State>, params: &serde_json::Value) -> anyhow::Result
         .unwrap_or(serde_json::Value::Null);
 
     let hook = crate::hooks::notify_hook(event, channel, config);
-    state.hook_store.write().unwrap().push(hook);
+    state.hook_store.write().push(hook);
     tracing::info!("added notification hook");
     Ok(())
 }
@@ -1326,7 +1325,7 @@ mod tests {
     async fn test_state(dir: &Path, tasks_dir: &Path) -> Arc<State> {
         let pool = crate::db::open(&dir.join("test.db")).await.unwrap();
         crate::db::migrate(&pool).await.unwrap();
-        let catalog = Arc::new(std::sync::RwLock::new(
+        let catalog = Arc::new(parking_lot::RwLock::new(
             crate::tasks::load_catalog(tasks_dir).unwrap(),
         ));
         let scheduler = tokio_cron_scheduler::JobScheduler::new().await.unwrap();
@@ -1337,14 +1336,14 @@ mod tests {
             crate::webhooks::WebhookSecrets::from_config(&crate::config::FavettoConfig::default()),
             crate::agents::AgentManager::new(),
             crate::agents::AgentRegistry::default(),
-            Arc::new(std::sync::RwLock::new(
+            Arc::new(parking_lot::RwLock::new(
                 crate::config::FavettoConfig::default(),
             )),
             dir.to_path_buf(),
             tasks_dir.to_path_buf(),
             catalog,
             scheduler,
-            Arc::new(std::sync::RwLock::new(Vec::new())),
+            Arc::new(parking_lot::RwLock::new(Vec::new())),
         ))
     }
 
@@ -1494,7 +1493,6 @@ mod tests {
         let prompt = state
             .catalog
             .read()
-            .unwrap()
             .iter()
             .find(|d| d.name == "a")
             .map(|d| d.prompt.clone())
@@ -1528,7 +1526,6 @@ mod tests {
         assert!(state
             .catalog
             .read()
-            .unwrap()
             .iter()
             .any(|d| d.name == "pipelines/plan" && d.prompt == "two"));
 
@@ -1665,7 +1662,7 @@ mod tests {
             cfg.agents.insert(name.to_string(), agent);
         }
         let registry = crate::agents::AgentRegistry::from_config_with(&cfg, &|_| true).unwrap();
-        let catalog = Arc::new(std::sync::RwLock::new(
+        let catalog = Arc::new(parking_lot::RwLock::new(
             crate::tasks::load_catalog(tasks_dir).unwrap(),
         ));
         let scheduler = tokio_cron_scheduler::JobScheduler::new().await.unwrap();
@@ -1676,12 +1673,12 @@ mod tests {
             crate::webhooks::WebhookSecrets::from_config(&cfg),
             crate::agents::AgentManager::new(),
             registry,
-            Arc::new(std::sync::RwLock::new(cfg)),
+            Arc::new(parking_lot::RwLock::new(cfg)),
             dir.to_path_buf(),
             tasks_dir.to_path_buf(),
             catalog,
             scheduler,
-            Arc::new(std::sync::RwLock::new(Vec::new())),
+            Arc::new(parking_lot::RwLock::new(Vec::new())),
         ))
     }
 

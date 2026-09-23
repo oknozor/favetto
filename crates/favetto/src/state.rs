@@ -2,11 +2,12 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use chrono::Utc;
 use favetto_core::auth::Token;
 use favetto_core::model::{Event, EventKind};
+use parking_lot::RwLock;
 use sqlx::SqlitePool;
 use tokio_cron_scheduler::JobScheduler;
 

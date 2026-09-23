@@ -14,10 +14,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use parking_lot::Mutex;
 use sqlx::SqlitePool;
 use tokio::process::Command;
 use tokio::sync::{OwnedMutexGuard, Semaphore};
@@ -70,7 +71,7 @@ fn record_run_outcome(task: &mut Task, outcome: anyhow::Result<RunOutcome>) -> b
 
 /// Spawn the dispatcher and the dependency listener.
 pub fn spawn(state: Arc<State>) -> tokio::task::JoinHandle<()> {
-    let cfg = state.config.read().unwrap().executor.clone();
+    let cfg = state.config.read().executor.clone();
 
     let dep_state = state.clone();
     tokio::spawn(async move {
@@ -271,7 +272,7 @@ async fn run_one(
         )
         .await;
 
-    let config = state.config.read().unwrap().clone();
+    let config = state.config.read().clone();
 
     let prompt = render_task_prompt(&def, &task);
 
@@ -567,7 +568,7 @@ async fn run_agent_task(
     };
 
     let (detect, quiet) = {
-        let cfg = state.config.read().unwrap();
+        let cfg = state.config.read();
         (
             cfg.executor.detect_awaiting_input,
             Duration::from_millis(cfg.executor.awaiting_input_quiet_ms),
@@ -604,7 +605,7 @@ async fn run_agent_task(
     if result.session_id.is_some() && agent.capabilities().resume {
         let _ = state.agents.close(&info.id);
     }
-    let max = state.config.read().unwrap().executor.max_output_bytes;
+    let max = state.config.read().executor.max_output_bytes;
     let output = build_task_output(
         &result.raw,
         &result.output,
@@ -779,7 +780,6 @@ fn lookup_def(state: &State, name: &str) -> Option<TaskDef> {
     state
         .catalog
         .read()
-        .unwrap()
         .iter()
         .find(|d| d.name == name)
         .cloned()
@@ -1034,7 +1034,7 @@ fn select_prunable(
 /// Remove tracked worktrees the retention policy has expired, drop their
 /// branches, and `git worktree prune` each repo. Never fatal.
 pub async fn prune_worktrees(state: &State) -> anyhow::Result<WorktreePruneStats> {
-    let cfg = state.config.read().unwrap().executor.clone();
+    let cfg = state.config.read().executor.clone();
     let retention = cfg.worktree_retention.clone();
     let records = db::list_worktrees(&state.db).await?;
 
@@ -1085,13 +1085,7 @@ struct DirLocks(Arc<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>>);
 
 impl DirLocks {
     fn try_lock(&self, dir: &Path) -> Option<OwnedMutexGuard<()>> {
-        let lock = self
-            .0
-            .lock()
-            .unwrap()
-            .entry(dir.to_path_buf())
-            .or_default()
-            .clone();
+        let lock = self.0.lock().entry(dir.to_path_buf()).or_default().clone();
         lock.try_lock_owned().ok()
     }
 }
@@ -1107,7 +1101,7 @@ async fn start_dependents(state: &Arc<State>, ev: &Event) {
         return;
     };
 
-    let catalog = state.catalog.read().unwrap().clone();
+    let catalog = state.catalog.read().clone();
     let mut finished: Vec<String> = Vec::new();
     let mut joins: Vec<String> = Vec::new();
     for def in &catalog {
@@ -1186,7 +1180,6 @@ async fn evaluate_join_barriers(
     let joins: Vec<String> = state
         .catalog
         .read()
-        .unwrap()
         .iter()
         .filter(|d| {
             d.needs.as_deref().is_some_and(|needs| {
@@ -1313,7 +1306,7 @@ mod tests {
     use crate::tasks::{TaskVar, VarType};
     use crate::webhooks::WebhookSecrets;
     use favetto_core::auth::Token;
-    use std::sync::RwLock;
+    use parking_lot::RwLock;
 
     fn def_with_vars() -> TaskDef {
         let var = |name: &str, required: bool| TaskVar {
