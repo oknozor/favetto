@@ -13,6 +13,8 @@ use base64::Engine as _;
 use chrono::Utc;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use parking_lot::Mutex;
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
@@ -167,7 +169,10 @@ async fn handle_request(
             )))
             .await;
 
-        if let Some(last) = req.params.get("last_event_id").and_then(|v| v.as_i64()) {
+        // `events.subscribe` never fails on params: a malformed object is treated
+        // as "no replay" so the subscription still succeeds.
+        let p: EventsSubscribeParams = parse_params(&req.method, &req.params).unwrap_or_default();
+        if let Some(last) = p.last_event_id {
             match db::events_after(&state.db, last, 500).await {
                 Ok(events) => {
                     for ev in events {
@@ -237,10 +242,10 @@ async fn handle_request(
 
     // `agents.attach` subscribes this connection; `agents.close` unsubscribes.
     if req.method == method::AGENTS_ATTACH {
-        let resp = match session_id(&req.params) {
-            Ok(sid) => match state.agents.attach(&sid) {
+        let resp = match parse_params::<SessionIdParams>(&req.method, &req.params) {
+            Ok(p) => match state.agents.attach(&p.session_id) {
                 Ok((session, data)) => {
-                    subscribed.lock().insert(sid);
+                    subscribed.lock().insert(p.session_id);
                     Response::ok(
                         id,
                         serde_json::json!({
@@ -251,22 +256,22 @@ async fn handle_request(
                 }
                 Err(e) => Response::err(id, error_code::INTERNAL, e.to_string()),
             },
-            Err(e) => Response::err(id, error_code::INVALID_PARAMS, e),
+            Err((code, message)) => Response::err(id, code, message),
         };
         let _ = out_tx.send(Frame::Response(resp)).await;
         return;
     }
 
     if req.method == method::AGENTS_CLOSE {
-        let resp = match session_id(&req.params) {
-            Ok(sid) => {
-                subscribed.lock().remove(&sid);
-                match state.agents.close(&sid) {
-                    Ok(()) => Response::ok(id, serde_json::json!({ "closed": sid })),
+        let resp = match parse_params::<SessionIdParams>(&req.method, &req.params) {
+            Ok(p) => {
+                subscribed.lock().remove(&p.session_id);
+                match state.agents.close(&p.session_id) {
+                    Ok(()) => Response::ok(id, serde_json::json!({ "closed": p.session_id })),
                     Err(e) => Response::err(id, error_code::INTERNAL, e.to_string()),
                 }
             }
-            Err(e) => Response::err(id, error_code::INVALID_PARAMS, e),
+            Err((code, message)) => Response::err(id, code, message),
         };
         let _ = out_tx.send(Frame::Response(resp)).await;
         return;
@@ -276,18 +281,248 @@ async fn handle_request(
     let _ = out_tx.send(Frame::Response(resp)).await;
 }
 
-/// Extract a required `session_id` string param.
-fn session_id(params: &serde_json::Value) -> Result<String, String> {
-    params
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| "missing session_id".to_string())
+/// Deserialize an optional field leniently: a missing or ill-typed value becomes
+/// `None`, matching the `params.get(..).and_then(..)` chains these typed params
+/// replace. Required fields deliberately do not use this.
+fn lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+}
+
+/// Deserialize request `params` into a typed struct, surfacing serde's message as
+/// an `anyhow` error for the helper functions below.
+fn parse_value<T: DeserializeOwned>(params: &serde_json::Value) -> anyhow::Result<T> {
+    Ok(serde_json::from_value(params.clone())?)
+}
+
+/// Deserialize request `params` into the typed struct for `method`.
+///
+/// A malformed object is an `INVALID_PARAMS` error with a stable message.
+fn parse_params<T: DeserializeOwned>(
+    method: &str,
+    params: &serde_json::Value,
+) -> Result<T, (i32, String)> {
+    parse_value(params).map_err(|err| {
+        (
+            error_code::INVALID_PARAMS,
+            format!("invalid params for {method}: {err}"),
+        )
+    })
+}
+
+/// `tasks.list` params. `limit` defaults to 500 and caps at 2000.
+#[derive(Debug, Default, Deserialize)]
+struct TasksListParams {
+    #[serde(default, deserialize_with = "lenient")]
+    limit: Option<u64>,
+}
+
+/// `tasks.get` / `tasks.cancel` params.
+#[derive(Debug, Deserialize)]
+struct TaskIdParams {
+    id: Uuid,
+}
+
+/// `tasks.start` params. `input` defaults to JSON null.
+#[derive(Debug, Deserialize)]
+struct TasksStartParams {
+    name: String,
+    #[serde(default, deserialize_with = "lenient")]
+    input: Option<serde_json::Value>,
+}
+
+/// `catalog.get` params.
+#[derive(Debug, Deserialize)]
+struct CatalogGetParams {
+    name: String,
+}
+
+/// `events.tail` params. `limit` defaults to 50 and caps at 1000.
+#[derive(Debug, Default, Deserialize)]
+struct EventsTailParams {
+    #[serde(default, deserialize_with = "lenient")]
+    limit: Option<u64>,
+}
+
+/// `events.subscribe` params. A malformed request degrades to "no replay".
+#[derive(Debug, Default, Deserialize)]
+struct EventsSubscribeParams {
+    #[serde(default, deserialize_with = "lenient")]
+    last_event_id: Option<i64>,
+}
+
+/// `notifications.list` params. `limit` defaults to 50 and caps at 1000.
+#[derive(Debug, Default, Deserialize)]
+struct NotificationsListParams {
+    #[serde(default, deserialize_with = "lenient")]
+    limit: Option<u64>,
+}
+
+/// `agents.attach` / `agents.close` params.
+#[derive(Debug, Deserialize)]
+struct SessionIdParams {
+    session_id: String,
+}
+
+/// `agents.input` params.
+#[derive(Debug, Deserialize)]
+struct AgentInputParams {
+    session_id: String,
+    #[serde(default, deserialize_with = "lenient")]
+    data: Option<String>,
+}
+
+/// `agents.resize` params. `rows`/`cols` default to 24/80.
+#[derive(Debug, Deserialize)]
+struct AgentResizeParams {
+    session_id: String,
+    #[serde(default, deserialize_with = "lenient")]
+    rows: Option<u64>,
+    #[serde(default, deserialize_with = "lenient")]
+    cols: Option<u64>,
+}
+
+/// `providers.list` params.
+#[derive(Debug, Default, Deserialize)]
+struct ProvidersListParams {
+    #[serde(default, deserialize_with = "lenient")]
+    agent: Option<String>,
+}
+
+/// `schedules.delete` params.
+#[derive(Debug, Deserialize)]
+struct ScheduleDeleteParams {
+    id: String,
+}
+
+/// `schedules.upsert` params.
+#[derive(Debug, Deserialize)]
+struct ScheduleUpsertParams {
+    #[serde(default, deserialize_with = "lenient")]
+    id: Option<String>,
+    cron: String,
+    task: String,
+    #[serde(default, deserialize_with = "lenient")]
+    input: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "lenient")]
+    enabled: Option<bool>,
+}
+
+/// `notifications.test` params.
+#[derive(Debug, Deserialize)]
+struct NotificationTestParams {
+    channel: String,
+    #[serde(default, deserialize_with = "lenient")]
+    config: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "lenient")]
+    subject: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    body: Option<String>,
+}
+
+/// `hooks.upsert` params.
+#[derive(Debug, Deserialize)]
+struct HookUpsertParams {
+    event: String,
+    channel: String,
+    #[serde(default, deserialize_with = "lenient")]
+    config: Option<serde_json::Value>,
+}
+
+/// `catalog.add` params. `spawn_new_root` defaults to false, `prompt` to "".
+#[derive(Debug, Deserialize)]
+struct CatalogAddParams {
+    name: String,
+    #[serde(default, deserialize_with = "lenient")]
+    agent: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    provider: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    model: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    cwd: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    schedule: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    needs: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    spawn: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    spawn_file: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    spawn_new_root: Option<bool>,
+    #[serde(default, deserialize_with = "lenient")]
+    prompt: Option<String>,
+}
+
+/// `catalog.update` params.
+#[derive(Debug, Deserialize)]
+struct CatalogUpdateParams {
+    name: String,
+    markdown: String,
+}
+
+/// `agents.start` params. `rows`/`cols` default to 24/80, `new` to false.
+#[derive(Debug, Default, Deserialize)]
+struct StartAgentParams {
+    #[serde(default, deserialize_with = "lenient")]
+    agent: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    task_id: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    prompt: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    session_id: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    rows: Option<u64>,
+    #[serde(default, deserialize_with = "lenient")]
+    cols: Option<u64>,
+    #[serde(default, deserialize_with = "lenient")]
+    new: Option<bool>,
+    #[serde(default, deserialize_with = "lenient")]
+    provider: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    model: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    cwd: Option<std::path::PathBuf>,
+}
+
+/// `tasks.start_oneshot` params. `rows`/`cols` default to 24/80.
+#[derive(Debug, Default, Deserialize)]
+struct StartOneshotParams {
+    #[serde(default, deserialize_with = "lenient")]
+    agent: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    provider: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    model: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    cwd: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    rows: Option<u64>,
+    #[serde(default, deserialize_with = "lenient")]
+    cols: Option<u64>,
 }
 
 /// Execute a request and build its response.
 pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
-    let result: Result<serde_json::Value, (i32, String)> = match req.method.as_str() {
+    let id = req.id;
+    match dispatch_method(state, &req).await {
+        Ok(value) => Response::ok(id, value),
+        Err((code, message)) => Response::err(id, code, message),
+    }
+}
+
+/// Resolve a method's typed params and produce its result value.
+async fn dispatch_method(
+    state: &Arc<State>,
+    req: &Request,
+) -> Result<serde_json::Value, (i32, String)> {
+    match req.method.as_str() {
         method::PING => Ok(serde_json::json!({
             "pong": true,
             "cwd": std::env::current_dir()
@@ -296,12 +531,8 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
         })),
 
         method::TASKS_LIST => {
-            let limit = req
-                .params
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(500)
-                .min(2000) as i64;
+            let p: TasksListParams = parse_params(&req.method, &req.params)?;
+            let limit = p.limit.unwrap_or(500).min(2000) as i64;
             match db::list_tasks(&state.db, limit).await {
                 Ok(tasks) => Ok(serde_json::json!(tasks)),
                 Err(e) => Err((error_code::INTERNAL, e.to_string())),
@@ -309,53 +540,26 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
         }
 
         method::TASKS_GET => {
-            let id = req
-                .params
-                .get("id")
-                .and_then(|v| v.as_str())
-                .and_then(|s| Uuid::parse_str(s).ok());
-            match id {
-                Some(id) => match db::get_task(&state.db, id).await {
-                    Ok(Some(task)) => Ok(serde_json::json!(task)),
-                    Ok(None) => Err((error_code::INVALID_PARAMS, "task not found".to_string())),
-                    Err(e) => Err((error_code::INTERNAL, e.to_string())),
-                },
-                None => Err((
-                    error_code::INVALID_PARAMS,
-                    "missing or invalid 'id'".to_string(),
-                )),
+            let p: TaskIdParams = parse_params(&req.method, &req.params)?;
+            match db::get_task(&state.db, p.id).await {
+                Ok(Some(task)) => Ok(serde_json::json!(task)),
+                Ok(None) => Err((error_code::INVALID_PARAMS, "task not found".to_string())),
+                Err(e) => Err((error_code::INTERNAL, e.to_string())),
             }
         }
 
         method::TASKS_CANCEL => {
-            let id = req
-                .params
-                .get("id")
-                .and_then(|v| v.as_str())
-                .and_then(|s| Uuid::parse_str(s).ok());
-            match id {
-                Some(id) => match cancel_task(state, id).await {
-                    Ok(task) => Ok(serde_json::json!(task)),
-                    Err(e) => Err((error_code::INTERNAL, e.to_string())),
-                },
-                None => Err((
-                    error_code::INVALID_PARAMS,
-                    "missing or invalid 'id'".to_string(),
-                )),
+            let p: TaskIdParams = parse_params(&req.method, &req.params)?;
+            match cancel_task(state, p.id).await {
+                Ok(task) => Ok(serde_json::json!(task)),
+                Err(e) => Err((error_code::INTERNAL, e.to_string())),
             }
         }
 
         method::TASKS_START => {
-            let name = match req.params.get("name").and_then(|v| v.as_str()) {
-                Some(s) => s.to_string(),
-                None => return Response::err(req.id, error_code::INVALID_PARAMS, "missing name"),
-            };
-            let input = req
-                .params
-                .get("input")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            match crate::executor::enqueue_task(state, name, input, None).await {
+            let p: TasksStartParams = parse_params(&req.method, &req.params)?;
+            let input = p.input.unwrap_or(serde_json::Value::Null);
+            match crate::executor::enqueue_task(state, p.name, input, None).await {
                 Ok(task) => Ok(serde_json::json!(task)),
                 Err(e) => Err((error_code::INTERNAL, e.to_string())),
             }
@@ -382,28 +586,27 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
             Ok(serde_json::json!(list))
         }
 
-        method::CATALOG_GET => match req.params.get("name").and_then(|v| v.as_str()) {
-            None => Err((error_code::INVALID_PARAMS, "missing 'name'".to_string())),
-            Some(name) => {
-                if let Err(e) = crate::tasks::validate_task_path(name) {
-                    Err((error_code::INVALID_PARAMS, e.to_string()))
-                } else {
-                    let path = state.tasks_dir.join(format!("{name}.md"));
-                    let markdown = std::fs::read_to_string(&path).ok().or_else(|| {
-                        state
-                            .catalog
-                            .read()
-                            .iter()
-                            .find(|d| d.name == name)
-                            .map(crate::tasks::to_markdown)
-                    });
-                    match markdown {
-                        Some(markdown) => Ok(serde_json::json!({ "markdown": markdown })),
-                        None => Err((error_code::INVALID_PARAMS, format!("unknown task '{name}'"))),
-                    }
+        method::CATALOG_GET => {
+            let p: CatalogGetParams = parse_params(&req.method, &req.params)?;
+            let name = p.name;
+            if let Err(e) = crate::tasks::validate_task_path(&name) {
+                Err((error_code::INVALID_PARAMS, e.to_string()))
+            } else {
+                let path = state.tasks_dir.join(format!("{name}.md"));
+                let markdown = std::fs::read_to_string(&path).ok().or_else(|| {
+                    state
+                        .catalog
+                        .read()
+                        .iter()
+                        .find(|d| d.name == name)
+                        .map(crate::tasks::to_markdown)
+                });
+                match markdown {
+                    Some(markdown) => Ok(serde_json::json!({ "markdown": markdown })),
+                    None => Err((error_code::INVALID_PARAMS, format!("unknown task '{name}'"))),
                 }
             }
-        },
+        }
 
         method::CATALOG_ADD => match add_catalog_task(state, &req.params).await {
             Ok(def) => Ok(serde_json::json!({
@@ -434,12 +637,8 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
         }
 
         method::EVENTS_TAIL => {
-            let limit = req
-                .params
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(50)
-                .min(1000) as i64;
+            let p: EventsTailParams = parse_params(&req.method, &req.params)?;
+            let limit = p.limit.unwrap_or(50).min(1000) as i64;
             match db::tail_events(&state.db, limit).await {
                 Ok(events) => Ok(serde_json::json!(events)),
                 Err(e) => Err((error_code::INTERNAL, e.to_string())),
@@ -489,46 +688,30 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
         }
 
         method::PROVIDERS_LIST => {
-            let agent = req.params.get("agent").and_then(|v| v.as_str());
-            match list_providers(state, agent).await {
+            let p: ProvidersListParams = parse_params(&req.method, &req.params)?;
+            match list_providers(state, p.agent.as_deref()).await {
                 Ok(providers) => Ok(serde_json::json!({ "providers": providers })),
                 Err(e) => Err((error_code::INTERNAL, e.to_string())),
             }
         }
 
         method::AGENTS_INPUT => {
-            let sid = match session_id(&req.params) {
-                Ok(s) => s,
-                Err(e) => return Response::err(req.id, error_code::INVALID_PARAMS, e),
-            };
-            let data = req
-                .params
-                .get("data")
-                .and_then(|v| v.as_str())
+            let p: AgentInputParams = parse_params(&req.method, &req.params)?;
+            let data = p
+                .data
                 .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
                 .unwrap_or_default();
-            match state.agents.input(&sid, &data) {
+            match state.agents.input(&p.session_id, &data) {
                 Ok(()) => Ok(serde_json::json!({ "bytes": data.len() })),
                 Err(e) => Err((error_code::INTERNAL, e.to_string())),
             }
         }
 
         method::AGENTS_RESIZE => {
-            let sid = match session_id(&req.params) {
-                Ok(s) => s,
-                Err(e) => return Response::err(req.id, error_code::INVALID_PARAMS, e),
-            };
-            let rows = req
-                .params
-                .get("rows")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(24) as u16;
-            let cols = req
-                .params
-                .get("cols")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(80) as u16;
-            match state.agents.resize(&sid, rows, cols) {
+            let p: AgentResizeParams = parse_params(&req.method, &req.params)?;
+            let rows = p.rows.unwrap_or(24) as u16;
+            let cols = p.cols.unwrap_or(80) as u16;
+            match state.agents.resize(&p.session_id, rows, cols) {
                 Ok(()) => Ok(serde_json::json!({ "rows": rows, "cols": cols })),
                 Err(e) => Err((error_code::INTERNAL, e.to_string())),
             }
@@ -545,23 +728,16 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
         },
 
         method::SCHEDULES_DELETE => {
-            let id = match req.params.get("id").and_then(|v| v.as_str()) {
-                Some(s) => s.to_string(),
-                None => return Response::err(req.id, error_code::INVALID_PARAMS, "missing id"),
-            };
-            match delete_schedule(state, &id).await {
-                Ok(()) => Ok(serde_json::json!({ "deleted": id })),
+            let p: ScheduleDeleteParams = parse_params(&req.method, &req.params)?;
+            match delete_schedule(state, &p.id).await {
+                Ok(()) => Ok(serde_json::json!({ "deleted": p.id })),
                 Err(e) => Err((error_code::INTERNAL, e.to_string())),
             }
         }
 
         method::NOTIFICATIONS_LIST => {
-            let limit = req
-                .params
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(50)
-                .min(1000) as i64;
+            let p: NotificationsListParams = parse_params(&req.method, &req.params)?;
+            let limit = p.limit.unwrap_or(50).min(1000) as i64;
             match db::list_notifications(&state.db, limit).await {
                 Ok(notifications) => Ok(serde_json::json!(notifications)),
                 Err(e) => Err((error_code::INTERNAL, e.to_string())),
@@ -569,30 +745,11 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
         }
 
         method::NOTIFICATIONS_TEST => {
-            let channel = match req.params.get("channel").and_then(|v| v.as_str()) {
-                Some(s) => s.to_string(),
-                None => {
-                    return Response::err(req.id, error_code::INVALID_PARAMS, "missing channel")
-                }
-            };
-            let config = req
-                .params
-                .get("config")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            let subject = req
-                .params
-                .get("subject")
-                .and_then(|v| v.as_str())
-                .unwrap_or("test")
-                .to_string();
-            let body = req
-                .params
-                .get("body")
-                .and_then(|v| v.as_str())
-                .unwrap_or("test notification")
-                .to_string();
-            crate::notify::send(state, &channel, &config, &subject, &body).await;
+            let p: NotificationTestParams = parse_params(&req.method, &req.params)?;
+            let config = p.config.unwrap_or(serde_json::Value::Null);
+            let subject = p.subject.as_deref().unwrap_or("test");
+            let body = p.body.as_deref().unwrap_or("test notification");
+            crate::notify::send(state, &p.channel, &config, subject, body).await;
             Ok(serde_json::json!({ "sent": true }))
         }
 
@@ -605,11 +762,6 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
             error_code::METHOD_NOT_FOUND,
             format!("unknown method: {}", req.method),
         )),
-    };
-
-    match result {
-        Ok(value) => Response::ok(req.id, value),
-        Err((code, message)) => Response::err(req.id, code, message),
     }
 }
 
@@ -626,26 +778,21 @@ async fn start_agent(
     state: &Arc<State>,
     params: &serde_json::Value,
 ) -> anyhow::Result<AgentSessionInfo> {
-    let requested = params
-        .get("agent")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let task_id = params
-        .get("task_id")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let prompt = params
-        .get("prompt")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let session_id = params
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let rows = params.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
-    let cols = params.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
-
-    let force_new = params.get("new").and_then(|v| v.as_bool()).unwrap_or(false);
+    let StartAgentParams {
+        agent: requested,
+        task_id,
+        prompt,
+        session_id,
+        rows,
+        cols,
+        new: force_new,
+        provider: requested_provider,
+        model: requested_model,
+        cwd,
+    } = parse_value(params)?;
+    let rows = rows.unwrap_or(24) as u16;
+    let cols = cols.unwrap_or(80) as u16;
+    let force_new = force_new.unwrap_or(false);
 
     // Resolve the agent: a request wins over the configured default.
     let name = requested
@@ -661,14 +808,6 @@ async fn start_agent(
     // `provider`/`model` too, so the panel session matches the run instead of
     // silently falling back to the agent default. The request wins; the task
     // definition fills in whatever it didn't send.
-    let requested_provider = params
-        .get("provider")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let requested_model = params
-        .get("model")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
     let (prompt, task_provider, task_model) = match task_id.as_deref() {
         Some(tid) => match task_and_definition(state, tid).await {
             Some((task, def)) => {
@@ -693,10 +832,7 @@ async fn start_agent(
     let model = requested_model.or(task_model);
 
     let mut ctx = AgentContext {
-        cwd: params
-            .get("cwd")
-            .and_then(|v| v.as_str())
-            .map(std::path::PathBuf::from),
+        cwd,
         session_id: session_id.clone(),
         rows,
         cols,
@@ -854,26 +990,19 @@ async fn start_oneshot_task(
     state: &Arc<State>,
     params: &serde_json::Value,
 ) -> anyhow::Result<serde_json::Value> {
-    let requested = params
-        .get("agent")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let provider = params
-        .get("provider")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let model = params
-        .get("model")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let cwd = params
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let rows = params.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
-    let cols = params.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
+    let StartOneshotParams {
+        agent: requested,
+        provider,
+        model,
+        cwd,
+        rows,
+        cols,
+    } = parse_value(params)?;
+    let cwd = cwd
+        .map(|cwd| cwd.trim().to_string())
+        .filter(|cwd| !cwd.is_empty());
+    let rows = rows.unwrap_or(24) as u16;
+    let cols = cols.unwrap_or(80) as u16;
 
     let name = requested
         .or_else(|| state.config.agent.default.clone())
@@ -1081,29 +1210,16 @@ async fn upsert_schedule(
 ) -> anyhow::Result<favetto_core::model::Schedule> {
     use favetto_core::model::Schedule;
 
-    let id = params
-        .get("id")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let cron = params
-        .get("cron")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing cron"))?
-        .to_string();
-    let task = params
-        .get("task")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing task"))?
-        .to_string();
-    let input = params
-        .get("input")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let enabled = params
-        .get("enabled")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+    let ScheduleUpsertParams {
+        id,
+        cron,
+        task,
+        input,
+        enabled,
+    } = parse_value(params)?;
+    let id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let input = input.unwrap_or(serde_json::Value::Null);
+    let enabled = enabled.unwrap_or(true);
 
     let schedule = Schedule {
         id,
@@ -1125,56 +1241,25 @@ async fn add_catalog_task(
 ) -> anyhow::Result<crate::tasks::TaskDef> {
     use crate::tasks::TaskDef;
 
-    let name = params
-        .get("name")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing 'name'"))?
-        .to_string();
+    let CatalogAddParams {
+        name,
+        agent,
+        provider,
+        model,
+        cwd,
+        schedule,
+        needs,
+        spawn,
+        spawn_file,
+        spawn_new_root,
+        prompt,
+    } = parse_value(params)?;
     crate::tasks::validate_task_path(&name)?;
-    let agent = params
-        .get("agent")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let provider = params
-        .get("provider")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let model = params
-        .get("model")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let cwd = params
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
     if agent.is_none() {
         anyhow::bail!("a task needs an 'agent'");
     }
-    let schedule = params
-        .get("schedule")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let needs = params
-        .get("needs")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let spawn = params
-        .get("spawn")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let spawn_file = params
-        .get("spawn_file")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let spawn_new_root = params
-        .get("spawn_new_root")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let prompt = params
-        .get("prompt")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
+    let spawn_new_root = spawn_new_root.unwrap_or(false);
+    let prompt = prompt.unwrap_or_default();
 
     let def = TaskDef {
         name,
@@ -1223,26 +1308,18 @@ async fn add_catalog_task(
 /// never clobber a good task file; the raw bytes are written unchanged so the
 /// user's formatting is preserved.
 async fn update_catalog_task(state: &Arc<State>, params: &serde_json::Value) -> anyhow::Result<()> {
-    let name = params
-        .get("name")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing 'name'"))?
-        .to_string();
+    let CatalogUpdateParams { name, markdown } = parse_value(params)?;
     crate::tasks::validate_task_path(&name)?;
-    let markdown = params
-        .get("markdown")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing 'markdown'"))?;
     if !state.catalog.read().iter().any(|d| d.name == name) {
         anyhow::bail!("unknown task '{name}'");
     }
-    crate::tasks::parse_task_md(&name, markdown)
+    crate::tasks::parse_task_md(&name, &markdown)
         .map_err(|e| anyhow::anyhow!("invalid task '{name}': {e}"))?;
     let path = state.tasks_dir.join(format!("{name}.md"));
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, markdown)?;
+    std::fs::write(&path, &markdown)?;
     crate::catalog_watch::reload(state).await;
     Ok(())
 }
@@ -1253,20 +1330,14 @@ async fn delete_schedule(state: &Arc<State>, id: &str) -> anyhow::Result<()> {
 
 /// Add a notification hook reacting to an event kind (live, in-memory).
 fn upsert_hook(state: &Arc<State>, params: &serde_json::Value) -> anyhow::Result<()> {
-    let event = params
-        .get("event")
-        .and_then(|v| v.as_str())
-        .and_then(favetto_core::model::EventKind::from_name)
+    let HookUpsertParams {
+        event,
+        channel,
+        config,
+    } = parse_value(params)?;
+    let event = favetto_core::model::EventKind::from_name(&event)
         .ok_or_else(|| anyhow::anyhow!("missing or invalid 'event' kind"))?;
-    let channel = params
-        .get("channel")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing 'channel'"))?
-        .to_string();
-    let config = params
-        .get("config")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
+    let config = config.unwrap_or(serde_json::Value::Null);
 
     let hook = crate::hooks::notify_hook(event, channel, config);
     state.hook_store.write().push(hook);
@@ -2645,5 +2716,85 @@ mod tests {
         assert_eq!(resp.error.unwrap().code, error_code::INVALID_PARAMS);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Malformed params must fail with `INVALID_PARAMS` and a stable message for
+    /// every arm that parses them, rather than reaching the database or PTY.
+    #[tokio::test]
+    async fn dispatch_rejects_malformed_params() {
+        let dir = temp_dir("malformed-params");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let state = test_state(&dir, &tasks_dir).await;
+
+        let cases: &[(&str, serde_json::Value)] = &[
+            // Missing / invalid `id`.
+            (method::TASKS_GET, serde_json::json!({})),
+            (method::TASKS_GET, serde_json::json!({ "id": "not-a-uuid" })),
+            (method::TASKS_GET, serde_json::json!({ "id": 17 })),
+            (method::TASKS_GET, serde_json::json!({ "id": null })),
+            (method::TASKS_CANCEL, serde_json::json!({})),
+            (
+                method::TASKS_CANCEL,
+                serde_json::json!({ "id": "not-a-uuid" }),
+            ),
+            // Missing / invalid `name`.
+            (method::TASKS_START, serde_json::json!({})),
+            (method::TASKS_START, serde_json::json!({ "name": 5 })),
+            (method::CATALOG_GET, serde_json::json!({})),
+            (method::CATALOG_GET, serde_json::json!({ "name": 5 })),
+            // Other required fields.
+            (method::SCHEDULES_DELETE, serde_json::json!({})),
+            (method::NOTIFICATIONS_TEST, serde_json::json!({})),
+            (method::AGENTS_INPUT, serde_json::json!({})),
+            (method::AGENTS_RESIZE, serde_json::json!({})),
+        ];
+
+        for (case, (name, params)) in cases.iter().enumerate() {
+            let resp = dispatch(
+                &state,
+                Request {
+                    id: case as u64 + 1,
+                    method: (*name).to_string(),
+                    params: params.clone(),
+                },
+            )
+            .await;
+            let err = resp
+                .error
+                .unwrap_or_else(|| panic!("{name} accepted malformed params {params}"));
+            assert_eq!(
+                err.code,
+                error_code::INVALID_PARAMS,
+                "{name} {params} produced {err:?}"
+            );
+            assert!(
+                err.message.contains("invalid params"),
+                "{name} {params} produced an unstable message: {:?}",
+                err.message
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Optional params keep their old lenient behaviour: an ill-typed value is
+    /// treated as absent so the default applies, preserving the wire contract.
+    #[test]
+    fn parse_params_tolerates_ill_typed_optional_fields() {
+        let p: TasksListParams =
+            parse_params(method::TASKS_LIST, &serde_json::json!({ "limit": "many" })).unwrap();
+        assert_eq!(p.limit, None);
+        let p: TasksListParams =
+            parse_params(method::TASKS_LIST, &serde_json::json!({ "limit": 7 })).unwrap();
+        assert_eq!(p.limit, Some(7));
+
+        let p: AgentResizeParams = parse_params(
+            method::AGENTS_RESIZE,
+            &serde_json::json!({ "session_id": "s", "rows": true, "cols": "80" }),
+        )
+        .unwrap();
+        assert_eq!(p.rows, None);
+        assert_eq!(p.cols, None);
     }
 }
