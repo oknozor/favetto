@@ -213,7 +213,20 @@ mod tests {
 
     #[tokio::test]
     async fn watch_flips_running_to_awaiting_and_back() {
-        let state = state_with_sh("printf 'Enter passphrase: '; sleep 1; exit 0").await;
+        // Keep the prompt in the args via `{prompt}` so it is not written to the
+        // PTY's stdin. A stdin prompt is echoed onto the printed line
+        // ("Enter passphrase: go"), which drops the trailing `:` the generic
+        // detector keys on, and the echo/print ordering is racy. The agent then
+        // blocks until the test creates the marker file instead of sleeping for a
+        // fixed second: `AwaitingInput` is transient, so a fixed lifetime also
+        // races the watcher's 500ms poll interval.
+        let release =
+            std::env::temp_dir().join(format!("favetto-attention-release-{}", Uuid::new_v4()));
+        let script = format!(
+            "# {{prompt}}\nprintf 'Enter passphrase: '; while [ ! -e '{}' ]; do sleep 0.05; done; exit 0",
+            release.display()
+        );
+        let state = state_with_sh(&script).await;
         let agent = state.registry.get("sh").unwrap();
 
         let task = favetto_core::model::Task {
@@ -268,7 +281,7 @@ mod tests {
 
         // The task flips to AwaitingInput while the agent blocks on the prompt.
         let mut saw_awaiting = false;
-        for _ in 0..40 {
+        for _ in 0..100 {
             let current = db::get_task(&state.db, task.id).await.unwrap().unwrap();
             if current.status == TaskStatus::AwaitingInput {
                 saw_awaiting = true;
@@ -277,6 +290,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(saw_awaiting, "task never became AwaitingInput");
+
+        // Release the blocked agent so `watch` observes the exit and restores the
+        // baseline.
+        std::fs::write(&release, b"go").unwrap();
 
         let code = handle.await.unwrap();
         assert_eq!(code, Some(0));
@@ -293,5 +310,7 @@ mod tests {
                 .any(|e| e.kind == EventKind::TaskAwaitingInput),
             "no TaskAwaitingInput event: {events:?}"
         );
+
+        let _ = std::fs::remove_file(&release);
     }
 }
