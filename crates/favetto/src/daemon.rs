@@ -21,43 +21,38 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         .config
         .clone()
         .unwrap_or_else(crate::cli::default_config_path);
-    let config = Arc::new(parking_lot::RwLock::new(
-        match FavettoConfig::load_from(&config_path) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, path = %config_path.display(), "failed to load config; using defaults");
-                FavettoConfig::default()
-            }
-        },
-    ));
+    let config = Arc::new(match FavettoConfig::load_from(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %config_path.display(), "failed to load config; using defaults");
+            FavettoConfig::default()
+        }
+    });
 
-    // Resolve settings: CLI flag > config > default. Read the config once here.
+    // Resolve settings: CLI flag > config > default. The config is loaded once up
+    // front and shared immutably from here on.
     let data_dir = crate::paths::expand_tilde({
-        let cfg = config.read();
         args.data_dir
             .clone()
-            .or_else(|| cfg.daemon.data_dir.clone())
+            .or_else(|| config.daemon.data_dir.clone())
             .unwrap_or_else(crate::cli::default_data_dir)
     });
     let socket = {
-        let cfg = config.read();
         args.socket
             .clone()
-            .or_else(|| cfg.daemon.socket.clone())
+            .or_else(|| config.daemon.socket.clone())
             .unwrap_or_else(|| PathBuf::from("/tmp/favetto.sock"))
     };
     let listen = {
-        let cfg = config.read();
         args.listen
             .clone()
-            .or_else(|| cfg.daemon.listen.clone())
+            .or_else(|| config.daemon.listen.clone())
             .unwrap_or_else(|| "127.0.0.1:7878".to_string())
     };
     let tasks_dir = crate::paths::expand_tilde({
-        let cfg = config.read();
         args.tasks_dir
             .clone()
-            .or_else(|| cfg.daemon.tasks_dir.clone())
+            .or_else(|| config.daemon.tasks_dir.clone())
             .unwrap_or_else(|| PathBuf::from("tasks"))
     });
     tokio::fs::create_dir_all(&data_dir).await?;
@@ -78,7 +73,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     }
 
     // Bounded growth: run one retention pass at startup. Never fatal.
-    let retention = config.read().daemon.retention.clone();
+    let retention = config.daemon.retention.clone();
     match db::prune(&pool, retention.days, retention.min_tasks, retention.vacuum).await {
         Ok(stats) if stats != db::PruneStats::default() => {
             tracing::info!(?stats, "pruned database")
@@ -102,16 +97,16 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let mut agents = crate::agents::AgentManager::new();
     // Resolve every configured agent before wiring state: an unknown `type`
     // fails startup rather than the first launch.
-    let registry = crate::agents::AgentRegistry::from_config(&config.read())?;
+    let registry = crate::agents::AgentRegistry::from_config(&config)?;
     // Resolve `[git]` (global + per-agent) and materialize any generated scripts
     // once, so a malformed section fails startup like an unknown agent type.
-    agents.configure_git(&config.read(), data_dir.clone())?;
+    agents.configure_git(&config, data_dir.clone())?;
     let scheduler = tokio_cron_scheduler::JobScheduler::new().await?;
 
     // Resolve webhook secrets from config/env and validate the trigger rules before
     // starting up, so a bad rule (unknown event/task/glob) fails fast.
-    let webhooks = WebhookSecrets::from_config(&config.read());
-    crate::webhooks::validate_rules(&config.read(), &catalog.read())?;
+    let webhooks = WebhookSecrets::from_config(&config);
+    crate::webhooks::validate_rules(&config, &catalog.read())?;
 
     // Notification hooks start empty; the TUI adds them live via `hooks.upsert`.
     let hook_store = Arc::new(parking_lot::RwLock::new(Vec::new()));
@@ -172,7 +167,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     }
 
     // Re-run the worktree sweep every six hours as well.
-    if state.config.read().executor.worktree {
+    if state.config.executor.worktree {
         let state = state.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));
