@@ -293,12 +293,20 @@ fn row_to_task(row: &SqliteRow) -> Task {
 }
 
 fn row_to_event(row: &SqliteRow) -> Event {
+    let raw_kind = row.get::<String, _>("kind");
+    let kind = match raw_kind.parse::<EventKind>() {
+        Ok(kind) => kind,
+        Err(()) => {
+            tracing::warn!(
+                kind = %raw_kind,
+                "unrecognised event kind; falling back to Unknown"
+            );
+            EventKind::Unknown
+        }
+    };
     Event {
         id: row.get("id"),
-        kind: row
-            .get::<String, _>("kind")
-            .parse()
-            .unwrap_or(EventKind::Synthetic),
+        kind,
         payload: serde_json::from_str(&row.get::<String, _>("payload")).unwrap_or_default(),
         created_at: from_ms(row.get("created_at")),
     }
@@ -738,7 +746,7 @@ mod tests {
         for i in 0..5 {
             let ev = Event {
                 id: 0,
-                kind: EventKind::Synthetic,
+                kind: EventKind::Unknown,
                 payload: serde_json::json!({ "n": i }),
                 created_at: Utc::now(),
             };
@@ -756,6 +764,25 @@ mod tests {
         let tail = tail_events(&pool, 3).await.unwrap();
         assert_eq!(tail.len(), 3);
         assert_eq!(tail[0].id, 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn row_to_event_falls_back_to_unknown() {
+        let (dir, pool) = scratch_pool("unknown-kind").await;
+        // A kind an older or newer build wrote that this build does not know.
+        sqlx::query(
+            "INSERT INTO events (kind, payload, created_at) VALUES ('not_a_kind', '{}', ?)",
+        )
+        .bind(ts_ms(Utc::now()))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let events = events_after(&pool, 0, 10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EventKind::Unknown);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -976,7 +1003,7 @@ mod tests {
             upsert_task(&pool, &task).await.unwrap();
         }
         // An old event and notification, plus one fresh of each.
-        sqlx::query("INSERT INTO events (kind, payload, created_at) VALUES ('synthetic', '{}', ?)")
+        sqlx::query("INSERT INTO events (kind, payload, created_at) VALUES ('unknown', '{}', ?)")
             .bind(ts_ms(old))
             .execute(&pool)
             .await

@@ -132,180 +132,113 @@ impl Task {
 
 /// Kinds of events emitted on the event bus.
 ///
-/// Integration events (`TicketCreated`, `IssueCreated`, ...) arrive in M3/M4; M1
-/// only emits task- and cron-flavoured synthetic events to exercise the pipeline.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EventKind {
-    TaskCreated,
-    TaskUpdated,
-    TaskCompleted,
-    TaskFailed,
-    TaskCancelled,
+/// Task and cron events are produced by the daemon's own lifecycle (the executor,
+/// the scheduler and the RPC surface); integration events (`IssueCreated`,
+/// `PrMerged`, `PushReceived`, ...) are emitted by webhook receivers as GitHub
+/// (or other provider) activity arrives.
+///
+/// The macro below is the single source of truth. The enum variants,
+/// [`EventKind::ALL`], [`EventKind::as_str`], [`EventKind::description`] and
+/// [`EventKind::from_name`] are all generated from the same table, so adding a
+/// kind is a one-line edit. Each entry carries its `snake_case` wire/storage
+/// name, the spec's `PascalCase` spelling and a one-line description.
+macro_rules! event_kinds {
+    ($(
+        $(#[$meta:meta])*
+        $variant:ident => $snake:literal, $pascal:literal, $description:literal;
+    )*) => {
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum EventKind {
+            $(
+                $(#[$meta])*
+                $variant,
+            )*
+        }
+
+        /// The event-kind table: `(kind, snake_case, PascalCase, description)`.
+        ///
+        /// Kept as the single source of truth for the generated methods below.
+        pub const KINDS: &[(EventKind, &str, &str, &str)] = &[
+            $( (EventKind::$variant, $snake, $pascal, $description), )*
+        ];
+
+        impl EventKind {
+            /// Every [`EventKind`], in declaration order.
+            pub const ALL: &'static [EventKind] = &[
+                $( EventKind::$variant, )*
+            ];
+
+            /// Stable string form used for persistence and on-the-wire encoding.
+            pub fn as_str(&self) -> &'static str {
+                match self {
+                    $( EventKind::$variant => $snake, )*
+                }
+            }
+
+            /// A one-line explanation of when this event is emitted, used by the
+            /// generated event-kinds reference.
+            pub fn description(&self) -> &'static str {
+                match self {
+                    $( EventKind::$variant => $description, )*
+                }
+            }
+
+            /// Parse an event name in either the wire `snake_case` form or the
+            /// spec's `PascalCase` form (e.g. `"ticket_created"` or
+            /// `"TicketCreated"`).
+            pub fn from_name(s: &str) -> Option<Self> {
+                match s {
+                    $( $snake | $pascal => Some(EventKind::$variant), )*
+                    // Rows written before `Synthetic` was renamed to `Unknown`.
+                    "synthetic" | "Synthetic" => Some(EventKind::Unknown),
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+event_kinds! {
+    TaskCreated => "task_created", "TaskCreated", "A task row was created.";
+    TaskUpdated => "task_updated", "TaskUpdated", "A task row changed.";
+    TaskCompleted => "task_completed", "TaskCompleted", "A task completed successfully (terminal).";
+    TaskFailed => "task_failed", "TaskFailed", "A task failed (terminal).";
+    TaskCancelled => "task_cancelled", "TaskCancelled", "A task was cancelled (terminal).";
     /// A task was enqueued and is idle (waiting to run).
-    TaskIdle,
+    TaskIdle => "task_idle", "TaskIdle", "A task was enqueued and is waiting to run.";
     /// A task began running.
-    TaskStarted,
+    TaskStarted => "task_started", "TaskStarted", "A task began running.";
     /// A running task's agent is blocked waiting for user input.
-    TaskAwaitingInput,
+    TaskAwaitingInput => "task_awaiting_input", "TaskAwaitingInput", "A running task's agent is blocked waiting for user input.";
     /// A task ended (success or failure) — used by `needs` dependencies.
-    TaskFinished,
-    CronTick,
-    // Integration events (M3+): emitted by webhook receivers and integrations.
-    IssueCreated,
-    IssueUpdated,
-    IssueClosed,
-    IssueReopened,
-    IssueLabeled,
-    IssueAssigned,
-    IssueCommentCreated,
-    PrCreated,
-    PrMerged,
-    PrClosed,
-    PrReopened,
-    PrSynchronized,
-    PrReadyForReview,
-    PrReviewRequested,
-    PrUpdated,
-    PrReviewSubmitted,
-    PushReceived,
-    TicketCreated,
-    TicketUpdated,
-    ActionRunCompleted,
-    CheckSuiteCompleted,
-    CheckRunCompleted,
-    EmailReceived,
-    /// Generic marker for synthetic events that drive the TUI before real
-    /// integrations exist (M1 only).
-    Synthetic,
-}
-
-impl EventKind {
-    /// Stable string form used for persistence and on-the-wire encoding.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            EventKind::TaskCreated => "task_created",
-            EventKind::TaskUpdated => "task_updated",
-            EventKind::TaskCompleted => "task_completed",
-            EventKind::TaskFailed => "task_failed",
-            EventKind::TaskCancelled => "task_cancelled",
-            EventKind::TaskIdle => "task_idle",
-            EventKind::TaskStarted => "task_started",
-            EventKind::TaskAwaitingInput => "task_awaiting_input",
-            EventKind::TaskFinished => "task_finished",
-            EventKind::CronTick => "cron_tick",
-            EventKind::IssueCreated => "issue_created",
-            EventKind::IssueUpdated => "issue_updated",
-            EventKind::IssueClosed => "issue_closed",
-            EventKind::IssueReopened => "issue_reopened",
-            EventKind::IssueLabeled => "issue_labeled",
-            EventKind::IssueAssigned => "issue_assigned",
-            EventKind::IssueCommentCreated => "issue_comment_created",
-            EventKind::PrCreated => "pr_created",
-            EventKind::PrMerged => "pr_merged",
-            EventKind::PrClosed => "pr_closed",
-            EventKind::PrReopened => "pr_reopened",
-            EventKind::PrSynchronized => "pr_synchronized",
-            EventKind::PrReadyForReview => "pr_ready_for_review",
-            EventKind::PrReviewRequested => "pr_review_requested",
-            EventKind::PrUpdated => "pr_updated",
-            EventKind::PrReviewSubmitted => "pr_review_submitted",
-            EventKind::PushReceived => "push_received",
-            EventKind::TicketCreated => "ticket_created",
-            EventKind::TicketUpdated => "ticket_updated",
-            EventKind::ActionRunCompleted => "action_run_completed",
-            EventKind::CheckSuiteCompleted => "check_suite_completed",
-            EventKind::CheckRunCompleted => "check_run_completed",
-            EventKind::EmailReceived => "email_received",
-            EventKind::Synthetic => "synthetic",
-        }
-    }
-}
-
-impl EventKind {
-    /// Every [`EventKind`], in declaration order. Kept in sync with the enum by
-    /// the `all_covers_every_kind` test.
-    pub const ALL: &'static [EventKind] = &[
-        EventKind::TaskCreated,
-        EventKind::TaskUpdated,
-        EventKind::TaskCompleted,
-        EventKind::TaskFailed,
-        EventKind::TaskCancelled,
-        EventKind::TaskIdle,
-        EventKind::TaskStarted,
-        EventKind::TaskAwaitingInput,
-        EventKind::TaskFinished,
-        EventKind::CronTick,
-        EventKind::IssueCreated,
-        EventKind::IssueUpdated,
-        EventKind::IssueClosed,
-        EventKind::IssueReopened,
-        EventKind::IssueLabeled,
-        EventKind::IssueAssigned,
-        EventKind::IssueCommentCreated,
-        EventKind::PrCreated,
-        EventKind::PrMerged,
-        EventKind::PrClosed,
-        EventKind::PrReopened,
-        EventKind::PrSynchronized,
-        EventKind::PrReadyForReview,
-        EventKind::PrReviewRequested,
-        EventKind::PrUpdated,
-        EventKind::PrReviewSubmitted,
-        EventKind::PushReceived,
-        EventKind::TicketCreated,
-        EventKind::TicketUpdated,
-        EventKind::ActionRunCompleted,
-        EventKind::CheckSuiteCompleted,
-        EventKind::CheckRunCompleted,
-        EventKind::EmailReceived,
-        EventKind::Synthetic,
-    ];
-
-    /// A one-line explanation of when this event is emitted, used by the
-    /// generated event-kinds reference.
-    pub fn description(&self) -> &'static str {
-        match self {
-            EventKind::TaskCreated => "A task row was created.",
-            EventKind::TaskUpdated => "A task row changed.",
-            EventKind::TaskCompleted => "A task completed successfully (terminal).",
-            EventKind::TaskFailed => "A task failed (terminal).",
-            EventKind::TaskCancelled => "A task was cancelled (terminal).",
-            EventKind::TaskIdle => "A task was enqueued and is waiting to run.",
-            EventKind::TaskStarted => "A task began running.",
-            EventKind::TaskAwaitingInput => {
-                "A running task's agent is blocked waiting for user input."
-            }
-            EventKind::TaskFinished => {
-                "A task ended (success or failure); used by `needs` dependencies."
-            }
-            EventKind::CronTick => "A scheduled cron job fired.",
-            EventKind::IssueCreated => "An issue was created.",
-            EventKind::IssueUpdated => "An issue was edited.",
-            EventKind::IssueClosed => "An issue was closed.",
-            EventKind::IssueReopened => "An issue was reopened.",
-            EventKind::IssueLabeled => "A label was added to or removed from an issue.",
-            EventKind::IssueAssigned => "An issue was assigned.",
-            EventKind::IssueCommentCreated => "A comment was posted on an issue.",
-            EventKind::PrCreated => "A pull request was opened.",
-            EventKind::PrMerged => "A pull request was merged.",
-            EventKind::PrClosed => "A pull request was closed without merging.",
-            EventKind::PrReopened => "A pull request was reopened.",
-            EventKind::PrSynchronized => "A pull request received new commits.",
-            EventKind::PrReadyForReview => "A draft pull request was marked ready for review.",
-            EventKind::PrReviewRequested => "A review was requested on a pull request.",
-            EventKind::PrUpdated => "A pull request was edited.",
-            EventKind::PrReviewSubmitted => "A review was submitted on a pull request.",
-            EventKind::PushReceived => "A push was received on a branch.",
-            EventKind::TicketCreated => "A ticket was created (integration event).",
-            EventKind::TicketUpdated => "A ticket was updated (integration event).",
-            EventKind::ActionRunCompleted => "A workflow run completed.",
-            EventKind::CheckSuiteCompleted => "A check suite completed.",
-            EventKind::CheckRunCompleted => "A check run completed.",
-            EventKind::EmailReceived => "An email was received (integration event).",
-            EventKind::Synthetic => "A synthetic marker event used before real integrations exist.",
-        }
-    }
+    TaskFinished => "task_finished", "TaskFinished", "A task ended (success or failure); used by `needs` dependencies.";
+    CronTick => "cron_tick", "CronTick", "A scheduled cron job fired.";
+    IssueCreated => "issue_created", "IssueCreated", "An issue was created.";
+    IssueUpdated => "issue_updated", "IssueUpdated", "An issue was edited.";
+    IssueClosed => "issue_closed", "IssueClosed", "An issue was closed.";
+    IssueReopened => "issue_reopened", "IssueReopened", "An issue was reopened.";
+    IssueLabeled => "issue_labeled", "IssueLabeled", "A label was added to or removed from an issue.";
+    IssueAssigned => "issue_assigned", "IssueAssigned", "An issue was assigned.";
+    IssueCommentCreated => "issue_comment_created", "IssueCommentCreated", "A comment was posted on an issue.";
+    PrCreated => "pr_created", "PRCreated", "A pull request was opened.";
+    PrMerged => "pr_merged", "PRMerged", "A pull request was merged.";
+    PrClosed => "pr_closed", "PRClosed", "A pull request was closed without merging.";
+    PrReopened => "pr_reopened", "PRReopened", "A pull request was reopened.";
+    PrSynchronized => "pr_synchronized", "PRSynchronized", "A pull request received new commits.";
+    PrReadyForReview => "pr_ready_for_review", "PRReadyForReview", "A draft pull request was marked ready for review.";
+    PrReviewRequested => "pr_review_requested", "PRReviewRequested", "A review was requested on a pull request.";
+    PrUpdated => "pr_updated", "PRUpdated", "A pull request was edited.";
+    PrReviewSubmitted => "pr_review_submitted", "PRReviewSubmitted", "A review was submitted on a pull request.";
+    PushReceived => "push_received", "PushReceived", "A push was received on a branch.";
+    TicketCreated => "ticket_created", "TicketCreated", "A ticket was created (integration event).";
+    TicketUpdated => "ticket_updated", "TicketUpdated", "A ticket was updated (integration event).";
+    ActionRunCompleted => "action_run_completed", "ActionRunCompleted", "A workflow run completed.";
+    CheckSuiteCompleted => "check_suite_completed", "CheckSuiteCompleted", "A check suite completed.";
+    CheckRunCompleted => "check_run_completed", "CheckRunCompleted", "A check run completed.";
+    EmailReceived => "email_received", "EmailReceived", "An email was received (integration event).";
+    /// Fallback for a persisted event whose kind is not recognised.
+    Unknown => "unknown", "Unknown", "An unrecognised persisted event kind (decode fallback).";
 }
 
 impl FromStr for EventKind {
@@ -313,85 +246,6 @@ impl FromStr for EventKind {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::from_name(s).ok_or(())
-    }
-}
-
-impl EventKind {
-    /// Parse an event name in either the wire `snake_case` form or the spec's
-    /// `PascalCase` form (e.g. `"ticket_created"` or `"TicketCreated"`).
-    pub fn from_name(s: &str) -> Option<Self> {
-        let kind = match s {
-            "task_created" => EventKind::TaskCreated,
-            "task_updated" => EventKind::TaskUpdated,
-            "task_completed" => EventKind::TaskCompleted,
-            "task_failed" => EventKind::TaskFailed,
-            "task_cancelled" => EventKind::TaskCancelled,
-            "task_idle" => EventKind::TaskIdle,
-            "task_started" => EventKind::TaskStarted,
-            "task_awaiting_input" => EventKind::TaskAwaitingInput,
-            "task_finished" => EventKind::TaskFinished,
-            "cron_tick" => EventKind::CronTick,
-            "issue_created" => EventKind::IssueCreated,
-            "issue_updated" => EventKind::IssueUpdated,
-            "issue_closed" => EventKind::IssueClosed,
-            "issue_reopened" => EventKind::IssueReopened,
-            "issue_labeled" => EventKind::IssueLabeled,
-            "issue_assigned" => EventKind::IssueAssigned,
-            "issue_comment_created" => EventKind::IssueCommentCreated,
-            "pr_created" => EventKind::PrCreated,
-            "pr_merged" => EventKind::PrMerged,
-            "pr_closed" => EventKind::PrClosed,
-            "pr_reopened" => EventKind::PrReopened,
-            "pr_synchronized" => EventKind::PrSynchronized,
-            "pr_ready_for_review" => EventKind::PrReadyForReview,
-            "pr_review_requested" => EventKind::PrReviewRequested,
-            "pr_updated" => EventKind::PrUpdated,
-            "pr_review_submitted" => EventKind::PrReviewSubmitted,
-            "push_received" => EventKind::PushReceived,
-            "ticket_created" => EventKind::TicketCreated,
-            "ticket_updated" => EventKind::TicketUpdated,
-            "action_run_completed" => EventKind::ActionRunCompleted,
-            "check_suite_completed" => EventKind::CheckSuiteCompleted,
-            "check_run_completed" => EventKind::CheckRunCompleted,
-            "email_received" => EventKind::EmailReceived,
-            "synthetic" => EventKind::Synthetic,
-            "TaskCreated" => EventKind::TaskCreated,
-            "TaskUpdated" => EventKind::TaskUpdated,
-            "TaskCompleted" => EventKind::TaskCompleted,
-            "TaskFailed" => EventKind::TaskFailed,
-            "TaskCancelled" => EventKind::TaskCancelled,
-            "TaskIdle" => EventKind::TaskIdle,
-            "TaskStarted" => EventKind::TaskStarted,
-            "TaskAwaitingInput" => EventKind::TaskAwaitingInput,
-            "TaskFinished" => EventKind::TaskFinished,
-            "CronTick" => EventKind::CronTick,
-            "IssueCreated" => EventKind::IssueCreated,
-            "IssueUpdated" => EventKind::IssueUpdated,
-            "IssueClosed" => EventKind::IssueClosed,
-            "IssueReopened" => EventKind::IssueReopened,
-            "IssueLabeled" => EventKind::IssueLabeled,
-            "IssueAssigned" => EventKind::IssueAssigned,
-            "IssueCommentCreated" => EventKind::IssueCommentCreated,
-            "PRCreated" => EventKind::PrCreated,
-            "PRMerged" => EventKind::PrMerged,
-            "PRClosed" => EventKind::PrClosed,
-            "PRReopened" => EventKind::PrReopened,
-            "PRSynchronized" => EventKind::PrSynchronized,
-            "PRReadyForReview" => EventKind::PrReadyForReview,
-            "PRReviewRequested" => EventKind::PrReviewRequested,
-            "PRUpdated" => EventKind::PrUpdated,
-            "PRReviewSubmitted" => EventKind::PrReviewSubmitted,
-            "PushReceived" => EventKind::PushReceived,
-            "TicketCreated" => EventKind::TicketCreated,
-            "TicketUpdated" => EventKind::TicketUpdated,
-            "ActionRunCompleted" => EventKind::ActionRunCompleted,
-            "CheckSuiteCompleted" => EventKind::CheckSuiteCompleted,
-            "CheckRunCompleted" => EventKind::CheckRunCompleted,
-            "EmailReceived" => EventKind::EmailReceived,
-            "Synthetic" => EventKind::Synthetic,
-            _ => return None,
-        };
-        Some(kind)
     }
 }
 
@@ -762,25 +616,58 @@ mod tests {
     }
 
     #[test]
-    fn event_kind_round_trips() {
-        for kind in EventKind::ALL {
+    fn event_kind_table_round_trips() {
+        // The table is the single source of truth: every entry round-trips
+        // through both spellings and its `snake_case` name matches `as_str`.
+        for (kind, snake, pascal, description) in KINDS {
             assert_eq!(
-                EventKind::from_name(kind.as_str()),
+                EventKind::from_name(snake),
                 Some(kind.clone()),
-                "from_name/as_str mismatch for {:?}",
+                "from_name(snake) mismatch for {:?}",
                 kind
+            );
+            assert_eq!(
+                EventKind::from_name(pascal),
+                Some(kind.clone()),
+                "from_name(pascal) mismatch for {:?}",
+                kind
+            );
+            assert_eq!(kind.as_str(), *snake, "as_str mismatch for {:?}", kind);
+            assert!(
+                !description.trim().is_empty(),
+                "{kind:?} has an empty description"
+            );
+            assert!(
+                EventKind::ALL.contains(kind),
+                "{kind:?} is missing from EventKind::ALL"
             );
         }
     }
 
     #[test]
     fn all_covers_every_kind() {
-        // Every `ALL` entry survives a round-trip, and the list has no duplicates.
+        // Every `ALL` entry appears exactly once and has a unique name.
+        assert_eq!(EventKind::ALL.len(), KINDS.len());
         let mut names: Vec<&str> = EventKind::ALL.iter().map(EventKind::as_str).collect();
         let len = names.len();
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), len, "EventKind::ALL contains a duplicate");
+    }
+
+    #[test]
+    fn unknown_kind_accepts_legacy_and_fallback_names() {
+        // The pre-rename `Synthetic` spellings and the new name all map to Unknown.
+        for name in ["unknown", "Unknown", "synthetic", "Synthetic"] {
+            assert_eq!(
+                EventKind::from_name(name),
+                Some(EventKind::Unknown),
+                "{name} should parse to Unknown"
+            );
+        }
+        // Anything else is not an event kind.
+        assert_eq!(EventKind::from_name("not_a_kind"), None);
+        assert_eq!("not_a_kind".parse::<EventKind>(), Err(()));
     }
 
     #[test]

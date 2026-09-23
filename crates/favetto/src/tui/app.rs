@@ -3685,7 +3685,7 @@ mod tests {
         for id in 1..=2 {
             app.ingest_event(Event {
                 id,
-                kind: EventKind::Synthetic,
+                kind: EventKind::Unknown,
                 payload: serde_json::json!({}),
                 created_at: Utc::now(),
             });

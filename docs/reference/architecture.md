@@ -45,14 +45,14 @@ tasks/                        task catalog: `*.md` files with TOML header + prom
 docs/                         VitePress site: guide + generated reference
 ```
 
-## Milestones
+## Features
 
-| Milestone | Scope | Status |
-|-----------|-------|--------|
-| **M1** | Skeleton + remote TUI: daemon, SQLite, event bus, MessagePack wire protocol over Unix socket + WebSocket, token auth, ratatui client | ✅ Done |
-| **M2** | External agent sessions: PTY spawn, server-side `vt100` emulation, remote attach/reattach, terminal query replies | ✅ Done |
-| **M3** | Scheduler + notifications: cron, task queue → agent sessions, notification channels, Scheduler + Notifications TUI tabs | ✅ Done |
-| **M4** | Hardening: metrics, pairing, webhook receivers + config-driven rules, parallel git-worktree execution | ✅ Done |
+| Area | Scope |
+|------|-------|
+| **Core + remote TUI** | daemon, SQLite, event bus, MessagePack wire protocol over Unix socket + WebSocket, token auth, ratatui client |
+| **Agent sessions** | PTY spawn, server-side `vt100` emulation, remote attach/reattach, terminal query replies |
+| **Scheduler + notifications** | cron, task queue → agent sessions, notification channels, Scheduler + Notifications TUI tabs |
+| **Integrations + hardening** | metrics, pairing, webhook receivers + config-driven rules, parallel git-worktree execution |
 
 ## Wire protocol
 
