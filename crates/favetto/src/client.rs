@@ -16,7 +16,9 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::codec::Framed;
 
 use favetto_core::rpc::{Frame, Notification, Request, RequestId, Response};
-use favetto_core::wire::{decode, encode, FrameCodec};
+use favetto_core::wire::FrameCodec;
+
+use crate::ws;
 
 type ClientStream = Pin<Box<dyn Stream<Item = anyhow::Result<Frame>> + Send>>;
 type ClientSink = Pin<Box<dyn Sink<Frame, Error = anyhow::Error> + Send>>;
@@ -202,9 +204,9 @@ async fn ws_connect(url: &str, token: Option<&str>) -> anyhow::Result<(ClientStr
 
     let incoming: ClientStream = Box::pin(stream.filter_map(|res| async {
         match res {
-            Ok(WsMessage::Binary(b)) => Some(decode(b.as_ref()).map_err(|e| anyhow::anyhow!(e))),
-            Ok(WsMessage::Text(t)) => Some(decode(t.as_bytes()).map_err(|e| anyhow::anyhow!(e))),
-            Ok(WsMessage::Close(_)) => Some(Err(anyhow::anyhow!("connection closed"))),
+            Ok(WsMessage::Binary(b)) => Some(ws::inbound_binary(b.as_ref()).map_err(Into::into)),
+            Ok(WsMessage::Text(t)) => Some(ws::inbound_text(&t).map_err(Into::into)),
+            Ok(WsMessage::Close(_)) => Some(Err(ws::closed().into())),
             Ok(_) => None,
             Err(e) => Some(Err(anyhow::anyhow!("ws error: {e}"))),
         }
@@ -213,7 +215,7 @@ async fn ws_connect(url: &str, token: Option<&str>) -> anyhow::Result<(ClientStr
     let outgoing: ClientSink = Box::pin(
         sink.sink_map_err(|e| anyhow::anyhow!("ws send: {e}"))
             .with(|frame: Frame| async move {
-                Ok::<_, anyhow::Error>(WsMessage::Binary(encode(&frame)?.into()))
+                Ok::<_, anyhow::Error>(WsMessage::Binary(ws::outbound(&frame)?.into()))
             }),
     );
 

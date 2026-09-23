@@ -26,6 +26,7 @@ mod transport;
 mod tui;
 mod webhooks;
 mod workflow;
+mod ws;
 
 use clap::Parser;
 
