@@ -33,7 +33,7 @@ examples.
 | `model` | string | no | Model id, substituted as `{model}`. When set, the agent's `run_args` template is used instead of `headless_args`. |
 | `cwd` | string | no | Working directory the agent runs in. Takes precedence over the agent's configured `cwd`; a per-run `input.cwd` wins over both. |
 | `schedule` | string | no | A cron expression that makes this a recurring task. Mutually exclusive with `needs`. |
-| `needs` | string | no | Dependency of the form `<task>:finished`. This task auto-starts when the named task finishes; the predecessor result is available as <span v-pre>`{{ prev.* }}`</span>. Mutually exclusive with `schedule`. |
+| `needs` | string | no | Dependency, either `<task>:finished` (auto-start once per finished `<task>` run, with its result as <span v-pre>`{{ prev.* }}`</span>) or `<task>:all_finished` (root-scoped fan-in: auto-start once after **every** `<task>` run of this workflow root is terminal, with an aggregate <span v-pre>`{{ prev.tasks }}`</span>). Mutually exclusive with `schedule`. |
 | `spawn` | string | no | Catalog task to enqueue from this task's handoff file when this task succeeds. Requires `spawn_file`. |
 | `spawn_file` | string | no | Path of the JSON handoff file consumed by `spawn`. Rendered as a template at run time; read as a JSON array, one child per element. |
 | `sign` | `"off"` \| `"ssh"` \| `"gpg"` | no | Per-task override of the `[git] signing` mode. Most specific level: task → `[agents.<name>.git]` → `[git]`. |
@@ -66,7 +66,7 @@ context:
 | <span v-pre>`{{ task.id }}`</span> | The task's UUID. |
 | <span v-pre>`{{ task.name }}`</span> | The task's catalog identity (relative path, no `.md`). |
 | <span v-pre>`{{ input.<name> }}`</span> | A collected variable or the input produced by `spawn`/webhooks. |
-| <span v-pre>`{{ prev.* }}`</span> | The result of the `needs` predecessor (also `input._prev`). |
+| <span v-pre>`{{ prev.* }}`</span> | The result of the `needs` predecessor (also `input._prev`). For `<task>:all_finished`, `prev` is the fan-in aggregate (`root`, `target`, `count`, `succeeded`, `failed`, `cancelled`, `tasks`). |
 
 Strings render raw, objects and arrays as compact JSON, and missing paths as
 empty. Double braces leave single braces in prompt code blocks alone.
