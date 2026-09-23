@@ -607,9 +607,11 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
 /// Resolve the requested (or default) agent and spawn a PTY session.
 ///
 /// Task runs are headless (their PTY carries machine output such as JSON), so
-/// attaching never shows that PTY: when a session id is known — from the task row
-/// or captured from a still-running run — the agent's `resume_args` open a real
-/// interactive TUI. A live interactive session is attached directly.
+/// when a session id is known — from the task row or captured from a still-running
+/// run — the agent's `resume_args` open a real interactive TUI. A live interactive
+/// session is attached directly. An agent that cannot resume keeps its retained
+/// PTY: a finished run is replayed and a still-running run is attached read-only
+/// (`AgentSessionInfo::headless` tells the client not to forward keystrokes).
 async fn start_agent(
     state: &Arc<State>,
     params: &serde_json::Value,
@@ -727,27 +729,13 @@ async fn start_agent(
             }
         }
 
-        // Legacy: replay a finished non-headless session's screen.
+        // Any other retained PTY bound to the task is shown in the panel rather
+        // than seeding a duplicate run: a finished run's final screen is replayed,
+        // and a still-running headless run is attached read-only (its PTY drives
+        // itself, so the client must not forward keystrokes). The session info's
+        // `headless` flag tells the client which mode to use.
         if let Some(existing) = &live {
-            if !existing.headless {
-                return Ok(existing.clone());
-            }
-        }
-
-        // A still-running headless run owns this task. Its PTY carries machine
-        // output, so it cannot be shown in the panel, and seeding a fresh
-        // interactive session here would start a duplicate run that re-submits
-        // the prompt. If its agent session id never surfaced (the resume/wait
-        // above), report that instead of racing a second run.
-        if let Some(existing) = task_id
-            .as_deref()
-            .and_then(|tid| state.agents.find_latest_by_task(tid))
-        {
-            if existing.running && existing.headless {
-                return Err(anyhow::anyhow!(
-                    "task is already running headless; its agent session is not ready to attach yet"
-                ));
-            }
+            return Ok(existing.clone());
         }
     }
 
@@ -2124,10 +2112,11 @@ mod tests {
     }
 
     /// Opening the panel on a live unattended run must not seed a duplicate
-    /// session (and re-submit the prompt) for the same task.
+    /// session (and re-submit the prompt) for the same task: it attaches to the
+    /// retained headless PTY (read-only, from the client's point of view).
     #[cfg(unix)]
     #[tokio::test]
-    async fn agents_start_does_not_duplicate_a_live_headless_run() {
+    async fn agents_start_attaches_a_live_headless_run_without_duplicating() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = temp_dir("start-no-dup");
@@ -2197,16 +2186,17 @@ mod tests {
             .unwrap();
         assert!(info.headless && info.running);
 
-        let err = start_agent(
+        let attached = start_agent(
             &state,
             &serde_json::json!({ "task_id": task.id.to_string(), "agent": "plain" }),
         )
         .await
-        .expect_err("a live headless run must not be duplicated");
-        assert!(
-            err.to_string().contains("already running headless"),
-            "{err}"
+        .expect("a live headless run must be attached, not duplicated");
+        assert_eq!(
+            attached.id, info.id,
+            "start_agent must bind to the live run's PTY"
         );
+        assert!(attached.headless && attached.running);
 
         let sessions = state.agents.sessions();
         assert_eq!(
@@ -2215,6 +2205,107 @@ mod tests {
             "a duplicate session was launched: {sessions:?}"
         );
         assert_eq!(sessions[0].id, info.id);
+
+        state.agents.close(&info.id).ok();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Opening the panel on a finished non-resume headless run replays its final
+    /// screen instead of seeding a duplicate interactive session.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agents_start_replays_a_finished_headless_run() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("start-replay");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::write(tasks_dir.join("issue.md"), "agent = \"plain\"\n---\nbody\n").unwrap();
+
+        // A non-resuming agent whose run finishes immediately; the daemon keeps
+        // the PTY so its final screen can still be replayed.
+        let script = dir.join("fake-plain.sh");
+        std::fs::write(&script, "#!/bin/sh\nprintf finished-run-output\n").unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let state = agent_state(
+            &dir,
+            &tasks_dir,
+            "plain",
+            vec![(
+                "plain",
+                crate::config::AgentConfig {
+                    command: script.to_string_lossy().into_owned(),
+                    headless_args: Some(vec!["run".to_string(), "{prompt}".to_string()]),
+                    ..Default::default()
+                },
+            )],
+        )
+        .await;
+
+        let task = Task {
+            id: Uuid::new_v4(),
+            name: "issue".to_string(),
+            status: TaskStatus::Running,
+            input: serde_json::json!({}),
+            output: None,
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: Some(Utc::now()),
+            finished_at: None,
+            error: None,
+            session_id: None,
+            session_title: None,
+            parent_id: None,
+            root_id: None,
+        };
+        db::insert_task(&state.db, &task).await.unwrap();
+
+        let agent = state.registry.get_checked("plain").unwrap();
+        let info = state
+            .agents
+            .start(
+                "plain",
+                agent,
+                Some(task.id.to_string()),
+                Invocation::Headless {
+                    prompt: "body",
+                    provider: None,
+                    model: None,
+                },
+                AgentContext {
+                    rows: 24,
+                    cols: 80,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(info.headless);
+        assert_eq!(state.agents.wait(&info.id).await, Some(0));
+
+        let replayed = start_agent(
+            &state,
+            &serde_json::json!({ "task_id": task.id.to_string(), "agent": "plain" }),
+        )
+        .await
+        .expect("a finished headless run must be replayed");
+        assert_eq!(replayed.id, info.id, "the retained PTY must be replayed");
+        assert!(replayed.headless && !replayed.running);
+
+        let (_info, frame) = state.agents.attach(&replayed.id).unwrap();
+        assert!(
+            String::from_utf8_lossy(&frame).contains("finished-run-output"),
+            "the finished screen was not replayed"
+        );
+
+        let sessions = state.agents.sessions();
+        assert_eq!(
+            sessions.len(),
+            1,
+            "a duplicate session was launched: {sessions:?}"
+        );
 
         state.agents.close(&info.id).ok();
         let _ = std::fs::remove_dir_all(&dir);

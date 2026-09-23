@@ -9,7 +9,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use favetto_core::model::TaskStatus;
+use favetto_core::model::{AgentSessionInfo, TaskStatus};
 
 use super::app::{
     table_rows_area, App, CatalogRow, ClickAction, ClickRegion, ConnState, Form, ListGeometry,
@@ -110,6 +110,9 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
             workflow_path.as_deref(),
             theme,
         ),
+        Popup::Sessions { selected, sessions } => {
+            draw_sessions_picker(frame, *selected, sessions, theme)
+        }
     }
 }
 
@@ -290,6 +293,58 @@ fn draw_menu(frame: &mut Frame, selected: usize, theme: Theme) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Ctrl+P — New ")
+                .style(theme.surface_style())
+                .border_style(theme.block(true)),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+    frame.render_widget(Clear, rect);
+    frame.buffer_mut().set_style(rect, theme.surface_style());
+    frame.render_widget(list, rect);
+}
+
+/// Draw the Ctrl+O session picker: one row per live/retained agent session,
+/// labelled with its agent, state, and task, so concurrent runs can be told apart.
+fn draw_sessions_picker(
+    frame: &mut Frame,
+    selected: usize,
+    sessions: &[AgentSessionInfo],
+    theme: Theme,
+) {
+    let area = frame.area();
+    let rect = centered_rect(area, 70, (sessions.len() as u16).saturating_add(2));
+
+    let items: Vec<ListItem> = sessions
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let style = if i == selected {
+                theme.selected()
+            } else {
+                Style::default()
+            };
+            let state = match (s.headless, s.running) {
+                (true, true) => "headless",
+                (true, false) => "headless · finished",
+                (false, true) => "running",
+                (false, false) => "stopped",
+            };
+            let task = s
+                .task_id
+                .as_deref()
+                .map(|t| format!(" · task {}", short_str(t)))
+                .unwrap_or_default();
+            ListItem::new(Line::from(Span::styled(
+                format!(" {} · {state}{task} ", s.agent),
+                style,
+            )))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Ctrl+O — Agent sessions ")
                 .style(theme.surface_style())
                 .border_style(theme.block(true)),
         )
@@ -539,6 +594,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Tab / →", "next tab"),
             ("Shift+Tab / ←", "previous tab"),
             ("Ctrl+P", "open the action menu"),
+            ("Ctrl+O", "pick a live/retained agent session"),
             ("?", "open/close this help"),
             ("w", "open/close the workflow graph"),
             ("M", "mute/unmute sound"),
@@ -571,9 +627,11 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("Ctrl+Y", "toggle focus: agent ↔ favetto"),
             ("(agent focus)", "every key is forwarded to the agent"),
+            ("(favetto focus) Ctrl+O", "switch to another session"),
             ("(favetto focus) Ctrl+Q", "leave the panel"),
             ("(favetto focus) Ctrl+N", "start a new session"),
             ("(favetto focus) Esc", "back to Tasks"),
+            ("headless runs", "shown read-only; keys are not forwarded"),
         ],
     ),
     (
@@ -1156,7 +1214,7 @@ fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
             spans.push(throbber_span(theme, &app.throbber_state));
         }
         spans.push(Span::raw(format!(
-            "{name} · {state}{extra} · Ctrl+N new · Ctrl+Q leave "
+            "{name} · {state}{extra} · Ctrl+O sessions · Ctrl+N new · Ctrl+Q leave "
         )));
         Line::from(spans)
     };
@@ -1169,7 +1227,7 @@ fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
 
     if app.agent_session_id.is_none() || inner_area.width == 0 || inner_area.height == 0 {
         let hint = Paragraph::new(Line::from(Span::styled(
-            "The embedded agent terminal appears here. Select a task and press Enter to launch the configured agent.",
+            "The embedded agent terminal appears here. Select a task and press Enter to launch the configured agent, or Ctrl+O to switch between running sessions.",
             Style::default().fg(theme.muted),
         )))
         .wrap(Wrap { trim: true });
@@ -1374,7 +1432,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
         if agent_focused {
             "[Ctrl+Y] favetto keys"
         } else {
-            "[Ctrl+Y] agent keys  [Ctrl+Q] leave  [Ctrl+N] new  [?] help"
+            "[Ctrl+Y] agent keys  [Ctrl+O] sessions  [Ctrl+Q] leave  [?] help"
         }
     } else {
         "[↑↓] select  [Enter] agent  [Tab] switch  [q] quit  [?] help"
@@ -1422,6 +1480,16 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
             format!("⚠ {awaiting} awaiting input · [Enter] open agent"),
             Style::default()
                 .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    if let Some(err) = &app.agent_error {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("⚠ agent: {err}"),
+            Style::default()
+                .fg(theme.danger)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -1518,6 +1586,18 @@ mod tests {
 
     use favetto_core::model::AgentCapabilities;
 
+    fn session(id: &str, agent: &str, headless: bool, running: bool) -> AgentSessionInfo {
+        AgentSessionInfo {
+            id: id.to_string(),
+            agent: agent.to_string(),
+            task_id: None,
+            running,
+            headless,
+            session_id: None,
+            awaiting_input: None,
+        }
+    }
+
     #[test]
     fn tab_regions_cover_every_tab() {
         let regions = tab_click_regions(0, 0);
@@ -1605,6 +1685,13 @@ mod tests {
                 Popup::Workflow {
                     scroll: 0,
                     hscroll: 0,
+                },
+                Popup::Sessions {
+                    selected: 0,
+                    sessions: vec![
+                        session("s1", "opencode", false, true),
+                        session("s2", "pi", true, false),
+                    ],
                 },
             ] {
                 let mut app = App::with_theme(theme);
@@ -1917,6 +2004,59 @@ mod tests {
         app.sound_muted = false;
         let text = render_text(&mut app, 140, 24);
         assert!(!text.contains("muted"), "stale mute badge: {text:?}");
+    }
+
+    #[test]
+    fn status_bar_surfaces_agent_errors() {
+        let mut app = App::new();
+        app.agent_error = Some("no agent sessions to switch to".to_string());
+        let text = render_text(&mut app, 140, 24);
+        assert!(text.contains("agent:"), "agent error missing: {text:?}");
+        assert!(
+            text.contains("no agent sessions"),
+            "agent error text missing: {text:?}"
+        );
+    }
+
+    #[test]
+    fn session_picker_renders_each_session() {
+        let mut app = App::new();
+        app.open_sessions(vec![
+            session("s1", "opencode", false, true),
+            session("s2", "pi", true, false),
+        ]);
+        let text = render_text(&mut app, 100, 24);
+        assert!(text.contains("Ctrl+O"), "picker title missing: {text:?}");
+        assert!(text.contains("opencode"), "first agent missing: {text:?}");
+        assert!(text.contains("pi"), "second agent missing: {text:?}");
+        assert!(
+            text.contains("headless"),
+            "headless state missing: {text:?}"
+        );
+    }
+
+    #[test]
+    fn agent_tab_marks_a_headless_session_read_only() {
+        let mut app = App::new();
+        app.tab = Tab::Agent;
+        app.open_agent(session("s1", "pi", true, true), b"");
+        let text = render_text(&mut app, 100, 24);
+        assert!(
+            text.contains("read-only"),
+            "read-only note missing: {text:?}"
+        );
+        assert!(text.contains("Ctrl+O"), "sessions hint missing: {text:?}");
+    }
+
+    #[test]
+    fn help_overlay_lists_session_picker() {
+        let mut app = App::new();
+        app.popup = Popup::Help { scroll: 0 };
+        let text = render_text(&mut app, 100, 40);
+        assert!(
+            text.contains("Ctrl+O"),
+            "session picker help row missing: {text:?}"
+        );
     }
 
     #[test]

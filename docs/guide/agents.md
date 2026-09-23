@@ -93,6 +93,13 @@ When a task's row shows **awaiting input** (see [Lifecycle](#lifecycle)), pressi
 session, so anything you type — a permission key, a passphrase — reaches the
 prompt the agent is waiting on.
 
+Agents that cannot resume (`pi`, `claude`, `vibe`, custom) still open: the daemon
+retains the headless run's PTY, so a **finished** run is replayed from its final
+screen and a **still-running** run is attached **read-only** — the panel shows it
+without forwarding keystrokes into its machine output. Concurrent sessions can be
+switched between with **Ctrl+O** (see the [TUI keybindings](./tui#agent-session-picker)),
+which lists every live and retained session regardless of agent.
+
 The daemon keeps a `vt100` emulator per session and streams self-contained
 full-screen frames; the panel parses and renders them, keys are forwarded to the
 agent, and the PTY is resized to fit. Common terminal queries (cursor position,
