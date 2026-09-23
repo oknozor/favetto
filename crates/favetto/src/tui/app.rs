@@ -21,6 +21,7 @@ use crate::tasks::TaskVar;
 
 use super::sound::SoundCue;
 use super::term::TerminalView;
+use super::text_buffer::TextBuffer;
 use super::theme::Theme;
 
 /// Tabs shown in the header. Agent hosts the embedded external-agent terminal.
@@ -132,8 +133,8 @@ pub struct Form {
     pub current: usize,
     /// Completed field values (one per completed field).
     pub values: Vec<String>,
-    /// Typing buffer for the current field.
-    pub input: String,
+    /// Caret-aware typing buffer for the current field.
+    pub input: TextBuffer,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -181,7 +182,8 @@ pub struct Wizard {
     pub agent: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
-    pub dir: String,
+    /// Working directory buffer (with caret).
+    pub dir: TextBuffer,
     pub loading: bool,
     pub error: Option<String>,
 }
@@ -229,7 +231,8 @@ pub struct TaskVarsForm {
     /// Index of the variable currently being edited.
     pub current: usize,
     /// Typed values, one per variable (initialized from each var's `default`).
-    pub values: Vec<String>,
+    /// Each value carries its own caret so fields remember the position.
+    pub values: Vec<TextBuffer>,
     /// Selected index into each variable's `choices` (0 when absent).
     pub choice_selected: Vec<usize>,
     pub error: Option<String>,
@@ -811,7 +814,7 @@ impl App {
 
         // A popup owns the keyboard while it is open.
         match &self.popup {
-            Popup::Form(_) => return self.handle_form_key(key.code),
+            Popup::Form(_) => return self.handle_form_key(key),
             Popup::Menu { .. } => return self.handle_menu_key(key.code),
             Popup::Wizard(_) => return self.handle_wizard_key(key),
             Popup::TaskVars(_) => return self.handle_task_vars_key(key),
@@ -1239,7 +1242,7 @@ impl App {
             fields,
             current: 0,
             values: Vec::new(),
-            input: String::new(),
+            input: TextBuffer::default(),
         });
         UiAction::None
     }
@@ -1270,7 +1273,7 @@ impl App {
             agent: None,
             provider: None,
             model: None,
-            dir: self.daemon_cwd.clone().unwrap_or_default(),
+            dir: TextBuffer::new(self.daemon_cwd.clone().unwrap_or_default()),
             loading: false,
             error: None,
         });
@@ -1326,6 +1329,9 @@ impl App {
             return UiAction::None; // popup already cleared
         }
 
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+
         let action = match key.code {
             KeyCode::Up => {
                 if w.step == WizardStep::Agent {
@@ -1343,12 +1349,64 @@ impl App {
                 }
                 UiAction::None
             }
-            KeyCode::Backspace if w.step == WizardStep::Dir => {
-                w.dir.pop();
+            KeyCode::Backspace if w.step == WizardStep::Dir && alt => {
+                w.dir.delete_word_before();
                 UiAction::None
             }
-            KeyCode::Char(c) if w.step == WizardStep::Dir => {
-                w.dir.push(c);
+            KeyCode::Backspace if w.step == WizardStep::Dir => {
+                w.dir.backspace();
+                UiAction::None
+            }
+            KeyCode::Delete if w.step == WizardStep::Dir => {
+                w.dir.delete();
+                UiAction::None
+            }
+            KeyCode::Left if w.step == WizardStep::Dir && (alt || ctrl) => {
+                w.dir.move_word_left();
+                UiAction::None
+            }
+            KeyCode::Left if w.step == WizardStep::Dir => {
+                w.dir.move_left();
+                UiAction::None
+            }
+            KeyCode::Right if w.step == WizardStep::Dir && (alt || ctrl) => {
+                w.dir.move_word_right();
+                UiAction::None
+            }
+            KeyCode::Right if w.step == WizardStep::Dir => {
+                w.dir.move_right();
+                UiAction::None
+            }
+            KeyCode::Home if w.step == WizardStep::Dir => {
+                w.dir.home();
+                UiAction::None
+            }
+            KeyCode::End if w.step == WizardStep::Dir => {
+                w.dir.end();
+                UiAction::None
+            }
+            KeyCode::Char('a') if w.step == WizardStep::Dir && ctrl => {
+                w.dir.home();
+                UiAction::None
+            }
+            KeyCode::Char('e') if w.step == WizardStep::Dir && ctrl => {
+                w.dir.end();
+                UiAction::None
+            }
+            KeyCode::Char('u') if w.step == WizardStep::Dir && ctrl => {
+                w.dir.delete_to_line_start();
+                UiAction::None
+            }
+            KeyCode::Char('k') if w.step == WizardStep::Dir && ctrl => {
+                w.dir.delete_to_line_end();
+                UiAction::None
+            }
+            KeyCode::Char('w') if w.step == WizardStep::Dir && ctrl => {
+                w.dir.delete_word_before();
+                UiAction::None
+            }
+            KeyCode::Char(c) if w.step == WizardStep::Dir && !ctrl && !alt => {
+                w.dir.insert_char(c);
                 UiAction::None
             }
             KeyCode::Enter if !w.loading => match w.step {
@@ -1411,10 +1469,10 @@ impl App {
                     None => UiAction::None,
                 },
                 WizardStep::Dir => {
-                    let cwd = if w.dir.trim().is_empty() {
+                    let cwd = if w.dir.value().trim().is_empty() {
                         None
                     } else {
-                        Some(w.dir.trim().to_string())
+                        Some(w.dir.value().trim().to_string())
                     };
                     UiAction::WizardStart {
                         agent: w.agent.clone().unwrap_or_default(),
@@ -1442,7 +1500,7 @@ impl App {
         let values = entry
             .vars
             .iter()
-            .map(|v| v.default.clone().unwrap_or_default())
+            .map(|v| TextBuffer::new(v.default.clone().unwrap_or_default()))
             .collect();
         let choice_selected = entry
             .vars
@@ -1475,11 +1533,13 @@ impl App {
 
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let last = form.vars.len().saturating_sub(1);
         let has_choices = form
             .vars
             .get(form.current)
             .is_some_and(|v| v.choices.is_some());
+        let multiline = form.vars.get(form.current).is_some_and(|v| v.multiline);
 
         let mut submit = false;
         match key.code {
@@ -1506,6 +1566,16 @@ impl App {
                 let selected = &mut form.choice_selected[form.current];
                 *selected = selected.saturating_sub(1);
             }
+            KeyCode::Down if multiline => {
+                if let Some(value) = form.values.get_mut(form.current) {
+                    value.line_down();
+                }
+            }
+            KeyCode::Up if multiline => {
+                if let Some(value) = form.values.get_mut(form.current) {
+                    value.line_up();
+                }
+            }
             KeyCode::Down | KeyCode::Up => {
                 if key.code == KeyCode::Down {
                     if form.current < last {
@@ -1517,12 +1587,21 @@ impl App {
                     form.current = form.current.saturating_sub(1);
                 }
             }
-            KeyCode::Enter if ctrl || alt => submit = true,
-            KeyCode::Enter if form.vars.get(form.current).is_some_and(|v| v.multiline) => {
+            KeyCode::Enter if ctrl => submit = true,
+            // Shift+Enter (and Alt+Enter) insert a newline in multiline fields;
+            // many terminals report the same byte for Enter, hence the plain
+            // Enter fallback below.
+            KeyCode::Enter if multiline && (shift || alt) => {
                 if let Some(value) = form.values.get_mut(form.current) {
-                    value.push('\n');
+                    value.insert_char('\n');
                 }
             }
+            KeyCode::Enter if multiline => {
+                if let Some(value) = form.values.get_mut(form.current) {
+                    value.insert_char('\n');
+                }
+            }
+            KeyCode::Enter if alt => submit = true,
             KeyCode::Enter => {
                 if form.current < last {
                     form.current += 1;
@@ -1530,14 +1609,79 @@ impl App {
                     submit = true;
                 }
             }
+            KeyCode::Backspace if !has_choices && alt => {
+                if let Some(value) = form.values.get_mut(form.current) {
+                    value.delete_word_before();
+                }
+            }
             KeyCode::Backspace if !has_choices => {
                 if let Some(value) = form.values.get_mut(form.current) {
-                    value.pop();
+                    value.backspace();
+                }
+            }
+            KeyCode::Delete if !has_choices => {
+                if let Some(value) = form.values.get_mut(form.current) {
+                    value.delete();
+                }
+            }
+            KeyCode::Left if !has_choices && (alt || ctrl) => {
+                if let Some(value) = form.values.get_mut(form.current) {
+                    value.move_word_left();
+                }
+            }
+            KeyCode::Left if !has_choices => {
+                if let Some(value) = form.values.get_mut(form.current) {
+                    value.move_left();
+                }
+            }
+            KeyCode::Right if !has_choices && (alt || ctrl) => {
+                if let Some(value) = form.values.get_mut(form.current) {
+                    value.move_word_right();
+                }
+            }
+            KeyCode::Right if !has_choices => {
+                if let Some(value) = form.values.get_mut(form.current) {
+                    value.move_right();
+                }
+            }
+            KeyCode::Home if !has_choices => {
+                if let Some(value) = form.values.get_mut(form.current) {
+                    value.home();
+                }
+            }
+            KeyCode::End if !has_choices => {
+                if let Some(value) = form.values.get_mut(form.current) {
+                    value.end();
+                }
+            }
+            KeyCode::Char('a') if !has_choices && ctrl => {
+                if let Some(value) = form.values.get_mut(form.current) {
+                    value.home();
+                }
+            }
+            KeyCode::Char('e') if !has_choices && ctrl => {
+                if let Some(value) = form.values.get_mut(form.current) {
+                    value.end();
+                }
+            }
+            KeyCode::Char('u') if !has_choices && ctrl => {
+                if let Some(value) = form.values.get_mut(form.current) {
+                    value.delete_to_line_start();
+                }
+            }
+            KeyCode::Char('k') if !has_choices && ctrl => {
+                if let Some(value) = form.values.get_mut(form.current) {
+                    value.delete_to_line_end();
+                }
+            }
+            KeyCode::Char('w') if !has_choices && ctrl => {
+                if let Some(value) = form.values.get_mut(form.current) {
+                    value.delete_word_before();
                 }
             }
             KeyCode::Char(c) if !ctrl && !alt && !has_choices => {
                 if let Some(value) = form.values.get_mut(form.current) {
-                    value.push(c);
+                    value.insert_char(c);
                 }
             }
             _ => {}
@@ -1561,21 +1705,101 @@ impl App {
         }
     }
 
-    fn handle_form_key(&mut self, code: KeyCode) -> UiAction {
-        match code {
+    fn handle_form_key(&mut self, key: KeyEvent) -> UiAction {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
             KeyCode::Esc => {
                 self.popup = Popup::None;
                 UiAction::None
             }
-            KeyCode::Backspace => {
+            KeyCode::Backspace if alt => {
                 if let Popup::Form(form) = &mut self.popup {
-                    form.input.pop();
+                    form.input.delete_word_before();
                 }
                 UiAction::None
             }
-            KeyCode::Char(c) => {
+            KeyCode::Backspace => {
                 if let Popup::Form(form) = &mut self.popup {
-                    form.input.push(c);
+                    form.input.backspace();
+                }
+                UiAction::None
+            }
+            KeyCode::Delete => {
+                if let Popup::Form(form) = &mut self.popup {
+                    form.input.delete();
+                }
+                UiAction::None
+            }
+            KeyCode::Left if alt || ctrl => {
+                if let Popup::Form(form) = &mut self.popup {
+                    form.input.move_word_left();
+                }
+                UiAction::None
+            }
+            KeyCode::Left => {
+                if let Popup::Form(form) = &mut self.popup {
+                    form.input.move_left();
+                }
+                UiAction::None
+            }
+            KeyCode::Right if alt || ctrl => {
+                if let Popup::Form(form) = &mut self.popup {
+                    form.input.move_word_right();
+                }
+                UiAction::None
+            }
+            KeyCode::Right => {
+                if let Popup::Form(form) = &mut self.popup {
+                    form.input.move_right();
+                }
+                UiAction::None
+            }
+            KeyCode::Home => {
+                if let Popup::Form(form) = &mut self.popup {
+                    form.input.home();
+                }
+                UiAction::None
+            }
+            KeyCode::End => {
+                if let Popup::Form(form) = &mut self.popup {
+                    form.input.end();
+                }
+                UiAction::None
+            }
+            KeyCode::Char('a') if ctrl => {
+                if let Popup::Form(form) = &mut self.popup {
+                    form.input.home();
+                }
+                UiAction::None
+            }
+            KeyCode::Char('e') if ctrl => {
+                if let Popup::Form(form) = &mut self.popup {
+                    form.input.end();
+                }
+                UiAction::None
+            }
+            KeyCode::Char('u') if ctrl => {
+                if let Popup::Form(form) = &mut self.popup {
+                    form.input.delete_to_line_start();
+                }
+                UiAction::None
+            }
+            KeyCode::Char('k') if ctrl => {
+                if let Popup::Form(form) = &mut self.popup {
+                    form.input.delete_to_line_end();
+                }
+                UiAction::None
+            }
+            KeyCode::Char('w') if ctrl => {
+                if let Popup::Form(form) = &mut self.popup {
+                    form.input.delete_word_before();
+                }
+                UiAction::None
+            }
+            KeyCode::Char(c) if !ctrl && !alt => {
+                if let Popup::Form(form) = &mut self.popup {
+                    form.input.insert_char(c);
                 }
                 UiAction::None
             }
@@ -1583,7 +1807,8 @@ impl App {
                 let Popup::Form(form) = &mut self.popup else {
                     return UiAction::None;
                 };
-                form.values.push(std::mem::take(&mut form.input));
+                form.values
+                    .push(std::mem::take(&mut form.input).into_string());
                 form.current += 1;
                 if form.current < form.fields.len() {
                     return UiAction::None;
@@ -1943,7 +2168,11 @@ fn submit_task_vars(form: &TaskVarsForm) -> Result<Value, String> {
                 .get(form.choice_selected.get(i).copied().unwrap_or(0))
                 .cloned()
                 .unwrap_or_default(),
-            None => form.values.get(i).cloned().unwrap_or_default(),
+            None => form
+                .values
+                .get(i)
+                .map(|buffer| buffer.value().to_string())
+                .unwrap_or_default(),
         };
         if raw.is_empty() {
             if var.required {
@@ -3576,7 +3805,10 @@ mod tests {
             panic!("expected TaskVars");
         };
         assert_eq!(form.task, "issue");
-        assert_eq!(form.values, vec!["draft".to_string(), String::new()]);
+        assert_eq!(
+            form.values.iter().map(|v| v.value()).collect::<Vec<_>>(),
+            vec!["draft", ""]
+        );
         assert_eq!(form.current, 0);
         assert!(form.error.is_none());
     }
@@ -3662,6 +3894,157 @@ mod tests {
                 assert_eq!(input, serde_json::json!({ "body": "a\nb" }));
             }
             _ => panic!("expected StartTaskWithInput"),
+        }
+    }
+
+    #[test]
+    fn task_vars_caret_keymap_edits_mid_string() {
+        let mut app = App::new();
+        let mut entry = vars_entry("issue");
+        entry.vars = vec![TaskVar {
+            name: "body".to_string(),
+            prompt: "Body".to_string(),
+            default: Some("hello brave world".to_string()),
+            required: false,
+            multiline: true,
+            var_type: VarType::String,
+            choices: None,
+        }];
+        open_vars_form(&mut app, entry);
+
+        // Alt+Left jumps to the start of the last word, then type and edit.
+        app.handle_key(key(KeyCode::Left, KeyModifiers::ALT));
+        app.handle_key(key(KeyCode::Char('X'), KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::Home, KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::End, KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::Backspace, KeyModifiers::empty()));
+        match &app.popup {
+            Popup::TaskVars(form) => {
+                assert_eq!(form.values[0].value(), "Yhello brave Xworl");
+                assert_eq!(form.values[0].caret(), "Yhello brave Xworl".len());
+            }
+            _ => panic!("expected TaskVars"),
+        }
+    }
+
+    #[test]
+    fn task_vars_shift_and_alt_enter_insert_newlines() {
+        let mut app = App::new();
+        let mut entry = vars_entry("issue");
+        entry.vars = vec![TaskVar {
+            name: "body".to_string(),
+            prompt: "Body".to_string(),
+            default: Some("a".to_string()),
+            required: false,
+            multiline: true,
+            var_type: VarType::String,
+            choices: None,
+        }];
+        open_vars_form(&mut app, entry);
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT));
+        app.handle_key(key(KeyCode::Char('b'), KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::ALT));
+        app.handle_key(key(KeyCode::Char('c'), KeyModifiers::empty()));
+        match &app.popup {
+            Popup::TaskVars(form) => assert_eq!(form.values[0].value(), "a\nb\nc"),
+            _ => panic!("expected TaskVars"),
+        }
+    }
+
+    #[test]
+    fn task_vars_multiline_arrows_move_the_caret_between_lines() {
+        let mut app = App::new();
+        let mut entry = vars_entry("issue");
+        entry.vars = vec![TaskVar {
+            name: "body".to_string(),
+            prompt: "Body".to_string(),
+            default: Some("one\ntwo".to_string()),
+            required: false,
+            multiline: true,
+            var_type: VarType::String,
+            choices: None,
+        }];
+        open_vars_form(&mut app, entry);
+        // Caret starts at the end of "two"; Up moves to the same column on line 0.
+        app.handle_key(key(KeyCode::Up, KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::Char('X'), KeyModifiers::empty()));
+        match &app.popup {
+            Popup::TaskVars(form) => {
+                assert_eq!(form.values[0].value(), "oneX\ntwo");
+                assert_eq!(form.current, 0, "Up moves the caret, not the field");
+            }
+            _ => panic!("expected TaskVars"),
+        }
+    }
+
+    #[test]
+    fn task_vars_single_line_arrows_still_change_fields() {
+        let mut app = App::new();
+        open_vars_form(&mut app, vars_entry("issue"));
+        app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+        match &app.popup {
+            Popup::TaskVars(form) => assert_eq!(form.current, 1),
+            _ => panic!("expected TaskVars"),
+        }
+    }
+
+    #[test]
+    fn form_caret_keymap_edits_mid_string() {
+        let mut app = App::new();
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
+        for c in "abcd".chars() {
+            app.handle_key(key(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        // Alt+Left jumps to the start of the word, Home/End go to line bounds.
+        app.handle_key(key(KeyCode::Left, KeyModifiers::ALT));
+        app.handle_key(key(KeyCode::Char('X'), KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::Home, KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::End, KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::Backspace, KeyModifiers::empty()));
+        let Popup::Form(form) = &app.popup else {
+            panic!("expected form");
+        };
+        assert_eq!(form.input.value(), "YXabc");
+        assert_eq!(form.input.caret(), "YXabc".len());
+    }
+
+    #[test]
+    fn wizard_directory_caret_keymap_edits_mid_string() {
+        let mut app = App::new();
+        app.daemon_cwd = Some("/code/che".to_string());
+        let narrow = AgentCatalogEntry {
+            name: "pi".to_string(),
+            display_name: "Pi".to_string(),
+            command: "pi".to_string(),
+            default: false,
+            available: true,
+            capabilities: AgentCapabilities {
+                interactive: true,
+                ..Default::default()
+            },
+            sessions: Vec::new(),
+        };
+        app.open_wizard(vec![narrow]);
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
+
+        // Alt+Left jumps to the start of "che", then insert at the caret.
+        app.handle_key(key(KeyCode::Left, KeyModifiers::ALT));
+        app.handle_key(key(KeyCode::Char('X'), KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::Home, KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::End, KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::Backspace, KeyModifiers::empty()));
+        match &app.popup {
+            Popup::Wizard(w) => assert_eq!(w.dir.value(), "Y/code/Xch"),
+            _ => panic!("expected wizard"),
+        }
+        match app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())) {
+            UiAction::WizardStart { cwd, .. } => assert_eq!(cwd.as_deref(), Some("Y/code/Xch")),
+            _ => panic!("expected WizardStart"),
         }
     }
 

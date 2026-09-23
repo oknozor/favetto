@@ -30,7 +30,10 @@ Open an issue in {{ input.repo }} with this body:
 
 Starting it from the Catalog tab opens a floating form. `Enter` advances to the
 next field and submits on the last one; a multiline field inserts a newline on
-`Enter`, so submit with `Ctrl+Enter`. `Esc` cancels and starts nothing.
+`Enter` (`Shift+Enter`/`Alt+Enter` also insert one), so submit with `Ctrl+Enter`.
+The text fields support a caret: `←`/`→` move by character, `Alt+←`/`Alt+→`
+(or `Ctrl+←`/`Ctrl+→`) by word, `Home`/`End` to the line bounds, and
+`Backspace`/`Delete` edit at the caret. `Esc` cancels and starts nothing.
 
 ![favetto TUI — variables form](/screenshots/tui-vars-form.png)
 
