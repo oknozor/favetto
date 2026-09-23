@@ -233,8 +233,7 @@ async fn run_one(
 
     let config = state.config.read().unwrap().clone();
 
-    let context = render_context(&task);
-    let prompt = crate::template::render(&def.prompt, &context);
+    let prompt = render_task_prompt(&def, &task);
 
     let agent_name = def.agent.clone().or_else(|| config.agent.default.clone());
     let outcome = match agent_name.as_deref() {
@@ -300,6 +299,14 @@ async fn run_one(
             tracing::warn!(task = %task.name, error = %e, "failed to spawn tasks from handoff");
         }
     }
+}
+
+/// Render a task definition's prompt against the task's `input`/`task`/`prev`
+/// context. Shared by the executor (before an agent run) and the server (when
+/// seeding a fresh interactive session for a catalog task) so both surfaces
+/// expand `{{ input.* }}` identically.
+pub(crate) fn render_task_prompt(def: &TaskDef, task: &Task) -> String {
+    crate::template::render(&def.prompt, &render_context(task))
 }
 
 /// Build the template context for a task's prompt and handoff path. `prev` is
@@ -1748,5 +1755,113 @@ mod tests {
         // `cutoff == None` disables age-based removal, but orphans still go.
         let selected = select_prunable(&[kept.clone(), orphan.clone()], &tasks, None, true, 0);
         assert_eq!(selected_ids(&selected), HashSet::from([orphan.task_id]));
+    }
+
+    /// End-to-end: a catalog task declaring `[[vars]]` has the collected `input`
+    /// substituted into its prompt before the agent is launched. Exercises the
+    /// same `render_context` + `template::render` path as `run_one`, with a fake
+    /// agent that records the argument vector it received.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_one_renders_input_vars_into_the_agent_prompt() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("favetto-render-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let capture = dir.join("captured-args.txt");
+        let script = dir.join("fake-opencode.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n",
+                capture.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let mut cfg = FavettoConfig::default();
+        cfg.agent.default = Some("opencode".to_string());
+        cfg.agents.insert(
+            "opencode".to_string(),
+            crate::config::AgentConfig {
+                command: script.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+        );
+        let registry = AgentRegistry::from_config_with(&cfg, &|_| true).unwrap();
+
+        let pool = crate::db::open(&dir.join("test.db")).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        let state = Arc::new(State::new(
+            pool,
+            EventBus::new(64),
+            Token::generate(),
+            WebhookSecrets {
+                github: None,
+                linear: None,
+            },
+            AgentManager::new(),
+            registry,
+            Arc::new(RwLock::new(cfg)),
+            dir.clone(),
+            dir.clone(),
+            Arc::new(RwLock::new(Vec::new())),
+            tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
+            Arc::new(RwLock::new(Vec::new())),
+        ));
+
+        let def = crate::tasks::parse_task_md(
+            "favetto/open_github_issue",
+            "agent = \"opencode\"\nmodel = \"deepseek-v4-flash\"\n\
+             [[vars]]\nname = \"issue_description\"\nprompt = \"Describe\"\nrequired = true\nmultiline = true\n\
+             [[vars]]\nname = \"repo\"\nprompt = \"Repo\"\nrequired = true\n\
+             ---\nTarget repository: `{{ input.repo }}`.\n\nDescription: {{ input.issue_description }}\n",
+        )
+        .unwrap();
+
+        let task = Task {
+            id: Uuid::new_v4(),
+            name: def.name.clone(),
+            status: TaskStatus::Running,
+            input: serde_json::json!({
+                "repo": "acme/widgets",
+                "issue_description": "the widget is broken",
+            }),
+            output: None,
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: Some(Utc::now()),
+            finished_at: None,
+            error: None,
+            session_id: None,
+            session_title: None,
+        };
+        db::insert_task(&state.db, &task).await.unwrap();
+
+        let plan = Plan {
+            cwd: dir.clone(),
+            needs_lock: false,
+            worktree: None,
+        };
+        run_one(&state, task, def, plan, None).await;
+
+        let captured = std::fs::read_to_string(&capture).unwrap_or_default();
+        assert!(
+            captured.contains("acme/widgets"),
+            "input.repo was not rendered into the prompt: {captured}"
+        );
+        assert!(
+            captured.contains("the widget is broken"),
+            "input.issue_description was not rendered into the prompt: {captured}"
+        );
+        assert!(
+            !captured.contains("{{ input."),
+            "a raw placeholder survived into the agent prompt: {captured}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

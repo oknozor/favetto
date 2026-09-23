@@ -647,6 +647,18 @@ async fn start_agent(
     };
     let agent = state.registry.get_checked(&name)?;
 
+    // A catalog task's prompt is a template over its collected `input`. Render it
+    // here so a freshly seeded interactive session sees the same text a headless
+    // run would, instead of raw `{{ input.* }}` placeholders. Fall back to the
+    // caller-provided prompt when the task (or its definition) can't be resolved.
+    let prompt = match task_id.as_deref() {
+        Some(tid) => match rendered_task_prompt(state, tid).await {
+            Some(rendered) if !rendered.is_empty() => Some(rendered),
+            _ => prompt,
+        },
+        None => prompt,
+    };
+
     let ctx = AgentContext {
         cwd: params
             .get("cwd")
@@ -743,6 +755,21 @@ async fn persisted_session_id(state: &Arc<State>, task_id: Option<&str>) -> Opti
         .ok()
         .flatten()
         .and_then(|t| t.session_id)
+}
+
+/// Render a catalog task's prompt against its persisted `input`. `None` when the
+/// task row or its catalog definition cannot be found.
+async fn rendered_task_prompt(state: &Arc<State>, task_id: &str) -> Option<String> {
+    let id = Uuid::parse_str(task_id).ok()?;
+    let task = db::get_task(&state.db, id).await.ok().flatten()?;
+    let def = state
+        .catalog
+        .read()
+        .unwrap()
+        .iter()
+        .find(|d| d.name == task.name)
+        .cloned()?;
+    Some(crate::executor::render_task_prompt(&def, &task))
 }
 
 /// Providers and models for the requested (or default) agent, cached per agent
@@ -1790,6 +1817,89 @@ mod tests {
         // A task paused on input is still finished once the session exits.
         let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
         assert_eq!(stored.status, TaskStatus::Succeeded);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agents_start_renders_catalog_prompt_with_task_input() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("start-render");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::write(
+            tasks_dir.join("issue.md"),
+            "agent = \"opencode\"\n\
+             [[vars]]\nname = \"repo\"\nprompt = \"Repo\"\nrequired = true\n\
+             ---\nTarget repository: `{{ input.repo }}`\n",
+        )
+        .unwrap();
+
+        // A fake opencode that records the argv it was launched with.
+        let capture = dir.join("captured-args.txt");
+        let script = dir.join("fake-opencode.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n",
+                capture.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let state = title_state(&dir, &tasks_dir, &script).await;
+
+        let task = Task {
+            id: Uuid::new_v4(),
+            name: "issue".to_string(),
+            status: TaskStatus::Failed,
+            input: serde_json::json!({ "repo": "acme/widgets" }),
+            output: None,
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+            session_id: None,
+            session_title: None,
+        };
+        db::insert_task(&state.db, &task).await.unwrap();
+
+        // The client sends the raw catalog prompt; the server must render it
+        // against the task's collected input before seeding the session.
+        start_agent(
+            &state,
+            &serde_json::json!({
+                "task_id": task.id.to_string(),
+                "prompt": "Target repository: `{{ input.repo }}`",
+                "rows": 40,
+                "cols": 120,
+            }),
+        )
+        .await
+        .expect("start_agent");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let captured = loop {
+            let text = std::fs::read_to_string(&capture).unwrap_or_default();
+            if !text.is_empty() || std::time::Instant::now() >= deadline {
+                break text;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert!(
+            captured.contains("acme/widgets"),
+            "input.repo was not rendered into the seeded prompt: {captured}"
+        );
+        assert!(
+            !captured.contains("{{ input."),
+            "a raw placeholder survived into the seeded prompt: {captured}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
