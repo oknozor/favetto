@@ -36,6 +36,7 @@ examples.
 | `needs` | string | no | Dependency, either `<task>:finished` (auto-start once per finished `<task>` run, with its result as <span v-pre>`{{ prev.* }}`</span>) or `<task>:all_finished` (root-scoped fan-in: auto-start once after **every** `<task>` run of this workflow root is terminal, with an aggregate <span v-pre>`{{ prev.tasks }}`</span>). Mutually exclusive with `schedule`. |
 | `spawn` | string | no | Catalog task to enqueue from this task's handoff file when this task succeeds. Requires `spawn_file`. |
 | `spawn_file` | string | no | Path of the JSON handoff file consumed by `spawn`. Rendered as a template at run time; read as a JSON array, one child per element. |
+| `spawn_new_root` | bool | no | When true, each `spawn` child is enqueued as **its own workflow root** instead of a descendant of this task. Lets a pipeline restart itself so the child's own fan-in is not deduped against the root that already fired it. Requires `spawn`; default `false`. |
 | `sign` | `"off"` \| `"ssh"` \| `"gpg"` | no | Per-task override of the `[git] signing` mode. Most specific level: task → `[agents.<name>.git]` → `[git]`. |
 | `[[vars]]` | array of tables | no | Manual input variables; see below. |
 

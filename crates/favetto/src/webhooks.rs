@@ -849,6 +849,7 @@ mod tests {
             needs: None,
             spawn: None,
             spawn_file: None,
+            spawn_new_root: false,
             sign: None,
             vars: Vec::new(),
             prompt: String::new(),

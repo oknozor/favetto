@@ -1157,6 +1157,10 @@ async fn add_catalog_task(
         .get("spawn_file")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    let spawn_new_root = params
+        .get("spawn_new_root")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let prompt = params
         .get("prompt")
         .and_then(|v| v.as_str())
@@ -1173,6 +1177,7 @@ async fn add_catalog_task(
         needs,
         spawn,
         spawn_file,
+        spawn_new_root,
         sign: None,
         vars: Vec::new(),
         prompt,

@@ -11,6 +11,7 @@
 //! needs = "another_task:all_finished"    # optional — start once after every run in the root
 //! spawn = "child_task"                   # optional — fan out from a handoff file
 //! spawn_file = ".favetto/{{ task.id }}/manifest.json"  # array → one child per item
+//! spawn_new_root = true                  # optional — each child starts its own workflow root
 //! ---
 //! You are an engineering agent…
 //! ```
@@ -126,6 +127,11 @@ pub struct TaskDef {
     /// Path (relative to the task's working directory, or absolute) of the JSON
     /// handoff file consumed by `spawn`. Rendered as a template at run time.
     pub spawn_file: Option<String>,
+    /// When true, each `spawn` child is enqueued as its own workflow root rather
+    /// than as a descendant of this task. This lets a pipeline restart itself:
+    /// the child's own `:all_finished` fan-in starts a fresh successor instead of
+    /// being deduped against the root that already fired it.
+    pub spawn_new_root: bool,
     /// Optional per-task override of the `[git] signing` mode for this run.
     pub sign: Option<GitSigning>,
     /// Manual input variables declared with `[[vars]]`; the TUI prompts for these
@@ -153,6 +159,8 @@ struct Header {
     spawn: Option<String>,
     #[serde(default)]
     spawn_file: Option<String>,
+    #[serde(default)]
+    spawn_new_root: bool,
     #[serde(default)]
     sign: Option<GitSigning>,
     #[serde(default)]
@@ -270,6 +278,7 @@ pub fn parse_task_md(name: &str, content: &str) -> anyhow::Result<TaskDef> {
         needs: header.needs,
         spawn: header.spawn,
         spawn_file: header.spawn_file,
+        spawn_new_root: header.spawn_new_root,
         sign: header.sign,
         vars: header.vars,
         prompt: prompt.trim().to_string(),
@@ -302,6 +311,9 @@ pub fn to_markdown(def: &TaskDef) -> String {
     }
     if let Some(s) = &def.spawn_file {
         out.push_str(&format!("spawn_file = {s:?}\n"));
+    }
+    if def.spawn_new_root {
+        out.push_str("spawn_new_root = true\n");
     }
     if let Some(sign) = &def.sign {
         let sign = match sign {
@@ -566,6 +578,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_spawn_new_root_and_defaults_off() {
+        // Absent -> false.
+        let def = parse_task_md(
+            "t",
+            "agent = \"x\"\nspawn = \"child\"\nspawn_file = \"m.json\"\n---\nbody\n",
+        )
+        .unwrap();
+        assert!(!def.spawn_new_root);
+
+        // Present -> true, and it round-trips.
+        let def = parse_task_md(
+            "t",
+            "agent = \"x\"\nspawn = \"child\"\nspawn_file = \"m.json\"\n\
+             spawn_new_root = true\n---\nbody\n",
+        )
+        .unwrap();
+        assert!(def.spawn_new_root);
+        let md = to_markdown(&def);
+        assert!(md.contains("spawn_new_root = true"), "{md}");
+        assert!(parse_task_md("t", &md).unwrap().spawn_new_root);
+
+        // A non-boolean value fails to parse.
+        assert!(parse_task_md("t", "spawn_new_root = \"yes\"\n---\nbody\n").is_err());
+    }
+
+    #[test]
     fn round_trips_through_markdown() {
         let def = TaskDef {
             name: "t".to_string(),
@@ -577,6 +615,7 @@ mod tests {
             needs: None,
             spawn: Some("plan".to_string()),
             spawn_file: Some(".favetto/{{ input.id }}/manifest.json".to_string()),
+            spawn_new_root: true,
             sign: Some(GitSigning::Off),
             vars: vec![
                 TaskVar {
@@ -620,6 +659,7 @@ mod tests {
             parsed.spawn_file.as_deref(),
             Some(".favetto/{{ input.id }}/manifest.json")
         );
+        assert!(parsed.spawn_new_root);
         assert_eq!(parsed.sign, Some(GitSigning::Off));
         assert_eq!(parsed.vars, def.vars);
         assert_eq!(parsed.prompt, "hello");
@@ -837,6 +877,7 @@ mod tests {
             needs: None,
             spawn: None,
             spawn_file: None,
+            spawn_new_root: false,
             sign: None,
             vars: Vec::new(),
             prompt: "nested body".to_string(),
@@ -876,6 +917,7 @@ mod tests {
             needs: None,
             spawn: None,
             spawn_file: None,
+            spawn_new_root: false,
             sign: None,
             vars: Vec::new(),
             prompt: String::new(),

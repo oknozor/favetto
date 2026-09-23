@@ -336,8 +336,12 @@ async fn run_one(
             // The parent's own `TaskFinished` was emitted above, before the
             // manifest was read, so a fan-in on the spawned child is evaluated
             // here instead. This is also what lets an empty manifest (`[]`)
-            // resolve the barrier.
-            evaluate_join_barriers(state, &spawn_task, task.root_or_self(), Some(task.id)).await;
+            // resolve the barrier. A new-root spawn starts independent workflows,
+            // so the parent's root has no barrier of its own to resolve for them.
+            if !def.spawn_new_root {
+                evaluate_join_barriers(state, &spawn_task, task.root_or_self(), Some(task.id))
+                    .await;
+            }
         }
     }
 
@@ -496,7 +500,14 @@ async fn spawn_from_manifest(
         return Ok(());
     }
 
-    let lineage = Lineage::child_of(task);
+    // A new-root spawn restarts the workflow: each child is its own root, so its
+    // own `:all_finished` fan-in is not deduped against this task's root. Otherwise
+    // the child inherits this task's lineage, as with any other spawn.
+    let lineage = if def.spawn_new_root {
+        Lineage::default()
+    } else {
+        Lineage::child_of(task)
+    };
     for (i, item) in items.into_iter().enumerate() {
         let dedupe = format!("spawn:{}:{i}", task.id);
         match enqueue_with_lineage(state, spawn_task.to_string(), item, Some(dedupe), lineage).await
@@ -1335,6 +1346,7 @@ mod tests {
             needs: None,
             spawn: None,
             spawn_file: None,
+            spawn_new_root: false,
             sign: None,
             vars: vec![var("required_one", true), var("optional_one", false)],
             prompt: "hello".to_string(),
@@ -2551,6 +2563,49 @@ mod tests {
             .into_iter()
             .filter(|t| t.name == name)
             .collect()
+    }
+
+    #[tokio::test]
+    async fn spawn_new_root_enqueues_children_as_their_own_roots() {
+        let dir = std::env::temp_dir().join(format!("favetto-new-root-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = join_state(&dir, Vec::new()).await;
+        std::fs::write(
+            dir.join("manifest.json"),
+            r#"[{"issue_id":1},{"issue_id":2}]"#,
+        )
+        .unwrap();
+
+        let def = crate::tasks::parse_task_md(
+            "favetto/triage_issues",
+            "agent = \"x\"\nspawn = \"favetto/plan_issue\"\n\
+             spawn_file = \"manifest.json\"\nspawn_new_root = true\n---\nbody\n",
+        )
+        .unwrap();
+        // The spawner itself belongs to a parent workflow root.
+        let task = lineage_task(
+            "favetto/merge_implementations",
+            TaskStatus::Running,
+            Some(Uuid::new_v4()),
+            Some(Uuid::new_v4()),
+        );
+        db::insert_task(&state.db, &task).await.unwrap();
+
+        spawn_from_manifest(&state, &task, &def, &dir)
+            .await
+            .unwrap();
+
+        let children = pending_named(&state, "favetto/plan_issue").await;
+        assert_eq!(children.len(), 2);
+        for child in &children {
+            // A new-root child drops the spawner's lineage: no parent, and it is
+            // its own root, so its own fan-in is not deduped against the old root.
+            assert_eq!(child.parent_id, None);
+            assert_eq!(child.root_id, None);
+            assert_eq!(child.root_or_self(), child.id);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

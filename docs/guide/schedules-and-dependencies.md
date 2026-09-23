@@ -133,6 +133,30 @@ empty fan-out (`[]`) still resolves it. The aggregated results are attached as
 review every child's output and react to `prev.failed`. A fan-in whose target is
 never spawned in a root never fires; only the "spawned zero" case is covered.
 
+## Restart a pipeline
+
+A fan-in successor runs **once per workflow root**, so a successor that re-spawns
+its own fan-out is normally deduped: its join key already fired for that root.
+Set `spawn_new_root = true` to break the cycle — each `spawn` child starts as its
+own workflow root, so its fan-in gets a fresh barrier:
+
+```md
+agent = "opencode"
+needs = "implement:all_finished"
+spawn = "triage"
+spawn_file = ".favetto/merge/{{ task.id }}/manifest.json"
+spawn_new_root = true
+---
+If issues remain, write `[{}]` to the manifest to triage another round;
+otherwise write `[]` to stop.
+```
+
+The `triage` child is its own root, so when its `implement` children finish the
+`:all_finished` fan-in fires again and starts a new successor instead of being
+silently dropped. Write `[]` in the handoff to end the loop. Without
+`spawn_new_root`, the child inherits the spawner's root and the successor runs at
+most once per pipeline.
+
 ::: tip Inspect the graph
 Press `w` in the TUI to render the catalog's `needs`, `spawn`, and fan-in `join`
 edges as a box-drawing graph (also persisted as Graphviz DOT at
