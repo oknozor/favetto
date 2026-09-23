@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Bump type
+        type: choice
+        options: [auto, major, minor, patch]
+        default: auto
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Required by pre_bump_hooks: `cargo set-version` (cargo-edit) + nextest.
+      - uses: taiki-e/install-action@cargo-edit
+      - uses: taiki-e/install-action@nextest
+
+      - uses: cocogitto/cocogitto-action@v4.2.0
+        id: cog
+        with:
+          git-user: github-actions
+          git-user-email: github-actions[bot]@users.noreply.github.com
+          command: bump
+          args: ${{ inputs.bump == 'auto' && '--auto' || format('--{0}', inputs.bump) }}
+
+      # Build clean release notes from the generated changelog instead of the
+      # noisy full bump stdout.
+      - name: Generate release notes
+        run: cog changelog --at "${{ steps.cog.outputs.version }}" > RELEASE_NOTES.md
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.cog.outputs.version }}" \
+            --title "${{ steps.cog.outputs.version }}" \
+            --notes-file RELEASE_NOTES.md

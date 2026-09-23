@@ -43,6 +43,12 @@ export default defineConfig({
             { text: "Troubleshooting", link: "/guide/troubleshooting" },
           ],
         },
+        {
+          text: "Contributing",
+          items: [
+            { text: "Releasing", link: "/guide/releasing" },
+          ],
+        },
       ],
       "/reference/": [
         {

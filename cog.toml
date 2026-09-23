@@ -1,0 +1,52 @@
+#:schema https://docs.cocogitto.io/cog-schema.json
+
+# Only main may receive version bumps.
+branch_whitelist = ["main"]
+
+# History contains "Merge pull request ..." merge commits that are not
+# Conventional Commits; ignore them instead of rewriting history.
+ignore_merge_commits = true
+
+# `v0.1.0`-style tags.
+tag_prefix = "v"
+
+# Run BEFORE the version commit. Files changed here are committed with it.
+# `cargo set-version` must run first because it also rewrites Cargo.lock, which
+# the `--locked` commands below rely on.
+pre_bump_hooks = [
+    "cargo set-version --workspace {{version}}",
+    "cargo fmt --all -- --check",
+    "cargo clippy --locked --workspace --all-targets -- -D warnings",
+    "cargo nextest run --locked --workspace",
+    "cargo run --locked -p favetto -- __doc",
+]
+
+# Run AFTER the commit/tag are created. Note `{{version_tag}}` (== "v0.1.0"),
+# NOT `{{version}}` (== "0.1.0"): only the prefixed tag exists.
+post_bump_hooks = [
+    "git push",
+    "git push origin {{version_tag}}",
+]
+
+# Keep noise out of the changelog.
+[commit_types]
+chore = { omit_from_changelog = true }
+test = { omit_from_changelog = true }
+
+[changelog]
+path = "CHANGELOG.md"
+template = "remote"
+remote = "github.com"
+repository = "favetto"
+owner = "oknozor"
+
+# Shareable local hook; install with `cog install-hook --all` (hooks under
+# .git/hooks are not versioned).
+[git_hooks.commit-msg]
+script = """#!/bin/sh
+set -e
+cog verify --file $1
+cog check
+cargo fmt -v --all --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+"""
