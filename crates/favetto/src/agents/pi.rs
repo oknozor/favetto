@@ -2,8 +2,8 @@
 
 use crate::config::AgentConfig;
 
-use super::agent::{Agent, AgentContext, AgentDescriptor, CommandSpec, Invocation};
-use super::configurable::{capabilities_from_config, overlay, TemplateAgent};
+use super::agent::Agent;
+use super::configurable::{delegate_to_template, overlay, TemplateAgent};
 
 /// The built-in defaults, matching `config.example.toml`.
 fn base_config() -> AgentConfig {
@@ -52,46 +52,20 @@ impl PiAgent {
     pub fn from_config(name: &str, overrides: &AgentConfig) -> Self {
         let mut config = base_config();
         overlay(&mut config, overrides);
-        let capabilities = capabilities_from_config(&config);
-        let descriptor = AgentDescriptor {
-            id: name.to_string(),
-            name: "Pi".to_string(),
-            command: config.command.clone(),
-            available: true,
-            capabilities,
-        };
         Self {
-            template: TemplateAgent {
-                descriptor,
-                config,
-                probe: None,
-            },
+            template: TemplateAgent::new(name, "Pi", config),
         }
     }
 }
 
 impl Agent for PiAgent {
-    fn descriptor(&self) -> &AgentDescriptor {
-        &self.template.descriptor
-    }
-
-    fn command(
-        &self,
-        invocation: &Invocation<'_>,
-        ctx: &AgentContext,
-    ) -> anyhow::Result<CommandSpec> {
-        self.template.command(invocation, ctx)
-    }
-
-    fn set_available(&mut self, available: bool) {
-        self.template.descriptor.available = available;
-    }
+    delegate_to_template!();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::agent::SubmitStrategy;
+    use crate::agents::agent::{AgentContext, Invocation, SubmitStrategy};
 
     fn ctx(prompt: Option<&str>, provider: Option<&str>, model: Option<&str>) -> AgentContext {
         AgentContext {

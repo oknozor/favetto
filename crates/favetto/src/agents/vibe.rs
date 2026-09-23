@@ -2,8 +2,8 @@
 
 use crate::config::AgentConfig;
 
-use super::agent::{Agent, AgentContext, AgentDescriptor, CommandSpec, Invocation, SessionIdProbe};
-use super::configurable::{capabilities_from_config, overlay, TemplateAgent};
+use super::agent::Agent;
+use super::configurable::{delegate_to_template, overlay, TemplateAgent};
 
 /// The built-in defaults, matching `config.example.toml`.
 fn base_config() -> AgentConfig {
@@ -46,54 +46,20 @@ impl VibeAgent {
     pub fn from_config(name: &str, overrides: &AgentConfig) -> Self {
         let mut config = base_config();
         overlay(&mut config, overrides);
-        let capabilities = capabilities_from_config(&config);
-        let probe = config
-            .session_id_json_key
-            .clone()
-            .map(SessionIdProbe::JsonKey);
-        let descriptor = AgentDescriptor {
-            id: name.to_string(),
-            name: "Vibe".to_string(),
-            command: config.command.clone(),
-            available: true,
-            capabilities,
-        };
         Self {
-            template: TemplateAgent {
-                descriptor,
-                config,
-                probe,
-            },
+            template: TemplateAgent::new(name, "Vibe", config),
         }
     }
 }
 
 impl Agent for VibeAgent {
-    fn descriptor(&self) -> &AgentDescriptor {
-        &self.template.descriptor
-    }
-
-    fn command(
-        &self,
-        invocation: &Invocation<'_>,
-        ctx: &AgentContext,
-    ) -> anyhow::Result<CommandSpec> {
-        self.template.command(invocation, ctx)
-    }
-
-    fn session_id_probe(&self) -> Option<SessionIdProbe> {
-        self.template.probe.clone()
-    }
-
-    fn set_available(&mut self, available: bool) {
-        self.template.descriptor.available = available;
-    }
+    delegate_to_template!();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::agent::SubmitStrategy;
+    use crate::agents::agent::{AgentContext, Invocation, SubmitStrategy};
 
     fn ctx(prompt: Option<&str>, provider: Option<&str>, model: Option<&str>) -> AgentContext {
         AgentContext {

@@ -6,7 +6,6 @@
 //! behaves exactly as before.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use favetto_core::model::AgentCapabilities;
 
@@ -17,6 +16,43 @@ use super::agent::{
     SessionIdProbe, SubmitStrategy, SUBMIT_DELAY, SUBMIT_MAX_SENDS,
 };
 
+/// Delegate the four shared `Agent` methods to an adapter's inner
+/// [`TemplateAgent`]: `descriptor`, `command`, `session_id_probe` and
+/// `set_available`.
+///
+/// Call it as the first item in a built-in's `impl Agent` block; every genuine
+/// per-agent difference (`parse_output`, `session_title`, `provider_source`,
+/// `awaiting_input`, …) stays as a hand-written override in the same block, so
+/// the block reads as a list of what actually differs.
+///
+/// The types are spelled through `$crate` so a call site only needs `Agent` in
+/// scope, not the underlying `Invocation`/`CommandSpec`/… types.
+macro_rules! delegate_to_template {
+    () => {
+        fn descriptor(&self) -> &$crate::agents::agent::AgentDescriptor {
+            &self.template.descriptor
+        }
+
+        fn command(
+            &self,
+            invocation: &$crate::agents::agent::Invocation<'_>,
+            ctx: &$crate::agents::agent::AgentContext,
+        ) -> anyhow::Result<$crate::agents::agent::CommandSpec> {
+            self.template.command(invocation, ctx)
+        }
+
+        fn session_id_probe(&self) -> Option<$crate::agents::agent::SessionIdProbe> {
+            self.template.probe.clone()
+        }
+
+        fn set_available(&mut self, available: bool) {
+            self.template.descriptor.available = available;
+        }
+    };
+}
+
+pub(crate) use delegate_to_template;
+
 /// Render an [`AgentConfig`]'s invocation templates into a [`CommandSpec`].
 #[derive(Debug, Clone)]
 pub(crate) struct TemplateAgent {
@@ -26,6 +62,31 @@ pub(crate) struct TemplateAgent {
 }
 
 impl TemplateAgent {
+    /// Build the shared renderer for a built-in (or template-only) agent.
+    ///
+    /// `id` is the configured `[agents.<name>]` key and `name` the human-readable
+    /// CLI name. The wire capabilities and the session-id probe are both derived
+    /// from `config`, so a caller only supplies what actually differs per agent.
+    pub(crate) fn new(id: &str, name: &str, config: AgentConfig) -> Self {
+        let capabilities = capabilities_from_config(&config);
+        let probe = config
+            .session_id_json_key
+            .clone()
+            .map(SessionIdProbe::JsonKey);
+        let descriptor = AgentDescriptor {
+            id: id.to_string(),
+            name: name.to_string(),
+            command: config.command.clone(),
+            available: true,
+            capabilities,
+        };
+        Self {
+            descriptor,
+            config,
+            probe,
+        }
+    }
+
     /// Build the command for `invocation`, reading the owned per-launch values
     /// from `ctx`.
     pub(crate) fn command(
@@ -206,48 +267,14 @@ pub struct ConfigurableAgent {
 impl ConfigurableAgent {
     /// Build the agent for the `[agents.<name>]` entry `config`.
     pub fn from_config(name: &str, config: &AgentConfig) -> Self {
-        let capabilities = capabilities_from_config(config);
-        let probe = config
-            .session_id_json_key
-            .clone()
-            .map(SessionIdProbe::JsonKey);
-        let descriptor = AgentDescriptor {
-            id: name.to_string(),
-            name: name.to_string(),
-            command: config.command.clone(),
-            available: true,
-            capabilities,
-        };
         Self {
-            template: TemplateAgent {
-                descriptor,
-                config: config.clone(),
-                probe,
-            },
+            template: TemplateAgent::new(name, name, config.clone()),
         }
     }
 }
 
 impl Agent for ConfigurableAgent {
-    fn descriptor(&self) -> &AgentDescriptor {
-        &self.template.descriptor
-    }
-
-    fn command(
-        &self,
-        invocation: &Invocation<'_>,
-        ctx: &AgentContext,
-    ) -> anyhow::Result<CommandSpec> {
-        self.template.command(invocation, ctx)
-    }
-
-    fn session_id_probe(&self) -> Option<SessionIdProbe> {
-        self.template.probe.clone()
-    }
-
-    fn set_available(&mut self, available: bool) {
-        self.template.descriptor.available = available;
-    }
+    delegate_to_template!();
 
     fn parse_output(&self, raw: &str, exit_code: Option<i32>) -> super::agent::AgentRunResult {
         let session_id = self
@@ -261,10 +288,6 @@ impl Agent for ConfigurableAgent {
             output: serde_json::json!({ "text": raw }),
             raw: raw.to_string(),
         }
-    }
-
-    fn provider_source(&self) -> Option<Arc<dyn super::agent::ProviderSource>> {
-        None
     }
 }
 
@@ -326,6 +349,24 @@ mod tests {
             )
             .unwrap();
         assert_eq!(spec.args, vec!["run", "--session-id", "ses-9", "hi"]);
+    }
+
+    #[test]
+    fn template_agent_new_derives_capabilities_and_probe() {
+        // `TemplateAgent::new` is the single construction path shared by every
+        // adapter; it must derive both capabilities and the session-id probe.
+        let template = TemplateAgent::new("mycli", "MyCLI", config());
+        assert_eq!(template.descriptor.id, "mycli");
+        assert_eq!(template.descriptor.name, "MyCLI");
+        assert_eq!(template.descriptor.command, "mycli");
+        assert!(template.descriptor.available);
+        assert_eq!(
+            template.probe,
+            Some(SessionIdProbe::JsonKey("sessionID".to_string()))
+        );
+        assert!(template.descriptor.capabilities.headless);
+        assert!(template.descriptor.capabilities.reports_session_id);
+        assert!(template.descriptor.capabilities.prompt_prefill);
     }
 
     #[test]
