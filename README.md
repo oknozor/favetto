@@ -106,3 +106,12 @@ git diff --exit-code -- docs/reference docs/public/favetto-schema.json
 # build the site (fails on dead internal links)
 cd docs && npm ci && npm run docs:check
 ```
+
+## Releasing
+
+Releases are cut from `main` with [cocogitto](https://github.com/cocogitto/cocogitto)
+(Conventional Commits + SemVer). Run the **Release** GitHub Actions workflow and
+choose a bump (`auto` is the default); it runs the CI gates, bumps
+`[workspace.package] version`, updates `CHANGELOG.md`, tags `vX.Y.Z`, and opens a
+GitHub release. See the [releasing guide](https://oknozor.github.io/favetto/guide/releasing)
+or `docs/guide/releasing.md`.

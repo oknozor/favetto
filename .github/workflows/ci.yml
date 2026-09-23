@@ -76,3 +76,15 @@ jobs:
       - name: Build the site (checks internal links)
         run: npm run docs:check
         working-directory: docs
+
+  conventional-commits:
+    name: conventional commits
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: cocogitto/cocogitto-action@v4.2.0
+        with:
+          command: check
