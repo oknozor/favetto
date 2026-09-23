@@ -293,7 +293,7 @@ mod tests {
             },
             AgentManager::new(),
             registry,
-            Arc::new(RwLock::new(cfg)),
+            Arc::new(cfg),
             dir.clone(),
             dir.clone(),
             Arc::new(RwLock::new(Vec::new())),

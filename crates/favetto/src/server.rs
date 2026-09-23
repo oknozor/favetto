@@ -647,16 +647,12 @@ async fn start_agent(
 
     let force_new = params.get("new").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    // Resolve the agent in a scoped block so the config read guard is dropped
-    // before the `await` below (a `parking_lot::RwLockReadGuard` is not `Send`).
-    let name = {
-        let cfg = state.config.read();
-        requested
-            .or_else(|| cfg.agent.default.clone())
-            .ok_or_else(|| {
-                anyhow::anyhow!("no agent given and no default configured ([agent].default)")
-            })?
-    };
+    // Resolve the agent: a request wins over the configured default.
+    let name = requested
+        .or_else(|| state.config.agent.default.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!("no agent given and no default configured ([agent].default)")
+        })?;
     let agent = state.registry.get_checked(&name)?;
 
     // A catalog task's prompt is a template over its collected `input`. Render it
@@ -879,14 +875,11 @@ async fn start_oneshot_task(
     let rows = params.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
     let cols = params.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
 
-    let name = {
-        let cfg = state.config.read();
-        requested
-            .or_else(|| cfg.agent.default.clone())
-            .ok_or_else(|| {
-                anyhow::anyhow!("no agent given and no default configured ([agent].default)")
-            })?
-    };
+    let name = requested
+        .or_else(|| state.config.agent.default.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!("no agent given and no default configured ([agent].default)")
+        })?;
     let agent = state.registry.get_checked(&name)?;
     let cwd_path = cwd.as_ref().map(std::path::PathBuf::from);
     // Keep a directory for the session-title lookup after `cwd_path` is moved
@@ -978,13 +971,10 @@ async fn start_oneshot_task(
         let session = info.id.clone();
         let agent_name = name.clone();
         let title_cwd = title_cwd.clone();
-        let (detect, quiet) = {
-            let cfg = state.config.read();
-            (
-                cfg.executor.detect_awaiting_input,
-                std::time::Duration::from_millis(cfg.executor.awaiting_input_quiet_ms),
-            )
-        };
+        let (detect, quiet) = (
+            state.config.executor.detect_awaiting_input,
+            std::time::Duration::from_millis(state.config.executor.awaiting_input_quiet_ms),
+        );
         tokio::spawn(async move {
             let code = if detect {
                 crate::attention::watch(&state, &session, agent, Some(task_id), quiet).await
@@ -1361,9 +1351,7 @@ mod tests {
             crate::webhooks::WebhookSecrets::from_config(&crate::config::FavettoConfig::default()),
             crate::agents::AgentManager::new(),
             crate::agents::AgentRegistry::default(),
-            Arc::new(parking_lot::RwLock::new(
-                crate::config::FavettoConfig::default(),
-            )),
+            Arc::new(crate::config::FavettoConfig::default()),
             dir.to_path_buf(),
             tasks_dir.to_path_buf(),
             catalog,
@@ -1670,22 +1658,15 @@ mod tests {
         path
     }
 
-    /// A `State` whose registry carries the given `[agents.*]` entries and whose
-    /// `[agent].default` is `default`.
+    /// A `State` built from an explicit config, with its registry resolved from it.
     #[cfg(unix)]
-    async fn agent_state(
+    async fn agent_state_with_config(
         dir: &Path,
         tasks_dir: &Path,
-        default: &str,
-        agents: Vec<(&str, crate::config::AgentConfig)>,
+        cfg: crate::config::FavettoConfig,
     ) -> Arc<State> {
         let pool = crate::db::open(&dir.join("test.db")).await.unwrap();
         crate::db::migrate(&pool).await.unwrap();
-        let mut cfg = crate::config::FavettoConfig::default();
-        cfg.agent.default = Some(default.to_string());
-        for (name, agent) in agents {
-            cfg.agents.insert(name.to_string(), agent);
-        }
         let registry = crate::agents::AgentRegistry::from_config_with(&cfg, &|_| true).unwrap();
         let catalog = Arc::new(parking_lot::RwLock::new(
             crate::tasks::load_catalog(tasks_dir).unwrap(),
@@ -1698,13 +1679,30 @@ mod tests {
             crate::webhooks::WebhookSecrets::from_config(&cfg),
             crate::agents::AgentManager::new(),
             registry,
-            Arc::new(parking_lot::RwLock::new(cfg)),
+            Arc::new(cfg),
             dir.to_path_buf(),
             tasks_dir.to_path_buf(),
             catalog,
             scheduler,
             Arc::new(parking_lot::RwLock::new(Vec::new())),
         ))
+    }
+
+    /// A `State` whose registry carries the given `[agents.*]` entries and whose
+    /// `[agent].default` is `default`.
+    #[cfg(unix)]
+    async fn agent_state(
+        dir: &Path,
+        tasks_dir: &Path,
+        default: &str,
+        agents: Vec<(&str, crate::config::AgentConfig)>,
+    ) -> Arc<State> {
+        let mut cfg = crate::config::FavettoConfig::default();
+        cfg.agent.default = Some(default.to_string());
+        for (name, agent) in agents {
+            cfg.agents.insert(name.to_string(), agent);
+        }
+        agent_state_with_config(dir, tasks_dir, cfg).await
     }
 
     /// A `State` whose `opencode` command is `command` (a title-lookup fixture).
@@ -2398,21 +2396,18 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).unwrap();
 
-        let state = agent_state(
-            &dir,
-            &tasks_dir,
-            "rsm",
-            vec![(
-                "rsm",
-                crate::config::AgentConfig {
-                    command: script.to_string_lossy().into_owned(),
-                    resume_args: Some(vec!["resume".to_string(), "{session_id}".to_string()]),
-                    ..Default::default()
-                },
-            )],
-        )
-        .await;
-        state.config.write().unwrap().executor.parallel = true;
+        let mut cfg = crate::config::FavettoConfig::default();
+        cfg.agent.default = Some("rsm".to_string());
+        cfg.executor.parallel = true;
+        cfg.agents.insert(
+            "rsm".to_string(),
+            crate::config::AgentConfig {
+                command: script.to_string_lossy().into_owned(),
+                resume_args: Some(vec!["resume".to_string(), "{session_id}".to_string()]),
+                ..Default::default()
+            },
+        );
+        let state = agent_state_with_config(&dir, &tasks_dir, cfg).await;
 
         let task = Task {
             id: Uuid::new_v4(),

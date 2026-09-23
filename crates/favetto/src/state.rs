@@ -32,8 +32,8 @@ pub struct State {
     pub agents: AgentManager,
     /// Configured external agents, resolved once at startup.
     pub registry: AgentRegistry,
-    /// Live config (external agents, executor/daemon defaults).
-    pub config: Arc<RwLock<FavettoConfig>>,
+    /// Config resolved once at startup (external agents, executor/daemon defaults).
+    pub config: Arc<FavettoConfig>,
     /// Directory for SQLite + token + worktrees.
     pub data_dir: PathBuf,
     /// Directory of task-definition `.md` files.
@@ -57,7 +57,7 @@ impl State {
         webhooks: WebhookSecrets,
         agents: AgentManager,
         registry: AgentRegistry,
-        config: Arc<RwLock<FavettoConfig>>,
+        config: Arc<FavettoConfig>,
         data_dir: PathBuf,
         tasks_dir: PathBuf,
         catalog: Arc<RwLock<Vec<TaskDef>>>,

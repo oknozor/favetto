@@ -71,7 +71,7 @@ fn record_run_outcome(task: &mut Task, outcome: anyhow::Result<RunOutcome>) -> b
 
 /// Spawn the dispatcher and the dependency listener.
 pub fn spawn(state: Arc<State>) -> tokio::task::JoinHandle<()> {
-    let cfg = state.config.read().executor.clone();
+    let cfg = state.config.executor.clone();
 
     let dep_state = state.clone();
     tokio::spawn(async move {
@@ -272,7 +272,7 @@ async fn run_one(
         )
         .await;
 
-    let config = state.config.read().clone();
+    let config = state.config.as_ref().clone();
 
     let prompt = render_task_prompt(&def, &task);
 
@@ -578,13 +578,10 @@ async fn run_agent_task(
         None
     };
 
-    let (detect, quiet) = {
-        let cfg = state.config.read();
-        (
-            cfg.executor.detect_awaiting_input,
-            Duration::from_millis(cfg.executor.awaiting_input_quiet_ms),
-        )
-    };
+    let (detect, quiet) = (
+        state.config.executor.detect_awaiting_input,
+        Duration::from_millis(state.config.executor.awaiting_input_quiet_ms),
+    );
     let code = if detect {
         crate::attention::watch(state, &info.id, agent.clone(), Some(task.id), quiet).await
     } else {
@@ -616,7 +613,7 @@ async fn run_agent_task(
     if result.session_id.is_some() && agent.capabilities().resume {
         let _ = state.agents.close(&info.id);
     }
-    let max = state.config.read().executor.max_output_bytes;
+    let max = state.config.executor.max_output_bytes;
     let output = build_task_output(
         &result.raw,
         &result.output,
@@ -896,7 +893,7 @@ async fn make_plan(
 pub async fn resume_cwd(state: &State, task_id: Uuid) -> Option<PathBuf> {
     let task = db::get_task(&state.db, task_id).await.ok().flatten()?;
     let def = lookup_def(state, &task.name)?;
-    let cfg = state.config.read().executor.clone();
+    let cfg = state.config.executor.clone();
     let base = resolve_base_dir(&def, &task);
     match make_plan(state, &cfg, &base, &task).await {
         Ok(plan) => Some(plan.cwd),
@@ -1070,7 +1067,7 @@ fn select_prunable(
 /// Remove tracked worktrees the retention policy has expired, drop their
 /// branches, and `git worktree prune` each repo. Never fatal.
 pub async fn prune_worktrees(state: &State) -> anyhow::Result<WorktreePruneStats> {
-    let cfg = state.config.read().executor.clone();
+    let cfg = state.config.executor.clone();
     let retention = cfg.worktree_retention.clone();
     let records = db::list_worktrees(&state.db).await?;
 
@@ -1481,7 +1478,7 @@ mod tests {
             },
             AgentManager::new(),
             registry,
-            Arc::new(RwLock::new(cfg)),
+            Arc::new(cfg),
             dir.clone(),
             dir.clone(),
             Arc::new(RwLock::new(Vec::new())),
@@ -1672,7 +1669,7 @@ mod tests {
             },
             AgentManager::new(),
             registry,
-            Arc::new(RwLock::new(cfg)),
+            Arc::new(cfg),
             dir.to_path_buf(),
             dir.to_path_buf(),
             Arc::new(RwLock::new(Vec::new())),
@@ -2172,7 +2169,7 @@ mod tests {
             },
             AgentManager::new(),
             registry,
-            Arc::new(RwLock::new(cfg)),
+            Arc::new(cfg),
             dir.clone(),
             dir.clone(),
             Arc::new(RwLock::new(Vec::new())),
@@ -2287,7 +2284,7 @@ mod tests {
             },
             AgentManager::new(),
             registry,
-            Arc::new(RwLock::new(cfg)),
+            Arc::new(cfg),
             dir.clone(),
             dir.clone(),
             Arc::new(RwLock::new(Vec::new())),
@@ -2429,7 +2426,7 @@ mod tests {
             },
             AgentManager::new(),
             registry,
-            Arc::new(RwLock::new(cfg)),
+            Arc::new(cfg),
             root.clone(),
             root.clone(),
             Arc::new(RwLock::new(Vec::new())),
@@ -2502,11 +2499,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A `State` whose live catalog is `catalog`, with no usable agent.
-    async fn join_state(dir: &Path, catalog: Vec<TaskDef>) -> Arc<State> {
+    /// A `State` whose live catalog is `catalog`, built from an explicit config,
+    /// with no usable agent.
+    async fn join_state_with_config(
+        dir: &Path,
+        catalog: Vec<TaskDef>,
+        cfg: FavettoConfig,
+    ) -> Arc<State> {
         let pool = crate::db::open(&dir.join("test.db")).await.unwrap();
         crate::db::migrate(&pool).await.unwrap();
-        let cfg = FavettoConfig::default();
         let registry = AgentRegistry::from_config_with(&cfg, &|_| true).unwrap();
         Arc::new(State::new(
             pool,
@@ -2518,13 +2519,18 @@ mod tests {
             },
             AgentManager::new(),
             registry,
-            Arc::new(RwLock::new(cfg)),
+            Arc::new(cfg),
             dir.to_path_buf(),
             dir.to_path_buf(),
             Arc::new(RwLock::new(catalog)),
             tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
             Arc::new(RwLock::new(Vec::new())),
         ))
+    }
+
+    /// A `State` whose live catalog is `catalog`, with no usable agent.
+    async fn join_state(dir: &Path, catalog: Vec<TaskDef>) -> Arc<State> {
+        join_state_with_config(dir, catalog, FavettoConfig::default()).await
     }
 
     /// Regression for issue #91: resuming an agent session must run in the run's
@@ -2574,8 +2580,9 @@ mod tests {
             ),
         )
         .unwrap();
-        let state = join_state(&dir, vec![def]).await;
-        state.config.write().unwrap().executor.parallel = true;
+        let mut cfg = FavettoConfig::default();
+        cfg.executor.parallel = true;
+        let state = join_state_with_config(&dir, vec![def], cfg).await;
 
         let mut task = lineage_task("issue", TaskStatus::Succeeded, None, None);
         task.session_id = Some("ses_1".to_string());

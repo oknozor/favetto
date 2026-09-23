@@ -188,9 +188,7 @@ mod tests {
             crate::webhooks::WebhookSecrets::from_config(&crate::config::FavettoConfig::default()),
             crate::agents::AgentManager::new(),
             crate::agents::AgentRegistry::default(),
-            Arc::new(parking_lot::RwLock::new(
-                crate::config::FavettoConfig::default(),
-            )),
+            Arc::new(crate::config::FavettoConfig::default()),
             dir.to_path_buf(),
             tasks_dir.to_path_buf(),
             catalog,
