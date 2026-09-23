@@ -23,6 +23,36 @@ export FAVETTO_URL=ws://HOST:7878
 favetto tui
 ```
 
+## TLS (`wss://`)
+
+The client attaches over TLS when the URL uses the `wss://` scheme:
+
+```bash
+favetto tui --remote wss://HOST:7878 --token-file ~/.local/share/favetto/token
+```
+
+The TLS handshake is validated against the bundled Mozilla root store; there is
+no flag to accept an invalid certificate. `wss://` is what makes remote attach
+safe over an untrusted network, and the connect timeout still bounds a stalled
+handshake.
+
+There are two supported deployments:
+
+- **Plaintext behind a TLS-terminating reverse proxy (recommended).** The daemon
+  keeps serving `ws://` (loopback by default) and the proxy (nginx, Caddy,
+  Traefik, …) terminates TLS and forwards the WebSocket upgrade. Clients use
+  `wss://PROXY_HOST`. No daemon change is required; make sure the proxy forwards
+  the `Authorization` header and the `/rpc` upgrade path.
+- **Direct `wss://` endpoint.** If something else already terminates TLS in
+  front of the daemon (or you front it yourself), point the client straight at
+  the `wss://` endpoint. Certificate validation applies to whatever host the URL
+  names.
+
+`wss://` also works with pairing: `exchange_pair_code` rewrites the WebSocket
+scheme to `https://` for the one-off `POST /pair/exchange` call, so
+`favetto tui --remote wss://HOST:7878 --pair-code 123456` talks to
+`https://HOST:7878` and then attaches over the validated WebSocket.
+
 ## Pairing
 
 Copying the token is fine for a trusted machine. For a one-off session, ask the
@@ -59,6 +89,8 @@ rotate a token outside the default location.
 
 - The WebSocket API rejects requests without a valid bearer token
   (`-32001 Unauthorized`).
+- A bearer token sent over `ws://` is plaintext on the wire; use `wss://` (or a
+  TLS-terminating proxy) whenever the network is not fully trusted.
 - The Unix socket is local and trusted; anyone who can open it can control the
   daemon.
 - The pairing code is short-lived and single-use. Do not expose the HTTP

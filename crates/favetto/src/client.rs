@@ -180,12 +180,12 @@ async fn unix_connect(path: &PathBuf) -> anyhow::Result<(ClientStream, ClientSin
     Ok((incoming, outgoing))
 }
 
+/// Connect over a WebSocket. Both `ws://` and `wss://` are supported: the
+/// `rustls-tls-webpki-roots` feature lets `connect_async` negotiate TLS for
+/// `wss://` URLs, validating the server certificate against the Mozilla root
+/// store (invalid certificates are rejected; there is no insecure fallback).
 async fn ws_connect(url: &str, token: Option<&str>) -> anyhow::Result<(ClientStream, ClientSink)> {
     use tokio_tungstenite::tungstenite::Message as WsMessage;
-
-    if url.starts_with("wss://") {
-        anyhow::bail!("TLS WebSocket (wss://) is not enabled in M6; use ws:// or the Unix socket");
-    }
 
     let mut builder = http::Request::builder().uri(url);
     if let Some(t) = token {
@@ -249,6 +249,55 @@ mod tests {
         .await;
 
         assert!(result.is_err(), "stalled connect should time out");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "connect blocked for {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// `wss://` must reach the real TLS connect path instead of short-circuiting
+    /// with the old "not enabled" error, and a peer that accepts TCP but never
+    /// completes the TLS handshake must still be bounded by the connect timeout.
+    ///
+    /// If the TLS feature were missing, `connect_async` would fail immediately
+    /// with a "TLS support not compiled in" error instead of stalling; the
+    /// timeout firing is therefore what proves a TLS handshake was attempted.
+    #[tokio::test]
+    async fn connect_with_timeout_attempts_tls_and_bounds_a_stalled_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept the TCP connection, then stay silent through the TLS handshake.
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                drop(stream);
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let result = Client::connect_with_timeout(
+            Transport::Ws {
+                url: format!("wss://{addr}/rpc"),
+                token: None,
+            },
+            Duration::from_millis(200),
+        )
+        .await;
+
+        let err = match result {
+            Ok(_) => panic!("stalled TLS connect should not succeed"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("timed out"),
+            "wss:// should attempt a TLS handshake then time out, got: {message}"
+        );
+        assert!(
+            !message.contains("not enabled"),
+            "wss:// must not short-circuit before connecting: {message}"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "connect blocked for {:?}",
