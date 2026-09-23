@@ -524,15 +524,20 @@ async fn run_agent_task(
 ) -> anyhow::Result<RunOutcome> {
     let agent = state.registry.get_checked(agent_name)?;
 
+    // Give every headless run a deterministic session id. Agents that accept
+    // `{session_id}` (pi) bind it with `--session-id`, and the manager seeds it
+    // onto the session so the task row and panel can reopen it later. Agents
+    // that report their own id (opencode) ignore the generated one.
+    let session_id = Uuid::new_v4().to_string();
     let ctx = crate::agents::AgentContext {
         cwd: Some(cwd.to_path_buf()),
         provider: def.provider.clone(),
         model: def.model.clone(),
         prompt: Some(prompt.to_string()),
+        session_id: Some(session_id),
         rows: 40,
         cols: 120,
         git_signing: def.sign,
-        ..Default::default()
     };
     let info = state.agents.start(
         agent_name,
@@ -2195,6 +2200,110 @@ mod tests {
             !captured.contains("{{ input."),
             "a raw placeholder survived into the agent prompt: {captured}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A headless run binds a deterministic session id (a UUID) into its args
+    /// and persists it on the task row, so the finished run can be reopened.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_one_binds_and_persists_a_deterministic_session_id() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("favetto-session-id-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let capture = dir.join("captured-args.txt");
+        let script = dir.join("fake-seedy.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n",
+                capture.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let mut cfg = FavettoConfig::default();
+        cfg.agent.default = Some("seedy".to_string());
+        cfg.agents.insert(
+            "seedy".to_string(),
+            crate::config::AgentConfig {
+                command: script.to_string_lossy().into_owned(),
+                headless_args: Some(vec![
+                    "run".to_string(),
+                    "--session-id".to_string(),
+                    "{session_id}".to_string(),
+                    "{prompt}".to_string(),
+                ]),
+                resume_args: Some(vec!["resume".to_string(), "{session_id}".to_string()]),
+                ..Default::default()
+            },
+        );
+        let registry = AgentRegistry::from_config_with(&cfg, &|_| true).unwrap();
+
+        let pool = crate::db::open(&dir.join("test.db")).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        let state = Arc::new(State::new(
+            pool,
+            EventBus::new(64),
+            Token::generate(),
+            WebhookSecrets {
+                github: None,
+                linear: None,
+            },
+            AgentManager::new(),
+            registry,
+            Arc::new(RwLock::new(cfg)),
+            dir.clone(),
+            dir.clone(),
+            Arc::new(RwLock::new(Vec::new())),
+            tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
+            Arc::new(RwLock::new(Vec::new())),
+        ));
+
+        let def = crate::tasks::parse_task_md("t", "agent = \"seedy\"\n---\nbody\n").unwrap();
+        let task = Task {
+            id: Uuid::new_v4(),
+            name: def.name.clone(),
+            status: TaskStatus::Running,
+            input: serde_json::json!({}),
+            output: None,
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: Some(Utc::now()),
+            finished_at: None,
+            error: None,
+            session_id: None,
+            session_title: None,
+            parent_id: None,
+            root_id: None,
+        };
+        db::insert_task(&state.db, &task).await.unwrap();
+        let task_id = task.id;
+
+        let plan = Plan {
+            cwd: dir.clone(),
+            needs_lock: false,
+            worktree: None,
+        };
+        run_one(&state, task, def, plan, None).await;
+
+        let captured = std::fs::read_to_string(&capture).unwrap_or_default();
+        let sid = captured
+            .split_whitespace()
+            .skip_while(|t| *t != "--session-id")
+            .nth(1)
+            .expect("--session-id was not passed to the run")
+            .to_string();
+        assert!(Uuid::parse_str(&sid).is_ok(), "not a UUID: {sid:?}");
+
+        let stored = db::get_task(&state.db, task_id).await.unwrap().unwrap();
+        assert_eq!(stored.status, TaskStatus::Succeeded);
+        assert_eq!(stored.session_id.as_deref(), Some(sid.as_str()));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

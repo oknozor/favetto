@@ -374,10 +374,19 @@ impl AgentManager {
         let running = Arc::new(AtomicBool::new(true));
         let raw = Arc::new(Mutex::new(Vec::new()));
         let exit_code = Arc::new(std::sync::atomic::AtomicI32::new(-1));
-        let external_session_id = Arc::new(Mutex::new(None::<String>));
+        let probe = agent.session_id_probe();
+        // A headless agent that does not report its own session id gets the
+        // deterministic one the caller generated (bound via `{session_id}`), so
+        // the task row and reattach path see it even if the process dies before
+        // emitting anything. Agents with a probe (opencode) capture their real id.
+        let seeded_session_id = if headless && probe.is_none() {
+            ctx.session_id.clone()
+        } else {
+            None
+        };
+        let external_session_id = Arc::new(Mutex::new(seeded_session_id));
         let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
         let awaiting_input = Arc::new(Mutex::new(None::<AwaitingInputReason>));
-        let probe = agent.session_id_probe();
         let tx = self.tx.clone();
 
         // Reader thread: feed the emulator, answer terminal queries, broadcast a
@@ -1059,6 +1068,72 @@ mod tests {
         assert_eq!(
             mgr.external_session_id(&info.id).as_deref(),
             Some("ses_123")
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_run_seeds_a_deterministic_session_id() {
+        let mgr = AgentManager::new();
+        let mut config = cfg("sh", &[]);
+        config.headless_args = Some(vec!["-c".to_string(), "printf ok".to_string()]);
+        config.resume_args = Some(vec!["--session".to_string(), "{session_id}".to_string()]);
+        let mut ctx = context(None, 40, 120);
+        ctx.session_id = Some("ses-seeded".to_string());
+        let info = mgr
+            .start(
+                "sh",
+                template("sh", config),
+                Some("task-seed".to_string()),
+                Invocation::Headless {
+                    prompt: "hi",
+                    provider: None,
+                    model: None,
+                },
+                ctx,
+            )
+            .unwrap();
+        // Visible immediately, before the process exits.
+        assert_eq!(
+            mgr.external_session_id(&info.id).as_deref(),
+            Some("ses-seeded")
+        );
+        assert_eq!(mgr.wait(&info.id).await, Some(0));
+        assert_eq!(
+            mgr.external_session_id(&info.id).as_deref(),
+            Some("ses-seeded")
+        );
+        mgr.close(&info.id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn probe_agent_captures_its_own_id_over_the_seeded_one() {
+        let mgr = AgentManager::new();
+        let mut config = cfg("sh", &[]);
+        config.headless_args = Some(vec![
+            "-c".to_string(),
+            r#"printf '{"sessionID":"ses_real"}\n'"#.to_string(),
+        ]);
+        config.session_id_json_key = Some("sessionID".to_string());
+        let mut ctx = context(None, 40, 120);
+        ctx.session_id = Some("ses-seeded".to_string());
+        let info = mgr
+            .start(
+                "sh",
+                template("sh", config),
+                None,
+                Invocation::Headless {
+                    prompt: "hi",
+                    provider: None,
+                    model: None,
+                },
+                ctx,
+            )
+            .unwrap();
+        assert_eq!(mgr.wait(&info.id).await, Some(0));
+        // The probe's real id wins; the generated one must not mask it.
+        assert_eq!(
+            mgr.external_session_id(&info.id).as_deref(),
+            Some("ses_real")
         );
     }
 
