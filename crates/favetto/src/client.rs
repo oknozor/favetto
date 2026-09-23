@@ -27,6 +27,12 @@ pub enum Transport {
     Ws { url: String, token: Option<String> },
 }
 
+/// Default bound on establishing a transport connection.
+///
+/// A dead or black-holed peer must not block the caller (notably the TUI event
+/// loop) for the OS TCP timeout; the timeout cancels the pending connect.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Clone)]
 pub struct Client {
     out_tx: mpsc::Sender<Frame>,
@@ -38,11 +44,28 @@ pub struct Client {
 
 impl Client {
     /// Establish a connection of the given transport kind.
+    ///
+    /// Bounded by [`CONNECT_TIMEOUT`] so a black-holed peer cannot wedge the
+    /// caller. Use [`Client::connect_with_timeout`] to override the bound.
     pub async fn connect(transport: Transport) -> anyhow::Result<Self> {
-        let (incoming, outgoing) = match transport {
-            Transport::Unix(path) => unix_connect(&path).await?,
-            Transport::Ws { url, token } => ws_connect(&url, token.as_deref()).await?,
-        };
+        Self::connect_with_timeout(transport, CONNECT_TIMEOUT).await
+    }
+
+    /// Establish a connection, failing if the transport is not ready within
+    /// `timeout`. The connect future is cancelled on timeout, so a stalled
+    /// WebSocket handshake or TCP connect cannot outlive the bound.
+    pub async fn connect_with_timeout(
+        transport: Transport,
+        timeout: Duration,
+    ) -> anyhow::Result<Self> {
+        let (incoming, outgoing) = tokio::time::timeout(timeout, async {
+            match transport {
+                Transport::Unix(path) => unix_connect(&path).await,
+                Transport::Ws { url, token } => ws_connect(&url, token.as_deref()).await,
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("connect timed out after {timeout:?}"))??;
         Self::from_streams(incoming, outgoing)
     }
 
@@ -194,4 +217,42 @@ async fn ws_connect(url: &str, token: Option<&str>) -> anyhow::Result<(ClientStr
     );
 
     Ok((incoming, outgoing))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A peer that accepts the TCP connection but never answers the WebSocket
+    /// handshake must be cancelled by the connect timeout instead of hanging the
+    /// caller until the OS TCP timeout.
+    #[tokio::test]
+    async fn connect_with_timeout_bounds_a_stalled_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept, then stay silent through the HTTP upgrade.
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                drop(stream);
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let result = Client::connect_with_timeout(
+            Transport::Ws {
+                url: format!("ws://{addr}/rpc"),
+                token: None,
+            },
+            Duration::from_millis(200),
+        )
+        .await;
+
+        assert!(result.is_err(), "stalled connect should time out");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "connect blocked for {:?}",
+            started.elapsed()
+        );
+    }
 }
