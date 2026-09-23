@@ -3,7 +3,7 @@
 # int, choices and bool.
 agent = "opencode"
 provider = "deepseek"
-model = "deepseek-v4-flash"
+model = "deepseek-flash"
 
 [[vars]]
 name = "issue"

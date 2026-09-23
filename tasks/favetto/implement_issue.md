@@ -1,6 +1,6 @@
 agent = "opencode"
 provider = "deepseek"  
-model = "deepseek-v4-flash" 
+model = "deepseek-flash" 
 cwd = "/code/che"
 ---
 

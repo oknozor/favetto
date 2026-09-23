@@ -244,14 +244,6 @@ async fn run_one(
         )),
     };
 
-    if let Some(wt) = &plan.worktree {
-        if config.executor.keep_worktree {
-            tracing::info!(path = %wt.path.display(), "worktree kept");
-        } else {
-            remove_worktree(&state.db, task.id, &wt.repo, &wt.path, &wt.branch).await;
-        }
-    }
-
     let success = record_run_outcome(&mut task, outcome);
     task.finished_at = Some(Utc::now());
 
@@ -297,6 +289,17 @@ async fn run_one(
     if success && def.spawn.is_some() {
         if let Err(e) = spawn_from_manifest(state, &task, &def, &plan.cwd).await {
             tracing::warn!(task = %task.name, error = %e, "failed to spawn tasks from handoff");
+        }
+    }
+
+    // Reclaim the worktree only after the handoff above has been read. For an
+    // isolated run the `spawn_file` lives inside the worktree, so removing it
+    // earlier made the manifest unreadable and silently dropped `spawn` tasks.
+    if let Some(wt) = &plan.worktree {
+        if config.executor.keep_worktree {
+            tracing::info!(path = %wt.path.display(), "worktree kept");
+        } else {
+            remove_worktree(&state.db, task.id, &wt.repo, &wt.path, &wt.branch).await;
         }
     }
 }
@@ -1863,5 +1866,158 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: an isolated run reads its `spawn_file` from the worktree
+    /// *before* reclaiming it. The worktree used to be removed before the
+    /// handoff was read, so the manifest was already gone and the `spawn` tasks
+    /// were silently dropped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_one_reads_spawn_file_before_reclaiming_worktree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("favetto-spawn-wt-{}", Uuid::new_v4()));
+        let repo = root.join("repo");
+        let worktree = root.join("worktree");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let run_git = |dir: PathBuf, args: Vec<String>| async move {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(&args)
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "t"],
+        ] {
+            run_git(repo.clone(), args.into_iter().map(String::from).collect()).await;
+        }
+        std::fs::write(repo.join("README.md"), "seed").unwrap();
+        for args in [vec!["add", "-A"], vec!["commit", "-qm", "init"]] {
+            run_git(repo.clone(), args.into_iter().map(String::from).collect()).await;
+        }
+
+        let branch = "favetto/spawn-test";
+        run_git(
+            repo.clone(),
+            vec![
+                "worktree".into(),
+                "add".into(),
+                "--force".into(),
+                "-B".into(),
+                branch.into(),
+                worktree.to_string_lossy().into_owned(),
+            ],
+        )
+        .await;
+
+        // The agent's handoff lives inside the worktree.
+        let handoff = worktree.join(".favetto").join("handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        std::fs::write(handoff.join("manifest.json"), r#"[{"issue_id":7}]"#).unwrap();
+
+        // A fake agent that succeeds without doing anything.
+        let script = root.join("fake-agent.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let mut cfg = FavettoConfig::default();
+        cfg.agent.default = Some("opencode".to_string());
+        cfg.agents.insert(
+            "opencode".to_string(),
+            crate::config::AgentConfig {
+                command: script.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+        );
+        let registry = AgentRegistry::from_config_with(&cfg, &|_| true).unwrap();
+
+        let pool = crate::db::open(&root.join("test.db")).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        let state = Arc::new(State::new(
+            pool,
+            EventBus::new(64),
+            Token::generate(),
+            WebhookSecrets {
+                github: None,
+                linear: None,
+            },
+            AgentManager::new(),
+            registry,
+            Arc::new(RwLock::new(cfg)),
+            root.clone(),
+            root.clone(),
+            Arc::new(RwLock::new(Vec::new())),
+            tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
+            Arc::new(RwLock::new(Vec::new())),
+        ));
+
+        let def = crate::tasks::parse_task_md(
+            "favetto/triage_issues",
+            "agent = \"opencode\"\nspawn = \"favetto/plan_issue\"\n\
+             spawn_file = \".favetto/handoff/manifest.json\"\n---\nTriage the issues.\n",
+        )
+        .unwrap();
+
+        let task = Task {
+            id: Uuid::new_v4(),
+            name: def.name.clone(),
+            status: TaskStatus::Running,
+            input: serde_json::json!({}),
+            output: None,
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: Some(Utc::now()),
+            finished_at: None,
+            error: None,
+            session_id: None,
+            session_title: None,
+        };
+        db::insert_task(&state.db, &task).await.unwrap();
+
+        let plan = Plan {
+            cwd: worktree.clone(),
+            needs_lock: false,
+            worktree: Some(Worktree {
+                repo: repo.clone(),
+                path: worktree.clone(),
+                branch: branch.to_string(),
+            }),
+        };
+        run_one(&state, task, def, plan, None).await;
+
+        let pending = db::next_pending_tasks(&state.db, 10).await.unwrap();
+        assert!(
+            pending.iter().any(|t| {
+                t.name == "favetto/plan_issue"
+                    && t.input.get("issue_id").and_then(|v| v.as_i64()) == Some(7)
+            }),
+            "spawn handoff was not enqueued; pending = {:?}",
+            pending
+                .iter()
+                .map(|t| (t.name.clone(), t.input.clone()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !worktree.exists(),
+            "the worktree should be reclaimed after the handoff is read"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
