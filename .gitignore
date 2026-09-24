@@ -7,3 +7,9 @@ workdir/SUMMARY.md
 docs/node_modules/
 docs/.vitepress/cache/
 docs/.vitepress/dist/
+
+# cargo-fuzz
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/

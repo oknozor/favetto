@@ -107,6 +107,19 @@ git diff --exit-code -- docs/reference docs/public/favetto-schema.json
 cd docs && npm ci && npm run docs:check
 ```
 
+### Fuzzing
+
+The wire decoder ships a [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) target
+under `fuzz/`. It needs a nightly toolchain and is not part of CI:
+
+```bash
+cargo install cargo-fuzz
+cd fuzz
+cargo +nightly fuzz run decode
+```
+
+The stable property tests above run in CI instead.
+
 ## Releasing
 
 Releases are cut from `main` with [cocogitto](https://github.com/cocogitto/cocogitto)
