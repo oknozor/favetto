@@ -1363,17 +1363,16 @@ async fn start_agent(
         }
     }
 
-    state.agents.start(
-        &name,
-        agent,
-        task_id,
-        Invocation::Interactive {
-            prompt: prompt.as_deref(),
-            provider: provider.as_deref(),
-            model: model.as_deref(),
-        },
-        ctx,
-    )
+    let invocation = Invocation::Interactive {
+        prompt: prompt.as_deref(),
+        provider: provider.as_deref(),
+        model: model.as_deref(),
+    };
+    // Let the agent create/seed its own session on a managed transport before the
+    // PTY is spawned (opencode's managed server). A failure degrades to the old
+    // prompt-on-the-command-line launch.
+    let _ = agent.prepare_launch(&invocation, &mut ctx).await;
+    state.agents.start(&name, agent, task_id, invocation, ctx)
 }
 
 /// Whether the daemon should reattach to an existing session rather than launch
@@ -1522,7 +1521,7 @@ async fn start_oneshot_task(
         )
         .await;
 
-    let ctx = AgentContext {
+    let mut ctx = AgentContext {
         cwd: cwd_path,
         provider: provider.clone(),
         model: model.clone(),
@@ -1530,15 +1529,17 @@ async fn start_oneshot_task(
         cols,
         ..Default::default()
     };
+    let invocation = Invocation::Interactive {
+        prompt: None,
+        provider: provider.as_deref(),
+        model: model.as_deref(),
+    };
+    let _ = agent.prepare_launch(&invocation, &mut ctx).await;
     let info = state.agents.start(
         &name,
         agent.clone(),
         Some(task.id.to_string()),
-        Invocation::Interactive {
-            prompt: None,
-            provider: provider.as_deref(),
-            model: model.as_deref(),
-        },
+        invocation,
         ctx,
     )?;
 

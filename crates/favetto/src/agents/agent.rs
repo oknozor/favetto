@@ -234,6 +234,18 @@ pub trait Agent: Send + Sync {
         None
     }
 
+    /// Prepare an agent-owned session before the PTY is spawned, e.g. create and
+    /// seed a session on a managed transport. The default is a no-op; callers run
+    /// it once before [`AgentManager::start`](super::AgentManager::start) and
+    /// degrade to the old launch when it fails.
+    fn prepare_launch<'a>(
+        &'a self,
+        _invocation: &'a Invocation<'_>,
+        _ctx: &'a mut AgentContext,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Detect that the session's *visible screen* is blocked waiting on the user
     /// (a permission dialog, confirmation, choice, …). Defaults to `None`; the
     /// generic fallback in `AgentManager` still applies.
@@ -458,6 +470,37 @@ mod tests {
             dir: std::path::PathBuf::from("favetto-none"),
         };
         assert!(Dummy.hook_injection(&launch).is_none());
+    }
+
+    #[tokio::test]
+    async fn default_prepare_launch_is_a_noop() {
+        struct Dummy;
+        impl Agent for Dummy {
+            fn descriptor(&self) -> &AgentDescriptor {
+                unimplemented!()
+            }
+            fn command(&self, _: &Invocation<'_>, _: &AgentContext) -> anyhow::Result<CommandSpec> {
+                unimplemented!()
+            }
+        }
+        let mut ctx = AgentContext {
+            session_id: Some("ses_keep".to_string()),
+            prompt: Some("keep".to_string()),
+            ..Default::default()
+        };
+        Dummy
+            .prepare_launch(
+                &Invocation::Interactive {
+                    prompt: None,
+                    provider: None,
+                    model: None,
+                },
+                &mut ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ctx.session_id.as_deref(), Some("ses_keep"));
+        assert_eq!(ctx.prompt.as_deref(), Some("keep"));
     }
 
     /// A title-capable fixture: returns `"Late title"` once `fail_first` lookups

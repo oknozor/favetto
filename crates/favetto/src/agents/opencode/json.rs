@@ -251,6 +251,20 @@ impl OpenCodeJsonlParser {
     }
 }
 
+impl crate::agents::state::StdoutParser for OpenCodeJsonlParser {
+    fn push(&mut self, chunk: &[u8]) {
+        OpenCodeJsonlParser::push(self, chunk);
+    }
+
+    fn finish(&mut self, exit_code: Option<i32>) {
+        OpenCodeJsonlParser::finish(self, exit_code);
+    }
+
+    fn summary(&self) -> RunSummary {
+        OpenCodeJsonlParser::summary(self).clone()
+    }
+}
+
 /// Read a nested string, returning `""` when the pointer is missing.
 fn json_str<'a>(value: &'a serde_json::Value, pointer: &str) -> &'a str {
     value

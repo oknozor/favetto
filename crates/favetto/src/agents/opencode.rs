@@ -9,10 +9,16 @@ use futures_util::future::BoxFuture;
 
 use crate::config::AgentConfig;
 
-use super::agent::{Agent, AgentRunResult, ProviderSource};
-use super::configurable::{delegate_to_template, overlay, TemplateAgent};
+use super::agent::{
+    Agent, AgentContext, AgentDescriptor, AgentRunResult, CommandSpec, Invocation, ProviderSource,
+    SessionIdProbe,
+};
+use super::configurable::{overlay, TemplateAgent};
+use super::state::{StateSource, StateSourceConfig};
 
 mod json;
+mod observer;
+mod server;
 use json::OpenCodeJsonlParser;
 
 /// The built-in defaults, matching `config.example.toml`.
@@ -60,20 +66,76 @@ impl OpenCodeAgent {
         let mut template = TemplateAgent::new(name, "OpenCode", config);
         // opencode is the only built-in that exposes a provider/model catalog.
         template.descriptor.capabilities.providers = true;
+        // The managed server observer reports live state and answers permissions.
+        template.descriptor.capabilities.reports_state = true;
+        template.descriptor.capabilities.permission_channel = true;
         Self { template }
     }
 }
 
 impl Agent for OpenCodeAgent {
-    delegate_to_template!();
+    fn descriptor(&self) -> &AgentDescriptor {
+        &self.template.descriptor
+    }
+
+    /// Render the template command, then route interactive/resume launches
+    /// through the managed server when one is running (and, for a fresh
+    /// session, once `prepare_launch` has created and seeded it).
+    fn command(
+        &self,
+        invocation: &Invocation<'_>,
+        ctx: &AgentContext,
+    ) -> anyhow::Result<CommandSpec> {
+        let mut spec = self.template.command(invocation, ctx)?;
+        let Some(endpoint) = server::endpoint() else {
+            return Ok(spec);
+        };
+        match invocation {
+            Invocation::Interactive { .. } => {
+                // Only attach when the session was created by `prepare_launch`;
+                // otherwise keep the `--prompt` + Enter fallback intact.
+                if let Some(session_id) = ctx.session_id.as_deref() {
+                    insert_server_args(&mut spec.args, &endpoint, Some(session_id));
+                    spec.env.insert(
+                        "OPENCODE_SERVER_PASSWORD".to_string(),
+                        endpoint.password.clone(),
+                    );
+                }
+            }
+            Invocation::Resume(_) => {
+                // `resume_args` already carries `--session {session_id}`.
+                insert_server_args(&mut spec.args, &endpoint, None);
+                spec.env.insert(
+                    "OPENCODE_SERVER_PASSWORD".to_string(),
+                    endpoint.password.clone(),
+                );
+            }
+            Invocation::Headless { .. } => {}
+        }
+        Ok(spec)
+    }
+
+    fn session_id_probe(&self) -> Option<SessionIdProbe> {
+        self.template.probe.clone()
+    }
+
+    fn set_available(&mut self, available: bool) {
+        self.template.descriptor.available = available;
+    }
 
     fn has_session_titles(&self) -> bool {
         true
     }
 
     fn session_title(&self, session_id: &str, cwd: &Path) -> Option<String> {
-        let out = std::process::Command::new(&self.template.config.command)
-            .args(["session", "list", "--format", "json"])
+        let mut cmd = std::process::Command::new(&self.template.config.command);
+        cmd.args(["session", "list"]);
+        if let Some(endpoint) = server::endpoint() {
+            cmd.args(["--server", &endpoint.url]);
+            cmd.env("OPENCODE_SERVER_PASSWORD", &endpoint.password);
+        }
+        let out = cmd
+            .args(["--format", "json"])
             .current_dir(cwd)
             .output()
             .ok()?;
@@ -104,18 +166,74 @@ impl Agent for OpenCodeAgent {
         super::detect::opencode_awaiting_input(&screen.contents())
     }
 
-    /// Ask the opencode server about the task's session, rather than waiting for
-    /// the TUI to exit. The background service tracks a per-session `outcome`
-    /// ("succeeded"/failed) once a turn completes, which is exactly the signal
-    /// needed to finish an interactive catalog task while its TUI stays open.
+    /// The managed server is the live-state transport for interactive sessions.
+    /// Headless runs keep the tolerant stdout JSONL parser.
+    fn state_source(&self, cfg: &StateSourceConfig) -> Option<Box<dyn StateSource>> {
+        if cfg.headless {
+            return None;
+        }
+        let endpoint = server::endpoint()?;
+        Some(Box::new(observer::OpenCodeServer::new(endpoint)))
+    }
+
+    /// Create and seed the session on the managed server before the PTY spawns.
+    /// Any failure is swallowed: the launch then falls back to the old
+    /// `--prompt` + timed-Enter path.
+    fn prepare_launch<'a>(
+        &'a self,
+        invocation: &'a Invocation<'_>,
+        ctx: &'a mut AgentContext,
+    ) -> futures_util::future::BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            if !matches!(invocation, Invocation::Interactive { .. }) {
+                return Ok(());
+            }
+            let Some(endpoint) =
+                server::ensure_started(Path::new(&self.template.config.command)).await
+            else {
+                return Ok(());
+            };
+            let Some(cwd) = ctx.cwd.clone() else {
+                return Ok(());
+            };
+            let model = ctx.model.as_deref().zip(ctx.provider.as_deref());
+            let session_id = match server::create_session(&endpoint, &cwd, model).await {
+                Ok(session_id) => session_id,
+                Err(e) => {
+                    tracing::warn!(error = %e, "opencode session create failed; using the prompt fallback");
+                    return Ok(());
+                }
+            };
+            ctx.session_id = Some(session_id.clone());
+            if let Some(prompt) = ctx.prompt.clone() {
+                match server::prompt(&endpoint, &session_id, &prompt).await {
+                    Ok(()) => ctx.prompt = None,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "opencode prompt seeding failed; using the prompt fallback");
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Ask the managed server (when there is one) about the task's session,
+    /// rather than waiting for the TUI to exit. The server tracks a per-session
+    /// `outcome` ("succeeded"/"failed") once a turn completes.
     ///
     /// `opencode api GET /api/session` returns every session with its
     /// `location.directory` and `time.created`; we keep the newest one created in
     /// this task's working directory at or after `since`, so a leftover session
     /// from an earlier run in the same directory cannot be mistaken for this one.
     fn interactive_turn_done(&self, cwd: &Path, since: DateTime<Utc>) -> Option<bool> {
-        let out = std::process::Command::new(&self.template.config.command)
-            .args(["api", "GET", "/api/session"])
+        let mut cmd = std::process::Command::new(&self.template.config.command);
+        cmd.args(["api"]);
+        if let Some(endpoint) = server::endpoint() {
+            cmd.args(["--server", &endpoint.url]);
+            cmd.env("OPENCODE_SERVER_PASSWORD", &endpoint.password);
+        }
+        let out = cmd
+            .args(["GET", "/api/session"])
             .current_dir(cwd)
             .output()
             .ok()?;
@@ -130,6 +248,28 @@ impl Agent for OpenCodeAgent {
             &cwd,
             since.timestamp_millis(),
         )
+    }
+}
+
+/// Insert `--server <url>` (and, when known, `--session <id>`) after a leading
+/// subcommand token (`mini`) or at the front.
+fn insert_server_args(
+    args: &mut Vec<String>,
+    endpoint: &server::Endpoint,
+    session_id: Option<&str>,
+) {
+    let mut introduced = vec!["--server".to_string(), endpoint.url.clone()];
+    if let Some(session_id) = session_id {
+        introduced.push("--session".to_string());
+        introduced.push(session_id.to_string());
+    }
+    let at = if args.first().map(|arg| arg == "mini").unwrap_or(false) {
+        1
+    } else {
+        0
+    };
+    for (offset, arg) in introduced.into_iter().enumerate() {
+        args.insert(at + offset, arg);
     }
 }
 
@@ -191,6 +331,7 @@ impl ProviderSource for OpenCodeProviderSource {
 mod tests {
     use super::*;
     use crate::agents::agent::{AgentContext, Invocation, SubmitStrategy};
+    use std::path::PathBuf;
 
     fn ctx(prompt: Option<&str>, provider: Option<&str>, model: Option<&str>) -> AgentContext {
         AgentContext {
@@ -311,7 +452,279 @@ mod tests {
         assert!(caps.structured_output);
         assert!(caps.reports_session_id);
         assert!(caps.prompt_prefill);
+        assert!(caps.reports_state);
+        assert!(caps.permission_channel);
         assert!(agent().has_session_titles());
+    }
+
+    fn install_endpoint() -> server::Endpoint {
+        let endpoint = server::Endpoint {
+            url: "http://127.0.0.1:9".to_string(),
+            password: "pw".to_string(),
+        };
+        server::install_endpoint_for_test(Some(endpoint.clone()));
+        endpoint
+    }
+
+    #[test]
+    fn interactive_with_managed_server_attaches_the_session() {
+        let endpoint = install_endpoint();
+        let ctx = AgentContext {
+            session_id: Some("ses_1".to_string()),
+            ..Default::default()
+        };
+        let spec = agent()
+            .command(
+                &Invocation::Interactive {
+                    prompt: None,
+                    provider: None,
+                    model: None,
+                },
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(
+            spec.args,
+            vec![
+                "--server".to_string(),
+                endpoint.url.clone(),
+                "--session".to_string(),
+                "ses_1".to_string(),
+            ]
+        );
+        assert_eq!(
+            spec.env.get("OPENCODE_SERVER_PASSWORD").map(String::as_str),
+            Some("pw")
+        );
+        server::install_endpoint_for_test(None);
+    }
+
+    #[test]
+    fn interactive_with_model_keeps_the_mini_subcommand() {
+        let endpoint = install_endpoint();
+        let ctx = AgentContext {
+            session_id: Some("ses_1".to_string()),
+            provider: Some("jev".to_string()),
+            model: Some("1.13".to_string()),
+            ..Default::default()
+        };
+        let spec = agent()
+            .command(
+                &Invocation::Interactive {
+                    prompt: None,
+                    provider: Some("jev"),
+                    model: Some("1.13"),
+                },
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(
+            spec.args,
+            vec![
+                "mini".to_string(),
+                "--server".to_string(),
+                endpoint.url.clone(),
+                "--session".to_string(),
+                "ses_1".to_string(),
+                "--model".to_string(),
+                "jev/1.13".to_string(),
+            ]
+        );
+        server::install_endpoint_for_test(None);
+    }
+
+    /// Without a session created by `prepare_launch`, an endpoint alone must not
+    /// change the old `--prompt` + timed-Enter fallback.
+    #[test]
+    fn interactive_without_a_created_session_keeps_the_prompt_fallback() {
+        install_endpoint();
+        let spec = agent()
+            .command(
+                &Invocation::Interactive {
+                    prompt: Some("hi"),
+                    provider: None,
+                    model: None,
+                },
+                &ctx(Some("hi"), None, None),
+            )
+            .unwrap();
+        assert_eq!(spec.args, vec!["--prompt", "hi"]);
+        assert!(matches!(spec.submit, SubmitStrategy::AfterSettle { .. }));
+        server::install_endpoint_for_test(None);
+    }
+
+    #[test]
+    fn resume_with_managed_server_targets_the_server() {
+        let endpoint = install_endpoint();
+        let ctx = AgentContext {
+            session_id: Some("ses_1".to_string()),
+            ..Default::default()
+        };
+        let spec = agent().command(&Invocation::Resume("ses_1"), &ctx).unwrap();
+        // `resume_args` already carries `--session`, so only `--server` is added.
+        assert_eq!(
+            spec.args,
+            vec![
+                "--server".to_string(),
+                endpoint.url.clone(),
+                "--session".to_string(),
+                "ses_1".to_string(),
+            ]
+        );
+        assert_eq!(
+            spec.env.get("OPENCODE_SERVER_PASSWORD").map(String::as_str),
+            Some("pw")
+        );
+        server::install_endpoint_for_test(None);
+    }
+
+    #[test]
+    fn state_source_is_interactive_only_and_needs_an_endpoint() {
+        let headless = StateSourceConfig {
+            headless: true,
+            ..Default::default()
+        };
+        assert!(agent().state_source(&headless).is_none());
+        assert!(agent()
+            .state_source(&StateSourceConfig::default())
+            .is_none());
+        install_endpoint();
+        assert!(agent()
+            .state_source(&StateSourceConfig::default())
+            .is_some());
+        server::install_endpoint_for_test(None);
+    }
+
+    fn mock_state() -> Arc<std::sync::Mutex<Vec<serde_json::Value>>> {
+        Arc::new(std::sync::Mutex::new(Vec::new()))
+    }
+
+    async fn record_create(
+        axum::extract::State(state): axum::extract::State<
+            Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        >,
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> axum::Json<serde_json::Value> {
+        state.lock().unwrap().push(body);
+        axum::Json(serde_json::json!({ "data": { "id": "ses_mock" } }))
+    }
+
+    async fn record_prompt(
+        axum::extract::State(state): axum::extract::State<
+            Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        >,
+        axum::extract::Path(_id): axum::extract::Path<String>,
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> axum::http::StatusCode {
+        state.lock().unwrap().push(body);
+        axum::http::StatusCode::NO_CONTENT
+    }
+
+    #[tokio::test]
+    async fn prepare_launch_creates_and_seeds_the_session() {
+        use axum::routing::post;
+        let recorded = mock_state();
+        let app = axum::Router::new()
+            .route("/api/session", post(record_create))
+            .route("/api/session/{id}/prompt", post(record_prompt))
+            .with_state(recorded.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        server::install_endpoint_for_test(Some(server::Endpoint {
+            url: format!("http://{addr}"),
+            password: "pw".to_string(),
+        }));
+
+        let mut launch_ctx = AgentContext {
+            cwd: Some(PathBuf::from("/tmp")),
+            prompt: Some("do it".to_string()),
+            ..Default::default()
+        };
+        agent()
+            .prepare_launch(
+                &Invocation::Interactive {
+                    prompt: Some("do it"),
+                    provider: None,
+                    model: None,
+                },
+                &mut launch_ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(launch_ctx.session_id.as_deref(), Some("ses_mock"));
+        assert!(
+            launch_ctx.prompt.is_none(),
+            "a seeded prompt must not also be passed on the command line"
+        );
+
+        let bodies = recorded.lock().unwrap().clone();
+        assert!(bodies
+            .iter()
+            .any(|b| b.pointer("/location/directory").is_some()));
+        assert!(bodies
+            .iter()
+            .any(|b| b.get("text").and_then(|v| v.as_str()) == Some("do it")));
+        server::install_endpoint_for_test(None);
+    }
+
+    async fn record_create_with_model(
+        axum::extract::State(state): axum::extract::State<
+            Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        >,
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> axum::Json<serde_json::Value> {
+        state.lock().unwrap().push(body);
+        axum::Json(serde_json::json!({ "data": { "id": "ses_model" } }))
+    }
+
+    #[tokio::test]
+    async fn prepare_launch_sends_the_selected_model() {
+        use axum::routing::post;
+        let recorded = mock_state();
+        let app = axum::Router::new()
+            .route("/api/session", post(record_create_with_model))
+            .with_state(recorded.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        server::install_endpoint_for_test(Some(server::Endpoint {
+            url: format!("http://{addr}"),
+            password: "pw".to_string(),
+        }));
+        let mut launch_ctx = AgentContext {
+            cwd: Some(PathBuf::from("/tmp")),
+            provider: Some("opencode".to_string()),
+            model: Some("space-bunny".to_string()),
+            ..Default::default()
+        };
+        agent()
+            .prepare_launch(
+                &Invocation::Interactive {
+                    prompt: None,
+                    provider: Some("opencode"),
+                    model: Some("space-bunny"),
+                },
+                &mut launch_ctx,
+            )
+            .await
+            .unwrap();
+        let bodies = recorded.lock().unwrap().clone();
+        assert_eq!(
+            bodies[0].pointer("/model/id").and_then(|v| v.as_str()),
+            Some("space-bunny")
+        );
+        assert_eq!(
+            bodies[0]
+                .pointer("/model/providerID")
+                .and_then(|v| v.as_str()),
+            Some("opencode")
+        );
+        server::install_endpoint_for_test(None);
     }
 
     #[test]
