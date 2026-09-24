@@ -10,10 +10,12 @@ Every section is optional; favetto falls back to built-in defaults for anything 
 |-------|------|---------|----------|-------------|
 | `agent` | AgentSettings | `{}` | no | Default external agent used for catalog tasks and new agent sessions. |
 | `agents` | Map<String, AgentConfig> | `{}` | no | External coding agents by name (e.g. `claude`, `opencode`, `pi`, `vibe`). |
+| `auth` | AuthSettings | `{"ticket_ttl_secs":30}` | no | Short-lived authentication ticket settings. |
 | `daemon` | DaemonSettings | `{"data_dir":null,"listen":null,"retention":{"days":30,"min_tasks":1000,"vacuum":true},"socket":null,"tasks_dir":null}` | no | Daemon defaults (overridable by CLI flags). |
 | `executor` | ExecutorSettings | `{"awaiting_input_quiet_ms":8000,"detect_awaiting_input":true,"keep_worktree":false,"max_concurrency":4,"max_output_bytes":262144,"parallel":false,"retry":{"backoff":"exponential","initial_ms":5000,"max_attempts":1,"max_ms":300000,"retry_on":["infrastructure","timeout"]},"stale_run":"fail","worktree":true,"worktree_retention":{"days":30,"min_worktrees":0}}` | no | Task executor concurrency / isolation. |
 | `git` | GitSettings | `{}` | no | Non-interactive git provisioning for agent processes. Defaults to `signing = "off"`, which forces `commit.gpgsign = false` so an agent commit can never block on an interactive pinentry/askpass prompt. |
 | `tui` | TuiSettings | `{"sound":{"enabled":true,"events":{"attention":"none","awaiting_input":"attention","task_failed":"failure","task_finished":"success","task_started":"none"},"min_interval_ms":400,"only_when_unfocused":false,"player":"auto"}}` | no | Client-side TUI settings. Ignored by the daemon, which reads the same file. |
+| `web` | WebSettings | `{"dir":"","enabled":true,"heartbeat_secs":15}` | no | Web client (embedded SPA) settings. |
 | `webhook` | WebhookSettings | `{"github":{"enabled":false,"rules":[]}}` | no | Webhook trigger rules (currently GitHub). |
 
 ## AgentConfig
@@ -74,6 +76,16 @@ HTTP/SSE endpoint (opencode); `hooks` observes via per-launch HTTP hooks
 is purely declarative for it.
 
 string
+
+## AuthSettings
+
+Short-lived, single-use tickets for header-less clients (browser
+WebSocket/SSE auth). The ticket is minted over authenticated HTTP and then
+presented in a query string, where an `Authorization` header cannot go.
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `ticket_ttl_secs` | integer | `30` | no | Ticket lifetime, in seconds. |
 
 ## Backoff
 
@@ -269,6 +281,21 @@ TUI-only settings. The daemon parses but ignores this section.
 |-------|------|---------|----------|-------------|
 | `editor` | string (optional) | — | no | Editor command for `e` on a Catalog task. Unset -> `$VISUAL`, then `$EDITOR`, then `vi`. May include arguments (e.g. `code --wait`). |
 | `sound` | SoundSettings | `{"enabled":true,"events":{"attention":"none","awaiting_input":"attention","task_failed":"failure","task_finished":"success","task_started":"none"},"min_interval_ms":400,"only_when_unfocused":false,"player":"auto"}` | no |  |
+
+## WebSettings
+
+Web client (embedded SPA) settings.
+
+`dir` overrides the assets embedded in the binary with a directory on disk
+(development); leave it empty to serve the embedded assets. `heartbeat_secs`
+is the interval of the SSE keep-alive comments that defeat idle proxy
+timeouts.
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `dir` | string | `` | no | Asset directory override; empty serves the embedded assets. |
+| `enabled` | boolean | `true` | no | Serve the embedded web client from the daemon. |
+| `heartbeat_secs` | integer | `15` | no | SSE keep-alive interval, in seconds. |
 
 ## WebhookSettings
 

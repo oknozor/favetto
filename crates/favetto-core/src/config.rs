@@ -54,6 +54,59 @@ pub struct FavettoConfig {
     /// Client-side TUI settings. Ignored by the daemon, which reads the same file.
     #[serde(default)]
     pub tui: TuiSettings,
+    /// Web client (embedded SPA) settings.
+    #[serde(default)]
+    pub web: WebSettings,
+    /// Short-lived authentication ticket settings.
+    #[serde(default)]
+    pub auth: AuthSettings,
+}
+
+/// Web client (embedded SPA) settings.
+///
+/// `dir` overrides the assets embedded in the binary with a directory on disk
+/// (development); leave it empty to serve the embedded assets. `heartbeat_secs`
+/// is the interval of the SSE keep-alive comments that defeat idle proxy
+/// timeouts.
+#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
+pub struct WebSettings {
+    /// Serve the embedded web client from the daemon.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Asset directory override; empty serves the embedded assets.
+    #[serde(default)]
+    pub dir: PathBuf,
+    /// SSE keep-alive interval, in seconds.
+    #[serde(default = "default_web_heartbeat_secs")]
+    pub heartbeat_secs: u64,
+}
+
+impl Default for WebSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dir: PathBuf::new(),
+            heartbeat_secs: default_web_heartbeat_secs(),
+        }
+    }
+}
+
+/// Short-lived, single-use tickets for header-less clients (browser
+/// WebSocket/SSE auth). The ticket is minted over authenticated HTTP and then
+/// presented in a query string, where an `Authorization` header cannot go.
+#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
+pub struct AuthSettings {
+    /// Ticket lifetime, in seconds.
+    #[serde(default = "default_ticket_ttl_secs")]
+    pub ticket_ttl_secs: u64,
+}
+
+impl Default for AuthSettings {
+    fn default() -> Self {
+        Self {
+            ticket_ttl_secs: default_ticket_ttl_secs(),
+        }
+    }
 }
 
 /// TUI-only settings. The daemon parses but ignores this section.
@@ -446,6 +499,14 @@ fn default_sound_player() -> String {
 
 fn default_min_interval_ms() -> u64 {
     400
+}
+
+fn default_web_heartbeat_secs() -> u64 {
+    15
+}
+
+fn default_ticket_ttl_secs() -> u64 {
+    30
 }
 
 fn default_sound_events() -> BTreeMap<String, String> {
@@ -1129,5 +1190,45 @@ mod tests {
             cfg.events.get("awaiting_input").map(String::as_str),
             Some("attention")
         );
+    }
+
+    #[test]
+    fn web_and_auth_defaults_apply_to_a_legacy_config() {
+        // A config written before `[web]`/`[auth]` existed must still decode,
+        // with the documented defaults filled in.
+        let cfg: FavettoConfig = toml::from_str(
+            r#"
+            [daemon]
+            listen = "127.0.0.1:7878"
+
+            [tui.sound]
+            enabled = false
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.web.enabled);
+        assert_eq!(cfg.web.dir, PathBuf::new());
+        assert_eq!(cfg.web.heartbeat_secs, 15);
+        assert_eq!(cfg.auth.ticket_ttl_secs, 30);
+    }
+
+    #[test]
+    fn parses_web_and_auth_overrides() {
+        let cfg: FavettoConfig = toml::from_str(
+            r#"
+            [web]
+            enabled = false
+            dir = "/srv/favetto/web"
+            heartbeat_secs = 5
+
+            [auth]
+            ticket_ttl_secs = 60
+            "#,
+        )
+        .unwrap();
+        assert!(!cfg.web.enabled);
+        assert_eq!(cfg.web.dir, PathBuf::from("/srv/favetto/web"));
+        assert_eq!(cfg.web.heartbeat_secs, 5);
+        assert_eq!(cfg.auth.ticket_ttl_secs, 60);
     }
 }

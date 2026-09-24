@@ -119,6 +119,20 @@ days = 30          # delete rows older than this many days (0 = keep forever)
 min_tasks = 1000   # always keep the newest N task rows
 vacuum = true      # reclaim disk space after a prune
 
+# Web client (embedded SPA) served by the daemon. `dir` overrides the assets
+# embedded in the binary with a directory on disk for development; leave it empty
+# in normal operation. `heartbeat_secs` is the SSE keep-alive interval.
+[web]
+enabled = true        # serve the embedded web client (default true)
+dir = ""              # empty = embedded assets; a path = serve from disk (dev)
+heartbeat_secs = 15   # SSE keep-alive interval, in seconds
+
+# Short-lived, single-use tickets for header-less clients (browser WebSocket/SSE
+# auth). The ticket is minted over authenticated HTTP, then presented in a query
+# string where an Authorization header cannot go.
+[auth]
+ticket_ttl_secs = 30  # ticket lifetime, in seconds
+
 # Task executor concurrency + isolation.
 [executor]
 parallel = true            # run tasks concurrently (default false = one at a time)

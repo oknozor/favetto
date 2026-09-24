@@ -192,6 +192,19 @@
         }
       ]
     },
+    "AuthSettings": {
+      "description": "Short-lived, single-use tickets for header-less clients (browser\nWebSocket/SSE auth). The ticket is minted over authenticated HTTP and then\npresented in a query string, where an `Authorization` header cannot go.",
+      "properties": {
+        "ticket_ttl_secs": {
+          "default": 30,
+          "description": "Ticket lifetime, in seconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "Backoff": {
       "description": "How the delay between automatic retry attempts grows.",
       "oneOf": [
@@ -708,6 +721,29 @@
       },
       "type": "object"
     },
+    "WebSettings": {
+      "description": "Web client (embedded SPA) settings.\n\n`dir` overrides the assets embedded in the binary with a directory on disk\n(development); leave it empty to serve the embedded assets. `heartbeat_secs`\nis the interval of the SSE keep-alive comments that defeat idle proxy\ntimeouts.",
+      "properties": {
+        "dir": {
+          "default": "",
+          "description": "Asset directory override; empty serves the embedded assets.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "Serve the embedded web client from the daemon.",
+          "type": "boolean"
+        },
+        "heartbeat_secs": {
+          "default": 15,
+          "description": "SSE keep-alive interval, in seconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "WebhookSettings": {
       "description": "Webhook trigger settings. Currently only GitHub is supported.",
       "properties": {
@@ -756,6 +792,13 @@
       "default": {},
       "description": "External coding agents by name (e.g. `claude`, `opencode`, `pi`, `vibe`).",
       "type": "object"
+    },
+    "auth": {
+      "$ref": "#/$defs/AuthSettings",
+      "default": {
+        "ticket_ttl_secs": 30
+      },
+      "description": "Short-lived authentication ticket settings."
     },
     "daemon": {
       "$ref": "#/$defs/DaemonSettings",
@@ -823,6 +866,15 @@
         }
       },
       "description": "Client-side TUI settings. Ignored by the daemon, which reads the same file."
+    },
+    "web": {
+      "$ref": "#/$defs/WebSettings",
+      "default": {
+        "dir": "",
+        "enabled": true,
+        "heartbeat_secs": 15
+      },
+      "description": "Web client (embedded SPA) settings."
     },
     "webhook": {
       "$ref": "#/$defs/WebhookSettings",
