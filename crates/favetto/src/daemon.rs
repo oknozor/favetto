@@ -197,7 +197,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let unix_task = tokio::spawn(async move { transport::serve_unix(&socket, unix_state).await });
 
     let app = Router::new()
-        .route("/rpc", get(transport::ws_handler))
+        .merge(transport::routes())
         .route("/metrics", get(crate::metrics::metrics_handler))
         .merge(crate::webhooks::routes())
         .merge(crate::agent_hooks::routes())

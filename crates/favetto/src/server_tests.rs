@@ -3,6 +3,7 @@ use favetto_core::model::InputReply;
 use favetto_core::rpc::error_code;
 use proptest::prelude::*;
 use std::path::Path;
+use tower::ServiceExt as _;
 
 use crate::state::StateInit;
 
@@ -2961,6 +2962,159 @@ async fn workflow_inspect_marks_dynamic_dependency_blocked() {
     let view = inspect(3).await;
     assert!(id_list(&view, "blocked").is_empty());
     assert_eq!(id_list(&view, "ready"), vec![id_b]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- HTTP `POST /rpc` (bearer auth + MessagePack request/response) -------------
+
+/// Drive `app` with a single `POST /rpc` and collect status, headers and body.
+async fn post_rpc(
+    app: axum::Router,
+    body: Vec<u8>,
+    token: Option<&str>,
+) -> (axum::http::StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let mut builder = axum::http::Request::builder()
+        .method("POST")
+        .uri("/rpc")
+        .header(axum::http::header::CONTENT_TYPE, "application/x-msgpack");
+    if let Some(t) = token {
+        builder = builder.header(axum::http::header::AUTHORIZATION, format!("Bearer {t}"));
+    }
+    let res = app
+        .oneshot(builder.body(axum::body::Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let status = res.status();
+    let headers = res.headers().clone();
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, headers, bytes.to_vec())
+}
+
+/// A scratch state plus the production `/rpc` router, for HTTP transport tests.
+async fn rpc_state(tag: &str) -> (std::path::PathBuf, Arc<State>, axum::Router) {
+    let dir = temp_dir(tag);
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+    let app = crate::transport::routes().with_state(state.clone());
+    (dir, state, app)
+}
+
+fn request_frame(id: u64, method_name: &str) -> Vec<u8> {
+    favetto_core::wire::encode(&Frame::Request(Request {
+        id,
+        method: method_name.to_string(),
+        params: serde_json::json!({}),
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn http_rpc_round_trips_a_request() {
+    let (dir, state, app) = rpc_state("http-rpc-round-trip").await;
+    let body = request_frame(42, method::TASKS_LIST);
+
+    let (status, headers, bytes) = post_rpc(app, body, Some(state.token.as_str())).await;
+
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(
+        headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/x-msgpack")
+    );
+    let frame = favetto_core::wire::decode(&bytes).expect("response frame decodes");
+    match frame {
+        Frame::Response(resp) => {
+            assert_eq!(resp.id, 42);
+            assert!(resp.error.is_none(), "{:?}", resp.error);
+            assert!(
+                resp.result.as_ref().is_some_and(|r| r.is_array()),
+                "tasks.list should be an array: {:?}",
+                resp.result
+            );
+        }
+        other => panic!("expected a response frame, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn http_rpc_requires_a_bearer_token() {
+    let (dir, state, app) = rpc_state("http-rpc-auth").await;
+    let body = request_frame(1, method::PING);
+
+    let (missing, _, _) = post_rpc(app, body.clone(), None).await;
+    assert_eq!(missing, axum::http::StatusCode::UNAUTHORIZED);
+
+    let app = crate::transport::routes().with_state(state.clone());
+    let (wrong, _, _) = post_rpc(app, body, Some("not-the-token")).await;
+    assert_eq!(wrong, axum::http::StatusCode::UNAUTHORIZED);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn http_rpc_rejects_a_malformed_body() {
+    let (dir, state, app) = rpc_state("http-rpc-malformed").await;
+
+    let (status, _, _) = post_rpc(app, b"not msgpack".to_vec(), Some(state.token.as_str())).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn http_rpc_rejects_a_non_request_frame() {
+    let (dir, state, app) = rpc_state("http-rpc-non-request").await;
+    let body = favetto_core::wire::encode(&Frame::Notification(Notification {
+        method: "event".to_string(),
+        params: serde_json::Value::Null,
+    }))
+    .unwrap();
+
+    let (status, _, _) = post_rpc(app, body, Some(state.token.as_str())).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn http_rpc_reports_protocol_errors_inside_the_response() {
+    let (dir, state, app) = rpc_state("http-rpc-protocol-error").await;
+    let body = request_frame(7, "no.such.method");
+
+    let (status, _, bytes) = post_rpc(app, body, Some(state.token.as_str())).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+
+    match favetto_core::wire::decode(&bytes).expect("response frame decodes") {
+        Frame::Response(resp) => {
+            assert_eq!(resp.id, 7);
+            assert!(resp.result.is_none());
+            let error = resp.error.expect("an error frame");
+            assert_eq!(error.code, error_code::METHOD_NOT_FOUND);
+        }
+        other => panic!("expected a response frame, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn http_rpc_rejects_a_body_over_the_frame_limit() {
+    let dir = temp_dir("http-rpc-limit");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+    // A tiny limit pins the `DefaultBodyLimit` layer without allocating 64 MiB.
+    let app = crate::transport::rpc_routes(1024).with_state(state.clone());
+
+    let (status, _, _) = post_rpc(app, vec![0u8; 2048], Some(state.token.as_str())).await;
+    assert_eq!(status, axum::http::StatusCode::PAYLOAD_TOO_LARGE);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
