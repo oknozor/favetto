@@ -303,6 +303,9 @@ mod tests {
         AwaitingInputReason {
             kind,
             message: "prompt".to_string(),
+            request_id: None,
+            options: Vec::new(),
+            allow_always: false,
         }
     }
 

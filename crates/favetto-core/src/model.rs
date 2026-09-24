@@ -8,6 +8,11 @@ use uuid::Uuid;
 
 use crate::rpc::{push, Notification};
 
+pub use crate::agent_state::{
+    AgentActivity, AgentStateEvent, AgentUsage, IdleOutcome, InputReply, InputRequest, RunSummary,
+    ToolCall,
+};
+
 /// Lifecycle of a single task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -423,6 +428,17 @@ pub struct AwaitingInputReason {
     pub kind: AwaitingInputKind,
     /// The prompt text (the last visible lines), for context.
     pub message: String,
+    /// Transport-specific correlation id, when the prompt can be answered
+    /// through a structured channel (`agents.reply`). Absent for screen-detected
+    /// prompts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Selectable options the prompt offers; empty means free-form text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+    /// Whether an "always" / "remember" answer is offered.
+    #[serde(default, skip_serializing_if = "crate::agent_state::is_false")]
+    pub allow_always: bool,
 }
 
 /// A live external-agent session (a PTY running an agent CLI on the daemon).
@@ -445,6 +461,12 @@ pub struct AgentSessionInfo {
     /// Set while the session is blocked waiting for the user to answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub awaiting_input: Option<AwaitingInputReason>,
+    /// The agent's current coarse activity, when a state channel reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<AgentActivity>,
+    /// Token/cost usage reported for this session so far.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AgentUsage>,
 }
 
 /// What an external agent CLI can do, so the daemon and TUI can adapt without
@@ -482,6 +504,12 @@ pub struct AgentCapabilities {
     /// `submit_prompt`), so a user-started task can run in the real TUI.
     #[serde(default)]
     pub interactive_prompt: bool,
+    /// Reports live state through a structured channel.
+    #[serde(default)]
+    pub reports_state: bool,
+    /// Can answer permission/dialog prompts through the channel.
+    #[serde(default)]
+    pub permission_channel: bool,
 }
 
 /// Default for a payload that omits `available`: older daemons/clients only know
@@ -556,6 +584,8 @@ mod tests {
                 reports_session_id: true,
                 prompt_prefill: true,
                 interactive_prompt: true,
+                reports_state: true,
+                permission_channel: true,
             },
             sessions: Vec::new(),
         };
@@ -922,12 +952,65 @@ mod tests {
             let reason = AwaitingInputReason {
                 kind,
                 message: "Allow once / Allow always / Reject".to_string(),
+                request_id: Some("perm_1".to_string()),
+                options: vec!["Allow once".to_string(), "Reject".to_string()],
+                allow_always: true,
             };
             let json = serde_json::to_value(&reason).unwrap();
             assert_eq!(json["kind"], serde_json::to_value(kind).unwrap());
+            assert_eq!(json["request_id"], "perm_1");
+            assert_eq!(json["allow_always"], true);
             let back: AwaitingInputReason = serde_json::from_value(json).unwrap();
             assert_eq!(back, reason);
         }
+
+        // Legacy payloads without the new fields decode with defaults, and the
+        // added fields are omitted from the wire when empty/false.
+        let legacy: AwaitingInputReason =
+            serde_json::from_str(r#"{"kind":"permission","message":"Allow?"}"#).unwrap();
+        assert!(legacy.request_id.is_none());
+        assert!(legacy.options.is_empty());
+        assert!(!legacy.allow_always);
+        let json = serde_json::to_value(&legacy).unwrap();
+        assert!(json.get("request_id").is_none());
+        assert!(json.get("options").is_none());
+        assert!(json.get("allow_always").is_none());
+    }
+
+    #[test]
+    fn agent_session_info_activity_and_usage_default_and_round_trip() {
+        // Legacy payloads (no activity/usage) decode unchanged.
+        let legacy: AgentSessionInfo = serde_json::from_str(
+            r#"{"id":"s1","agent":"opencode","task_id":null,"running":true,"headless":true}"#,
+        )
+        .unwrap();
+        assert!(legacy.activity.is_none());
+        assert!(legacy.usage.is_none());
+
+        let live = AgentSessionInfo {
+            activity: Some(AgentActivity::Responding),
+            usage: Some(AgentUsage {
+                input_tokens: 12,
+                cost_usd: Some(0.02),
+                ..Default::default()
+            }),
+            ..legacy
+        };
+        let json = serde_json::to_value(&live).unwrap();
+        assert_eq!(json["activity"]["kind"], "responding");
+        assert_eq!(json["usage"]["input_tokens"], 12);
+        let back: AgentSessionInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(back.activity, live.activity);
+        assert_eq!(back.usage, live.usage);
+
+        // A session with neither field omits both from the wire.
+        let bare: AgentSessionInfo = serde_json::from_str(
+            r#"{"id":"s2","agent":"opencode","task_id":null,"running":false,"headless":false}"#,
+        )
+        .unwrap();
+        let json = serde_json::to_value(&bare).unwrap();
+        assert!(json.get("activity").is_none());
+        assert!(json.get("usage").is_none());
     }
 
     #[test]
@@ -943,6 +1026,9 @@ mod tests {
             awaiting_input: Some(AwaitingInputReason {
                 kind: AwaitingInputKind::Pinentry,
                 message: "Enter passphrase:".to_string(),
+                request_id: None,
+                options: Vec::new(),
+                allow_always: false,
             }),
             ..legacy
         };

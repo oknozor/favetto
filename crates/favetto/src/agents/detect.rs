@@ -94,7 +94,13 @@ fn reason(kind: AwaitingInputKind, lines: &[String]) -> AwaitingInputReason {
         .last()
         .map(|line| line.chars().take(200).collect::<String>())
         .unwrap_or_default();
-    AwaitingInputReason { kind, message }
+    AwaitingInputReason {
+        kind,
+        message,
+        request_id: None,
+        options: Vec::new(),
+        allow_always: false,
+    }
 }
 
 /// Classify a tail that has already passed the marker gate.

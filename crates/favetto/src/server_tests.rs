@@ -694,7 +694,12 @@ fn live_session(running: bool, headless: bool, awaiting: bool) -> AgentSessionIn
         awaiting_input: awaiting.then(|| favetto_core::model::AwaitingInputReason {
             kind: favetto_core::model::AwaitingInputKind::Permission,
             message: "Allow?".to_string(),
+            request_id: None,
+            options: Vec::new(),
+            allow_always: false,
         }),
+        activity: None,
+        usage: None,
     }
 }
 

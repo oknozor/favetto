@@ -257,6 +257,8 @@ pub(crate) fn capabilities_from_config(config: &AgentConfig) -> AgentCapabilitie
         reports_session_id: config.session_id_json_key.is_some(),
         prompt_prefill: config.submit_prompt.unwrap_or(false),
         interactive_prompt: config.prompt_args.is_some() || config.submit_prompt.unwrap_or(false),
+        reports_state: false,
+        permission_channel: false,
     }
 }
 

@@ -7,6 +7,7 @@
 //!
 //! Modules:
 //! - [`model`]: domain types (tasks, events) shared by daemon and TUI.
+//! - [`agent_state`]: normalized external-agent state (activity, usage, events).
 //! - [`rpc`]: JSON-RPC-style request/response/push types encoded as MessagePack.
 //! - [`wire`]: length-prefixed MessagePack framing over raw byte streams.
 //! - [`auth`]: bearer-token generation and constant-time verification.
@@ -16,6 +17,7 @@
 //! - [`paths`]: shared path helpers (`~` expansion, default locations).
 //! - [`ws`]: the MessagePack-frame ↔ WebSocket payload conversion both ends use.
 
+pub mod agent_state;
 pub mod auth;
 pub mod config;
 pub mod model;

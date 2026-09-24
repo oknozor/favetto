@@ -144,6 +144,8 @@ impl Session {
             headless: self.headless,
             session_id: self.external_session_id.lock().clone(),
             awaiting_input: self.awaiting_input.lock().clone(),
+            activity: None,
+            usage: None,
         }
     }
 }
@@ -1273,6 +1275,9 @@ mod tests {
         let reason = AwaitingInputReason {
             kind: AwaitingInputKind::Permission,
             message: "Allow once?".to_string(),
+            request_id: None,
+            options: Vec::new(),
+            allow_always: false,
         };
         mgr.set_awaiting_input(&info.id, Some(reason.clone()));
         assert_eq!(find(&info.id).awaiting_input, Some(reason.clone()));
