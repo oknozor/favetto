@@ -236,6 +236,203 @@ async fn workflow_inspect_unknown_root_is_invalid_params() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `workflow.cancel` cancels every non-terminal task in the root — including a
+/// task that is mid-run — and leaves terminal tasks untouched. Each cancelled
+/// task emits `TaskCancelled`, no `TaskFinished` fires, so `needs`/join
+/// listeners never schedule follow-on work.
+#[tokio::test]
+async fn workflow_cancel_cancels_active_tasks_and_skips_terminal() {
+    let dir = temp_dir("workflow-cancel");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    std::fs::write(tasks_dir.join("root.md"), "agent = \"x\"\n---\nroot\n").unwrap();
+    std::fs::write(
+        tasks_dir.join("dependent.md"),
+        "agent = \"x\"\nneeds = \"root:finished\"\n---\ndependent\n",
+    )
+    .unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+
+    let root = Uuid::new_v4();
+    let mut root_task = oneshot_task();
+    root_task.id = root;
+    root_task.name = "root".to_string();
+    root_task.root_id = None;
+
+    // A task mid-run (cancel-during-run) and a pending descendant.
+    let mut child_running = oneshot_task();
+    child_running.name = "child".to_string();
+    child_running.root_id = Some(root);
+
+    let mut grandchild_pending = oneshot_task();
+    grandchild_pending.name = "grandchild".to_string();
+    grandchild_pending.status = TaskStatus::Pending;
+    grandchild_pending.started_at = None;
+    grandchild_pending.root_id = Some(root);
+
+    // An already-terminal task must not be re-cancelled.
+    let mut done = oneshot_task();
+    done.name = "done".to_string();
+    done.status = TaskStatus::Succeeded;
+    done.finished_at = Some(Utc::now());
+    done.root_id = Some(root);
+
+    for task in [&root_task, &child_running, &grandchild_pending, &done] {
+        db::upsert_task(&state.db, task).await.unwrap();
+    }
+
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 1,
+            method: method::WORKFLOW_CANCEL.to_string(),
+            params: serde_json::json!({ "root_id": root }),
+        },
+    )
+    .await;
+    let result = resp.result.expect("workflow.cancel result");
+    assert_eq!(result["root_id"], root.to_string());
+    let mut cancelled = id_list(&result, "cancelled");
+    cancelled.sort();
+    let mut expected = vec![root, child_running.id, grandchild_pending.id];
+    expected.sort();
+    assert_eq!(cancelled, expected);
+    assert!(
+        !cancelled.contains(&done.id),
+        "a terminal task is never cancelled"
+    );
+
+    for task in [&root_task, &child_running, &grandchild_pending] {
+        let got = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+        assert_eq!(got.status, TaskStatus::Cancelled, "{}", task.name);
+        assert!(got.finished_at.is_some());
+    }
+    let stored_done = db::get_task(&state.db, done.id).await.unwrap().unwrap();
+    assert_eq!(stored_done.status, TaskStatus::Succeeded);
+
+    // One durable `TaskCancelled` event per cancelled task, and no `TaskFinished`
+    // that could trigger a dependent or fan-in.
+    let events = db::tail_events(&state.db, 50).await.unwrap();
+    let cancelled_events = events
+        .iter()
+        .filter(|e| e.kind == EventKind::TaskCancelled)
+        .count();
+    assert_eq!(cancelled_events, expected.len());
+    assert!(
+        !events.iter().any(|e| e.kind == EventKind::TaskFinished),
+        "cancel must not fire follow-on scheduling: {events:?}"
+    );
+
+    // No new task was enqueued for the `needs` dependent.
+    let names: Vec<String> = db::list_root_tasks(&state.db, root)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(names.len(), 4, "{names:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn workflow_cancel_unknown_root_is_invalid_params() {
+    let dir = temp_dir("workflow-cancel-missing");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 1,
+            method: method::WORKFLOW_CANCEL.to_string(),
+            params: serde_json::json!({ "root_id": Uuid::new_v4() }),
+        },
+    )
+    .await;
+    assert!(resp.result.is_none());
+    let error = resp.error.expect("unknown root must error");
+    assert_eq!(error.code, error_code::INVALID_PARAMS);
+    assert!(
+        error.message.contains("workflow root not found"),
+        "{error:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `workflow.retry` delegates to the manual retry, keyed by `task_id`.
+#[tokio::test]
+async fn workflow_retry_delegates_to_manual_retry() {
+    use favetto_core::model::{Failure, FailureKind, RunStatus, TaskRun};
+
+    let dir = temp_dir("workflow-retry");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+
+    let mut failed = oneshot_task();
+    failed.name = "failed".to_string();
+    failed.status = TaskStatus::Failed;
+    failed.error = Some("boom".to_string());
+    failed.failure = Some(Failure::new(FailureKind::Agent, "boom"));
+    failed.finished_at = Some(Utc::now());
+    db::upsert_task(&state.db, &failed).await.unwrap();
+    db::insert_task_run(
+        &state.db,
+        &TaskRun {
+            id: Uuid::new_v4(),
+            task_id: failed.id,
+            attempt: 1,
+            status: RunStatus::Failed,
+            agent: None,
+            session_id: None,
+            started_at: Some(Utc::now()),
+            finished_at: Some(Utc::now()),
+            exit_code: None,
+            error: None,
+            failure: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 1,
+            method: method::WORKFLOW_RETRY.to_string(),
+            params: serde_json::json!({ "task_id": failed.id }),
+        },
+    )
+    .await;
+    let result = resp.result.expect("workflow.retry result");
+    assert_eq!(result["status"], "pending");
+    assert_eq!(
+        db::list_task_runs(&state.db, failed.id)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "manual retry preserves run history"
+    );
+
+    // Unknown id is invalid params, not internal.
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 2,
+            method: method::WORKFLOW_RETRY.to_string(),
+            params: serde_json::json!({ "task_id": Uuid::new_v4() }),
+        },
+    )
+    .await;
+    assert_eq!(resp.error.unwrap().code, error_code::INVALID_PARAMS);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn add_catalog_task_writes_dot_and_pushes_catalog_updated() {
     let dir = temp_dir("add");

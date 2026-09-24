@@ -710,6 +710,22 @@ pub async fn requeue_terminal_task(pool: &SqlitePool, id: Uuid) -> anyhow::Resul
     Ok(result.rows_affected() == 1)
 }
 
+/// Cancel a non-terminal (`pending`/`running`/`awaiting_input`) task. Already
+/// terminal tasks are never touched, so a root-scoped cancel cannot overwrite a
+/// task that finished concurrently. Returns whether a row changed, so the caller
+/// emits `TaskCancelled` only for tasks this request actually cancelled.
+pub async fn cancel_active_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        "UPDATE tasks SET status = 'cancelled', finished_at = ? \
+         WHERE id = ? AND status IN ('pending', 'running', 'awaiting_input')",
+    )
+    .bind(ts_ms(Utc::now()))
+    .bind(id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 /// Fail a `pending` task that can no longer run (its catalog definition
 /// vanished). Only a pending row is touched. Returns whether a row changed.
 pub async fn fail_pending_task(

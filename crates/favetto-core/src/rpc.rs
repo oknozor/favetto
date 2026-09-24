@@ -124,6 +124,12 @@ pub mod method {
     /// Add one runtime task to an existing workflow root with per-instance
     /// dependencies.
     pub const WORKFLOW_SPAWN: &str = "workflow.spawn";
+    /// Cancel every non-terminal task in a workflow root, emitting
+    /// `TaskCancelled` per task.
+    pub const WORKFLOW_CANCEL: &str = "workflow.cancel";
+    /// Retry a terminal task, preserving its prior run history. Single-task
+    /// alias of `tasks.retry`.
+    pub const WORKFLOW_RETRY: &str = "workflow.retry";
     pub const EVENTS_TAIL: &str = "events.tail";
     /// (Re)subscribe to the live event stream. Accepts `last_event_id` to replay
     /// missed events before switching to live delivery.
@@ -227,6 +233,16 @@ pub const CLIENT_METHODS: &[(&str, &str)] = &[
         method::WORKFLOW_SPAWN,
         "Add one runtime task to an existing workflow root, optionally depending \
          on existing task ids.",
+    ),
+    (
+        method::WORKFLOW_CANCEL,
+        "Cancel every non-terminal task in a workflow root, emitting \
+         `TaskCancelled` per task.",
+    ),
+    (
+        method::WORKFLOW_RETRY,
+        "Retry a terminal task, preserving its prior run history. Single-task \
+         alias of `tasks.retry`.",
     ),
     (method::EVENTS_TAIL, "Tail persisted events."),
     (
@@ -409,6 +425,8 @@ mod tests {
             method::WORKFLOW_INSPECT,
             method::WORKFLOW_CREATE,
             method::WORKFLOW_SPAWN,
+            method::WORKFLOW_CANCEL,
+            method::WORKFLOW_RETRY,
             method::EVENTS_TAIL,
             method::EVENTS_SUBSCRIBE,
             method::AGENTS_LIST,

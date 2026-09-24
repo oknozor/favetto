@@ -38,6 +38,8 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | `workflow.inspect` | Fetch the runtime workflow graph for a root (task instances plus ready/running/failed/blocked buckets). |
 | `workflow.create` | Create a runtime DAG of catalog tasks with per-instance dependencies. Idempotent on `idempotency_key`. |
 | `workflow.spawn` | Add one runtime task to an existing workflow root, optionally depending on existing task ids. |
+| `workflow.cancel` | Cancel every non-terminal task in a workflow root, emitting `TaskCancelled` per task. |
+| `workflow.retry` | Retry a terminal task, preserving its prior run history. Single-task alias of `tasks.retry`. |
 | `events.tail` | Tail persisted events. |
 | `events.subscribe` | (Re)subscribe to the live event stream; accepts `last_event_id` to replay missed events before switching to live delivery. |
 | `agents.list` | List configured external agents and live agent sessions, including each agent's `available` flag and capability flags. |

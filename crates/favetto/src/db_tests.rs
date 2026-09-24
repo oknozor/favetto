@@ -734,6 +734,46 @@ async fn stale_task_helpers_are_conditional_and_idempotent() {
 }
 
 #[tokio::test]
+async fn cancel_active_task_cancels_only_non_terminal_tasks() {
+    let (dir, pool) = scratch_pool("cancel-active").await;
+
+    let mut pending = task_at(Utc::now(), None, None);
+    pending.status = TaskStatus::Pending;
+    pending.started_at = None;
+    let mut running = task_at(Utc::now(), None, None);
+    running.status = TaskStatus::Running;
+    let mut awaiting = task_at(Utc::now(), None, None);
+    awaiting.status = TaskStatus::AwaitingInput;
+    let succeeded = task_at(Utc::now(), Some(Utc::now()), None);
+    let mut cancelled = task_at(Utc::now(), Some(Utc::now()), None);
+    cancelled.status = TaskStatus::Cancelled;
+    for task in [&pending, &running, &awaiting, &succeeded, &cancelled] {
+        upsert_task(&pool, task).await.unwrap();
+    }
+
+    // Every non-terminal status is cancelled exactly once.
+    for task in [&pending, &running, &awaiting] {
+        assert!(cancel_active_task(&pool, task.id).await.unwrap());
+        assert!(
+            !cancel_active_task(&pool, task.id).await.unwrap(),
+            "a second cancel is a no-op"
+        );
+        let got = get_task(&pool, task.id).await.unwrap().unwrap();
+        assert_eq!(got.status, TaskStatus::Cancelled);
+        assert!(got.finished_at.is_some());
+    }
+
+    // Terminal rows (succeeded / already cancelled) are never touched.
+    for task in [&succeeded, &cancelled] {
+        assert!(!cancel_active_task(&pool, task.id).await.unwrap());
+        let got = get_task(&pool, task.id).await.unwrap().unwrap();
+        assert_eq!(got.status, task.status);
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn interrupt_run_marks_active_runs_and_is_idempotent() {
     let (dir, pool) = scratch_pool("interrupt-run").await;
     let task = task_at(Utc::now(), None, None);
