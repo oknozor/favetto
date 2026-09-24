@@ -3,3 +3,125 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [v0.1.0](https://github.com/oknozor/favetto/compare/43d559eb61470cb856693533030a06e35add805e..v0.1.0) - 2026-09-24
+#### Features
+- (**agents**) observe vibe streaming output - ([7771bfb](https://github.com/oknozor/favetto/commit/7771bfbc9bcb9e8d4f2dab08c14d5338f2ea92b3)) - Paul Delafosse
+- (**agents**) configurable plain-jsonl parser and agent state config - ([3ff96d6](https://github.com/oknozor/favetto/commit/3ff96d653e651f045566b2b980b5ef1405960f89)) - Paul Delafosse
+- (**agents**) managed opencode server state source - ([dea193d](https://github.com/oknozor/favetto/commit/dea193d0fdd2f5c643d79fce427dfcfe5d3ba7de)) - Paul Delafosse
+- (**agents**) observe claude via stream-json and hooks - ([a0accd9](https://github.com/oknozor/favetto/commit/a0accd9d1960ecd986c915c4df039e0d2b32736a)) - Paul Delafosse
+- (**agents**) observe pi over rpc - ([e389b1c](https://github.com/oknozor/favetto/commit/e389b1cf2ed84604c40d7e6408a1048de5e2993a)) - Paul Delafosse
+- (**agents**) add state source adapter interface + screen fallback - ([92b52a9](https://github.com/oknozor/favetto/commit/92b52a9dfbf77686ea588208725598bb8c85ac19)) - Paul Delafosse
+- (**agents**) normalized agent state model and tolerant stdout parsing - ([24af540](https://github.com/oknozor/favetto/commit/24af5407405c587cdb47af2e4cb980623692fdf2)) - Paul Delafosse
+- (**api**) root-scoped workflow control (cancel / retry) - ([d48ca6c](https://github.com/oknozor/favetto/commit/d48ca6c8024bc1466a5e206a2e7df7cc7d1336f2)) - Paul Delafosse
+- (**api**) dynamic instance-level workflows (workflow.create / spawn) - ([4f5d355](https://github.com/oknozor/favetto/commit/4f5d35506bd9a28dcdef4aaef96dcfd7cf72a8ae)) - Paul Delafosse
+- (**api**) workflow.inspect runtime workflow view - ([00075a4](https://github.com/oknozor/favetto/commit/00075a48e0923975dfa6c8e5497b2a79565c20e5)) - Paul Delafosse
+- (**core**) strongly typed, rustdoc'd RPC messages - ([3f91f33](https://github.com/oknozor/favetto/commit/3f91f332f1ad06170979dbd8cb2eb9d473508876)) - Paul Delafosse
+- (**core**) model and persist execution attempts (task_runs) - ([e98b50d](https://github.com/oknozor/favetto/commit/e98b50d8de9ab7e6b13120081ea674c3ef371bf6)) - Paul Delafosse
+- (**core**) typed task failure semantics - ([09a4fd3](https://github.com/oknozor/favetto/commit/09a4fd34aba2e0ac315a1ed0aebbd8605a657766)) - Paul Delafosse
+- (**events**) enrich the TaskFinished payload - ([00a6699](https://github.com/oknozor/favetto/commit/00a669916db11ca2299e5839561608e54fc321d6)) - Paul Delafosse
+- (**examples**) reference external supervisor - ([f5ccb3c](https://github.com/oknozor/favetto/commit/f5ccb3cef376d3027aa26f220c443479b3d3e875)) - Paul Delafosse
+- (**executor**) retry retryable failures only - ([22aa117](https://github.com/oknozor/favetto/commit/22aa1174d4a006015dba1e9d117b6723e354a900)) - Paul Delafosse
+- (**executor**) reconcile interrupted runs at startup (idempotent) - ([5f5f472](https://github.com/oknozor/favetto/commit/5f5f472aab9519716828787a5cc6fd2cdc920ae6)) - Paul Delafosse
+- (**executor**) record one run per execution attempt - ([286d6e7](https://github.com/oknozor/favetto/commit/286d6e784b5f7925cd0dfbdc62f5833220a29ef8)) - Paul Delafosse
+- (**mcp**) add an MCP supervisor server for the workflow control plane - ([4367f18](https://github.com/oknozor/favetto/commit/4367f18aaa833e39926bdcdf3fdc5d99b1cc7cfa)) - Paul Delafosse
+- (**tasks**) structured task result envelope - ([04160f9](https://github.com/oknozor/favetto/commit/04160f95fadc2294ba5c1b679c6b227e1c34bc81)) - Paul Delafosse
+- (**tasks**) add needs outcome conditions (:succeeded / :failed / :terminal) - ([07b85c7](https://github.com/oknozor/favetto/commit/07b85c7e26edba07d1ec1495c98100b9473a6b4b)) - Paul Delafosse
+- (**tui**) inspect runtime workflows (workflow.inspect) from the TUI - ([2b69bd0](https://github.com/oknozor/favetto/commit/2b69bd092a3a326cddc387f393f11d0ef624613b)) - Paul Delafosse
+- (**tui**) cancel and retry tasks from the TUI - ([ea69ee1](https://github.com/oknozor/favetto/commit/ea69ee10eab2aa91b19bd35cb679d0a7eff5b121)) - Paul Delafosse
+- (**tui**) surface task attempt and typed failure in the Tasks tab - ([f4523d6](https://github.com/oknozor/favetto/commit/f4523d61e81fba139b501d21be43a4380c87e52c)) - Paul Delafosse
+- (**tui**) show agent activity/usage and answer precise prompts - ([984b510](https://github.com/oknozor/favetto/commit/984b510e122998cb5f604d34306743a2d7a55f9a)) - Paul Delafosse
+- update designs - ([68f62cb](https://github.com/oknozor/favetto/commit/68f62cbc1d15983277a64738d3dcbff3f58271a6)) - Paul Delafosse
+- fix needs_all argument - ([cce5648](https://github.com/oknozor/favetto/commit/cce56488682bccae3c5df8e7c18276af48cdf91d)) - Paul Delafosse
+- add looping - ([79bab35](https://github.com/oknozor/favetto/commit/79bab35b8a8b54f87660a77ffed52bd08f6b7389)) - Paul Delafosse
+- TUI inputs: standard text-editing keybindings (caret & word navigation, Shift+Enter newline) - ([13f327e](https://github.com/oknozor/favetto/commit/13f327ee0c64c0b26ccffc069c1438e1bfd4fae4)) - Paul Delafosse
+- scheduler fan-in needs dependency (all_finished) - ([b54a1e7](https://github.com/oknozor/favetto/commit/b54a1e71c8bc17dcf2336f6d3912a8ccd01cd2b4)) - Paul Delafosse
+- surface tasks whose agent is awaiting user input - ([5fe5699](https://github.com/oknozor/favetto/commit/5fe56993e5687de5398f17fd8c399b1e85e0da45)) - Paul Delafosse
+- edit the selected catalog task in $EDITOR - ([aac7cac](https://github.com/oknozor/favetto/commit/aac7cac469259021865184555bd3821ebce156bc)) - Paul Delafosse
+- TUI: render the catalog workflow graph instead of raw Graphviz DOT - ([31e79e7](https://github.com/oknozor/favetto/commit/31e79e748c77c0e43c072d6ac3522801a0dd58e9)) - Paul Delafosse
+- Catalog: organize tasks into subfolders as a collapsible tree - ([57fd411](https://github.com/oknozor/favetto/commit/57fd411f1fa33760497d32e211047e8827c3838d)) - Paul Delafosse
+- add a daemon workflow graph and floating TUI overlay - ([786b79a](https://github.com/oknozor/favetto/commit/786b79aa0b613c1442a2160f752c7c9a5b66d01a)) - Paul Delafosse
+- support non-interactive git commit signing in agent sessions - ([a72844a](https://github.com/oknozor/favetto/commit/a72844a80c54f65be9072924e25c73d54025033a)) - Paul Delafosse
+- add TUI sound notifications for task events - ([e88ecda](https://github.com/oknozor/favetto/commit/e88ecdac90e0fd6e4b34f46fe4b514b345a76f97)) - Paul Delafosse
+- introduce a generic Agent trait with per-CLI implementations - ([f69eb8b](https://github.com/oknozor/favetto/commit/f69eb8b9bd32b3b27b9ce190b8bd4741a2ba39fc)) - Paul Delafosse
+- add manual input variables to catalog tasks - ([63c7464](https://github.com/oknozor/favetto/commit/63c7464df55f360528dc4305ead3de7344ef3e86)) - Paul Delafosse
+- trigger tasks from config-driven GitHub webhook rules - ([4ed5cec](https://github.com/oknozor/favetto/commit/4ed5cecea53a68a41f5de4ddb7908eb6b038c13b)) - Paul Delafosse
+- add "?" help overlay listing keybindings - ([b897853](https://github.com/oknozor/favetto/commit/b89785340f8ae19e93f3e7183e51a711bf83c9f1)) - Paul Delafosse
+- add favetto tasks, remove all test task from the repo - ([c8545dc](https://github.com/oknozor/favetto/commit/c8545dc2355d16a0cb79e58c5d092f88682932b8)) - Paul Delafosse
+- add task spawn and spawn_file options - ([5857aea](https://github.com/oknozor/favetto/commit/5857aea1c9bdf0c9ddd288d52a3ecd5a89f645db)) - Paul Delafosse
+- add task/event preview - ([15c05a3](https://github.com/oknozor/favetto/commit/15c05a3179f28a63a8616465846f604e45ddca83)) - Paul Delafosse
+- add one shot agent - ([14b5b39](https://github.com/oknozor/favetto/commit/14b5b39379efbb2b3535a5c16d35b0ed8ae78430)) - Paul Delafosse
+- add switch keyboard focus to agent panel - ([52fac8e](https://github.com/oknozor/favetto/commit/52fac8eed215a8166ef87b3efc0194f3f8e9f5a8)) - Paul Delafosse
+- stabilized agent process - ([5fa8758](https://github.com/oknozor/favetto/commit/5fa87581db8421880a5b07ee449c1791293c9108)) - Paul Delafosse
+- eye candies, and TUI fix - ([1a26970](https://github.com/oknozor/favetto/commit/1a269706bde4ab7519b7bd8f502bb4ed68c6caf5)) - Paul Delafosse
+- M6 - ([612b4f7](https://github.com/oknozor/favetto/commit/612b4f726fb6aaf298ab543b08d85bc14fcb82d9)) - Paul Delafosse
+#### Bug Fixes
+- (**agents**) never show the headless machine PTY in the Agent panel - ([d544ffb](https://github.com/oknozor/favetto/commit/d544ffbd7b81d459e3f0eb2f53f42133efd5064a)) - Paul Delafosse
+- (**executor**) make task cancellation terminal-safe - ([ec78959](https://github.com/oknozor/favetto/commit/ec78959c0792b18f07024889cae66a53e21d5e45)) - Paul Delafosse
+- (**test**) use the typed StartAgentParams in the concurrent attach test - ([9e934fe](https://github.com/oknozor/favetto/commit/9e934fe752b70429da70ca717d8cac7f21dd1926)) - Paul Delafosse
+- (**tui**) split task usage into token/cost and move errors to a popup - ([a9637e0](https://github.com/oknozor/favetto/commit/a9637e02ec496d0ad65cc752d7f31c2f343f6466)) - Paul Delafosse
+- (**tui**) target the /rpc WebSocket path on remote attach - ([deab9e0](https://github.com/oknozor/favetto/commit/deab9e0033a684585553a34ec9fa6e9d35dce68d)) - Paul Delafosse
+- (**tui**) align the `?` help overlay with real key handling - ([d03feaf](https://github.com/oknozor/favetto/commit/d03feaf48384e5a9af28d48c9675e30bea8a3062)) - Paul Delafosse
+- fix task completion - ([f57dee0](https://github.com/oknozor/favetto/commit/f57dee0a5ae60680f50016729f4c2507d8a69f7b)) - Paul Delafosse
+- Show the live embedded agent in the Agent panel while a task runs, instead of headless JSON - ([eb37775](https://github.com/oknozor/favetto/commit/eb377750e4b924d659aa5d722253fce48da96ce0)) - Paul Delafosse
+- Extract the TUI client into a dependency-light favetto-tui crate - ([5cc69f6](https://github.com/oknozor/favetto/commit/5cc69f6562d595cb82323472044bfe167c8ce3f7)) - Paul Delafosse
+- Split tui/app.rs input handlers into submodules and move tests out - ([b5f3398](https://github.com/oknozor/favetto/commit/b5f339820a5c0abd1b440294948b784017bdd228)) - Paul Delafosse
+- Replace too_many_arguments allows with params structs - ([41af37c](https://github.com/oknozor/favetto/commit/41af37c18b758c249149bb2da190da0494651756)) - Paul Delafosse
+- Document the shipped token model in auth - ([ab24c06](https://github.com/oknozor/favetto/commit/ab24c062a701f32f1024921da55d5657ee24f26e)) - Paul Delafosse
+- Remove unused auth::Scope and SessionIdProbe::JsonPath - ([5bd21ea](https://github.com/oknozor/favetto/commit/5bd21ea460e8b67827f28ea3e87fc15d8b24e26d)) - Paul Delafosse
+- Apply rustfmt to the moved test modules - ([66a12e3](https://github.com/oknozor/favetto/commit/66a12e37c1038f34ee4ba71962cd945e0a91ba9d)) - Paul Delafosse
+- Move the largest inline test modules into sibling files - ([b6fe22a](https://github.com/oknozor/favetto/commit/b6fe22a6c999fa666df32196f94ee189a52020e7)) - Paul Delafosse
+- Separate docgen's prose templates from its generation logic - ([78cb0f1](https://github.com/oknozor/favetto/commit/78cb0f14d7176da649657f83c0d34d9725051577)) - Paul Delafosse
+- Route non-output diagnostics through tracing - ([d87cac8](https://github.com/oknozor/favetto/commit/d87cac8f69c08739a0d7dfd71468df2c2d99ccad)) - Paul Delafosse
+- Remove the dead ServerPush::LogLine path - ([488df4f](https://github.com/oknozor/favetto/commit/488df4fbe5b621cff9d3b647411f6ca8b2c54ada)) - Paul Delafosse
+- Add property and fuzz tests for the wire codec and task-Markdown parser - ([03a3dee](https://github.com/oknozor/favetto/commit/03a3dee934047a82d01bc49578ac102fd825d503)) - Paul Delafosse
+- Add end-to-end daemon tests (spawn daemon, attach client, run a task) - ([d3c7bcd](https://github.com/oknozor/favetto/commit/d3c7bcd98a7567fa6e68e928bd29b3fe25335f05)) - Paul Delafosse
+- Give the favetto crate a library target so its modules can be reused - ([d1a2ce8](https://github.com/oknozor/favetto/commit/d1a2ce8e8a1fca479c01ddf7e8d129bdb64bd6bc)) - Paul Delafosse
+- Introduce a typed domain/RPC error enum instead of (i32, String) - ([68e535d](https://github.com/oknozor/favetto/commit/68e535d76adef17117a0b04f25528914d81eaa9f)) - Paul Delafosse
+- Inject the metrics registry through State instead of a process-global - ([3dc7d65](https://github.com/oknozor/favetto/commit/3dc7d65be7f460bbd53c23cbb207f7b7adbb92e5)) - Paul Delafosse
+- deserialize RPC params into typed structs in server::dispatch - ([8d89ecf](https://github.com/oknozor/favetto/commit/8d89ecf71a83b300d35507b8bd4251200e946565)) - Paul Delafosse
+- share MessagePack-frame/WebSocket conversion between client and transport - ([077c299](https://github.com/oknozor/favetto/commit/077c2998ca6ab2f9c98755991a74375bca83aadc)) - Paul Delafosse
+- Rework EventKind into a single source of truth - ([7e01c53](https://github.com/oknozor/favetto/commit/7e01c537fa0ba1289c6b4526ca6e876d0662abf8)) - Paul Delafosse
+- Collapse the five agent adapters' TemplateAgent delegation boilerplate - ([631d0e2](https://github.com/oknozor/favetto/commit/631d0e2a84cc4a7d656559a70516563b50e04fb4)) - Paul Delafosse
+- Drop the unused RwLock around State.config - ([94a46cb](https://github.com/oknozor/favetto/commit/94a46cb050458f51d7d1e716c352a721272f2bbf)) - Paul Delafosse
+- build failure - ([7df9edc](https://github.com/oknozor/favetto/commit/7df9edc857309903f488718e6e89e4ac4f1b9e0d)) - Paul Delafosse
+- Stop silently swallowing serialization and RPC errors - ([0452a65](https://github.com/oknozor/favetto/commit/0452a6545d7d7ab9b8ba3440c875e7dd55cca8e1)) - Paul Delafosse
+- add wss:// (TLS) support to the TUI client transport - ([60b1b09](https://github.com/oknozor/favetto/commit/60b1b09c45a5c6a5c64915176892ea93ca71b7de)) - Paul Delafosse
+- make AgentConfig overlay exhaustive in tests - ([872cc48](https://github.com/oknozor/favetto/commit/872cc481945fd3f7a9f6855f7626da8a0ddb47e4)) - Paul Delafosse
+- replace lock().unwrap() sites with poison-safe locking - ([0a8d93d](https://github.com/oknozor/favetto/commit/0a8d93da5882de9b8e15a4413a6a70f871e5e701)) - Paul Delafosse
+- resume the agent panel session in the run's worktree - ([b1e4035](https://github.com/oknozor/favetto/commit/b1e40352166f3dfac90f805a797e0c56b480637c)) - Paul Delafosse
+- reopen pi sessions in the Agent panel instead of a read-only headless PTY - ([fc618d8](https://github.com/oknozor/favetto/commit/fc618d8091907023ec397d532926e0da62b9d111)) - Paul Delafosse
+- stop awaiting-input false positives and stale task status - ([c7f801b](https://github.com/oknozor/favetto/commit/c7f801bf1cb085ffcdf018d9eb18646b6d6b1d00)) - Paul Delafosse
+- open any agent's session from the TUI, not only resumable ones - ([3a8fda9](https://github.com/oknozor/favetto/commit/3a8fda903531b7dde5088ddb5f18fdfd59307868)) - Paul Delafosse
+- attach to live task runs instead of seeding a duplicate - ([19b644c](https://github.com/oknozor/favetto/commit/19b644c820704b42336f70f70374b4adf82519b0)) - Paul Delafosse
+- TUI stays responsive while reconnecting to the daemon - ([bbdf6aa](https://github.com/oknozor/favetto/commit/bbdf6aa42542413acfa9ede4cf2161db36f0f66e)) - Paul Delafosse
+- Set up a release process with cocogitto - ([a972623](https://github.com/oknozor/favetto/commit/a972623ac957d3203f6b4c260ad7c6f3dbacb907)) - Paul Delafosse
+- fix invalid model name - ([860d597](https://github.com/oknozor/favetto/commit/860d59711538e6c90aa8184a31ec66a7c18c5c55)) - Paul Delafosse
+- fix task prompt not being rendered - ([4cfa4fe](https://github.com/oknozor/favetto/commit/4cfa4fe1c7ea7f52419d47b8f608137d57aff78f)) - Paul Delafosse
+- Catalog: mouse wheel over the floating preview scrolls the tree behind it - ([ecd538e](https://github.com/oknozor/favetto/commit/ecd538e279fea2a83c22eed412d2611a9c270508)) - Paul Delafosse
+- fill the Tasks session title as soon as it is available - ([b777faf](https://github.com/oknozor/favetto/commit/b777faf3f91986456c2e425209aa1b9212415c47)) - Paul Delafosse
+- clean up git worktrees after tasks finish - ([09e4b6e](https://github.com/oknozor/favetto/commit/09e4b6ed4c8ce93d64b70283a14a5ed1ae5ec20b)) - Paul Delafosse
+- size task input popups from wrapped content and keep cursor visible - ([050274c](https://github.com/oknozor/favetto/commit/050274c697cfa83a702f57122440316badc8f6eb)) - Paul Delafosse
+- pi: ship default headless_args/run_args so tasks can run with a model - ([a88db4c](https://github.com/oknozor/favetto/commit/a88db4ce1fc870e002148dc8abae275b3e470bde)) - Paul Delafosse
+- bound task output, list payloads, and database growth - ([70139af](https://github.com/oknozor/favetto/commit/70139af156d400475330e3c23e33d5837b748736)) - Paul Delafosse
+- Tasks panel: resolve session titles with retry and backfill - ([7342377](https://github.com/oknozor/favetto/commit/7342377db263fa4fcdc8e6b63ff64be99a0a00e8)) - Paul Delafosse
+- Catalog tab 50/50 split, preview toggle, and floating preview - ([3a4a5bb](https://github.com/oknozor/favetto/commit/3a4a5bb2abf39cbfe208c809831f4958a4bc9334)) - Paul Delafosse
+- register catalog schedules when tasks are added via Catalog - ([f2b652e](https://github.com/oknozor/favetto/commit/f2b652e55ae7cc40224d7231acd5581c1d6db393)) - Paul Delafosse
+- Auto-register well-known agents and mark unavailable ones - ([309ee3a](https://github.com/oknozor/favetto/commit/309ee3a7ecc0acd68ca101b7a0ef036bfa2845ce)) - Paul Delafosse
+- TUI: show the agent session title in the Tasks list - ([91a3355](https://github.com/oknozor/favetto/commit/91a3355b400dcbfd11a28173993ed4726df6e60c)) - Paul Delafosse
+- Add a documentation website on GitHub Pages with VitePress - ([4196da5](https://github.com/oknozor/favetto/commit/4196da51852cf0e4370ba7b378cc4cd5b490ff83)) - Paul Delafosse
+- expand `~` in configured worktree, data and tasks paths - ([572b6a5](https://github.com/oknozor/favetto/commit/572b6a573afa8b0f44361dbfad47919f41b0617f)) - Paul Delafosse
+- theme the sound badge and catalog task-input popup - ([66fe192](https://github.com/oknozor/favetto/commit/66fe19287bb711246c872af5ce4a198a2e8ae45f)) - Paul Delafosse
+- revamp the TUI with a cohesive dark/light theme - ([9820e6c](https://github.com/oknozor/favetto/commit/9820e6c135d0d3d82529b8c3ea0ec94052cd6c73)) - Paul Delafosse
+- modify favetto implement task - ([4752170](https://github.com/oknozor/favetto/commit/4752170c3c4fe2d199c7bffaed100a7ac86ed428)) - Paul Delafosse
+- reload the task catalog when task files change on disk - ([c193703](https://github.com/oknozor/favetto/commit/c1937038bdcd053cf6497de472da5195d04c0fc1)) - Paul Delafosse
+- make list rows clickable in every panel - ([b7737e7](https://github.com/oknozor/favetto/commit/b7737e7032bde5ca0f654e2599a24fe8f8bdc7e5)) - Paul Delafosse
+#### Documentation
+- supervisor control contract - ([7cd7395](https://github.com/oknozor/favetto/commit/7cd7395bd7bd56721bce2453e623c2213d5f3cce)) - Paul Delafosse
+- add AGENT.md with pre-push gates and commit rules - ([847b8d5](https://github.com/oknozor/favetto/commit/847b8d538b8aae2fcce229c416952466e4c6287f)) - Paul Delafosse
+- use real screenshot for doc website - ([fadd138](https://github.com/oknozor/favetto/commit/fadd13859e4681f4dbd5b3b9d1eeb74b98f92771)) - Paul Delafosse
+- make the website human-centric with a practical user guide and a generated reference - ([7bda889](https://github.com/oknozor/favetto/commit/7bda889cc2abd7d44b8b07048447ed74f55e08f8)) - Paul Delafosse
+#### Continuous Integration
+- add MSRV, cargo-deny, and Dependabot checks - ([d91ab39](https://github.com/oknozor/favetto/commit/d91ab39ea930575284ad5f6360effd0649c75dd9)) - Paul Delafosse
+
+- - -
+
