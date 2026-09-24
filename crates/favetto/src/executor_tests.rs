@@ -2043,7 +2043,10 @@ async fn run_one_reads_spawn_file_before_reclaiming_worktree() {
         run_git(repo.clone(), args.into_iter().map(String::from).collect()).await;
     }
     std::fs::write(repo.join("README.md"), "seed").unwrap();
-    for args in [vec!["add", "-A"], vec!["commit", "-qm", "init"]] {
+    for args in [
+        vec!["add", "-A"],
+        vec!["-c", "commit.gpgsign=false", "commit", "-qm", "init"],
+    ] {
         run_git(repo.clone(), args.into_iter().map(String::from).collect()).await;
     }
 
@@ -2211,7 +2214,10 @@ async fn run_one_keeps_the_worktree_while_an_attach_is_live() {
         run_git(repo.clone(), args.into_iter().map(String::from).collect()).await;
     }
     std::fs::write(repo.join("README.md"), "seed").unwrap();
-    for args in [vec!["add", "-A"], vec!["commit", "-qm", "init"]] {
+    for args in [
+        vec!["add", "-A"],
+        vec!["-c", "commit.gpgsign=false", "commit", "-qm", "init"],
+    ] {
         run_git(repo.clone(), args.into_iter().map(String::from).collect()).await;
     }
 
@@ -2410,7 +2416,10 @@ async fn resume_cwd_recreates_a_reclaimed_worktree() {
         run_git(args.into_iter().map(String::from).collect()).await;
     }
     std::fs::write(repo.join("README.md"), "seed").unwrap();
-    for args in [vec!["add", "-A"], vec!["commit", "-qm", "init"]] {
+    for args in [
+        vec!["add", "-A"],
+        vec!["-c", "commit.gpgsign=false", "commit", "-qm", "init"],
+    ] {
         run_git(args.into_iter().map(String::from).collect()).await;
     }
 
