@@ -60,6 +60,7 @@ export default defineConfig({
             { text: "Event kinds", link: "/reference/events" },
             { text: "Environment", link: "/reference/environment" },
             { text: "Remote API", link: "/reference/remote-api" },
+            { text: "Supervisor contract", link: "/reference/supervisor-contract" },
             { text: "Architecture", link: "/reference/architecture" },
           ],
         },
