@@ -37,6 +37,7 @@ fn task(name: &str) -> Task {
         session_title: None,
         parent_id: None,
         root_id: None,
+        interactive: false,
     }
 }
 

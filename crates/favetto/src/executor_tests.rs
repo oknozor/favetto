@@ -113,6 +113,7 @@ fn render_context_exposes_task_input_and_prev() {
         session_title: None,
         parent_id: None,
         root_id: None,
+        interactive: false,
     };
     let ctx = render_context(&task);
     assert_eq!(crate::template::render("{{ task.name }}", &ctx), "triage");
@@ -164,6 +165,7 @@ async fn unavailable_agent_fails_with_clear_error() {
         session_title: None,
         parent_id: None,
         root_id: None,
+        interactive: false,
     };
     let def = def_with_vars();
     let err = run_agent_task(&state, &task, "opencode", &def, "prompt", Path::new("/tmp"))
@@ -191,6 +193,7 @@ fn task_with_session(session_id: Option<&str>, session_title: Option<&str>) -> T
         session_title: session_title.map(str::to_string),
         parent_id: None,
         root_id: None,
+        interactive: false,
     }
 }
 
@@ -679,6 +682,7 @@ fn branch_name_slugifies_folder_qualified_task() {
         session_title: None,
         parent_id: None,
         root_id: None,
+        interactive: false,
     };
     let short = &task.id.to_string()[..8];
     assert_eq!(
@@ -899,6 +903,7 @@ async fn run_one_renders_input_vars_into_the_agent_prompt() {
         session_title: None,
         parent_id: None,
         root_id: None,
+        interactive: false,
     };
     db::insert_task(&state.db, &task).await.unwrap();
 
@@ -1003,6 +1008,7 @@ async fn run_one_binds_and_persists_a_deterministic_session_id() {
         session_title: None,
         parent_id: None,
         root_id: None,
+        interactive: false,
     };
     db::insert_task(&state.db, &task).await.unwrap();
     let task_id = task.id;
@@ -1026,6 +1032,156 @@ async fn run_one_binds_and_persists_a_deterministic_session_id() {
     let stored = db::get_task(&state.db, task_id).await.unwrap().unwrap();
     assert_eq!(stored.status, TaskStatus::Succeeded);
     assert_eq!(stored.session_id.as_deref(), Some(sid.as_str()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A user-started task (`interactive = true`) runs the agent's real TUI: the
+/// rendered prompt goes through the interactive `prompt_args`, not
+/// `headless_args`, and the retained session is not marked headless so the
+/// Agent panel attaches to it writable.
+#[cfg(unix)]
+#[tokio::test]
+async fn run_one_runs_user_started_tasks_interactively() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("favetto-interactive-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let capture = dir.join("captured-args.txt");
+    let script = dir.join("fake-iv.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nprintf 'INTERACTIVE-SCREEN\\n'\n",
+            capture.display()
+        ),
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let mut cfg = FavettoConfig::default();
+    cfg.agent.default = Some("iv".to_string());
+    cfg.agents.insert(
+        "iv".to_string(),
+        crate::config::AgentConfig {
+            command: script.to_string_lossy().into_owned(),
+            prompt_args: Some(vec!["{prompt}".to_string()]),
+            headless_args: Some(vec!["--headless".to_string(), "{prompt}".to_string()]),
+            ..Default::default()
+        },
+    );
+    let def = crate::tasks::parse_task_md("t", "agent = \"iv\"\n---\nbody\n").unwrap();
+    let state = join_state_with_config(&dir, vec![def.clone()], cfg).await;
+
+    let mut task = task_with_session(None, None);
+    task.interactive = true;
+    db::insert_task(&state.db, &task).await.unwrap();
+
+    let plan = Plan {
+        cwd: dir.clone(),
+        needs_lock: false,
+        worktree: None,
+    };
+    run_one(&state, task.clone(), def, plan, None).await;
+
+    let captured = std::fs::read_to_string(&capture).unwrap_or_default();
+    assert!(
+        captured.contains("body"),
+        "the rendered prompt did not reach the interactive run: {captured:?}"
+    );
+    assert!(
+        !captured.contains("--headless"),
+        "a user-started task used the headless args: {captured:?}"
+    );
+
+    // The run finished, but its session is retained (and writable) so the panel
+    // can attach to the real TUI rather than replay a JSON firehose.
+    let live = state
+        .agents
+        .find_latest_by_task(&task.id.to_string())
+        .expect("interactive session retained");
+    assert!(!live.headless, "the task session must not be headless");
+
+    let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Succeeded);
+    assert!(stored.interactive);
+    // The captured output comes from the emulator's plain-text screen.
+    let output = stored
+        .output
+        .as_ref()
+        .and_then(|o| o.get("output"))
+        .and_then(|o| o.as_str())
+        .unwrap_or_default();
+    assert!(
+        output.contains("INTERACTIVE-SCREEN"),
+        "screen text was not captured: {output:?}"
+    );
+
+    state.agents.close(&live.id).ok();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A programmatic task (`interactive = false`) keeps running headless with the
+/// `headless_args`, preserving structured output / unattended completion.
+#[cfg(unix)]
+#[tokio::test]
+async fn run_one_runs_programmatic_tasks_headlessly() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("favetto-headless-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let capture = dir.join("captured-args.txt");
+    let script = dir.join("fake-hl.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n",
+            capture.display()
+        ),
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let mut cfg = FavettoConfig::default();
+    cfg.agent.default = Some("hl".to_string());
+    cfg.agents.insert(
+        "hl".to_string(),
+        crate::config::AgentConfig {
+            command: script.to_string_lossy().into_owned(),
+            prompt_args: Some(vec!["{prompt}".to_string()]),
+            headless_args: Some(vec!["--headless".to_string(), "{prompt}".to_string()]),
+            ..Default::default()
+        },
+    );
+    let def = crate::tasks::parse_task_md("t", "agent = \"hl\"\n---\nbody\n").unwrap();
+    let state = join_state_with_config(&dir, vec![def.clone()], cfg).await;
+
+    let mut task = task_with_session(None, None);
+    task.interactive = false;
+    db::insert_task(&state.db, &task).await.unwrap();
+
+    let plan = Plan {
+        cwd: dir.clone(),
+        needs_lock: false,
+        worktree: None,
+    };
+    run_one(&state, task.clone(), def, plan, None).await;
+
+    let captured = std::fs::read_to_string(&capture).unwrap_or_default();
+    assert!(
+        captured.contains("--headless"),
+        "a programmatic task did not use the headless args: {captured:?}"
+    );
+
+    let live = state
+        .agents
+        .find_latest_by_task(&task.id.to_string())
+        .expect("headless session retained");
+    assert!(live.headless, "programmatic runs must stay headless");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1151,6 +1307,7 @@ async fn run_one_reads_spawn_file_before_reclaiming_worktree() {
         session_title: None,
         parent_id: None,
         root_id: None,
+        interactive: false,
     };
     db::insert_task(&state.db, &task).await.unwrap();
 
@@ -1329,6 +1486,7 @@ fn lineage_task(name: &str, status: TaskStatus, root: Option<Uuid>, parent: Opti
         session_title: None,
         parent_id: parent,
         root_id: root,
+        interactive: false,
     }
 }
 

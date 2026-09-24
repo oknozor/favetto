@@ -34,7 +34,8 @@ pub async fn register(
         let schedule_id = schedule_id.clone();
         Box::pin(async move {
             let dedupe = format!("schedule:{schedule_id}:{}", Utc::now().timestamp());
-            if let Ok(task) = executor::enqueue_task(&state, task, input, Some(dedupe)).await {
+            if let Ok(task) = executor::enqueue_task(&state, task, input, Some(dedupe), false).await
+            {
                 state
                     .emit_event(
                         favetto_core::model::EventKind::CronTick,

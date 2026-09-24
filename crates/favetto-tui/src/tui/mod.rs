@@ -447,12 +447,20 @@ async fn refresh_lists(client: &Client, app: &mut App) {
 }
 
 /// Send a `tasks.start` request and refresh the list tabs afterwards.
-async fn start_task(client: &Client, app: &mut App, params: serde_json::Value) {
+///
+/// Every call is user-initiated (Catalog **Enter** / the variable popup), so the
+/// run is marked `interactive`: the executor launches the agent's real TUI and
+/// the Agent panel attaches to it live. Programmatic starts (scheduler, hooks,
+/// webhooks, `needs`, `spawn`) stay headless.
+async fn start_task(client: &Client, app: &mut App, mut params: serde_json::Value) {
     let name = params
         .get("name")
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
+    if let Some(obj) = params.as_object_mut() {
+        obj.insert("interactive".to_string(), serde_json::json!(true));
+    }
     match client.request(method::TASKS_START, params).await {
         Ok(resp) => match resp.result {
             Some(_) => app.logs.push_back(format!("started task: {name}")),

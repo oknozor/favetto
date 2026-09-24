@@ -423,6 +423,7 @@ fn oneshot_task() -> Task {
         session_title: None,
         parent_id: None,
         root_id: None,
+        interactive: false,
     }
 }
 
@@ -648,6 +649,7 @@ async fn agents_start_renders_catalog_prompt_with_task_input() {
         session_title: None,
         parent_id: None,
         root_id: None,
+        interactive: false,
     };
     db::insert_task(&state.db, &task).await.unwrap();
 
@@ -718,6 +720,7 @@ async fn agents_start_uses_catalog_provider_and_model() {
         session_title: None,
         parent_id: None,
         root_id: None,
+        interactive: false,
     };
     db::insert_task(&state.db, &task).await.unwrap();
 
@@ -810,6 +813,61 @@ async fn tasks_start_submits_rendered_prompt_without_attach() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `tasks.start` is headless by default; only the TUI opts a run into the
+/// interactive TUI by sending `interactive: true`.
+#[tokio::test]
+async fn tasks_start_marks_the_task_interactive_only_when_requested() {
+    let dir = temp_dir("tasks-start-interactive");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    std::fs::write(tasks_dir.join("issue.md"), "agent = \"x\"\n---\nbody\n").unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+
+    let start = |id: u64, interactive: Option<bool>| {
+        let state = state.clone();
+        async move {
+            let mut params = serde_json::json!({ "name": "issue" });
+            if let Some(interactive) = interactive {
+                params["interactive"] = serde_json::json!(interactive);
+            }
+            let resp = dispatch(
+                &state,
+                Request {
+                    id,
+                    method: method::TASKS_START.to_string(),
+                    params,
+                },
+            )
+            .await;
+            assert!(resp.error.is_none(), "{:?}", resp.error);
+            let result = resp.result.expect("tasks.start result");
+            Uuid::parse_str(result["id"].as_str().expect("task id")).expect("uuid")
+        }
+    };
+
+    // The TUI's request marks the run interactive.
+    let user_id = start(1, Some(true)).await;
+    assert!(
+        db::get_task(&state.db, user_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .interactive
+    );
+
+    // A plain `tasks.start` (raw RPC / automation) stays headless.
+    let programmatic_id = start(2, None).await;
+    assert!(
+        !db::get_task(&state.db, programmatic_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .interactive
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Opening the panel on a live unattended run must not seed a duplicate
 /// session (and re-submit the prompt) for the same task: it attaches to the
 /// retained headless PTY (read-only, from the client's point of view).
@@ -861,6 +919,7 @@ async fn agents_start_attaches_a_live_headless_run_without_duplicating() {
         session_title: None,
         parent_id: None,
         root_id: None,
+        interactive: false,
     };
     db::insert_task(&state.db, &task).await.unwrap();
 
@@ -960,6 +1019,7 @@ async fn agents_start_does_not_resume_a_live_headless_writer() {
         session_title: None,
         parent_id: None,
         root_id: None,
+        interactive: false,
     };
     db::insert_task(&state.db, &task).await.unwrap();
 
@@ -1108,6 +1168,7 @@ async fn agents_start_resumes_in_the_runs_worktree() {
         session_title: None,
         parent_id: None,
         root_id: None,
+        interactive: false,
     };
     db::insert_task(&state.db, &task).await.unwrap();
 
@@ -1195,6 +1256,7 @@ async fn agents_start_replays_a_finished_headless_run() {
         session_title: None,
         parent_id: None,
         root_id: None,
+        interactive: false,
     };
     db::insert_task(&state.db, &task).await.unwrap();
 
@@ -1268,6 +1330,7 @@ async fn tasks_list_omits_output_and_honours_limit_and_get_returns_it() {
         session_title: None,
         parent_id: None,
         root_id: None,
+        interactive: false,
     };
     let first = make("one");
     let second = make("two");

@@ -101,6 +101,12 @@ pub struct Task {
     /// its id); a spawned child inherits its parent's root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_id: Option<Uuid>,
+    /// True when the run was started by a user and should execute in the agent's
+    /// interactive TUI (the Agent panel attaches to it live). Programmatic starts
+    /// (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run
+    /// headless. Defaults to false so older payloads and rows decode unchanged.
+    #[serde(default)]
+    pub interactive: bool,
 }
 
 impl Task {
@@ -414,6 +420,10 @@ pub struct AgentCapabilities {
     /// Seeds, but does not submit, a prompt (needs an Enter press).
     #[serde(default)]
     pub prompt_prefill: bool,
+    /// Can be seeded with a prompt in interactive mode (`prompt_args` and/or
+    /// `submit_prompt`), so a user-started task can run in the real TUI.
+    #[serde(default)]
+    pub interactive_prompt: bool,
 }
 
 /// Default for a payload that omits `available`: older daemons/clients only know
@@ -487,6 +497,7 @@ mod tests {
                 structured_output: true,
                 reports_session_id: true,
                 prompt_prefill: true,
+                interactive_prompt: true,
             },
             sessions: Vec::new(),
         };
@@ -526,6 +537,7 @@ mod tests {
             session_title: Some("Fix the widget".to_string()),
             parent_id: None,
             root_id: None,
+            interactive: false,
         };
         let json = serde_json::to_value(&task).unwrap();
         assert_eq!(json["session_title"], "Fix the widget");
@@ -556,6 +568,48 @@ mod tests {
     }
 
     #[test]
+    fn task_interactive_round_trips_and_defaults_false() {
+        let task = Task {
+            id: Uuid::new_v4(),
+            name: "t".to_string(),
+            status: TaskStatus::Pending,
+            input: serde_json::json!({}),
+            output: None,
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+            session_id: None,
+            session_title: None,
+            parent_id: None,
+            root_id: None,
+            interactive: true,
+        };
+        let json = serde_json::to_value(&task).unwrap();
+        assert_eq!(json["interactive"], true);
+        let back: Task = serde_json::from_value(json).unwrap();
+        assert!(back.interactive);
+
+        // Legacy payloads without `interactive` decode as headless.
+        let legacy: Task = serde_json::from_str(
+            r#"{
+                "id": "00000000-0000-0000-0000-000000000000",
+                "name": "t",
+                "status": "pending",
+                "input": {},
+                "dedupe_key": null,
+                "created_at": "2024-01-01T00:00:00Z",
+                "started_at": null,
+                "finished_at": null,
+                "error": null
+            }"#,
+        )
+        .unwrap();
+        assert!(!legacy.interactive);
+    }
+
+    #[test]
     fn task_lineage_round_trips() {
         let parent = Uuid::new_v4();
         let root = Uuid::new_v4();
@@ -574,6 +628,7 @@ mod tests {
             session_title: None,
             parent_id: Some(parent),
             root_id: Some(root),
+            interactive: false,
         };
         let json = serde_json::to_value(&task).unwrap();
         assert_eq!(json["parent_id"], parent.to_string());
@@ -771,6 +826,7 @@ mod tests {
             session_title: None,
             parent_id: None,
             root_id: None,
+            interactive: false,
         };
         let n = task.into_notification().expect("task serialization");
         assert_eq!(n.method, push::TASK_UPDATED);

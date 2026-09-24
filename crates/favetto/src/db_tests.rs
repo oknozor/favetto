@@ -96,11 +96,46 @@ async fn task_session_id_round_trips() {
         session_title: Some("Fix the widget".to_string()),
         parent_id: None,
         root_id: None,
+        interactive: false,
     };
     upsert_task(&pool, &task).await.unwrap();
     let got = get_task(&pool, task.id).await.unwrap().unwrap();
     assert_eq!(got.session_id.as_deref(), Some("ses_123"));
     assert_eq!(got.session_title.as_deref(), Some("Fix the widget"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn task_interactive_round_trips_through_the_database() {
+    let (dir, pool) = scratch_pool("interactive").await;
+
+    let user = Task {
+        interactive: true,
+        ..task_at(Utc::now(), None, None)
+    };
+    let programmatic = task_at(Utc::now(), None, None);
+    assert!(!programmatic.interactive);
+
+    insert_task(&pool, &user).await.unwrap();
+    upsert_task(&pool, &programmatic).await.unwrap();
+
+    assert!(get_task(&pool, user.id).await.unwrap().unwrap().interactive);
+    assert!(
+        !get_task(&pool, programmatic.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .interactive
+    );
+
+    // Both list and the pending-task scan carry the flag.
+    let listed = list_tasks(&pool, 500).await.unwrap();
+    assert!(listed.iter().any(|t| t.id == user.id && t.interactive));
+    let pending = next_pending_tasks(&pool, 10).await.unwrap();
+    // Both rows are `succeeded`, so the pending scan is empty; the flag still
+    // travels through `list_tasks` above. Sanity-check the scan does not error.
+    assert!(pending.is_empty());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -132,9 +167,22 @@ async fn migrate_adds_session_title_to_legacy_database() {
     .await
     .unwrap();
 
+    // A row written before the newer columns existed. The migration must fill
+    // `interactive` with the headless default rather than fail.
+    let legacy_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO tasks (id, name, status, input, created_at) VALUES (?, 'legacy', 'succeeded', '{}', ?)")
+        .bind(legacy_id.to_string())
+        .bind(ts_ms(Utc::now()))
+        .execute(&pool)
+        .await
+        .unwrap();
+
     // Running the migration twice is a no-op the second time.
     migrate(&pool).await.unwrap();
     migrate(&pool).await.unwrap();
+
+    let legacy = get_task(&pool, legacy_id).await.unwrap().unwrap();
+    assert!(!legacy.interactive, "legacy rows must default to headless");
 
     let task = Task {
         id: Uuid::new_v4(),
@@ -151,6 +199,7 @@ async fn migrate_adds_session_title_to_legacy_database() {
         session_title: Some("Legacy title".to_string()),
         parent_id: Some(Uuid::new_v4()),
         root_id: Some(Uuid::new_v4()),
+        interactive: false,
     };
     upsert_task(&pool, &task).await.unwrap();
     let got = get_task(&pool, task.id).await.unwrap().unwrap();
@@ -194,6 +243,7 @@ fn task_at(
         session_title: None,
         parent_id: None,
         root_id: None,
+        interactive: false,
     }
 }
 

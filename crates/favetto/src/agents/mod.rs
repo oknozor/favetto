@@ -591,6 +591,14 @@ impl AgentManager {
             .unwrap_or_default()
     }
 
+    /// Plain-text contents of a session's terminal screen (no ANSI, no terminal
+    /// queries). Used as the captured output of an interactive task run.
+    pub fn screen_text(&self, session_id: &str) -> String {
+        self.get(session_id)
+            .map(|s| s.parser.lock().screen().contents())
+            .unwrap_or_default()
+    }
+
     /// The agent's own session id captured from a run, if any.
     pub fn external_session_id(&self, session_id: &str) -> Option<String> {
         self.get(session_id)
@@ -921,6 +929,35 @@ mod tests {
             "frame: {:?}",
             String::from_utf8_lossy(&data)
         );
+        mgr.close(&info.id).unwrap();
+    }
+
+    #[test]
+    fn screen_text_returns_plain_emulator_contents() {
+        let mgr = AgentManager::new();
+        let agent = template("sh", cfg("sh", &["-c", "printf 'hello-screen'; sleep 1"]));
+        let info = mgr
+            .start(
+                "sh",
+                agent,
+                Some("task-screen".to_string()),
+                Invocation::Interactive {
+                    prompt: None,
+                    provider: None,
+                    model: None,
+                },
+                context(None, 24, 80),
+            )
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(
+            mgr.screen_text(&info.id).contains("hello-screen"),
+            "screen text: {:?}",
+            mgr.screen_text(&info.id)
+        );
+        // An unknown session has no screen.
+        assert_eq!(mgr.screen_text("missing"), "");
         mgr.close(&info.id).unwrap();
     }
 

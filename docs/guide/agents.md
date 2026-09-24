@@ -88,20 +88,27 @@ a task first reattaches to its running session; if the run already finished and 
 session id was captured, it reopens that session with `resume_args`. Press
 **Ctrl+N** to force a new session.
 
+A task you start from the **Catalog** runs in this real TUI (see
+[Lifecycle](#lifecycle)): the panel attaches to the live session **writable**, so
+you can watch the agent work, answer a permission prompt, or take over by hand.
+Programmatic runs — started by a schedule, a webhook/hook, `needs`, or `spawn` —
+stay headless; for those, the panel keeps the read-only fallback described below.
+
 When a task's row shows **awaiting input** (see [Lifecycle](#lifecycle)), pressing
 **Enter** attaches to the *live blocked PTY* rather than launching a fresh
 session, so anything you type — a permission key, a passphrase — reaches the
 prompt the agent is waiting on.
 
-Agents that cannot resume (`claude`, `vibe`, custom) still open: the daemon
-retains the headless run's PTY, so a **finished** run is replayed from its final
-screen and a **still-running** run is attached **read-only** — the panel shows it
-without forwarding keystrokes into its machine output. A resumable agent is only
-resumed once its run has exited (or is blocked on the user): while the writer is
-still in flight the retained PTY is attached read-only, so two processes never
-write the same session. Concurrent sessions can be switched between with
-**Ctrl+O** (see the [TUI keybindings](./tui#agent-session-picker)), which lists
-every live and retained session regardless of agent.
+For a **headless** (programmatic) run, agents that cannot resume (`claude`,
+`vibe`, custom) still open: the daemon retains the run's PTY, so a **finished**
+run is replayed from its final screen and a **still-running** run is attached
+**read-only** — the panel shows it without forwarding keystrokes into its machine
+output. A resumable agent is only resumed once its run has exited (or is blocked
+on the user): while the writer is still in flight the retained PTY is attached
+read-only, so two processes never write the same session. Concurrent sessions can
+be switched between with **Ctrl+O** (see the [TUI
+keybindings](./tui#agent-session-picker)), which lists every live and retained
+session regardless of agent.
 
 The daemon keeps a `vt100` emulator per session and streams self-contained
 full-screen frames; the panel parses and renders them, keys are forwarded to the
@@ -126,11 +133,17 @@ the agent and its children with it. Live PTYs therefore do **not** survive a
 daemon restart, but an agent's own session (captured via `session_id_json_key`)
 does, so tasks can be resumed after a restart.
 
-Catalog tasks run through their `agent` (or `[agent].default`) in headless mode
-using `headless_args` (or `run_args` when a model is set); a task with no agent
-and no default fails to start. An external agent **without** the relevant args is
-rejected rather than launched interactively (an interactive TUI would never exit
-and would hang the task).
+How a catalog task runs depends on who started it. A task you start from the
+**Catalog** runs in the agent's real interactive TUI, seeded with the rendered
+prompt (`prompt_args` plus `submit_prompt`, or the prompt on stdin); the Agent
+panel attaches to that single session live and writable, and the task finishes
+when the session exits — quit the TUI (or send the CLI's exit key) when the work
+is done. A task started programmatically — by a schedule, a webhook/hook,
+`needs`, or `spawn` — runs headless, using `headless_args` (or `run_args` when a
+model is set), so it completes unattended and captures structured output and the
+agent session id. A task with no agent and no default fails to start, and an
+agent with no way to seed an interactive prompt (`prompt_args`/`submit_prompt`)
+falls back to a headless run even when started by hand.
 
 While a run is in flight the daemon watches its terminal screen. If the agent
 blocks on something only a human can answer — a tool permission dialog, a

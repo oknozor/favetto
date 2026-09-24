@@ -125,6 +125,13 @@ definition — no `.md` file), emits `task_idle`/`task_started`, and opens an
 interactive session using the agent's `interactive_model_args`. The task is
 marked completed/failed when that session exits.
 
+A catalog task started with **Enter** on the Catalog tab runs the same way: the
+daemon launches the agent's real TUI (seeded with the rendered prompt) and the
+Agent panel attaches to it live and writable. The task is marked
+completed/failed when that session exits, so quit the agent CLI when the work is
+done. Only programmatic runs (schedules, hooks/webhooks, `needs`, `spawn`) stay
+headless and finish on their own.
+
 ## Workflow overlay
 
 Press **w** to render the catalog's `needs`/`spawn` edges as box-drawing art (the

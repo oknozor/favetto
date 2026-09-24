@@ -256,6 +256,7 @@ pub(crate) fn capabilities_from_config(config: &AgentConfig) -> AgentCapabilitie
         structured_output: config.session_id_json_key.is_some(),
         reports_session_id: config.session_id_json_key.is_some(),
         prompt_prefill: config.submit_prompt.unwrap_or(false),
+        interactive_prompt: config.prompt_args.is_some() || config.submit_prompt.unwrap_or(false),
     }
 }
 
@@ -321,6 +322,45 @@ mod tests {
         assert!(caps.structured_output);
         assert!(caps.reports_session_id);
         assert!(caps.prompt_prefill);
+        assert!(caps.interactive_prompt);
+    }
+
+    #[test]
+    fn interactive_prompt_follows_prompt_templates() {
+        // `prompt_args` alone is enough to seed an interactive TUI.
+        let with_prompt_args = AgentConfig {
+            command: "mycli".to_string(),
+            prompt_args: Some(vec!["--prompt".to_string(), "{prompt}".to_string()]),
+            ..Default::default()
+        };
+        assert!(
+            ConfigurableAgent::from_config("mycli", &with_prompt_args)
+                .capabilities()
+                .interactive_prompt
+        );
+
+        // `submit_prompt` alone also counts (the prompt goes to stdin).
+        let submit_only = AgentConfig {
+            command: "mycli".to_string(),
+            submit_prompt: Some(true),
+            ..Default::default()
+        };
+        assert!(
+            ConfigurableAgent::from_config("mycli", &submit_only)
+                .capabilities()
+                .interactive_prompt
+        );
+
+        // A bare command has no way to seed the prompt.
+        let bare = AgentConfig {
+            command: "mycli".to_string(),
+            ..Default::default()
+        };
+        assert!(
+            !ConfigurableAgent::from_config("mycli", &bare)
+                .capabilities()
+                .interactive_prompt
+        );
     }
 
     #[test]

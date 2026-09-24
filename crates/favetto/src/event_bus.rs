@@ -92,6 +92,7 @@ mod tests {
             session_title: None,
             parent_id: None,
             root_id: None,
+            interactive: false,
         };
         let n = ServerPush::TaskUpdated(Box::new(task))
             .into_notification()
