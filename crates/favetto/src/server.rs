@@ -1151,6 +1151,7 @@ async fn start_oneshot_task(
         started_at: Some(Utc::now()),
         finished_at: None,
         error: None,
+        failure: None,
         session_id: None,
         session_title: None,
         parent_id: None,

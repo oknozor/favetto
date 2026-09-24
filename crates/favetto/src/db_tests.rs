@@ -1,6 +1,6 @@
 use super::*;
 use chrono::Utc;
-use favetto_core::model::Event;
+use favetto_core::model::{Event, Failure, FailureKind};
 
 #[tokio::test]
 async fn event_replay_resumes_from_cursor() {
@@ -92,6 +92,7 @@ async fn task_session_id_round_trips() {
         started_at: None,
         finished_at: None,
         error: None,
+        failure: None,
         session_id: Some("ses_123".to_string()),
         session_title: Some("Fix the widget".to_string()),
         parent_id: None,
@@ -102,6 +103,33 @@ async fn task_session_id_round_trips() {
     let got = get_task(&pool, task.id).await.unwrap().unwrap();
     assert_eq!(got.session_id.as_deref(), Some("ses_123"));
     assert_eq!(got.session_title.as_deref(), Some("Fix the widget"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn task_failure_round_trips_through_the_database() {
+    let (dir, pool) = scratch_pool("failure-roundtrip").await;
+
+    let mut task = task_at(Utc::now(), Some(Utc::now()), None);
+    task.status = TaskStatus::Failed;
+    task.error = Some("exit 1".to_string());
+    task.failure = Some(Failure::new(FailureKind::Agent, "exit 1"));
+    upsert_task(&pool, &task).await.unwrap();
+
+    let got = get_task(&pool, task.id).await.unwrap().unwrap();
+    let failure = got.failure.expect("failure persisted");
+    assert_eq!(failure.kind, FailureKind::Agent);
+    assert_eq!(failure.message, "exit 1");
+    assert!(!failure.retryable);
+    assert_eq!(got.error.as_deref(), Some("exit 1"));
+
+    // The list SELECT carries the column too, not just `tasks.get`.
+    let listed = list_tasks(&pool, 10).await.unwrap();
+    assert_eq!(
+        listed[0].failure.as_ref().map(|f| f.kind),
+        Some(FailureKind::Agent)
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -183,6 +211,10 @@ async fn migrate_adds_session_title_to_legacy_database() {
 
     let legacy = get_task(&pool, legacy_id).await.unwrap().unwrap();
     assert!(!legacy.interactive, "legacy rows must default to headless");
+    assert!(
+        legacy.failure.is_none(),
+        "legacy rows must decode with no typed failure"
+    );
 
     let task = Task {
         id: Uuid::new_v4(),
@@ -195,6 +227,7 @@ async fn migrate_adds_session_title_to_legacy_database() {
         started_at: None,
         finished_at: None,
         error: None,
+        failure: None,
         session_id: Some("ses_legacy".to_string()),
         session_title: Some("Legacy title".to_string()),
         parent_id: Some(Uuid::new_v4()),
@@ -239,6 +272,7 @@ fn task_at(
         started_at: Some(created_at),
         finished_at,
         error: None,
+        failure: None,
         session_id: None,
         session_title: None,
         parent_id: None,

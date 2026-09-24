@@ -58,6 +58,60 @@ impl FromStr for TaskStatus {
     }
 }
 
+/// Why a task ended in failure, so a controller can distinguish a genuine
+/// agent failure from an infrastructure fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKind {
+    /// The agent ran and reported failure (non-zero exit, rejected work, …).
+    Agent,
+    /// The daemon could not start or supervise the run (spawn/PTY/daemon fault).
+    Infrastructure,
+    /// The run exceeded its deadline.
+    Timeout,
+    /// Input was invalid (missing required vars, unparseable manifest, …).
+    InvalidInput,
+    /// A dependency could not be satisfied.
+    Dependency,
+    /// Cancelled by a user or controller.
+    Cancelled,
+    /// Cannot proceed until something external changes; terminal and never
+    /// retried automatically.
+    Blocked,
+    /// Unclassified failure.
+    Unknown,
+}
+
+impl FailureKind {
+    /// Whether an unattended retry could plausibly help for this kind. Mirrors
+    /// the design's default `retry_on = ["infrastructure", "timeout"]`; producers
+    /// may still override the flag per [`Failure`].
+    pub fn retryable_by_default(self) -> bool {
+        matches!(self, FailureKind::Infrastructure | FailureKind::Timeout)
+    }
+}
+
+/// A machine-readable task failure. `Task.error` remains the human-readable
+/// view; this is what controllers branch on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Failure {
+    pub kind: FailureKind,
+    pub message: String,
+    /// Whether an unattended retry could plausibly help.
+    pub retryable: bool,
+}
+
+impl Failure {
+    /// Build a failure whose `retryable` flag follows the kind's default.
+    pub fn new(kind: FailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            retryable: kind.retryable_by_default(),
+        }
+    }
+}
+
 /// A unit of work the favetto is driving.
 ///
 /// Tasks are created by integrations, hooks, the scheduler, or manually via the
@@ -82,6 +136,10 @@ pub struct Task {
     pub finished_at: Option<DateTime<Utc>>,
     /// Human-readable failure reason when `status == Failed`.
     pub error: Option<String>,
+    /// Machine-readable failure classification when `status == Failed`. Absent on
+    /// success and on rows/payloads written before typed failures existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<Failure>,
     /// The agent's own session id (e.g. opencode's session id), captured from a
     /// task run's output so the session can be reattached later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -533,6 +591,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             error: None,
+            failure: None,
             session_id: Some("ses_1".to_string()),
             session_title: Some("Fix the widget".to_string()),
             parent_id: None,
@@ -580,6 +639,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             error: None,
+            failure: None,
             session_id: None,
             session_title: None,
             parent_id: None,
@@ -624,6 +684,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             error: None,
+            failure: None,
             session_id: None,
             session_title: None,
             parent_id: Some(parent),
@@ -755,6 +816,101 @@ mod tests {
     }
 
     #[test]
+    fn failure_kind_round_trips() {
+        for kind in [
+            FailureKind::Agent,
+            FailureKind::Infrastructure,
+            FailureKind::Timeout,
+            FailureKind::InvalidInput,
+            FailureKind::Dependency,
+            FailureKind::Cancelled,
+            FailureKind::Blocked,
+            FailureKind::Unknown,
+        ] {
+            let json = serde_json::to_value(kind).unwrap();
+            let back: FailureKind = serde_json::from_value(json).unwrap();
+            assert_eq!(back, kind);
+        }
+        assert_eq!(
+            serde_json::to_value(FailureKind::InvalidInput).unwrap(),
+            "invalid_input"
+        );
+    }
+
+    #[test]
+    fn failure_round_trips() {
+        let failure = Failure::new(FailureKind::Infrastructure, "boom");
+        let json = serde_json::to_value(&failure).unwrap();
+        assert_eq!(json["kind"], "infrastructure");
+        assert_eq!(json["message"], "boom");
+        assert_eq!(json["retryable"], true);
+        let back: Failure = serde_json::from_value(json).unwrap();
+        assert_eq!(back, failure);
+    }
+
+    #[test]
+    fn failure_retryable_defaults_only_for_infrastructure_and_timeout() {
+        assert!(FailureKind::Infrastructure.retryable_by_default());
+        assert!(FailureKind::Timeout.retryable_by_default());
+        for kind in [
+            FailureKind::Agent,
+            FailureKind::InvalidInput,
+            FailureKind::Dependency,
+            FailureKind::Cancelled,
+            FailureKind::Blocked,
+            FailureKind::Unknown,
+        ] {
+            assert!(!kind.retryable_by_default(), "{kind:?} must not retry");
+        }
+    }
+
+    #[test]
+    fn task_failure_round_trips_and_defaults() {
+        let task = Task {
+            id: Uuid::new_v4(),
+            name: "t".to_string(),
+            status: TaskStatus::Failed,
+            input: serde_json::json!({}),
+            output: None,
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            error: Some("exit 1".to_string()),
+            failure: Some(Failure::new(FailureKind::Agent, "exit 1")),
+            session_id: None,
+            session_title: None,
+            parent_id: None,
+            root_id: None,
+            interactive: false,
+        };
+        let json = serde_json::to_value(&task).unwrap();
+        assert_eq!(json["failure"]["kind"], "agent");
+        assert_eq!(json["failure"]["retryable"], false);
+        assert_eq!(json["error"], "exit 1");
+        let back: Task = serde_json::from_value(json).unwrap();
+        assert_eq!(back.failure, task.failure);
+
+        // Legacy payloads without `failure` still decode, keeping `error`.
+        let legacy: Task = serde_json::from_str(
+            r#"{
+                "id": "00000000-0000-0000-0000-000000000000",
+                "name": "t",
+                "status": "failed",
+                "input": {},
+                "dedupe_key": null,
+                "created_at": "2024-01-01T00:00:00Z",
+                "started_at": null,
+                "finished_at": null,
+                "error": "legacy boom"
+            }"#,
+        )
+        .unwrap();
+        assert!(legacy.failure.is_none());
+        assert_eq!(legacy.error.as_deref(), Some("legacy boom"));
+    }
+
+    #[test]
     fn awaiting_input_reason_round_trips() {
         for kind in [
             AwaitingInputKind::Permission,
@@ -822,6 +978,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             error: None,
+            failure: None,
             session_id: None,
             session_title: None,
             parent_id: None,

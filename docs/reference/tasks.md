@@ -56,6 +56,26 @@ drops a task).
 | `type` | `"string"` \| `"int"` \| `"bool"` | no | Parses the value before storing it in `input` (default `"string"`). |
 | `choices` | array of strings | no | Fixed list rendered as a selectable list instead of a free-text field. |
 
+## Task failure
+
+When a run ends in `failed`, the task carries two failure fields:
+
+- `error` — a human-readable message, safe to display.
+- `failure` — a machine-readable classification for controllers:
+
+  | Field | Type | Description |
+  |-------|------|-------------|
+  | `kind` | string | One of `agent`, `infrastructure`, `timeout`, `invalid_input`, `dependency`, `cancelled`, `blocked`, `unknown`. |
+  | `message` | string | The same detail as `error`. |
+  | `retryable` | bool | Whether an unattended retry could plausibly help. `true` by default for `infrastructure` and `timeout`; `false` for every other kind, including `agent`, `invalid_input`, and `blocked`. |
+
+`failure` is absent (`null`) on success and on rows written before typed
+failures existed. `blocked` is a failure kind, not a task status: a blocked run
+is terminal and is never retried automatically.
+
+This is part of the runtime task API (the daemon, remote API, and TUI), not a
+task-file header key.
+
 ## Prompt templates
 
 Prompt bodies and `spawn_file` paths are rendered before use.

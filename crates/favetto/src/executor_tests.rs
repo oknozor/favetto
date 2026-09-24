@@ -109,6 +109,7 @@ fn render_context_exposes_task_input_and_prev() {
         started_at: None,
         finished_at: None,
         error: None,
+        failure: None,
         session_id: None,
         session_title: None,
         parent_id: None,
@@ -161,6 +162,7 @@ async fn unavailable_agent_fails_with_clear_error() {
         started_at: None,
         finished_at: None,
         error: None,
+        failure: None,
         session_id: None,
         session_title: None,
         parent_id: None,
@@ -189,6 +191,7 @@ fn task_with_session(session_id: Option<&str>, session_title: Option<&str>) -> T
         started_at: None,
         finished_at: None,
         error: None,
+        failure: None,
         session_id: session_id.map(str::to_string),
         session_title: session_title.map(str::to_string),
         parent_id: None,
@@ -206,7 +209,7 @@ fn failed_run_preserves_session_info() {
             output: serde_json::json!({}),
             session_id: Some("ses_1".to_string()),
             session_title: Some("Fix the widget".to_string()),
-            error: Some("exit 1".to_string()),
+            failure: Some(Failure::new(FailureKind::Agent, "exit 1")),
             alive: false,
         }),
     );
@@ -215,6 +218,11 @@ fn failed_run_preserves_session_info() {
     assert_eq!(task.session_id.as_deref(), Some("ses_1"));
     assert_eq!(task.session_title.as_deref(), Some("Fix the widget"));
     assert!(task.error.as_deref().unwrap().contains("exit 1"));
+    assert_eq!(
+        task.failure.as_ref().map(|f| f.kind),
+        Some(FailureKind::Agent)
+    );
+    assert!(!task.failure.as_ref().unwrap().retryable);
     assert!(task.output.is_none());
 }
 
@@ -222,13 +230,14 @@ fn failed_run_preserves_session_info() {
 fn successful_run_records_output_and_session() {
     let mut task = task_with_session(None, None);
     task.error = Some("stale".to_string());
+    task.failure = Some(Failure::new(FailureKind::Agent, "stale"));
     let success = record_run_outcome(
         &mut task,
         Ok(RunOutcome {
             output: serde_json::json!({ "ok": true }),
             session_id: Some("ses_1".to_string()),
             session_title: Some("Fix the widget".to_string()),
-            error: None,
+            failure: None,
             alive: false,
         }),
     );
@@ -238,18 +247,95 @@ fn successful_run_records_output_and_session() {
     assert_eq!(task.session_id.as_deref(), Some("ses_1"));
     assert_eq!(task.session_title.as_deref(), Some("Fix the widget"));
     assert!(task.error.is_none());
+    // A successful run clears a failure left by an earlier attempt.
+    assert!(task.failure.is_none());
 }
 
 #[test]
 fn run_without_agent_still_fails() {
     let mut task = task_with_session(Some("ses_keep"), Some("Keep"));
-    let success = record_run_outcome(&mut task, Err(anyhow::anyhow!("no agent")));
+    let success = record_run_outcome(
+        &mut task,
+        Err(RunError::new(FailureKind::Infrastructure, "no agent")),
+    );
     assert!(!success);
     assert_eq!(task.status, TaskStatus::Failed);
     // A pre-run failure never drops an already-resolved session.
     assert_eq!(task.session_id.as_deref(), Some("ses_keep"));
     assert_eq!(task.session_title.as_deref(), Some("Keep"));
     assert!(task.error.as_deref().unwrap().contains("no agent"));
+    assert_eq!(
+        task.failure.as_ref().map(|f| f.kind),
+        Some(FailureKind::Infrastructure)
+    );
+    assert!(task.failure.as_ref().unwrap().retryable);
+}
+
+/// A run that produced no exit code (the PTY/session vanished) is an
+/// infrastructure fault, not an agent failure.
+#[test]
+fn vanished_session_is_infrastructure() {
+    let mut task = task_with_session(None, None);
+    let success = record_run_outcome(
+        &mut task,
+        Ok(RunOutcome {
+            output: serde_json::json!({}),
+            session_id: None,
+            session_title: None,
+            failure: Some(Failure::new(
+                FailureKind::Infrastructure,
+                "agent 'opencode' session disappeared",
+            )),
+            alive: false,
+        }),
+    );
+    assert!(!success);
+    assert_eq!(
+        task.failure.as_ref().map(|f| f.kind),
+        Some(FailureKind::Infrastructure)
+    );
+}
+
+/// The resolved design decision: `Blocked` is a `FailureKind`, terminal and
+/// never retried automatically.
+#[test]
+fn blocked_failure_is_not_retryable() {
+    let failure = Failure::new(FailureKind::Blocked, "credentials");
+    assert_eq!(failure.kind, FailureKind::Blocked);
+    assert!(!failure.retryable);
+}
+
+/// `fail_task` persists both the human-readable `error` and the typed
+/// `failure`, so a controller can classify a task that never started.
+#[tokio::test]
+async fn fail_task_records_the_requested_kind() {
+    let dir = std::env::temp_dir().join(format!("favetto-fail-task-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let state = join_state(&dir, Vec::new()).await;
+
+    let task = task_with_session(None, None);
+    db::insert_task(&state.db, &task).await.unwrap();
+
+    fail_task(
+        &state,
+        task.clone(),
+        FailureKind::InvalidInput,
+        "task not found in the catalog",
+    )
+    .await;
+
+    let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Failed);
+    assert_eq!(
+        stored.error.as_deref(),
+        Some("task not found in the catalog")
+    );
+    let failure = stored.failure.expect("failure recorded");
+    assert_eq!(failure.kind, FailureKind::InvalidInput);
+    assert_eq!(failure.message, "task not found in the catalog");
+    assert!(!failure.retryable);
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -262,7 +348,7 @@ fn terminal_outcome_overrides_awaiting_input_status() {
             output: serde_json::json!({}),
             session_id: None,
             session_title: None,
-            error: None,
+            failure: None,
             alive: false,
         }),
     );
@@ -277,7 +363,7 @@ fn terminal_outcome_overrides_awaiting_input_status() {
             output: serde_json::json!({}),
             session_id: None,
             session_title: None,
-            error: Some("exit 1".to_string()),
+            failure: Some(Failure::new(FailureKind::Agent, "exit 1")),
             alive: false,
         }),
     );
@@ -682,6 +768,7 @@ fn branch_name_slugifies_folder_qualified_task() {
         started_at: None,
         finished_at: None,
         error: None,
+        failure: None,
         session_id: None,
         session_title: None,
         parent_id: None,
@@ -903,6 +990,7 @@ async fn run_one_renders_input_vars_into_the_agent_prompt() {
         started_at: Some(Utc::now()),
         finished_at: None,
         error: None,
+        failure: None,
         session_id: None,
         session_title: None,
         parent_id: None,
@@ -1008,6 +1096,7 @@ async fn run_one_binds_and_persists_a_deterministic_session_id() {
         started_at: Some(Utc::now()),
         finished_at: None,
         error: None,
+        failure: None,
         session_id: None,
         session_title: None,
         parent_id: None,
@@ -1386,6 +1475,7 @@ async fn run_one_reads_spawn_file_before_reclaiming_worktree() {
         started_at: Some(Utc::now()),
         finished_at: None,
         error: None,
+        failure: None,
         session_id: None,
         session_title: None,
         parent_id: None,
@@ -1565,6 +1655,7 @@ fn lineage_task(name: &str, status: TaskStatus, root: Option<Uuid>, parent: Opti
         started_at: None,
         finished_at: None,
         error: None,
+        failure: None,
         session_id: None,
         session_title: None,
         parent_id: parent,
