@@ -16,6 +16,7 @@ use crate::config::FavettoConfig;
 use crate::db;
 use crate::event_bus::{EventBus, ServerPush};
 use crate::hooks::Hook;
+use crate::metrics::Metrics;
 use crate::pair::PairStore;
 use crate::tasks::TaskDef;
 use crate::webhooks::WebhookSecrets;
@@ -46,6 +47,8 @@ pub struct State {
     pub hook_store: Arc<RwLock<Vec<Hook>>>,
     /// Cached provider/model catalogs, keyed by agent name (fetched lazily).
     pub providers_cache: tokio::sync::Mutex<HashMap<String, Vec<favetto_providers::Provider>>>,
+    /// Per-daemon counters rendered on `/metrics`.
+    pub metrics: Metrics,
 }
 
 impl State {
@@ -79,6 +82,7 @@ impl State {
             pair: PairStore::new(),
             hook_store,
             providers_cache: tokio::sync::Mutex::new(HashMap::new()),
+            metrics: Metrics::default(),
         }
     }
 
@@ -97,7 +101,7 @@ impl State {
         match db::insert_event(&self.db, &event).await {
             Ok(id) => {
                 let event = Event { id, ..event };
-                crate::metrics::inc_events();
+                self.metrics.inc_events();
                 self.bus.publish(ServerPush::Event(event));
             }
             Err(e) => tracing::warn!(error = %e, "failed to persist event"),

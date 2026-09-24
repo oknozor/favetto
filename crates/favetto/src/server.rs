@@ -159,7 +159,7 @@ async fn handle_request(
     req: Request,
 ) {
     let id = req.id;
-    crate::metrics::inc_rpc();
+    state.metrics.inc_rpc();
 
     if req.method == method::EVENTS_SUBSCRIBE {
         let _ = out_tx
@@ -1041,7 +1041,7 @@ async fn start_oneshot_task(
         root_id: None,
     };
     db::insert_task(&state.db, &task).await?;
-    crate::metrics::inc_tasks();
+    state.metrics.inc_tasks();
     state
         .bus
         .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
