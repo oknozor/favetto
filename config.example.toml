@@ -136,6 +136,18 @@ keep_worktree = false      # default false = remove the worktree when the task e
 days = 30          # remove finished-task worktrees older than this many days (0 = keep forever)
 min_worktrees = 0  # always keep the newest N finished worktrees
 
+# Automatic retry for retryable failures. Off by default: `max_attempts = 1`
+# runs a task exactly once. When enabled, a failed attempt whose failure kind is
+# listed in `retry_on` is re-enqueued after the backoff and records a run under
+# `attempt + 1`. Agent and invalid-input failures are not in the default
+# `retry_on`, so genuine task failures are never retried on their own.
+[executor.retry]
+# max_attempts = 1           # total attempts per task, including the first (1 = never retry)
+# backoff = "exponential"    # "fixed" | "exponential"
+# initial_ms = 5000          # base delay before the second attempt
+# max_ms = 300000            # cap on any single backoff delay
+# retry_on = ["infrastructure", "timeout"]
+
 # Non-interactive git for agent sessions. favetto injects these into every agent
 # PTY through git's environment config only, never touching your real config.
 # Default `signing = "off"` forces commit.gpgsign=false so an agent commit can

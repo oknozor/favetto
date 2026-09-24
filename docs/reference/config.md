@@ -11,7 +11,7 @@ Every section is optional; favetto falls back to built-in defaults for anything 
 | `agent` | AgentSettings | `{}` | no | Default external agent used for catalog tasks and new agent sessions. |
 | `agents` | Map<String, AgentConfig> | `{}` | no | External coding agents by name (e.g. `claude`, `opencode`, `pi`, `vibe`). |
 | `daemon` | DaemonSettings | `{"data_dir":null,"listen":null,"retention":{"days":30,"min_tasks":1000,"vacuum":true},"socket":null,"tasks_dir":null}` | no | Daemon defaults (overridable by CLI flags). |
-| `executor` | ExecutorSettings | `{"awaiting_input_quiet_ms":8000,"detect_awaiting_input":true,"keep_worktree":false,"max_concurrency":4,"max_output_bytes":262144,"parallel":false,"stale_run":"fail","worktree":true,"worktree_retention":{"days":30,"min_worktrees":0}}` | no | Task executor concurrency / isolation. |
+| `executor` | ExecutorSettings | `{"awaiting_input_quiet_ms":8000,"detect_awaiting_input":true,"keep_worktree":false,"max_concurrency":4,"max_output_bytes":262144,"parallel":false,"retry":{"backoff":"exponential","initial_ms":5000,"max_attempts":1,"max_ms":300000,"retry_on":["infrastructure","timeout"]},"stale_run":"fail","worktree":true,"worktree_retention":{"days":30,"min_worktrees":0}}` | no | Task executor concurrency / isolation. |
 | `git` | GitSettings | `{}` | no | Non-interactive git provisioning for agent processes. Defaults to `signing = "off"`, which forces `commit.gpgsign = false` so an agent commit can never block on an interactive pinentry/askpass prompt. |
 | `tui` | TuiSettings | `{"sound":{"enabled":true,"events":{"attention":"none","awaiting_input":"attention","task_failed":"failure","task_finished":"success","task_started":"none"},"min_interval_ms":400,"only_when_unfocused":false,"player":"auto"}}` | no | Client-side TUI settings. Ignored by the daemon, which reads the same file. |
 | `webhook` | WebhookSettings | `{"github":{"enabled":false,"rules":[]}}` | no | Webhook trigger rules (currently GitHub). |
@@ -75,6 +75,12 @@ is purely declarative for it.
 
 string
 
+## Backoff
+
+How the delay between automatic retry attempts grows.
+
+string
+
 ## DaemonSettings
 
 | Field | Type | Default | Required | Description |
@@ -102,10 +108,18 @@ serialized per working directory.
 | `max_concurrency` | integer | `4` | no | Maximum concurrent tasks when `parallel` is true. |
 | `max_output_bytes` | integer | `262144` | no | Cap on the stored `task.output` blob, in bytes (default 256 KiB). Longer output is truncated head+tail and flagged. |
 | `parallel` | boolean | `false` | no | Run multiple tasks at once (default false: one at a time). |
+| `retry` | RetrySettings | `{"backoff":"exponential","initial_ms":5000,"max_attempts":1,"max_ms":300000,"retry_on":["infrastructure","timeout"]}` | no | Automatic retry policy for retryable failures. Disabled by default. |
 | `stale_run` | StaleRunPolicy | `fail` | no | Startup policy for a task left in flight by a previous daemon: `"fail"` (default) marks it failed, `"retry"` re-enqueues it for a fresh attempt. |
 | `worktree` | boolean | `true` | no | Give each task its own `git worktree` when it runs in a repository. |
 | `worktree_dir` | string (optional) | — | no | Where worktrees are created: absolute, or relative to the repo root. Defaults to `<data_dir>/worktrees`. |
 | `worktree_retention` | WorktreeRetentionSettings | `{"days":30,"min_worktrees":0}` | no | Retention policy for worktrees left on disk. |
+
+## FailureKind
+
+Why a task ended in failure, so a controller can distinguish a genuine
+agent failure from an infrastructure fault.
+
+string
 
 ## GitSettings
 
@@ -196,6 +210,25 @@ of age. Set `days = 0` to opt out and keep everything forever.
 | `days` | integer | `30` | no | Delete rows older than this many days (0 = keep forever). |
 | `min_tasks` | integer | `1000` | no | Always keep at least this many newest task rows. |
 | `vacuum` | boolean | `true` | no | VACUUM + WAL checkpoint after a prune that deleted rows. |
+
+## RetrySettings
+
+Automatic retry policy for retryable task failures (`[executor.retry]`).
+
+Retries are opt-in: the default `max_attempts = 1` means a task runs exactly
+once. When enabled, after a failed attempt whose [`FailureKind`] is listed in
+`retry_on`, the executor re-enqueues the task for `attempt + 1` after the
+backoff, recording one run per attempt. Agent and invalid-input failures are
+excluded from the default `retry_on`, so a genuine failure is never retried
+on its own.
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `backoff` | Backoff | `exponential` | no | How the delay between attempts grows. |
+| `initial_ms` | integer | `5000` | no | Base delay before the second attempt, in milliseconds. |
+| `max_attempts` | integer | `1` | no | Total execution attempts allowed per task, including the first. `1` (default) disables automatic retries. |
+| `max_ms` | integer | `300000` | no | Upper bound on any single backoff delay, in milliseconds. |
+| `retry_on` | FailureKind[] | `["infrastructure","timeout"]` | no | Failure kinds eligible for automatic retry. Defaults to infrastructure and timeout faults; `agent` and `invalid_input` should stay out. |
 
 ## SoundSettings
 

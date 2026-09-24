@@ -617,6 +617,13 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
             }
         }
 
+        method::TASKS_RETRY => {
+            let p: TaskIdParams = parse_params(&req.method, &req.params)?;
+            retry_task(state, p.id)
+                .await
+                .map(|task| serde_json::json!(task))
+        }
+
         method::TASKS_START => {
             let p: TasksStartParams = parse_params(&req.method, &req.params)?;
             let input = p.input.unwrap_or(serde_json::Value::Null);
@@ -953,7 +960,7 @@ async fn inspect_workflow(state: &State, root_id: Uuid) -> Result<WorkflowInspec
             id: task.id,
             name: task.name.clone(),
             status: task.status,
-            attempt: 1,
+            attempt: task.attempt,
             summary: task.error.clone(),
         });
     }
@@ -1808,6 +1815,64 @@ fn upsert_hook(state: &Arc<State>, params: &serde_json::Value) -> anyhow::Result
     state.hook_store.write().push(hook);
     tracing::info!("added notification hook");
     Ok(())
+}
+
+/// Re-enqueue a terminal task for a fresh attempt, preserving its run history.
+///
+/// Rejected while a run is live: the task must be terminal and have no active
+/// run row. The next claim records `attempt + 1`; earlier runs remain in the
+/// history.
+async fn retry_task(state: &State, id: Uuid) -> Result<favetto_core::model::Task, RpcError> {
+    let task = match db::get_task(&state.db, id).await {
+        Ok(Some(task)) => task,
+        Ok(None) => return Err(RpcError::InvalidParams("task not found".to_string())),
+        Err(e) => return Err(RpcError::Internal(e.to_string())),
+    };
+    if let Ok(Some(run)) = db::get_active_task_run(&state.db, id).await {
+        return Err(RpcError::InvalidParams(format!(
+            "task '{}' still has a live run (attempt {})",
+            task.name, run.attempt
+        )));
+    }
+    if !crate::executor::is_terminal(task.status) {
+        return Err(RpcError::InvalidParams(format!(
+            "task '{}' is not terminal (status '{}')",
+            task.name,
+            task.status.as_str()
+        )));
+    }
+    match db::requeue_terminal_task(&state.db, id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(RpcError::InvalidParams(format!(
+                "task '{}' could not be re-enqueued",
+                task.name
+            )))
+        }
+        Err(e) => return Err(RpcError::Internal(e.to_string())),
+    }
+
+    let fresh = match db::get_task(&state.db, id).await {
+        Ok(Some(task)) => task,
+        Ok(None) => {
+            return Err(RpcError::Internal(
+                "task disappeared after retry".to_string(),
+            ))
+        }
+        Err(e) => return Err(RpcError::Internal(e.to_string())),
+    };
+    state
+        .bus
+        .publish(crate::event_bus::ServerPush::TaskUpdated(Box::new(
+            fresh.summary(),
+        )));
+    state
+        .emit_event(
+            favetto_core::model::EventKind::TaskIdle,
+            serde_json::json!({ "name": fresh.name, "task_id": fresh.id }),
+        )
+        .await;
+    Ok(fresh.summary())
 }
 
 /// Mark a task cancelled, persist it, and announce the change.

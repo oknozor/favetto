@@ -27,6 +27,7 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | `tasks.list` | List tasks (metadata only; output is omitted). |
 | `tasks.get` | Fetch a single task by id, including its stored output. |
 | `tasks.cancel` | Cancel a task. |
+| `tasks.retry` | Retry a terminal task, preserving its prior run history. |
 | `tasks.start` | Start a catalog task by name. |
 | `tasks.start_oneshot` | Start a one-shot task from an inline definition (not added to the catalog) and open its interactive agent session. |
 | `catalog.list` | List the task catalog. |

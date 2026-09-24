@@ -1075,6 +1075,131 @@ async fn claim_task_advances_the_attempt_for_a_retry() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An automatic retry re-enqueues a failed task but keeps it out of the dispatch
+/// set until `retry_at`; claiming it then records the next attempt as a new run.
+#[tokio::test]
+async fn schedule_task_retry_defers_dispatch_until_the_deadline() {
+    let (dir, pool) = scratch_pool("schedule-retry").await;
+
+    let mut future = task_at(Utc::now(), Some(Utc::now()), None);
+    future.status = TaskStatus::Failed;
+    future.attempt = 1;
+    future.error = Some("PTY died".to_string());
+    future.failure = Some(Failure::new(FailureKind::Infrastructure, "PTY died"));
+    upsert_task(&pool, &future).await.unwrap();
+    // A failed run from the first attempt.
+    let mut first_run = run_at(future.id, 1);
+    first_run.status = RunStatus::Failed;
+    insert_task_run(&pool, &first_run).await.unwrap();
+
+    let mut ready = future.clone();
+    ready.id = Uuid::new_v4();
+    upsert_task(&pool, &ready).await.unwrap();
+
+    assert!(
+        schedule_task_retry(&pool, future.id, Utc::now() + ChronoDuration::seconds(60))
+            .await
+            .unwrap()
+    );
+    assert!(
+        schedule_task_retry(&pool, ready.id, Utc::now() - ChronoDuration::seconds(1))
+            .await
+            .unwrap()
+    );
+
+    // The outcome is cleared but the attempt is untouched until the claim.
+    let stored = get_task(&pool, future.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Pending);
+    assert!(stored.error.is_none() && stored.failure.is_none());
+    assert_eq!(stored.attempt, 1);
+
+    // Only the task whose deadline has passed is dispatchable.
+    let pending = next_pending_tasks(&pool, 10).await.unwrap();
+    let ids: Vec<Uuid> = pending.iter().map(|t| t.id).collect();
+    assert_eq!(ids, vec![ready.id]);
+
+    // Claiming the deferred task records attempt 2 as a second run.
+    let run = claim_task(&pool, &pending[0]).await.unwrap().unwrap();
+    assert_eq!(run.attempt, 2);
+    let runs = list_task_runs(&pool, ready.id).await.unwrap();
+    assert_eq!(runs.len(), 1, "claim records exactly one run");
+    let stored = get_task(&pool, future.id).await.unwrap().unwrap();
+    assert_eq!(
+        stored.status,
+        TaskStatus::Pending,
+        "still waiting out its backoff"
+    );
+
+    // Only a failed row can be scheduled: a second attempt is a no-op.
+    assert!(!schedule_task_retry(&pool, future.id, Utc::now())
+        .await
+        .unwrap());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A manual retry re-enqueues a terminal task, keeps its run history, and is
+/// rejected while the task is still active.
+#[tokio::test]
+async fn requeue_terminal_task_is_conditional_on_a_terminal_status() {
+    let (dir, pool) = scratch_pool("requeue-terminal").await;
+
+    let mut failed = task_at(
+        Utc::now(),
+        Some(Utc::now()),
+        Some(serde_json::json!({ "old": true })),
+    );
+    failed.status = TaskStatus::Failed;
+    failed.attempt = 2;
+    failed.error = Some("boom".to_string());
+    failed.failure = Some(Failure::new(FailureKind::Agent, "boom"));
+    upsert_task(&pool, &failed).await.unwrap();
+    insert_task_run(&pool, &run_at(failed.id, 1)).await.unwrap();
+    let mut second = run_at(failed.id, 2);
+    second.status = RunStatus::Failed;
+    insert_task_run(&pool, &second).await.unwrap();
+
+    assert!(requeue_terminal_task(&pool, failed.id).await.unwrap());
+    let stored = get_task(&pool, failed.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Pending);
+    assert_eq!(
+        stored.attempt, 2,
+        "a manual retry does not reset the attempt"
+    );
+    assert!(stored.output.is_none() && stored.error.is_none() && stored.failure.is_none());
+    assert_eq!(
+        list_task_runs(&pool, failed.id).await.unwrap().len(),
+        2,
+        "run history is preserved"
+    );
+    // Not terminal any more: a second call is a no-op.
+    assert!(!requeue_terminal_task(&pool, failed.id).await.unwrap());
+
+    let mut running = task_at(Utc::now(), None, None);
+    running.status = TaskStatus::Running;
+    upsert_task(&pool, &running).await.unwrap();
+    assert!(!requeue_terminal_task(&pool, running.id).await.unwrap());
+
+    let mut pending = task_at(Utc::now(), None, None);
+    pending.status = TaskStatus::Pending;
+    upsert_task(&pool, &pending).await.unwrap();
+    assert!(!requeue_terminal_task(&pool, pending.id).await.unwrap());
+
+    // A succeeded or cancelled task can also be retried.
+    for status in [TaskStatus::Succeeded, TaskStatus::Cancelled] {
+        let mut task = task_at(Utc::now(), Some(Utc::now()), None);
+        task.status = status;
+        upsert_task(&pool, &task).await.unwrap();
+        assert!(requeue_terminal_task(&pool, task.id).await.unwrap());
+        assert_eq!(
+            get_task(&pool, task.id).await.unwrap().unwrap().status,
+            TaskStatus::Pending
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn prune_cascades_task_runs() {
     let (dir, pool) = scratch_pool("prune-runs").await;

@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     session_title TEXT,
     parent_id   TEXT,
     root_id     TEXT,
-    interactive INTEGER NOT NULL DEFAULT 0
+    interactive INTEGER NOT NULL DEFAULT 0,
+    retry_at    INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -175,6 +176,12 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     // Per-attempt execution counter. Legacy rows default to 0 attempts; the next
     // claim records attempt 1.
     let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0")
+        .execute(pool)
+        .await;
+    // Earliest wall-clock time a re-enqueued task may be claimed again. NULL for
+    // every ordinary task; set by the automatic-retry path so the executor can
+    // honor the backoff without a sleeping task per retry.
+    let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN retry_at INTEGER")
         .execute(pool)
         .await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_tasks_root_id ON tasks(root_id)")
@@ -654,8 +661,48 @@ pub async fn fail_stale_task(
 pub async fn retry_stale_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<bool> {
     let result = sqlx::query(
         "UPDATE tasks SET status = 'pending', started_at = NULL, finished_at = NULL, \
-             error = NULL, failure = NULL \
+             error = NULL, failure = NULL, retry_at = NULL \
          WHERE id = ? AND status IN ('running', 'awaiting_input')",
+    )
+    .bind(id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Re-enqueue a failed task for the next automatic attempt after `retry_at`.
+///
+/// Flips the row back to `pending` and clears the just-finished attempt's
+/// outcome (and its `retry_at`), so the dispatcher claims it once the backoff
+/// deadline passes and records a fresh run under `attempt + 1`. Only a currently
+/// `failed` row is touched, so a concurrent cancellation/manual retry wins.
+/// Returns whether a row changed.
+pub async fn schedule_task_retry(
+    pool: &SqlitePool,
+    id: Uuid,
+    retry_at: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        "UPDATE tasks SET status = 'pending', started_at = NULL, finished_at = NULL, \
+             error = NULL, failure = NULL, output = NULL, retry_at = ? \
+         WHERE id = ? AND status = 'failed'",
+    )
+    .bind(ts_ms(retry_at))
+    .bind(id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Re-enqueue a terminal (`succeeded`/`failed`/`cancelled`) task for a manual
+/// retry. Keeps the previous attempt's run history; the next claim records
+/// `attempt + 1`. Clears the outcome fields and any pending retry deadline.
+/// Returns whether a row changed.
+pub async fn requeue_terminal_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        "UPDATE tasks SET status = 'pending', started_at = NULL, finished_at = NULL, \
+             error = NULL, failure = NULL, output = NULL, retry_at = NULL \
+         WHERE id = ? AND status IN ('succeeded', 'failed', 'cancelled')",
     )
     .bind(id.to_string())
     .execute(pool)
@@ -696,6 +743,7 @@ pub async fn next_pending_tasks(pool: &SqlitePool, limit: i64) -> anyhow::Result
         "SELECT t.id, t.name, t.status, t.attempt, t.input, t.dedupe_key, t.created_at, t.started_at, t.finished_at, t.error, t.failure, t.session_id, t.session_title, t.parent_id, t.root_id, t.interactive \
          FROM tasks t \
          WHERE t.status = 'pending' \
+           AND (t.retry_at IS NULL OR t.retry_at <= ?) \
            AND NOT EXISTS ( \
                SELECT 1 FROM task_dependencies d \
                JOIN tasks p ON p.id = d.depends_on \
@@ -704,6 +752,7 @@ pub async fn next_pending_tasks(pool: &SqlitePool, limit: i64) -> anyhow::Result
            ) \
          ORDER BY t.created_at ASC LIMIT ?",
     )
+    .bind(ts_ms(Utc::now()))
     .bind(limit.max(1))
     .fetch_all(pool)
     .await?;
@@ -722,7 +771,7 @@ pub async fn claim_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<Option
     let attempt = task.attempt + 1;
     let mut tx = pool.begin().await?;
     let result = sqlx::query(
-        "UPDATE tasks SET status = 'running', started_at = ?, attempt = ? \
+        "UPDATE tasks SET status = 'running', started_at = ?, attempt = ?, retry_at = NULL \
          WHERE id = ? AND status = 'pending'",
     )
     .bind(ts_ms(now))
