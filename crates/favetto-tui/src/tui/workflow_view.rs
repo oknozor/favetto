@@ -15,7 +15,8 @@ use crate::workflow::{WorkflowEdgeKind, WorkflowGraph};
 /// Render `graph` as box-drawing text (one entry per output row).
 ///
 /// Node labels carry the `(external)`/`(scheduled)` suffixes; edge labels are
-/// `spawn`/`needs`. Returns `Err` only when an edge references an unknown node,
+/// `spawn`/`needs`/`needs:succeeded`/`needs:failed`/`join`. Returns `Err` only
+/// when an edge references an unknown node,
 /// which [`crate::workflow::build_graph`] never produces — the caller then
 /// falls back to raw DOT.
 pub fn render(graph: &WorkflowGraph) -> Result<String, String> {
@@ -51,6 +52,8 @@ pub fn render(graph: &WorkflowGraph) -> Result<String, String> {
         let label = match edge.kind {
             WorkflowEdgeKind::Spawn => "spawn",
             WorkflowEdgeKind::Needs => "needs",
+            WorkflowEdgeKind::NeedsSucceeded => "needs:succeeded",
+            WorkflowEdgeKind::NeedsFailed => "needs:failed",
             WorkflowEdgeKind::Join => "join",
         };
         dag.add_edge(from, to, Some(label));
@@ -130,6 +133,20 @@ mod tests {
         };
         let text = render(&graph).unwrap();
         assert!(text.contains("join"), "{text}");
+    }
+
+    #[test]
+    fn render_labels_outcome_edges() {
+        let graph = WorkflowGraph {
+            nodes: vec![node("a"), node("ok"), node("bad")],
+            edges: vec![
+                edge("a", "ok", WorkflowEdgeKind::NeedsSucceeded),
+                edge("a", "bad", WorkflowEdgeKind::NeedsFailed),
+            ],
+        };
+        let text = render(&graph).unwrap();
+        assert!(text.contains("needs:succeeded"), "{text}");
+        assert!(text.contains("needs:failed"), "{text}");
     }
 
     #[test]

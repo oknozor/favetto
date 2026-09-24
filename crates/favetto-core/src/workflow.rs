@@ -2,11 +2,12 @@
 //!
 //! Nodes are catalog tasks. Edges: `spawn = "child"` → parent→child (solid,
 //! labelled `spawn`); `needs = "other:finished"` → other→this (dashed, labelled
-//! `needs`, source resolved by stripping the suffix after `:`);
-//! `needs = "other:all_finished"` → other→this (dashed, labelled `join`) as a
-//! distinct fan-in edge. Isolated tasks are still nodes; references to names
-//! absent from the catalog become dashed "external" nodes; `schedule` marks a
-//! node with `peripheries=2`.
+//! `needs`, source resolved by stripping the suffix after `:`); the outcome
+//! conditions `other:succeeded` / `other:failed` are dashed edges labelled
+//! `needs:succeeded` / `needs:failed`; `needs = "other:all_finished"` →
+//! other→this (dashed, labelled `join`) as a distinct fan-in edge. Isolated
+//! tasks are still nodes; references to names absent from the catalog become
+//! dashed "external" nodes; `schedule` marks a node with `peripheries=2`.
 //!
 //! `build_dot` is pure and deterministic: task order does not affect the output.
 
@@ -37,13 +38,18 @@ pub struct WorkflowNode {
 }
 
 /// The edge kinds: `spawn = "child"` is [`Spawn`](Self::Spawn),
-/// `needs = "other:finished"` is [`Needs`](Self::Needs), and the root-scoped
-/// fan-in `needs = "other:all_finished"` is [`Join`](Self::Join).
+/// `needs = "other:finished"` (or its alias `:terminal`) is
+/// [`Needs`](Self::Needs), `needs = "other:succeeded"` is
+/// [`NeedsSucceeded`](Self::NeedsSucceeded), `needs = "other:failed"` is
+/// [`NeedsFailed`](Self::NeedsFailed), and the root-scoped fan-in
+/// `needs = "other:all_finished"` is [`Join`](Self::Join).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum WorkflowEdgeKind {
     Spawn,
     Needs,
+    NeedsSucceeded,
+    NeedsFailed,
     Join,
 }
 
@@ -170,6 +176,8 @@ pub fn build_graph(tasks: &[TaskDef]) -> WorkflowGraph {
                 to: def.name.clone(),
                 kind: match kind {
                     NeedsKind::Finished => WorkflowEdgeKind::Needs,
+                    NeedsKind::Succeeded => WorkflowEdgeKind::NeedsSucceeded,
+                    NeedsKind::Failed => WorkflowEdgeKind::NeedsFailed,
                     NeedsKind::AllFinished => WorkflowEdgeKind::Join,
                 },
             });
@@ -213,6 +221,16 @@ pub fn build_dot(tasks: &[TaskDef]) -> String {
             WorkflowEdgeKind::Needs => {
                 out.push_str(&format!(
                     "  \"{from}\" -> \"{to}\" [label=\"needs\", style=dashed];\n"
+                ));
+            }
+            WorkflowEdgeKind::NeedsSucceeded => {
+                out.push_str(&format!(
+                    "  \"{from}\" -> \"{to}\" [label=\"needs:succeeded\", style=dashed];\n"
+                ));
+            }
+            WorkflowEdgeKind::NeedsFailed => {
+                out.push_str(&format!(
+                    "  \"{from}\" -> \"{to}\" [label=\"needs:failed\", style=dashed];\n"
                 ));
             }
             WorkflowEdgeKind::Join => {
@@ -283,6 +301,13 @@ mod tests {
             vars: Vec::new(),
             prompt: String::new(),
         }
+    }
+
+    /// A minimal task with the given `needs` value.
+    fn needs_task(name: &str, needs: &str) -> TaskDef {
+        let mut t = task(name);
+        t.needs = Some(needs.to_string());
+        t
     }
 
     /// A unique scratch directory for workflow tests.
@@ -361,6 +386,75 @@ mod tests {
                 kind: WorkflowEdgeKind::Join,
             }]
         );
+    }
+
+    #[test]
+    fn outcome_needs_edges_are_distinct_and_labelled() {
+        let tasks = vec![
+            task("a"),
+            needs_task("bad", "a:failed"),
+            needs_task("either", "a:terminal"),
+            needs_task("ok", "a:succeeded"),
+        ];
+
+        // `:terminal` is an alias for `:finished` (`Needs`); `:succeeded` and
+        // `:failed` get their own edge kinds.
+        let graph = build_graph(&tasks);
+        assert_eq!(
+            graph.edges,
+            vec![
+                WorkflowEdge {
+                    from: "a".to_string(),
+                    to: "bad".to_string(),
+                    kind: WorkflowEdgeKind::NeedsFailed,
+                },
+                WorkflowEdge {
+                    from: "a".to_string(),
+                    to: "either".to_string(),
+                    kind: WorkflowEdgeKind::Needs,
+                },
+                WorkflowEdge {
+                    from: "a".to_string(),
+                    to: "ok".to_string(),
+                    kind: WorkflowEdgeKind::NeedsSucceeded,
+                },
+            ]
+        );
+
+        let dot = build_dot(&tasks);
+        assert!(
+            dot.contains("  \"a\" -> \"bad\" [label=\"needs:failed\", style=dashed];"),
+            "{dot}"
+        );
+        assert!(
+            dot.contains("  \"a\" -> \"ok\" [label=\"needs:succeeded\", style=dashed];"),
+            "{dot}"
+        );
+        assert!(
+            dot.contains("  \"a\" -> \"either\" [label=\"needs\", style=dashed];"),
+            "{dot}"
+        );
+        // The suffixes are stripped from the resolved source node names.
+        assert!(!dot.contains("\"a:succeeded\""), "{dot}");
+        assert!(!dot.contains("\"a:failed\""), "{dot}");
+        assert!(!dot.contains("terminal"), "{dot}");
+    }
+
+    #[test]
+    fn edge_kind_wire_names_are_stable() {
+        for (kind, wire) in [
+            (WorkflowEdgeKind::Spawn, "spawn"),
+            (WorkflowEdgeKind::Needs, "needs"),
+            (WorkflowEdgeKind::NeedsSucceeded, "needs_succeeded"),
+            (WorkflowEdgeKind::NeedsFailed, "needs_failed"),
+            (WorkflowEdgeKind::Join, "join"),
+        ] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), serde_json::json!(wire));
+            assert_eq!(
+                serde_json::from_value::<WorkflowEdgeKind>(serde_json::json!(wire)).unwrap(),
+                kind
+            );
+        }
     }
 
     #[test]
