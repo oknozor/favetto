@@ -1575,3 +1575,98 @@ fn scrolling_body_layout_clamps_scroll() {
     assert!(scroll + viewport > 39);
     assert!(scroll <= 40 - viewport);
 }
+
+fn usage_stats_for(period: UsagePeriod) -> favetto_core::model::UsageStats {
+    use favetto_core::model::{AgentUsage, UsageBucket, UsageStats, UsageTotals};
+
+    let start = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+    let bucket = |offset: i64, input: u64, cost: Option<f64>| UsageBucket {
+        start: start + chrono::Duration::hours(offset),
+        end: start + chrono::Duration::hours(offset + 1),
+        usage: AgentUsage {
+            input_tokens: input,
+            output_tokens: input / 2,
+            cost_usd: cost,
+            ..Default::default()
+        },
+        runs: 1,
+    };
+    UsageStats {
+        period,
+        totals: UsageTotals {
+            usage: AgentUsage {
+                input_tokens: 1500,
+                output_tokens: 250,
+                cost_usd: Some(0.5),
+                ..Default::default()
+            },
+            runs: 2,
+        },
+        buckets: vec![bucket(0, 1000, Some(0.25)), bucket(1, 500, Some(0.25))],
+    }
+}
+
+#[test]
+fn usage_tab_renders_totals_and_charts_for_every_period() {
+    for period in UsagePeriod::ALL {
+        let mut app = App::new();
+        app.tab = Tab::Usage;
+        app.usage_period = period;
+        app.usage_stats = Some(usage_stats_for(period));
+        let text = render_text(&mut app, 110, 30);
+        assert!(text.contains("Usage"), "{period:?}: {text:?}");
+        assert!(text.contains(period.label()), "{period:?}: {text:?}");
+        assert!(text.contains("Runs: 2"), "{period:?}: {text:?}");
+        assert!(text.contains("Tokens:"), "{period:?}: {text:?}");
+        assert!(text.contains("(in 1.5k · out 250)"), "{period:?}: {text:?}");
+        assert!(text.contains("$0.5000"), "{period:?}: {text:?}");
+        assert!(text.contains("Tokens "), "{period:?}: {text:?}");
+        assert!(text.contains("Cost (USD)"), "{period:?}: {text:?}");
+    }
+}
+
+#[test]
+fn usage_tab_labels_each_bucket_by_period() {
+    // Year labels are month abbreviations; day labels are hours.
+    let mut app = App::new();
+    app.tab = Tab::Usage;
+    app.usage_period = UsagePeriod::Year;
+    app.usage_stats = Some(usage_stats_for(UsagePeriod::Year));
+    let text = render_text(&mut app, 110, 30);
+    assert!(text.contains("Nov"), "year bucket label missing: {text:?}");
+
+    app.usage_period = UsagePeriod::Day;
+    app.usage_stats = Some(usage_stats_for(UsagePeriod::Day));
+    let text = render_text(&mut app, 110, 30);
+    assert!(text.contains(" per hour"), "day unit missing: {text:?}");
+}
+
+#[test]
+fn usage_tab_shows_loading_then_fetch_error() {
+    let mut app = App::new();
+    app.tab = Tab::Usage;
+    let text = render_text(&mut app, 100, 20);
+    assert!(text.contains("Loading usage"), "{text:?}");
+
+    app.set_usage_error("usage.stats failed: boom".to_string());
+    let text = render_text(&mut app, 100, 20);
+    assert!(text.contains("boom"), "{text:?}");
+}
+
+#[test]
+fn usage_formatting_helpers_are_compact_and_guarded() {
+    assert_eq!(short_tokens(0), "0");
+    assert_eq!(short_tokens(999), "999");
+    assert_eq!(short_tokens(1_234), "1.2k");
+    assert_eq!(short_tokens(2_500_000), "2.5M");
+
+    assert_eq!(format_cost(None), "$0");
+    assert_eq!(format_cost(Some(0.0)), "$0");
+    assert_eq!(format_cost(Some(0.0312)), "$0.0312");
+    assert_eq!(cost_bar_value(None), 0);
+    assert_eq!(cost_bar_value(Some(0.5)), 500_000);
+
+    let start = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+    assert_eq!(bucket_label(UsagePeriod::Year, start).len(), 3);
+    assert_eq!(bucket_label(UsagePeriod::Day, start).len(), 2);
+}

@@ -56,6 +56,7 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | `notifications.list` | List recent notifications. |
 | `notifications.test` | Send a test notification through a channel. |
 | `hooks.upsert` | Add a notification hook reacting to an event kind. |
+| `usage.stats` | Aggregate persisted per-run token/cost usage into a per-bucket series (day/week/month/year) plus window totals. |
 
 ## Client → server request & response types
 
@@ -738,6 +739,24 @@ Add a notification hook reacting to an event kind.
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
 | `added` | boolean | — | yes |  |
+
+### `usage.stats`
+
+Aggregate persisted per-run token/cost usage into a per-bucket series (day/week/month/year) plus window totals.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `period` | UsagePeriod (optional) | null | no |  |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `buckets` | UsageBucket[] | — | yes | Oldest bucket first. Empty buckets are included so the TUI chart always has a fixed number of points for the selected period. |
+| `period` | UsagePeriod | — | yes |  |
+| `totals` | UsageTotals | — | yes |  |
 
 ## Server → client pushes
 

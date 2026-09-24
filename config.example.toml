@@ -109,8 +109,11 @@ tasks_dir = "tasks"
 
 # Bounded database growth. This is the one setting that deletes data: at daemon
 # startup and every six hours, rows older than `days` are pruned and the database
-# is optionally VACUUM'd. The newest `min_tasks` task rows always survive. Set
-# days = 0 to keep everything forever.
+# is optionally VACUUM'd. The newest `min_tasks` task rows always survive. Pruning
+# first clears old `output` blobs (keeping metadata); per-run token/cost usage is
+# stored separately on task_runs, so it survives that pass and stays available to
+# `usage.stats` until the task row itself is deleted. Set days = 0 to keep
+# everything forever.
 [daemon.retention]
 days = 30          # delete rows older than this many days (0 = keep forever)
 min_tasks = 1000   # always keep the newest N task rows

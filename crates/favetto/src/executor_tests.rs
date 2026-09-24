@@ -213,11 +213,13 @@ fn running_run(task_id: Uuid) -> TaskRun {
         attempt: 1,
         status: RunStatus::Running,
         agent: None,
+        model: None,
         session_id: None,
         started_at: Some(Utc::now()),
         finished_at: None,
         exit_code: None,
         error: None,
+        usage: None,
         failure: None,
     }
 }
@@ -232,6 +234,7 @@ fn failed_run_preserves_session_info() {
             session_id: Some("ses_1".to_string()),
             session_title: Some("Fix the widget".to_string()),
             exit_code: None,
+            usage: None,
             failure: Some(Failure::new(FailureKind::Agent, "exit 1")),
             alive: false,
         }),
@@ -261,6 +264,7 @@ fn successful_run_records_output_and_session() {
             session_id: Some("ses_1".to_string()),
             session_title: Some("Fix the widget".to_string()),
             exit_code: None,
+            usage: None,
             failure: None,
             alive: false,
         }),
@@ -273,6 +277,40 @@ fn successful_run_records_output_and_session() {
     assert!(task.error.is_none());
     // A successful run clears a failure left by an earlier attempt.
     assert!(task.failure.is_none());
+}
+
+#[test]
+fn reported_usage_prefers_structured_output_then_live_state() {
+    let live = AgentUsage {
+        input_tokens: 7,
+        cost_usd: Some(0.01),
+        ..Default::default()
+    };
+
+    // Structured `RunSummary.usage` wins over the live fallback.
+    let summary = serde_json::to_value(RunSummary {
+        usage: AgentUsage {
+            input_tokens: 3,
+            output_tokens: 2,
+            cost_usd: Some(0.5),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .unwrap();
+    let got = reported_usage(&summary, Some(live.clone())).expect("structured usage");
+    assert_eq!(got.input_tokens, 3);
+    assert_eq!(got.output_tokens, 2);
+
+    // No structured usage: fall back to the folded live state.
+    let got = reported_usage(&serde_json::json!({ "text": "hi" }), Some(live)).expect("live usage");
+    assert_eq!(got.input_tokens, 7);
+
+    // Nothing reported anywhere: stored as `None`.
+    assert_eq!(
+        reported_usage(&serde_json::json!({ "text": "hi" }), None),
+        None
+    );
 }
 
 #[test]
@@ -307,6 +345,7 @@ fn vanished_session_is_infrastructure() {
             session_id: None,
             session_title: None,
             exit_code: None,
+            usage: None,
             failure: Some(Failure::new(
                 FailureKind::Infrastructure,
                 "agent 'opencode' session disappeared",
@@ -508,6 +547,7 @@ fn terminal_outcome_overrides_awaiting_input_status() {
             session_id: None,
             session_title: None,
             exit_code: None,
+            usage: None,
             failure: None,
             alive: false,
         }),
@@ -524,6 +564,7 @@ fn terminal_outcome_overrides_awaiting_input_status() {
             session_id: None,
             session_title: None,
             exit_code: None,
+            usage: None,
             failure: Some(Failure::new(FailureKind::Agent, "exit 1")),
             alive: false,
         }),
@@ -1487,6 +1528,10 @@ async fn run_one_binds_and_persists_a_deterministic_session_id() {
     assert_eq!(runs[0].attempt, 1);
     assert_eq!(runs[0].session_id.as_deref(), Some(sid.as_str()));
     assert_eq!(runs[0].exit_code, Some(0));
+    // The agent that ran is recorded so usage can be attributed (#213).
+    assert_eq!(runs[0].agent.as_deref(), Some("seedy"));
+    assert!(runs[0].model.is_none());
+    assert!(runs[0].usage.is_none());
 
     let _ = std::fs::remove_dir_all(&dir);
 }

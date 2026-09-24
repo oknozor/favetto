@@ -651,6 +651,15 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
             }
         }
 
+        method::USAGE_STATS => {
+            let p: UsageStatsParams = parse_params(&req.method, &req.params)?;
+            let period = p.period.unwrap_or_default();
+            match db::usage_stats(&state.db, period, Utc::now()).await {
+                Ok(stats) => to_value(stats),
+                Err(e) => Err(RpcError::Internal(e.to_string())),
+            }
+        }
+
         _ => Err(RpcError::MethodNotFound(format!(
             "unknown method: {}",
             req.method

@@ -55,6 +55,10 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 | Catalog | `p` | show/hide the preview pane |
 | Catalog | `PageUp` / `PageDown` / wheel | scroll the preview pane |
 | Events | `PageUp` / `PageDown` | move the selection by a page |
+| Usage | `1` | day buckets (last 24 hours) |
+| Usage | `2` | week buckets (last 7 days) |
+| Usage | `3` | month buckets (last 30 days) |
+| Usage | `4` | year buckets (last 12 months) |
 | Agent | `Ctrl+Y` | toggle focus: agent ↔ favetto |
 | Agent | *(agent focus)* | every key is forwarded to the agent |
 | Agent | *(favetto focus)* `Ctrl+O` | switch to another session |
@@ -214,6 +218,32 @@ syntax highlighting.
 ![favetto TUI — Events tab](/screenshots/tui-events.png)
 
 *The Events tab with the payload panel.*
+
+## Usage panel
+
+The **Usage** tab shows where tokens and money went. Each finished attempt
+persists its `AgentUsage` (input/output/reasoning/cache tokens and cost) in flat
+columns on its run row, independent of the `tasks.output` blob, so the data
+survives the retention pass that clears old output. The panel calls the typed
+`usage.stats` RPC, which aggregates finished runs into a fixed number of time
+buckets plus window totals (runs, tokens, cost).
+
+Press **1**–**4** to pick the period; the panel re-fetches and the charts and
+labels update:
+
+| Key | Period | Buckets | Window |
+|-----|--------|---------|--------|
+| `1` | Day | hourly | last 24 hours |
+| `2` | Week | daily | last 7 days |
+| `3` | Month | daily | last 30 days |
+| `4` | Year | monthly | last 12 calendar months |
+
+The header summarises run count, total tokens (with the input/output split) and
+total cost for the window. Below it, a **Tokens** `BarChart` and a separate
+**Cost (USD)** `BarChart` render one bar per bucket (different units read better
+as two charts); empty buckets are still drawn so the axis stays stable. Costs
+are shown to four decimal places. Attaching to the tab, changing the period, or
+a `task.updated` push all refresh the view.
 
 ## Theme
 

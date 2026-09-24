@@ -25,7 +25,8 @@ use tokio::sync::{OwnedMutexGuard, Semaphore};
 use uuid::Uuid;
 
 use favetto_core::model::{
-    Event, EventKind, Failure, FailureKind, RunStatus, Task, TaskRun, TaskStatus,
+    AgentUsage, Event, EventKind, Failure, FailureKind, RunStatus, RunSummary, Task, TaskRun,
+    TaskStatus,
 };
 
 use crate::agents::{resolve_session_title, Agent, TITLE_POLL_ATTEMPTS, TITLE_POLL_INTERVAL};
@@ -44,6 +45,8 @@ struct RunOutcome {
     session_title: Option<String>,
     /// The agent process exit code, when one was observed. Recorded on the run.
     exit_code: Option<i32>,
+    /// Token/cost usage the agent reported for the run, when any.
+    usage: Option<AgentUsage>,
     /// `Some` for a non-zero exit / vanished session / failed turn.
     failure: Option<Failure>,
     /// The interactive TUI process is still alive after its turn finished. Its
@@ -98,6 +101,23 @@ fn record_run_outcome(task: &mut Task, outcome: Result<RunOutcome, RunError>) ->
             false
         }
     }
+}
+
+/// Recover the token/cost usage a finished run reported. Structured agents embed
+/// their folded [`RunSummary`] in `output`, so prefer its `usage`; interactive
+/// runs have no machine output, so fall back to the folded live-state usage
+/// (`live`). Returns `None` when nothing was reported, so a run with no usage
+/// stores NULL and stays out of `SUM(...)`.
+fn reported_usage(output: &serde_json::Value, live: Option<AgentUsage>) -> Option<AgentUsage> {
+    let mut usage = serde_json::from_value::<RunSummary>(output.clone())
+        .map(|summary| summary.usage)
+        .unwrap_or_default();
+    if usage.is_empty() {
+        if let Some(live) = live {
+            usage = live;
+        }
+    }
+    (!usage.is_empty()).then_some(usage)
 }
 
 /// Persist an automatic retry for a failed attempt and announce the re-enqueue.
@@ -591,6 +611,8 @@ async fn run_one(
     let session_alive = matches!(&outcome, Ok(run) if run.alive)
         || state.agents.has_live_interactive(&task.id.to_string());
     let exit_code = outcome.as_ref().ok().and_then(|run| run.exit_code);
+    // Take the reported usage out before `record_run_outcome` consumes the outcome.
+    let usage = outcome.as_ref().ok().and_then(|run| run.usage.clone());
     let success = record_run_outcome(&mut task, outcome);
     task.finished_at = Some(Utc::now());
 
@@ -622,6 +644,11 @@ async fn run_one(
     finished_run.exit_code = exit_code;
     finished_run.error = task.error.clone();
     finished_run.failure = task.failure.clone();
+    // Attribute the run and persist its per-attempt usage. `agent_name` was
+    // resolved above; `model` is the task's configured model, if any.
+    finished_run.agent = agent_name.clone();
+    finished_run.model = def.model.clone();
+    finished_run.usage = usage;
     let _ = db::finalize_task_run(&state.db, &finished_run).await;
 
     if !finished {
@@ -1318,11 +1345,21 @@ async fn run_agent_task(
             format!("agent '{agent_name}' session disappeared"),
         )),
     };
+    // Structured agents serialize their folded `RunSummary` into `result.output`;
+    // recover its usage from there. Interactive runs carry a TUI screen rather
+    // than machine output, so fall back to the folded live state observed while
+    // the run was in progress. A run that reported nothing stays `None`.
+    let live_usage = state
+        .agents
+        .find_latest_by_task(&task.id.to_string())
+        .and_then(|session| session.usage);
+    let usage = reported_usage(&result.output, live_usage);
     Ok(RunOutcome {
         output,
         session_id: result.session_id,
         session_title,
         exit_code: result.exit_code,
+        usage,
         failure,
         alive: interactive && turn_finished,
     })

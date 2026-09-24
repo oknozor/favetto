@@ -5,11 +5,12 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, TableState, Tabs, Wrap,
+    Bar, BarChart, Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, TableState,
+    Tabs, Wrap,
 };
 use ratatui::Frame;
 
-use favetto_core::model::{AgentSessionInfo, FailureKind, Task, TaskStatus};
+use favetto_core::model::{AgentSessionInfo, FailureKind, Task, TaskStatus, UsagePeriod};
 use favetto_core::workflow::{WorkflowInspect, WorkflowState};
 
 use super::app::{
@@ -71,6 +72,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Tab::Events => draw_events(frame, app, chunks[1], theme),
         Tab::Scheduler => draw_schedules(frame, app, chunks[1], theme),
         Tab::Notifications => draw_notifications(frame, app, chunks[1], theme),
+        Tab::Usage => draw_usage(frame, app, chunks[1], theme),
     }
 
     draw_status(frame, app, chunks[2], theme);
@@ -819,6 +821,13 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         &[("PageUp / PageDown", "move the selection by a page")],
     ),
     (
+        "Usage tab",
+        &[
+            ("1 / 2 / 3 / 4", "day / week / month / year"),
+            ("Tab / ←/→", "switch tabs; re-fetches on focus"),
+        ],
+    ),
+    (
         "Agent tab",
         &[
             ("Ctrl+Y", "toggle focus: agent ↔ favetto"),
@@ -1466,6 +1475,172 @@ fn draw_notifications(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme
         offset: state.offset(),
         len,
     };
+}
+
+/// Draw the Usage tab: window totals plus a token and a cost `BarChart`, one bar
+/// per bucket for the selected period.
+fn draw_usage(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
+    let period = app.usage_period;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(
+            " Usage — {} per {} · 1 Day  2 Week  3 Month  4 Year ",
+            period.label(),
+            period.bucket_unit()
+        ))
+        .border_style(theme.block(false));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let Some(stats) = app.usage_stats.as_ref() else {
+        let message = app
+            .usage_error
+            .clone()
+            .unwrap_or_else(|| "Loading usage…".to_string());
+        frame.render_widget(
+            Paragraph::new(message)
+                .style(theme.base())
+                .wrap(Wrap { trim: true }),
+            inner,
+        );
+        return;
+    };
+
+    let chunks = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(6),
+        Constraint::Min(6),
+    ])
+    .split(inner);
+
+    let totals = format!(
+        "Runs: {}    Tokens: {} (in {} · out {})    Cost: {}",
+        stats.totals.runs,
+        short_tokens(stats.totals.total_tokens()),
+        short_tokens(stats.totals.usage.input_tokens),
+        short_tokens(stats.totals.usage.output_tokens),
+        format_cost(stats.totals.usage.cost_usd),
+    );
+    let mut summary = vec![
+        Line::from(Span::styled(totals, theme.selected())),
+        Line::from(Span::styled(
+            format!(
+                "Window: last {} {}s, older to newer",
+                stats.buckets.len(),
+                period.bucket_unit()
+            ),
+            Style::default().fg(theme.muted),
+        )),
+    ];
+    if let Some(error) = &app.usage_error {
+        summary.push(Line::from(Span::styled(
+            error.clone(),
+            Style::default().fg(theme.danger),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(summary).block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(theme.block(false)),
+        ),
+        chunks[0],
+    );
+
+    let token_bars: Vec<Bar> = stats
+        .buckets
+        .iter()
+        .map(|bucket| {
+            let tokens = bucket.total_tokens();
+            Bar::with_label(bucket_label(period, bucket.start), tokens)
+                .text_value(short_tokens(tokens))
+        })
+        .collect();
+    let bar_width = usage_bar_width(chunks[1].width, stats.buckets.len());
+    let token_chart = BarChart::vertical(token_bars)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Tokens ")
+                .border_style(theme.block(false)),
+        )
+        .bar_width(bar_width)
+        .bar_gap(1)
+        .bar_style(Style::default().fg(theme.accent))
+        .value_style(Style::default().fg(theme.muted))
+        .label_style(Style::default().fg(theme.muted));
+    frame.render_widget(token_chart, chunks[1]);
+
+    let cost_bars: Vec<Bar> = stats
+        .buckets
+        .iter()
+        .map(|bucket| {
+            Bar::with_label(
+                bucket_label(period, bucket.start),
+                cost_bar_value(bucket.usage.cost_usd),
+            )
+            .text_value(format_cost(bucket.usage.cost_usd))
+        })
+        .collect();
+    let cost_chart = BarChart::vertical(cost_bars)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Cost (USD) ")
+                .border_style(theme.block(false)),
+        )
+        .bar_width(bar_width)
+        .bar_gap(1)
+        .bar_style(Style::default().fg(theme.success))
+        .value_style(Style::default().fg(theme.muted))
+        .label_style(Style::default().fg(theme.muted));
+    frame.render_widget(cost_chart, chunks[2]);
+}
+
+/// Pick a bar width that fits every bucket in the chart area, so labels like
+/// `Nov` or `12` are not truncated to a single character.
+fn usage_bar_width(chart_width: u16, buckets: usize) -> u16 {
+    let buckets = buckets.max(1) as u16;
+    (chart_width.saturating_sub(2) / buckets)
+        .saturating_sub(1)
+        .clamp(1, 6)
+}
+
+/// Compact token count for a bar label (e.g. `999`, `1.2k`, `3.4M`).
+fn short_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// Format a cost for a bar label, keeping sub-cent precision.
+fn format_cost(cost: Option<f64>) -> String {
+    match cost {
+        Some(cost) if cost.is_finite() && cost > 0.0 => format!("${cost:.4}"),
+        _ => "$0".to_string(),
+    }
+}
+
+/// Convert a USD cost into the integer the `BarChart` needs, using micro-dollars
+/// so sub-cent amounts still produce a visible bar.
+fn cost_bar_value(cost: Option<f64>) -> u64 {
+    match cost {
+        Some(cost) if cost.is_finite() && cost > 0.0 => (cost * 1_000_000.0).round() as u64,
+        _ => 0,
+    }
+}
+
+/// The x-axis label for one usage bucket.
+fn bucket_label(period: UsagePeriod, start: DateTime<Utc>) -> String {
+    match period {
+        UsagePeriod::Day => start.format("%H").to_string(),
+        UsagePeriod::Week | UsagePeriod::Month => start.format("%d").to_string(),
+        UsagePeriod::Year => start.format("%b").to_string(),
+    }
 }
 
 fn status_ok(s: &str, theme: Theme) -> Line<'static> {
