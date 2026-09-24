@@ -231,6 +231,11 @@ pub struct Task {
     /// Name of the catalog task (the `*.md` file) that defines how to run this.
     pub name: String,
     pub status: TaskStatus,
+    /// How many execution attempts this task has had. Starts at 0; each claim
+    /// increments it and records a [`TaskRun`] under the new attempt. Defaults to
+    /// 0 so rows and payloads written before attempts existed decode unchanged.
+    #[serde(default)]
+    pub attempt: u32,
     /// Arbitrary input passed to the task's prompt.
     pub input: serde_json::Value,
     /// Produced by the task on completion. Omitted from list and push payloads;
@@ -717,6 +722,7 @@ mod tests {
             id: Uuid::new_v4(),
             name: "t".to_string(),
             status: TaskStatus::Succeeded,
+            attempt: 0,
             input: serde_json::json!({}),
             output: None,
             dedupe_key: None,
@@ -760,11 +766,56 @@ mod tests {
     }
 
     #[test]
+    fn task_attempt_round_trips_and_defaults_zero() {
+        let task = Task {
+            id: Uuid::new_v4(),
+            name: "t".to_string(),
+            status: TaskStatus::Running,
+            attempt: 3,
+            input: serde_json::json!({}),
+            output: None,
+            dedupe_key: None,
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+            failure: None,
+            session_id: None,
+            session_title: None,
+            parent_id: None,
+            root_id: None,
+            interactive: false,
+        };
+        let json = serde_json::to_value(&task).unwrap();
+        assert_eq!(json["attempt"], 3);
+        let back: Task = serde_json::from_value(json).unwrap();
+        assert_eq!(back.attempt, 3);
+
+        // Legacy payloads without `attempt` decode as 0 attempts.
+        let legacy: Task = serde_json::from_str(
+            r#"{
+                "id": "00000000-0000-0000-0000-000000000000",
+                "name": "t",
+                "status": "pending",
+                "input": {},
+                "dedupe_key": null,
+                "created_at": "2024-01-01T00:00:00Z",
+                "started_at": null,
+                "finished_at": null,
+                "error": null
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.attempt, 0);
+    }
+
+    #[test]
     fn task_interactive_round_trips_and_defaults_false() {
         let task = Task {
             id: Uuid::new_v4(),
             name: "t".to_string(),
             status: TaskStatus::Pending,
+            attempt: 0,
             input: serde_json::json!({}),
             output: None,
             dedupe_key: None,
@@ -810,6 +861,7 @@ mod tests {
             id: Uuid::new_v4(),
             name: "t".to_string(),
             status: TaskStatus::Succeeded,
+            attempt: 0,
             input: serde_json::json!({}),
             output: None,
             dedupe_key: None,
@@ -1124,6 +1176,7 @@ mod tests {
             id: Uuid::new_v4(),
             name: "t".to_string(),
             status: TaskStatus::Failed,
+            attempt: 0,
             input: serde_json::json!({}),
             output: None,
             dedupe_key: None,
@@ -1281,6 +1334,7 @@ mod tests {
             id,
             name: "t".to_string(),
             status: TaskStatus::Pending,
+            attempt: 0,
             input: serde_json::json!({}),
             output: None,
             dedupe_key: None,

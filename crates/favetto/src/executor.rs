@@ -24,7 +24,9 @@ use tokio::process::Command;
 use tokio::sync::{OwnedMutexGuard, Semaphore};
 use uuid::Uuid;
 
-use favetto_core::model::{Event, EventKind, Failure, FailureKind, Task, TaskStatus};
+use favetto_core::model::{
+    Event, EventKind, Failure, FailureKind, RunStatus, Task, TaskRun, TaskStatus,
+};
 
 use crate::agents::{resolve_session_title, Agent, TITLE_POLL_ATTEMPTS, TITLE_POLL_INTERVAL};
 use crate::config::ExecutorSettings;
@@ -40,6 +42,8 @@ struct RunOutcome {
     output: serde_json::Value,
     session_id: Option<String>,
     session_title: Option<String>,
+    /// The agent process exit code, when one was observed. Recorded on the run.
+    exit_code: Option<i32>,
     /// `Some` for a non-zero exit / vanished session / failed turn.
     failure: Option<Failure>,
     /// The interactive TUI process is still alive after its turn finished. Its
@@ -198,12 +202,12 @@ async fn dispatch_loop(state: Arc<State>, cfg: ExecutorSettings) {
                 None
             };
 
-            if !db::claim_task(&state.db, task.id).await.unwrap_or(false) {
+            let Some(run) = db::claim_task(&state.db, &task).await.unwrap_or(None) else {
                 if let Some(wt) = &plan.worktree {
                     remove_worktree(&state.db, task.id, &wt.repo, &wt.path, &wt.branch).await;
                 }
                 continue; // already claimed
-            }
+            };
 
             tracing::info!(
                 task_id = %task.id,
@@ -216,7 +220,7 @@ async fn dispatch_loop(state: Arc<State>, cfg: ExecutorSettings) {
             let state = state.clone();
             let def = def.clone();
             tokio::spawn(async move {
-                run_one(&state, task, def, plan, guard).await;
+                run_one(&state, task, run, def, plan, guard).await;
                 drop(permit);
             });
         }
@@ -301,6 +305,7 @@ async fn enqueue_with_id(
         id,
         name: name.clone(),
         status: TaskStatus::Pending,
+        attempt: 0,
         input,
         output: None,
         dedupe_key,
@@ -415,13 +420,16 @@ async fn record_dependencies(
 async fn run_one(
     state: &Arc<State>,
     mut task: Task,
+    run: TaskRun,
     def: TaskDef,
     plan: Plan,
     _dir_guard: Option<OwnedMutexGuard<()>>,
 ) {
-    // `claim_task` already persisted Running; mirror it on our copy.
+    // `claim_task` already persisted Running and the attempt; mirror both on our
+    // copy so the task update we publish and persist matches the run.
     task.status = TaskStatus::Running;
-    task.started_at = Some(Utc::now());
+    task.attempt = run.attempt;
+    task.started_at = run.started_at.or_else(|| Some(Utc::now()));
     state
         .bus
         .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
@@ -453,10 +461,25 @@ async fn run_one(
     // An interactive run that finished its turn keeps its TUI (and therefore its
     // worktree) alive so the Agent panel can still attach to it.
     let session_alive = matches!(&outcome, Ok(run) if run.alive);
+    let exit_code = outcome.as_ref().ok().and_then(|run| run.exit_code);
     let success = record_run_outcome(&mut task, outcome);
     task.finished_at = Some(Utc::now());
 
     let _ = db::upsert_task(&state.db, &task).await;
+    // Finalize the attempt's run with the same outcome as the task row. Task-level
+    // output/session stay authoritative for `tasks.get`; the run is the history.
+    let mut finished_run = run;
+    finished_run.status = if success {
+        RunStatus::Succeeded
+    } else {
+        RunStatus::Failed
+    };
+    finished_run.session_id = task.session_id.clone();
+    finished_run.finished_at = task.finished_at;
+    finished_run.exit_code = exit_code;
+    finished_run.error = task.error.clone();
+    finished_run.failure = task.failure.clone();
+    let _ = db::finalize_task_run(&state.db, &finished_run).await;
     state
         .bus
         .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
@@ -1082,6 +1105,7 @@ async fn run_agent_task(
         output,
         session_id: result.session_id,
         session_title,
+        exit_code: result.exit_code,
         failure,
         alive: interactive && turn_finished,
     })
@@ -1219,13 +1243,28 @@ async fn backfill_title(
 }
 
 /// Mark a task failed (used when it can't even be started).
+///
+/// The task is claimed here first — atomically creating the attempt's run — so a
+/// failure that happens before dispatch still records exactly one failed run.
 async fn fail_task(state: &State, task: Task, kind: FailureKind, error: &str) {
     let mut task = task;
+    let claimed = db::claim_task(&state.db, &task).await.ok().flatten();
+    if let Some(run) = &claimed {
+        task.attempt = run.attempt;
+        task.started_at = run.started_at;
+    }
     task.status = TaskStatus::Failed;
     task.error = Some(error.to_string());
     task.failure = Some(Failure::new(kind, error));
     task.finished_at = Some(Utc::now());
     let _ = db::upsert_task(&state.db, &task).await;
+    if let Some(mut run) = claimed {
+        run.status = RunStatus::Failed;
+        run.finished_at = task.finished_at;
+        run.error = task.error.clone();
+        run.failure = task.failure.clone();
+        let _ = db::finalize_task_run(&state.db, &run).await;
+    }
     state
         .bus
         .publish(ServerPush::TaskUpdated(Box::new(task.summary())));

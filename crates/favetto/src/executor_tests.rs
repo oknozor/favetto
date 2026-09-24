@@ -99,6 +99,7 @@ fn render_context_exposes_task_input_and_prev() {
         id: Uuid::new_v4(),
         name: "triage".to_string(),
         status: TaskStatus::Succeeded,
+        attempt: 0,
         input: serde_json::json!({
             "issue_id": 7,
             "_prev": { "output": "done", "name": "triage" },
@@ -155,6 +156,7 @@ async fn unavailable_agent_fails_with_clear_error() {
         id: Uuid::new_v4(),
         name: "oneshot".to_string(),
         status: TaskStatus::Running,
+        attempt: 0,
         input: serde_json::json!({}),
         output: None,
         dedupe_key: None,
@@ -184,6 +186,7 @@ fn task_with_session(session_id: Option<&str>, session_title: Option<&str>) -> T
         id: Uuid::new_v4(),
         name: "t".to_string(),
         status: TaskStatus::Running,
+        attempt: 0,
         input: serde_json::json!({}),
         output: None,
         dedupe_key: None,
@@ -200,6 +203,24 @@ fn task_with_session(session_id: Option<&str>, session_title: Option<&str>) -> T
     }
 }
 
+/// A running attempt for a task inserted directly by a test (the state a task is
+/// in after `db::claim_task`). Used to drive `run_one` without the dispatcher.
+fn running_run(task_id: Uuid) -> TaskRun {
+    TaskRun {
+        id: Uuid::new_v4(),
+        task_id,
+        attempt: 1,
+        status: RunStatus::Running,
+        agent: None,
+        session_id: None,
+        started_at: Some(Utc::now()),
+        finished_at: None,
+        exit_code: None,
+        error: None,
+        failure: None,
+    }
+}
+
 #[test]
 fn failed_run_preserves_session_info() {
     let mut task = task_with_session(None, None);
@@ -209,6 +230,7 @@ fn failed_run_preserves_session_info() {
             output: serde_json::json!({}),
             session_id: Some("ses_1".to_string()),
             session_title: Some("Fix the widget".to_string()),
+            exit_code: None,
             failure: Some(Failure::new(FailureKind::Agent, "exit 1")),
             alive: false,
         }),
@@ -237,6 +259,7 @@ fn successful_run_records_output_and_session() {
             output: serde_json::json!({ "ok": true }),
             session_id: Some("ses_1".to_string()),
             session_title: Some("Fix the widget".to_string()),
+            exit_code: None,
             failure: None,
             alive: false,
         }),
@@ -282,6 +305,7 @@ fn vanished_session_is_infrastructure() {
             output: serde_json::json!({}),
             session_id: None,
             session_title: None,
+            exit_code: None,
             failure: Some(Failure::new(
                 FailureKind::Infrastructure,
                 "agent 'opencode' session disappeared",
@@ -313,7 +337,9 @@ async fn fail_task_records_the_requested_kind() {
     std::fs::create_dir_all(&dir).unwrap();
     let state = join_state(&dir, Vec::new()).await;
 
-    let task = task_with_session(None, None);
+    let mut task = task_with_session(None, None);
+    // A pre-dispatch failure is still `pending` when `fail_task` runs.
+    task.status = TaskStatus::Pending;
     db::insert_task(&state.db, &task).await.unwrap();
 
     fail_task(
@@ -334,6 +360,17 @@ async fn fail_task_records_the_requested_kind() {
     assert_eq!(failure.kind, FailureKind::InvalidInput);
     assert_eq!(failure.message, "task not found in the catalog");
     assert!(!failure.retryable);
+    assert_eq!(stored.attempt, 1, "the failed attempt is counted");
+
+    // The failure is recorded as exactly one failed run.
+    let runs = db::list_task_runs(&state.db, task.id).await.unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, RunStatus::Failed);
+    assert_eq!(runs[0].attempt, 1);
+    assert_eq!(
+        runs[0].failure.as_ref().map(|f| f.kind),
+        Some(FailureKind::InvalidInput)
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -348,6 +385,7 @@ fn terminal_outcome_overrides_awaiting_input_status() {
             output: serde_json::json!({}),
             session_id: None,
             session_title: None,
+            exit_code: None,
             failure: None,
             alive: false,
         }),
@@ -363,6 +401,7 @@ fn terminal_outcome_overrides_awaiting_input_status() {
             output: serde_json::json!({}),
             session_id: None,
             session_title: None,
+            exit_code: None,
             failure: Some(Failure::new(FailureKind::Agent, "exit 1")),
             alive: false,
         }),
@@ -852,6 +891,7 @@ fn branch_name_slugifies_folder_qualified_task() {
         id: Uuid::new_v4(),
         name: "pipelines/plan".to_string(),
         status: TaskStatus::Pending,
+        attempt: 0,
         input: serde_json::json!({}),
         output: None,
         dedupe_key: None,
@@ -1071,6 +1111,7 @@ async fn run_one_renders_input_vars_into_the_agent_prompt() {
         id: Uuid::new_v4(),
         name: def.name.clone(),
         status: TaskStatus::Running,
+        attempt: 0,
         input: serde_json::json!({
             "repo": "acme/widgets",
             "issue_description": "the widget is broken",
@@ -1095,7 +1136,9 @@ async fn run_one_renders_input_vars_into_the_agent_prompt() {
         needs_lock: false,
         worktree: None,
     };
-    run_one(&state, task, def, plan, None).await;
+    let run = running_run(task.id);
+    db::insert_task_run(&state.db, &run).await.unwrap();
+    run_one(&state, task, run, def, plan, None).await;
 
     let captured = std::fs::read_to_string(&capture).unwrap_or_default();
     assert!(
@@ -1180,6 +1223,7 @@ async fn run_one_binds_and_persists_a_deterministic_session_id() {
         id: Uuid::new_v4(),
         name: def.name.clone(),
         status: TaskStatus::Running,
+        attempt: 0,
         input: serde_json::json!({}),
         output: None,
         dedupe_key: None,
@@ -1202,7 +1246,9 @@ async fn run_one_binds_and_persists_a_deterministic_session_id() {
         needs_lock: false,
         worktree: None,
     };
-    run_one(&state, task, def, plan, None).await;
+    let run = running_run(task.id);
+    db::insert_task_run(&state.db, &run).await.unwrap();
+    run_one(&state, task, run, def, plan, None).await;
 
     let captured = std::fs::read_to_string(&capture).unwrap_or_default();
     let sid = captured
@@ -1216,6 +1262,72 @@ async fn run_one_binds_and_persists_a_deterministic_session_id() {
     let stored = db::get_task(&state.db, task_id).await.unwrap().unwrap();
     assert_eq!(stored.status, TaskStatus::Succeeded);
     assert_eq!(stored.session_id.as_deref(), Some(sid.as_str()));
+    assert_eq!(stored.attempt, 1, "the successful attempt is counted");
+
+    // Exactly one run records the success, its session and exit code. The task's
+    // output/session remain the authoritative source for `tasks.get`.
+    let runs = db::list_task_runs(&state.db, task_id).await.unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, RunStatus::Succeeded);
+    assert_eq!(runs[0].attempt, 1);
+    assert_eq!(runs[0].session_id.as_deref(), Some(sid.as_str()));
+    assert_eq!(runs[0].exit_code, Some(0));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A failing run-one finalizes the attempt's run as `failed`, carrying the exit
+/// code and typed failure, while `tasks.get` still returns the task.
+#[cfg(unix)]
+#[tokio::test]
+async fn run_one_records_a_failed_run() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("favetto-run-fail-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("fake-fail.sh");
+    std::fs::write(&script, "#!/bin/sh\nexit 3\n").unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let mut cfg = FavettoConfig::default();
+    cfg.agent.default = Some("fail".to_string());
+    cfg.agents.insert(
+        "fail".to_string(),
+        crate::config::AgentConfig {
+            command: script.to_string_lossy().into_owned(),
+            headless_args: Some(vec!["{prompt}".to_string()]),
+            ..Default::default()
+        },
+    );
+    let def = crate::tasks::parse_task_md("t", "agent = \"fail\"\n---\nbody\n").unwrap();
+    let state = join_state_with_config(&dir, vec![def.clone()], cfg).await;
+
+    let task = task_with_session(None, None);
+    db::insert_task(&state.db, &task).await.unwrap();
+
+    let plan = Plan {
+        cwd: dir.clone(),
+        needs_lock: false,
+        worktree: None,
+    };
+    let run = running_run(task.id);
+    db::insert_task_run(&state.db, &run).await.unwrap();
+    run_one(&state, task.clone(), run, def, plan, None).await;
+
+    let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Failed);
+
+    let runs = db::list_task_runs(&state.db, task.id).await.unwrap();
+    assert_eq!(runs.len(), 1, "exactly one run per attempt");
+    assert_eq!(runs[0].status, RunStatus::Failed);
+    assert_eq!(runs[0].attempt, 1);
+    assert_eq!(runs[0].exit_code, Some(3));
+    assert_eq!(
+        runs[0].failure.as_ref().map(|f| f.kind),
+        Some(FailureKind::Agent)
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1268,7 +1380,9 @@ async fn run_one_runs_user_started_tasks_interactively() {
         needs_lock: false,
         worktree: None,
     };
-    run_one(&state, task.clone(), def, plan, None).await;
+    let run = running_run(task.id);
+    db::insert_task_run(&state.db, &run).await.unwrap();
+    run_one(&state, task.clone(), run, def, plan, None).await;
 
     let captured = std::fs::read_to_string(&capture).unwrap_or_default();
     assert!(
@@ -1359,7 +1473,9 @@ while true; do sleep 1; done
         needs_lock: false,
         worktree: None,
     };
-    run_one(&state, task.clone(), def, plan, None).await;
+    let run = running_run(task.id);
+    db::insert_task_run(&state.db, &run).await.unwrap();
+    run_one(&state, task.clone(), run, def, plan, None).await;
 
     let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
     assert_eq!(stored.status, TaskStatus::Succeeded);
@@ -1432,7 +1548,9 @@ async fn run_one_runs_programmatic_tasks_headlessly() {
         needs_lock: false,
         worktree: None,
     };
-    run_one(&state, task.clone(), def, plan, None).await;
+    let run = running_run(task.id);
+    db::insert_task_run(&state.db, &run).await.unwrap();
+    run_one(&state, task.clone(), run, def, plan, None).await;
 
     let captured = std::fs::read_to_string(&capture).unwrap_or_default();
     assert!(
@@ -1559,6 +1677,7 @@ async fn run_one_reads_spawn_file_before_reclaiming_worktree() {
         id: Uuid::new_v4(),
         name: def.name.clone(),
         status: TaskStatus::Running,
+        attempt: 0,
         input: serde_json::json!({}),
         output: None,
         dedupe_key: None,
@@ -1585,7 +1704,9 @@ async fn run_one_reads_spawn_file_before_reclaiming_worktree() {
         }),
     };
     let spawner_id = task.id;
-    run_one(&state, task, def, plan, None).await;
+    let run = running_run(task.id);
+    db::insert_task_run(&state.db, &run).await.unwrap();
+    run_one(&state, task, run, def, plan, None).await;
 
     let pending = db::next_pending_tasks(&state.db, 10).await.unwrap();
     let spawned = pending
@@ -1739,6 +1860,7 @@ fn lineage_task(name: &str, status: TaskStatus, root: Option<Uuid>, parent: Opti
         id: Uuid::new_v4(),
         name: name.to_string(),
         status,
+        attempt: 0,
         input: serde_json::json!({}),
         output: None,
         dedupe_key: None,

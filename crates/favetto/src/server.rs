@@ -1483,6 +1483,7 @@ async fn start_oneshot_task(
         id: Uuid::new_v4(),
         name: "one-shot".to_string(),
         status: TaskStatus::Running,
+        attempt: 0,
         input: serde_json::json!({
             "oneshot": true,
             "agent": name.clone(),
