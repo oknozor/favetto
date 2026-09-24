@@ -1,17 +1,16 @@
 //! Shared MessagePack-frame ↔ WebSocket payload conversion.
 //!
-//! Both the client ([`client::ws_connect`](crate::client)) and the daemon
-//! ([`transport::serve_socket`](crate::transport)) speak the same wire format
-//! over WebSocket: a [`Frame`] travels as a single binary (or text) message
-//! carrying its msgpack encoding, and a Close message ends the stream.
+//! Both the client and the daemon speak the same wire format over WebSocket: a
+//! [`Frame`] travels as a single binary (or text) message carrying its msgpack
+//! encoding, and a Close message ends the stream.
 //!
 //! The two sides use different `Message` types (`tokio-tungstenite` vs `axum`),
 //! so a fully generic adapter is not worth it. Instead this module owns the
 //! payload-level conversion — encode/decode plus the "stream closed" error — and
 //! each call site keeps only its own match over its own message type.
 
-use favetto_core::rpc::Frame;
-use favetto_core::wire::{decode, encode, WireError};
+use crate::rpc::Frame;
+use crate::wire::{decode, encode, WireError};
 
 /// Decode a frame from a WebSocket binary payload.
 pub fn inbound_binary(bytes: &[u8]) -> Result<Frame, WireError> {
@@ -36,7 +35,7 @@ pub fn closed() -> WireError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use favetto_core::rpc::Request;
+    use crate::rpc::Request;
 
     fn request() -> Frame {
         Frame::Request(Request {

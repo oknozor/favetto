@@ -5,19 +5,19 @@
 //! in the library crate — the whole point of the library target.
 
 use favetto::cli::{Cli, Command, DaemonArgs, DocArgs, PairArgs, TokenRotateArgs, TuiArgs};
-use favetto::client::{Client, Transport, CONNECT_TIMEOUT};
 use favetto::config::FavettoConfig;
 use favetto::paths::expand_tilde;
 use favetto::tasks::TaskDef;
 use favetto::template::render;
 use favetto::workflow::WorkflowGraph;
+use favetto_tui::client::{Client, Transport, CONNECT_TIMEOUT};
 
 #[test]
 fn library_target_exposes_the_reusable_surface() {
     // Subcommand entry points.
     let entry_points = [
         std::any::type_name_of_val(&favetto::daemon::run),
-        std::any::type_name_of_val(&favetto::tui::run),
+        std::any::type_name_of_val(&favetto_tui::tui::run),
         std::any::type_name_of_val(&favetto::pair::run),
         std::any::type_name_of_val(&favetto::docgen::run),
     ];

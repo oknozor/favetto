@@ -75,9 +75,10 @@ ignored. Only `main` receives version bumps (`branch_whitelist = ["main"]` in
 ## Workspace and toolchain
 
 - Workspace members:
-  - `crates/favetto-core` — shared wire protocol and domain types (no HTTP/DB/LLM).
+  - `crates/favetto-core` — shared wire protocol, domain types, config/tasks/workflow (no HTTP/DB/LLM).
   - `crates/favetto-providers` — provider/model catalog (opencode auth + models.dev).
-  - `crates/favetto` — the single binary: daemon, TUI, and doc generator.
+  - `crates/favetto-tui` — the dependency-light terminal client binary.
+  - `crates/favetto` — the daemon binary and doc generator.
 - Rust edition 2021, `rust-version = 1.92`, workspace resolver `2`.
 - Tests are inline `#[cfg(test)]` modules next to the code they cover, often
   using `#[tokio::test]`; add cases there.

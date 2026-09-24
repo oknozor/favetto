@@ -85,7 +85,8 @@ starting configuration.
 crates/
   favetto-core/          shared wire protocol + domain types (no HTTP/DB/LLM)
   favetto-providers/     provider/model catalog (opencode auth + models.dev)
-  favetto/               single binary: daemon, tui, doc generator
+  favetto-tui/           dependency-light terminal client binary
+  favetto/               daemon binary + doc generator
 tasks/                   task catalog: `*.md` files with TOML header + prompt
 docs/                    VitePress site (guide + generated reference)
 ```

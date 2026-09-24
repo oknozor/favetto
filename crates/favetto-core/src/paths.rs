@@ -31,6 +31,35 @@ pub fn expand_tilde(path: impl AsRef<Path>) -> PathBuf {
     }
 }
 
+/// Default data directory (SQLite + token): `$FAVETTO_DATA_DIR`, else the XDG data
+/// dir (`~/.local/share/favetto`).
+pub fn default_data_dir() -> PathBuf {
+    std::env::var("FAVETTO_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::data_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("favetto")
+        })
+}
+
+/// Default config file: `$FAVETTO_CONFIG`, else `~/.config/favetto/config.toml`.
+pub fn default_config_path() -> PathBuf {
+    std::env::var("FAVETTO_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::config_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("favetto")
+                .join("config.toml")
+        })
+}
+
+/// Default bearer-token file: `<data_dir>/token`.
+pub fn default_token_path() -> PathBuf {
+    default_data_dir().join("token")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
