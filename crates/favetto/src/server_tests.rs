@@ -1,4 +1,3 @@
-
 use super::*;
 use favetto_core::rpc::error_code;
 use std::path::Path;
