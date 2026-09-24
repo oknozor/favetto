@@ -1,6 +1,7 @@
 use super::*;
 use favetto_core::model::InputReply;
 use favetto_core::rpc::error_code;
+use proptest::prelude::*;
 use std::path::Path;
 
 use crate::state::StateInit;
@@ -2245,10 +2246,21 @@ async fn dispatch_rejects_malformed_params() {
         (method::CATALOG_GET, serde_json::json!({})),
         (method::CATALOG_GET, serde_json::json!({ "name": 5 })),
         // Other required fields.
+        (method::TASKS_RETRY, serde_json::json!({ "id": 1 })),
         (method::SCHEDULES_DELETE, serde_json::json!({})),
         (method::NOTIFICATIONS_TEST, serde_json::json!({})),
         (method::AGENTS_INPUT, serde_json::json!({})),
         (method::AGENTS_RESIZE, serde_json::json!({})),
+        (method::AGENTS_REPLY, serde_json::json!({})),
+        (method::CATALOG_ADD, serde_json::json!({ "name": 5 })),
+        (method::CATALOG_UPDATE, serde_json::json!({})),
+        (method::WORKFLOW_INSPECT, serde_json::json!({})),
+        (method::WORKFLOW_CANCEL, serde_json::json!({})),
+        (method::WORKFLOW_CREATE, serde_json::json!({ "tasks": 5 })),
+        (method::WORKFLOW_SPAWN, serde_json::json!({ "name": 5 })),
+        (method::WORKFLOW_RETRY, serde_json::json!({})),
+        (method::SCHEDULES_UPSERT, serde_json::json!({ "id": 5 })),
+        (method::HOOKS_UPSERT, serde_json::json!({})),
     ];
 
     for (case, (name, params)) in cases.iter().enumerate() {
@@ -2313,6 +2325,96 @@ fn parse_params_returns_a_typed_invalid_params_error() {
         error.message()
     );
     assert_eq!(error.to_object().code, error_code::INVALID_PARAMS);
+}
+
+/// A depth-bounded arbitrary JSON value, mirroring the strategy in
+/// `favetto_core::wire`'s round-trip tests. Only finite numbers are generated so
+/// value construction itself can never panic.
+fn arb_hostile_json(depth: u32) -> BoxedStrategy<serde_json::Value> {
+    if depth == 0 {
+        prop_oneof![
+            Just(serde_json::Value::Null),
+            any::<bool>().prop_map(serde_json::Value::Bool),
+            any::<i64>().prop_map(|n| serde_json::Value::Number(n.into())),
+            "[ -~]{0,24}".prop_map(serde_json::Value::String),
+        ]
+        .boxed()
+    } else {
+        prop_oneof![
+            arb_hostile_json(0),
+            prop::collection::btree_map("[a-z_]{1,8}", arb_hostile_json(depth - 1), 0..4)
+                .prop_map(|m| serde_json::Value::Object(m.into_iter().collect())),
+            prop::collection::vec(arb_hostile_json(depth - 1), 0..4)
+                .prop_map(serde_json::Value::Array),
+        ]
+        .boxed()
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// `parse_params` is the single deserialization boundary for every RPC arm.
+    /// No arbitrary JSON value may make it panic; a panic here would fail the
+    /// request loop and drop every attached TUI session.
+    #[test]
+    fn parse_params_never_panics_on_hostile_values(value in arb_hostile_json(3)) {
+        // Pure deserialization only: no side-effecting handler is invoked.
+        let _: Result<TaskIdParams, _> = parse_params(method::TASKS_RETRY, &value);
+        let _: Result<WorkflowInspectParams, _> = parse_params(method::WORKFLOW_INSPECT, &value);
+        let _: Result<WorkflowRetryParams, _> = parse_params(method::WORKFLOW_RETRY, &value);
+        let _: Result<WorkflowCreateParams, _> = parse_params(method::WORKFLOW_CREATE, &value);
+        let _: Result<WorkflowSpawnParams, _> = parse_params(method::WORKFLOW_SPAWN, &value);
+        let _: Result<StartAgentParams, _> = parse_params(method::AGENTS_START, &value);
+        let _: Result<StartOneshotParams, _> = parse_params(method::TASKS_START_ONESHOT, &value);
+        let _: Result<CatalogAddParams, _> = parse_params(method::CATALOG_ADD, &value);
+        let _: Result<CatalogUpdateParams, _> = parse_params(method::CATALOG_UPDATE, &value);
+        let _: Result<ScheduleUpsertParams, _> = parse_params(method::SCHEDULES_UPSERT, &value);
+        let _: Result<HookUpsertParams, _> = parse_params(method::HOOKS_UPSERT, &value);
+        let _: Result<AgentReplyParams, _> = parse_params(method::AGENTS_REPLY, &value);
+        let _: Result<NotificationTestParams, _> = parse_params(method::NOTIFICATIONS_TEST, &value);
+        let _: Result<SessionIdParams, _> = parse_params(method::AGENTS_ATTACH, &value);
+    }
+}
+
+/// `agents.attach` / `agents.close` are special-cased in `handle_request` (they
+/// subscribe/unsubscribe the connection), so they bypass `dispatch`. Malformed
+/// session params must still be a typed `INVALID_PARAMS` before the session
+/// manager is touched.
+#[tokio::test]
+async fn handle_request_rejects_malformed_special_params() {
+    let dir = temp_dir("malformed-special");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(4);
+    let subscribed: Attached = Arc::new(Mutex::new(HashSet::new()));
+
+    for (id, method) in [(1u64, method::AGENTS_ATTACH), (2u64, method::AGENTS_CLOSE)] {
+        handle_request(
+            &state,
+            &tx,
+            &subscribed,
+            Request {
+                id,
+                method: method.to_string(),
+                params: serde_json::json!({ "session_id": 5 }),
+            },
+        )
+        .await;
+        let frame = rx.recv().await.expect("a response frame");
+        let error = match frame {
+            Frame::Response(resp) => resp.error.expect("malformed params must error"),
+            other => panic!("expected a response, got {other:?}"),
+        };
+        assert_eq!(error.code, error_code::INVALID_PARAMS, "{method}");
+        assert!(
+            error.message.contains("invalid params"),
+            "{method}: {error:?}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `agents.reply` deserializes its typed reply and routes it to the session's

@@ -867,6 +867,98 @@ fn build_task_output_caps_and_dedupes() {
     assert!(encoded.len() < 2 * 1000, "bounded blob: {encoded}");
 }
 
+/// The persisted `task.output` blob must stay bounded for *every* envelope shape
+/// the parser can produce, not just the default `{"text": raw}` one. Pins the
+/// `[executor].max_output_bytes` guarantee (issue #207) and round-trips the
+/// largest shape through SQLite so the stored blob is bounded too.
+#[tokio::test]
+async fn build_task_output_bounds_every_shape() {
+    let max = 1000usize;
+    let raw = "x".repeat(50_000);
+    let huge = "y".repeat(200_000);
+
+    let shapes: Vec<serde_json::Value> = vec![
+        // Default parser: raw text wrapped as `{"text": raw}`.
+        serde_json::json!({ "text": raw }),
+        // Structured envelope with oversized artifacts / findings / outputs.
+        serde_json::json!({
+            "summary": huge,
+            "artifacts": [{ "kind": "source", "path": huge }],
+            "findings": [{ "note": huge }],
+            "outputs": { "blob": huge },
+            "continuation": { "spawn": "next" },
+        }),
+        // Non-envelope result: a huge array with no expected shape.
+        serde_json::json!([{ "event": "x" }, { "event": huge }]),
+        // Unknown deeply-nested object that is not an envelope.
+        serde_json::json!({ "foo": { "bar": { "baz": [huge] } } }),
+    ];
+
+    for (i, parsed) in shapes.iter().enumerate() {
+        let value = build_task_output(&raw, parsed, "agent", None, None, max);
+        assert_eq!(
+            value["output_bytes"].as_u64(),
+            Some(raw.len() as u64),
+            "shape {i}"
+        );
+        assert_eq!(value["truncated"], true, "shape {i}");
+        let encoded = serde_json::to_string(&value).unwrap();
+        assert!(
+            encoded.len() < 4 * max,
+            "shape {i} stored {} bytes (cap {max})",
+            encoded.len()
+        );
+    }
+
+    // Round-trip the largest shape through the DB: the persisted blob stays
+    // bounded too.
+    let dir = std::env::temp_dir().join(format!("favetto-output-bound-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let pool = crate::db::open(&dir.join("test.db")).await.unwrap();
+    crate::db::migrate(&pool).await.unwrap();
+
+    let built = build_task_output(
+        &raw,
+        &serde_json::json!([{ "event": huge }]),
+        "agent",
+        None,
+        None,
+        max,
+    );
+    let task = Task {
+        id: Uuid::new_v4(),
+        name: "bounded".to_string(),
+        status: TaskStatus::Succeeded,
+        attempt: 1,
+        input: serde_json::json!({}),
+        output: Some(built),
+        dedupe_key: None,
+        created_at: Utc::now(),
+        started_at: None,
+        finished_at: None,
+        error: None,
+        failure: None,
+        session_id: None,
+        session_title: None,
+        parent_id: None,
+        root_id: None,
+        interactive: false,
+    };
+    crate::db::upsert_task(&pool, &task).await.unwrap();
+    let stored = crate::db::get_task(&pool, task.id)
+        .await
+        .unwrap()
+        .expect("task row");
+    let encoded = serde_json::to_string(&stored.output.expect("output persisted")).unwrap();
+    assert!(
+        encoded.len() < 4 * max,
+        "persisted blob is {} bytes (cap {max})",
+        encoded.len()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn build_task_output_keeps_structured_result() {
     let raw = "done";

@@ -1043,12 +1043,11 @@ fn build_task_output(
     let mut envelope = structured
         .map(normalize_envelope)
         .unwrap_or_else(|| normalize_envelope(synthesized_envelope(&capped_raw)));
-    bound_envelope(
-        envelope
-            .as_object_mut()
-            .expect("normalize_envelope returns an object"),
-        max / 2,
-    );
+    // `normalize_envelope` always yields an object; guard anyway so a future
+    // change to it cannot panic a long-running run.
+    if let Some(env) = envelope.as_object_mut() {
+        bound_envelope(env, max / 2);
+    }
     serde_json::json!({
         "agent": agent,
         "session_id": session_id,

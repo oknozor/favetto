@@ -78,3 +78,7 @@ state. The full observation and decision schema and the action-to-RPC mapping
 live in the [Supervisor contract reference](./supervisor-contract). An
 MCP-speaking supervisor ships as the `favetto-mcp` binary; see the
 [MCP supervisor guide](../guide/mcp).
+
+Because the daemon is long-running, its production panic paths are audited and
+mechanically linted, and its persisted output is bounded; see
+[Panic safety](../design/panic-safety) for the inventory and the guard tests.

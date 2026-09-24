@@ -31,6 +31,10 @@ use templates::*;
 mod templates;
 
 /// Resolve the docs directory: an explicit `--docs-dir`, else `<repo>/docs`.
+#[allow(
+    clippy::expect_used,
+    reason = "CARGO_MANIFEST_DIR is always crates/favetto, so two ancestors up is the repo root"
+)]
 pub fn docs_dir(explicit: Option<&Path>) -> PathBuf {
     match explicit {
         Some(dir) => dir.to_path_buf(),
