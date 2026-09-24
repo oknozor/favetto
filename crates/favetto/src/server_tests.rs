@@ -1743,7 +1743,7 @@ async fn agents_start_concurrently_attaches_a_live_headless_run() {
 
     let attached = start_agent(
         &state,
-        &serde_json::json!({ "task_id": task.id.to_string(), "agent": "opencode" }),
+        json_params(serde_json::json!({ "task_id": task.id.to_string(), "agent": "opencode" })),
     )
     .await
     .expect("a concurrent-capable live run must open an interactive attach");
