@@ -62,3 +62,17 @@ transport, which is what makes local attach just a special case of remote attach
 Each frame is MessagePack-encoded and tagged with a `type`:
 `request` / `response` / `notification`. See the
 [Remote API reference](./remote-api) for the full method list.
+
+## Supervisor boundary
+
+An external supervisor — a script, a binary, a web UI, a human, or another
+agent — can drive a workflow by observing it with `workflow.inspect` (plus the
+event cursor from `events.subscribe`) and submitting a strict vocabulary of
+decisions through the workflow RPCs. The supervisor is a plain remote API
+client; it is never part of the daemon.
+
+This keeps the boundary above intact: favetto validates and executes, while all
+judgment — which task to spawn, when to retry, when to stop — stays outside.
+There is no LLM or agent loop in the daemon, and the daemon stores no supervisor
+state. The full observation and decision schema and the action-to-RPC mapping
+live in the [Supervisor contract reference](./supervisor-contract).

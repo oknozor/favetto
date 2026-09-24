@@ -77,4 +77,5 @@ step.
 - **Reference** — [CLI](/reference/cli), [Configuration](/reference/config),
   [Task file format](/reference/tasks), [Event kinds](/reference/events),
   [Environment](/reference/environment), [Remote API](/reference/remote-api),
+  [Supervisor contract](/reference/supervisor-contract),
   [Architecture](/reference/architecture).
