@@ -1,4 +1,4 @@
-agent = "pi"
+agent = "opencode"
 provider = "deepseek"
 model = "deepseek-flash"
 cwd = "/code/che"
