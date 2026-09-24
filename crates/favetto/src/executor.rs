@@ -203,14 +203,24 @@ impl Lineage {
 }
 
 /// Enqueue a task (idle), announcing it on the bus and emitting `TaskIdle`. The
-/// task is its own workflow root (no lineage).
+/// task is its own workflow root (no lineage). `interactive` marks a
+/// user-started run that should execute in the agent's real TUI.
 pub async fn enqueue_task(
     state: &State,
     name: String,
     input: serde_json::Value,
     dedupe_key: Option<String>,
+    interactive: bool,
 ) -> anyhow::Result<Task> {
-    enqueue_with_lineage(state, name, input, dedupe_key, Lineage::default()).await
+    enqueue_with_lineage(
+        state,
+        name,
+        input,
+        dedupe_key,
+        Lineage::default(),
+        interactive,
+    )
+    .await
 }
 
 /// Enqueue a task with workflow lineage, announcing it on the bus and emitting
@@ -221,6 +231,7 @@ async fn enqueue_with_lineage(
     input: serde_json::Value,
     dedupe_key: Option<String>,
     lineage: Lineage,
+    interactive: bool,
 ) -> anyhow::Result<Task> {
     let task = Task {
         id: Uuid::new_v4(),
@@ -237,6 +248,7 @@ async fn enqueue_with_lineage(
         session_title: None,
         parent_id: lineage.parent_id,
         root_id: lineage.root_id,
+        interactive,
     };
     db::insert_task(&state.db, &task).await?;
     state.metrics.inc_tasks();
@@ -562,7 +574,15 @@ async fn spawn_from_manifest(
     };
     for (i, item) in items.into_iter().enumerate() {
         let dedupe = format!("spawn:{}:{i}", task.id);
-        match enqueue_with_lineage(state, spawn_task.to_string(), item, Some(dedupe), lineage).await
+        match enqueue_with_lineage(
+            state,
+            spawn_task.to_string(),
+            item,
+            Some(dedupe),
+            lineage,
+            false,
+        )
+        .await
         {
             Ok(enqueued) => {
                 tracing::info!(task = %task.name, spawned = %enqueued.id, "spawned task");
@@ -587,30 +607,48 @@ async fn run_agent_task(
 ) -> anyhow::Result<RunOutcome> {
     let agent = state.registry.get_checked(agent_name)?;
 
+    // A user-started task runs in the agent's real interactive TUI, seeded with
+    // the rendered prompt, so the Agent panel attaches to the single writer while
+    // the task executes. Programmatic runs (scheduler, webhooks, hooks, `needs`,
+    // `spawn`) stay headless. The agent must be able to run a TUI and accept a
+    // seeded prompt; otherwise the task falls back to headless.
+    let interactive = task.interactive
+        && agent.capabilities().interactive
+        && agent.capabilities().interactive_prompt;
+
     // Give every headless run a deterministic session id. Agents that accept
     // `{session_id}` (pi) bind it with `--session-id`, and the manager seeds it
     // onto the session so the task row and panel can reopen it later. Agents
-    // that report their own id (opencode) ignore the generated one.
-    let session_id = Uuid::new_v4().to_string();
+    // that report their own id (opencode) ignore the generated one. Interactive
+    // runs never seed one: the TUI may not accept the flag.
     let ctx = crate::agents::AgentContext {
         cwd: Some(cwd.to_path_buf()),
         provider: def.provider.clone(),
         model: def.model.clone(),
         prompt: Some(prompt.to_string()),
-        session_id: Some(session_id),
+        session_id: (!interactive).then(|| Uuid::new_v4().to_string()),
         rows: 40,
         cols: 120,
         git_signing: def.sign,
+    };
+    let invocation = if interactive {
+        crate::agents::Invocation::Interactive {
+            prompt: Some(prompt),
+            provider: def.provider.as_deref(),
+            model: def.model.as_deref(),
+        }
+    } else {
+        crate::agents::Invocation::Headless {
+            prompt,
+            provider: def.provider.as_deref(),
+            model: def.model.as_deref(),
+        }
     };
     let info = state.agents.start(
         agent_name,
         agent.clone(),
         Some(task.id.to_string()),
-        crate::agents::Invocation::Headless {
-            prompt,
-            provider: def.provider.as_deref(),
-            model: def.model.as_deref(),
-        },
+        invocation,
         ctx,
     )?;
 
@@ -638,7 +676,13 @@ async fn run_agent_task(
     } else {
         state.agents.wait(&info.id).await
     };
-    let raw = state.agents.output(&info.id);
+    // An interactive run's PTY holds a TUI, not machine output; capture the
+    // emulator's plain-text screen instead of the raw escape stream.
+    let raw = if interactive {
+        state.agents.screen_text(&info.id)
+    } else {
+        state.agents.output(&info.id)
+    };
     let mut result = agent.parse_output(&raw, code);
     // The manager also captures the id live from the PTY; prefer it if the
     // implementation's parser did not find one.
@@ -661,7 +705,7 @@ async fn run_agent_task(
     // its session id is captured, since reattaching launches a fresh interactive
     // TUI on that session. Agents without resume keep the PTY so its final screen
     // can still be replayed.
-    if result.session_id.is_some() && agent.capabilities().resume {
+    if !interactive && result.session_id.is_some() && agent.capabilities().resume {
         let _ = state.agents.close(&info.id);
     }
     let max = state.config.executor.max_output_bytes;
@@ -1233,7 +1277,7 @@ async fn start_dependents(state: &Arc<State>, ev: &Event) {
             tracing::info!(task = %dep, trigger = %name, "auto-starting dependent task");
             let dedupe = format!("needs:{}:{}", dep, ev.id);
             if let Err(e) =
-                enqueue_with_lineage(state, dep, input.clone(), Some(dedupe), lineage).await
+                enqueue_with_lineage(state, dep, input.clone(), Some(dedupe), lineage, false).await
             {
                 tracing::warn!(error = %e, "failed to enqueue dependent task");
             }
@@ -1317,6 +1361,7 @@ async fn maybe_start_join(
             parent_id,
             root_id: Some(root_id),
         },
+        false,
     )
     .await
     {

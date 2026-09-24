@@ -826,6 +826,7 @@ fn geom_task(name: &str) -> favetto_core::model::Task {
         session_title: None,
         parent_id: None,
         root_id: None,
+        interactive: false,
     }
 }
 

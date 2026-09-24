@@ -157,7 +157,14 @@ async fn handle_github(state: &State, headers: &HeaderMap, body: &[u8]) -> Respo
             continue;
         }
         let dedupe = delivery.map(|d| format!("webhook:{d}:{}", rule.name));
-        match crate::executor::enqueue_task(state, rule.task.clone(), summary.clone(), dedupe).await
+        match crate::executor::enqueue_task(
+            state,
+            rule.task.clone(),
+            summary.clone(),
+            dedupe,
+            false,
+        )
+        .await
         {
             Ok(enqueued) => {
                 tracing::info!(

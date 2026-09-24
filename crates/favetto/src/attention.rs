@@ -337,6 +337,7 @@ mod tests {
             session_title: None,
             parent_id: None,
             root_id: None,
+            interactive: false,
         };
         db::insert_task(&state.db, &task).await.unwrap();
 
@@ -427,6 +428,7 @@ mod tests {
             session_title: None,
             parent_id: None,
             root_id: None,
+            interactive: false,
         };
         db::insert_task(&state.db, &task).await.unwrap();
 

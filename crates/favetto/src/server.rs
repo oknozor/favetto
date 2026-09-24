@@ -323,12 +323,15 @@ struct TaskIdParams {
     id: Uuid,
 }
 
-/// `tasks.start` params. `input` defaults to JSON null.
+/// `tasks.start` params. `input` defaults to JSON null; `interactive` defaults
+/// to false (headless), so only the TUI opts into the live embedded TUI.
 #[derive(Debug, Deserialize)]
 struct TasksStartParams {
     name: String,
     #[serde(default, deserialize_with = "lenient")]
     input: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "lenient")]
+    interactive: Option<bool>,
 }
 
 /// `catalog.get` params.
@@ -552,7 +555,8 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
         method::TASKS_START => {
             let p: TasksStartParams = parse_params(&req.method, &req.params)?;
             let input = p.input.unwrap_or(serde_json::Value::Null);
-            match crate::executor::enqueue_task(state, p.name, input, None).await {
+            let interactive = p.interactive.unwrap_or(false);
+            match crate::executor::enqueue_task(state, p.name, input, None, interactive).await {
                 Ok(task) => Ok(serde_json::json!(task)),
                 Err(e) => Err(RpcError::Internal(e.to_string())),
             }
@@ -1032,6 +1036,7 @@ async fn start_oneshot_task(
         session_title: None,
         parent_id: None,
         root_id: None,
+        interactive: false,
     };
     db::insert_task(&state.db, &task).await?;
     state.metrics.inc_tasks();
