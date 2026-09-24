@@ -9,7 +9,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use favetto_core::model::{AgentSessionInfo, TaskStatus};
+use favetto_core::model::{AgentSessionInfo, FailureKind, Task, TaskStatus};
 
 use super::app::{
     activity_cell, format_activity, format_usage, table_rows_area, usage_cell, App, CatalogRow,
@@ -1229,8 +1229,10 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     let widths = [
         Constraint::Length(10),
         Constraint::Length(20),
-        Constraint::Length(24),
-        Constraint::Length(12),
+        // Session titles are truncated to 22 chars, so the column matches that.
+        Constraint::Length(22),
+        // Wide enough for `✓ succeeded #10`, the longest status plus an attempt.
+        Constraint::Length(15),
         Constraint::Length(14),
         Constraint::Length(18),
         Constraint::Length(8),
@@ -1256,11 +1258,11 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
                     t.session_title.as_deref().unwrap_or(""),
                     22,
                 )),
-                Cell::from(status_line(t.status, theme, &state)),
+                Cell::from(status_line(t.status, t.attempt, theme, &state)),
                 Cell::from(activity),
                 Cell::from(usage),
                 Cell::from(age(t.created_at)),
-                Cell::from(t.error.clone().unwrap_or_default()),
+                Cell::from(error_cell(t, theme)),
             ])
         })
         .collect();
@@ -1626,8 +1628,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
 }
 
 /// A status glyph/colour line for a task row. `Running` renders a throbber.
+/// When `attempt` is non-zero (the task has been claimed at least once) a muted
+/// `#N` suffix folds the attempt number into the same cell.
 fn status_line(
     s: TaskStatus,
+    attempt: u32,
     theme: Theme,
     state: &throbber_widgets_tui::ThrobberState,
 ) -> Line<'static> {
@@ -1650,7 +1655,57 @@ fn status_line(
         ));
     }
     spans.push(Span::styled(txt.to_string(), Style::default().fg(color)));
+    if attempt > 0 {
+        spans.push(Span::styled(format!(" #{attempt}"), theme.muted_style()));
+    }
     Line::from(spans)
+}
+
+/// Compact label for a typed failure kind, matching the wire's `snake_case`.
+fn failure_kind_label(kind: FailureKind) -> &'static str {
+    match kind {
+        FailureKind::Agent => "agent",
+        FailureKind::Infrastructure => "infrastructure",
+        FailureKind::Timeout => "timeout",
+        FailureKind::InvalidInput => "invalid_input",
+        FailureKind::Dependency => "dependency",
+        FailureKind::Cancelled => "cancelled",
+        FailureKind::Blocked => "blocked",
+        FailureKind::Unknown => "unknown",
+    }
+}
+
+/// The ERROR cell: a typed failure rendered as `[kind] message (retryability)`.
+/// Falls back to the plain error string for rows written before typed failures
+/// existed, and is empty when there is nothing to show.
+fn error_cell(task: &Task, theme: Theme) -> Line<'static> {
+    if let Some(failure) = &task.failure {
+        let color = if failure.retryable {
+            theme.warning
+        } else {
+            theme.danger
+        };
+        let hint = if failure.retryable {
+            " (retryable)"
+        } else {
+            " (not retryable)"
+        };
+        return Line::from(vec![
+            Span::styled(
+                format!("[{}] ", failure_kind_label(failure.kind)),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(failure.message.clone()),
+            Span::styled(hint.to_string(), theme.muted_style()),
+        ]);
+    }
+    match task.error.as_deref() {
+        Some(err) if !err.is_empty() => Line::from(Span::styled(
+            err.to_string(),
+            Style::default().fg(theme.danger),
+        )),
+        _ => Line::default(),
+    }
 }
 
 /// A styled throbber symbol span for the active theme.

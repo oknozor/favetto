@@ -224,10 +224,91 @@ fn running_task_renders_throbber_and_selection_uses_theme() {
 fn status_line_shows_awaiting_input() {
     let theme = Theme::dark();
     let state = throbber_widgets_tui::ThrobberState::default();
-    let line = status_line(TaskStatus::AwaitingInput, theme, &state);
+    let line = status_line(TaskStatus::AwaitingInput, 0, theme, &state);
     let text: String = line.spans.iter().map(|s| s.content.to_string()).collect();
     assert!(text.contains('!'), "glyph missing: {text:?}");
     assert!(text.contains("awaiting"), "label missing: {text:?}");
+}
+
+#[test]
+fn status_line_folds_in_attempt_when_retried() {
+    let theme = Theme::dark();
+    let state = throbber_widgets_tui::ThrobberState::default();
+
+    // A task that has never been claimed has no attempt suffix.
+    let fresh = status_line(TaskStatus::Pending, 0, theme, &state);
+    let fresh: String = fresh.spans.iter().map(|s| s.content.to_string()).collect();
+    assert!(!fresh.contains('#'), "unexpected attempt: {fresh:?}");
+
+    // A retried task shows which attempt it is on.
+    let retried = status_line(TaskStatus::Failed, 2, theme, &state);
+    let retried: String = retried
+        .spans
+        .iter()
+        .map(|s| s.content.to_string())
+        .collect();
+    assert!(retried.contains("#2"), "attempt missing: {retried:?}");
+}
+
+#[test]
+fn failed_task_renders_typed_failure_and_retryability() {
+    use favetto_core::model::Failure;
+
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    let mut task = geom_task("flaky");
+    task.status = TaskStatus::Failed;
+    task.attempt = 2;
+    task.failure = Some(Failure {
+        kind: FailureKind::Infrastructure,
+        message: "PTY died".to_string(),
+        retryable: true,
+    });
+    app.tasks = vec![task];
+
+    let text = render_text(&mut app, 200, 24);
+    assert!(text.contains("#2"), "attempt missing: {text:?}");
+    assert!(text.contains("infrastructure"), "kind missing: {text:?}");
+    assert!(text.contains("PTY died"), "message missing: {text:?}");
+    assert!(text.contains("retryable"), "retryability missing: {text:?}");
+    assert!(
+        !text.contains("not retryable"),
+        "unexpected non-retryable hint: {text:?}"
+    );
+}
+
+#[test]
+fn failed_task_renders_non_retryable_hint() {
+    use favetto_core::model::Failure;
+
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    let mut task = geom_task("rejected");
+    task.status = TaskStatus::Failed;
+    task.failure = Some(Failure {
+        kind: FailureKind::Agent,
+        message: "exit 1".to_string(),
+        retryable: false,
+    });
+    app.tasks = vec![task];
+
+    let text = render_text(&mut app, 200, 24);
+    assert!(text.contains("agent"), "kind missing: {text:?}");
+    assert!(text.contains("exit 1"), "message missing: {text:?}");
+    assert!(text.contains("not retryable"), "hint missing: {text:?}");
+}
+
+#[test]
+fn failed_task_without_typed_failure_falls_back_to_error() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    let mut task = geom_task("legacy");
+    task.status = TaskStatus::Failed;
+    task.error = Some("boom".to_string());
+    app.tasks = vec![task];
+
+    let text = render_text(&mut app, 200, 24);
+    assert!(text.contains("boom"), "error missing: {text:?}");
 }
 
 #[test]
