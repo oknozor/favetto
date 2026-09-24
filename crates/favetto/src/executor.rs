@@ -29,7 +29,7 @@ use favetto_core::model::{
 };
 
 use crate::agents::{resolve_session_title, Agent, TITLE_POLL_ATTEMPTS, TITLE_POLL_INTERVAL};
-use crate::config::ExecutorSettings;
+use crate::config::{ExecutorSettings, StaleRunPolicy};
 use crate::db;
 use crate::event_bus::ServerPush;
 use crate::state::State;
@@ -98,6 +98,85 @@ fn record_run_outcome(task: &mut Task, outcome: Result<RunOutcome, RunError>) ->
             false
         }
     }
+}
+
+/// What a startup [`reconcile`] pass changed. All zero on a clean start or on a
+/// second, idempotent pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReconcileReport {
+    /// Active runs marked `interrupted`.
+    pub runs_interrupted: u64,
+    /// Stale tasks failed (`stale_run = "fail"`).
+    pub tasks_failed: u64,
+    /// Stale tasks re-enqueued (`stale_run = "retry"`).
+    pub tasks_retried: u64,
+    /// Pending tasks failed because their catalog definition vanished.
+    pub tasks_invalidated: u64,
+}
+
+/// The error recorded when a previous daemon left a run in flight. Kept stable:
+/// `stale_run = "fail"` reproduces the message the old
+/// `db::fail_interrupted_tasks` wrote.
+const INTERRUPTED_ERROR: &str = "interrupted by daemon restart";
+
+/// Reconcile state left behind by a previous daemon instance. Run at startup
+/// before the executor claims anything, and safe to run repeatedly: a second
+/// pass changes nothing.
+///
+/// 1. Every active run (`pending`/`running`/`awaiting_input`) becomes
+///    `interrupted` — its agent process died with the old daemon.
+/// 2. Each active task's fate follows [`ExecutorSettings::stale_run`]: `fail`
+///    (default) marks it failed, `retry` re-enqueues it for a fresh attempt.
+/// 3. Pending tasks whose catalog definition no longer exists are failed with
+///    [`FailureKind::InvalidInput`] instead of waiting for the dispatcher to
+///    reject them lazily.
+///
+/// Terminal tasks are never touched.
+pub async fn reconcile(state: &State) -> anyhow::Result<ReconcileReport> {
+    let mut report = ReconcileReport::default();
+    let interrupted = Failure::new(FailureKind::Infrastructure, INTERRUPTED_ERROR);
+
+    for run in db::list_active_task_runs(&state.db).await? {
+        if db::interrupt_run(&state.db, run.id, INTERRUPTED_ERROR, &interrupted).await? {
+            report.runs_interrupted += 1;
+        }
+    }
+
+    // Active tasks are reconciled independently of their run rows so a legacy
+    // database (a `running` task with no run) is still recovered.
+    for task in db::list_active_tasks(&state.db).await? {
+        match state.config.executor.stale_run {
+            StaleRunPolicy::Fail => {
+                if db::fail_stale_task(&state.db, task.id, INTERRUPTED_ERROR, &interrupted).await? {
+                    report.tasks_failed += 1;
+                }
+            }
+            StaleRunPolicy::Retry => {
+                if db::retry_stale_task(&state.db, task.id).await? {
+                    report.tasks_retried += 1;
+                }
+            }
+        }
+    }
+
+    let known: HashSet<String> = state
+        .catalog
+        .read()
+        .iter()
+        .map(|def| def.name.clone())
+        .collect();
+    for task in db::list_pending_tasks(&state.db).await? {
+        if known.contains(&task.name) {
+            continue;
+        }
+        let message = format!("task '{}' not found in the catalog", task.name);
+        let failure = Failure::new(FailureKind::InvalidInput, message.clone());
+        if db::fail_pending_task(&state.db, task.id, &message, &failure).await? {
+            report.tasks_invalidated += 1;
+        }
+    }
+
+    Ok(report)
 }
 
 /// Spawn the dispatcher and the dependency listener.
@@ -1542,7 +1621,10 @@ async fn remove_worktree(pool: &SqlitePool, task_id: Uuid, repo: &Path, path: &P
 
 /// A terminal task is finished: its worktree may be reclaimed by retention.
 fn is_terminal(status: TaskStatus) -> bool {
-    matches!(status, TaskStatus::Succeeded | TaskStatus::Failed)
+    matches!(
+        status,
+        TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled
+    )
 }
 
 /// Pick the tracked worktrees the retention policy should remove.

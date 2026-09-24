@@ -414,6 +414,18 @@ fn default_awaiting_input_quiet_ms() -> u64 {
     8000
 }
 
+/// What the startup reconciler does with a task whose in-flight run was left
+/// behind by a previous daemon instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, JsonSchema, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StaleRunPolicy {
+    /// Mark the owning task failed (preserves the pre-reconciler behaviour).
+    #[default]
+    Fail,
+    /// Re-enqueue the owning task so the executor claims a fresh attempt.
+    Retry,
+}
+
 /// How the executor runs tasks: concurrency and directory/worktree isolation.
 ///
 /// With `parallel = true` each task gets a git worktree when its working
@@ -456,6 +468,10 @@ pub struct ExecutorSettings {
     /// fires (default 8000). Agent-specific detectors ignore this.
     #[serde(default = "default_awaiting_input_quiet_ms")]
     pub awaiting_input_quiet_ms: u64,
+    /// Startup policy for a task left in flight by a previous daemon: `"fail"`
+    /// (default) marks it failed, `"retry"` re-enqueues it for a fresh attempt.
+    #[serde(default)]
+    pub stale_run: StaleRunPolicy,
 }
 
 impl Default for ExecutorSettings {
@@ -470,6 +486,7 @@ impl Default for ExecutorSettings {
             max_output_bytes: default_max_output_bytes(),
             detect_awaiting_input: true,
             awaiting_input_quiet_ms: default_awaiting_input_quiet_ms(),
+            stale_run: StaleRunPolicy::default(),
         }
     }
 }
@@ -723,6 +740,18 @@ mod tests {
         assert!(!cfg.executor.keep_worktree);
         assert_eq!(cfg.executor.worktree_retention.days, 30);
         assert_eq!(cfg.executor.worktree_retention.min_worktrees, 0);
+    }
+
+    #[test]
+    fn stale_run_defaults_to_fail_and_parses_retry() {
+        let cfg: FavettoConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.executor.stale_run, StaleRunPolicy::Fail);
+
+        let retry: FavettoConfig = toml::from_str("[executor]\nstale_run = \"retry\"\n").unwrap();
+        assert_eq!(retry.executor.stale_run, StaleRunPolicy::Retry);
+
+        let explicit: FavettoConfig = toml::from_str("[executor]\nstale_run = \"fail\"\n").unwrap();
+        assert_eq!(explicit.executor.stale_run, StaleRunPolicy::Fail);
     }
 
     #[test]

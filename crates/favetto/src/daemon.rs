@@ -63,15 +63,6 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let pool = db::open(&db_path).await?;
     db::migrate(&pool).await?;
 
-    // Tasks left running by a previous instance are interrupted: their agent
-    // process died with the old daemon, so mark them failed rather than letting
-    // them linger (the executor only ever picks up `pending` tasks).
-    match db::fail_interrupted_tasks(&pool).await {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(count = n, "marked interrupted task(s) as failed"),
-        Err(e) => tracing::warn!(error = %e, "failed to reconcile interrupted tasks"),
-    }
-
     // Bounded growth: run one retention pass at startup. Never fatal.
     let retention = config.daemon.retention.clone();
     match db::prune(&pool, retention.days, retention.min_tasks, retention.vacuum).await {
@@ -133,6 +124,18 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     // exists even before the first catalog change.
     if let Err(e) = crate::workflow::regenerate(&state.catalog.read(), &state.data_dir) {
         tracing::warn!(error = %e, "failed to write workflow.dot");
+    }
+
+    // Reconcile state left by a previous instance before anything consumes the
+    // queue: interrupted runs become `interrupted`, stale tasks follow
+    // `[executor].stale_run`, and pending tasks whose catalog definition vanished
+    // are failed. Idempotent; never fatal.
+    match crate::executor::reconcile(&state).await {
+        Ok(report) if report != crate::executor::ReconcileReport::default() => {
+            tracing::info!(?report, "reconciled interrupted runs")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "startup reconcile failed"),
     }
 
     // Start the scheduler, executor, and hook engine, then register catalog

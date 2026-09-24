@@ -1047,6 +1047,7 @@ fn selected_ids(selected: &[db::WorktreeRecord]) -> HashSet<Uuid> {
 fn terminal_status_classification() {
     assert!(is_terminal(TaskStatus::Succeeded));
     assert!(is_terminal(TaskStatus::Failed));
+    assert!(is_terminal(TaskStatus::Cancelled));
     assert!(!is_terminal(TaskStatus::Pending));
     assert!(!is_terminal(TaskStatus::Running));
     assert!(!is_terminal(TaskStatus::AwaitingInput));
@@ -2634,6 +2635,127 @@ async fn spawn_dynamic_with_dedupe_key_is_idempotent() {
         .await
         .unwrap();
     assert_eq!(rows, 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The startup reconciler marks the in-flight run `interrupted`, fails the
+/// owning task under the default `stale_run = "fail"` policy, and is idempotent.
+#[tokio::test]
+async fn reconcile_fails_stale_run_by_default_and_is_idempotent() {
+    let dir = std::env::temp_dir().join(format!("favetto-reconcile-fail-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let state = join_state(&dir, Vec::new()).await;
+
+    let mut task = lineage_task("t", TaskStatus::Running, None, None);
+    task.attempt = 1;
+    db::insert_task(&state.db, &task).await.unwrap();
+    db::insert_task_run(&state.db, &running_run(task.id))
+        .await
+        .unwrap();
+
+    let report = reconcile(&state).await.unwrap();
+    assert_eq!(report.runs_interrupted, 1);
+    assert_eq!(report.tasks_failed, 1);
+    assert_eq!(report.tasks_retried, 0);
+    assert_eq!(report.tasks_invalidated, 0);
+
+    let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Failed);
+    assert_eq!(
+        stored.error.as_deref(),
+        Some("interrupted by daemon restart")
+    );
+    assert_eq!(
+        stored.failure.as_ref().map(|f| f.kind),
+        Some(FailureKind::Infrastructure)
+    );
+
+    // A restart with one running task yields exactly one interrupted run.
+    let runs = db::list_task_runs(&state.db, task.id).await.unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, RunStatus::Interrupted);
+
+    // The second pass is a no-op.
+    assert_eq!(reconcile(&state).await.unwrap(), ReconcileReport::default());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `stale_run = "retry"` re-enqueues the task for a fresh attempt while still
+/// recording the old run as interrupted.
+#[tokio::test]
+async fn reconcile_retry_policy_re_enqueues_the_task() {
+    let dir = std::env::temp_dir().join(format!("favetto-reconcile-retry-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cfg = FavettoConfig::default();
+    cfg.executor.stale_run = StaleRunPolicy::Retry;
+    // The catalog must still define `t`, or the retried task is invalidated
+    // instead of re-enqueued (covered by the vanished-definition test).
+    let state = join_state_with_config(&dir, vec![def_with_vars()], cfg).await;
+
+    let mut task = lineage_task("t", TaskStatus::AwaitingInput, None, None);
+    task.attempt = 1;
+    task.error = Some("previous error".to_string());
+    db::insert_task(&state.db, &task).await.unwrap();
+    db::insert_task_run(&state.db, &running_run(task.id))
+        .await
+        .unwrap();
+
+    let report = reconcile(&state).await.unwrap();
+    assert_eq!(report.runs_interrupted, 1);
+    assert_eq!(report.tasks_retried, 1);
+    assert_eq!(report.tasks_failed, 0);
+    assert_eq!(report.tasks_invalidated, 0);
+
+    let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Pending);
+    assert!(stored.error.is_none() && stored.failure.is_none());
+    assert_eq!(
+        db::list_task_runs(&state.db, task.id).await.unwrap()[0].status,
+        RunStatus::Interrupted
+    );
+
+    // Idempotent: the pending task is not touched again.
+    assert_eq!(reconcile(&state).await.unwrap(), ReconcileReport::default());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Pending tasks whose catalog definition vanished fail eagerly with
+/// `InvalidInput`; a still-defined pending task is left for the executor.
+#[tokio::test]
+async fn reconcile_fails_pending_tasks_with_a_vanished_catalog_definition() {
+    let dir = std::env::temp_dir().join(format!("favetto-reconcile-gone-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let state = join_state(&dir, vec![def_with_vars()]).await;
+
+    let kept = lineage_task("t", TaskStatus::Pending, None, None);
+    let gone = lineage_task("gone", TaskStatus::Pending, None, None);
+    db::insert_task(&state.db, &kept).await.unwrap();
+    db::insert_task(&state.db, &gone).await.unwrap();
+
+    let report = reconcile(&state).await.unwrap();
+    assert_eq!(report.tasks_invalidated, 1);
+    assert_eq!(report.tasks_failed, 0);
+    assert_eq!(report.runs_interrupted, 0);
+
+    assert_eq!(
+        db::get_task(&state.db, kept.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskStatus::Pending
+    );
+    let stored = db::get_task(&state.db, gone.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Failed);
+    assert_eq!(
+        stored.failure.as_ref().map(|f| f.kind),
+        Some(FailureKind::InvalidInput)
+    );
+
+    assert_eq!(reconcile(&state).await.unwrap(), ReconcileReport::default());
 
     let _ = std::fs::remove_dir_all(&dir);
 }

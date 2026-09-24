@@ -661,29 +661,113 @@ async fn set_task_session_never_touches_status() {
 }
 
 #[tokio::test]
-async fn fail_interrupted_tasks_marks_running_and_awaiting_input() {
-    let (dir, pool) = scratch_pool("interrupted").await;
+async fn stale_task_helpers_are_conditional_and_idempotent() {
+    let (dir, pool) = scratch_pool("stale-helpers").await;
+    let interrupted = Failure::new(FailureKind::Infrastructure, "interrupted by daemon restart");
+
     let mut running = task_at(Utc::now(), None, None);
     running.status = TaskStatus::Running;
     let mut awaiting = task_at(Utc::now(), None, None);
     awaiting.status = TaskStatus::AwaitingInput;
+    let mut pending = task_at(Utc::now(), None, None);
+    pending.status = TaskStatus::Pending;
     let done = task_at(Utc::now(), Some(Utc::now()), None);
-    for task in [&running, &awaiting, &done] {
+    for task in [&running, &awaiting, &pending, &done] {
         upsert_task(&pool, task).await.unwrap();
     }
 
-    assert_eq!(fail_interrupted_tasks(&pool).await.unwrap(), 2);
+    // Active-task scans split pending from running/awaiting_input.
+    let pending_tasks = list_pending_tasks(&pool).await.unwrap();
+    assert_eq!(pending_tasks.len(), 1);
+    assert_eq!(pending_tasks[0].id, pending.id);
+    let active = list_active_tasks(&pool).await.unwrap();
+    assert_eq!(active.len(), 2);
 
-    for id in [running.id, awaiting.id] {
-        let got = get_task(&pool, id).await.unwrap().unwrap();
-        assert_eq!(got.status, TaskStatus::Failed);
-        assert_eq!(got.error.as_deref(), Some("interrupted by daemon restart"));
-    }
-    // A terminal task is untouched.
+    // Fail an active task; a second call is a no-op and terminal rows are safe.
+    assert!(fail_stale_task(
+        &pool,
+        running.id,
+        "interrupted by daemon restart",
+        &interrupted
+    )
+    .await
+    .unwrap());
+    assert!(!fail_stale_task(&pool, running.id, "again", &interrupted)
+        .await
+        .unwrap());
+    assert!(!fail_stale_task(&pool, done.id, "terminal", &interrupted)
+        .await
+        .unwrap());
+    let got = get_task(&pool, running.id).await.unwrap().unwrap();
+    assert_eq!(got.status, TaskStatus::Failed);
+    assert_eq!(got.error.as_deref(), Some("interrupted by daemon restart"));
     assert_eq!(
-        get_task(&pool, done.id).await.unwrap().unwrap().status,
-        TaskStatus::Succeeded
+        got.failure.as_ref().map(|f| f.kind),
+        Some(FailureKind::Infrastructure)
     );
+
+    // Retry re-enqueues an active task and clears the previous attempt's outcome.
+    assert!(retry_stale_task(&pool, awaiting.id).await.unwrap());
+    assert!(!retry_stale_task(&pool, awaiting.id).await.unwrap());
+    let got = get_task(&pool, awaiting.id).await.unwrap().unwrap();
+    assert_eq!(got.status, TaskStatus::Pending);
+    assert!(got.error.is_none() && got.failure.is_none() && got.finished_at.is_none());
+
+    // A pending task can be invalidated once, not twice.
+    let invalid = Failure::new(FailureKind::InvalidInput, "task 'gone' not found");
+    assert!(
+        fail_pending_task(&pool, pending.id, "task 'gone' not found", &invalid)
+            .await
+            .unwrap()
+    );
+    assert!(!fail_pending_task(&pool, pending.id, "again", &invalid)
+        .await
+        .unwrap());
+    let got = get_task(&pool, pending.id).await.unwrap().unwrap();
+    assert_eq!(got.status, TaskStatus::Failed);
+    assert_eq!(
+        got.failure.as_ref().map(|f| f.kind),
+        Some(FailureKind::InvalidInput)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn interrupt_run_marks_active_runs_and_is_idempotent() {
+    let (dir, pool) = scratch_pool("interrupt-run").await;
+    let task = task_at(Utc::now(), None, None);
+    upsert_task(&pool, &task).await.unwrap();
+    let run = run_at(task.id, 1);
+    insert_task_run(&pool, &run).await.unwrap();
+    let terminal = run_at(task.id, 2);
+    let mut terminal = terminal;
+    terminal.status = RunStatus::Succeeded;
+    insert_task_run(&pool, &terminal).await.unwrap();
+
+    let failure = Failure::new(FailureKind::Infrastructure, "interrupted by daemon restart");
+    assert!(
+        interrupt_run(&pool, run.id, "interrupted by daemon restart", &failure)
+            .await
+            .unwrap()
+    );
+    assert!(!interrupt_run(&pool, run.id, "again", &failure)
+        .await
+        .unwrap());
+    // A terminal run is never touched.
+    assert!(!interrupt_run(&pool, terminal.id, "again", &failure)
+        .await
+        .unwrap());
+
+    let got = get_task_run(&pool, run.id).await.unwrap().unwrap();
+    assert_eq!(got.status, RunStatus::Interrupted);
+    assert_eq!(got.error.as_deref(), Some("interrupted by daemon restart"));
+    assert_eq!(
+        got.failure.as_ref().map(|f| f.kind),
+        Some(FailureKind::Infrastructure)
+    );
+    assert!(got.finished_at.is_some());
+    assert!(list_active_task_runs(&pool).await.unwrap().is_empty());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
