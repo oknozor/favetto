@@ -15,7 +15,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use favetto_core::model::{AwaitingInputReason, EventKind, TaskStatus};
+use favetto_core::model::{AgentStateEvent, AwaitingInputReason, EventKind, TaskStatus};
+use tokio::sync::broadcast;
 
 use crate::agents::Agent;
 use crate::db;
@@ -175,11 +176,27 @@ async fn watch_inner(
     let mut debouncer = Debouncer::default();
     let mut last_probe = std::time::Instant::now();
     let mut finished: Option<bool> = None;
+    // When the session has a structured state source, its `InputRequested`/
+    // `InputResolved` events are authoritative and the debounced screen heuristic
+    // is disabled for it. Sessions without a source keep the screen poll below.
+    let mut state_rx = state.agents.subscribe_state(session);
     loop {
         if !state.agents.is_running(session) {
             break;
         }
-        if detect {
+        if let Some(rx) = state_rx.as_mut() {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => observe_state(state, session, task_id, event).await,
+                    Err(broadcast::error::TryRecvError::Empty) => break,
+                    Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::TryRecvError::Closed) => {
+                        state_rx = None;
+                        break;
+                    }
+                }
+            }
+        } else if detect {
             let next = state
                 .agents
                 .detect_awaiting_input(session, agent.as_ref(), quiet);
@@ -233,6 +250,44 @@ async fn watch_inner(
     match finished {
         Some(success) => WatchEnd::TurnFinished { success },
         None => WatchEnd::Exited(state.agents.exit_code(session)),
+    }
+}
+
+/// Apply one structured state event to the watched task.
+///
+/// `InputRequested` marks the task awaiting input with the request's correlation
+/// id, options, and `allow_always` flag; `InputResolved`/`Idle` clear it. Other
+/// events only update activity/usage, which the session's state task already
+/// folded into the manager snapshot.
+async fn observe_state(
+    state: &Arc<State>,
+    session: &str,
+    task_id: Option<Uuid>,
+    event: AgentStateEvent,
+) {
+    match event {
+        AgentStateEvent::InputRequested { request } => {
+            let reason = AwaitingInputReason {
+                kind: request.kind,
+                message: request.message,
+                request_id: Some(request.id),
+                options: request.options,
+                allow_always: request.allow_always,
+            };
+            state
+                .agents
+                .set_awaiting_input(session, Some(reason.clone()));
+            if let Some(task_id) = task_id {
+                mark_awaiting(state, task_id, session, &reason).await;
+            }
+        }
+        AgentStateEvent::InputResolved { .. } | AgentStateEvent::Idle { .. } => {
+            state.agents.set_awaiting_input(session, None);
+            if let Some(task_id) = task_id {
+                resume_task(state, task_id).await;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -775,5 +830,105 @@ mod tests {
         .await;
 
         assert_eq!(end, WatchEnd::Exited(Some(0)));
+    }
+
+    /// A session with a structured state source drives awaiting-input without
+    /// the debounced screen heuristic: `InputRequested` marks the task with the
+    /// request's correlation id and `InputResolved` restores it.
+    #[tokio::test]
+    async fn state_source_drives_awaiting_input_and_resume() {
+        use favetto_core::model::{AwaitingInputKind, InputRequest};
+
+        let state = state_with_sh("exit 0").await;
+        let fake = crate::agents::testing::fake_state_agent("while true; do sleep 1; done");
+        let task_id = running_task(&state).await;
+
+        let info = state
+            .agents
+            .start(
+                "fake",
+                fake.agent.clone(),
+                Some(task_id.to_string()),
+                Invocation::Interactive {
+                    prompt: None,
+                    provider: None,
+                    model: None,
+                },
+                AgentContext {
+                    rows: 40,
+                    cols: 120,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let handle = tokio::spawn({
+            let state = state.clone();
+            let session = info.id.clone();
+            let agent = fake.agent.clone();
+            async move {
+                watch(
+                    &state,
+                    &session,
+                    agent,
+                    Some(task_id),
+                    Duration::from_millis(50),
+                )
+                .await
+            }
+        });
+
+        let request = InputRequest {
+            id: "perm_1".to_string(),
+            kind: AwaitingInputKind::Permission,
+            message: "Allow?".to_string(),
+            options: vec!["Allow once".to_string()],
+            allow_always: true,
+        };
+
+        // Retry the event: the watcher may subscribe after the first broadcast.
+        let mut marked = false;
+        for _ in 0..100 {
+            let task = db::get_task(&state.db, task_id).await.unwrap().unwrap();
+            if task.status == TaskStatus::AwaitingInput {
+                marked = true;
+                break;
+            }
+            fake.events
+                .send(AgentStateEvent::InputRequested {
+                    request: request.clone(),
+                })
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(marked, "task never became AwaitingInput");
+
+        // The persisted event carries the structured request for hooks.
+        let events = db::tail_events(&state.db, 50).await.unwrap();
+        let event = events
+            .iter()
+            .find(|e| e.kind == EventKind::TaskAwaitingInput)
+            .expect("task_awaiting_input event");
+        assert_eq!(event.payload["reason"]["request_id"], "perm_1");
+        assert_eq!(event.payload["session_id"], info.id);
+
+        let mut resolved = false;
+        for _ in 0..100 {
+            let task = db::get_task(&state.db, task_id).await.unwrap().unwrap();
+            if task.status == TaskStatus::Running {
+                resolved = true;
+                break;
+            }
+            fake.events
+                .send(AgentStateEvent::InputResolved {
+                    id: "perm_1".to_string(),
+                })
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(resolved, "task never resumed");
+
+        state.agents.close(&info.id).ok();
+        let _ = handle.await;
     }
 }

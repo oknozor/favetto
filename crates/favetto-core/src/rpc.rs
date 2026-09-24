@@ -133,6 +133,8 @@ pub mod method {
     pub const AGENTS_ATTACH: &str = "agents.attach";
     /// Terminate a session.
     pub const AGENTS_CLOSE: &str = "agents.close";
+    /// Answer a structured input request on a session's state channel.
+    pub const AGENTS_REPLY: &str = "agents.reply";
     /// List configured providers and their available models.
     pub const PROVIDERS_LIST: &str = "providers.list";
     /// List cron schedules.
@@ -159,6 +161,8 @@ pub mod push {
     pub const AGENT_OUTPUT: &str = "agent.output";
     /// An agent session's child process exited.
     pub const AGENT_EXIT: &str = "agent.exit";
+    /// A session's folded live state (activity/usage) changed.
+    pub const AGENT_STATE: &str = "agent.state";
 }
 
 /// Every client → server method, paired with a one-line purpose. Consumed by the
@@ -229,6 +233,10 @@ pub const CLIENT_METHODS: &[(&str, &str)] = &[
     ),
     (method::AGENTS_CLOSE, "Terminate a session."),
     (
+        method::AGENTS_REPLY,
+        "Answer a structured input request on a session's state channel.",
+    ),
+    (
         method::PROVIDERS_LIST,
         "List configured providers and their available models.",
     ),
@@ -263,6 +271,10 @@ pub const SERVER_PUSHES: &[(&str, &str)] = &[
         "Raw PTY output (base64) from a running agent session.",
     ),
     (push::AGENT_EXIT, "An agent session's child process exited."),
+    (
+        push::AGENT_STATE,
+        "A session's folded live state (activity/usage) changed.",
+    ),
 ];
 
 /// A client → server request.
@@ -381,6 +393,7 @@ mod tests {
             method::AGENTS_RESIZE,
             method::AGENTS_ATTACH,
             method::AGENTS_CLOSE,
+            method::AGENTS_REPLY,
             method::PROVIDERS_LIST,
             method::SCHEDULES_LIST,
             method::SCHEDULES_UPSERT,
@@ -402,6 +415,7 @@ mod tests {
             push::CATALOG_UPDATED,
             push::AGENT_OUTPUT,
             push::AGENT_EXIT,
+            push::AGENT_STATE,
         ]
         .into_iter()
         .collect();

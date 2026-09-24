@@ -18,7 +18,9 @@ use serde::Deserialize;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
-use favetto_core::model::{AgentCatalogEntry, AgentSessionInfo, EventKind, Task, TaskStatus};
+use favetto_core::model::{
+    AgentCatalogEntry, AgentSessionInfo, EventKind, InputReply, Task, TaskStatus,
+};
 use favetto_core::rpc::{method, push, Frame, Notification, Request, Response, RpcError};
 use favetto_core::wire::WireError;
 use favetto_core::workflow::{WorkflowInspect, WorkflowState, WorkflowTaskView};
@@ -108,6 +110,14 @@ pub async fn serve_connection(state: Arc<State>, mut incoming: BoxIn, mut outgoi
                             AgentEvent::Exit { code, .. } => (
                                 push::AGENT_EXIT,
                                 serde_json::json!({ "session_id": sid, "code": code }),
+                            ),
+                            AgentEvent::State { live, .. } => (
+                                push::AGENT_STATE,
+                                serde_json::json!({
+                                    "session_id": sid,
+                                    "activity": live.activity,
+                                    "usage": live.usage,
+                                }),
                             ),
                         };
                         let frame = Frame::Notification(Notification {
@@ -391,6 +401,14 @@ struct AgentResizeParams {
     rows: Option<u64>,
     #[serde(default, deserialize_with = "lenient")]
     cols: Option<u64>,
+}
+
+/// `agents.reply` params: answer the request identified by `request_id`.
+#[derive(Debug, Deserialize)]
+struct AgentReplyParams {
+    session_id: String,
+    request_id: String,
+    reply: InputReply,
 }
 
 /// `providers.list` params.
@@ -725,6 +743,18 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
             let cols = p.cols.unwrap_or(80) as u16;
             match state.agents.resize(&p.session_id, rows, cols) {
                 Ok(()) => Ok(serde_json::json!({ "rows": rows, "cols": cols })),
+                Err(e) => Err(RpcError::Internal(e.to_string())),
+            }
+        }
+
+        method::AGENTS_REPLY => {
+            let p: AgentReplyParams = parse_params(&req.method, &req.params)?;
+            match state
+                .agents
+                .reply(&p.session_id, &p.request_id, p.reply)
+                .await
+            {
+                Ok(()) => Ok(serde_json::json!({ "replied": true })),
                 Err(e) => Err(RpcError::Internal(e.to_string())),
             }
         }
