@@ -172,6 +172,11 @@ pub enum Popup {
     /// A destructive task action (`c` cancel / `C` cancel root / `r` retry)
     /// awaiting explicit confirmation before its RPC is submitted.
     Confirm(ConfirmPrompt),
+    /// The `x` popup on the Tasks tab: the selected task's typed failure (or plain
+    /// `error`) rendered in full, reusing `error_cell`'s formatting.
+    TaskError {
+        task_id: Uuid,
+    },
 }
 
 pub struct Form {
@@ -532,6 +537,10 @@ pub struct App {
     /// Cached `agents.list` sessions keyed by daemon session id. The source of
     /// the Tasks-table Activity/Usage cells and the Ctrl+R reply target.
     pub agent_sessions: HashMap<String, AgentSessionInfo>,
+    /// Last activity/usage observed per catalog task id. Updated from every
+    /// `agents.list` refresh and `agent.state` push, and never cleared by a refresh,
+    /// so a task keeps its token/cost after its session leaves the registry.
+    pub task_state: HashMap<String, (Option<AgentActivity>, Option<AgentUsage>)>,
     /// The embedded terminal's inner screen rectangle (set during draw), used to
     /// translate mouse events into the agent's coordinate space.
     pub agent_area: Option<Rect>,
@@ -622,6 +631,7 @@ impl App {
             agent_error: None,
             notice: None,
             agent_sessions: HashMap::new(),
+            task_state: HashMap::new(),
             agent_area: None,
             agent_resize: None,
             term: TerminalView::default(),
@@ -664,6 +674,16 @@ impl App {
             return true;
         }
         matches!(&self.popup, Popup::Wizard(w) if w.loading)
+    }
+
+    /// True while a task is non-terminal or a cached session is running, so the
+    /// session loop refreshes `agents.list` and the Tasks table tracks live
+    /// Activity/Usage for runs this connection never attached to.
+    pub fn wants_agent_refresh(&self) -> bool {
+        self.tasks
+            .iter()
+            .any(|t| !task_status_is_terminal(t.status))
+            || self.agent_sessions.values().any(|s| s.running)
     }
 
     pub fn next_tab(&mut self) {
@@ -1087,13 +1107,27 @@ impl App {
     }
 
     /// Replace the cached `agents.list` sessions (the Activity/Usage source for
-    /// the Tasks table and the Ctrl+O picker).
+    /// the Tasks table and the Ctrl+O picker), retaining each task's last-known
+    /// activity/usage in [`App::task_state`] so a task keeps its token/cost after
+    /// its session leaves the registry.
     pub fn set_agent_sessions(&mut self, sessions: Vec<AgentSessionInfo>) {
+        for s in &sessions {
+            if let Some(task_id) = &s.task_id {
+                let entry = self.task_state.entry(task_id.clone()).or_default();
+                if s.activity.is_some() {
+                    entry.0 = s.activity.clone();
+                }
+                if s.usage.is_some() {
+                    entry.1 = s.usage.clone();
+                }
+            }
+        }
         self.agent_sessions = sessions.into_iter().map(|s| (s.id.clone(), s)).collect();
     }
 
-    /// Fold a `push::agent.state` frame into the cached session. A state frame
-    /// for an unknown session is ignored: the next `agents.list` re-syncs it.
+    /// Fold a `push::agent.state` frame into the cached session and the task's
+    /// retained state. A state frame for an unknown session is ignored: the next
+    /// `agents.list` re-syncs it.
     pub fn apply_agent_state(
         &mut self,
         session_id: &str,
@@ -1101,8 +1135,17 @@ impl App {
         usage: Option<AgentUsage>,
     ) {
         if let Some(session) = self.agent_sessions.get_mut(session_id) {
-            session.activity = activity;
-            session.usage = usage;
+            session.activity = activity.clone();
+            session.usage = usage.clone();
+            if let Some(task_id) = session.task_id.clone() {
+                let entry = self.task_state.entry(task_id).or_default();
+                if activity.is_some() {
+                    entry.0 = activity;
+                }
+                if usage.is_some() {
+                    entry.1 = usage;
+                }
+            }
         }
     }
 
@@ -1113,6 +1156,25 @@ impl App {
             .values()
             .filter(|s| s.task_id.as_deref() == Some(task_id))
             .max_by_key(|s| (s.running, s.activity.is_some(), s.id.as_str()))
+    }
+
+    /// The activity/usage to show for a task: the live session's fields when
+    /// present, otherwise the last value retained from an earlier refresh. The two
+    /// fields fall back independently, so an activity-only push does not hide a
+    /// retained cost (and vice versa).
+    pub fn task_activity_usage(
+        &self,
+        task_id: &str,
+    ) -> (Option<&AgentActivity>, Option<&AgentUsage>) {
+        let live = self.task_session(task_id);
+        let stored = self.task_state.get(task_id);
+        let activity = live
+            .and_then(|s| s.activity.as_ref())
+            .or_else(|| stored.and_then(|(a, _)| a.as_ref()));
+        let usage = live
+            .and_then(|s| s.usage.as_ref())
+            .or_else(|| stored.and_then(|(_, u)| u.as_ref()));
+        (activity, usage)
     }
 
     /// The structured input request the Ctrl+R keybind can answer: the attached
@@ -1477,7 +1539,14 @@ impl App {
             push::TASK_UPDATED => {
                 if let Ok(t) = serde_json::from_value::<Task>(n.params) {
                     match self.tasks.iter().position(|x| x.id == t.id) {
-                        Some(i) => self.tasks[i] = t,
+                        Some(i) => {
+                            // A new attempt must not inherit the prior run's
+                            // retained activity/usage.
+                            if t.attempt > self.tasks[i].attempt {
+                                self.task_state.remove(&t.id.to_string());
+                            }
+                            self.tasks[i] = t;
+                        }
                         None => self.tasks.insert(0, t),
                     }
                 }
@@ -1647,25 +1716,23 @@ pub fn activity_cell(activity: Option<&AgentActivity>) -> String {
         .unwrap_or_else(|| "—".to_string())
 }
 
-/// Compact `input/output` token counts plus cost, used by the Tasks table and
-/// picker.
-pub fn format_usage(usage: &AgentUsage) -> String {
-    let mut out = format!(
-        "{}/{} tok",
-        format_tokens(usage.input_tokens),
-        format_tokens(usage.output_tokens)
-    );
-    if let Some(cost) = usage.cost_usd {
-        out.push_str(&format!(" ${cost:.4}"));
+/// Token cell value: `input/output tok`, or an em dash when nothing was reported.
+pub fn token_cell(usage: Option<&AgentUsage>) -> String {
+    match usage {
+        Some(u) if !u.is_empty() => format!(
+            "{}/{} tok",
+            format_tokens(u.input_tokens),
+            format_tokens(u.output_tokens)
+        ),
+        _ => "—".to_string(),
     }
-    out
 }
 
-/// Usage cell value, or an em dash when nothing has been reported yet.
-pub fn usage_cell(usage: Option<&AgentUsage>) -> String {
-    match usage {
-        Some(usage) if !usage.is_empty() => format_usage(usage),
-        _ => "—".to_string(),
+/// Cost cell value: `$x.xxxx`, or an em dash when `cost_usd` is absent.
+pub fn cost_cell(usage: Option<&AgentUsage>) -> String {
+    match usage.and_then(|u| u.cost_usd) {
+        Some(cost) => format!("${cost:.4}"),
+        None => "—".to_string(),
     }
 }
 

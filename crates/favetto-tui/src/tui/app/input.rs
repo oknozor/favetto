@@ -78,6 +78,7 @@ impl App {
             Popup::Sessions { .. } => return self.handle_sessions_key(key.code),
             Popup::Reply(_) => return self.handle_reply_key(key),
             Popup::Confirm(_) => return self.handle_confirm_key(key.code),
+            Popup::TaskError { .. } => return self.handle_task_error_key(key.code),
             Popup::None => {}
         }
 
@@ -116,6 +117,14 @@ impl App {
             && (key.code == KeyCode::Char('i') || key.code == KeyCode::Char('I'))
         {
             return self.open_workflow_inspect();
+        }
+
+        // `x` shows the selected task's error in a popup; literal inside a popup and
+        // forwarded while the embedded agent captures the keyboard.
+        if self.tab == Tab::Tasks
+            && (key.code == KeyCode::Char('x') || key.code == KeyCode::Char('X'))
+        {
+            return self.open_task_error();
         }
 
         // `p` toggles the Catalog preview pane, but only on the Catalog tab.
@@ -596,6 +605,23 @@ impl App {
             }
             _ => UiAction::None,
         }
+    }
+
+    /// Open the `x` popup for the selected task's error.
+    fn open_task_error(&mut self) -> UiAction {
+        if let Some(task) = self.selected_task() {
+            self.popup = Popup::TaskError { task_id: task.id };
+        }
+        UiAction::None
+    }
+
+    /// Keys while the task-error popup is open: `Esc` or `x` closes it.
+    pub(super) fn handle_task_error_key(&mut self, code: KeyCode) -> UiAction {
+        match code {
+            KeyCode::Esc | KeyCode::Char('x') | KeyCode::Char('X') => self.popup = Popup::None,
+            _ => {}
+        }
+        UiAction::None
     }
 
     pub(super) fn handle_menu_key(&mut self, code: KeyCode) -> UiAction {
