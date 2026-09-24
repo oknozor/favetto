@@ -1,7 +1,6 @@
 //! Token generation, storage, and verification.
 //!
-//! M1 ships a single bearer token with full (admin) scope. Scoped tokens
-//! (`read`/`write`/`admin`) and the pairing exchange arrive in M6.
+//! A single bearer token grants full access, and verification is constant-time.
 
 use std::path::Path;
 
