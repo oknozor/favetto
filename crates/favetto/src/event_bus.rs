@@ -81,6 +81,7 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             name: "t".to_string(),
             status: favetto_core::model::TaskStatus::Pending,
+            attempt: 0,
             input: serde_json::json!({}),
             output: None,
             dedupe_key: None,

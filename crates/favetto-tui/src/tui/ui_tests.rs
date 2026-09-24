@@ -817,6 +817,7 @@ fn geom_task(name: &str) -> favetto_core::model::Task {
         id: uuid::Uuid::new_v4(),
         name: name.to_string(),
         status: TaskStatus::Pending,
+        attempt: 0,
         input: serde_json::json!({}),
         output: None,
         dedupe_key: None,

@@ -85,6 +85,7 @@ async fn task_session_id_round_trips() {
         id: Uuid::new_v4(),
         name: "t".to_string(),
         status: TaskStatus::Succeeded,
+        attempt: 0,
         input: serde_json::json!({}),
         output: None,
         dedupe_key: None,
@@ -220,6 +221,7 @@ async fn migrate_adds_session_title_to_legacy_database() {
         id: Uuid::new_v4(),
         name: "t".to_string(),
         status: TaskStatus::Succeeded,
+        attempt: 0,
         input: serde_json::json!({}),
         output: None,
         dedupe_key: None,
@@ -265,6 +267,7 @@ fn task_at(
         id: Uuid::new_v4(),
         name: "t".to_string(),
         status: TaskStatus::Succeeded,
+        attempt: 0,
         input: serde_json::json!({}),
         output,
         dedupe_key: None,
@@ -934,6 +937,56 @@ async fn finalize_task_run_writes_outcome_and_keeps_started() {
     let mut missing = run.clone();
     missing.id = Uuid::new_v4();
     assert!(!finalize_task_run(&pool, &missing).await.unwrap());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `claim_task` flips the task to running, advances `attempt`, and records
+/// exactly one run under the new attempt. Claiming the same task twice is a
+/// no-op, so a run is never created twice for one dispatch.
+#[tokio::test]
+async fn claim_task_creates_one_run_and_increments_attempt() {
+    let (dir, pool) = scratch_pool("claim-run").await;
+    let mut task = task_at(Utc::now(), None, None);
+    task.status = TaskStatus::Pending;
+    task.attempt = 0;
+    insert_task(&pool, &task).await.unwrap();
+
+    let run = claim_task(&pool, &task)
+        .await
+        .unwrap()
+        .expect("a pending task is claimable");
+    assert_eq!(run.task_id, task.id);
+    assert_eq!(run.attempt, 1);
+    assert_eq!(run.status, RunStatus::Running);
+    assert!(run.started_at.is_some());
+
+    let stored = get_task(&pool, task.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Running);
+    assert_eq!(stored.attempt, 1);
+
+    // The task is no longer pending: claim again and expect no new run.
+    assert!(claim_task(&pool, &stored).await.unwrap().is_none());
+    let runs = list_task_runs(&pool, task.id).await.unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].id, run.id);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A retried task (already carrying an attempt) claims at `attempt + 1`.
+#[tokio::test]
+async fn claim_task_advances_the_attempt_for_a_retry() {
+    let (dir, pool) = scratch_pool("claim-retry").await;
+    let mut task = task_at(Utc::now(), None, None);
+    task.status = TaskStatus::Pending;
+    task.attempt = 2;
+    insert_task(&pool, &task).await.unwrap();
+
+    let run = claim_task(&pool, &task).await.unwrap().unwrap();
+    assert_eq!(run.attempt, 3);
+    assert_eq!(get_task(&pool, task.id).await.unwrap().unwrap().attempt, 3);
+    assert_eq!(list_task_runs(&pool, task.id).await.unwrap().len(), 1);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
