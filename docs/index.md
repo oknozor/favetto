@@ -56,7 +56,7 @@ favetto daemon
 favetto tui
 
 # or attach remotely over WebSocket (token auto-created in ~/.local/share/favetto/token)
-favetto tui --remote ws://127.0.0.1:7878 \
+favetto tui --remote ws://127.0.0.1:7878/rpc \
     --token-file ~/.local/share/favetto/token
 
 # then write tasks/hello.md and start it from the Catalog tab

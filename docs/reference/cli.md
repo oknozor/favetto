@@ -22,7 +22,7 @@ Attach the TUI to a running daemon (local Unix socket or remote WebSocket)
 
 | Flag | Value | Default | Description |
 |------|-------|---------|-------------|
-| `--remote` | `<REMOTE>` | — | Remote WebSocket URL (`ws://...`). If unset, attach to the local Unix socket |
+| `--remote` | `<REMOTE>` | — | Remote WebSocket URL (`ws://`/`wss://`; `/rpc` appended when absent). If unset, attach to the local Unix socket |
 | `--token-file` | `<TOKEN_FILE>` | — | Bearer token file for remote auth (defaults to `<data_dir>/token`) |
 | `--socket` | `<SOCKET>` | — | Unix socket path (overrides the default) |
 | `--pair-code` | `<PAIR_CODE>` | — | Short-lived pairing code to exchange for a token (remote attach only) |

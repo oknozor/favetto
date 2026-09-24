@@ -113,6 +113,6 @@ pub async fn run(args: crate::cli::PairArgs) -> anyhow::Result<()> {
         .unwrap_or(crate::pair::PAIR_TTL_SECS);
 
     println!("pairing code (valid {expires}s): {code}");
-    println!("attach with: favetto tui --remote ws://HOST:7878 --pair-code {code}");
+    println!("attach with: favetto tui --remote ws://HOST:7878/rpc --pair-code {code}");
     Ok(())
 }

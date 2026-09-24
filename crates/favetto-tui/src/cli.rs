@@ -12,7 +12,7 @@ pub use favetto_core::paths::{default_config_path, default_data_dir, default_tok
 
 #[derive(Args)]
 pub struct TuiArgs {
-    /// Remote WebSocket URL (`ws://...`). If unset, attach to the local Unix socket.
+    /// Remote WebSocket URL (`ws://`/`wss://`; `/rpc` appended when absent). If unset, attach to the local Unix socket.
     #[arg(long)]
     pub remote: Option<String>,
     /// Bearer token file for remote auth (defaults to `<data_dir>/token`).
