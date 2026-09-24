@@ -1,6 +1,6 @@
 //! TUI application state and the logic for folding server pushes into it.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -11,8 +11,9 @@ use serde_json::Value;
 use base64::Engine as _;
 
 use favetto_core::model::{
-    AgentCapabilities, AgentCatalogEntry, AgentSessionInfo, Event, EventKind, NotificationRecord,
-    Schedule, Task, TaskStatus,
+    AgentActivity, AgentCapabilities, AgentCatalogEntry, AgentSessionInfo, AgentUsage,
+    AwaitingInputKind, Event, EventKind, InputReply, InputRequest, NotificationRecord, Schedule,
+    Task, TaskStatus,
 };
 use favetto_core::rpc::{method, push, Notification};
 use favetto_providers::Provider;
@@ -112,6 +113,12 @@ pub enum UiAction {
         method: &'static str,
         params: Value,
     },
+    /// Answer the attached session's structured input request (`agents.reply`).
+    Reply {
+        session_id: String,
+        request_id: String,
+        reply: InputReply,
+    },
 }
 
 /// The Ctrl+P popup: either the top-level menu, a step-by-step form, the
@@ -140,6 +147,9 @@ pub enum Popup {
         selected: usize,
         sessions: Vec<AgentSessionInfo>,
     },
+    /// The Ctrl+R reply prompt: answer a session's structured input request
+    /// (`AgentActivity::Waiting { request }`) through `agents.reply`.
+    Reply(ReplyPrompt),
 }
 
 pub struct Form {
@@ -253,6 +263,43 @@ pub struct TaskVarsForm {
     /// Selected index into each variable's `choices` (0 when absent).
     pub choice_selected: Vec<usize>,
     pub error: Option<String>,
+}
+
+/// State for the Ctrl+R prompt that answers a session's structured input request.
+///
+/// Option prompts select a row; a free-form request (empty `options`) edits
+/// [`ReplyPrompt::input`]. Either way the typed reply is derived kind-aware by
+/// [`ReplyPrompt::reply`].
+pub struct ReplyPrompt {
+    /// The daemon session id the reply is sent to.
+    pub session_id: String,
+    /// The precise prompt as reported by the agent's state channel.
+    pub request: InputRequest,
+    /// Selected option index (0 when the request is free-form).
+    pub selected: usize,
+    /// Free-form answer buffer, used when `request.options` is empty.
+    pub input: TextBuffer,
+}
+
+impl ReplyPrompt {
+    pub fn new(session_id: String, request: InputRequest) -> Self {
+        Self {
+            session_id,
+            request,
+            selected: 0,
+            input: TextBuffer::default(),
+        }
+    }
+
+    /// Whether the prompt offers selectable options (vs free-form text).
+    pub fn has_options(&self) -> bool {
+        !self.request.options.is_empty()
+    }
+
+    /// The typed reply for the current selection/buffer.
+    pub fn reply(&self) -> InputReply {
+        reply_for(&self.request, self.selected, self.input.value())
+    }
 }
 
 /// A task-definition entry in the catalog (as returned by `catalog.list`).
@@ -416,6 +463,9 @@ pub struct App {
     pub agent_read_only: bool,
     /// The last `agents.start` / `agents.attach` error, shown in the status bar.
     pub agent_error: Option<String>,
+    /// Cached `agents.list` sessions keyed by daemon session id. The source of
+    /// the Tasks-table Activity/Usage cells and the Ctrl+R reply target.
+    pub agent_sessions: HashMap<String, AgentSessionInfo>,
     /// The embedded terminal's inner screen rectangle (set during draw), used to
     /// translate mouse events into the agent's coordinate space.
     pub agent_area: Option<Rect>,
@@ -502,6 +552,7 @@ impl App {
             agent_capture: false,
             agent_read_only: false,
             agent_error: None,
+            agent_sessions: HashMap::new(),
             agent_area: None,
             agent_resize: None,
             term: TerminalView::default(),
@@ -781,6 +832,10 @@ impl App {
     /// keystrokes. A headless run that is blocked on the user is the exception —
     /// attaching is what lets the answer reach its prompt.
     pub fn open_agent(&mut self, session: AgentSessionInfo, frame: &[u8]) {
+        // Cache the session so its activity/usage show in the Tasks table and the
+        // Ctrl+R reply sees the latest prompt without waiting for an `agents.list`.
+        self.agent_sessions
+            .insert(session.id.clone(), session.clone());
         let read_only = session.headless && session.awaiting_input.is_none();
         let status = if !session.headless {
             String::new()
@@ -821,6 +876,58 @@ impl App {
             selected: 0,
             sessions,
         };
+    }
+
+    /// Replace the cached `agents.list` sessions (the Activity/Usage source for
+    /// the Tasks table and the Ctrl+O picker).
+    pub fn set_agent_sessions(&mut self, sessions: Vec<AgentSessionInfo>) {
+        self.agent_sessions = sessions.into_iter().map(|s| (s.id.clone(), s)).collect();
+    }
+
+    /// Fold a `push::agent.state` frame into the cached session. A state frame
+    /// for an unknown session is ignored: the next `agents.list` re-syncs it.
+    pub fn apply_agent_state(
+        &mut self,
+        session_id: &str,
+        activity: Option<AgentActivity>,
+        usage: Option<AgentUsage>,
+    ) {
+        if let Some(session) = self.agent_sessions.get_mut(session_id) {
+            session.activity = activity;
+            session.usage = usage;
+        }
+    }
+
+    /// The cached session attached to a task, preferring a running one. Used to
+    /// join Activity/Usage into the Tasks table.
+    pub fn task_session(&self, task_id: &str) -> Option<&AgentSessionInfo> {
+        self.agent_sessions
+            .values()
+            .filter(|s| s.task_id.as_deref() == Some(task_id))
+            .max_by_key(|s| (s.running, s.activity.is_some(), s.id.as_str()))
+    }
+
+    /// The structured input request the Ctrl+R keybind can answer: the attached
+    /// session's `AgentActivity::Waiting`, or its structured `awaiting_input`
+    /// fallback. A screen-detected prompt (no `request_id`) yields `None`, so
+    /// sessions without a state channel keep their existing behaviour.
+    pub fn pending_request(&self) -> Option<(String, InputRequest)> {
+        let session = self.agent_sessions.get(self.agent_session_id.as_deref()?)?;
+        if let Some(AgentActivity::Waiting { request }) = &session.activity {
+            return Some((session.id.clone(), request.clone()));
+        }
+        let awaiting = session.awaiting_input.as_ref()?;
+        let request_id = awaiting.request_id.clone()?;
+        Some((
+            session.id.clone(),
+            InputRequest {
+                id: request_id,
+                kind: awaiting.kind,
+                message: awaiting.message.clone(),
+                options: awaiting.options.clone(),
+                allow_always: awaiting.allow_always,
+            },
+        ))
     }
 
     /// Feed a full-screen frame to the active session's terminal.
@@ -1195,6 +1302,22 @@ impl App {
                     self.enqueue_sound(SoundCue::Attention);
                 }
             }
+            push::AGENT_STATE => {
+                let sid = n.params.get("session_id").and_then(|v| v.as_str());
+                let activity = n
+                    .params
+                    .get("activity")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value::<AgentActivity>(v).ok());
+                let usage = n
+                    .params
+                    .get("usage")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value::<AgentUsage>(v).ok());
+                if let Some(sid) = sid {
+                    self.apply_agent_state(sid, activity, usage);
+                }
+            }
             _ => {}
         }
 
@@ -1246,6 +1369,103 @@ impl App {
         }
         let offset = self.events_selected.min(n - 1);
         self.events.get(n - 1 - offset)
+    }
+}
+
+/// Map a selected option (or free-form value) to a typed [`InputReply`].
+///
+/// The mapping is kind-aware so a permission prompt answers with
+/// `Once`/`Always`/`Reject`, a confirmation with `Confirmed`, and everything
+/// else (choices, free-form text) with `Value`.
+fn reply_for(request: &InputRequest, selected: usize, value: &str) -> InputReply {
+    if request.options.is_empty() {
+        return InputReply::Value {
+            value: value.to_string(),
+        };
+    }
+    let label = request.options.get(selected).cloned().unwrap_or_default();
+    let lower = label.to_ascii_lowercase();
+    match request.kind {
+        AwaitingInputKind::Permission => {
+            if lower.contains("always") || lower.contains("remember") {
+                InputReply::Always
+            } else if lower.contains("reject")
+                || lower.contains("deny")
+                || lower.contains("block")
+                || lower.contains("cancel")
+            {
+                InputReply::Reject
+            } else if request.allow_always && selected == 1 && request.options.len() > 2 {
+                InputReply::Always
+            } else {
+                InputReply::Once
+            }
+        }
+        AwaitingInputKind::Confirmation => {
+            let confirmed = !(lower.contains("no")
+                || lower.contains("deny")
+                || lower.contains("reject")
+                || lower.contains("cancel"));
+            InputReply::Confirmed { confirmed }
+        }
+        AwaitingInputKind::Choice | AwaitingInputKind::Pinentry | AwaitingInputKind::Other => {
+            InputReply::Value { value: label }
+        }
+    }
+}
+
+/// Short human label for an activity, used by the Tasks table and picker.
+pub fn format_activity(activity: &AgentActivity) -> String {
+    match activity {
+        AgentActivity::Starting => "starting".to_string(),
+        AgentActivity::Thinking => "thinking".to_string(),
+        AgentActivity::Responding => "responding".to_string(),
+        AgentActivity::Tool { name, .. } => format!("tool: {name}"),
+        AgentActivity::Waiting { .. } => "waiting".to_string(),
+        AgentActivity::Idle => "idle".to_string(),
+        AgentActivity::Exited { code } => match code {
+            Some(code) => format!("exited({code})"),
+            None => "exited".to_string(),
+        },
+    }
+}
+
+/// Activity cell value, or an em dash when no state channel reported one.
+pub fn activity_cell(activity: Option<&AgentActivity>) -> String {
+    activity
+        .map(format_activity)
+        .unwrap_or_else(|| "—".to_string())
+}
+
+/// Compact `input/output` token counts plus cost, used by the Tasks table and
+/// picker.
+pub fn format_usage(usage: &AgentUsage) -> String {
+    let mut out = format!(
+        "{}/{} tok",
+        format_tokens(usage.input_tokens),
+        format_tokens(usage.output_tokens)
+    );
+    if let Some(cost) = usage.cost_usd {
+        out.push_str(&format!(" ${cost:.4}"));
+    }
+    out
+}
+
+/// Usage cell value, or an em dash when nothing has been reported yet.
+pub fn usage_cell(usage: Option<&AgentUsage>) -> String {
+    match usage {
+        Some(usage) if !usage.is_empty() => format_usage(usage),
+        _ => "—".to_string(),
+    }
+}
+
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
     }
 }
 

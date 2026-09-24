@@ -1,6 +1,8 @@
 use super::*;
 use chrono::Utc;
-use favetto_core::model::{EventKind, TaskStatus};
+use favetto_core::model::{
+    AgentActivity, AgentUsage, AwaitingInputKind, EventKind, InputReply, InputRequest, TaskStatus,
+};
 
 use crate::tasks::VarType;
 
@@ -167,6 +169,245 @@ fn session_picker_closes_and_reports_when_empty() {
     app.open_sessions(Vec::new());
     assert!(matches!(app.popup, Popup::None));
     assert!(app.agent_error.is_some());
+}
+
+/// A permission request shaped like the adapters produce (opencode/claude).
+fn permission_request(options: Vec<&str>, allow_always: bool) -> InputRequest {
+    InputRequest {
+        id: "perm_1".to_string(),
+        kind: AwaitingInputKind::Permission,
+        message: "Allow bash?".to_string(),
+        options: options.into_iter().map(str::to_string).collect(),
+        allow_always,
+    }
+}
+
+fn waiting_session(id: &str, request: InputRequest) -> AgentSessionInfo {
+    let mut session = agent_session(id, false, true, false);
+    session.activity = Some(AgentActivity::Waiting { request });
+    session
+}
+
+#[test]
+fn agent_state_push_folds_activity_and_usage() {
+    let mut app = App::new();
+    app.set_agent_sessions(vec![agent_session("s1", false, true, false)]);
+    app.handle_notification(Notification {
+        method: push::AGENT_STATE.to_string(),
+        params: serde_json::json!({
+            "session_id": "s1",
+            "activity": { "kind": "tool", "name": "bash" },
+            "usage": { "input_tokens": 1200, "output_tokens": 34, "cost_usd": 0.25 },
+        }),
+    });
+    let session = app.agent_sessions.get("s1").unwrap();
+    assert_eq!(
+        session.activity,
+        Some(AgentActivity::Tool {
+            name: "bash".to_string(),
+            description: None,
+        })
+    );
+    let usage = session.usage.as_ref().expect("usage folded");
+    assert_eq!(usage.input_tokens, 1200);
+    assert_eq!(usage.cost_usd, Some(0.25));
+
+    // A frame for an unknown session is ignored, not invented.
+    app.handle_notification(Notification {
+        method: push::AGENT_STATE.to_string(),
+        params: serde_json::json!({ "session_id": "nope", "activity": { "kind": "idle" } }),
+    });
+    assert_eq!(app.agent_sessions.len(), 1);
+}
+
+#[test]
+fn task_session_joins_by_task_id_preferring_running() {
+    let mut app = App::new();
+    let mut stopped = agent_session("a", false, false, false);
+    stopped.task_id = Some("t1".to_string());
+    let mut running = agent_session("b", false, true, false);
+    running.task_id = Some("t1".to_string());
+    let mut other = agent_session("c", false, true, false);
+    other.task_id = Some("t2".to_string());
+    app.set_agent_sessions(vec![stopped, running, other]);
+
+    assert_eq!(app.task_session("t1").map(|s| s.id.as_str()), Some("b"));
+    assert_eq!(app.task_session("t2").map(|s| s.id.as_str()), Some("c"));
+    assert!(app.task_session("missing").is_none());
+}
+
+#[test]
+fn ctrl_r_opens_reply_only_with_a_structured_request() {
+    let mut app = App::new();
+    // No attached session: Ctrl+R is inert.
+    app.handle_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert!(matches!(app.popup, Popup::None));
+
+    // Screen-detected awaiting input (no request_id) is not remotely answerable.
+    let mut screen = agent_session("s1", false, true, true);
+    screen.awaiting_input.as_mut().unwrap().request_id = None;
+    app.set_agent_sessions(vec![screen]);
+    app.agent_session_id = Some("s1".to_string());
+    app.handle_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert!(matches!(app.popup, Popup::None));
+
+    // A Waiting activity opens the precise reply prompt.
+    app.set_agent_sessions(vec![waiting_session(
+        "s2",
+        permission_request(vec!["Allow once", "Reject"], true),
+    )]);
+    app.agent_session_id = Some("s2".to_string());
+    app.handle_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert!(matches!(app.popup, Popup::Reply(_)));
+}
+
+#[test]
+fn ctrl_r_uses_the_structured_awaiting_input_fallback() {
+    let mut app = App::new();
+    let mut session = agent_session("s1", false, true, true);
+    session.activity = None;
+    session.awaiting_input.as_mut().unwrap().request_id = Some("perm_9".to_string());
+    session.awaiting_input.as_mut().unwrap().options = vec!["Allow once".to_string()];
+    app.set_agent_sessions(vec![session]);
+    app.agent_session_id = Some("s1".to_string());
+
+    match app.pending_request() {
+        Some((sid, request)) => {
+            assert_eq!(sid, "s1");
+            assert_eq!(request.id, "perm_9");
+            assert_eq!(request.options, vec!["Allow once".to_string()]);
+        }
+        None => panic!("expected a structured fallback request"),
+    }
+}
+
+#[test]
+fn reply_popup_maps_permission_selection() {
+    let mut app = App::new();
+    app.set_agent_sessions(vec![waiting_session(
+        "s1",
+        permission_request(vec!["Allow once", "Allow always", "Reject"], true),
+    )]);
+    app.agent_session_id = Some("s1".to_string());
+
+    app.handle_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+    match app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())) {
+        UiAction::Reply {
+            session_id,
+            request_id,
+            reply,
+        } => {
+            assert_eq!(session_id, "s1");
+            assert_eq!(request_id, "perm_1");
+            assert_eq!(reply, InputReply::Always);
+        }
+        _ => panic!("expected Reply"),
+    }
+    assert!(matches!(app.popup, Popup::None));
+}
+
+#[test]
+fn reply_for_is_kind_aware() {
+    let permission = permission_request(vec!["Allow once", "Allow always", "Reject"], true);
+    assert_eq!(reply_for(&permission, 0, ""), InputReply::Once);
+    assert_eq!(reply_for(&permission, 1, ""), InputReply::Always);
+    assert_eq!(reply_for(&permission, 2, ""), InputReply::Reject);
+
+    let confirmation = InputRequest {
+        id: "c".to_string(),
+        kind: AwaitingInputKind::Confirmation,
+        message: "Proceed?".to_string(),
+        options: vec!["Yes".to_string(), "No".to_string()],
+        allow_always: false,
+    };
+    assert_eq!(
+        reply_for(&confirmation, 0, ""),
+        InputReply::Confirmed { confirmed: true }
+    );
+    assert_eq!(
+        reply_for(&confirmation, 1, ""),
+        InputReply::Confirmed { confirmed: false }
+    );
+
+    let choice = InputRequest {
+        id: "ch".to_string(),
+        kind: AwaitingInputKind::Choice,
+        message: "Pick".to_string(),
+        options: vec!["A".to_string(), "B".to_string()],
+        allow_always: false,
+    };
+    assert_eq!(
+        reply_for(&choice, 1, ""),
+        InputReply::Value {
+            value: "B".to_string()
+        }
+    );
+
+    let free = InputRequest {
+        options: Vec::new(),
+        ..choice
+    };
+    assert_eq!(
+        reply_for(&free, 0, "typed"),
+        InputReply::Value {
+            value: "typed".to_string()
+        }
+    );
+}
+
+#[test]
+fn reply_popup_free_form_types_a_value() {
+    let mut app = App::new();
+    let request = InputRequest {
+        id: "q1".to_string(),
+        kind: AwaitingInputKind::Other,
+        message: "Your name?".to_string(),
+        options: Vec::new(),
+        allow_always: false,
+    };
+    app.set_agent_sessions(vec![waiting_session("s1", request)]);
+    app.agent_session_id = Some("s1".to_string());
+
+    app.handle_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    for c in "abc".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::empty()));
+    }
+    match app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())) {
+        UiAction::Reply { reply, .. } => {
+            assert_eq!(
+                reply,
+                InputReply::Value {
+                    value: "abc".to_string()
+                }
+            )
+        }
+        _ => panic!("expected Reply"),
+    }
+}
+
+#[test]
+fn activity_and_usage_cells_render_compactly() {
+    assert_eq!(activity_cell(None), "—");
+    assert_eq!(activity_cell(Some(&AgentActivity::Thinking)), "thinking");
+    assert_eq!(
+        activity_cell(Some(&AgentActivity::Tool {
+            name: "read".to_string(),
+            description: None,
+        })),
+        "tool: read"
+    );
+    assert_eq!(usage_cell(None), "—");
+    assert_eq!(usage_cell(Some(&AgentUsage::default())), "—");
+    let usage = AgentUsage {
+        input_tokens: 1500,
+        output_tokens: 20,
+        reasoning_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        cost_usd: Some(0.5),
+    };
+    assert_eq!(usage_cell(Some(&usage)), "1.5k/20 tok $0.5000");
 }
 
 fn event(id: i64, kind: EventKind, payload: serde_json::Value) -> Event {
