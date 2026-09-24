@@ -2855,3 +2855,53 @@ fn task_updated_push_replaces_a_cancelled_row_in_place() {
     assert_eq!(app.tasks.len(), 2, "push must replace, not insert");
     assert_eq!(app.tasks[1].status, TaskStatus::Cancelled);
 }
+
+#[test]
+fn usage_tab_period_keys_select_and_mark_dirty() {
+    let mut app = App::new();
+    app.set_tab(Tab::Usage);
+    // The focus switch arms the first fetch; consume it.
+    assert!(app.usage_dirty);
+    app.usage_dirty = false;
+
+    app.handle_key(key(KeyCode::Char('3'), KeyModifiers::empty()));
+    assert_eq!(app.usage_period, UsagePeriod::Month);
+    assert!(app.usage_dirty, "a period change re-fetches");
+
+    // Re-selecting the same period does not re-fetch.
+    app.usage_dirty = false;
+    app.handle_key(key(KeyCode::Char('3'), KeyModifiers::empty()));
+    assert_eq!(app.usage_period, UsagePeriod::Month);
+    assert!(!app.usage_dirty);
+
+    // Digits are ignored outside the Usage tab.
+    app.set_tab(Tab::Tasks);
+    app.usage_dirty = false;
+    app.handle_key(key(KeyCode::Char('1'), KeyModifiers::empty()));
+    assert_eq!(app.usage_period, UsagePeriod::Month);
+    assert!(!app.usage_dirty);
+}
+
+#[test]
+fn usage_tab_focus_and_task_push_mark_it_dirty() {
+    let mut app = App::new();
+    assert!(!app.usage_dirty);
+    app.set_tab(Tab::Usage);
+    assert!(app.usage_dirty);
+    app.usage_dirty = false;
+
+    // Leaving and returning to Usage arms a refresh.
+    app.set_tab(Tab::Tasks);
+    assert!(!app.usage_dirty);
+    app.set_tab(Tab::Usage);
+    assert!(app.usage_dirty);
+
+    // A `task.updated` push while the tab is focused re-fetches.
+    app.usage_dirty = false;
+    let task = task("t");
+    app.handle_notification(favetto_core::rpc::Notification {
+        method: favetto_core::rpc::push::TASK_UPDATED.to_string(),
+        params: serde_json::to_value(&task).unwrap(),
+    });
+    assert!(app.usage_dirty);
+}

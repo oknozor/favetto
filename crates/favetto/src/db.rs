@@ -5,16 +5,18 @@
 //! Timestamps are stored as Unix epoch milliseconds (INTEGER) and JSON blobs as TEXT;
 //! the conversion happens at the boundary so the domain model stays clean.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, NaiveTime, TimeZone, Utc};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
 };
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
+use favetto_core::agent_state::{AgentUsage, UsageBucket, UsagePeriod, UsageStats, UsageTotals};
 use favetto_core::model::{
     Event, EventKind, Failure, NotificationRecord, RunStatus, Schedule, Task, TaskRun, TaskStatus,
 };
@@ -89,12 +91,19 @@ CREATE TABLE IF NOT EXISTS task_runs (
     attempt     INTEGER NOT NULL,
     status      TEXT NOT NULL,
     agent       TEXT,
+    model       TEXT,
     session_id  TEXT,
     started_at  INTEGER,
     finished_at INTEGER,
     exit_code   INTEGER,
     error       TEXT,
-    failure     TEXT
+    failure     TEXT,
+    input_tokens        INTEGER,
+    output_tokens       INTEGER,
+    reasoning_tokens    INTEGER,
+    cache_read_tokens   INTEGER,
+    cache_write_tokens  INTEGER,
+    cost_usd            REAL
 );
 
 -- Per-instance workflow dependencies for runtime DAGs created through
@@ -117,6 +126,7 @@ CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);
 CREATE INDEX IF NOT EXISTS idx_notifications_sent_at ON notifications(sent_at);
 CREATE INDEX IF NOT EXISTS idx_task_runs_task_attempt ON task_runs(task_id, attempt);
 CREATE INDEX IF NOT EXISTS idx_task_runs_status ON task_runs(status);
+CREATE INDEX IF NOT EXISTS idx_task_runs_finished_at ON task_runs(finished_at);
 "#;
 
 fn ts_ms(dt: DateTime<Utc>) -> i64 {
@@ -184,9 +194,36 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN retry_at INTEGER")
         .execute(pool)
         .await;
+    // Per-run token/cost usage and the configured model, stored on `task_runs`
+    // (not inside the `tasks.output` blob) so `usage.stats` can aggregate it and
+    // so it survives the retention pass that clears output blobs. Legacy rows
+    // keep NULL and decode as `None`.
+    let _ = sqlx::query("ALTER TABLE task_runs ADD COLUMN model TEXT")
+        .execute(pool)
+        .await;
+    for column in [
+        "input_tokens INTEGER",
+        "output_tokens INTEGER",
+        "reasoning_tokens INTEGER",
+        "cache_read_tokens INTEGER",
+        "cache_write_tokens INTEGER",
+        "cost_usd REAL",
+    ] {
+        // `column` is one of the fixed literals above, never user input.
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE task_runs ADD COLUMN {column}"
+        )))
+        .execute(pool)
+        .await;
+    }
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_tasks_root_id ON tasks(root_id)")
         .execute(pool)
         .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_task_runs_finished_at ON task_runs(finished_at)",
+    )
+    .execute(pool)
+    .await;
     Ok(())
 }
 
@@ -399,6 +436,7 @@ fn row_to_task_run(row: &SqliteRow) -> TaskRun {
             .parse()
             .unwrap_or(RunStatus::Pending),
         agent: row.try_get::<Option<String>, _>("agent").ok().flatten(),
+        model: row.try_get::<Option<String>, _>("model").ok().flatten(),
         session_id: row
             .try_get::<Option<String>, _>("session_id")
             .ok()
@@ -415,12 +453,54 @@ fn row_to_task_run(row: &SqliteRow) -> TaskRun {
             .map(from_ms),
         exit_code: row.try_get::<Option<i32>, _>("exit_code").ok().flatten(),
         error: row.try_get::<Option<String>, _>("error").ok().flatten(),
+        usage: usage_from_row(row),
         failure: row
             .try_get::<Option<String>, _>("failure")
             .ok()
             .flatten()
             .and_then(|s| serde_json::from_str(&s).ok()),
     }
+}
+
+/// Rebuild a run's [`AgentUsage`] from its flat `task_runs` columns. Returns
+/// `None` when every usage column is NULL (the agent reported nothing, or the
+/// row predates the columns).
+fn usage_from_row(row: &SqliteRow) -> Option<AgentUsage> {
+    let input = row.try_get::<Option<i64>, _>("input_tokens").ok().flatten();
+    let output = row
+        .try_get::<Option<i64>, _>("output_tokens")
+        .ok()
+        .flatten();
+    let reasoning = row
+        .try_get::<Option<i64>, _>("reasoning_tokens")
+        .ok()
+        .flatten();
+    let cache_read = row
+        .try_get::<Option<i64>, _>("cache_read_tokens")
+        .ok()
+        .flatten();
+    let cache_write = row
+        .try_get::<Option<i64>, _>("cache_write_tokens")
+        .ok()
+        .flatten();
+    let cost = row.try_get::<Option<f64>, _>("cost_usd").ok().flatten();
+    if input.is_none()
+        && output.is_none()
+        && reasoning.is_none()
+        && cache_read.is_none()
+        && cache_write.is_none()
+        && cost.is_none()
+    {
+        return None;
+    }
+    Some(AgentUsage {
+        input_tokens: input.unwrap_or(0).max(0) as u64,
+        output_tokens: output.unwrap_or(0).max(0) as u64,
+        reasoning_tokens: reasoning.unwrap_or(0).max(0) as u64,
+        cache_read_tokens: cache_read.unwrap_or(0).max(0) as u64,
+        cache_write_tokens: cache_write.unwrap_or(0).max(0) as u64,
+        cost_usd: cost,
+    })
 }
 
 fn row_to_event(row: &SqliteRow) -> Event {
@@ -857,11 +937,13 @@ pub async fn claim_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<Option
         attempt,
         status: RunStatus::Running,
         agent: None,
+        model: None,
         session_id: None,
         started_at: Some(now),
         finished_at: None,
         exit_code: None,
         error: None,
+        usage: None,
         failure: None,
     };
     insert_task_run(&mut *tx, &run).await?;
@@ -1046,20 +1128,28 @@ where
 {
     sqlx::query(
         "INSERT INTO task_runs
-            (id, task_id, attempt, status, agent, session_id, started_at, finished_at, exit_code, error, failure)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (id, task_id, attempt, status, agent, model, session_id, started_at, finished_at, exit_code, error, failure,
+             input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(run.id.to_string())
     .bind(run.task_id.to_string())
     .bind(run.attempt as i64)
     .bind(run.status.as_str())
     .bind(&run.agent)
+    .bind(&run.model)
     .bind(&run.session_id)
     .bind(run.started_at.map(ts_ms))
     .bind(run.finished_at.map(ts_ms))
     .bind(run.exit_code)
     .bind(&run.error)
     .bind(run.failure.as_ref().map(serde_json::to_string).transpose()?)
+    .bind(run.usage.as_ref().map(|u| u.input_tokens as i64))
+    .bind(run.usage.as_ref().map(|u| u.output_tokens as i64))
+    .bind(run.usage.as_ref().map(|u| u.reasoning_tokens as i64))
+    .bind(run.usage.as_ref().map(|u| u.cache_read_tokens as i64))
+    .bind(run.usage.as_ref().map(|u| u.cache_write_tokens as i64))
+    .bind(run.usage.as_ref().and_then(|u| u.cost_usd))
     .execute(executor)
     .await?;
     Ok(())
@@ -1069,7 +1159,8 @@ where
 #[allow(dead_code)] // consumed by the executor (#147); unit-tested here.
 pub async fn get_task_run(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Option<TaskRun>> {
     let row = sqlx::query(
-        "SELECT id, task_id, attempt, status, agent, session_id, started_at, finished_at, exit_code, error, failure \
+        "SELECT id, task_id, attempt, status, agent, model, session_id, started_at, finished_at, exit_code, error, failure, \
+                input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, cost_usd \
          FROM task_runs WHERE id = ?",
     )
     .bind(id.to_string())
@@ -1082,7 +1173,8 @@ pub async fn get_task_run(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Option<
 #[allow(dead_code)] // consumed by the executor (#147); unit-tested here.
 pub async fn list_task_runs(pool: &SqlitePool, task_id: Uuid) -> anyhow::Result<Vec<TaskRun>> {
     let rows = sqlx::query(
-        "SELECT id, task_id, attempt, status, agent, session_id, started_at, finished_at, exit_code, error, failure \
+        "SELECT id, task_id, attempt, status, agent, model, session_id, started_at, finished_at, exit_code, error, failure, \
+                input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, cost_usd \
          FROM task_runs WHERE task_id = ? ORDER BY attempt ASC, started_at ASC",
     )
     .bind(task_id.to_string())
@@ -1098,7 +1190,8 @@ pub async fn get_active_task_run(
     task_id: Uuid,
 ) -> anyhow::Result<Option<TaskRun>> {
     let row = sqlx::query(
-        "SELECT id, task_id, attempt, status, agent, session_id, started_at, finished_at, exit_code, error, failure \
+        "SELECT id, task_id, attempt, status, agent, model, session_id, started_at, finished_at, exit_code, error, failure, \
+                input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, cost_usd \
          FROM task_runs WHERE task_id = ? AND status IN ('pending', 'running', 'awaiting_input') \
          ORDER BY attempt DESC LIMIT 1",
     )
@@ -1112,7 +1205,8 @@ pub async fn get_active_task_run(
 #[allow(dead_code)] // consumed by the startup reconciler (#148); unit-tested here.
 pub async fn list_active_task_runs(pool: &SqlitePool) -> anyhow::Result<Vec<TaskRun>> {
     let rows = sqlx::query(
-        "SELECT id, task_id, attempt, status, agent, session_id, started_at, finished_at, exit_code, error, failure \
+        "SELECT id, task_id, attempt, status, agent, model, session_id, started_at, finished_at, exit_code, error, failure, \
+                input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, cost_usd \
          FROM task_runs WHERE status IN ('pending', 'running', 'awaiting_input') \
          ORDER BY started_at ASC",
     )
@@ -1123,23 +1217,33 @@ pub async fn list_active_task_runs(pool: &SqlitePool) -> anyhow::Result<Vec<Task
 
 /// Finalize a run's outcome columns by id. Returns whether a row matched.
 ///
-/// Only the outcome fields are written; `started_at`, `agent` and `attempt` are
-/// left as inserted. `session_id` uses `COALESCE`, so an id persisted earlier is
-/// kept when `None` is passed. Takes a whole [`TaskRun`] because the executor
-/// already has one in hand when finishing an attempt.
+/// Only the outcome fields are written; `started_at` and `attempt` are left as
+/// inserted. `session_id`/`agent`/`model` use `COALESCE`, so a value persisted
+/// earlier is kept when `None` is passed. Takes a whole [`TaskRun`] because the
+/// executor already has one in hand when finishing an attempt.
 pub async fn finalize_task_run(pool: &SqlitePool, run: &TaskRun) -> anyhow::Result<bool> {
     let result = sqlx::query(
         "UPDATE task_runs SET
              status = ?,
              session_id = COALESCE(?, session_id),
+             agent = COALESCE(?, agent),
+             model = COALESCE(?, model),
              finished_at = ?,
              exit_code = ?,
              error = ?,
-             failure = ?
+             failure = ?,
+             input_tokens = ?,
+             output_tokens = ?,
+             reasoning_tokens = ?,
+             cache_read_tokens = ?,
+             cache_write_tokens = ?,
+             cost_usd = ?
          WHERE id = ?",
     )
     .bind(run.status.as_str())
     .bind(&run.session_id)
+    .bind(&run.agent)
+    .bind(&run.model)
     .bind(run.finished_at.map(ts_ms))
     .bind(run.exit_code)
     .bind(&run.error)
@@ -1149,10 +1253,184 @@ pub async fn finalize_task_run(pool: &SqlitePool, run: &TaskRun) -> anyhow::Resu
             .map(serde_json::to_string)
             .transpose()?,
     )
+    .bind(run.usage.as_ref().map(|u| u.input_tokens as i64))
+    .bind(run.usage.as_ref().map(|u| u.output_tokens as i64))
+    .bind(run.usage.as_ref().map(|u| u.reasoning_tokens as i64))
+    .bind(run.usage.as_ref().map(|u| u.cache_read_tokens as i64))
+    .bind(run.usage.as_ref().map(|u| u.cache_write_tokens as i64))
+    .bind(run.usage.as_ref().and_then(|u| u.cost_usd))
     .bind(run.id.to_string())
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
+}
+
+// ---------------------------------------------------------------------------
+// Usage aggregation
+// ---------------------------------------------------------------------------
+
+const HOUR_MS: i64 = 3_600_000;
+const DAY_MS: i64 = 86_400_000;
+
+/// Aggregate finished runs into `period`-sized buckets ending at `now`, with
+/// overall totals. The series always has a fixed number of points (24 hours, 7
+/// days, 30 days or 12 months) so a chart does not jump as data arrives; empty
+/// buckets are zero. Cost is `None` for a bucket where no run reported one.
+pub async fn usage_stats(
+    pool: &SqlitePool,
+    period: UsagePeriod,
+    now: DateTime<Utc>,
+) -> anyhow::Result<UsageStats> {
+    let buckets = usage_bucket_bounds(period, now);
+    let Some(first) = buckets.first() else {
+        return Ok(UsageStats {
+            period,
+            ..Default::default()
+        });
+    };
+    let start_ms = ts_ms(first.0);
+    let end_ms = buckets
+        .last()
+        .map(|(_, end)| ts_ms(*end))
+        .unwrap_or(start_ms);
+
+    // Group in SQL by the period's bucket key so the sum is a single scan; empty
+    // buckets are filled in below.
+    let key_expr = match period {
+        UsagePeriod::Day => "strftime('%Y-%m-%dT%H', finished_at / 1000, 'unixepoch')",
+        UsagePeriod::Week | UsagePeriod::Month => {
+            "strftime('%Y-%m-%d', finished_at / 1000, 'unixepoch')"
+        }
+        UsagePeriod::Year => "strftime('%Y-%m', finished_at / 1000, 'unixepoch')",
+    };
+    let sql = format!(
+        "SELECT {key_expr} AS bucket, \
+                COALESCE(SUM(input_tokens), 0) AS input_tokens, \
+                COALESCE(SUM(output_tokens), 0) AS output_tokens, \
+                COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens, \
+                COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, \
+                COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, \
+                SUM(cost_usd) AS cost_usd, \
+                COUNT(*) AS runs \
+         FROM task_runs \
+         WHERE finished_at IS NOT NULL AND finished_at >= ? AND finished_at < ? \
+         GROUP BY bucket ORDER BY bucket"
+    );
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(start_ms)
+        .bind(end_ms)
+        .fetch_all(pool)
+        .await?;
+
+    let mut grouped: HashMap<String, (AgentUsage, u64)> = HashMap::new();
+    for row in &rows {
+        let key: String = row.get("bucket");
+        let usage = AgentUsage {
+            input_tokens: row.get::<i64, _>("input_tokens").max(0) as u64,
+            output_tokens: row.get::<i64, _>("output_tokens").max(0) as u64,
+            reasoning_tokens: row.get::<i64, _>("reasoning_tokens").max(0) as u64,
+            cache_read_tokens: row.get::<i64, _>("cache_read_tokens").max(0) as u64,
+            cache_write_tokens: row.get::<i64, _>("cache_write_tokens").max(0) as u64,
+            cost_usd: row.try_get::<Option<f64>, _>("cost_usd").ok().flatten(),
+        };
+        let runs = row.get::<i64, _>("runs").max(0) as u64;
+        let entry = grouped.entry(key).or_default();
+        entry.0.merge(&usage);
+        entry.1 += runs;
+    }
+
+    let mut totals = UsageTotals::default();
+    let mut out = Vec::with_capacity(buckets.len());
+    for (start, end) in buckets {
+        let key = usage_bucket_key(period, start);
+        let (usage, runs) = grouped.remove(&key).unwrap_or_default();
+        totals.usage.merge(&usage);
+        totals.runs += runs;
+        out.push(UsageBucket {
+            start,
+            end,
+            usage,
+            runs,
+        });
+    }
+    Ok(UsageStats {
+        period,
+        totals,
+        buckets: out,
+    })
+}
+
+/// The old-to-new bucket boundaries for a period, ending at `now`.
+fn usage_bucket_bounds(
+    period: UsagePeriod,
+    now: DateTime<Utc>,
+) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+    match period {
+        UsagePeriod::Day => {
+            let end = floor_to(now, HOUR_MS) + ChronoDuration::hours(1);
+            (0..24)
+                .map(|i| {
+                    let start = end - ChronoDuration::hours(24 - i);
+                    (start, start + ChronoDuration::hours(1))
+                })
+                .collect()
+        }
+        UsagePeriod::Week => day_buckets(now, 7),
+        UsagePeriod::Month => day_buckets(now, 30),
+        UsagePeriod::Year => month_buckets(now, 12),
+    }
+}
+
+/// The bucket key SQLite's `strftime` groups by, mirrored in Rust so a bucket
+/// can be matched without a second query.
+fn usage_bucket_key(period: UsagePeriod, start: DateTime<Utc>) -> String {
+    match period {
+        UsagePeriod::Day => start.format("%Y-%m-%dT%H").to_string(),
+        UsagePeriod::Week | UsagePeriod::Month => start.format("%Y-%m-%d").to_string(),
+        UsagePeriod::Year => start.format("%Y-%m").to_string(),
+    }
+}
+
+/// Truncate `now` down to a multiple of `step_ms` since the Unix epoch.
+fn floor_to(now: DateTime<Utc>, step_ms: i64) -> DateTime<Utc> {
+    let ms = now.timestamp_millis().div_euclid(step_ms) * step_ms;
+    DateTime::from_timestamp_millis(ms).unwrap_or(now)
+}
+
+fn day_buckets(now: DateTime<Utc>, days: i64) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+    let end = floor_to(now, DAY_MS) + ChronoDuration::days(1);
+    (0..days)
+        .map(|i| {
+            let start = end - ChronoDuration::days(days - i);
+            (start, start + ChronoDuration::days(1))
+        })
+        .collect()
+}
+
+/// The first instant of `now`'s UTC calendar month.
+fn month_floor(now: DateTime<Utc>) -> DateTime<Utc> {
+    let date =
+        NaiveDate::from_ymd_opt(now.year(), now.month(), 1).unwrap_or_else(|| now.date_naive());
+    Utc.from_utc_datetime(&date.and_time(NaiveTime::MIN))
+}
+
+/// `base` shifted by `delta` whole months (clamped to the first of the month).
+fn add_months(base: DateTime<Utc>, delta: i32) -> DateTime<Utc> {
+    let total = base.year() * 12 + base.month0() as i32 + delta;
+    let year = total.div_euclid(12);
+    let month = total.rem_euclid(12) + 1;
+    let date = NaiveDate::from_ymd_opt(year, month as u32, 1).unwrap_or_else(|| base.date_naive());
+    Utc.from_utc_datetime(&date.and_time(NaiveTime::MIN))
+}
+
+fn month_buckets(now: DateTime<Utc>, months: i32) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+    let end = add_months(month_floor(now), 1);
+    (0..months)
+        .map(|i| {
+            let start = add_months(end, -(months - i));
+            (start, add_months(start, 1))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

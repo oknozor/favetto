@@ -541,7 +541,7 @@
       "type": "object"
     },
     "RetentionSettings": {
-      "description": "Database retention policy.\n\nThis is the one setting that deletes data: on daemon start (and every six\nhours) rows older than `days` are pruned and the database is optionally\n`VACUUM`ed. `min_tasks` guarantees the newest N task rows survive regardless\nof age. Set `days = 0` to opt out and keep everything forever.",
+      "description": "Database retention policy.\n\nThis is the one setting that deletes data: on daemon start (and every six\nhours) rows older than `days` are pruned and the database is optionally\n`VACUUM`ed. `min_tasks` guarantees the newest N task rows survive regardless\nof age. Set `days = 0` to opt out and keep everything forever.\n\nPruning happens in two stages. First an old task's `output` blob is cleared\n(space reclaim with the metadata kept); per-run token/cost usage is stored in\nflat `task_runs` columns, so it survives this stage and stays available to\n`usage.stats`. Then, once the task row itself is old enough to delete, its\nrun rows (and their usage) go with it.",
       "properties": {
         "days": {
           "default": 30,

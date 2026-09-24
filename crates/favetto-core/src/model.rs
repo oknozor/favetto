@@ -11,7 +11,7 @@ use crate::rpc::{push, Notification};
 
 pub use crate::agent_state::{
     AgentActivity, AgentStateEvent, AgentUsage, IdleOutcome, InputReply, InputRequest, RunSummary,
-    ToolCall,
+    ToolCall, UsageBucket, UsagePeriod, UsageStats, UsageTotals,
 };
 
 /// Lifecycle of a single task.
@@ -150,6 +150,10 @@ pub struct TaskRun {
     /// Name of the agent that ran (or was configured for) this attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// The provider/model the attempt was configured with (e.g. the task's
+    /// `model`), so usage can be attributed. Absent for runs that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// The agent's own session id for this attempt, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -161,6 +165,12 @@ pub struct TaskRun {
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Token/cost usage reported by the agent for this attempt. Stored on the
+    /// run (not inside `tasks.output`) so it survives the retention pass that
+    /// clears output blobs and can be aggregated by `usage.stats`. Absent when
+    /// the agent reported no usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AgentUsage>,
     /// Machine-readable classification, defined by #141. Absent while the run is
     /// still in flight or when it did not fail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1067,11 +1077,18 @@ mod tests {
             attempt: 2,
             status: RunStatus::Failed,
             agent: Some("opencode".to_string()),
+            model: Some("anthropic/claude-sonnet".to_string()),
             session_id: Some("ses_1".to_string()),
             started_at: Some(started_at),
             finished_at: Some(finished_at),
             exit_code: Some(1),
             error: Some("boom".to_string()),
+            usage: Some(AgentUsage {
+                input_tokens: 12,
+                output_tokens: 3,
+                cost_usd: Some(0.02),
+                ..Default::default()
+            }),
             failure: Some(Failure::new(FailureKind::Infrastructure, "boom")),
         };
 
@@ -1083,6 +1100,9 @@ mod tests {
         assert_eq!(json["exit_code"], 1);
         assert_eq!(json["failure"]["kind"], "infrastructure");
         assert_eq!(json["failure"]["message"], "boom");
+        assert_eq!(json["model"], "anthropic/claude-sonnet");
+        assert_eq!(json["usage"]["input_tokens"], 12);
+        assert_eq!(json["usage"]["cost_usd"], 0.02);
 
         let back: TaskRun = serde_json::from_value(json).unwrap();
         assert_eq!(back.id, run.id);
@@ -1090,6 +1110,7 @@ mod tests {
         assert_eq!(back.attempt, run.attempt);
         assert_eq!(back.status, run.status);
         assert_eq!(back.agent, run.agent);
+        assert_eq!(back.model, run.model);
         assert_eq!(back.session_id, run.session_id);
         assert_eq!(
             back.started_at.map(|t| t.timestamp_millis()),
@@ -1101,6 +1122,7 @@ mod tests {
         );
         assert_eq!(back.exit_code, run.exit_code);
         assert_eq!(back.error, run.error);
+        assert_eq!(back.usage, run.usage);
         assert_eq!(back.failure, run.failure);
     }
 
@@ -1117,15 +1139,19 @@ mod tests {
         )
         .unwrap();
         assert!(legacy.agent.is_none());
+        assert!(legacy.model.is_none());
         assert!(legacy.session_id.is_none());
         assert!(legacy.started_at.is_none());
         assert!(legacy.finished_at.is_none());
         assert!(legacy.exit_code.is_none());
         assert!(legacy.error.is_none());
+        assert!(legacy.usage.is_none());
         assert!(legacy.failure.is_none());
         // Absent optional fields are omitted from the serialized form.
         let json = serde_json::to_value(&legacy).unwrap();
         assert!(json.get("agent").is_none());
+        assert!(json.get("model").is_none());
+        assert!(json.get("usage").is_none());
         assert!(json.get("failure").is_none());
     }
 

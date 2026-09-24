@@ -8,8 +8,11 @@
 //! All types are additive on the wire: every new field defaults, so an older
 //! client or daemon decodes a newer payload unchanged.
 
+use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+use std::str::FromStr;
 
 use crate::model::{AwaitingInputKind, MessageRole};
 
@@ -110,6 +113,128 @@ impl AgentUsage {
             && self.cache_write_tokens == 0
             && self.cost_usd.is_none()
     }
+
+    /// Sum of the token classes that are not subsets of one another. Cache
+    /// read/write counters are excluded because a cache read is normally also
+    /// counted as input and would otherwise be double-counted.
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens + self.output_tokens + self.reasoning_tokens
+    }
+}
+
+/// The aggregation window requested from `usage.stats`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UsagePeriod {
+    /// Hourly buckets over the last 24 hours.
+    #[default]
+    Day,
+    /// Daily buckets over the last 7 days.
+    Week,
+    /// Daily buckets over the last 30 days.
+    Month,
+    /// Monthly buckets over the last 12 months.
+    Year,
+}
+
+impl UsagePeriod {
+    /// Every period, in selector order.
+    pub const ALL: [UsagePeriod; 4] = [
+        UsagePeriod::Day,
+        UsagePeriod::Week,
+        UsagePeriod::Month,
+        UsagePeriod::Year,
+    ];
+
+    /// Stable string form used on the wire and in URLs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UsagePeriod::Day => "day",
+            UsagePeriod::Week => "week",
+            UsagePeriod::Month => "month",
+            UsagePeriod::Year => "year",
+        }
+    }
+
+    /// Human-readable name for the TUI period selector.
+    pub fn label(self) -> &'static str {
+        match self {
+            UsagePeriod::Day => "Day",
+            UsagePeriod::Week => "Week",
+            UsagePeriod::Month => "Month",
+            UsagePeriod::Year => "Year",
+        }
+    }
+
+    /// What a single bucket represents (chart/label unit).
+    pub fn bucket_unit(self) -> &'static str {
+        match self {
+            UsagePeriod::Day => "hour",
+            UsagePeriod::Week | UsagePeriod::Month => "day",
+            UsagePeriod::Year => "month",
+        }
+    }
+}
+
+impl FromStr for UsagePeriod {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "day" => UsagePeriod::Day,
+            "week" => UsagePeriod::Week,
+            "month" => UsagePeriod::Month,
+            "year" => UsagePeriod::Year,
+            _ => return Err(()),
+        })
+    }
+}
+
+/// One time bucket of aggregated usage in a [`UsageStats`] result.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct UsageBucket {
+    /// Inclusive bucket start (UTC).
+    pub start: DateTime<Utc>,
+    /// Exclusive bucket end (UTC).
+    pub end: DateTime<Utc>,
+    /// Token/cost totals for the bucket. `cost_usd` is `None` when no run in the
+    /// bucket reported a cost.
+    pub usage: AgentUsage,
+    /// Number of finished runs whose `finished_at` fell in the bucket.
+    pub runs: u64,
+}
+
+impl UsageBucket {
+    /// Total tokens in the bucket (see [`AgentUsage::total_tokens`]).
+    pub fn total_tokens(&self) -> u64 {
+        self.usage.total_tokens()
+    }
+}
+
+/// Overall totals for a [`UsageStats`] result: the sum of every bucket.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct UsageTotals {
+    pub usage: AgentUsage,
+    /// Number of finished runs in the whole window.
+    pub runs: u64,
+}
+
+impl UsageTotals {
+    /// Total tokens across the window (see [`AgentUsage::total_tokens`]).
+    pub fn total_tokens(&self) -> u64 {
+        self.usage.total_tokens()
+    }
+}
+
+/// `usage.stats` result: a per-bucket token/cost series plus window totals for
+/// the requested [`UsagePeriod`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct UsageStats {
+    pub period: UsagePeriod,
+    pub totals: UsageTotals,
+    /// Oldest bucket first. Empty buckets are included so the TUI chart always
+    /// has a fixed number of points for the selected period.
+    pub buckets: Vec<UsageBucket>,
 }
 
 /// A completed tool invocation, kept in a [`RunSummary`].
@@ -387,5 +512,70 @@ mod tests {
             let back: AgentActivity = serde_json::from_value(json).unwrap();
             assert_eq!(back, activity);
         }
+    }
+
+    #[test]
+    fn usage_period_round_trips_and_defaults() {
+        assert_eq!(UsagePeriod::default(), UsagePeriod::Day);
+        assert_eq!(
+            UsagePeriod::ALL.map(|p| p.as_str()),
+            ["day", "week", "month", "year"]
+        );
+        assert_eq!(UsagePeriod::Week.bucket_unit(), "day");
+        assert_eq!(UsagePeriod::Year.bucket_unit(), "month");
+
+        for period in UsagePeriod::ALL {
+            let json = serde_json::to_value(period).unwrap();
+            assert_eq!(json, serde_json::json!(period.as_str()));
+            let back: UsagePeriod = serde_json::from_value(json).unwrap();
+            assert_eq!(back, period);
+            assert_eq!(period.as_str().parse::<UsagePeriod>(), Ok(period));
+        }
+        assert!("nope".parse::<UsagePeriod>().is_err());
+    }
+
+    #[test]
+    fn usage_stats_round_trip_and_total_tokens() {
+        let start = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let usage = AgentUsage {
+            input_tokens: 10,
+            output_tokens: 4,
+            reasoning_tokens: 1,
+            cache_read_tokens: 7,
+            cache_write_tokens: 2,
+            cost_usd: Some(0.25),
+        };
+        // Cache counters are excluded from the headline total.
+        assert_eq!(usage.total_tokens(), 15);
+
+        let stats = UsageStats {
+            period: UsagePeriod::Day,
+            totals: UsageTotals {
+                usage: usage.clone(),
+                runs: 3,
+            },
+            buckets: vec![UsageBucket {
+                start,
+                end: start + chrono::Duration::hours(1),
+                usage,
+                runs: 3,
+            }],
+        };
+        let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(json["period"], "day");
+        assert_eq!(json["totals"]["runs"], 3);
+        assert_eq!(json["buckets"][0]["usage"]["input_tokens"], 10);
+        let back: UsageStats = serde_json::from_value(json).unwrap();
+        assert_eq!(back, stats);
+        assert_eq!(back.buckets[0].total_tokens(), 15);
+
+        // An absent cost serializes as null and decodes back to `None`.
+        let no_cost = UsageBucket {
+            usage: AgentUsage::default(),
+            runs: 0,
+            ..back.buckets[0].clone()
+        };
+        let json = serde_json::to_value(no_cost).unwrap();
+        assert_eq!(json["usage"]["cost_usd"], serde_json::Value::Null);
     }
 }

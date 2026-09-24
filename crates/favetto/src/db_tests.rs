@@ -291,11 +291,13 @@ fn run_at(task_id: Uuid, attempt: u32) -> TaskRun {
         attempt,
         status: RunStatus::Running,
         agent: None,
+        model: None,
         session_id: None,
         started_at: Some(Utc::now()),
         finished_at: None,
         exit_code: None,
         error: None,
+        usage: None,
         failure: None,
     }
 }
@@ -1577,6 +1579,280 @@ async fn prune_deletes_orphan_dependencies() {
         .await
         .unwrap();
     assert_eq!(remaining, 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Insert a finished run carrying the given usage, so the aggregation query can
+/// be exercised without the executor.
+async fn insert_finished_run(
+    pool: &SqlitePool,
+    task_id: Uuid,
+    finished_at: DateTime<Utc>,
+    usage: Option<AgentUsage>,
+) {
+    let run = TaskRun {
+        status: RunStatus::Succeeded,
+        finished_at: Some(finished_at),
+        usage,
+        ..run_at(task_id, 1)
+    };
+    insert_task_run(pool, &run).await.unwrap();
+}
+
+fn tokens(input: u64, output: u64, cost: Option<f64>) -> AgentUsage {
+    AgentUsage {
+        input_tokens: input,
+        output_tokens: output,
+        cost_usd: cost,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn usage_stats_buckets_by_hour_and_sums_cost_and_runs() {
+    let (dir, pool) = scratch_pool("usage-day").await;
+    let now = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(); // 2023-11-14T22:13:20Z
+    let task = Uuid::new_v4();
+    // Same current hour as `now`, and three hours earlier.
+    insert_finished_run(
+        &pool,
+        task,
+        now - ChronoDuration::minutes(30),
+        Some(tokens(10, 2, Some(0.5))),
+    )
+    .await;
+    insert_finished_run(
+        &pool,
+        task,
+        now - ChronoDuration::hours(3),
+        Some(tokens(5, 0, None)),
+    )
+    .await;
+    // An unfinished run must not contribute.
+    let running = TaskRun {
+        finished_at: None,
+        usage: Some(tokens(99, 99, Some(9.9))),
+        ..run_at(task, 1)
+    };
+    insert_task_run(&pool, &running).await.unwrap();
+
+    let stats = usage_stats(&pool, UsagePeriod::Day, now).await.unwrap();
+    assert_eq!(stats.period, UsagePeriod::Day);
+    assert_eq!(stats.buckets.len(), 24);
+    assert_eq!(stats.totals.usage.input_tokens, 15);
+    assert_eq!(stats.totals.usage.output_tokens, 2);
+    assert_eq!(stats.totals.usage.cost_usd, Some(0.5));
+    assert_eq!(stats.totals.runs, 2);
+
+    // The newest bucket is the hour containing `now`; the run at `now - 30m`
+    // (a little before the hour) lands in the previous bucket.
+    assert_eq!(stats.buckets[23].start, floor_to(now, HOUR_MS));
+    assert_eq!(
+        stats.buckets[0].end - stats.buckets[0].start,
+        ChronoDuration::hours(1)
+    );
+    assert_eq!(stats.buckets[23].runs, 0, "the current hour has no runs");
+
+    let recent = &stats.buckets[22];
+    assert_eq!(recent.usage.input_tokens, 10);
+    assert_eq!(recent.usage.cost_usd, Some(0.5));
+    assert_eq!(recent.runs, 1);
+    let earlier = &stats.buckets[20];
+    assert_eq!(earlier.usage.input_tokens, 5);
+    assert!(earlier.usage.cost_usd.is_none());
+    assert_eq!(earlier.runs, 1);
+    // A gap hour is present, zeroed.
+    assert_eq!(stats.buckets[21].runs, 0);
+    assert_eq!(stats.buckets[21].total_tokens(), 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn usage_stats_buckets_by_day_and_month() {
+    let (dir, pool) = scratch_pool("usage-coarse").await;
+    let now = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+    let task = Uuid::new_v4();
+    insert_finished_run(&pool, task, now, Some(tokens(1, 0, None))).await;
+    insert_finished_run(
+        &pool,
+        task,
+        now - ChronoDuration::days(2),
+        Some(tokens(2, 0, None)),
+    )
+    .await;
+    // The 40-day-old run falls in an earlier calendar month of the year series.
+    insert_finished_run(
+        &pool,
+        task,
+        now - ChronoDuration::days(40),
+        Some(tokens(4, 0, None)),
+    )
+    .await;
+
+    let week = usage_stats(&pool, UsagePeriod::Week, now).await.unwrap();
+    assert_eq!(week.buckets.len(), 7);
+    assert_eq!(week.totals.usage.input_tokens, 3); // now + 2 days ago
+    assert_eq!(week.totals.runs, 2);
+
+    let month = usage_stats(&pool, UsagePeriod::Month, now).await.unwrap();
+    assert_eq!(month.buckets.len(), 30);
+    assert_eq!(month.totals.usage.input_tokens, 3); // the 40-day-old run is out of window
+
+    let year = usage_stats(&pool, UsagePeriod::Year, now).await.unwrap();
+    assert_eq!(year.buckets.len(), 12);
+    assert_eq!(year.totals.usage.input_tokens, 7);
+    // Every bucket is a calendar month, oldest first, ending with the current one.
+    assert_eq!(month_floor(now), year.buckets[11].start);
+    assert_eq!(add_months(month_floor(now), 1), year.buckets[11].end);
+    assert_eq!(
+        year.buckets[1].end, year.buckets[2].start,
+        "month buckets are contiguous"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn usage_stats_empty_history_is_all_zero_with_fixed_buckets() {
+    let (dir, pool) = scratch_pool("usage-empty").await;
+    let now = Utc::now();
+    for (period, expected) in [
+        (UsagePeriod::Day, 24),
+        (UsagePeriod::Week, 7),
+        (UsagePeriod::Month, 30),
+        (UsagePeriod::Year, 12),
+    ] {
+        let stats = usage_stats(&pool, period, now).await.unwrap();
+        assert_eq!(stats.buckets.len(), expected, "{period:?}");
+        assert_eq!(stats.totals.runs, 0);
+        assert_eq!(stats.totals.usage, AgentUsage::default());
+        assert!(stats.totals.usage.cost_usd.is_none());
+        assert!(stats
+            .buckets
+            .iter()
+            .all(|b| b.runs == 0 && b.total_tokens() == 0));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn usage_survives_the_retention_pass_that_clears_outputs() {
+    let (dir, pool) = scratch_pool("usage-retention").await;
+    let old = Utc::now() - ChronoDuration::days(60);
+    let task = task_at(
+        old,
+        Some(old),
+        Some(serde_json::json!({ "big": "x".repeat(500) })),
+    );
+    upsert_task(&pool, &task).await.unwrap();
+    insert_finished_run(&pool, task.id, old, Some(tokens(11, 7, Some(0.125)))).await;
+
+    // `min_tasks` keeps the row; its output blob is cleared.
+    let stats = prune(&pool, 30, 1000, false).await.unwrap();
+    assert_eq!(stats.outputs_cleared, 1);
+    assert!(get_task(&pool, task.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .output
+        .is_none());
+
+    // The run (and therefore its usage) is still there and still aggregates.
+    let runs = list_task_runs(&pool, task.id).await.unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].usage.as_ref().map(|u| u.input_tokens), Some(11));
+
+    let agg = usage_stats(&pool, UsagePeriod::Month, old).await.unwrap();
+    assert_eq!(agg.totals.usage.input_tokens, 11);
+    assert_eq!(agg.totals.usage.cost_usd, Some(0.125));
+    assert_eq!(agg.totals.runs, 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn finalized_run_round_trips_usage_model_and_agent() {
+    let (dir, pool) = scratch_pool("usage-roundtrip").await;
+    let task = task_at(Utc::now(), None, None);
+    upsert_task(&pool, &task).await.unwrap();
+    let run = run_at(task.id, 1);
+    insert_task_run(&pool, &run).await.unwrap();
+
+    let mut done = run.clone();
+    done.status = RunStatus::Succeeded;
+    done.finished_at = Some(Utc::now());
+    done.agent = Some("opencode".to_string());
+    done.model = Some("deepseek-v4-flash".to_string());
+    done.usage = Some(tokens(100, 20, Some(0.03)));
+    assert!(finalize_task_run(&pool, &done).await.unwrap());
+
+    let got = get_task_run(&pool, run.id).await.unwrap().unwrap();
+    assert_eq!(got.agent.as_deref(), Some("opencode"));
+    assert_eq!(got.model.as_deref(), Some("deepseek-v4-flash"));
+    let usage = got.usage.expect("usage");
+    assert_eq!(usage.input_tokens, 100);
+    assert_eq!(usage.output_tokens, 20);
+    assert_eq!(usage.cost_usd, Some(0.03));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn migrate_adds_usage_columns_to_a_legacy_task_runs_table() {
+    let dir = std::env::temp_dir().join(format!("favetto-legacy-usage-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let pool = open(&dir.join("test.db")).await.unwrap();
+    // A `task_runs` table from before the usage columns existed.
+    sqlx::query(
+        "CREATE TABLE task_runs (
+                id          TEXT PRIMARY KEY,
+                task_id     TEXT NOT NULL,
+                attempt     INTEGER NOT NULL,
+                status      TEXT NOT NULL,
+                agent       TEXT,
+                session_id  TEXT,
+                started_at  INTEGER,
+                finished_at INTEGER,
+                exit_code   INTEGER,
+                error       TEXT,
+                failure     TEXT
+            )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    migrate(&pool).await.unwrap();
+    migrate(&pool).await.unwrap();
+
+    let columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('task_runs')")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    for expected in [
+        "model",
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "cost_usd",
+    ] {
+        assert!(
+            columns.iter().any(|c| c == expected),
+            "missing column `{expected}` in {columns:?}"
+        );
+    }
+
+    // A run inserted against the migrated table carries its usage.
+    let task_id = Uuid::new_v4();
+    insert_finished_run(&pool, task_id, Utc::now(), Some(tokens(3, 1, Some(0.01)))).await;
+    let runs = list_task_runs(&pool, task_id).await.unwrap();
+    assert_eq!(runs[0].usage.as_ref().map(|u| u.input_tokens), Some(3));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -104,6 +104,79 @@ async fn workflow_get_returns_dot_and_path() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn usage_stats_dispatches_aggregated_usage() {
+    use favetto_core::agent_state::{AgentUsage, UsagePeriod};
+    use favetto_core::model::{RunStatus, TaskRun};
+
+    let dir = temp_dir("usage-stats");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+
+    let now = Utc::now();
+    let task_id = Uuid::new_v4();
+    db::insert_task_run(
+        &state.db,
+        &TaskRun {
+            id: Uuid::new_v4(),
+            task_id,
+            attempt: 1,
+            status: RunStatus::Succeeded,
+            agent: Some("opencode".to_string()),
+            model: Some("deepseek-v4-flash".to_string()),
+            session_id: None,
+            started_at: Some(now),
+            finished_at: Some(now),
+            exit_code: Some(0),
+            error: None,
+            usage: Some(AgentUsage {
+                input_tokens: 120,
+                output_tokens: 30,
+                cost_usd: Some(0.42),
+                ..Default::default()
+            }),
+            failure: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 1,
+            method: method::USAGE_STATS.to_string(),
+            params: serde_json::json!({ "period": "month" }),
+        },
+    )
+    .await;
+    let result = resp.result.expect("usage.stats result");
+    assert_eq!(result["period"], UsagePeriod::Month.as_str());
+    assert_eq!(result["totals"]["usage"]["input_tokens"], 120);
+    assert_eq!(result["totals"]["usage"]["output_tokens"], 30);
+    assert_eq!(result["totals"]["usage"]["cost_usd"], 0.42);
+    assert_eq!(result["totals"]["runs"], 1);
+    let buckets = result["buckets"].as_array().expect("buckets");
+    assert_eq!(buckets.len(), 30);
+
+    // A missing period defaults to `day`.
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 2,
+            method: method::USAGE_STATS.to_string(),
+            params: serde_json::json!({}),
+        },
+    )
+    .await;
+    let result = resp.result.expect("usage.stats result");
+    assert_eq!(result["period"], "day");
+    assert_eq!(result["buckets"].as_array().map(Vec::len), Some(24));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Decode a `workflow.inspect` id bucket into `Uuid`s.
 fn id_list(result: &serde_json::Value, field: &str) -> Vec<Uuid> {
     result[field]
@@ -572,11 +645,13 @@ async fn workflow_retry_delegates_to_manual_retry() {
             attempt: 1,
             status: RunStatus::Failed,
             agent: None,
+            model: None,
             session_id: None,
             started_at: Some(Utc::now()),
             finished_at: Some(Utc::now()),
             exit_code: None,
             error: None,
+            usage: None,
             failure: None,
         },
     )
@@ -2134,11 +2209,13 @@ async fn tasks_retry_requeues_terminal_tasks_and_rejects_live_runs() {
         attempt,
         status,
         agent: None,
+        model: None,
         session_id: None,
         started_at: Some(Utc::now()),
         finished_at: None,
         exit_code: None,
         error: None,
+        usage: None,
         failure: None,
     };
 

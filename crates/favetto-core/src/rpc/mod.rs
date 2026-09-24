@@ -166,6 +166,9 @@ pub mod method {
     pub const NOTIFICATIONS_TEST: &str = "notifications.test";
     /// Add a notification hook reacting to an event kind.
     pub const HOOKS_UPSERT: &str = "hooks.upsert";
+    /// Aggregate persisted per-run token/cost usage into a per-bucket series for
+    /// a day/week/month/year period, plus window totals.
+    pub const USAGE_STATS: &str = "usage.stats";
 }
 
 /// Well-known server → client push (notification) method names.
@@ -295,6 +298,11 @@ pub const CLIENT_METHODS: &[(&str, &str)] = &[
     (
         method::HOOKS_UPSERT,
         "Add a notification hook reacting to an event kind.",
+    ),
+    (
+        method::USAGE_STATS,
+        "Aggregate persisted per-run token/cost usage into a per-bucket series \
+         (day/week/month/year) plus window totals.",
     ),
 ];
 
@@ -447,6 +455,7 @@ mod tests {
             method::NOTIFICATIONS_LIST,
             method::NOTIFICATIONS_TEST,
             method::HOOKS_UPSERT,
+            method::USAGE_STATS,
         ]
         .into_iter()
         .collect();

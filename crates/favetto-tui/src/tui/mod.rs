@@ -34,7 +34,7 @@ use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 
 use favetto_core::model::{
-    AgentCatalogEntry, AgentSessionInfo, Event, NotificationRecord, Schedule, Task,
+    AgentCatalogEntry, AgentSessionInfo, Event, NotificationRecord, Schedule, Task, UsageStats,
 };
 use favetto_core::rpc::method;
 use favetto_core::workflow::WorkflowInspect;
@@ -496,6 +496,31 @@ async fn maybe_load_catalog_preview(client: &Client, app: &mut App) {
     app.catalog_preview_pending = None;
 }
 
+/// Fetch `usage.stats` for the selected period and fold it into the Usage tab.
+async fn fetch_usage_stats(client: &Client, app: &mut App) {
+    let period = app.usage_period;
+    match client
+        .request(method::USAGE_STATS, serde_json::json!({ "period": period }))
+        .await
+    {
+        Ok(resp) => match resp.result {
+            Some(value) => match serde_json::from_value::<UsageStats>(value) {
+                Ok(stats) => app.set_usage_stats(stats),
+                Err(e) => app.set_usage_error(format!("usage.stats: {e}")),
+            },
+            None => {
+                let message = resp
+                    .error
+                    .as_ref()
+                    .map(|e| e.message.clone())
+                    .unwrap_or_else(|| "usage.stats failed".to_string());
+                app.set_usage_error(message);
+            }
+        },
+        Err(e) => app.set_usage_error(format!("usage.stats failed: {e}")),
+    }
+}
+
 /// Re-fetch the list-based tabs (used after a form submission).
 async fn refresh_lists(client: &Client, app: &mut App) {
     if let Ok(resp) = client
@@ -884,6 +909,12 @@ async fn run_session(
             }
         }
         maybe_load_catalog_preview(client, app).await;
+        // The Usage tab fetches on focus, on period change, and when a task push
+        // marks it dirty.
+        if app.usage_dirty {
+            app.usage_dirty = false;
+            fetch_usage_stats(client, app).await;
+        }
     }
 }
 

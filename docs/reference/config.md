@@ -205,6 +205,12 @@ hours) rows older than `days` are pruned and the database is optionally
 `VACUUM`ed. `min_tasks` guarantees the newest N task rows survive regardless
 of age. Set `days = 0` to opt out and keep everything forever.
 
+Pruning happens in two stages. First an old task's `output` blob is cleared
+(space reclaim with the metadata kept); per-run token/cost usage is stored in
+flat `task_runs` columns, so it survives this stage and stays available to
+`usage.stats`. Then, once the task row itself is old enough to delete, its
+run rows (and their usage) go with it.
+
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
 | `days` | integer | `30` | no | Delete rows older than this many days (0 = keep forever). |

@@ -202,7 +202,7 @@ impl App {
                     && mouse.column < region.col_end
                 {
                     let ClickAction::Tab(tab) = region.action;
-                    self.tab = tab;
+                    self.set_tab(tab);
                     return UiAction::None;
                 }
             }
@@ -271,7 +271,7 @@ impl App {
             Tab::Events => Some((Tab::Events, self.events_geom)),
             Tab::Scheduler => Some((Tab::Scheduler, self.schedules_geom)),
             Tab::Notifications => Some((Tab::Notifications, self.notifications_geom)),
-            Tab::Agent => None,
+            Tab::Agent | Tab::Usage => None,
         }
     }
 
@@ -341,7 +341,7 @@ impl App {
                 }
                 UiAction::None
             }
-            Tab::Agent => UiAction::None,
+            Tab::Agent | Tab::Usage => UiAction::None,
         }
     }
 
@@ -378,7 +378,7 @@ impl App {
                 self.notifications_selected =
                     shift_index(self.notifications_selected, delta, self.notifications.len());
             }
-            Tab::Agent => {}
+            Tab::Agent | Tab::Usage => {}
         }
         true
     }
@@ -786,6 +786,14 @@ impl App {
             }
             KeyCode::Char('r') if self.tab == Tab::Tasks && !ctrl && !alt => {
                 self.confirm_retry_task()
+            }
+            // Usage: `1`..`4` select day/week/month/year. Bare digits only.
+            KeyCode::Char(c @ '1'..='4') if self.tab == Tab::Usage && !ctrl && !alt => {
+                let idx = (c as u8 - b'1') as usize;
+                if let Some(period) = UsagePeriod::ALL.get(idx) {
+                    self.set_usage_period(*period);
+                }
+                UiAction::None
             }
             _ => UiAction::None,
         }

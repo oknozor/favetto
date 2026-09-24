@@ -20,7 +20,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::agent_state::{AgentActivity, AgentUsage, InputReply};
+use crate::agent_state::{AgentActivity, AgentUsage, InputReply, UsagePeriod, UsageStats};
 use crate::model::{
     AgentCatalogEntry, AgentSessionInfo, Event, NotificationRecord, Schedule, Task,
 };
@@ -539,6 +539,16 @@ pub struct HookUpsertResult {
     pub added: bool,
 }
 
+/// `usage.stats` params. `period` defaults to `day` when omitted or malformed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct UsageStatsParams {
+    #[serde(default, deserialize_with = "lenient")]
+    pub period: Option<UsagePeriod>,
+}
+
+/// `usage.stats` result: per-bucket token/cost series plus window totals.
+pub type UsageStatsResult = UsageStats;
+
 // ---------------------------------------------------------------------------
 // push payloads
 // ---------------------------------------------------------------------------
@@ -674,6 +684,8 @@ rpc_calls! {
     NotificationsTestCall => method::NOTIFICATIONS_TEST, NotificationTestParams, NotificationTestResult;
     /// Typed call for `hooks.upsert`.
     HooksUpsertCall => method::HOOKS_UPSERT, HookUpsertParams, HookUpsertResult;
+    /// Typed call for `usage.stats`.
+    UsageStatsCall => method::USAGE_STATS, UsageStatsParams, UsageStatsResult;
 }
 
 /// The JSON Schema of a type, as a plain JSON value. Used by the doc generator.
@@ -860,6 +872,11 @@ pub const CLIENT_CALLS: &[RpcCallSpec] = &[
         params_schema: schema_of::<HookUpsertParams>,
         result_schema: schema_of::<HookUpsertResult>,
     },
+    RpcCallSpec {
+        method: method::USAGE_STATS,
+        params_schema: schema_of::<UsageStatsParams>,
+        result_schema: schema_of::<UsageStatsResult>,
+    },
 ];
 
 /// One server → client push's typed metadata.
@@ -958,6 +975,16 @@ mod tests {
         assert_eq!(p.limit, None);
         let p: TasksListParams = serde_json::from_value(serde_json::json!({ "limit": 7 })).unwrap();
         assert_eq!(p.limit, Some(7));
+
+        // `usage.stats` accepts a missing or ill-typed period.
+        let p: UsageStatsParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(p.period, None);
+        let p: UsageStatsParams =
+            serde_json::from_value(serde_json::json!({ "period": "month" })).unwrap();
+        assert_eq!(p.period, Some(UsagePeriod::Month));
+        let p: UsageStatsParams =
+            serde_json::from_value(serde_json::json!({ "period": 3 })).unwrap();
+        assert_eq!(p.period, None);
     }
 
     #[test]

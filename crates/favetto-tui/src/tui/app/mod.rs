@@ -14,7 +14,7 @@ use base64::Engine as _;
 use favetto_core::model::{
     AgentActivity, AgentCapabilities, AgentCatalogEntry, AgentSessionInfo, AgentUsage,
     AwaitingInputKind, Event, EventKind, InputReply, InputRequest, NotificationRecord, Schedule,
-    Task, TaskStatus,
+    Task, TaskStatus, UsagePeriod, UsageStats,
 };
 use favetto_core::rpc::{method, push, Notification};
 use favetto_core::workflow::WorkflowInspect;
@@ -43,16 +43,18 @@ pub enum Tab {
     Events,
     Scheduler,
     Notifications,
+    Usage,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 6] = [
+    pub const ALL: [Tab; 7] = [
         Tab::Tasks,
         Tab::Catalog,
         Tab::Agent,
         Tab::Events,
         Tab::Scheduler,
         Tab::Notifications,
+        Tab::Usage,
     ];
 
     pub fn label(self) -> &'static str {
@@ -63,6 +65,7 @@ impl Tab {
             Tab::Events => "Events",
             Tab::Scheduler => "Scheduler",
             Tab::Notifications => "Notifications",
+            Tab::Usage => "Usage",
         }
     }
 }
@@ -541,6 +544,15 @@ pub struct App {
     /// `agents.list` refresh and `agent.state` push, and never cleared by a refresh,
     /// so a task keeps its token/cost after its session leaves the registry.
     pub task_state: HashMap<String, (Option<AgentActivity>, Option<AgentUsage>)>,
+    /// The period selected on the Usage tab (day/week/month/year).
+    pub usage_period: UsagePeriod,
+    /// The last fetched `usage.stats` view, if any.
+    pub usage_stats: Option<UsageStats>,
+    /// Why the last `usage.stats` fetch failed, shown in the Usage panel.
+    pub usage_error: Option<String>,
+    /// Set when the Usage tab is focused or its period changes; the session loop
+    /// re-fetches `usage.stats` and clears it.
+    pub usage_dirty: bool,
     /// The embedded terminal's inner screen rectangle (set during draw), used to
     /// translate mouse events into the agent's coordinate space.
     pub agent_area: Option<Rect>,
@@ -632,6 +644,10 @@ impl App {
             notice: None,
             agent_sessions: HashMap::new(),
             task_state: HashMap::new(),
+            usage_period: UsagePeriod::default(),
+            usage_stats: None,
+            usage_error: None,
+            usage_dirty: false,
             agent_area: None,
             agent_resize: None,
             term: TerminalView::default(),
@@ -688,12 +704,44 @@ impl App {
 
     pub fn next_tab(&mut self) {
         let idx = Tab::ALL.iter().position(|t| *t == self.tab).unwrap_or(0);
-        self.tab = Tab::ALL[(idx + 1) % Tab::ALL.len()];
+        let next = Tab::ALL[(idx + 1) % Tab::ALL.len()];
+        self.set_tab(next);
     }
 
     pub fn prev_tab(&mut self) {
         let idx = Tab::ALL.iter().position(|t| *t == self.tab).unwrap_or(0);
-        self.tab = Tab::ALL[(idx + Tab::ALL.len() - 1) % Tab::ALL.len()];
+        let prev = Tab::ALL[(idx + Tab::ALL.len() - 1) % Tab::ALL.len()];
+        self.set_tab(prev);
+    }
+
+    /// Switch tabs, arming the Usage tab's fetch when it gains focus. Every tab
+    /// switch goes through here so a client-side list is re-fetched at most once
+    /// per visit.
+    pub fn set_tab(&mut self, tab: Tab) {
+        if tab == Tab::Usage && self.tab != Tab::Usage {
+            self.usage_dirty = true;
+        }
+        self.tab = tab;
+    }
+
+    /// Store a fetched `usage.stats` view and clear any prior error.
+    pub fn set_usage_stats(&mut self, stats: UsageStats) {
+        self.usage_stats = Some(stats);
+        self.usage_error = None;
+    }
+
+    /// Record a failed `usage.stats` fetch.
+    pub fn set_usage_error(&mut self, message: String) {
+        self.usage_error = Some(message);
+    }
+
+    /// Select the Usage period and re-fetch the series. The previous stats stay
+    /// visible until the new fetch lands so the panel does not flash empty.
+    pub fn set_usage_period(&mut self, period: UsagePeriod) {
+        if period != self.usage_period {
+            self.usage_period = period;
+            self.usage_dirty = true;
+        }
     }
 
     pub fn select_next(&mut self) {
@@ -1551,6 +1599,11 @@ impl App {
                     }
                 }
                 self.mark_workflow_inspect_dirty();
+                // A finished attempt may have added usage; refresh the panel if
+                // the user is looking at it.
+                if self.tab == Tab::Usage {
+                    self.usage_dirty = true;
+                }
             }
             push::CATALOG_UPDATED => {
                 // The list is re-fetched by the session loop, which owns the client.
