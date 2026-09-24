@@ -402,6 +402,60 @@ async fn websocket_accepts_a_single_use_ticket() {
     }
 }
 
+/// The embedded SPA is served over the real HTTP listener: `/` returns the
+/// shell, an HTML navigation falls back to it, and a missing asset is a 404.
+#[tokio::test]
+async fn spa_is_served_over_http() {
+    let daemon = DaemonHarness::spawn();
+    wait_for_tcp(daemon.listen(), &daemon).await;
+    let http = reqwest::Client::new();
+
+    let index = http
+        .get(format!("http://{}/", daemon.listen()))
+        .send()
+        .await
+        .expect("GET /");
+    assert_eq!(index.status().as_u16(), 200);
+    assert_eq!(
+        index
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/html; charset=utf-8")
+    );
+    assert_eq!(
+        index
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-cache")
+    );
+    let body = index.text().await.expect("index body");
+    assert!(body.contains("favetto-placeholder"), "{body}");
+
+    // An unmatched HTML navigation falls back to the shell.
+    let fallback = http
+        .get(format!("http://{}/inbox/abc", daemon.listen()))
+        .header(reqwest::header::ACCEPT, "text/html")
+        .send()
+        .await
+        .expect("GET /inbox/abc");
+    assert_eq!(fallback.status().as_u16(), 200);
+    let fallback_body = fallback.text().await.expect("fallback body");
+    assert!(
+        fallback_body.contains("favetto-placeholder"),
+        "{fallback_body}"
+    );
+
+    // A missing hashed asset is a 404, never the shell.
+    let missing = http
+        .get(format!("http://{}/assets/missing.js", daemon.listen()))
+        .send()
+        .await
+        .expect("GET /assets/missing.js");
+    assert_eq!(missing.status().as_u16(), 404);
+}
+
 /// The TUI's remote attach uses the `favetto-tui` client (not the raw test
 /// client above). A base URL without `/rpc` must still reach the daemon, which
 /// only upgrades WebSockets at `/rpc`.

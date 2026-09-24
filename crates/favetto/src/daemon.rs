@@ -21,13 +21,17 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         .config
         .clone()
         .unwrap_or_else(crate::cli::default_config_path);
-    let config = Arc::new(match FavettoConfig::load_from(&config_path) {
+    let mut config = match FavettoConfig::load_from(&config_path) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(error = %e, path = %config_path.display(), "failed to load config; using defaults");
             FavettoConfig::default()
         }
-    });
+    };
+    if let Some(dir) = args.web_dir.clone() {
+        config.web.dir = crate::paths::expand_tilde(dir);
+    }
+    let config = Arc::new(config);
 
     // Resolve settings: CLI flag > config > default. The config is loaded once up
     // front and shared immutably from here on.
@@ -196,15 +200,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let unix_state = state.clone();
     let unix_task = tokio::spawn(async move { transport::serve_unix(&socket, unix_state).await });
 
-    let app = Router::new()
-        .merge(transport::routes())
-        .route("/events", get(crate::server::events_handler))
-        .route("/metrics", get(crate::metrics::metrics_handler))
-        .merge(crate::webhooks::routes())
-        .merge(crate::agent_hooks::routes())
-        .merge(crate::pair::routes())
-        .merge(crate::ticket::routes())
-        .with_state(state.clone());
+    let app = http_app(&state);
     let http_task = tokio::spawn(async move { transport::serve_http(&listen, app).await });
 
     tracing::info!("daemon started (ctrl-c to stop)");
@@ -223,4 +219,26 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
 
     tracing::info!("daemon stopped");
     Ok(())
+}
+
+/// Assemble the daemon's HTTP/WebSocket router (API + embedded SPA).
+///
+/// The SPA fallback is attached here, on the root router only: `Router::merge`
+/// panics when two merged routers both own a fallback, and the API routes are
+/// real routes, so axum matches them before the fallback ever runs.
+pub(crate) fn http_app(state: &Arc<State>) -> Router {
+    let mut app = Router::new()
+        .merge(transport::routes())
+        .route("/events", get(crate::server::events_handler))
+        .route("/metrics", get(crate::metrics::metrics_handler))
+        .merge(crate::webhooks::routes())
+        .merge(crate::agent_hooks::routes())
+        .merge(crate::pair::routes())
+        .merge(crate::ticket::routes());
+    if state.config.web.enabled {
+        app = app
+            .merge(crate::web::routes())
+            .fallback(crate::web::spa_fallback);
+    }
+    app.with_state(state.clone())
 }
