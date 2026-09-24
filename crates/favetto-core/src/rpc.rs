@@ -152,7 +152,6 @@ pub mod push {
     pub const TASK_UPDATED: &str = "task.updated";
     /// The task catalog changed on disk; clients should re-fetch it.
     pub const CATALOG_UPDATED: &str = "catalog.updated";
-    pub const LOG_LINE: &str = "log.line";
     /// Raw PTY output (base64) from a running agent session.
     pub const AGENT_OUTPUT: &str = "agent.output";
     /// An agent session's child process exited.
@@ -251,7 +250,6 @@ pub const SERVER_PUSHES: &[(&str, &str)] = &[
         push::CATALOG_UPDATED,
         "The task catalog changed on disk; clients should re-fetch it.",
     ),
-    (push::LOG_LINE, "A daemon log line."),
     (
         push::AGENT_OUTPUT,
         "Raw PTY output (base64) from a running agent session.",
@@ -393,7 +391,6 @@ mod tests {
             push::EVENT,
             push::TASK_UPDATED,
             push::CATALOG_UPDATED,
-            push::LOG_LINE,
             push::AGENT_OUTPUT,
             push::AGENT_EXIT,
         ]

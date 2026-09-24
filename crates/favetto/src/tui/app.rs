@@ -2125,11 +2125,6 @@ impl App {
                 // The list is re-fetched by the session loop, which owns the client.
                 self.catalog_dirty = true;
             }
-            push::LOG_LINE => {
-                if let Some(msg) = n.params.get("message").and_then(|m| m.as_str()) {
-                    self.logs.push_back(msg.to_string());
-                }
-            }
             push::AGENT_OUTPUT => {
                 let sid = n.params.get("session_id").and_then(|v| v.as_str());
                 let data = n

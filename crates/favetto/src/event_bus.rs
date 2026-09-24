@@ -20,12 +20,6 @@ pub enum ServerPush {
     TaskUpdated(Box<Task>),
     /// The task catalog changed on disk; clients should re-fetch it.
     CatalogUpdated,
-    /// Forward-looking: used once the runtime streams agent logs to clients.
-    #[allow(dead_code)]
-    LogLine {
-        level: String,
-        message: String,
-    },
 }
 
 impl ServerPush {
@@ -40,10 +34,6 @@ impl ServerPush {
             ServerPush::CatalogUpdated => Ok(Notification {
                 method: push::CATALOG_UPDATED.to_string(),
                 params: serde_json::json!({}),
-            }),
-            ServerPush::LogLine { level, message } => Ok(Notification {
-                method: push::LOG_LINE.to_string(),
-                params: serde_json::json!({ "level": level, "message": message }),
             }),
         }
     }
@@ -108,18 +98,5 @@ mod tests {
             .expect("task push serialization");
         assert_eq!(n.method, push::TASK_UPDATED);
         assert_eq!(n.params["name"], "t");
-    }
-
-    #[test]
-    fn log_line_push_serializes_params() {
-        let n = ServerPush::LogLine {
-            level: "info".to_string(),
-            message: "hi".to_string(),
-        }
-        .into_notification()
-        .expect("log line push serialization");
-        assert_eq!(n.method, push::LOG_LINE);
-        assert_eq!(n.params["level"], "info");
-        assert_eq!(n.params["message"], "hi");
     }
 }
