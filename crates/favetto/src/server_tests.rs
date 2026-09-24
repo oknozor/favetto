@@ -1694,3 +1694,421 @@ async fn dispatch_agents_reply_round_trips_against_a_state_source() {
     state.agents.close(&info.id).ok();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A state whose catalog contains one trivial task per name in `names`.
+async fn dag_state(tag: &str, names: &[&str]) -> (std::path::PathBuf, Arc<State>) {
+    let dir = temp_dir(tag);
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    for name in names {
+        std::fs::write(
+            tasks_dir.join(format!("{name}.md")),
+            format!("agent = \"x\"\n---\n{name}\n"),
+        )
+        .unwrap();
+    }
+    let state = test_state(&dir, &tasks_dir).await;
+    (dir, state)
+}
+
+/// Build `workflow.create` params, optionally extending an existing root.
+fn create_params(
+    idempotency_key: &str,
+    root_id: Option<Uuid>,
+    tasks: serde_json::Value,
+) -> serde_json::Value {
+    let mut params = serde_json::json!({
+        "idempotency_key": idempotency_key,
+        "tasks": tasks,
+    });
+    if let Some(root_id) = root_id {
+        params["root_id"] = serde_json::json!(root_id);
+    }
+    params
+}
+
+async fn dispatch_create(state: &Arc<State>, id: u64, params: serde_json::Value) -> Response {
+    dispatch(
+        state,
+        Request {
+            id,
+            method: method::WORKFLOW_CREATE.to_string(),
+            params,
+        },
+    )
+    .await
+}
+
+fn node_id(result: &serde_json::Value, key: &str) -> Uuid {
+    Uuid::parse_str(
+        result["tasks"]
+            .as_array()
+            .expect("tasks array")
+            .iter()
+            .find(|t| t["key"] == key)
+            .unwrap_or_else(|| panic!("no node with key {key}"))["id"]
+            .as_str()
+            .expect("id string"),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn workflow_create_inserts_a_dag_and_returns_ids() {
+    let (dir, state) = dag_state("create-dag", &["a", "b", "c"]).await;
+    let params = create_params(
+        "op1",
+        None,
+        serde_json::json!([
+            { "key": "a", "name": "a" },
+            { "key": "b", "name": "b", "depends_on": ["a"] },
+            { "key": "c", "name": "c", "depends_on": ["b"] },
+        ]),
+    );
+
+    let resp = dispatch_create(&state, 1, params).await;
+    let result = resp.result.expect("create result");
+    let root = Uuid::parse_str(result["root_id"].as_str().unwrap()).unwrap();
+    assert_eq!(result["tasks"].as_array().unwrap().len(), 3);
+
+    let id_a = node_id(&result, "a");
+    let id_b = node_id(&result, "b");
+    let id_c = node_id(&result, "c");
+    assert_eq!(root, id_a, "the first task is the root");
+
+    for (id, is_root) in [(id_a, true), (id_b, false), (id_c, false)] {
+        let row = db::get_task(&state.db, id).await.unwrap().unwrap();
+        assert_eq!(row.status, TaskStatus::Pending);
+        assert_eq!(row.root_id, Some(root));
+        assert_eq!(row.parent_id, if is_root { None } else { Some(root) });
+    }
+
+    assert_eq!(
+        db::list_dependencies(&state.db, id_b).await.unwrap(),
+        vec![id_a]
+    );
+    assert_eq!(
+        db::list_dependencies(&state.db, id_c).await.unwrap(),
+        vec![id_b]
+    );
+
+    // Only the root is ready to dispatch: b and c wait on their predecessors.
+    let pending: Vec<Uuid> = db::next_pending_tasks(&state.db, 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
+    assert_eq!(pending, vec![id_a]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn workflow_create_runs_in_dependency_order() {
+    let (dir, state) = dag_state("create-order", &["a", "b"]).await;
+    let resp = dispatch_create(
+        &state,
+        1,
+        create_params(
+            "op-order",
+            None,
+            serde_json::json!([
+                { "key": "a", "name": "a" },
+                { "key": "b", "name": "b", "depends_on": ["a"] },
+            ]),
+        ),
+    )
+    .await;
+    let result = resp.result.expect("create result");
+    let id_a = node_id(&result, "a");
+    let id_b = node_id(&result, "b");
+
+    // Readiness is re-derived from the DB — no in-memory dispatcher state.
+    let mut a = db::get_task(&state.db, id_a).await.unwrap().unwrap();
+    a.status = TaskStatus::Succeeded;
+    a.finished_at = Some(Utc::now());
+    db::upsert_task(&state.db, &a).await.unwrap();
+
+    let pending: Vec<Uuid> = db::next_pending_tasks(&state.db, 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
+    assert_eq!(pending, vec![id_b]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn workflow_create_dedupes_re_submission() {
+    let (dir, state) = dag_state("create-dedupe", &["a", "b"]).await;
+    let params = || {
+        create_params(
+            "op-dedupe",
+            None,
+            serde_json::json!([
+                { "key": "a", "name": "a" },
+                { "key": "b", "name": "b", "depends_on": ["a"] },
+            ]),
+        )
+    };
+
+    let first = dispatch_create(&state, 1, params()).await.result.unwrap();
+    let second = dispatch_create(&state, 2, params()).await.result.unwrap();
+    assert_eq!(first["root_id"], second["root_id"]);
+    assert_eq!(node_id(&first, "b"), node_id(&second, "b"));
+
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(rows, 2, "re-submission must not create a second run");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn workflow_create_rejects_invalid_requests() {
+    let (dir, state) = dag_state("create-invalid", &["a", "b"]).await;
+    let assert_invalid = |resp: Response, needle: &str| {
+        assert!(resp.result.is_none(), "expected an error");
+        let error = resp.error.expect("error object");
+        assert_eq!(error.code, error_code::INVALID_PARAMS);
+        assert!(error.message.contains(needle), "{error:?}");
+    };
+
+    // Unknown catalog name.
+    assert_invalid(
+        dispatch_create(
+            &state,
+            1,
+            create_params(
+                "k1",
+                None,
+                serde_json::json!([{ "key": "x", "name": "ghost" }]),
+            ),
+        )
+        .await,
+        "unknown task",
+    );
+    // Empty task list.
+    assert_invalid(
+        dispatch_create(&state, 2, create_params("k2", None, serde_json::json!([]))).await,
+        "at least one task",
+    );
+    // Duplicate key.
+    assert_invalid(
+        dispatch_create(
+            &state,
+            3,
+            create_params(
+                "k3",
+                None,
+                serde_json::json!([
+                    { "key": "dup", "name": "a" },
+                    { "key": "dup", "name": "b" },
+                ]),
+            ),
+        )
+        .await,
+        "duplicate task key",
+    );
+    // Dependency on a key not in the request.
+    assert_invalid(
+        dispatch_create(
+            &state,
+            4,
+            create_params(
+                "k4",
+                None,
+                serde_json::json!([
+                    { "key": "a", "name": "a", "depends_on": ["missing"] },
+                ]),
+            ),
+        )
+        .await,
+        "unknown key",
+    );
+    // Cycle.
+    assert_invalid(
+        dispatch_create(
+            &state,
+            5,
+            create_params(
+                "k5",
+                None,
+                serde_json::json!([
+                    { "key": "a", "name": "a", "depends_on": ["b"] },
+                    { "key": "b", "name": "b", "depends_on": ["a"] },
+                ]),
+            ),
+        )
+        .await,
+        "cycle",
+    );
+    // Unknown root.
+    assert_invalid(
+        dispatch_create(
+            &state,
+            6,
+            create_params(
+                "k6",
+                Some(Uuid::new_v4()),
+                serde_json::json!([{ "key": "a", "name": "a" }]),
+            ),
+        )
+        .await,
+        "root",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn workflow_spawn_records_depends_on_and_root() {
+    let (dir, state) = dag_state("spawn-dyn", &["child"]).await;
+    let root = oneshot_task();
+    db::upsert_task(&state.db, &root).await.unwrap();
+    let mut predecessor = oneshot_task();
+    predecessor.root_id = Some(root.id);
+    predecessor.parent_id = Some(root.id);
+    db::upsert_task(&state.db, &predecessor).await.unwrap();
+
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 1,
+            method: method::WORKFLOW_SPAWN.to_string(),
+            params: serde_json::json!({
+                "name": "child",
+                "root_id": root.id,
+                "depends_on": [predecessor.id],
+            }),
+        },
+    )
+    .await;
+    let task = resp.result.expect("spawn result");
+    let id = Uuid::parse_str(task["id"].as_str().unwrap()).unwrap();
+    assert_eq!(task["root_id"], root.id.to_string());
+    assert_eq!(task["parent_id"], root.id.to_string());
+    assert_eq!(task["status"], "pending");
+    assert_eq!(
+        db::list_dependencies(&state.db, id).await.unwrap(),
+        vec![predecessor.id]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn workflow_spawn_rejects_unknown_task_and_dependency() {
+    let (dir, state) = dag_state("spawn-invalid", &["child"]).await;
+    let root = oneshot_task();
+    db::upsert_task(&state.db, &root).await.unwrap();
+    let mut other_root_task = oneshot_task();
+    other_root_task.root_id = Some(Uuid::new_v4());
+    db::upsert_task(&state.db, &other_root_task).await.unwrap();
+
+    let spawn = |id: u64, params: serde_json::Value| {
+        let state = state.clone();
+        async move {
+            dispatch(
+                &state,
+                Request {
+                    id,
+                    method: method::WORKFLOW_SPAWN.to_string(),
+                    params,
+                },
+            )
+            .await
+        }
+    };
+    let assert_invalid = |resp: Response, needle: &str| {
+        let error = resp.error.expect("error object");
+        assert_eq!(error.code, error_code::INVALID_PARAMS);
+        assert!(error.message.contains(needle), "{error:?}");
+    };
+
+    assert_invalid(
+        spawn(1, serde_json::json!({ "name": "ghost" })).await,
+        "unknown task",
+    );
+    assert_invalid(
+        spawn(
+            2,
+            serde_json::json!({ "name": "child", "depends_on": [Uuid::new_v4()] }),
+        )
+        .await,
+        "not found",
+    );
+    assert_invalid(
+        spawn(
+            3,
+            serde_json::json!({
+                "name": "child",
+                "root_id": root.id,
+                "depends_on": [other_root_task.id],
+            }),
+        )
+        .await,
+        "does not belong to root",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn workflow_inspect_marks_dynamic_dependency_blocked() {
+    let (dir, state) = dag_state("inspect-dynamic", &["a", "b"]).await;
+    let resp = dispatch_create(
+        &state,
+        1,
+        create_params(
+            "op-inspect",
+            None,
+            serde_json::json!([
+                { "key": "a", "name": "a" },
+                { "key": "b", "name": "b", "depends_on": ["a"] },
+            ]),
+        ),
+    )
+    .await;
+    let result = resp.result.expect("create result");
+    let root = Uuid::parse_str(result["root_id"].as_str().unwrap()).unwrap();
+    let id_a = node_id(&result, "a");
+    let id_b = node_id(&result, "b");
+
+    let inspect = |id: u64| {
+        let state = state.clone();
+        async move {
+            dispatch(
+                &state,
+                Request {
+                    id,
+                    method: method::WORKFLOW_INSPECT.to_string(),
+                    params: serde_json::json!({ "root_id": root }),
+                },
+            )
+            .await
+            .result
+            .expect("inspect result")
+        }
+    };
+
+    let view = inspect(2).await;
+    assert_eq!(id_list(&view, "ready"), vec![id_a]);
+    assert_eq!(id_list(&view, "blocked"), vec![id_b]);
+
+    // Finish the predecessor: the dependent moves from `blocked` to `ready`.
+    let mut a = db::get_task(&state.db, id_a).await.unwrap().unwrap();
+    a.status = TaskStatus::Succeeded;
+    a.finished_at = Some(Utc::now());
+    db::upsert_task(&state.db, &a).await.unwrap();
+    let view = inspect(3).await;
+    assert!(id_list(&view, "blocked").is_empty());
+    assert_eq!(id_list(&view, "ready"), vec![id_b]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

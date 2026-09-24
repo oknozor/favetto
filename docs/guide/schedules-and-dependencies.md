@@ -196,6 +196,41 @@ silently dropped. Write `[]` in the handoff to end the loop. Without
 `spawn_new_root`, the child inherits the spawner's root and the successor runs at
 most once per pipeline.
 
+## Dynamic workflows from the API
+
+The header-based `needs`/`spawn` graph is fixed in the catalog. An external
+controller can instead build a **runtime** DAG of catalog tasks with
+per-instance dependencies through two RPC methods (see the
+[remote API reference](../reference/remote-api)): `workflow.create` submits a
+whole DAG at once, and `workflow.spawn` adds a single node to an existing
+workflow root.
+
+Both are idempotent when you supply keys, so an interrupted controller can safely
+re-submit. `workflow.create` requires an `idempotency_key`; each node's dedupe
+key is derived from it and the node's local `key`:
+
+```json
+{
+  "method": "workflow.create",
+  "params": {
+    "idempotency_key": "issue-151-run-1",
+    "tasks": [
+      { "key": "research", "name": "favetto/triage_issues" },
+      { "key": "plan", "name": "favetto/plan_issue", "depends_on": ["research"] },
+      { "key": "implement", "name": "favetto/implement_issue",
+        "depends_on": ["plan"], "input": { "issue_id": 151 } }
+    ]
+  }
+}
+```
+
+The first task becomes the workflow root unless `root_id` names an existing root.
+A dependent starts only once every predecessor it lists in `depends_on` is
+terminal (succeeded, failed, or cancelled); readiness is re-derived from SQLite,
+so a created DAG survives a daemon restart. `workflow.inspect { root_id }` reports
+a waiting task in its `blocked` bucket. Catalog `needs`/`spawn` workflows are
+unaffected: dynamic dependencies are stored separately and never inject `_prev`.
+
 ::: tip Inspect the graph
 Press `w` in the TUI to render the catalog's `needs`, outcome-condition
 (`needs:succeeded` / `needs:failed`), `spawn`, and fan-in `join` edges as a

@@ -95,6 +95,20 @@ CREATE TABLE IF NOT EXISTS task_runs (
     failure     TEXT
 );
 
+-- Per-instance workflow dependencies for runtime DAGs created through
+-- `workflow.create` / `workflow.spawn`. Catalog `needs`/`spawn` edges are not
+-- represented here. `kind` is reserved; only `finished` is written today.
+CREATE TABLE IF NOT EXISTS task_dependencies (
+    task_id    TEXT NOT NULL,
+    depends_on TEXT NOT NULL,
+    kind       TEXT NOT NULL DEFAULT 'finished',
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (task_id, depends_on)
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_dependencies_task_id ON task_dependencies(task_id);
+CREATE INDEX IF NOT EXISTS idx_task_dependencies_depends_on ON task_dependencies(depends_on);
+CREATE INDEX IF NOT EXISTS idx_tasks_dedupe_key ON tasks(dedupe_key);
 CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tasks_status_created_at ON tasks(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);
@@ -233,6 +247,21 @@ pub async fn get_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Option<Task
          FROM tasks WHERE id = ?",
     )
     .bind(id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.as_ref().map(row_to_task))
+}
+
+/// Fetch the task stored under `dedupe_key`, if any. Used to make
+/// `workflow.create` / `workflow.spawn` idempotent: re-submitting the same key
+/// returns the canonical row instead of the transient id an
+/// `INSERT OR IGNORE` would have produced.
+pub async fn get_task_by_dedupe_key(pool: &SqlitePool, key: &str) -> anyhow::Result<Option<Task>> {
+    let row = sqlx::query(
+        "SELECT id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, failure, session_id, session_title, parent_id, root_id, interactive \
+         FROM tasks WHERE dedupe_key = ?",
+    )
+    .bind(key)
     .fetch_optional(pool)
     .await?;
     Ok(row.as_ref().map(row_to_task))
@@ -555,10 +584,24 @@ pub async fn fail_interrupted_tasks(pool: &SqlitePool) -> anyhow::Result<u64> {
 }
 
 /// Up to `limit` pending tasks, oldest first (for the parallel executor).
+///
+/// A task with runtime dependencies is gated on them: it is returned only once
+/// every predecessor present in `task_dependencies` has reached a terminal state
+/// (`succeeded`/`failed`/`cancelled`). A missing predecessor does not block, so a
+/// pruned task cannot wedge a dependent. Catalog `needs` dependents have no
+/// dependency rows, so their dispatch is unchanged.
 pub async fn next_pending_tasks(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec<Task>> {
     let rows = sqlx::query(
-        "SELECT id, name, status, input, dedupe_key, created_at, started_at, finished_at, error, failure, session_id, session_title, parent_id, root_id, interactive \
-         FROM tasks WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?",
+        "SELECT t.id, t.name, t.status, t.input, t.dedupe_key, t.created_at, t.started_at, t.finished_at, t.error, t.failure, t.session_id, t.session_title, t.parent_id, t.root_id, t.interactive \
+         FROM tasks t \
+         WHERE t.status = 'pending' \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM task_dependencies d \
+               JOIN tasks p ON p.id = d.depends_on \
+               WHERE d.task_id = t.id \
+                 AND p.status NOT IN ('succeeded', 'failed', 'cancelled') \
+           ) \
+         ORDER BY t.created_at ASC LIMIT ?",
     )
     .bind(limit.max(1))
     .fetch_all(pool)
@@ -631,6 +674,73 @@ pub async fn list_root_tasks(pool: &SqlitePool, root_id: Uuid) -> anyhow::Result
     .fetch_all(pool)
     .await?;
     Ok(rows.iter().map(row_to_task).collect())
+}
+
+// ---------------------------------------------------------------------------
+// Runtime workflow dependencies (`workflow.create` / `workflow.spawn`)
+// ---------------------------------------------------------------------------
+
+/// Record that `task_id` may start only once `depends_on` reaches a terminal
+/// state. Idempotent: a duplicate edge is ignored.
+pub async fn insert_dependency(
+    pool: &SqlitePool,
+    task_id: Uuid,
+    depends_on: Uuid,
+    created_at: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO task_dependencies (task_id, depends_on, kind, created_at)
+         VALUES (?, ?, 'finished', ?)",
+    )
+    .bind(task_id.to_string())
+    .bind(depends_on.to_string())
+    .bind(ts_ms(created_at))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The predecessor ids `task_id` waits on, oldest first.
+#[cfg(test)]
+pub async fn list_dependencies(pool: &SqlitePool, task_id: Uuid) -> anyhow::Result<Vec<Uuid>> {
+    let rows = sqlx::query(
+        "SELECT depends_on FROM task_dependencies WHERE task_id = ? ORDER BY created_at ASC",
+    )
+    .bind(task_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| Uuid::parse_str(&row.get::<String, _>("depends_on")).ok())
+        .collect())
+}
+
+/// Every `(task_id, depends_on)` dependency edge whose dependent belongs to
+/// `root_id` (the root row itself is included via `id = root_id`). Powers the
+/// `blocked` bucket in `workflow.inspect`.
+pub async fn list_root_dependencies(
+    pool: &SqlitePool,
+    root_id: Uuid,
+) -> anyhow::Result<Vec<(Uuid, Uuid)>> {
+    let rows = sqlx::query(
+        "SELECT d.task_id, d.depends_on FROM task_dependencies d \
+         JOIN tasks t ON t.id = d.task_id \
+         WHERE t.root_id = ? OR t.id = ? \
+         ORDER BY d.created_at ASC",
+    )
+    .bind(root_id.to_string())
+    .bind(root_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            Some((
+                Uuid::parse_str(&row.get::<String, _>("task_id")).ok()?,
+                Uuid::parse_str(&row.get::<String, _>("depends_on")).ok()?,
+            ))
+        })
+        .collect())
 }
 
 /// Set a task's status only when it currently has `from`. Targeted, so it can
@@ -810,6 +920,7 @@ pub struct PruneStats {
     pub outputs_cleared: u64,
     pub tasks_deleted: u64,
     pub runs_deleted: u64,
+    pub dependencies_deleted: u64,
     pub events_deleted: u64,
     pub notifications_deleted: u64,
     pub webhook_deliveries_deleted: u64,
@@ -855,6 +966,15 @@ pub async fn prune(
             .execute(pool)
             .await?
             .rows_affected();
+    // Dependency rows are meaningless once either endpoint is gone.
+    stats.dependencies_deleted = sqlx::query(
+        "DELETE FROM task_dependencies \
+         WHERE task_id NOT IN (SELECT id FROM tasks) \
+            OR depends_on NOT IN (SELECT id FROM tasks)",
+    )
+    .execute(pool)
+    .await?
+    .rows_affected();
     stats.events_deleted = sqlx::query("DELETE FROM events WHERE created_at < ?")
         .bind(cutoff)
         .execute(pool)
@@ -875,6 +995,7 @@ pub async fn prune(
         && (stats.outputs_cleared
             + stats.tasks_deleted
             + stats.runs_deleted
+            + stats.dependencies_deleted
             + stats.events_deleted
             + stats.notifications_deleted
             + stats.webhook_deliveries_deleted)

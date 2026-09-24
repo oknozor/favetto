@@ -273,8 +273,32 @@ async fn enqueue_with_lineage(
     lineage: Lineage,
     interactive: bool,
 ) -> anyhow::Result<Task> {
+    enqueue_with_id(
+        state,
+        Uuid::new_v4(),
+        name,
+        input,
+        dedupe_key,
+        lineage,
+        interactive,
+    )
+    .await
+}
+
+/// Enqueue a task under a caller-assigned id, announcing it on the bus and
+/// emitting `TaskIdle`. `workflow.create` needs a stable id so dependency rows
+/// can reference it before the insert.
+async fn enqueue_with_id(
+    state: &State,
+    id: Uuid,
+    name: String,
+    input: serde_json::Value,
+    dedupe_key: Option<String>,
+    lineage: Lineage,
+    interactive: bool,
+) -> anyhow::Result<Task> {
     let task = Task {
-        id: Uuid::new_v4(),
+        id,
         name: name.clone(),
         status: TaskStatus::Pending,
         input,
@@ -303,6 +327,89 @@ async fn enqueue_with_lineage(
         )
         .await;
     Ok(task)
+}
+
+/// Args for [`enqueue_dynamic`]: one runtime node with a caller-assigned id,
+/// lineage, and per-instance dependencies.
+pub struct DynamicNode {
+    pub id: Uuid,
+    pub name: String,
+    pub input: serde_json::Value,
+    pub dedupe_key: Option<String>,
+    pub root_id: Uuid,
+    pub parent_id: Option<Uuid>,
+    pub depends_on: Vec<Uuid>,
+}
+
+/// Enqueue a runtime task with a caller-assigned id and per-instance
+/// dependencies. Used by `workflow.create`, which resolves every node's id (and
+/// therefore validates the whole DAG) before inserting anything.
+pub async fn enqueue_dynamic(state: &State, node: DynamicNode) -> anyhow::Result<Task> {
+    let lineage = Lineage {
+        parent_id: node.parent_id,
+        root_id: Some(node.root_id),
+    };
+    let task = enqueue_with_id(
+        state,
+        node.id,
+        node.name,
+        node.input,
+        node.dedupe_key,
+        lineage,
+        false,
+    )
+    .await?;
+    record_dependencies(state, task.id, &node.depends_on).await?;
+    Ok(task)
+}
+
+/// Add one runtime task to an existing root (or make it its own root when
+/// `root_id` is `None`), recording per-instance dependencies. Used by
+/// `workflow.spawn`.
+pub async fn spawn_dynamic(
+    state: &State,
+    name: String,
+    input: serde_json::Value,
+    root_id: Option<Uuid>,
+    depends_on: &[Uuid],
+    dedupe_key: Option<String>,
+) -> anyhow::Result<Task> {
+    // `INSERT OR IGNORE` on the dedupe key would leave us with a transient id;
+    // look the canonical row up first so a re-submission is a pure no-op.
+    if let Some(key) = &dedupe_key {
+        if let Some(existing) = db::get_task_by_dedupe_key(&state.db, key).await? {
+            return Ok(existing);
+        }
+    }
+    let lineage = Lineage {
+        parent_id: root_id,
+        root_id,
+    };
+    let task = enqueue_with_id(
+        state,
+        Uuid::new_v4(),
+        name,
+        input,
+        dedupe_key,
+        lineage,
+        false,
+    )
+    .await?;
+    record_dependencies(state, task.id, depends_on).await?;
+    Ok(task)
+}
+
+/// Persist the dependency edges from a dynamic task to its predecessors.
+async fn record_dependencies(
+    state: &State,
+    task_id: Uuid,
+    depends_on: &[Uuid],
+) -> anyhow::Result<()> {
+    let now = Utc::now();
+    for predecessor in depends_on {
+        db::insert_dependency(&state.db, task_id, *predecessor, now).await?;
+    }
+    Ok(())
 }
 
 async fn run_one(

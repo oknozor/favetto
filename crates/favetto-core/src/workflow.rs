@@ -116,6 +116,24 @@ pub struct WorkflowInspect {
     pub blocked: Vec<Uuid>,
 }
 
+/// One node created by `workflow.create`: the caller's local `key` plus the id
+/// and catalog name assigned to the new (or already-existing) task instance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowNodeRef {
+    /// The caller's local key, used by other nodes' `depends_on`.
+    pub key: String,
+    pub id: Uuid,
+    pub name: String,
+}
+
+/// The result of `workflow.create`: the root the DAG belongs to and one
+/// [`WorkflowNodeRef`] per submitted task, in request order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowCreateResult {
+    pub root_id: Uuid,
+    pub tasks: Vec<WorkflowNodeRef>,
+}
+
 /// Build the catalog's `needs`/`spawn` graph as structured data.
 ///
 /// Deterministic regardless of the order of `tasks`: catalog nodes are sorted by
@@ -667,5 +685,33 @@ mod tests {
 
         let decoded: WorkflowInspect = serde_json::from_value(value).unwrap();
         assert_eq!(decoded, view);
+    }
+
+    #[test]
+    fn create_result_round_trips() {
+        let root_id = Uuid::new_v4();
+        let result = WorkflowCreateResult {
+            root_id,
+            tasks: vec![
+                WorkflowNodeRef {
+                    key: "a".to_string(),
+                    id: Uuid::new_v4(),
+                    name: "build".to_string(),
+                },
+                WorkflowNodeRef {
+                    key: "b".to_string(),
+                    id: Uuid::new_v4(),
+                    name: "test".to_string(),
+                },
+            ],
+        };
+
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["root_id"], root_id.to_string());
+        assert_eq!(value["tasks"][0]["key"], "a");
+        assert_eq!(value["tasks"][0]["name"], "build");
+
+        let decoded: WorkflowCreateResult = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, result);
     }
 }

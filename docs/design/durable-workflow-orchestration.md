@@ -327,13 +327,67 @@ and the TUI workflow view):
 `TaskFinished` payload. This enables `research -> implement` on success and
 `research -> diagnose` on failure without a controller.
 
-### 7.4 Dynamic instance-level workflows (separate feature)
+### 7.4 Dynamic instance-level workflows
 
-`workflow.create`/`workflow.spawn` that reference catalog definitions with
-**per-instance** dependencies (`depends_on: [task_id]`) require a new dependency
-representation and a readiness check evaluated alongside the name-based `needs`
-path. This is deliberately out of scope for the first delivery; treat it as its
-own design spike once §7.1–§7.3 have landed.
+`workflow.create` / `workflow.spawn` let an external controller build runtime
+task graphs that reference catalog definitions and carry **per-instance**
+dependencies, evaluated alongside the name-based `needs` path. No second
+scheduler: the existing dispatcher, lineage, dedupe, and `TaskFinished` listener
+are reused.
+
+**Representation — a dedicated `task_dependencies` table.**
+
+```sql
+task_dependencies(task_id, depends_on, kind, created_at)
+  PRIMARY KEY (task_id, depends_on)
+```
+
+`kind` is reserved and currently always `'finished'`: a dependent starts once its
+predecessor reaches a terminal state (`succeeded` / `failed` / `cancelled`).
+Cancellation counts as terminal because it does not emit `TaskFinished`, so an
+otherwise-cancelled predecessor must not wedge a dynamic dependent.
+
+**Readiness gate.** Dynamic nodes are inserted `Pending` up front (durable and
+inspectable) and gated inside `db::next_pending_tasks` with a `NOT EXISTS
+(... non-terminal predecessor ...)` subquery, so the existing dispatcher and
+dependency listener are unchanged. Readiness is re-derived from SQLite on every
+poll, so a restart needs no replay. A missing (pruned) predecessor does not
+block. Catalog `needs` dependents carry no dependency rows, so their dispatch is
+untouched. `_prev` injection is intentionally not done for dynamic dependencies;
+their inputs are supplied at creation.
+
+**RPCs.**
+
+```
+workflow.create {
+  idempotency_key: String,
+  root_id?: Uuid,
+  tasks: [{ key, name, input?, depends_on?: [key] }]
+} -> { root_id, tasks: [{ key, id, name }] }
+```
+
+The whole request is validated before any insert (non-empty, unique keys, known
+catalog names, in-request dependency keys, acyclic, known root). Per-node dedupe
+keys `workflow:{idempotency_key}:{key}` make re-submission return the same ids
+without creating a second run. The first task is the root unless `root_id` is
+given; every other node becomes its child.
+
+```
+workflow.spawn {
+  name, input?, root_id?, depends_on?: [task_id], dedupe_key?
+} -> Task
+```
+
+is a thin wrapper over the existing enqueue/lineage path that records dependency
+rows; with a `dedupe_key` it returns the canonical stored row.
+
+`workflow.inspect` reports a `Pending` node as `blocked` when any of its
+`task_dependencies` predecessors is still non-terminal, in addition to the
+catalog-`needs` rule.
+
+**Non-goals.** No new `TaskStatus` or `Task` wire field; no outcome-conditional
+dynamic dependencies, cross-root dependencies, or `all_finished` joins over
+dynamic edges; no TUI change; no cascade-cancel.
 
 ### 7.5 Richer `TaskFinished`
 
@@ -408,8 +462,8 @@ best first API win.
 **P2.3 `needs` conditions** · S–M — `tasks.rs`, `workflow.rs`, `executor.rs`,
 TUI workflow view; independent.
 
-**P2.4 Dynamic instance-level workflows** · L — separate design spike; depends on
-P2.1, independent of retry.
+**P2.4 Dynamic instance-level workflows** · L — `task_dependencies` plus
+`workflow.create` / `workflow.spawn`; depends on P2.1, independent of retry.
 
 ### Phase 3 — supervisor
 
@@ -497,4 +551,6 @@ the answers are recorded here and mirrored in the tracking issue
 4. **Dynamic workflows use a dedicated `task_dependencies` table.** Widening
    `Task` with `depends_on` would put the graph on the wire and still need a
    readiness query; a table is restart-safe, queryable, and keeps `Task` stable.
-   (Issue #151.)
+   The readiness gate lives in `db::next_pending_tasks`, and
+   `workflow.create` / `workflow.spawn` dedupe re-submissions with per-node
+   dedupe keys. (Issue #151.)

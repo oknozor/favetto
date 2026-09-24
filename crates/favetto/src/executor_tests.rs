@@ -2195,3 +2195,110 @@ async fn failed_and_cancelled_children_satisfy_barrier() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn enqueue_dynamic_persists_task_and_dependencies() {
+    let dir = std::env::temp_dir().join(format!("favetto-dynamic-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let state = join_state(&dir, Vec::new()).await;
+
+    let root = Uuid::new_v4();
+    let predecessor = Uuid::new_v4();
+    let id = Uuid::new_v4();
+    let task = enqueue_dynamic(
+        &state,
+        DynamicNode {
+            id,
+            name: "child".to_string(),
+            input: serde_json::json!({ "k": 1 }),
+            dedupe_key: Some("workflow:op:child".to_string()),
+            root_id: root,
+            parent_id: Some(root),
+            depends_on: vec![predecessor],
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(task.id, id, "the caller-assigned id must be preserved");
+    assert_eq!(task.root_id, Some(root));
+    assert_eq!(task.parent_id, Some(root));
+    assert_eq!(task.status, TaskStatus::Pending);
+
+    let stored = db::get_task(&state.db, id).await.unwrap().unwrap();
+    assert_eq!(stored.name, "child");
+    assert_eq!(
+        db::list_dependencies(&state.db, id).await.unwrap(),
+        vec![predecessor]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn spawn_dynamic_records_dependencies_and_lineage() {
+    let dir = std::env::temp_dir().join(format!("favetto-spawn-dyn-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let state = join_state(&dir, Vec::new()).await;
+
+    let root = Uuid::new_v4();
+    let predecessor = lineage_task("pred", TaskStatus::Succeeded, Some(root), Some(root));
+    db::insert_task(&state.db, &predecessor).await.unwrap();
+
+    let task = spawn_dynamic(
+        &state,
+        "child".to_string(),
+        serde_json::json!({}),
+        Some(root),
+        &[predecessor.id],
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(task.root_id, Some(root));
+    assert_eq!(task.parent_id, Some(root));
+    assert_eq!(
+        db::list_dependencies(&state.db, task.id).await.unwrap(),
+        vec![predecessor.id]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn spawn_dynamic_with_dedupe_key_is_idempotent() {
+    let dir = std::env::temp_dir().join(format!("favetto-spawn-dedupe-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let state = join_state(&dir, Vec::new()).await;
+
+    let first = spawn_dynamic(
+        &state,
+        "child".to_string(),
+        serde_json::json!({}),
+        None,
+        &[],
+        Some("spawn:op:1".to_string()),
+    )
+    .await
+    .unwrap();
+    let second = spawn_dynamic(
+        &state,
+        "child".to_string(),
+        serde_json::json!({}),
+        None,
+        &[],
+        Some("spawn:op:1".to_string()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(first.id, second.id, "re-submission returns the stored row");
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE name = 'child'")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

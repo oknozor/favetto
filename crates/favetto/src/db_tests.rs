@@ -1022,3 +1022,201 @@ async fn migrate_adds_task_runs_to_legacy_database() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A minimal pending task, optionally in a workflow root.
+fn pending_task(name: &str, root: Option<Uuid>) -> Task {
+    let mut task = task_at(Utc::now(), None, None);
+    task.name = name.to_string();
+    task.status = TaskStatus::Pending;
+    task.started_at = None;
+    task.root_id = root;
+    task
+}
+
+#[tokio::test]
+async fn migrate_creates_task_dependencies_table_and_indexes() {
+    let (dir, pool) = scratch_pool("deps-table").await;
+    let tables: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        tables.iter().any(|n| n == "task_dependencies"),
+        "missing task_dependencies table in {tables:?}"
+    );
+    let indexes: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'index'")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    for expected in [
+        "idx_task_dependencies_task_id",
+        "idx_task_dependencies_depends_on",
+        "idx_tasks_dedupe_key",
+    ] {
+        assert!(
+            indexes.iter().any(|n| n == expected),
+            "missing index `{expected}` in {indexes:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn next_pending_tasks_skips_tasks_with_unmet_dependencies() {
+    let (dir, pool) = scratch_pool("readiness-gate").await;
+    let a = pending_task("a", None);
+    let b = pending_task("b", None);
+    let c = pending_task("c", None);
+    // Delay `b` so ordering is deterministic (oldest first).
+    for task in [&a, &b, &c] {
+        upsert_task(&pool, task).await.unwrap();
+    }
+    insert_dependency(&pool, b.id, a.id, Utc::now())
+        .await
+        .unwrap();
+
+    let names: Vec<String> = next_pending_tasks(&pool, 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert!(names.contains(&"a".to_string()), "{names:?}");
+    assert!(names.contains(&"c".to_string()), "{names:?}");
+    assert!(
+        !names.contains(&"b".to_string()),
+        "b must wait for a: {names:?}"
+    );
+
+    // Once `a` is terminal, `b` becomes dispatchable.
+    let mut done = a.clone();
+    done.status = TaskStatus::Succeeded;
+    done.finished_at = Some(Utc::now());
+    upsert_task(&pool, &done).await.unwrap();
+    let names: Vec<String> = next_pending_tasks(&pool, 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert!(names.contains(&"b".to_string()), "{names:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn next_pending_tasks_ignores_missing_predecessor() {
+    let (dir, pool) = scratch_pool("readiness-missing").await;
+    let b = pending_task("b", None);
+    upsert_task(&pool, &b).await.unwrap();
+    // A pruned predecessor must not wedge the dependent forever.
+    insert_dependency(&pool, b.id, Uuid::new_v4(), Utc::now())
+        .await
+        .unwrap();
+
+    let pending = next_pending_tasks(&pool, 50).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, b.id);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn next_pending_tasks_cancelled_predecessor_unblocks() {
+    let (dir, pool) = scratch_pool("readiness-cancelled").await;
+    let mut a = pending_task("a", None);
+    let b = pending_task("b", None);
+    a.status = TaskStatus::Cancelled;
+    a.finished_at = Some(Utc::now());
+    upsert_task(&pool, &a).await.unwrap();
+    upsert_task(&pool, &b).await.unwrap();
+    insert_dependency(&pool, b.id, a.id, Utc::now())
+        .await
+        .unwrap();
+
+    let names: Vec<String> = next_pending_tasks(&pool, 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert!(
+        names.contains(&"b".to_string()),
+        "a cancelled predecessor is terminal: {names:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn insert_dependency_is_idempotent_and_listable() {
+    let (dir, pool) = scratch_pool("deps-crud").await;
+    let root = Uuid::new_v4();
+    let a = pending_task("a", Some(root));
+    let b = pending_task("b", Some(root));
+    for task in [&a, &b] {
+        upsert_task(&pool, task).await.unwrap();
+    }
+
+    insert_dependency(&pool, b.id, a.id, Utc::now())
+        .await
+        .unwrap();
+    insert_dependency(&pool, b.id, a.id, Utc::now())
+        .await
+        .unwrap();
+
+    assert_eq!(list_dependencies(&pool, b.id).await.unwrap(), vec![a.id]);
+
+    // Root-scoped listing returns the edge and scopes it by the dependent's root.
+    let edges = list_root_dependencies(&pool, root).await.unwrap();
+    assert_eq!(edges, vec![(b.id, a.id)]);
+    assert!(list_root_dependencies(&pool, Uuid::new_v4())
+        .await
+        .unwrap()
+        .is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn get_task_by_dedupe_key_returns_the_stored_row() {
+    let (dir, pool) = scratch_pool("dedupe-lookup").await;
+    let mut task = pending_task("a", None);
+    task.dedupe_key = Some("workflow:op:key-a".to_string());
+    upsert_task(&pool, &task).await.unwrap();
+
+    let found = get_task_by_dedupe_key(&pool, "workflow:op:key-a")
+        .await
+        .unwrap()
+        .expect("stored row");
+    assert_eq!(found.id, task.id);
+    assert!(get_task_by_dedupe_key(&pool, "workflow:op:missing")
+        .await
+        .unwrap()
+        .is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn prune_deletes_orphan_dependencies() {
+    let (dir, pool) = scratch_pool("prune-deps").await;
+    let old = Utc::now() - ChronoDuration::days(60);
+    let a = task_at(old, Some(old), None);
+    let b = task_at(old, Some(old), None);
+    upsert_task(&pool, &a).await.unwrap();
+    upsert_task(&pool, &b).await.unwrap();
+    insert_dependency(&pool, b.id, a.id, old).await.unwrap();
+
+    let stats = prune(&pool, 30, 0, false).await.unwrap();
+    assert_eq!(stats.dependencies_deleted, 1);
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_dependencies")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
