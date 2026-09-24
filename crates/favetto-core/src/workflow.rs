@@ -134,6 +134,17 @@ pub struct WorkflowCreateResult {
     pub tasks: Vec<WorkflowNodeRef>,
 }
 
+/// The result of `workflow.cancel`: the root that was targeted and the ids of
+/// every task actually transitioned to `cancelled`, in root order.
+///
+/// Tasks that were already terminal are omitted, so `cancelled.len()` is the
+/// number of `TaskCancelled` events emitted for this request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowCancelResult {
+    pub root_id: Uuid,
+    pub cancelled: Vec<Uuid>,
+}
+
 /// Build the catalog's `needs`/`spawn` graph as structured data.
 ///
 /// Deterministic regardless of the order of `tasks`: catalog nodes are sorted by
@@ -712,6 +723,23 @@ mod tests {
         assert_eq!(value["tasks"][0]["name"], "build");
 
         let decoded: WorkflowCreateResult = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, result);
+    }
+
+    #[test]
+    fn cancel_result_round_trips() {
+        let root_id = Uuid::new_v4();
+        let cancelled = vec![Uuid::new_v4(), Uuid::new_v4()];
+        let result = WorkflowCancelResult {
+            root_id,
+            cancelled: cancelled.clone(),
+        };
+
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["root_id"], root_id.to_string());
+        assert_eq!(value["cancelled"][0], cancelled[0].to_string());
+
+        let decoded: WorkflowCancelResult = serde_json::from_value(value).unwrap();
         assert_eq!(decoded, result);
     }
 }

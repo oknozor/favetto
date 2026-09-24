@@ -24,7 +24,8 @@ use favetto_core::model::{
 use favetto_core::rpc::{method, push, Frame, Notification, Request, Response, RpcError};
 use favetto_core::wire::WireError;
 use favetto_core::workflow::{
-    WorkflowCreateResult, WorkflowInspect, WorkflowNodeRef, WorkflowState, WorkflowTaskView,
+    WorkflowCancelResult, WorkflowCreateResult, WorkflowInspect, WorkflowNodeRef, WorkflowState,
+    WorkflowTaskView,
 };
 
 use crate::agents::{AgentContext, AgentEvent, Invocation};
@@ -337,10 +338,16 @@ struct TaskIdParams {
     id: Uuid,
 }
 
-/// `workflow.inspect` params.
+/// `workflow.inspect` / `workflow.cancel` params.
 #[derive(Debug, Deserialize)]
 struct WorkflowInspectParams {
     root_id: Uuid,
+}
+
+/// `workflow.retry` params. The workflow API names the task id `task_id`.
+#[derive(Debug, Deserialize)]
+struct WorkflowRetryParams {
+    task_id: Uuid,
 }
 
 /// One node of a `workflow.create` request. `key` is local to the request and is
@@ -726,6 +733,20 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
                 .map(|task| serde_json::json!(task))
         }
 
+        method::WORKFLOW_CANCEL => {
+            let p: WorkflowInspectParams = parse_params(&req.method, &req.params)?;
+            cancel_workflow(state, p.root_id)
+                .await
+                .map(|result| serde_json::json!(result))
+        }
+
+        method::WORKFLOW_RETRY => {
+            let p: WorkflowRetryParams = parse_params(&req.method, &req.params)?;
+            retry_task(state, p.task_id)
+                .await
+                .map(|task| serde_json::json!(task))
+        }
+
         method::EVENTS_TAIL => {
             let p: EventsTailParams = parse_params(&req.method, &req.params)?;
             let limit = p.limit.unwrap_or(50).min(1000) as i64;
@@ -976,6 +997,43 @@ async fn inspect_workflow(state: &State, root_id: Uuid) -> Result<WorkflowInspec
         failed,
         blocked,
     })
+}
+
+/// `workflow.cancel`: cancel every non-terminal task in `root_id`.
+///
+/// Each task transitioned to `cancelled` gets a `task.updated` push and a
+/// `TaskCancelled` event; already-terminal tasks are left untouched. Because no
+/// `TaskFinished` is emitted, the `needs`/join listeners never fire for them, so
+/// no follow-on work is scheduled. Single-task `tasks.cancel` is unchanged.
+async fn cancel_workflow(state: &State, root_id: Uuid) -> Result<WorkflowCancelResult, RpcError> {
+    let tasks = db::list_root_tasks(&state.db, root_id)
+        .await
+        .map_err(|e| RpcError::Internal(e.to_string()))?;
+    if tasks.is_empty() {
+        return Err(RpcError::InvalidParams(
+            "workflow root not found".to_string(),
+        ));
+    }
+
+    let mut cancelled = Vec::new();
+    for task in &tasks {
+        if crate::executor::is_terminal(task.status) {
+            continue;
+        }
+        match db::cancel_active_task(&state.db, task.id).await {
+            Ok(true) => {
+                cancelled.push(task.id);
+                // Re-read so the push carries the persisted `cancelled` status.
+                if let Ok(Some(fresh)) = db::get_task(&state.db, task.id).await {
+                    announce_cancelled(state, &fresh).await;
+                }
+            }
+            Ok(false) => {}
+            Err(e) => return Err(RpcError::Internal(e.to_string())),
+        }
+    }
+
+    Ok(WorkflowCancelResult { root_id, cancelled })
 }
 
 /// Validate a `workflow.create` request before any row is inserted: non-empty,
@@ -1883,7 +1941,14 @@ async fn cancel_task(state: &State, id: Uuid) -> anyhow::Result<favetto_core::mo
     task.status = favetto_core::model::TaskStatus::Cancelled;
     task.finished_at = Some(chrono::Utc::now());
     db::upsert_task(&state.db, &task).await?;
+    announce_cancelled(state, &task).await;
+    Ok(task.summary())
+}
 
+/// Publish the `task.updated` push and persist + push the `TaskCancelled` event
+/// for a task already transitioned to `cancelled`. Shared by `tasks.cancel` and
+/// `workflow.cancel`.
+async fn announce_cancelled(state: &State, task: &Task) {
     state
         .bus
         .publish(crate::event_bus::ServerPush::TaskUpdated(Box::new(
@@ -1905,8 +1970,6 @@ async fn cancel_task(state: &State, id: Uuid) -> anyhow::Result<favetto_core::mo
             .bus
             .publish(crate::event_bus::ServerPush::Event(event));
     }
-
-    Ok(task.summary())
 }
 
 #[cfg(test)]
