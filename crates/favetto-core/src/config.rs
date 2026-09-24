@@ -1184,6 +1184,15 @@ mod tests {
     }
 
     #[test]
+    fn auth_ticket_ttl_defaults_and_parses() {
+        let cfg: FavettoConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.auth.ticket_ttl_secs, 30);
+
+        let overridden: FavettoConfig = toml::from_str("[auth]\nticket_ttl_secs = 5\n").unwrap();
+        assert_eq!(overridden.auth.ticket_ttl_secs, 5);
+    }
+
+    #[test]
     fn default_sound_events_includes_awaiting_input() {
         let cfg = SoundSettings::default();
         assert_eq!(

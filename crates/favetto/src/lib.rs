@@ -51,5 +51,6 @@ mod notify;
 mod scheduler;
 mod server;
 mod state;
+mod ticket;
 mod transport;
 mod webhooks;

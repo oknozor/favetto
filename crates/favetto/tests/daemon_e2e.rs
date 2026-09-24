@@ -346,6 +346,62 @@ async fn websocket_rejects_a_wrong_bearer_token() {
     }
 }
 
+#[tokio::test]
+async fn websocket_accepts_a_single_use_ticket() {
+    let daemon = DaemonHarness::spawn();
+    wait_for_tcp(daemon.listen(), &daemon).await;
+    let token = std::fs::read_to_string(daemon.root.join("data/token"))
+        .expect("daemon token")
+        .trim()
+        .to_string();
+
+    // Without a bearer, the ticket endpoint refuses to hand one out.
+    let http = reqwest::Client::new();
+    let unauthorized = http
+        .post(format!("http://{}/auth/ticket", daemon.listen()))
+        .send()
+        .await
+        .expect("POST /auth/ticket");
+    assert_eq!(unauthorized.status().as_u16(), 401);
+
+    let body: serde_json::Value = http
+        .post(format!("http://{}/auth/ticket", daemon.listen()))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("POST /auth/ticket")
+        .error_for_status()
+        .expect("a valid bearer issues a ticket")
+        .json()
+        .await
+        .expect("ticket response is JSON");
+    let ticket = body["ticket"].as_str().expect("ticket string").to_string();
+    assert_eq!(body["expires_in"], serde_json::json!(30));
+
+    // The ticket upgrades the WebSocket exactly once.
+    let socket =
+        tokio_tungstenite::connect_async(format!("ws://{}/rpc?ticket={ticket}", daemon.listen()))
+            .await
+            .expect("a fresh ticket upgrades the WebSocket");
+    drop(socket);
+
+    // Replaying the same ticket is rejected before the upgrade.
+    match tokio_tungstenite::connect_async(format!("ws://{}/rpc?ticket={ticket}", daemon.listen()))
+        .await
+    {
+        Ok(_) => panic!("a reused ticket must be rejected"),
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            assert_eq!(
+                resp.status().as_u16(),
+                401,
+                "expected a 401 rejection, got {}",
+                resp.status()
+            );
+        }
+        Err(other) => panic!("expected an HTTP 401 rejection, got {other:?}"),
+    }
+}
+
 /// The TUI's remote attach uses the `favetto-tui` client (not the raw test
 /// client above). A base URL without `/rpc` must still reach the daemon, which
 /// only upgrades WebSockets at `/rpc`.
