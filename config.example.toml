@@ -34,6 +34,17 @@ default = "opencode"
 # entry, or the template-only agent for a custom name. Add `[agents.<name>.git]`
 # to override the global `[git]` section for that agent (same keys as `[git]`).
 #
+# Agent state (see docs/design/agent-state-adapters.md): `state` selects how the
+# agent's live state is observed — "auto" (built-in default), "none" (screen
+# fallback), "stdout", "server", or "hooks". `output_format` names a structured
+# stdout format for headless runs ("opencode-json", "claude-stream-json",
+# "pi-json", "pi-rpc", "vibe-streaming", or "plain-jsonl"). `server` selects the
+# opencode server ("managed", "background", or a URL); `hooks = true` lets
+# claude report through per-launch HTTP hooks. A custom `configurable` agent only
+# has a parser for "plain-jsonl": top-level `text`/`content` becomes its summary
+# text, `{"type":"tool_use"}` rows become tool calls, and every other JSON row is
+# preserved verbatim.
+#
 # An agent whose binary is not on PATH is still listed and marked unavailable;
 # launching it fails with a clear error. Availability is resolved once at daemon
 # startup, so a PATH change needs a restart.
@@ -78,6 +89,16 @@ default = "opencode"
 # headless_args = ["-p", "{prompt}", "--auto-approve"]
 # run_args = ["-p", "--provider", "{provider}", "--model", "{model}", "{prompt}", "--auto-approve"]
 # interactive_model_args = ["--provider", "{provider}", "--model", "{model}"]
+#
+# A custom CLI that emits line-delimited JSON opt into a structured summary with
+# output_format = "plain-jsonl" and keeps its session id via `session_id_json_key`.
+# [agents.mycli]
+# type = "configurable"
+# command = "mycli"
+# headless_args = ["run", "{prompt}"]
+# output_format = "plain-jsonl"
+# session_id_json_key = "session_id"
+# state = "stdout"
 
 # Daemon defaults. CLI flags take precedence over these.
 [daemon]

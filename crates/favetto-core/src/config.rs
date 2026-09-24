@@ -181,6 +181,30 @@ pub struct AgentSettings {
     pub default: Option<String>,
 }
 
+/// How an agent's live state is observed (see
+/// `docs/design/agent-state-adapters.md`).
+///
+/// `auto` keeps the built-in default for the agent; `none` disables structured
+/// observation entirely (the debounced screen heuristic still runs); `stdout`
+/// parses the CLI's line-delimited JSON output; `server` observes a long-lived
+/// HTTP/SSE endpoint (opencode); `hooks` observes via per-launch HTTP hooks
+/// (claude). A custom agent has no built-in transport, so anything but `auto`
+/// is purely declarative for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, JsonSchema, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStateMode {
+    /// Use the built-in default for this agent.
+    Auto,
+    /// Disable structured observation (screen fallback only).
+    None,
+    /// Observe the CLI's line-delimited JSON output.
+    Stdout,
+    /// Observe a long-lived HTTP/SSE endpoint.
+    Server,
+    /// Observe via per-launch HTTP hooks.
+    Hooks,
+}
+
 /// An external coding-agent CLI (opencode, Claude Code, pi, Mistral Vibe, …).
 ///
 /// `args` is the interactive invocation used by the embedded terminal panel.
@@ -229,6 +253,25 @@ pub struct AgentConfig {
     /// session id (e.g. `"sessionID"`). Unset disables capture.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id_json_key: Option<String>,
+    /// How to observe the agent's live state. Unset (or `auto`) keeps the
+    /// built-in default for the agent; `none` forces the screen fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<AgentStateMode>,
+    /// Structured stdout format for headless runs and final summaries, e.g.
+    /// `"opencode-json"`, `"claude-stream-json"`, `"pi-json"`, `"pi-rpc"`,
+    /// `"vibe-streaming"`, or `"plain-jsonl"`. Unset keeps the default
+    /// `{ "text": raw }` output. A custom (`configurable`) agent only has a
+    /// parser for `"plain-jsonl"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<String>,
+    /// opencode only: which server to observe. `"managed"` (favetto-owned
+    /// `serve`), `"background"` (the registered background service), or a URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    /// claude only: inject favetto's HTTP hooks through a per-launch
+    /// `--settings` file. Unset keeps the built-in default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<bool>,
     /// Arguments appended to the interactive command when starting with a prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_args: Option<Vec<String>>,
@@ -640,6 +683,42 @@ mod tests {
         let custom = &cfg.agents["custom"];
         assert!(custom.agent_type.is_none());
         assert!(custom.submit_prompt.is_none());
+    }
+
+    #[test]
+    fn agent_config_state_and_output_format_parse() {
+        let cfg: FavettoConfig = toml::from_str(
+            r#"
+            [agents.custom]
+            command = "mycli"
+            state = "stdout"
+            output_format = "plain-jsonl"
+            server = "managed"
+
+            [agents.claude]
+            command = "claude"
+            state = "hooks"
+            hooks = true
+            "#,
+        )
+        .unwrap();
+
+        let custom = &cfg.agents["custom"];
+        assert_eq!(custom.state, Some(AgentStateMode::Stdout));
+        assert_eq!(custom.output_format.as_deref(), Some("plain-jsonl"));
+        assert_eq!(custom.server.as_deref(), Some("managed"));
+        assert!(custom.hooks.is_none());
+
+        let claude = &cfg.agents["claude"];
+        assert_eq!(claude.state, Some(AgentStateMode::Hooks));
+        assert_eq!(claude.hooks, Some(true));
+
+        // Unknown/absent fields stay unset.
+        let empty: FavettoConfig = toml::from_str("[agents.bare]\ncommand = \"x\"\n").unwrap();
+        assert!(empty.agents["bare"].state.is_none());
+        assert!(empty.agents["bare"].output_format.is_none());
+        assert!(empty.agents["bare"].server.is_none());
+        assert!(empty.agents["bare"].hooks.is_none());
     }
 
     #[test]

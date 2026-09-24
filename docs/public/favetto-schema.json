@@ -51,6 +51,13 @@
             "null"
           ]
         },
+        "hooks": {
+          "description": "claude only: inject favetto's HTTP hooks through a per-launch\n`--settings` file. Unset keeps the built-in default.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "interactive_model_args": {
           "description": "Interactive arguments used when a model is selected (e.g. for a one-shot\nsession); `{provider}` and `{model}` are substituted. Lets an agent reach a\npath that accepts a model when its plain `args` do not.",
           "items": {
@@ -58,6 +65,13 @@
           },
           "type": [
             "array",
+            "null"
+          ]
+        },
+        "output_format": {
+          "description": "Structured stdout format for headless runs and final summaries, e.g.\n`\"opencode-json\"`, `\"claude-stream-json\"`, `\"pi-json\"`, `\"pi-rpc\"`,\n`\"vibe-streaming\"`, or `\"plain-jsonl\"`. Unset keeps the default\n`{ \"text\": raw }` output. A custom (`configurable`) agent only has a\nparser for `\"plain-jsonl\"`.",
+          "type": [
+            "string",
             "null"
           ]
         },
@@ -91,12 +105,30 @@
             "null"
           ]
         },
+        "server": {
+          "description": "opencode only: which server to observe. `\"managed\"` (favetto-owned\n`serve`), `\"background\"` (the registered background service), or a URL.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "session_id_json_key": {
           "description": "Key under which a run's line-delimited JSON output carries the agent's\nsession id (e.g. `\"sessionID\"`). Unset disables capture.",
           "type": [
             "string",
             "null"
           ]
+        },
+        "state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentStateMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How to observe the agent's live state. Unset (or `auto`) keeps the\nbuilt-in default for the agent; `none` forces the screen fallback."
         },
         "submit_prompt": {
           "description": "After starting interactively with a prompt via `prompt_args`, send Enter to\nsubmit it once the agent's UI has settled (some agents, e.g. opencode,\nonly pre-fill the input with `--prompt`). `None` leaves the built-in\ndefault in place.",
@@ -129,6 +161,36 @@
         }
       },
       "type": "object"
+    },
+    "AgentStateMode": {
+      "description": "How an agent's live state is observed (see\n`docs/design/agent-state-adapters.md`).\n\n`auto` keeps the built-in default for the agent; `none` disables structured\nobservation entirely (the debounced screen heuristic still runs); `stdout`\nparses the CLI's line-delimited JSON output; `server` observes a long-lived\nHTTP/SSE endpoint (opencode); `hooks` observes via per-launch HTTP hooks\n(claude). A custom agent has no built-in transport, so anything but `auto`\nis purely declarative for it.",
+      "oneOf": [
+        {
+          "const": "auto",
+          "description": "Use the built-in default for this agent.",
+          "type": "string"
+        },
+        {
+          "const": "none",
+          "description": "Disable structured observation (screen fallback only).",
+          "type": "string"
+        },
+        {
+          "const": "stdout",
+          "description": "Observe the CLI's line-delimited JSON output.",
+          "type": "string"
+        },
+        {
+          "const": "server",
+          "description": "Observe a long-lived HTTP/SSE endpoint.",
+          "type": "string"
+        },
+        {
+          "const": "hooks",
+          "description": "Observe via per-launch HTTP hooks.",
+          "type": "string"
+        }
+      ]
     },
     "DaemonSettings": {
       "properties": {

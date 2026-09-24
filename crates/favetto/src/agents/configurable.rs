@@ -9,12 +9,13 @@ use std::path::PathBuf;
 
 use favetto_core::model::AgentCapabilities;
 
-use crate::config::AgentConfig;
+use crate::config::{AgentConfig, AgentStateMode};
 
 use super::agent::{
     append_template, substitute, Agent, AgentContext, AgentDescriptor, CommandSpec, Invocation,
     SessionIdProbe, SubmitStrategy, SUBMIT_DELAY, SUBMIT_MAX_SENDS,
 };
+use super::plain_jsonl::{PlainJsonlParser, PLAIN_JSONL};
 
 /// Delegate the four shared `Agent` methods to an adapter's inner
 /// [`TemplateAgent`]: `descriptor`, `command`, `session_id_probe` and
@@ -229,6 +230,18 @@ pub(crate) fn overlay(base: &mut AgentConfig, overrides: &AgentConfig) {
     if let Some(v) = &overrides.session_id_json_key {
         base.session_id_json_key = Some(v.clone());
     }
+    if let Some(v) = overrides.state {
+        base.state = Some(v);
+    }
+    if let Some(v) = &overrides.output_format {
+        base.output_format = Some(v.clone());
+    }
+    if let Some(v) = &overrides.server {
+        base.server = Some(v.clone());
+    }
+    if let Some(v) = overrides.hooks {
+        base.hooks = Some(v);
+    }
     if let Some(v) = &overrides.prompt_args {
         base.prompt_args = Some(v.clone());
     }
@@ -246,19 +259,31 @@ pub(crate) fn overlay(base: &mut AgentConfig, overrides: &AgentConfig) {
 }
 
 /// Derive the wire capabilities of a template-only agent.
+///
+/// A structured `output_format` (or a `session_id_json_key`) marks the agent as
+/// producing structured output; an explicit live `state` (anything but
+/// `auto`/`none`) marks it as reporting state. Only the server/hooks transports
+/// can answer a permission prompt.
 pub(crate) fn capabilities_from_config(config: &AgentConfig) -> AgentCapabilities {
+    let reports_state = matches!(
+        config.state,
+        Some(AgentStateMode::Stdout | AgentStateMode::Server | AgentStateMode::Hooks)
+    );
     AgentCapabilities {
         interactive: true,
         headless: config.headless_args.is_some() || config.run_args.is_some(),
         resume: config.resume_args.is_some(),
         model_selection: config.run_args.is_some() || config.interactive_model_args.is_some(),
         providers: false,
-        structured_output: config.session_id_json_key.is_some(),
+        structured_output: config.output_format.is_some() || config.session_id_json_key.is_some(),
         reports_session_id: config.session_id_json_key.is_some(),
         prompt_prefill: config.submit_prompt.unwrap_or(false),
         interactive_prompt: config.prompt_args.is_some() || config.submit_prompt.unwrap_or(false),
-        reports_state: false,
-        permission_channel: false,
+        reports_state,
+        permission_channel: matches!(
+            config.state,
+            Some(AgentStateMode::Server | AgentStateMode::Hooks)
+        ),
     }
 }
 
@@ -280,6 +305,18 @@ impl Agent for ConfigurableAgent {
     delegate_to_template!();
 
     fn parse_output(&self, raw: &str, exit_code: Option<i32>) -> super::agent::AgentRunResult {
+        if self.template.config.output_format.as_deref() == Some(PLAIN_JSONL) {
+            let mut parser = PlainJsonlParser::new(self.template.probe.clone());
+            parser.push(raw.as_bytes());
+            parser.finish(exit_code);
+            let summary = parser.summary();
+            return super::agent::AgentRunResult {
+                exit_code,
+                session_id: summary.session_id.clone(),
+                output: serde_json::to_value(summary).unwrap_or(serde_json::Value::Null),
+                raw: raw.to_string(),
+            };
+        }
         let session_id = self
             .template
             .probe
@@ -325,6 +362,100 @@ mod tests {
         assert!(caps.reports_session_id);
         assert!(caps.prompt_prefill);
         assert!(caps.interactive_prompt);
+    }
+
+    #[test]
+    fn output_format_and_state_drive_capabilities() {
+        let base = AgentConfig {
+            command: "mycli".to_string(),
+            ..Default::default()
+        };
+
+        // `plain-jsonl` + stdout: structured output, live state, no replies.
+        let agent = ConfigurableAgent::from_config(
+            "mycli",
+            &AgentConfig {
+                output_format: Some(PLAIN_JSONL.to_string()),
+                state: Some(AgentStateMode::Stdout),
+                ..base.clone()
+            },
+        );
+        let caps = agent.capabilities();
+        assert!(caps.structured_output);
+        assert!(caps.reports_state);
+        assert!(!caps.permission_channel);
+
+        // server/hooks can answer a permission prompt.
+        for state in [AgentStateMode::Server, AgentStateMode::Hooks] {
+            let agent = ConfigurableAgent::from_config(
+                "mycli",
+                &AgentConfig {
+                    state: Some(state),
+                    ..base.clone()
+                },
+            );
+            assert!(agent.capabilities().reports_state);
+            assert!(agent.capabilities().permission_channel);
+        }
+
+        // `none`/`auto` (and unset) advertise no structured channel.
+        for state in [None, Some(AgentStateMode::None), Some(AgentStateMode::Auto)] {
+            let agent = ConfigurableAgent::from_config(
+                "mycli",
+                &AgentConfig {
+                    state,
+                    ..base.clone()
+                },
+            );
+            let caps = agent.capabilities();
+            assert!(!caps.structured_output);
+            assert!(!caps.reports_state);
+            assert!(!caps.permission_channel);
+        }
+    }
+
+    #[test]
+    fn plain_jsonl_output_format_produces_a_run_summary() {
+        let config = AgentConfig {
+            command: "mycli".to_string(),
+            output_format: Some(PLAIN_JSONL.to_string()),
+            session_id_json_key: Some("sessionID".to_string()),
+            ..Default::default()
+        };
+        let agent = ConfigurableAgent::from_config("mycli", &config);
+        let raw = concat!(
+            r#"{"sessionID":"ses_1","text":"hello"}"#,
+            "\n",
+            r#"{"type":"tool_use","id":"c1","name":"bash","input":{"command":"ls"}}"#,
+            "\n",
+        );
+        let result = agent.parse_output(raw, Some(0));
+        assert_eq!(result.session_id.as_deref(), Some("ses_1"));
+
+        let summary: favetto_core::model::RunSummary =
+            serde_json::from_value(result.output.clone()).unwrap();
+        assert_eq!(summary.text, "hello");
+        assert_eq!(summary.tool_calls.len(), 1);
+        assert_eq!(summary.tool_calls[0].name, "bash");
+        assert_eq!(
+            summary.outcome,
+            Some(favetto_core::model::IdleOutcome::Succeeded)
+        );
+    }
+
+    #[test]
+    fn non_plain_output_format_keeps_the_raw_text_wrapper() {
+        let config = AgentConfig {
+            command: "mycli".to_string(),
+            output_format: Some("opencode-json".to_string()),
+            ..Default::default()
+        };
+        let agent = ConfigurableAgent::from_config("mycli", &config);
+        let result = agent.parse_output(r#"{"text":"hi"}"#, Some(0));
+        assert_eq!(
+            result.output,
+            serde_json::json!({ "text": r#"{"text":"hi"}"# })
+        );
     }
 
     #[test]
@@ -443,6 +574,10 @@ mod tests {
             resume_args: Some(vec!["override-resume".to_string()]),
             interactive_model_args: Some(vec!["override-model".to_string()]),
             session_id_json_key: Some("overrideSessionId".to_string()),
+            state: Some(AgentStateMode::Stdout),
+            output_format: Some("plain-jsonl".to_string()),
+            server: Some("managed".to_string()),
+            hooks: Some(true),
             prompt_args: Some(vec!["override-prompt".to_string()]),
             submit_prompt: Some(true),
             env: BTreeMap::from([
@@ -465,6 +600,10 @@ mod tests {
             resume_args: Some(vec!["base-resume".to_string()]),
             interactive_model_args: Some(vec!["base-model".to_string()]),
             session_id_json_key: Some("baseSessionId".to_string()),
+            state: Some(AgentStateMode::None),
+            output_format: Some("base-format".to_string()),
+            server: Some("background".to_string()),
+            hooks: Some(false),
             prompt_args: Some(vec!["base-prompt".to_string()]),
             submit_prompt: Some(false),
             env: BTreeMap::from([
@@ -493,6 +632,10 @@ mod tests {
             overrides.interactive_model_args
         );
         assert_eq!(merged.session_id_json_key, overrides.session_id_json_key);
+        assert_eq!(merged.state, overrides.state);
+        assert_eq!(merged.output_format, overrides.output_format);
+        assert_eq!(merged.server, overrides.server);
+        assert_eq!(merged.hooks, overrides.hooks);
         assert_eq!(merged.prompt_args, overrides.prompt_args);
         assert_eq!(merged.submit_prompt, Some(true));
         assert_eq!(merged.cwd, overrides.cwd);
