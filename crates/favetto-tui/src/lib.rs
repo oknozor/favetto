@@ -7,6 +7,7 @@
 
 pub mod cli;
 pub mod client;
+pub mod supervisor;
 pub mod tui;
 
 // Shared types live in `favetto-core`; re-export them here so the TUI modules

@@ -321,3 +321,43 @@ loop:
 
 The supervisor — not the daemon — owns `decide`, `policy`, and the meaning of
 "done". That is the whole point of the boundary.
+
+## Reference implementation
+
+The repository ships a runnable two-step supervisor so the contract can be read
+alongside working code. It is an ordinary remote-API client — it links only the
+wire types and the TUI's `Client`, never daemon code — and lives entirely outside
+`crates/favetto`:
+
+- **Engine** — `crates/favetto-tui/src/supervisor.rs`. `decide` is a pure
+  function from a `WorkflowInspect` snapshot plus the policy to exactly one
+  `Decision`; `run` applies each decision (`wait` sleeps, `spawn` calls
+  `workflow.spawn`) until the root is terminal. It emits a subset of the closed
+  vocabulary: `wait`, `spawn`, `complete`, `escalate`.
+- **Binary** — `crates/favetto-tui/examples/reference_supervisor.rs`. It starts
+  the first catalog task as its own root, waits for it, spawns the second into
+  the same root, waits again, and completes.
+- **Two-step catalog** — `tasks/examples/supervisor/plan.md` and
+  `tasks/examples/supervisor/implement.md`. They deliberately declare **no**
+  `spawn` or `needs` edge: the controller owns the sequencing, which is what
+  keeps the daemon a deterministic executor.
+
+Run it against a local daemon whose tasks directory contains the examples:
+
+```bash
+# terminal 1
+favetto daemon --socket /tmp/favetto.sock
+
+# terminal 2, from the repository root
+cargo run -p favetto-tui --example reference_supervisor -- \
+    --socket /tmp/favetto.sock \
+    --first examples/supervisor/plan \
+    --second examples/supervisor/implement
+```
+
+The `--remote`/`--token-file` flags attach over the authenticated WebSocket
+instead of the Unix socket, and `--` `input`/`dedupe-key`/`wait-ms`/`max-cycles`
+tune the run. `crates/favetto/tests/supervisor_e2e.rs` exercises the same path
+end to end against the real daemon binary and the two catalog tasks, asserting
+that the loop observes `wait`, submits `workflow.spawn`, and reaches
+`complete`.
