@@ -773,6 +773,64 @@ async fn cancel_active_task_cancels_only_non_terminal_tasks() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `finish_active_task` is a compare-and-set: it finalizes an active run but
+/// never overwrites a row that a concurrent cancellation already made terminal.
+#[tokio::test]
+async fn finish_active_task_never_overwrites_a_cancelled_row() {
+    let (dir, pool) = scratch_pool("finish-active").await;
+
+    let mut running = task_at(Utc::now(), None, None);
+    running.status = TaskStatus::Running;
+    let mut awaiting = task_at(Utc::now(), None, None);
+    awaiting.status = TaskStatus::AwaitingInput;
+    let mut cancelled = task_at(Utc::now(), Some(Utc::now()), None);
+    cancelled.status = TaskStatus::Cancelled;
+    for task in [&running, &awaiting, &cancelled] {
+        upsert_task(&pool, task).await.unwrap();
+    }
+
+    // A running task is finalized with the run's outcome.
+    let mut done = running.clone();
+    done.status = TaskStatus::Succeeded;
+    done.finished_at = Some(Utc::now());
+    done.output = Some(serde_json::json!({ "ok": true }));
+    assert!(finish_active_task(&pool, &done).await.unwrap());
+    let got = get_task(&pool, done.id).await.unwrap().unwrap();
+    assert_eq!(got.status, TaskStatus::Succeeded);
+    assert!(got.finished_at.is_some());
+    assert!(got.output.is_some());
+
+    // `awaiting_input` is still active and can be finalized as a failure.
+    let mut failed = awaiting.clone();
+    failed.status = TaskStatus::Failed;
+    failed.finished_at = Some(Utc::now());
+    failed.error = Some("boom".to_string());
+    assert!(finish_active_task(&pool, &failed).await.unwrap());
+    assert_eq!(
+        get_task(&pool, awaiting.id).await.unwrap().unwrap().status,
+        TaskStatus::Failed
+    );
+
+    // A row cancelled while the run was in flight is never resurrected, even by
+    // a "successful" outcome.
+    let mut resurrection = cancelled.clone();
+    resurrection.status = TaskStatus::Succeeded;
+    resurrection.finished_at = Some(Utc::now());
+    resurrection.output = Some(serde_json::json!({ "ok": true }));
+    assert!(!finish_active_task(&pool, &resurrection).await.unwrap());
+    let got = get_task(&pool, cancelled.id).await.unwrap().unwrap();
+    assert_eq!(got.status, TaskStatus::Cancelled);
+    assert!(
+        got.output.is_none(),
+        "the cancelled row keeps its own outcome"
+    );
+
+    // Finishing an already-terminal row is a no-op.
+    assert!(!finish_active_task(&pool, &done).await.unwrap());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn interrupt_run_marks_active_runs_and_is_idempotent() {
     let (dir, pool) = scratch_pool("interrupt-run").await;

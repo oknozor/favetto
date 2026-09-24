@@ -590,11 +590,25 @@ async fn run_one(
     let success = record_run_outcome(&mut task, outcome);
     task.finished_at = Some(Utc::now());
 
-    let _ = db::upsert_task(&state.db, &task).await;
-    // Finalize the attempt's run with the same outcome as the task row. Task-level
-    // output/session stay authoritative for `tasks.get`; the run is the history.
+    // Compare-and-set the terminal outcome: only write while the task is still
+    // active. A `tasks.cancel`/`workflow.cancel` that landed while the agent ran
+    // leaves the row `cancelled`; this run's own result must neither resurrect the
+    // row nor fire its terminal events.
+    let finished = match db::finish_active_task(&state.db, &task).await {
+        Ok(finished) => finished,
+        Err(e) => {
+            tracing::warn!(task_id = %task.id, error = %e, "failed to record task outcome");
+            false
+        }
+    };
+
+    // Finalize the attempt's run. Task-level output/session stay authoritative for
+    // `tasks.get`; the run is the history. A run whose task was cancelled
+    // concurrently is recorded `cancelled` too, so the two rows agree.
     let mut finished_run = run;
-    finished_run.status = if success {
+    finished_run.status = if !finished {
+        RunStatus::Cancelled
+    } else if success {
         RunStatus::Succeeded
     } else {
         RunStatus::Failed
@@ -605,62 +619,78 @@ async fn run_one(
     finished_run.error = task.error.clone();
     finished_run.failure = task.failure.clone();
     let _ = db::finalize_task_run(&state.db, &finished_run).await;
-    state
-        .bus
-        .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
 
-    // If the CLI had not written the title yet, keep polling in the background and
-    // push the update when it appears, so an open TUI fills the cell live.
-    if task.session_id.is_some() && task.session_title.is_none() {
-        let worktree_removed = plan.worktree.is_some() && !config.executor.keep_worktree;
-        let backfill_cwd = if worktree_removed {
-            plan.worktree
-                .as_ref()
-                .map(|w| w.repo.clone())
-                .unwrap_or_else(|| plan.cwd.clone())
-        } else {
-            plan.cwd.clone()
-        };
-        if let Some(agent) = agent_name.as_deref().and_then(|n| state.registry.get(n)) {
-            if agent.has_session_titles() {
-                if let Some(sid) = task.session_id.clone() {
-                    spawn_title_backfill(state.clone(), task.id, agent, sid, backfill_cwd);
+    if !finished {
+        // The task was cancelled out from under the run: the cancellation owns the
+        // row and has already announced itself. Suppress the terminal events and any
+        // `spawn`/`needs`/join successor, but still reclaim the worktree below.
+        tracing::info!(
+            task_id = %task.id,
+            "run finished after task cancellation; leaving the cancelled row untouched"
+        );
+    } else {
+        state
+            .bus
+            .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
+
+        // If the CLI had not written the title yet, keep polling in the background and
+        // push the update when it appears, so an open TUI fills the cell live.
+        if task.session_id.is_some() && task.session_title.is_none() {
+            let worktree_removed = plan.worktree.is_some() && !config.executor.keep_worktree;
+            let backfill_cwd = if worktree_removed {
+                plan.worktree
+                    .as_ref()
+                    .map(|w| w.repo.clone())
+                    .unwrap_or_else(|| plan.cwd.clone())
+            } else {
+                plan.cwd.clone()
+            };
+            if let Some(agent) = agent_name.as_deref().and_then(|n| state.registry.get(n)) {
+                if agent.has_session_titles() {
+                    if let Some(sid) = task.session_id.clone() {
+                        spawn_title_backfill(state.clone(), task.id, agent, sid, backfill_cwd);
+                    }
                 }
             }
         }
-    }
 
-    // A failure eligible for an automatic retry re-enqueues the task for a fresh
-    // attempt instead of ending it: the attempt is not terminal, so the terminal
-    // events (and any `spawn`) wait for a later attempt.
-    let retrying = !success && schedule_auto_retry(state, &task, &config.executor.retry).await;
+        // A failure eligible for an automatic retry re-enqueues the task for a fresh
+        // attempt instead of ending it: the attempt is not terminal, so the terminal
+        // events (and any `spawn`) wait for a later attempt.
+        let retrying = !success && schedule_auto_retry(state, &task, &config.executor.retry).await;
 
-    if !retrying {
-        let kind = if success {
-            EventKind::TaskCompleted
-        } else {
-            EventKind::TaskFailed
-        };
-        state
-            .emit_event(kind, serde_json::json!({ "task_id": task.id }))
-            .await;
-        state
-            .emit_event(EventKind::TaskFinished, finished_payload(&task, success))
-            .await;
+        if !retrying {
+            let kind = if success {
+                EventKind::TaskCompleted
+            } else {
+                EventKind::TaskFailed
+            };
+            state
+                .emit_event(kind, serde_json::json!({ "task_id": task.id }))
+                .await;
+            state
+                .emit_event(EventKind::TaskFinished, finished_payload(&task, success))
+                .await;
 
-        if success {
-            if let Some(spawn_task) = def.spawn.clone() {
-                if let Err(e) = spawn_from_manifest(state, &task, &def, &plan.cwd).await {
-                    tracing::warn!(task = %task.name, error = %e, "failed to spawn tasks from handoff");
-                }
-                // The parent's own `TaskFinished` was emitted above, before the
-                // manifest was read, so a fan-in on the spawned child is evaluated
-                // here instead. This is also what lets an empty manifest (`[]`)
-                // resolve the barrier. A new-root spawn starts independent workflows,
-                // so the parent's root has no barrier of its own to resolve for them.
-                if !def.spawn_new_root {
-                    evaluate_join_barriers(state, &spawn_task, task.root_or_self(), Some(task.id))
+            if success {
+                if let Some(spawn_task) = def.spawn.clone() {
+                    if let Err(e) = spawn_from_manifest(state, &task, &def, &plan.cwd).await {
+                        tracing::warn!(task = %task.name, error = %e, "failed to spawn tasks from handoff");
+                    }
+                    // The parent's own `TaskFinished` was emitted above, before the
+                    // manifest was read, so a fan-in on the spawned child is evaluated
+                    // here instead. This is also what lets an empty manifest (`[]`)
+                    // resolve the barrier. A new-root spawn starts independent workflows,
+                    // so the parent's root has no barrier of its own to resolve for them.
+                    if !def.spawn_new_root {
+                        evaluate_join_barriers(
+                            state,
+                            &spawn_task,
+                            task.root_or_self(),
+                            Some(task.id),
+                        )
                         .await;
+                    }
                 }
             }
         }
@@ -1435,13 +1465,26 @@ async fn fail_task(state: &State, task: Task, kind: FailureKind, error: &str) {
     task.error = Some(error.to_string());
     task.failure = Some(Failure::new(kind, error));
     task.finished_at = Some(Utc::now());
-    let _ = db::upsert_task(&state.db, &task).await;
+    // Compare-and-set: only write while the task is still active, so a
+    // cancellation that landed between the claim and here wins.
+    let finished = db::finish_active_task(&state.db, &task)
+        .await
+        .unwrap_or(false);
     if let Some(mut run) = claimed {
-        run.status = RunStatus::Failed;
+        run.status = if finished {
+            RunStatus::Failed
+        } else {
+            RunStatus::Cancelled
+        };
         run.finished_at = task.finished_at;
         run.error = task.error.clone();
         run.failure = task.failure.clone();
         let _ = db::finalize_task_run(&state.db, &run).await;
+    }
+    if !finished {
+        // Cancelled out from under the pre-dispatch failure: the cancellation owns
+        // the row and already emitted `TaskCancelled`; do not fire `TaskFinished`.
+        return;
     }
     state
         .bus

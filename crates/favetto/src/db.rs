@@ -219,6 +219,11 @@ pub async fn insert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
 }
 
 /// Insert-or-update a task (full overwrite of mutable fields).
+///
+/// Production finishes go through the conditional [`finish_active_task`] (or a
+/// targeted status CAS) so a cancelled row is never overwritten; this helper is
+/// kept for tests that seed rows directly.
+#[cfg(test)]
 pub async fn upsert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO tasks (id, name, status, attempt, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title, parent_id, root_id, interactive, failure)
@@ -721,6 +726,53 @@ pub async fn cancel_active_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<b
     )
     .bind(ts_ms(Utc::now()))
     .bind(id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Finalize an active (`running`/`awaiting_input`) task with a terminal outcome
+/// as a compare-and-set.
+///
+/// Unlike a full-overwrite upsert, the write is conditional on the task still
+/// being active: a cancellation (or any other terminal transition) that landed while
+/// the run was in flight wins, so the run's own result can never resurrect the
+/// cancelled row. Returns whether the row was written; the caller must suppress
+/// its `TaskFinished`/`needs`/join work when it was not.
+pub async fn finish_active_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        "UPDATE tasks SET
+             status = ?,
+             attempt = ?,
+             output = ?,
+             started_at = ?,
+             finished_at = ?,
+             error = ?,
+             failure = ?,
+             session_id = ?,
+             session_title = ?
+         WHERE id = ? AND status IN ('running', 'awaiting_input')",
+    )
+    .bind(task.status.as_str())
+    .bind(task.attempt as i64)
+    .bind(
+        task.output
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+    )
+    .bind(task.started_at.map(ts_ms))
+    .bind(task.finished_at.map(ts_ms))
+    .bind(&task.error)
+    .bind(
+        task.failure
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+    )
+    .bind(&task.session_id)
+    .bind(&task.session_title)
+    .bind(task.id.to_string())
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)

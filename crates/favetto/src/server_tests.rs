@@ -362,6 +362,184 @@ async fn workflow_cancel_unknown_root_is_invalid_params() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `tasks.cancel` on a running task flips it to `cancelled`, terminates its live
+/// agent session, and emits exactly one `TaskCancelled`. Already-terminal tasks
+/// are returned untouched with no second event.
+#[cfg(unix)]
+#[tokio::test]
+async fn cancel_task_terminates_the_live_session_and_is_terminal_safe() {
+    use crate::agents::{AgentContext, Invocation};
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_dir("task-cancel-live");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let script = dir.join("fake-opencode.sh");
+    std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+    let state = title_state(&dir, &tasks_dir, &script).await;
+
+    let task = oneshot_task();
+    db::insert_task(&state.db, &task).await.unwrap();
+
+    let agent = state.registry.get("opencode").expect("opencode registered");
+    let info = state
+        .agents
+        .start(
+            "opencode",
+            agent,
+            Some(task.id.to_string()),
+            Invocation::Interactive {
+                prompt: None,
+                provider: None,
+                model: None,
+            },
+            AgentContext {
+                rows: 24,
+                cols: 80,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(state.agents.is_running(&info.id));
+
+    let returned = cancel_task(&state, task.id).await.unwrap();
+    assert_eq!(returned.status, TaskStatus::Cancelled);
+    let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Cancelled);
+    assert!(stored.finished_at.is_some());
+    // The agent process no longer has a live session for the task.
+    assert!(
+        state
+            .agents
+            .find_latest_by_task(&task.id.to_string())
+            .is_none(),
+        "the cancelled task's agent session must be terminated"
+    );
+
+    let cancelled_events = |events: Vec<favetto_core::model::Event>| {
+        events
+            .iter()
+            .filter(|e| e.kind == EventKind::TaskCancelled)
+            .count()
+    };
+    assert_eq!(
+        cancelled_events(db::tail_events(&state.db, 50).await.unwrap()),
+        1
+    );
+
+    // A second cancel of the now-terminal task is a no-op: no flip, no event.
+    let returned = cancel_task(&state, task.id).await.unwrap();
+    assert_eq!(returned.status, TaskStatus::Cancelled);
+    assert_eq!(
+        cancelled_events(db::tail_events(&state.db, 50).await.unwrap()),
+        1
+    );
+
+    // A succeeded task is never resurrected as cancelled.
+    let mut done = oneshot_task();
+    done.status = TaskStatus::Succeeded;
+    done.finished_at = Some(Utc::now());
+    db::insert_task(&state.db, &done).await.unwrap();
+    let returned = cancel_task(&state, done.id).await.unwrap();
+    assert_eq!(returned.status, TaskStatus::Succeeded);
+    assert_eq!(
+        db::get_task(&state.db, done.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskStatus::Succeeded
+    );
+    assert_eq!(
+        cancelled_events(db::tail_events(&state.db, 50).await.unwrap()),
+        1
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `workflow.cancel` terminates the live agent session of every mid-run task it
+/// cancels, not just flips the row.
+#[cfg(unix)]
+#[tokio::test]
+async fn workflow_cancel_terminates_live_sessions() {
+    use crate::agents::{AgentContext, Invocation};
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_dir("workflow-cancel-live");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let script = dir.join("fake-opencode.sh");
+    std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+    let state = title_state(&dir, &tasks_dir, &script).await;
+
+    let root = Uuid::new_v4();
+    let mut root_task = oneshot_task();
+    root_task.id = root;
+    root_task.name = "root".to_string();
+    root_task.root_id = None;
+
+    let mut child_running = oneshot_task();
+    child_running.name = "child".to_string();
+    child_running.root_id = Some(root);
+
+    for task in [&root_task, &child_running] {
+        db::upsert_task(&state.db, task).await.unwrap();
+    }
+
+    let agent = state.registry.get("opencode").expect("opencode registered");
+    let info = state
+        .agents
+        .start(
+            "opencode",
+            agent,
+            Some(child_running.id.to_string()),
+            Invocation::Interactive {
+                prompt: None,
+                provider: None,
+                model: None,
+            },
+            AgentContext {
+                rows: 24,
+                cols: 80,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(state.agents.is_running(&info.id));
+
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 1,
+            method: method::WORKFLOW_CANCEL.to_string(),
+            params: serde_json::json!({ "root_id": root }),
+        },
+    )
+    .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let got = db::get_task(&state.db, child_running.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.status, TaskStatus::Cancelled);
+    assert!(
+        state
+            .agents
+            .find_latest_by_task(&child_running.id.to_string())
+            .is_none(),
+        "workflow.cancel must terminate the task's live session"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `workflow.retry` delegates to the manual retry, keyed by `task_id`.
 #[tokio::test]
 async fn workflow_retry_delegates_to_manual_retry() {
