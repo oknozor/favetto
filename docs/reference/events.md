@@ -14,7 +14,7 @@ Every event persisted on the bus is one of the kinds below. The **Event** column
 | `task_idle` | A task was enqueued and is waiting to run. |
 | `task_started` | A task began running. |
 | `task_awaiting_input` | A running task's agent is blocked waiting for user input. |
-| `task_finished` | A task ended (success or failure); used by `needs` dependencies. |
+| `task_finished` | A task ended (success or failure); the payload carries `name`, `task_id`, `success`, `status`, `attempt`, `retryable`, and an optional bounded `summary`; used by `needs` dependencies. |
 | `cron_tick` | A scheduled cron job fired. |
 | `issue_created` | An issue was created. |
 | `issue_updated` | An issue was edited. |

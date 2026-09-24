@@ -389,7 +389,7 @@ event_kinds! {
     /// A running task's agent is blocked waiting for user input.
     TaskAwaitingInput => "task_awaiting_input", "TaskAwaitingInput", "A running task's agent is blocked waiting for user input.";
     /// A task ended (success or failure) — used by `needs` dependencies.
-    TaskFinished => "task_finished", "TaskFinished", "A task ended (success or failure); used by `needs` dependencies.";
+    TaskFinished => "task_finished", "TaskFinished", "A task ended (success or failure); the payload carries `name`, `task_id`, `success`, `status`, `attempt`, `retryable`, and an optional bounded `summary`; used by `needs` dependencies.";
     CronTick => "cron_tick", "CronTick", "A scheduled cron job fired.";
     IssueCreated => "issue_created", "IssueCreated", "An issue was created.";
     IssueUpdated => "issue_updated", "IssueUpdated", "An issue was edited.";

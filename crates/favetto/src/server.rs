@@ -1662,7 +1662,7 @@ async fn finish_oneshot(
     state
         .emit_event(
             EventKind::TaskFinished,
-            serde_json::json!({ "name": task.name, "task_id": task.id, "success": success }),
+            crate::executor::finished_payload(&task, success),
         )
         .await;
 }

@@ -375,6 +375,122 @@ async fn fail_task_records_the_requested_kind() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The additive payload keeps every legacy key and layers the machine-readable
+/// finish context on top, so a consumer need not fetch the task.
+#[test]
+fn finished_payload_keeps_legacy_fields_and_adds_context() {
+    let mut task = task_with_session(None, None);
+    task.status = TaskStatus::Succeeded;
+    task.output = Some(serde_json::json!({
+        "envelope": { "summary": "Added the widget" }
+    }));
+
+    let payload = finished_payload(&task, true);
+    assert_eq!(payload["name"], "t");
+    assert_eq!(payload["task_id"], task.id.to_string());
+    assert_eq!(payload["success"], true);
+    assert_eq!(payload["status"], "succeeded");
+    assert_eq!(payload["attempt"], 1);
+    assert_eq!(payload["retryable"], false);
+    assert_eq!(payload["summary"], "Added the widget");
+}
+
+#[test]
+fn finished_payload_reports_a_retryable_failure() {
+    let mut task = task_with_session(None, None);
+    task.status = TaskStatus::Failed;
+    task.error = Some("PTY died".to_string());
+    task.failure = Some(Failure::new(FailureKind::Infrastructure, "PTY died"));
+
+    let payload = finished_payload(&task, false);
+    assert_eq!(payload["success"], false);
+    assert_eq!(payload["status"], "failed");
+    assert_eq!(payload["attempt"], 1);
+    assert_eq!(payload["retryable"], true);
+    // A failed task has no output, so the error is the bounded summary.
+    assert_eq!(payload["summary"], "PTY died");
+}
+
+#[test]
+fn finished_payload_marks_agent_failures_non_retryable() {
+    let mut task = task_with_session(None, None);
+    task.status = TaskStatus::Failed;
+    task.error = Some("exit 1".to_string());
+    task.failure = Some(Failure::new(FailureKind::Agent, "exit 1"));
+
+    let payload = finished_payload(&task, false);
+    assert_eq!(payload["status"], "failed");
+    assert_eq!(payload["retryable"], false);
+}
+
+#[test]
+fn finished_payload_omits_an_empty_summary() {
+    let mut task = task_with_session(None, None);
+    task.status = TaskStatus::Succeeded;
+    task.output = Some(serde_json::json!({ "envelope": { "summary": "  " } }));
+
+    let payload = finished_payload(&task, true);
+    assert!(
+        payload.get("summary").is_none(),
+        "a blank summary must be omitted, got {:?}",
+        payload.get("summary")
+    );
+}
+
+#[test]
+fn finished_payload_bounds_a_long_summary() {
+    let mut task = task_with_session(None, None);
+    task.status = TaskStatus::Succeeded;
+    task.output = Some(serde_json::json!({
+        "envelope": { "summary": "x".repeat(4096) }
+    }));
+
+    let payload = finished_payload(&task, true);
+    let summary = payload["summary"].as_str().expect("summary present");
+    assert!(summary.len() < 4096, "summary was not truncated");
+    // `tail_truncate` prefixes the `…` ellipsis (3 UTF-8 bytes).
+    assert!(
+        summary.len() <= FINISHED_SUMMARY_BYTES + 3,
+        "summary exceeds the cap: {} bytes",
+        summary.len()
+    );
+}
+
+/// `fail_task` emits the enriched `TaskFinished` event, not just the legacy keys.
+#[tokio::test]
+async fn fail_task_emits_an_enriched_finished_event() {
+    let dir = std::env::temp_dir().join(format!("favetto-finish-fail-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let state = join_state(&dir, Vec::new()).await;
+
+    let task = task_with_session(None, None);
+    db::insert_task(&state.db, &task).await.unwrap();
+
+    fail_task(
+        &state,
+        task.clone(),
+        FailureKind::Infrastructure,
+        "spawn failed",
+    )
+    .await;
+
+    let events = db::tail_events(&state.db, 10).await.unwrap();
+    let finished = events
+        .iter()
+        .rev()
+        .find(|e| e.kind == EventKind::TaskFinished)
+        .expect("TaskFinished emitted");
+    assert_eq!(finished.payload["name"], "t");
+    assert_eq!(finished.payload["task_id"], task.id.to_string());
+    assert_eq!(finished.payload["success"], false);
+    assert_eq!(finished.payload["status"], "failed");
+    assert_eq!(finished.payload["attempt"], 1);
+    assert_eq!(finished.payload["retryable"], true);
+    assert_eq!(finished.payload["summary"], "spawn failed");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn terminal_outcome_overrides_awaiting_input_status() {
     let mut task = task_with_session(None, None);
@@ -1332,6 +1448,73 @@ async fn run_one_records_a_failed_run() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `run_one` emits the enriched `TaskFinished` event on success too. With no
+/// agent output the synthesized envelope summary is blank, so it is omitted.
+#[cfg(unix)]
+#[tokio::test]
+async fn run_one_emits_an_enriched_finished_event() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("favetto-finish-ok-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("fake-agent.sh");
+    std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let mut cfg = FavettoConfig::default();
+    cfg.agent.default = Some("seedy".to_string());
+    cfg.agents.insert(
+        "seedy".to_string(),
+        crate::config::AgentConfig {
+            command: script.to_string_lossy().into_owned(),
+            headless_args: Some(vec![
+                "run".to_string(),
+                "--session-id".to_string(),
+                "{session_id}".to_string(),
+                "{prompt}".to_string(),
+            ]),
+            resume_args: Some(vec!["resume".to_string(), "{session_id}".to_string()]),
+            ..Default::default()
+        },
+    );
+    let state = join_state_with_config(&dir, Vec::new(), cfg).await;
+
+    let def = crate::tasks::parse_task_md("t", "agent = \"seedy\"\n---\nbody\n").unwrap();
+    let task = task_with_session(None, None);
+    db::insert_task(&state.db, &task).await.unwrap();
+
+    let plan = Plan {
+        cwd: dir.clone(),
+        needs_lock: false,
+        worktree: None,
+    };
+    let run = running_run(task.id);
+    db::insert_task_run(&state.db, &run).await.unwrap();
+    run_one(&state, task.clone(), run, def, plan, None).await;
+
+    let events = db::tail_events(&state.db, 20).await.unwrap();
+    let finished = events
+        .iter()
+        .rev()
+        .find(|e| e.kind == EventKind::TaskFinished)
+        .expect("TaskFinished emitted");
+    assert_eq!(finished.payload["name"], "t");
+    assert_eq!(finished.payload["task_id"], task.id.to_string());
+    assert_eq!(finished.payload["success"], true);
+    assert_eq!(finished.payload["status"], "succeeded");
+    assert_eq!(finished.payload["attempt"], 1);
+    assert_eq!(finished.payload["retryable"], false);
+    assert!(
+        finished.payload.get("summary").is_none(),
+        "empty output should omit the summary, got {:?}",
+        finished.payload.get("summary")
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A user-started task (`interactive = true`) runs the agent's real TUI: the
 /// rendered prompt goes through the interactive `prompt_args`, not
 /// `headless_args`, and the retained session is not marked headless so the
@@ -2038,6 +2221,36 @@ async fn finished_and_terminal_dependencies_fire_on_failure() {
     start_dependents(&state, &finished_event_at(1, "target", target.id, false)).await;
     assert_eq!(pending_named(&state, "legacy").await.len(), 1);
     assert_eq!(pending_named(&state, "either").await.len(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The enriched payload must not change `needs` semantics: `:finished` still
+/// fires on a failure now that the event carries extra fields.
+#[tokio::test]
+async fn enriched_finished_payload_still_starts_dependents() {
+    let dir = std::env::temp_dir().join(format!("favetto-finish-needs-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let state = join_state(&dir, vec![needs_def("follower", "target:finished")]).await;
+
+    let mut target = lineage_task("target", TaskStatus::Failed, None, None);
+    target.error = Some("agent failed".to_string());
+    target.failure = Some(Failure::new(FailureKind::Agent, "agent failed"));
+    db::insert_task(&state.db, &target).await.unwrap();
+
+    let event = Event {
+        id: 1,
+        kind: EventKind::TaskFinished,
+        payload: finished_payload(&target, false),
+        created_at: Utc::now(),
+    };
+    start_dependents(&state, &event).await;
+
+    assert_eq!(
+        pending_named(&state, "follower").await.len(),
+        1,
+        "`:finished` did not start a dependent on an enriched failure payload"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
