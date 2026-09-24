@@ -41,6 +41,17 @@ jobs:
       - name: Lint
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the declared MSRV toolchain
+        uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Check against the declared MSRV
+        run: cargo check --locked --workspace --all-targets
+
   test:
     name: nextest
     runs-on: ubuntu-latest
@@ -88,3 +99,10 @@ jobs:
       - uses: cocogitto/cocogitto-action@v4.2.0
         with:
           command: check
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
