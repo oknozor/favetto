@@ -8,14 +8,6 @@ use std::path::Path;
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
-/// Scopes a token may carry. Reserved for M6; M1 tokens are implicitly admin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Scope {
-    Read,
-    Write,
-    Admin,
-}
-
 /// A bearer token used to authenticate remote (WebSocket/TCP) clients.
 #[derive(Debug, Clone)]
 pub struct Token {

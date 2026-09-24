@@ -806,7 +806,6 @@ fn spawn_submit(
 
 #[cfg(test)]
 mod tests {
-    use super::agent::{AgentDescriptor, CommandSpec, SessionIdProbe};
     use super::configurable::ConfigurableAgent;
     use super::*;
     use crate::config::{AgentConfig, FavettoConfig, GitSigning};
@@ -829,30 +828,6 @@ mod tests {
             rows,
             cols,
             ..Default::default()
-        }
-    }
-
-    /// An agent that delegates to a template but reports a nested session-id path.
-    struct ProbeAgent {
-        inner: ConfigurableAgent,
-        probe: SessionIdProbe,
-    }
-
-    impl Agent for ProbeAgent {
-        fn descriptor(&self) -> &AgentDescriptor {
-            self.inner.descriptor()
-        }
-
-        fn command(
-            &self,
-            invocation: &Invocation<'_>,
-            ctx: &AgentContext,
-        ) -> anyhow::Result<CommandSpec> {
-            self.inner.command(invocation, ctx)
-        }
-
-        fn session_id_probe(&self) -> Option<SessionIdProbe> {
-            Some(self.probe.clone())
         }
     }
 
@@ -1126,42 +1101,6 @@ mod tests {
         assert_eq!(
             mgr.external_session_id(&info.id).as_deref(),
             Some("ses_real")
-        );
-    }
-
-    #[tokio::test]
-    async fn headless_run_captures_nested_session_id_via_json_path() {
-        let mgr = AgentManager::new();
-        let mut config = cfg("sh", &[]);
-        config.headless_args = Some(vec![
-            "-c".to_string(),
-            r#"printf '{"part":{"session":{"id":"ses_nested"}}}\n'"#.to_string(),
-        ]);
-        let agent: Arc<dyn Agent> = Arc::new(ProbeAgent {
-            inner: ConfigurableAgent::from_config("sh", &config),
-            probe: SessionIdProbe::JsonPath(vec![
-                "part".to_string(),
-                "session".to_string(),
-                "id".to_string(),
-            ]),
-        });
-        let info = mgr
-            .start(
-                "sh",
-                agent,
-                None,
-                Invocation::Headless {
-                    prompt: "hi",
-                    provider: None,
-                    model: None,
-                },
-                context(None, 40, 120),
-            )
-            .unwrap();
-        assert_eq!(mgr.wait(&info.id).await, Some(0));
-        assert_eq!(
-            mgr.external_session_id(&info.id).as_deref(),
-            Some("ses_nested")
         );
     }
 

@@ -107,10 +107,6 @@ pub(crate) fn check_arg_sizes(program: &Path, args: &[String]) -> anyhow::Result
 pub enum SessionIdProbe {
     /// A top-level key (e.g. opencode's `"sessionID"`).
     JsonKey(String),
-    /// A nested path of object keys. No shipped built-in needs this yet, but the
-    /// trait is designed to grow; it is exercised by the test suite.
-    #[allow(dead_code)]
-    JsonPath(Vec<String>),
 }
 
 /// The outcome of a headless run.
@@ -253,16 +249,8 @@ pub(crate) fn extract_session_id(
     value: &serde_json::Value,
     probe: &SessionIdProbe,
 ) -> Option<String> {
-    match probe {
-        SessionIdProbe::JsonKey(key) => value.get(key)?.as_str().map(str::to_string),
-        SessionIdProbe::JsonPath(path) => {
-            let mut cursor = value;
-            for segment in path {
-                cursor = cursor.get(segment)?;
-            }
-            cursor.as_str().map(str::to_string)
-        }
-    }
+    let SessionIdProbe::JsonKey(key) = probe;
+    value.get(key)?.as_str().map(str::to_string)
 }
 
 /// Extract an agent session id from one line of line-delimited JSON output.
@@ -359,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_session_id_handles_json_key_and_path() {
+    fn extract_session_id_reads_top_level_key() {
         let value = serde_json::json!({
             "sessionID": "ses_top",
             "part": { "session": { "id": "ses_nested" } },
@@ -370,26 +358,7 @@ mod tests {
             Some("ses_top")
         );
         assert_eq!(
-            extract_session_id(
-                &value,
-                &SessionIdProbe::JsonPath(vec![
-                    "part".to_string(),
-                    "session".to_string(),
-                    "id".to_string()
-                ])
-            )
-            .as_deref(),
-            Some("ses_nested")
-        );
-        assert_eq!(
             extract_session_id(&value, &SessionIdProbe::JsonKey("missing".to_string())),
-            None
-        );
-        assert_eq!(
-            extract_session_id(
-                &value,
-                &SessionIdProbe::JsonPath(vec!["part".to_string(), "missing".to_string()])
-            ),
             None
         );
     }
