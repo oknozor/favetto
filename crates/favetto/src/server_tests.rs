@@ -1813,7 +1813,10 @@ async fn agents_start_resumes_in_the_runs_worktree() {
         run_git(args.into_iter().map(String::from).collect()).await;
     }
     std::fs::write(repo.join("README.md"), "seed").unwrap();
-    for args in [vec!["add", "-A"], vec!["commit", "-qm", "init"]] {
+    for args in [
+        vec!["add", "-A"],
+        vec!["-c", "commit.gpgsign=false", "commit", "-qm", "init"],
+    ] {
         run_git(args.into_iter().map(String::from).collect()).await;
     }
 
