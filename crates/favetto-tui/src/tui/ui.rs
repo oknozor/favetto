@@ -10,6 +10,7 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use favetto_core::model::{AgentSessionInfo, FailureKind, Task, TaskStatus};
+use favetto_core::workflow::{WorkflowInspect, WorkflowState};
 
 use super::app::{
     activity_cell, format_activity, format_usage, table_rows_area, usage_cell, App, CatalogRow,
@@ -80,6 +81,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_popup(frame: &mut Frame, app: &mut App) {
+    // The runtime workflow inspector draws straight from `app` (it needs the
+    // throbber and the full view), so handle it before borrowing `popup`.
+    if matches!(&app.popup, Popup::WorkflowRuntime(_)) {
+        draw_workflow_runtime(frame, app);
+        return;
+    }
+
     // Copy the theme and clone the throbber state before borrowing `popup`, so
     // the wizard can render a spinner without holding a borrow of `app`.
     let theme = app.theme;
@@ -120,6 +128,8 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
         Popup::Confirm(prompt) => {
             draw_confirm(frame, prompt, theme);
         }
+        // Handled above, before `popup` is borrowed, so the full `App` is available.
+        Popup::WorkflowRuntime(_) => {}
     }
 }
 
@@ -714,6 +724,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+R", "answer a pending agent prompt"),
             ("?", "open/close this help"),
             ("w", "open/close the workflow graph"),
+            ("i (Tasks)", "inspect the selected task's runtime workflow"),
             ("M", "mute/unmute sound"),
             ("q / Esc", "quit"),
         ],
@@ -796,6 +807,15 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("↑ / ↓ / PageUp / PageDown", "scroll the graph source"),
             ("Esc / w", "close"),
+        ],
+    ),
+    (
+        "Runtime workflow (i)",
+        &[
+            ("↑ / ↓", "select an instance"),
+            ("c", "cancel every non-terminal instance in the root"),
+            ("r", "retry the selected instance"),
+            ("Esc / i", "close"),
         ],
     ),
     (
@@ -942,6 +962,142 @@ fn draw_workflow(frame: &mut Frame, overlay: WorkflowOverlay<'_>) {
     *scroll = (*scroll).min(max_scroll);
 
     frame.render_widget(paragraph.scroll((*scroll, 0)), rect);
+}
+
+/// Draw the runtime workflow inspector (`i` on the Tasks tab): the root's state,
+/// its ready/running/failed/blocked buckets, and the per-instance
+/// status/attempt/summary table. While the first `workflow.inspect` is in
+/// flight, or when it failed, the body shows a placeholder instead.
+fn draw_workflow_runtime(frame: &mut Frame, app: &App) {
+    let Popup::WorkflowRuntime(rt) = &app.popup else {
+        return;
+    };
+    let theme = app.theme;
+    let area = frame.area();
+    let rect = centered_rect(area, 90, area.height.saturating_sub(2));
+
+    frame.render_widget(Clear, rect);
+    frame.buffer_mut().set_style(rect, theme.surface_style());
+
+    let title = match &rt.view {
+        Some(view) => format!(
+            " Runtime workflow (i) — {} [{}] — ↑/↓ select, c cancel, r retry, Esc/i close ",
+            view.root_task,
+            state_label(view.state),
+        ),
+        None => " Runtime workflow (i) — Esc/i close ".to_string(),
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .style(theme.surface_style())
+        .border_style(theme.block(true));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let Some(view) = &rt.view else {
+        let placeholder = rt
+            .error
+            .clone()
+            .unwrap_or_else(|| "Loading workflow.inspect…".to_string());
+        let color = if rt.error.is_some() {
+            theme.danger
+        } else {
+            theme.muted
+        };
+        frame.render_widget(
+            Paragraph::new(placeholder)
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(color)),
+            inner,
+        );
+        return;
+    };
+
+    // Header (buckets + any stale-view error), then the instance table.
+    let header_height = 1u16 + u16::from(rt.error.is_some());
+    let chunks =
+        Layout::vertical([Constraint::Length(header_height), Constraint::Min(0)]).split(inner);
+
+    let mut header = vec![bucket_line(view, theme)];
+    if let Some(err) = &rt.error {
+        header.push(Line::from(Span::styled(
+            err.clone(),
+            Style::default().fg(theme.danger),
+        )));
+    }
+    frame.render_widget(Paragraph::new(header), chunks[0]);
+
+    let widths = [
+        Constraint::Length(12),
+        Constraint::Length(24),
+        Constraint::Length(8),
+        Constraint::Min(0),
+    ];
+    let head = Row::new(vec!["STATUS", "TASK", "ATTEMPT", "SUMMARY"]).style(theme.table_header());
+    let state = app.throbber_state.clone();
+    let rows: Vec<Row> = view
+        .tasks
+        .iter()
+        .map(|t| {
+            Row::new(vec![
+                Cell::from(status_line(t.status, t.attempt, theme, &state)),
+                Cell::from(t.name.clone()),
+                Cell::from(t.attempt.to_string()),
+                Cell::from(t.summary.clone().unwrap_or_default()),
+            ])
+        })
+        .collect();
+
+    let table = Table::new(rows, widths)
+        .header(head)
+        .row_highlight_style(theme.selected())
+        .column_spacing(2);
+    let mut table_state = TableState::default();
+    if !view.tasks.is_empty() {
+        table_state.select(Some(rt.selected.min(view.tasks.len() - 1)));
+    }
+    frame.render_stateful_widget(table, chunks[1], &mut table_state);
+}
+
+/// Lower-case wire word for a runtime workflow root state.
+fn state_label(state: WorkflowState) -> &'static str {
+    match state {
+        WorkflowState::Running => "running",
+        WorkflowState::Succeeded => "succeeded",
+        WorkflowState::Failed => "failed",
+        WorkflowState::Cancelled => "cancelled",
+    }
+}
+
+/// The `ready/running/failed/blocked` bucket counts as one styled line.
+fn bucket_line(view: &WorkflowInspect, theme: Theme) -> Line<'static> {
+    let buckets = [
+        ("ready", &view.ready),
+        ("running", &view.running),
+        ("failed", &view.failed),
+        ("blocked", &view.blocked),
+    ];
+    let mut spans: Vec<Span> = Vec::new();
+    for (i, (label, ids)) in buckets.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("    "));
+        }
+        spans.push(Span::styled(
+            format!("{label} "),
+            Style::default().fg(theme.muted),
+        ));
+        spans.push(Span::styled(
+            ids.len().to_string(),
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// Minimum Catalog content width at which the tree and preview are docked

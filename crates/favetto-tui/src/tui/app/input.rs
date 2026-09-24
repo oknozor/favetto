@@ -74,6 +74,7 @@ impl App {
             Popup::TaskVars(_) => return self.handle_task_vars_key(key),
             Popup::Help { .. } => return self.handle_help_key(key.code),
             Popup::Workflow { .. } => return self.handle_workflow_key(key.code),
+            Popup::WorkflowRuntime(_) => return self.handle_workflow_runtime_key(key.code),
             Popup::Sessions { .. } => return self.handle_sessions_key(key.code),
             Popup::Reply(_) => return self.handle_reply_key(key),
             Popup::Confirm(_) => return self.handle_confirm_key(key.code),
@@ -106,6 +107,15 @@ impl App {
                 hscroll: 0,
             };
             return UiAction::OpenWorkflow;
+        }
+
+        // `i` opens the runtime workflow inspector for the selected task's root
+        // on the Tasks tab. Like `w`, it is literal inside a popup (routed
+        // above) and forwarded while the embedded agent captures the keyboard.
+        if self.tab == Tab::Tasks
+            && (key.code == KeyCode::Char('i') || key.code == KeyCode::Char('I'))
+        {
+            return self.open_workflow_inspect();
         }
 
         // `p` toggles the Catalog preview pane, but only on the Catalog tab.
@@ -432,6 +442,42 @@ impl App {
             _ => {}
         }
         UiAction::None
+    }
+
+    /// Keys while the runtime workflow inspector is open: `i`/`Esc` close,
+    /// arrows move the instance selection, `c` cancels the root and `r` retries
+    /// the selected instance (both via the daemon's root-scoped workflow API).
+    pub(super) fn handle_workflow_runtime_key(&mut self, code: KeyCode) -> UiAction {
+        match code {
+            KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('I') => {
+                self.popup = Popup::None;
+                UiAction::None
+            }
+            KeyCode::Up => {
+                if let Popup::WorkflowRuntime(rt) = &mut self.popup {
+                    rt.selected = rt.selected.saturating_sub(1);
+                }
+                UiAction::None
+            }
+            KeyCode::Down => {
+                if let Popup::WorkflowRuntime(rt) = &mut self.popup {
+                    let len = rt.view.as_ref().map_or(0, |v| v.tasks.len());
+                    rt.selected = (rt.selected + 1).min(len.saturating_sub(1));
+                }
+                UiAction::None
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') => match self.workflow_inspect_root() {
+                Some(root_id) => UiAction::CancelWorkflow(root_id),
+                None => UiAction::None,
+            },
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                match self.workflow_runtime_selected_task() {
+                    Some(task_id) => UiAction::RetryWorkflowTask(task_id),
+                    None => UiAction::None,
+                }
+            }
+            _ => UiAction::None,
+        }
     }
 
     /// Keys while the Ctrl+O session picker is open: arrows move, Enter attaches,
