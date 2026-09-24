@@ -506,12 +506,132 @@ const PREV_TASKS_BYTES: usize = 64 * 1024;
 /// Smallest meaningful per-task slice of [`PREV_TASKS_BYTES`].
 const MIN_PREV_OUTPUT_BYTES: usize = 512;
 
+/// Cap on `envelope.summary` so a runaway agent cannot make the summary huge.
+const ENVELOPE_SUMMARY_BYTES: usize = 512;
+
+/// Smallest meaningful per-field slice when bounding envelope arrays.
+const MIN_ENVELOPE_FIELD_BYTES: usize = 256;
+
+/// Keep the tail of `s` on a UTF-8 boundary, so a truncated summary reads as the
+/// final (usually most useful) part of an agent's output.
+fn tail_truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let start = ceil_char_boundary(s, s.len() - max);
+    format!("…{}", &s[start..])
+}
+
+/// Synthesise a summary from the tail of the capped raw output when the agent
+/// offers no structured envelope.
+fn synthesized_summary(capped_raw: &str) -> String {
+    let last = capped_raw
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or("");
+    tail_truncate(last, ENVELOPE_SUMMARY_BYTES)
+}
+
+/// The envelope for a run whose agent produced no structured one: a summary
+/// synthesised from the raw transcript and empty collections.
+fn synthesized_envelope(capped_raw: &str) -> serde_json::Value {
+    serde_json::json!({
+        "summary": synthesized_summary(capped_raw),
+        "artifacts": [],
+        "findings": [],
+        "outputs": {},
+        "continuation": serde_json::Value::Null,
+    })
+}
+
+/// Whether an object is a result envelope. `summary` is the one required field,
+/// so a JSON string there is the discriminator.
+fn is_envelope_object(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    obj.get("summary").is_some_and(serde_json::Value::is_string)
+}
+
+/// Extract a result envelope from an agent's structured `result`, if it carries
+/// one: an explicit `envelope` wrapper wins, then the result itself when it
+/// looks like an envelope, then an envelope encoded in the result's `text`
+/// (which covers agents that emit the envelope as their final answer).
+fn envelope_from_result(result: &serde_json::Value) -> Option<serde_json::Value> {
+    let obj = result.as_object()?;
+    if let Some(envelope) = obj.get("envelope") {
+        if envelope.is_object() {
+            return Some(envelope.clone());
+        }
+    }
+    if is_envelope_object(obj) {
+        return Some(result.clone());
+    }
+    if let Some(text) = obj.get("text").and_then(|value| value.as_str()) {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text.trim()) {
+            if parsed.as_object().is_some_and(is_envelope_object) {
+                return Some(parsed);
+            }
+        }
+    }
+    None
+}
+
+/// Ensure an envelope always has the five documented keys with sane types,
+/// preserving any extra keys the agent supplied. `summary` is always a string,
+/// `artifacts`/`findings` are always arrays, `outputs` defaults to `{}`, and
+/// `continuation` defaults to `null`.
+fn normalize_envelope(mut envelope: serde_json::Value) -> serde_json::Value {
+    let Some(obj) = envelope.as_object_mut() else {
+        return synthesized_envelope("");
+    };
+    if !obj.get("summary").is_some_and(serde_json::Value::is_string) {
+        obj.insert(
+            "summary".to_string(),
+            serde_json::Value::String(String::new()),
+        );
+    }
+    for key in ["artifacts", "findings"] {
+        if !obj.get(key).is_some_and(serde_json::Value::is_array) {
+            obj.insert(key.to_string(), serde_json::Value::Array(Vec::new()));
+        }
+    }
+    if !obj.contains_key("outputs") {
+        obj.insert("outputs".to_string(), serde_json::json!({}));
+    }
+    if !obj.contains_key("continuation") {
+        obj.insert("continuation".to_string(), serde_json::Value::Null);
+    }
+    envelope
+}
+
+/// Bound an envelope's fields in place so an embedded `_prev` copy stays within
+/// `budget`. Oversized `artifacts`/`findings`/`outputs` are replaced by a
+/// bounded string, trading shape for a hard byte cap; the outer `truncated` flag
+/// records the loss.
+fn bound_envelope(env: &mut serde_json::Map<String, serde_json::Value>, budget: usize) {
+    if let Some(serde_json::Value::String(summary)) = env.get_mut("summary") {
+        *summary = tail_truncate(summary.as_str(), ENVELOPE_SUMMARY_BYTES);
+    }
+    let per_field = (budget / 3).max(MIN_ENVELOPE_FIELD_BYTES);
+    for key in ["artifacts", "findings", "outputs"] {
+        let Some(value) = env.get_mut(key) else {
+            continue;
+        };
+        let serialized = value.to_string();
+        if serialized.len() > per_field {
+            let (capped, _) = truncate_text(&serialized, per_field);
+            *value = serde_json::Value::String(capped);
+        }
+    }
+}
+
 /// Bound a finished task's stored `output` (or `input`) before embedding it as
 /// `_prev`. A payload at or under `cap` is returned verbatim. A larger one keeps
 /// its object shape but truncates the bulky `output` field head+tail (the tail
-/// usually carries the agent's final summary) and drops the parsed `result`
-/// duplicate, flagging `truncated`. An unknown shape falls back to a bounded
-/// JSON string so the prompt can never exceed the argument limit.
+/// usually carries the agent's final summary), bounds the `envelope`, and drops
+/// the parsed `result` duplicate, flagging `truncated`. An unknown shape falls
+/// back to a bounded JSON string so the prompt can never exceed the argument
+/// limit.
 fn bounded_prev_value(value: Option<&serde_json::Value>, cap: usize) -> serde_json::Value {
     let Some(value) = value else {
         return serde_json::Value::Null;
@@ -529,6 +649,13 @@ fn bounded_prev_value(value: Option<&serde_json::Value>, cap: usize) -> serde_js
             changed = true;
         }
         if obj.remove("result").is_some() {
+            changed = true;
+        }
+        if let Some(env) = obj
+            .get_mut("envelope")
+            .and_then(|value| value.as_object_mut())
+        {
+            bound_envelope(env, cap);
             changed = true;
         }
         if changed {
@@ -552,12 +679,18 @@ fn build_task_output(
     max: usize,
 ) -> serde_json::Value {
     let (capped_raw, truncated) = truncate_text(raw, max);
+    // An envelope is embedded when the agent's structured result carries one;
+    // otherwise the summary is synthesised from the tail of the raw output.
+    let structured = envelope_from_result(parsed);
     // The default parser wraps the raw text as `{"text": raw}`; that is a
-    // byte-for-byte duplicate of `output`, so store `null` instead.
+    // byte-for-byte duplicate of `output`, so store `null` instead. When the
+    // parsed result *is* the envelope, the envelope is the canonical copy and
+    // `result` is de-duped the same way.
     let result = if parsed
         .as_object()
         .map(|o| o.len() == 1 && o.get("text").and_then(|v| v.as_str()) == Some(raw))
         .unwrap_or(false)
+        || structured.as_ref() == Some(parsed)
     {
         serde_json::Value::Null
     } else {
@@ -569,6 +702,15 @@ fn build_task_output(
             parsed.clone()
         }
     };
+    let mut envelope = structured
+        .map(normalize_envelope)
+        .unwrap_or_else(|| normalize_envelope(synthesized_envelope(&capped_raw)));
+    bound_envelope(
+        envelope
+            .as_object_mut()
+            .expect("normalize_envelope returns an object"),
+        max / 2,
+    );
     serde_json::json!({
         "agent": agent,
         "session_id": session_id,
@@ -577,6 +719,7 @@ fn build_task_output(
         "truncated": truncated,
         "output": capped_raw,
         "result": result,
+        "envelope": envelope,
     })
 }
 

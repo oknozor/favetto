@@ -76,6 +76,63 @@ is terminal and is never retried automatically.
 This is part of the runtime task API (the daemon, remote API, and TUI), not a
 task-file header key.
 
+## Result envelope
+
+`task.output` stays arbitrary JSON, but every run carries an additive `envelope`
+so a dependent task (or a controller) can consume a predecessor's result without
+parsing a raw transcript. The existing keys (`agent`, `session_id`,
+`session_title`, `output_bytes`, `truncated`, `output`, `result`) are unchanged:
+
+```json
+{
+  "agent": "opencode",
+  "session_id": "ses_…",
+  "output_bytes": 12345,
+  "truncated": false,
+  "output": "<capped raw transcript>",
+  "result": { "…": "agent-specific parsed result, or null" },
+  "envelope": {
+    "summary": "Implemented GitHub webhook signature verification.",
+    "artifacts": [{ "kind": "source", "path": "src/github.rs" }],
+    "findings": [],
+    "outputs": { "tests_passed": true },
+    "continuation": null
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `summary` | string | Always present. A one-line result summary. |
+| `artifacts` | array | Things the run produced; may be empty. |
+| `findings` | array | Observations the successor should know; may be empty. |
+| `outputs` | object (any JSON) | Structured values keyed by name; defaults to `{}`. |
+| `continuation` | object or `null` | Optional machine-readable hint for what to do next. |
+
+A structured agent result may carry the envelope directly (a `summary` string),
+under an explicit `envelope` wrapper, or as JSON in its `text` field. When it
+does, it is embedded verbatim (normalized to the five keys above). Otherwise
+`summary` is synthesised from the tail of the capped raw output and the arrays
+are empty. Envelopes are a convention, not a mandatory schema: a result that
+does not match simply gets a synthesised summary.
+
+When the parsed result *is* the envelope, `result` is `null` (the envelope is the
+canonical copy), matching the existing `{ "text": raw }` de-duplication. Older
+rows written before this convention have no `envelope`; consumers must tolerate
+`null`. The envelope is additive and never removes existing keys.
+
+**Artifact durability.** A run's worktree is removed unless `keep_worktree` is
+set or the agent committed/pushed, so an artifact path must be **repo-relative**
+and should not point at a worktree-local file that will be deleted. Prefer
+durable `branch`/`commit`/`pr` artifacts, for example
+`{"kind":"commit","ref":"favetto/implement-abc12345"}` or
+`{"kind":"pr","ref":"#146"}`, over a bare file path.
+
+When the output is embedded in a dependent's `_prev`, `envelope.summary` and any
+oversized `artifacts`/`findings`/`outputs` are bounded so the rendered prompt
+stays under the argument-size limit. Read the summary with
+<span v-pre>`{{ prev.output.envelope.summary }}`</span>.
+
 ## Prompt templates
 
 Prompt bodies and `spawn_file` paths are rendered before use.

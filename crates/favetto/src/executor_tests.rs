@@ -756,6 +756,97 @@ fn bounded_prev_value_truncates_large_shape_and_keeps_small_verbatim() {
 }
 
 #[test]
+fn build_task_output_synthesises_summary_from_raw_tail() {
+    let raw = "starting\nstep one\ndone: added the feature\n";
+    let parsed = serde_json::json!({ "text": raw });
+    let value = build_task_output(raw, &parsed, "plain", None, None, 1000);
+    assert_eq!(value["envelope"]["summary"], "done: added the feature");
+    assert_eq!(value["envelope"]["artifacts"], serde_json::json!([]));
+    assert_eq!(value["envelope"]["findings"], serde_json::json!([]));
+    assert_eq!(value["envelope"]["outputs"], serde_json::json!({}));
+    assert_eq!(value["envelope"]["continuation"], serde_json::Value::Null);
+    // The default `{ "text": raw }` duplicate is still dropped.
+    assert_eq!(value["result"], serde_json::Value::Null);
+    assert_eq!(value["agent"], "plain");
+    assert_eq!(value["output"], raw);
+}
+
+#[test]
+fn build_task_output_embeds_structured_envelope() {
+    let parsed = serde_json::json!({
+        "summary": "did it",
+        "artifacts": [{ "kind": "source", "path": "a.rs" }],
+        "findings": [{ "note": "n" }],
+        "outputs": { "tests_passed": true },
+        "continuation": { "spawn": "next" },
+    });
+    let value = build_task_output("raw text", &parsed, "agent", None, None, 1000);
+    assert_eq!(value["envelope"], parsed);
+    // The envelope is the canonical copy, so `result` is de-duped.
+    assert_eq!(value["result"], serde_json::Value::Null);
+    assert_eq!(value["output"], "raw text");
+    assert_eq!(value["agent"], "agent");
+}
+
+#[test]
+fn build_task_output_embeds_envelope_from_result_text() {
+    let parsed = serde_json::json!({
+        "text": "{\"summary\":\"from text\",\"artifacts\":[]}",
+        "session_id": "ses_1",
+    });
+    let value = build_task_output("whatever", &parsed, "opencode", None, None, 1000);
+    assert_eq!(value["envelope"]["summary"], "from text");
+    // Missing documented keys are normalized in.
+    assert_eq!(value["envelope"]["findings"], serde_json::json!([]));
+    assert_eq!(value["envelope"]["outputs"], serde_json::json!({}));
+    // The envelope came from `text`, not from the result object itself, so the
+    // result is preserved.
+    assert_eq!(value["result"], parsed);
+}
+
+#[test]
+fn build_task_output_ignores_non_envelope_result() {
+    let raw = "line a\nfinal answer";
+    let parsed = serde_json::json!({
+        "text": "this is not JSON",
+        "session_id": "ses_1",
+    });
+    let value = build_task_output(raw, &parsed, "opencode", None, None, 1000);
+    assert_eq!(value["envelope"]["summary"], "final answer");
+    assert_eq!(value["result"], parsed);
+}
+
+#[test]
+fn bounded_prev_value_bounds_envelope_arrays() {
+    let big = "x".repeat(200 * 1024);
+    let stored = serde_json::json!({
+        "agent": "opencode",
+        "output": "small transcript",
+        "envelope": {
+            "summary": "s",
+            "artifacts": [{ "kind": "source", "path": big }],
+            "findings": [{ "note": big }],
+            "outputs": { "blob": big },
+            "continuation": null,
+        },
+    });
+    let bounded = bounded_prev_value(Some(&stored), PREV_OUTPUT_BYTES);
+    assert_eq!(bounded["truncated"], true);
+    // Each bulky field is replaced by a bounded string.
+    for key in ["artifacts", "findings", "outputs"] {
+        let field = &bounded["envelope"][key];
+        assert!(field.is_string(), "{key} should be stringified: {field}");
+        assert!(field.as_str().unwrap().len() <= PREV_OUTPUT_BYTES / 3 + 128);
+    }
+    assert!(bounded["envelope"]["summary"].is_string());
+    assert!(
+        bounded.to_string().len() < 2 * PREV_OUTPUT_BYTES,
+        "bounded _prev is {} bytes",
+        bounded.to_string().len()
+    );
+}
+
+#[test]
 fn branch_name_slugifies_folder_qualified_task() {
     let task = Task {
         id: Uuid::new_v4(),
@@ -1903,6 +1994,45 @@ async fn finished_dependency_bounds_large_output() {
     assert!(
         prev.to_string().len() < PREV_OUTPUT_BYTES + 1024,
         "single-dep _prev is {} bytes",
+        prev.to_string().len()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn finished_dependency_prev_bounds_large_envelope() {
+    let dir = std::env::temp_dir().join(format!("favetto-needs-envelope-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let state = join_state(&dir, vec![needs_def("follower", "target:finished")]).await;
+
+    let mut target = lineage_task("target", TaskStatus::Succeeded, None, None);
+    let big = "x".repeat(200 * 1024);
+    target.output = Some(serde_json::json!({
+        "agent": "opencode",
+        "output": "small transcript",
+        "envelope": {
+            "summary": "done",
+            "artifacts": [{ "kind": "source", "path": big }],
+            "findings": [{ "note": big }],
+            "outputs": { "blob": big },
+            "continuation": null,
+        },
+    }));
+    db::insert_task(&state.db, &target).await.unwrap();
+
+    start_dependents(&state, &finished_event("target", target.id)).await;
+    let followers = pending_named(&state, "follower").await;
+    assert_eq!(followers.len(), 1);
+    let prev = &followers[0].input["_prev"];
+    assert_eq!(prev["output"]["truncated"], true);
+    let envelope = &prev["output"]["envelope"];
+    assert!(envelope["artifacts"].is_string());
+    assert!(envelope["findings"].is_string());
+    assert!(envelope["outputs"].is_string());
+    assert!(
+        prev.to_string().len() < PREV_OUTPUT_BYTES + 16 * 1024,
+        "single-dep envelope _prev is {} bytes",
         prev.to_string().len()
     );
 
