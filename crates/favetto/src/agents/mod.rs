@@ -22,9 +22,11 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
-use favetto_core::model::{AgentSessionInfo, AwaitingInputReason};
+use favetto_core::model::{
+    AgentActivity, AgentSessionInfo, AgentStateEvent, AwaitingInputReason, InputReply,
+};
 
 use crate::config::{FavettoConfig, GitSettings};
 
@@ -37,6 +39,9 @@ mod detect;
 mod opencode;
 mod pi;
 mod registry;
+mod state;
+#[cfg(test)]
+pub(crate) mod testing;
 mod vibe;
 
 pub(crate) use agent::{resolve_session_title, TITLE_POLL_ATTEMPTS, TITLE_POLL_INTERVAL};
@@ -46,6 +51,9 @@ pub use agent::{Agent, AgentContext, Invocation, SubmitStrategy};
 #[cfg(test)]
 pub(crate) use agent::{AgentDescriptor, CommandSpec};
 pub use registry::AgentRegistry;
+pub(crate) use state::{
+    AgentLiveState, InputResponder, StateContext, StateSourceConfig, StateStart, StateStop,
+};
 
 /// Scrollback lines retained by each session's server-side emulator.
 const SCROLLBACK: usize = 2000;
@@ -81,8 +89,8 @@ fn terminate(pid: Option<u32>) {
     let _ = pid;
 }
 
-/// A full-screen terminal frame or a child exit, broadcast to connections that
-/// attached to the session.
+/// A full-screen terminal frame, a child exit, or a folded live-state snapshot,
+/// broadcast to connections that attached to the session.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     /// `data` is a self-contained `vt100` formatted screen (clears then redraws).
@@ -91,14 +99,19 @@ pub enum AgentEvent {
         session_id: String,
         code: Option<i32>,
     },
+    /// The session's folded live state changed (activity/usage).
+    State {
+        session_id: String,
+        live: AgentLiveState,
+    },
 }
 
 impl AgentEvent {
     pub fn session_id(&self) -> &str {
         match self {
-            AgentEvent::Output { session_id, .. } | AgentEvent::Exit { session_id, .. } => {
-                session_id
-            }
+            AgentEvent::Output { session_id, .. }
+            | AgentEvent::Exit { session_id, .. }
+            | AgentEvent::State { session_id, .. } => session_id,
         }
     }
 }
@@ -130,12 +143,21 @@ struct Session {
     last_activity: Arc<Mutex<std::time::Instant>>,
     /// The current awaiting-input reason, if the detector last saw one.
     awaiting_input: Arc<Mutex<Option<AwaitingInputReason>>>,
+    /// Folded live state from a structured channel, if this session has one.
+    live: Arc<Mutex<AgentLiveState>>,
+    /// Answers structured prompts through the session's state transport.
+    responder: Option<Arc<dyn InputResponder>>,
+    /// Per-session broadcast of raw normalized events, for `attention`.
+    state_tx: Option<broadcast::Sender<AgentStateEvent>>,
+    /// Stops the session's detached state transport; taken on exit or close.
+    state_stop: Arc<Mutex<Option<StateStop>>>,
     /// Creation order, so "the task's latest session" is well-defined.
     order: u64,
 }
 
 impl Session {
     fn info(&self) -> AgentSessionInfo {
+        let live = self.live.lock();
         AgentSessionInfo {
             id: self.id.clone(),
             agent: self.agent.clone(),
@@ -144,8 +166,16 @@ impl Session {
             headless: self.headless,
             session_id: self.external_session_id.lock().clone(),
             awaiting_input: self.awaiting_input.lock().clone(),
-            activity: None,
-            usage: None,
+            activity: live.activity.clone(),
+            usage: live.usage.clone(),
+        }
+    }
+
+    /// Stop the session's detached state transport, if it is still running.
+    fn stop_state(&self) {
+        let stop = self.state_stop.lock().take();
+        if let Some(stop) = stop {
+            stop();
         }
     }
 }
@@ -190,6 +220,7 @@ impl Drop for AgentManager {
         let mut sessions = self.sessions.lock();
         for (_, session) in sessions.drain() {
             session.running.store(false, Ordering::SeqCst);
+            session.stop_state();
             terminate(session.pid);
         }
     }
@@ -395,6 +426,68 @@ impl AgentManager {
         let awaiting_input = Arc::new(Mutex::new(None::<AwaitingInputReason>));
         let tx = self.tx.clone();
 
+        // Start the agent's structured state source, if it has one. The stdout
+        // parser is fed by the reader thread below; the event receiver is
+        // consumed by a per-session task that folds it into the live snapshot,
+        // mirrors awaiting-input onto the session, and rebroadcasts raw events
+        // for `attention`. A source that fails to start degrades to the screen
+        // heuristic without affecting the session.
+        let state_cfg = StateSourceConfig {
+            headless,
+            program: spec.program.clone(),
+            args: spec.args.clone(),
+            env: spec.env.clone(),
+            cwd: spec.cwd.clone(),
+        };
+        let state_ctx = StateContext {
+            favetto_session: id.clone(),
+            external_session: ctx.session_id.clone(),
+            headless,
+            cwd: spec.cwd.clone(),
+            program: spec.program.clone(),
+            args: spec.args.clone(),
+            env: spec.env.clone(),
+            stdin: writer.clone(),
+        };
+        let started = if tokio::runtime::Handle::try_current().is_ok() {
+            match agent.state_source(&state_cfg) {
+                Some(source) => match source.start(state_ctx) {
+                    Ok(start) => Some(start),
+                    Err(e) => {
+                        tracing::warn!(
+                            agent = name,
+                            session = %id,
+                            error = %e,
+                            "agent state source failed to start; falling back to screens"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            }
+        } else {
+            // The state task needs the async runtime; the daemon always has one,
+            // but a bare-sync caller must not half-wire a source.
+            None
+        };
+        let (state_events, state_stdout, state_responder, state_stop, state_tx) = match started {
+            Some(StateStart {
+                events,
+                stdout,
+                responder,
+                stop,
+            }) => {
+                let (state_tx, _) = broadcast::channel(256);
+                (Some(events), stdout, Some(responder), stop, Some(state_tx))
+            }
+            None => (None, None, None, None, None),
+        };
+        let state_stop = Arc::new(Mutex::new(state_stop));
+        let live = Arc::new(Mutex::new(AgentLiveState {
+            activity: state_events.as_ref().map(|_| AgentActivity::Starting),
+            usage: None,
+        }));
+
         // Reader thread: feed the emulator, answer terminal queries, broadcast a
         // full-screen frame, then reap the child and announce its exit.
         {
@@ -407,6 +500,9 @@ impl AgentManager {
             let exit_code = exit_code.clone();
             let external_session_id = external_session_id.clone();
             let last_activity = last_activity.clone();
+            let mut state_stdout = state_stdout;
+            let state_stop = state_stop.clone();
+            let reader_tx = tx.clone();
             std::thread::spawn(move || {
                 let mut chunk = [0u8; 8192];
                 let mut line_buf: Vec<u8> = Vec::new();
@@ -423,6 +519,11 @@ impl AgentManager {
                                     let excess = buf.len() - MAX_RAW;
                                     buf.drain(..excess);
                                 }
+                            }
+                            // Feed the structured stdout parser, if this session
+                            // has one, from the same bytes as the emulator.
+                            if let Some(parser) = state_stdout.as_mut() {
+                                parser.push(bytes);
                             }
                             // Capture the agent's own session id from line-delimited
                             // JSON output (e.g. `opencode run --format json`).
@@ -458,7 +559,7 @@ impl AgentManager {
                                 let _ = w.write_all(&replies);
                                 let _ = w.flush();
                             }
-                            let _ = tx.send(AgentEvent::Output {
+                            let _ = reader_tx.send(AgentEvent::Output {
                                 session_id: id.clone(),
                                 data: frame,
                             });
@@ -473,7 +574,14 @@ impl AgentManager {
                     .map(|status| status.exit_code() as i32)
                     .unwrap_or(-1);
                 exit_code.store(code, Ordering::SeqCst);
-                let _ = tx.send(AgentEvent::Exit {
+                if let Some(parser) = state_stdout.as_mut() {
+                    parser.finish(Some(code));
+                }
+                let stop = state_stop.lock().take();
+                if let Some(stop) = stop {
+                    stop();
+                }
+                let _ = reader_tx.send(AgentEvent::Exit {
                     session_id: id,
                     code: Some(code),
                 });
@@ -509,8 +617,15 @@ impl AgentManager {
             headless,
             last_activity,
             awaiting_input,
+            live,
+            responder: state_responder,
+            state_tx,
+            state_stop,
             order,
         });
+        if let Some(events) = state_events {
+            spawn_state_task(session.clone(), tx, events);
+        }
         let info = session.info();
         self.sessions.lock().insert(id, session);
         Ok(info)
@@ -612,6 +727,17 @@ impl AgentManager {
             .and_then(|s| s.external_session_id.lock().clone())
     }
 
+    /// Subscribe to a session's raw normalized state events, if it has a
+    /// structured source. `None` means the session relies on the screen
+    /// heuristic.
+    pub fn subscribe_state(
+        &self,
+        session_id: &str,
+    ) -> Option<broadcast::Receiver<AgentStateEvent>> {
+        let session = self.get(session_id).ok()?;
+        session.state_tx.as_ref().map(|tx| tx.subscribe())
+    }
+
     /// Write raw bytes to the session's PTY (keystrokes from the TUI).
     pub fn input(&self, session_id: &str, data: &[u8]) -> anyhow::Result<()> {
         let session = self.get(session_id)?;
@@ -619,6 +745,24 @@ impl AgentManager {
         writer.write_all(data)?;
         writer.flush()?;
         Ok(())
+    }
+
+    /// Answer a structured input request through the session's state transport.
+    ///
+    /// This is the typed counterpart to [`Self::input`]: replies are correlated
+    /// by `request_id` and validated, rather than typed as raw PTY bytes. Errors
+    /// when the session has no structured input channel.
+    pub async fn reply(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        reply: InputReply,
+    ) -> anyhow::Result<()> {
+        let session = self.get(session_id)?;
+        let responder = session.responder.clone().ok_or_else(|| {
+            anyhow::anyhow!("agent session '{session_id}' has no structured input channel")
+        })?;
+        responder.reply(request_id, reply).await
     }
 
     /// Resize the session's PTY and server-side emulator.
@@ -639,6 +783,7 @@ impl AgentManager {
     pub fn close(&self, session_id: &str) -> anyhow::Result<()> {
         if let Some(session) = self.sessions.lock().remove(session_id) {
             session.running.store(false, Ordering::SeqCst);
+            session.stop_state();
             terminate(session.pid);
         }
         Ok(())
@@ -814,6 +959,50 @@ fn spawn_submit(
                 break; // the agent reacted; don't send more Enters
             }
             before = now;
+        }
+    });
+}
+
+/// Consume a session's normalized state events.
+///
+/// Folds each event into the session's live snapshot, mirrors structured
+/// awaiting-input onto the session, and rebroadcasts the raw event so
+/// `attention` can react to `InputRequested`/`InputResolved` without the screen
+/// heuristic. Emits a folded `AgentEvent::State` for attached clients.
+fn spawn_state_task(
+    session: Arc<Session>,
+    tx: broadcast::Sender<AgentEvent>,
+    mut events: mpsc::UnboundedReceiver<AgentStateEvent>,
+) {
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            {
+                let mut live = session.live.lock();
+                live.apply(&event);
+            }
+            match &event {
+                AgentStateEvent::InputRequested { request } => {
+                    *session.awaiting_input.lock() = Some(AwaitingInputReason {
+                        kind: request.kind,
+                        message: request.message.clone(),
+                        request_id: Some(request.id.clone()),
+                        options: request.options.clone(),
+                        allow_always: request.allow_always,
+                    });
+                }
+                AgentStateEvent::InputResolved { .. } | AgentStateEvent::Idle { .. } => {
+                    *session.awaiting_input.lock() = None;
+                }
+                _ => {}
+            }
+            if let Some(state_tx) = &session.state_tx {
+                let _ = state_tx.send(event);
+            }
+            let live = session.live.lock().clone();
+            let _ = tx.send(AgentEvent::State {
+                session_id: session.id.clone(),
+                live,
+            });
         }
     });
 }
@@ -1383,5 +1572,131 @@ mod tests {
         assert!(mgr.sessions().is_empty());
         assert!(mgr.get("missing").is_err());
         assert!(mgr.close("missing").is_ok());
+    }
+
+    /// Poll a session's info until `check` passes.
+    async fn wait_for_session(
+        mgr: &AgentManager,
+        id: &str,
+        mut check: impl FnMut(&AgentSessionInfo) -> bool,
+    ) -> AgentSessionInfo {
+        for _ in 0..200 {
+            if let Some(info) = mgr.sessions().into_iter().find(|s| s.id == id) {
+                if check(&info) {
+                    return info;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("session {id} never reached the expected state");
+    }
+
+    /// A fake `StateSource` folds into the session snapshot and answers
+    /// `agents.reply` through its typed responder; a session without a source
+    /// keeps the screen-only surface and rejects replies.
+    #[tokio::test]
+    async fn state_source_folds_live_state_and_reply_round_trips() {
+        let fake = crate::agents::testing::fake_state_agent("while true; do sleep 1; done");
+        let mgr = AgentManager::new();
+        let info = mgr
+            .start(
+                "fake",
+                fake.agent.clone(),
+                Some("task-state".to_string()),
+                Invocation::Interactive {
+                    prompt: None,
+                    provider: None,
+                    model: None,
+                },
+                context(None, 24, 80),
+            )
+            .unwrap();
+
+        // The source seeds `Starting`; `agents.list` would surface it via info().
+        assert_eq!(info.activity, Some(AgentActivity::Starting));
+        assert!(info.usage.is_none());
+
+        let request = favetto_core::model::InputRequest {
+            id: "perm_1".to_string(),
+            kind: favetto_core::model::AwaitingInputKind::Permission,
+            message: "Allow?".to_string(),
+            options: vec!["Allow once".to_string()],
+            allow_always: true,
+        };
+        fake.events
+            .send(AgentStateEvent::InputRequested {
+                request: request.clone(),
+            })
+            .unwrap();
+        let info = wait_for_session(&mgr, &info.id, |s| {
+            s.activity
+                == Some(AgentActivity::Waiting {
+                    request: request.clone(),
+                })
+        })
+        .await;
+        let awaiting = info.awaiting_input.expect("awaiting-input slot");
+        assert_eq!(awaiting.request_id.as_deref(), Some("perm_1"));
+        assert_eq!(awaiting.options, vec!["Allow once".to_string()]);
+        assert!(awaiting.allow_always);
+
+        fake.events
+            .send(AgentStateEvent::Usage {
+                usage: favetto_core::model::AgentUsage {
+                    input_tokens: 7,
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        let info = wait_for_session(&mgr, &info.id, |s| {
+            s.usage.as_ref().is_some_and(|u| u.input_tokens == 7)
+        })
+        .await;
+        assert_eq!(info.usage.expect("usage").input_tokens, 7);
+
+        // `agents.reply` reaches the session's responder with the exact reply.
+        mgr.reply(&info.id, "perm_1", InputReply::Once)
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.responder.replies(),
+            vec![("perm_1".to_string(), InputReply::Once)]
+        );
+
+        fake.events
+            .send(AgentStateEvent::InputResolved {
+                id: "perm_1".to_string(),
+            })
+            .unwrap();
+        wait_for_session(&mgr, &info.id, |s| s.awaiting_input.is_none()).await;
+
+        // A session started without a source keeps the screen fallback and has
+        // no structured channel to reply to.
+        let plain = mgr
+            .start(
+                "sh",
+                template("sh", cfg("sh", &["-c", "sleep 1"])),
+                None,
+                Invocation::Interactive {
+                    prompt: None,
+                    provider: None,
+                    model: None,
+                },
+                context(None, 24, 80),
+            )
+            .unwrap();
+        assert!(mgr.subscribe_state(&plain.id).is_none());
+        assert!(mgr.subscribe_state(&info.id).is_some());
+        assert!(mgr
+            .reply(&plain.id, "perm_1", InputReply::Once)
+            .await
+            .is_err());
+        assert!(mgr
+            .reply("missing", "perm_1", InputReply::Once)
+            .await
+            .is_err());
+
+        mgr.close(&info.id).unwrap();
+        mgr.close(&plain.id).unwrap();
     }
 }

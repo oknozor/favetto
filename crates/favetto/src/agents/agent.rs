@@ -19,6 +19,8 @@ use futures_util::future::BoxFuture;
 
 use favetto_core::model::{AgentCapabilities, AwaitingInputReason};
 
+use super::state::{StateSource, StateSourceConfig};
+
 /// Delay before the first submit-Enter, and the maximum number of sends.
 pub(crate) const SUBMIT_DELAY: Duration = Duration::from_millis(1200);
 pub(crate) const SUBMIT_MAX_SENDS: u32 = 8;
@@ -209,6 +211,15 @@ pub trait Agent: Send + Sync {
 
     /// The agent's provider/model catalog source, if it has one.
     fn provider_source(&self) -> Option<Arc<dyn ProviderSource>> {
+        None
+    }
+
+    /// Build the live-state source for a launch, if this agent has one.
+    ///
+    /// Defaults to `None`: the session then relies on the debounced screen
+    /// heuristic. An implementation that returns a source opts its sessions into
+    /// structured state (and, where supported, structured input replies).
+    fn state_source(&self, _cfg: &StateSourceConfig) -> Option<Box<dyn StateSource>> {
         None
     }
 
@@ -426,6 +437,9 @@ mod tests {
         // The default awaiting-input detector never fires.
         let parser = vt100::Parser::new(4, 20, 0);
         assert!(Dummy.awaiting_input(parser.screen()).is_none());
+
+        // The default has no structured state source (screen fallback).
+        assert!(Dummy.state_source(&StateSourceConfig::default()).is_none());
     }
 
     /// A title-capable fixture: returns `"Late title"` once `fail_first` lookups

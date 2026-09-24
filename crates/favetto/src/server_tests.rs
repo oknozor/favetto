@@ -1641,3 +1641,56 @@ fn parse_params_returns_a_typed_invalid_params_error() {
     );
     assert_eq!(error.to_object().code, error_code::INVALID_PARAMS);
 }
+
+/// `agents.reply` deserializes its typed reply and routes it to the session's
+/// `InputResponder`; an unknown session is an internal error.
+#[tokio::test]
+async fn dispatch_agents_reply_round_trips_against_a_state_source() {
+    let dir = temp_dir("agents-reply");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+    let fake = crate::agents::testing::fake_state_agent("while true; do sleep 1; done");
+    let info = state
+        .agents
+        .start(
+            "fake",
+            fake.agent.clone(),
+            None,
+            Invocation::Interactive {
+                prompt: None,
+                provider: None,
+                model: None,
+            },
+            AgentContext {
+                rows: 40,
+                cols: 120,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let reply = |id: u64, session: &str| Request {
+        id,
+        method: method::AGENTS_REPLY.to_string(),
+        params: serde_json::json!({
+            "session_id": session,
+            "request_id": "perm_1",
+            "reply": { "reply": "once" },
+        }),
+    };
+
+    let resp = dispatch(&state, reply(1, &info.id)).await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    assert_eq!(resp.result.unwrap()["replied"], true);
+    assert_eq!(
+        fake.responder.replies(),
+        vec![("perm_1".to_string(), InputReply::Once)]
+    );
+
+    let resp = dispatch(&state, reply(2, "missing")).await;
+    assert_eq!(resp.error.expect("error").code, error_code::INTERNAL);
+
+    state.agents.close(&info.id).ok();
+    let _ = std::fs::remove_dir_all(&dir);
+}

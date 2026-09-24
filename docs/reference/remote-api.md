@@ -43,6 +43,7 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | `agents.resize` | Resize a session's PTY. |
 | `agents.attach` | Attach to a session: returns the session and a replay of its output. |
 | `agents.close` | Terminate a session. |
+| `agents.reply` | Answer a structured input request on a session's state channel. |
 | `providers.list` | List configured providers and their available models. |
 | `schedules.list` | List cron schedules. |
 | `schedules.upsert` | Create or update a cron schedule. |
@@ -60,6 +61,7 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | `catalog.updated` | The task catalog changed on disk; clients should re-fetch it. |
 | `agent.output` | Raw PTY output (base64) from a running agent session. |
 | `agent.exit` | An agent session's child process exited. |
+| `agent.state` | A session's folded live state (activity/usage) changed. |
 
 ## Error codes
 
