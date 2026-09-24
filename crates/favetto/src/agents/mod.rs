@@ -66,14 +66,14 @@ const MAX_RAW: usize = 1024 * 1024;
 /// The favetto binary itself. Agent processes are launched through
 /// `favetto __agent-exec -- <cmd>`, which sets a parent-death signal so they are
 /// killed when the daemon exits (including `SIGKILL`).
-fn agent_exec_program() -> anyhow::Result<PathBuf> {
+pub(crate) fn agent_exec_program() -> anyhow::Result<PathBuf> {
     std::env::current_exe().map_err(|e| anyhow::anyhow!("cannot locate favetto binary: {e}"))
 }
 
 /// Whether to launch agents through the `__agent-exec` wrapper. Disabled under
 /// unit tests (where the current exe is the test harness) and when
 /// `FAVETTO_NO_AGENT_WRAP` is set.
-fn wrap_agent() -> bool {
+pub(crate) fn wrap_agent() -> bool {
     !cfg!(test) && std::env::var_os("FAVETTO_NO_AGENT_WRAP").is_none()
 }
 
@@ -1698,6 +1698,18 @@ mod tests {
         // The source seeds `Starting`; `agents.list` would surface it via info().
         assert_eq!(info.activity, Some(AgentActivity::Starting));
         assert!(info.usage.is_none());
+
+        // A source-reported session id is recorded on the session so the panel
+        // and reattach path can see an interactive agent's own id.
+        fake.events
+            .send(AgentStateEvent::Session {
+                session_id: Some("ses_x".to_string()),
+                title: None,
+                model: None,
+            })
+            .unwrap();
+        wait_for_session(&mgr, &info.id, |s| s.session_id.as_deref() == Some("ses_x")).await;
+        assert_eq!(mgr.external_session_id(&info.id).as_deref(), Some("ses_x"));
 
         let request = favetto_core::model::InputRequest {
             id: "perm_1".to_string(),

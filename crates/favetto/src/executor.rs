@@ -993,7 +993,7 @@ async fn run_agent_task(
     // onto the session so the task row and panel can reopen it later. Agents
     // that report their own id (opencode) ignore the generated one. Interactive
     // runs never seed one: the TUI may not accept the flag.
-    let ctx = crate::agents::AgentContext {
+    let mut ctx = crate::agents::AgentContext {
         cwd: Some(cwd.to_path_buf()),
         provider: def.provider.clone(),
         model: def.model.clone(),
@@ -1016,6 +1016,9 @@ async fn run_agent_task(
             model: def.model.as_deref(),
         }
     };
+    // The agent may prepare its own session on a managed transport (opencode's
+    // managed server) before the PTY is spawned; headless opencode is a no-op.
+    let _ = agent.prepare_launch(&invocation, &mut ctx).await;
     let info = state.agents.start(
         agent_name,
         agent.clone(),
