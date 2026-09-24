@@ -500,8 +500,13 @@ stdio instead of HTTP.
 `pi --mode json`. Interactive stays `pi --session-id <id>`.
 
 **State source (`pi-rpc`).** `StdioRpc` over the PTY. Commands are JSON lines
-written to the PTY stdin (`prompt`, `get_state`, `get_messages`, `abort`);
-records read back are either `response` (correlated by `id`) or events.
+written to the PTY stdin (`prompt`, `get_state`, `get_messages`, `abort`,
+`get_session_stats`); records read back are either `response` (correlated by
+`id`) or events. Usage is taken from the authoritative completed message
+(`message_end.message.usage` / `turn_end.message.usage`) and reconciled against
+the exact whole-session `get_session_stats` totals, so a provider that only
+reports usage at completion (or nested tool/compaction usage) is still counted
+once and exactly.
 
 **Native event mapping:**
 
@@ -514,7 +519,9 @@ records read back are either `response` (correlated by `id`) or events.
 | `tool_execution_start/update/end` | `ToolStarted`/`ToolUpdated`/`ToolFinished` |
 | `extension_ui_request` (`select`/`confirm`/`input`/`editor`) | `InputRequested` |
 | `extension_ui_response` | `InputResolved` |
-| `message_update.usage` / `get_session_stats` | `Usage` |
+| `message_update.usage` / `message_end.message.usage` / `turn_end.message.usage` | `Usage` |
+| `compaction_end.result.usage` | `Usage` |
+| `get_session_stats` (`tokens` + flat `cost`) | `Usage` (reconciled delta) |
 | `session_info_changed` | `Title` |
 | `agent_end` | run boundary (do not treat as final) |
 
@@ -526,13 +533,18 @@ records read back are either `response` (correlated by `id`) or events.
 (`--mode rpc`); `--session-id` already seeds it. **Title** from `--name` /
 `session_info_changed`.
 
-**Interactive.** The RPC process is headless. For the TUI, tail the session
-file (`~/.pi/agent/sessions/--<cwd-slug>--/<ts>_<id>.jsonl`) for progress and
-title; pending dialogs are not written until answered, so the screen fallback
+**Interactive (`pi-session-file`).** The RPC process is headless; the TUI has no
+machine channel. When the launch cwd is known, a detached `FileTail` follows the
+newest session file (`~/.pi/agent/sessions/--<cwd-slug>--/<ts>_<id>.jsonl`,
+resumed by session id, otherwise discovered by mtime after launch) and maps
+appended `message`/`usage`/`compaction`/`session_info`/`model_change` entries to
+`TextDelta`/`ReasoningDelta`/`ToolStarted`/`ToolFinished`/`Usage`/`Title`/
+`Session`. Reads are bounded (`MAX_BYTES`/`MAX_LINES`) and never write to the
+file; pending dialogs are not persisted until answered, so the screen fallback
 remains for awaiting-input on the TUI.
 
 **Module layout.** `agents/pi/rpc.rs`, `agents/pi/json.rs`,
-`agents/pi/session_file.rs`.
+`agents/pi/session_file.rs`, `agents/pi/file_tail.rs`.
 
 ### 7.3 claude
 

@@ -7,6 +7,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// Longest file prefix scanned, so a huge session file is never fully read.
 const MAX_BYTES: u64 = 256 * 1024;
@@ -66,11 +67,9 @@ pub(crate) fn find_session_file(cwd: &Path, session_id: &str) -> Option<PathBuf>
 
 /// [`find_session_file`] against an explicit root, for tests.
 pub(crate) fn find_session_file_in(root: &Path, cwd: &Path, session_id: &str) -> Option<PathBuf> {
-    let slug = cwd_slug(cwd);
     let suffix = format!("_{session_id}.jsonl");
-    // pi wraps the slug in `--`; tolerate both shapes across versions.
     let mut newest: Option<(String, PathBuf)> = None;
-    for dir in [root.join(format!("--{slug}--")), root.join(&slug)] {
+    for dir in session_dirs(root, cwd) {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -82,6 +81,49 @@ pub(crate) fn find_session_file_in(root: &Path, cwd: &Path, session_id: &str) ->
             let better = newest.as_ref().is_none_or(|(best, _)| name > *best);
             if better {
                 newest = Some((name, entry.path()));
+            }
+        }
+    }
+    newest.map(|(_, path)| path)
+}
+
+/// The candidate session directories for `cwd`: pi wraps the slug in `--`, but
+/// older/newer versions may not, so both are probed.
+pub(crate) fn session_dirs(root: &Path, cwd: &Path) -> [PathBuf; 2] {
+    let slug = cwd_slug(cwd);
+    [root.join(format!("--{slug}--")), root.join(&slug)]
+}
+
+/// The newest `.jsonl` session file for `cwd` whose modification time is at or
+/// after `after` (when given). Used to discover an interactive session whose id
+/// is not known before launch: the file pi creates for the new run wins by
+/// mtime over any pre-existing session in the same directory.
+pub(crate) fn newest_session_file_in(
+    root: &Path,
+    cwd: &Path,
+    after: Option<SystemTime>,
+) -> Option<PathBuf> {
+    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    for dir in session_dirs(root, cwd) {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+                continue;
+            };
+            if let Some(after) = after {
+                if modified < after {
+                    continue;
+                }
+            }
+            let better = newest.as_ref().is_none_or(|(best, _)| modified >= *best);
+            if better {
+                newest = Some((modified, path));
             }
         }
     }

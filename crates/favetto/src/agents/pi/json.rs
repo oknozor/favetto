@@ -24,6 +24,10 @@ use favetto_core::model::{
 
 use crate::agents::state::StdoutParser;
 
+/// The `get_session_stats` command written at turn/settle boundaries. pi treats
+/// the command `id` as optional, so no correlation id is needed.
+const SESSION_STATS_REQUEST: &[u8] = b"{\"type\":\"get_session_stats\"}\n";
+
 /// A shared handle to the agent's stdin (the PTY master writer).
 pub(crate) type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
@@ -39,8 +43,16 @@ pub(crate) struct PiJsonlParser {
     /// RPC process exits instead of waiting forever for input.
     close_on_settle: Option<SharedWriter>,
     summary: RunSummary,
-    /// The latest cumulative provider usage, emitted once per `turn_end`.
+    /// The latest provider usage for the current turn: the streamed
+    /// `message_update.usage`, superseded by the authoritative
+    /// `message_end.message.usage` when the completed message arrives.
     last_usage: Option<AgentUsage>,
+    /// The total already emitted as `Usage` events, so the authoritative
+    /// `get_session_stats` total can be reconciled without double counting.
+    emitted_usage: AgentUsage,
+    /// Whether to ask pi for `get_session_stats` at turn/settle boundaries.
+    /// Only RPC runs (which have a stdin writer) opt in.
+    stats_on_settle: bool,
     /// At least one recognized record was seen (the stream is machine-readable).
     saw_structured: bool,
     /// `agent_settled` was seen (pi will not continue automatically).
@@ -60,6 +72,8 @@ impl PiJsonlParser {
             close_on_settle: None,
             summary: RunSummary::default(),
             last_usage: None,
+            emitted_usage: AgentUsage::default(),
+            stats_on_settle: false,
             saw_structured: false,
             saw_settled: false,
             saw_error: false,
@@ -72,9 +86,13 @@ impl PiJsonlParser {
         tx: mpsc::UnboundedSender<AgentStateEvent>,
         close_on_settle: Option<SharedWriter>,
     ) -> Self {
+        // An RPC run owns the stdin writer, so it can also ask for the
+        // authoritative session totals before it exits.
+        let stats_on_settle = close_on_settle.is_some();
         Self {
             tx: Some(tx),
             close_on_settle,
+            stats_on_settle,
             ..Self::new()
         }
     }
@@ -129,6 +147,12 @@ impl PiJsonlParser {
             // unstructured run did before.
             return;
         }
+        // A completed assistant message that never reached its `turn_end` (a
+        // truncated stream) still carries usage: flush it rather than dropping
+        // the run's only token/cost report.
+        if let Some(usage) = self.last_usage.take() {
+            self.emit_usage(usage);
+        }
         if !self.saw_settled {
             let outcome = if self.saw_error || matches!(exit_code, Some(code) if code != 0) {
                 IdleOutcome::Failed
@@ -162,6 +186,7 @@ impl PiJsonlParser {
                 self.emit(AgentStateEvent::TurnStarted);
             }
             "message_update" => self.process_message_update(&value),
+            "message_end" => self.process_message_end(&value),
             "tool_execution_start" => {
                 self.saw_structured = true;
                 let id = json_str(&value, "/toolCallId").to_string();
@@ -191,7 +216,8 @@ impl PiJsonlParser {
                     self.emit(AgentStateEvent::Title { title: name });
                 }
             }
-            "turn_end" => self.process_turn_end(),
+            "turn_end" => self.process_turn_end(&value),
+            "compaction_end" => self.process_compaction_end(&value),
             "agent_settled" => self.process_settled(),
             "extension_error" => {
                 let message = json_str(&value, "/error").trim().to_string();
@@ -231,9 +257,16 @@ impl PiJsonlParser {
         if value.get("success").and_then(|v| v.as_bool()) != Some(true) {
             return;
         }
-        if value.get("command").and_then(|v| v.as_str()) != Some("get_state") {
-            return;
+        match value.get("command").and_then(|v| v.as_str()) {
+            Some("get_state") => self.process_get_state(value),
+            // The authoritative session totals, requested at turn/settle
+            // boundaries: pi sums assistant usage, tool usage and compaction.
+            Some("get_session_stats") => self.process_session_stats(value.get("data")),
+            _ => {}
         }
+    }
+
+    fn process_get_state(&mut self, value: &serde_json::Value) {
         let Some(data) = value.get("data") else {
             return;
         };
@@ -263,6 +296,39 @@ impl PiJsonlParser {
             title,
             model,
         });
+    }
+
+    /// `get_session_stats` reports the exact whole-session totals: map them and
+    /// reconcile against the per-turn stream so the folded live usage lands on
+    /// pi's totals instead of double counting.
+    fn process_session_stats(&mut self, data: Option<&serde_json::Value>) {
+        let Some(data) = data else {
+            return;
+        };
+        let mut total = parse_usage(data);
+        if total.is_empty() {
+            return;
+        }
+        // `get_session_stats.tokens` omits `reasoning`; keep the value the
+        // per-turn messages reported instead of dropping it from the summary.
+        total.reasoning_tokens = total
+            .reasoning_tokens
+            .max(self.emitted_usage.reasoning_tokens);
+        // A reply requested before the latest turn landed can trail the running
+        // stream. Session totals only grow, so a stale reply must not rewind the
+        // folded total (which would make the next delta double count).
+        if !usage_covers(&total, &self.emitted_usage) {
+            return;
+        }
+        self.saw_structured = true;
+        // Only the delta over what was already emitted is sent to the fold; the
+        // summary keeps the authoritative total directly.
+        let delta = usage_delta(&total, &self.emitted_usage);
+        self.summary.usage = total.clone();
+        self.emitted_usage = total;
+        if !delta.is_empty() {
+            self.emit(AgentStateEvent::Usage { usage: delta });
+        }
     }
 
     fn process_message_update(&mut self, value: &serde_json::Value) {
@@ -307,6 +373,40 @@ impl PiJsonlParser {
                 self.record_error(message.to_string());
             }
             _ => {}
+        }
+    }
+
+    /// `message_end.message` is the authoritative completed message; pi
+    /// guarantees assistant usage here even when streaming usage stayed zero.
+    /// The assistant usage is held for the `turn_end` boundary so a streamed
+    /// running total is never re-counted; a `toolResult`'s nested model usage is
+    /// additional and emitted immediately.
+    fn process_message_end(&mut self, value: &serde_json::Value) {
+        let Some(usage) = value
+            .pointer("/message/usage")
+            .filter(|usage| usage.is_object())
+        else {
+            return;
+        };
+        let usage = parse_usage(usage);
+        match json_str(value, "/message/role") {
+            "assistant" => {
+                self.saw_structured = true;
+                self.last_usage = Some(usage);
+            }
+            "toolResult" => self.emit_usage(usage),
+            _ => {}
+        }
+    }
+
+    /// `compaction_end.result.usage` is the summary generation's usage; it
+    /// contributes to the session totals (and to `get_session_stats`).
+    fn process_compaction_end(&mut self, value: &serde_json::Value) {
+        if let Some(usage) = value
+            .pointer("/result/usage")
+            .filter(|usage| usage.is_object())
+        {
+            self.emit_usage(parse_usage(usage));
         }
     }
 
@@ -395,14 +495,43 @@ impl PiJsonlParser {
         }
     }
 
-    fn process_turn_end(&mut self) {
-        // `message_update.usage` is cumulative for the response; emit it once at
-        // the turn boundary so the folded summary sums turns rather than
-        // re-counting the same running total.
-        if let Some(usage) = self.last_usage.take() {
-            self.saw_structured = true;
-            self.summary.usage.merge(&usage);
-            self.emit(AgentStateEvent::Usage { usage });
+    fn process_turn_end(&mut self, value: &serde_json::Value) {
+        // Prefer the authoritative completed message usage; fall back to the
+        // last streaming `message_update.usage`. Either way the turn's usage is
+        // emitted once at the turn boundary so the folded summary sums turns
+        // rather than re-counting a running total.
+        let streamed = self.last_usage.take();
+        let usage = value
+            .pointer("/message/usage")
+            .filter(|usage| usage.is_object())
+            .map(parse_usage)
+            .or(streamed);
+        if let Some(usage) = usage {
+            self.emit_usage(usage);
+        }
+        // Ask for the authoritative totals while pi is still alive; the reply
+        // lands in the same stdout stream we are parsing.
+        self.request_session_stats();
+    }
+
+    /// Record a `Usage` event and fold it into the summary's running total.
+    fn emit_usage(&mut self, usage: AgentUsage) {
+        self.saw_structured = true;
+        self.summary.usage.merge(&usage);
+        self.emitted_usage.merge(&usage);
+        self.emit(AgentStateEvent::Usage { usage });
+    }
+
+    /// Write a `get_session_stats` command to pi's stdin, when this is an RPC
+    /// run. Best-effort: a closed writer is ignored.
+    fn request_session_stats(&mut self) {
+        if !self.stats_on_settle {
+            return;
+        }
+        if let Some(writer) = &self.close_on_settle {
+            let mut w = writer.lock();
+            let _ = w.write_all(SESSION_STATS_REQUEST);
+            let _ = w.flush();
         }
     }
 
@@ -416,8 +545,10 @@ impl PiJsonlParser {
         };
         self.summary.outcome = Some(outcome);
         self.emit(AgentStateEvent::Idle { outcome });
-        // Close pi's stdin so a long-lived RPC process exits. `0x04` is the same
-        // EOF signal the manager sends for `stdin_eof`; send it at most once.
+        // Ask for the exact session totals before shutdown, then close pi's
+        // stdin so the long-lived RPC process exits. `0x04` is the same EOF
+        // signal the manager sends for `stdin_eof`; send it at most once.
+        self.request_session_stats();
         if let Some(writer) = self.close_on_settle.take() {
             let mut w = writer.lock();
             let _ = w.write_all(&[0x04]);
@@ -461,14 +592,56 @@ fn ui_message(value: &serde_json::Value) -> String {
 }
 
 /// Parse pi's usage object into an [`AgentUsage`].
-fn parse_usage(value: &serde_json::Value) -> AgentUsage {
+///
+/// Handles both shapes pi emits: an `AssistantMessage.usage` (or a session
+/// `usage` entry) puts the counters at the top level with a nested
+/// `cost.total`, while `get_session_stats` nests them under `tokens` with a flat
+/// `cost`. `reasoning` is already included in `output`, so it is reported
+/// separately without touching the output count.
+pub(super) fn parse_usage(value: &serde_json::Value) -> AgentUsage {
+    let tokens = value.get("tokens").unwrap_or(value);
     AgentUsage {
-        input_tokens: u64_at(value, "/input"),
-        output_tokens: u64_at(value, "/output"),
-        cache_read_tokens: u64_at(value, "/cacheRead"),
-        cache_write_tokens: u64_at(value, "/cacheWrite"),
-        cost_usd: value.pointer("/cost/total").and_then(|v| v.as_f64()),
-        ..Default::default()
+        input_tokens: u64_at(tokens, "/input"),
+        output_tokens: u64_at(tokens, "/output"),
+        reasoning_tokens: u64_at(tokens, "/reasoning"),
+        cache_read_tokens: u64_at(tokens, "/cacheRead"),
+        cache_write_tokens: u64_at(tokens, "/cacheWrite"),
+        cost_usd: value
+            .pointer("/cost/total")
+            .and_then(|v| v.as_f64())
+            .or_else(|| value.pointer("/cost").and_then(|v| v.as_f64())),
+    }
+}
+
+/// Whether `total` is at least `emitted` in every counter, i.e. it is a
+/// non-stale snapshot of the monotonically growing session totals.
+fn usage_covers(total: &AgentUsage, emitted: &AgentUsage) -> bool {
+    total.input_tokens >= emitted.input_tokens
+        && total.output_tokens >= emitted.output_tokens
+        && total.reasoning_tokens >= emitted.reasoning_tokens
+        && total.cache_read_tokens >= emitted.cache_read_tokens
+        && total.cache_write_tokens >= emitted.cache_write_tokens
+        && total.cost_usd.unwrap_or(0.0) >= emitted.cost_usd.unwrap_or(0.0)
+}
+
+/// The part of `total` not yet reflected in `emitted`, field by field, so
+/// merging the result onto `emitted` yields exactly `total` (never negative).
+fn usage_delta(total: &AgentUsage, emitted: &AgentUsage) -> AgentUsage {
+    AgentUsage {
+        input_tokens: total.input_tokens.saturating_sub(emitted.input_tokens),
+        output_tokens: total.output_tokens.saturating_sub(emitted.output_tokens),
+        reasoning_tokens: total
+            .reasoning_tokens
+            .saturating_sub(emitted.reasoning_tokens),
+        cache_read_tokens: total
+            .cache_read_tokens
+            .saturating_sub(emitted.cache_read_tokens),
+        cache_write_tokens: total
+            .cache_write_tokens
+            .saturating_sub(emitted.cache_write_tokens),
+        cost_usd: total
+            .cost_usd
+            .map(|cost| (cost - emitted.cost_usd.unwrap_or(0.0)).max(0.0)),
     }
 }
 
@@ -806,5 +979,195 @@ mod tests {
         parser.finish(Some(0));
         let bytes = buffer.lock();
         assert_eq!(bytes.iter().filter(|b| **b == 0x04).count(), 1);
+    }
+
+    /// Collect the usage carried by the parser's `Usage` events.
+    fn usage_events(parser: &PiJsonlParser) -> Vec<AgentUsage> {
+        parser
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                AgentStateEvent::Usage { usage } => Some(usage.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn fold(usages: &[AgentUsage]) -> AgentUsage {
+        let mut total = AgentUsage::default();
+        for usage in usages {
+            total.merge(usage);
+        }
+        total
+    }
+
+    /// The authoritative completed-message usage is mapped even when the
+    /// streaming `message_update.usage` stayed at zero until completion.
+    #[test]
+    fn message_end_usage_is_authoritative() {
+        let raw = concat!(
+            r#"{"type":"agent_start"}"#,
+            "\n",
+            r#"{"type":"message_update","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"total":0}},"assistantMessageEvent":{"type":"text_delta","delta":"hi"}}"#,
+            "\n",
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input":50000,"output":10000,"cacheRead":40000,"cacheWrite":5000,"reasoning":1234,"totalTokens":105000,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0.45}},"stopReason":"stop"}}"#,
+            "\n",
+            r#"{"type":"turn_end","message":{"role":"assistant","usage":{"input":50000,"output":10000,"cacheRead":40000,"cacheWrite":5000,"reasoning":1234,"totalTokens":105000,"cost":{"total":0.45}}},"toolResults":[]}"#,
+            "\n",
+            r#"{"type":"agent_settled"}"#,
+            "\n",
+        );
+        let parser = parse(raw, Some(0));
+        let expected = AgentUsage {
+            input_tokens: 50000,
+            output_tokens: 10000,
+            reasoning_tokens: 1234,
+            cache_read_tokens: 40000,
+            cache_write_tokens: 5000,
+            cost_usd: Some(0.45),
+        };
+        // Emitted once at the turn boundary, not twice for message_end+turn_end.
+        assert_eq!(usage_events(&parser), vec![expected.clone()]);
+        assert_eq!(parser.summary().usage, expected);
+    }
+
+    /// `get_session_stats` carries the exact session totals under `tokens` with a
+    /// flat `cost`; the parser emits only the delta over the per-turn stream so
+    /// the folded total equals pi's number without double counting.
+    #[test]
+    fn session_stats_reconciles_without_double_counting() {
+        let raw = concat!(
+            r#"{"type":"agent_start"}"#,
+            "\n",
+            r#"{"type":"message_end","message":{"role":"assistant","usage":{"input":100,"output":20,"cacheRead":10,"cacheWrite":5,"reasoning":7,"totalTokens":135,"cost":{"total":0.02}}}}"#,
+            "\n",
+            r#"{"type":"turn_end","message":{},"toolResults":[]}"#,
+            "\n",
+            r#"{"type":"response","command":"get_session_stats","success":true,"data":{"sessionId":"ses_pi","tokens":{"input":50000,"output":10000,"cacheRead":40000,"cacheWrite":5000,"total":105000},"cost":0.45,"contextUsage":{"tokens":60000,"contextWindow":200000,"percent":30}}}"#,
+            "\n",
+            r#"{"type":"agent_settled"}"#,
+            "\n",
+        );
+        let parser = parse(raw, Some(0));
+        let expected = AgentUsage {
+            input_tokens: 50000,
+            output_tokens: 10000,
+            reasoning_tokens: 7,
+            cache_read_tokens: 40000,
+            cache_write_tokens: 5000,
+            cost_usd: Some(0.45),
+        };
+        let usages = usage_events(&parser);
+        // The turn's stream plus the stats delta; the fold is exact.
+        assert_eq!(usages.len(), 2);
+        assert_eq!(fold(&usages), expected);
+        assert_eq!(parser.summary().usage, expected);
+    }
+
+    /// A late `get_session_stats` reply that trails the running stream must not
+    /// rewind the folded total (which would double count the next delta).
+    #[test]
+    fn stale_session_stats_does_not_rewind_the_total() {
+        let raw = concat!(
+            r#"{"type":"message_end","message":{"role":"assistant","usage":{"input":100,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":100,"cost":{"total":0.10}}}}"#,
+            "\n",
+            r#"{"type":"turn_end","message":{},"toolResults":[]}"#,
+            "\n",
+            r#"{"type":"response","command":"get_session_stats","success":true,"data":{"tokens":{"input":100,"output":0,"cacheRead":0,"cacheWrite":0,"total":100},"cost":0.10}}"#,
+            "\n",
+            r#"{"type":"message_end","message":{"role":"assistant","usage":{"input":50,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":50,"cost":{"total":0.05}}}}"#,
+            "\n",
+            r#"{"type":"turn_end","message":{},"toolResults":[]}"#,
+            "\n",
+            // A reply that predates turn 2 arrives late.
+            r#"{"type":"response","command":"get_session_stats","success":true,"data":{"tokens":{"input":100,"output":0,"cacheRead":0,"cacheWrite":0,"total":100},"cost":0.10}}"#,
+            "\n",
+            r#"{"type":"response","command":"get_session_stats","success":true,"data":{"tokens":{"input":150,"output":0,"cacheRead":0,"cacheWrite":0,"total":150},"cost":0.15}}"#,
+            "\n",
+            r#"{"type":"agent_settled"}"#,
+            "\n",
+        );
+        let parser = parse(raw, Some(0));
+        assert_eq!(fold(&usage_events(&parser)).input_tokens, 150);
+        assert_eq!(parser.summary().usage.input_tokens, 150);
+        let cost = parser.summary().usage.cost_usd.unwrap();
+        assert!((cost - 0.15).abs() < 1e-9, "cost: {cost}");
+    }
+
+    /// A completed assistant message that never reached `turn_end` (a truncated
+    /// stream) still flushes its usage at `finish`.
+    #[test]
+    fn truncated_stream_flushes_message_end_usage() {
+        let raw = concat!(
+            r#"{"type":"message_end","message":{"role":"assistant","usage":{"input":5,"output":6,"cacheRead":0,"cacheWrite":0,"totalTokens":11,"cost":{"total":0.01}}}}"#,
+            "\n",
+        );
+        let parser = parse(raw, Some(0));
+        assert_eq!(
+            usage_events(&parser),
+            vec![AgentUsage {
+                input_tokens: 5,
+                output_tokens: 6,
+                cost_usd: Some(0.01),
+                ..Default::default()
+            }]
+        );
+        assert_eq!(parser.summary().outcome, Some(IdleOutcome::Interrupted));
+    }
+
+    /// `parse_usage` accepts the flat `cost`/nested `tokens` shape and reads
+    /// `reasoning`.
+    #[test]
+    fn parse_usage_reads_reasoning_and_both_cost_shapes() {
+        let message = parse_usage(&serde_json::json!({
+            "input": 1,
+            "output": 2,
+            "reasoning": 3,
+            "cacheRead": 4,
+            "cacheWrite": 5,
+            "cost": { "total": 0.5 }
+        }));
+        assert_eq!(message.reasoning_tokens, 3);
+        assert_eq!(message.cost_usd, Some(0.5));
+
+        let stats = parse_usage(&serde_json::json!({
+            "tokens": {
+                "input": 10,
+                "output": 20,
+                "cacheRead": 40,
+                "cacheWrite": 50,
+                "total": 120
+            },
+            "cost": 0.75
+        }));
+        assert_eq!(stats.input_tokens, 10);
+        assert_eq!(stats.output_tokens, 20);
+        assert_eq!(stats.cache_read_tokens, 40);
+        assert_eq!(stats.cache_write_tokens, 50);
+        assert_eq!(stats.cost_usd, Some(0.75));
+    }
+
+    /// A settle writes the `get_session_stats` request before the EOT.
+    #[test]
+    fn settle_requests_session_stats_before_closing() {
+        let (writer, buffer) = shared_writer();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut parser = PiJsonlParser::with_channel(tx, Some(writer));
+        parser.push(HAPPY.as_bytes());
+        let written = String::from_utf8_lossy(&buffer.lock()).to_string();
+        assert!(
+            written.contains(r#"{"type":"get_session_stats"}"#),
+            "stats request missing: {written:?}"
+        );
+        assert_eq!(
+            written.matches(r#"{"type":"get_session_stats"}"#).count(),
+            2
+        );
+        assert!(parser.events().iter().any(|e| matches!(
+            e,
+            AgentStateEvent::Idle {
+                outcome: IdleOutcome::Succeeded
+            }
+        )));
     }
 }
