@@ -1,36 +1,10 @@
 //! `favetto` — LLM-driven agent orchestrator (daemon + remote TUI).
-
-mod agents;
-mod attention;
-mod catalog_watch;
-mod cli;
-mod client;
-mod config;
-mod daemon;
-mod db;
-mod docgen;
-mod event_bus;
-mod executor;
-mod git;
-mod hooks;
-mod metrics;
-mod notify;
-mod pair;
-mod paths;
-mod scheduler;
-mod server;
-mod state;
-mod tasks;
-mod template;
-mod transport;
-mod tui;
-mod webhooks;
-mod workflow;
-mod ws;
+//!
+//! Thin entry point: the implementation lives in the `favetto` library crate.
 
 use clap::Parser;
 
-use crate::cli::Command;
+use favetto::cli::{self, Command};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -44,11 +18,11 @@ async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
 
     match cli.command {
-        Command::Daemon(args) => daemon::run(args).await,
-        Command::Tui(args) => tui::run(args).await,
-        Command::Pair(args) => pair(args).await,
+        Command::Daemon(args) => favetto::daemon::run(args).await,
+        Command::Tui(args) => favetto::tui::run(args).await,
+        Command::Pair(args) => favetto::pair::run(args).await,
         Command::TokenRotate(args) => token_rotate(args),
-        Command::Doc(args) => docgen::run(&args),
+        Command::Doc(args) => favetto::docgen::run(&args),
         Command::InternalAgentExec { argv } => agent_exec(argv),
     }
 }
@@ -121,13 +95,9 @@ fn agent_exec(argv: Vec<String>) -> anyhow::Result<()> {
     }
 }
 
-/// `favetto pair`: ask the daemon for a short-lived pairing code and print it.
-async fn pair(args: cli::PairArgs) -> anyhow::Result<()> {
-    pair::run(args).await
-}
-
 fn token_rotate(args: cli::TokenRotateArgs) -> anyhow::Result<()> {
-    let data_dir = paths::expand_tilde(args.data_dir.unwrap_or_else(cli::default_data_dir));
+    let data_dir =
+        favetto::paths::expand_tilde(args.data_dir.unwrap_or_else(cli::default_data_dir));
     let path = data_dir.join("token");
     let token = favetto_core::auth::Token::generate();
 

@@ -20,7 +20,7 @@ use crate::state::State;
 pub const PAIR_TTL_SECS: u64 = 60;
 
 /// In-memory store of active pairing codes.
-pub struct PairStore {
+pub(crate) struct PairStore {
     codes: Mutex<HashMap<String, Instant>>,
 }
 
@@ -46,7 +46,7 @@ impl PairStore {
 }
 
 /// Pairing sub-routes (`/pair/generate`, `/pair/exchange`).
-pub fn routes() -> Router<Arc<State>> {
+pub(crate) fn routes() -> Router<Arc<State>> {
     Router::new()
         .route("/pair/generate", post(generate))
         .route("/pair/exchange", post(exchange))
