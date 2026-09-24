@@ -303,19 +303,20 @@ async fn dispatch_loop(state: Arc<State>, cfg: ExecutorSettings) {
             }
 
             let base = resolve_base_dir(&def, &task);
-            let plan = match make_plan(&state, &cfg, &base, &task).await {
-                Ok(p) => p,
-                Err(e) => {
-                    fail_task(
-                        &state,
-                        task,
-                        FailureKind::Infrastructure,
-                        &format!("worktree setup failed: {e}"),
-                    )
-                    .await;
-                    continue;
-                }
-            };
+            let plan =
+                match make_plan(&state, &cfg, &base, &task, def.worktree.unwrap_or(true)).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        fail_task(
+                            &state,
+                            task,
+                            FailureKind::Infrastructure,
+                            &format!("worktree setup failed: {e}"),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
 
             // Reserve the directory so same-dir tasks serialize.
             let guard = if plan.needs_lock {
@@ -702,6 +703,11 @@ async fn run_one(
     // Reclaim the worktree only after the handoff above has been read. For an
     // isolated run the `spawn_file` lives inside the worktree, so removing it
     // earlier made the manifest unreadable and silently dropped `spawn` tasks.
+    //
+    // This block is outside the `if finished` arm above on purpose: a run that
+    // was cancelled out from under the executor (`!finished`, e.g. the daemon
+    // killed the row or a `tasks.cancel` landed) still reaches it and cleans up,
+    // so a cancellation cannot strand the branch or worktree.
     if let Some(wt) = &plan.worktree {
         if config.executor.keep_worktree {
             tracing::info!(path = %wt.path.display(), "worktree kept");
@@ -1553,6 +1559,11 @@ pub struct WorktreePruneStats {
     pub removed: usize,
     pub orphans: usize,
     pub repos_pruned: usize,
+    /// `favetto/*` branches reclaimed by the git-native sweep (including
+    /// rowless leftovers the tracked retention pass cannot see).
+    pub branches_removed: usize,
+    /// Linked worktrees under the worktree root reclaimed by the sweep.
+    pub untracked_worktrees_removed: usize,
 }
 
 struct Worktree {
@@ -1561,15 +1572,28 @@ struct Worktree {
     branch: String,
 }
 
+/// What one repo's git-native [`sweep_repo`] pass reclaimed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SweepStats {
+    branches_removed: usize,
+    worktrees_removed: usize,
+}
+
 /// Choose the task's working directory: a fresh git worktree when parallel +
 /// `worktree` and the base dir is inside a repository, otherwise the base dir.
+///
+/// `worktree_enabled` is the task's [`TaskDef::worktree`] opt-out resolved
+/// against the global default (`None`/`true` inherit it). A `false` task always
+/// runs in `base` with `needs_lock = true`, so read-only runs never create a
+/// `favetto/*` branch or linked worktree.
 async fn make_plan(
     state: &State,
     cfg: &ExecutorSettings,
     base: &Path,
     task: &Task,
+    worktree_enabled: bool,
 ) -> anyhow::Result<Plan> {
-    if cfg.parallel && cfg.worktree {
+    if worktree_enabled && cfg.parallel && cfg.worktree {
         if let Some(repo) = git_toplevel(base).await {
             let path = worktree_path(state, cfg, &repo, task);
             let branch = branch_name(task);
@@ -1614,7 +1638,7 @@ pub async fn resume_cwd(state: &State, task_id: Uuid) -> Option<PathBuf> {
     let def = lookup_def(state, &task.name)?;
     let cfg = state.config.executor.clone();
     let base = resolve_base_dir(&def, &task);
-    match make_plan(state, &cfg, &base, &task).await {
+    match make_plan(state, &cfg, &base, &task, def.worktree.unwrap_or(true)).await {
         Ok(plan) => Some(plan.cwd),
         Err(e) => {
             tracing::warn!(
@@ -1657,6 +1681,21 @@ fn branch_name(task: &Task) -> String {
     slug.truncate(40);
     let short = task.id.to_string();
     format!("favetto/{slug}-{}", &short[..8])
+}
+
+/// The first 8 hex of a task id, exactly the suffix [`branch_name`] appends.
+fn task_id_prefix(task_id: Uuid) -> String {
+    task_id.to_string()[..8].to_string()
+}
+
+/// The 8-hex task-id suffix of a `favetto/<slug>-<8hex>` branch name.
+///
+/// This is the inverse of [`branch_name`]; keep the two in sync if the scheme
+/// changes. Returns `None` for a branch that does not carry the suffix.
+fn branch_suffix(branch: &str) -> Option<&str> {
+    let rest = branch.strip_prefix("favetto/")?;
+    let (_, suffix) = rest.rsplit_once('-')?;
+    (suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_hexdigit())).then_some(suffix)
 }
 
 fn worktree_path(state: &State, cfg: &ExecutorSettings, repo: &Path, task: &Task) -> PathBuf {
@@ -1703,24 +1742,60 @@ async fn create_worktree(repo: &Path, path: &Path, branch: &str) -> anyhow::Resu
     Ok(())
 }
 
+/// Delete `branch` with `git branch -D`, returning whether git accepted it.
+///
+/// The `--` separator keeps a branch name from ever being parsed as an option.
+async fn delete_branch(repo: &Path, branch: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["branch", "-D", "--", branch])
+        .output()
+        .await
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// `git worktree prune`: clear registrations whose directory has vanished.
+async fn prune_repo(repo: &Path) {
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "prune"])
+        .output()
+        .await;
+}
+
+/// Remove a task's worktree directory and branch, and drop its tracking row.
+///
+/// A worktree directory cleaned up out-of-band leaves git's *registration* in
+/// place, which pins the branch as "checked out" and makes `git branch -D`
+/// fail. Prune the stale registration before deleting the branch, and retry
+/// once after another prune, so a tracked removal can never leak the branch.
 async fn remove_worktree(pool: &SqlitePool, task_id: Uuid, repo: &Path, path: &Path, branch: &str) {
-    let out = Command::new("git")
+    if let Err(e) = Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(["worktree", "remove", "--force"])
         .arg(path)
         .output()
-        .await;
-    if let Err(e) = out {
+        .await
+    {
         tracing::warn!(error = %e, path = %path.display(), "failed to remove worktree");
     }
-    // Drop the per-task branch as well (the task opted out of keeping work).
-    let _ = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["branch", "-D", branch])
-        .output()
-        .await;
+    prune_repo(repo).await;
+    if !delete_branch(repo, branch).await {
+        // A surviving registration elsewhere can still pin the branch; prune
+        // once more and retry before giving up.
+        prune_repo(repo).await;
+        if !delete_branch(repo, branch).await {
+            tracing::warn!(
+                branch,
+                repo = %repo.display(),
+                "failed to delete worktree branch after pruning"
+            );
+        }
+    }
     let _ = db::forget_worktree(pool, task_id).await;
 }
 
@@ -1786,8 +1861,139 @@ fn select_prunable(
     selected
 }
 
+/// Reclaim `favetto/*` branches and linked worktrees under `worktree_root`
+/// whose owning task is known-terminal or unknown.
+///
+/// A branch/worktree is kept when its 8-hex task-id prefix is in
+/// `active_prefixes` (a pending/running/awaiting task), when a live interactive
+/// session still runs in it, or when `tracked_branches` still has a `worktrees`
+/// row (a `keep_worktree`/age-retained worktree owned by the row-based pass).
+///
+/// Unlike the row-based retention pass this sees leftovers that never got a
+/// `worktrees` row: a failed record write, a row dropped after a failed branch
+/// delete, or a branch created by an older favetto.
+async fn sweep_repo(
+    state: &State,
+    repo: &Path,
+    worktree_root: &Path,
+    active_prefixes: &HashSet<String>,
+    tracked_branches: &HashSet<String>,
+) -> SweepStats {
+    let mut stats = SweepStats::default();
+
+    // Clear stale registrations first: a vanished directory otherwise keeps the
+    // branch pinned as "checked out" and `git branch -D` refuses it.
+    prune_repo(repo).await;
+
+    let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .await
+    else {
+        return stats;
+    };
+    if !out.status.success() {
+        return stats;
+    }
+    let listing = String::from_utf8_lossy(&out.stdout).into_owned();
+
+    // Parse `worktree <path>` / `branch refs/heads/<name>` blocks.
+    let mut entries: Vec<(PathBuf, Option<String>)> = Vec::new();
+    for line in listing.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            entries.push((PathBuf::from(path), None));
+        } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+            if let Some(last) = entries.last_mut() {
+                last.1 = Some(branch.to_string());
+            }
+        }
+    }
+
+    // A branch checked out by any surviving worktree is off limits, so a sweep
+    // can never yank a live session's checkout.
+    let linked_branches: HashSet<&str> = entries
+        .iter()
+        .filter_map(|(_, branch)| branch.as_deref())
+        .collect();
+
+    let mut handled: HashSet<String> = HashSet::new();
+    for (path, branch) in &entries {
+        let Some(branch) = branch else { continue };
+        if !branch.starts_with("favetto/") || !path.starts_with(worktree_root) {
+            continue;
+        }
+        if tracked_branches.contains(branch) {
+            continue;
+        }
+        // The directory basename is the full task id; prefer it for the live
+        // session check and the `worktrees` row lookup.
+        let task_id = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|s| Uuid::parse_str(s).ok());
+        let suffix_active = branch_suffix(branch).is_some_and(|p| active_prefixes.contains(p));
+        let dir_active = task_id
+            .map(task_id_prefix)
+            .is_some_and(|p| active_prefixes.contains(&p));
+        let live = task_id
+            .map(|id| state.agents.has_live_interactive(&id.to_string()))
+            .unwrap_or(false);
+        if suffix_active || dir_active || live {
+            handled.insert(branch.clone());
+            continue;
+        }
+        remove_worktree(
+            &state.db,
+            task_id.unwrap_or(Uuid::nil()),
+            repo,
+            path,
+            branch,
+        )
+        .await;
+        handled.insert(branch.clone());
+        stats.worktrees_removed += 1;
+        stats.branches_removed += 1;
+    }
+
+    // Reclaim bare `favetto/*` branches with no linked worktree. A branch whose
+    // owner is active, still checked out, or still tracked by a row is kept.
+    let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["branch", "--list", "--format=%(refname:short)", "favetto/*"])
+        .output()
+        .await
+    else {
+        return stats;
+    };
+    if !out.status.success() {
+        return stats;
+    }
+    let branch_list = String::from_utf8_lossy(&out.stdout).into_owned();
+    for branch in branch_list.lines().map(str::trim).filter(|b| !b.is_empty()) {
+        if handled.contains(branch)
+            || linked_branches.contains(branch)
+            || tracked_branches.contains(branch)
+        {
+            continue;
+        }
+        if branch_suffix(branch).is_some_and(|p| active_prefixes.contains(p)) {
+            continue;
+        }
+        if delete_branch(repo, branch).await {
+            stats.branches_removed += 1;
+        }
+    }
+
+    stats
+}
+
 /// Remove tracked worktrees the retention policy has expired, drop their
-/// branches, and `git worktree prune` each repo. Never fatal.
+/// branches, and `git worktree prune` each repo. Then run a git-native sweep
+/// that also reclaims `favetto/*` branches and linked worktrees with no
+/// tracking row. Never fatal.
 pub async fn prune_worktrees(state: &State) -> anyhow::Result<WorktreePruneStats> {
     let cfg = state.config.executor.clone();
     let retention = cfg.worktree_retention.clone();
@@ -1796,8 +2002,9 @@ pub async fn prune_worktrees(state: &State) -> anyhow::Result<WorktreePruneStats
     // A worktree whose task still has a live interactive Agent-panel session
     // attached must not be reclaimed: that session runs inside it.
     let records: Vec<db::WorktreeRecord> = all_records
-        .into_iter()
+        .iter()
         .filter(|r| !state.agents.has_live_interactive(&r.task_id.to_string()))
+        .cloned()
         .collect();
 
     let mut tasks = HashMap::new();
@@ -1829,15 +2036,52 @@ pub async fn prune_worktrees(state: &State) -> anyhow::Result<WorktreePruneStats
         }
         stats.removed += 1;
     }
-    for repo in repos {
+    for repo in &repos {
         stats.repos_pruned += 1;
-        let _ = Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(["worktree", "prune"])
-            .output()
-            .await;
+        prune_repo(repo).await;
     }
+
+    // Git-native sweep. Re-read the rows after the tracked pass: a branch whose
+    // delete just failed lost its row, so the sweep must see it and retry.
+    let tracked_branches: HashSet<String> = db::list_worktrees(&state.db)
+        .await?
+        .into_iter()
+        .map(|r| r.branch)
+        .collect();
+
+    // Never touch a task that is still pending, running, or awaiting input.
+    let mut active_prefixes: HashSet<String> = HashSet::new();
+    for task in db::list_active_tasks(&state.db).await? {
+        active_prefixes.insert(task_id_prefix(task.id));
+    }
+    for task in db::list_pending_tasks(&state.db).await? {
+        active_prefixes.insert(task_id_prefix(task.id));
+    }
+
+    // Sweep every repo favetto may have created a worktree in: the tracked ones,
+    // plus the resolved base dir of each task row, so a repo whose rows are gone
+    // is still reclaimed.
+    let mut sweep_repos: Vec<PathBuf> = all_records.iter().map(|r| r.repo.clone()).collect();
+    let mut bases: HashSet<PathBuf> = HashSet::new();
+    for task in db::list_tasks(&state.db, i64::MAX).await? {
+        if let Some(def) = lookup_def(state, &task.name) {
+            bases.insert(resolve_base_dir(&def, &task));
+        }
+    }
+    for base in bases {
+        if let Some(repo) = git_toplevel(&base).await {
+            sweep_repos.push(repo);
+        }
+    }
+    sweep_repos.sort();
+    sweep_repos.dedup();
+    for repo in sweep_repos {
+        let root = worktree_root(&cfg, &state.data_dir, &repo);
+        let sweep = sweep_repo(state, &repo, &root, &active_prefixes, &tracked_branches).await;
+        stats.branches_removed += sweep.branches_removed;
+        stats.untracked_worktrees_removed += sweep.worktrees_removed;
+    }
+
     Ok(stats)
 }
 

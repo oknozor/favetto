@@ -873,6 +873,7 @@ mod tests {
             spawn_file: None,
             spawn_new_root: false,
             sign: None,
+            worktree: None,
             vars: Vec::new(),
             prompt: String::new(),
         }]

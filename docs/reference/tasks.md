@@ -38,6 +38,7 @@ examples.
 | `spawn_file` | string | no | Path of the JSON handoff file consumed by `spawn`. Rendered as a template at run time; read as a JSON array, one child per element. |
 | `spawn_new_root` | bool | no | When true, each `spawn` child is enqueued as **its own workflow root** instead of a descendant of this task. Lets a pipeline restart itself so the child's own fan-in is not deduped against the root that already fired it. Requires `spawn`; default `false`. |
 | `sign` | `"off"` \| `"ssh"` \| `"gpg"` | no | Per-task override of the `[git] signing` mode. Most specific level: task → `[agents.<name>.git]` → `[git]`. |
+| `worktree` | bool | no | Per-task opt-out of `[executor].worktree` isolation. `false` runs the task directly in its base directory, serialized per directory, and never creates a `favetto/*` branch or linked worktree — set it on read-only tasks (triage, review, planning). `true`/absent inherit the global setting. |
 | `[[vars]]` | array of tables | no | Manual input variables; see below. |
 
 An unknown or invalid key makes the whole file fail to parse, and the running
