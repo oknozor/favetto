@@ -30,6 +30,7 @@ fn def_with_vars() -> TaskDef {
         spawn_file: None,
         spawn_new_root: false,
         sign: None,
+        worktree: None,
         vars: vec![var("required_one", true), var("optional_one", false)],
         prompt: "hello".to_string(),
     }
@@ -2471,6 +2472,311 @@ async fn join_state_with_config(
 /// A `State` whose live catalog is `catalog`, with no usable agent.
 async fn join_state(dir: &Path, catalog: Vec<TaskDef>) -> Arc<State> {
     join_state_with_config(dir, catalog, FavettoConfig::default()).await
+}
+
+/// A scratch directory for a git-backed executor test (not created).
+fn scratch_dir(tag: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("favetto-{tag}-{}", Uuid::new_v4()))
+}
+
+/// Run `git -C <repo> <args>`, panicking on a non-zero exit.
+async fn git_run(repo: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Initialize a real git repository at `repo` with one unsigned commit.
+async fn init_git_repo(repo: &Path) {
+    std::fs::create_dir_all(repo).unwrap();
+    git_run(repo, &["init", "-q"]).await;
+    git_run(repo, &["config", "user.email", "t@example.com"]).await;
+    git_run(repo, &["config", "user.name", "t"]).await;
+    std::fs::write(repo.join("README.md"), "seed").unwrap();
+    git_run(repo, &["add", "-A"]).await;
+    git_run(
+        repo,
+        &["-c", "commit.gpgsign=false", "commit", "-qm", "init"],
+    )
+    .await;
+}
+
+/// Every local branch in `repo`, short-named.
+async fn git_branches(repo: &Path) -> Vec<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["branch", "--list", "--format=%(refname:short)"])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git branch --list: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// A catalog task definition whose `cwd` is `repo`.
+fn repo_def(name: &str, repo: &Path, extra: &str) -> TaskDef {
+    crate::tasks::parse_task_md(
+        name,
+        &format!(
+            "agent = \"x\"\ncwd = {:?}\n{extra}---\nbody\n",
+            repo.to_string_lossy()
+        ),
+    )
+    .unwrap()
+}
+
+/// The 8-hex suffix parser is the inverse of `branch_name`; keep it honest.
+#[test]
+fn parses_task_id_suffix_from_branch_name() {
+    let task = lineage_task("pipelines/plan", TaskStatus::Pending, None, None);
+    let short = task.id.to_string();
+    assert_eq!(
+        branch_suffix(&branch_name(&task)).map(str::to_string),
+        Some(short[..8].to_string())
+    );
+    assert_eq!(branch_suffix("favetto/foo-deadbeef"), Some("deadbeef"));
+    assert_eq!(branch_suffix("favetto/a-b-c-12345678"), Some("12345678"));
+    assert_eq!(branch_suffix("main"), None);
+    assert_eq!(branch_suffix("favetto/no-suffix"), None);
+    assert_eq!(branch_suffix("favetto/foo-nothex!"), None);
+    assert_eq!(branch_suffix("other/foo-deadbeef"), None);
+}
+
+/// Regression for #206: a linked worktree directory removed out-of-band leaves
+/// git's registration behind, which used to make `git branch -D` fail and pin
+/// the branch forever. `remove_worktree` prunes first, so the branch still goes.
+#[tokio::test]
+async fn remove_worktree_deletes_branch_after_directory_vanished() {
+    let dir = scratch_dir("rm-vanished");
+    let repo = dir.join("repo");
+    init_git_repo(&repo).await;
+    let state = join_state(&dir, Vec::new()).await;
+
+    let task = lineage_task("review", TaskStatus::Succeeded, None, None);
+    let branch = branch_name(&task);
+    let worktree = dir.join("worktrees").join(task.id.to_string());
+    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    let wt = worktree.to_string_lossy().into_owned();
+    git_run(&repo, &["worktree", "add", "--force", "-B", &branch, &wt]).await;
+    assert!(git_branches(&repo).await.contains(&branch));
+
+    // Out-of-band cleanup: the directory is gone but git still has the row.
+    std::fs::remove_dir_all(&worktree).unwrap();
+
+    remove_worktree(&state.db, task.id, &repo, &worktree, &branch).await;
+
+    let branches = git_branches(&repo).await;
+    assert!(
+        !branches.contains(&branch),
+        "branch leaked after its worktree directory vanished: {branches:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Regression for #206: a `favetto/*` branch with no `worktrees` row (the
+/// leaked backlog) is invisible to the row-based pass and must be reclaimed by
+/// the git-native sweep.
+#[tokio::test]
+async fn prune_worktrees_reclaims_untracked_favetto_branch() {
+    let dir = scratch_dir("sweep-untracked");
+    let repo = dir.join("repo");
+    init_git_repo(&repo).await;
+    let state = join_state(&dir, vec![repo_def("review", &repo, "")]).await;
+
+    let task = lineage_task("review", TaskStatus::Succeeded, None, None);
+    db::insert_task(&state.db, &task).await.unwrap();
+    let branch = branch_name(&task);
+    git_run(&repo, &["branch", &branch]).await;
+    assert!(git_branches(&repo).await.contains(&branch));
+
+    let stats = prune_worktrees(&state).await.unwrap();
+    assert!(stats.branches_removed >= 1, "stats: {stats:?}");
+    let branches = git_branches(&repo).await;
+    assert!(
+        !branches.contains(&branch),
+        "untracked favetto branch leaked: {branches:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The sweep must never touch a branch owned by a pending/running task.
+#[tokio::test]
+async fn prune_worktrees_keeps_active_task_branch() {
+    let dir = scratch_dir("sweep-active");
+    let repo = dir.join("repo");
+    init_git_repo(&repo).await;
+    let state = join_state(&dir, vec![repo_def("review", &repo, "")]).await;
+
+    let pending = lineage_task("review", TaskStatus::Pending, None, None);
+    let running = lineage_task("review", TaskStatus::Running, None, None);
+    db::insert_task(&state.db, &pending).await.unwrap();
+    db::insert_task(&state.db, &running).await.unwrap();
+    let pending_branch = branch_name(&pending);
+    let running_branch = branch_name(&running);
+    git_run(&repo, &["branch", &pending_branch]).await;
+    git_run(&repo, &["branch", &running_branch]).await;
+
+    prune_worktrees(&state).await.unwrap();
+
+    let branches = git_branches(&repo).await;
+    assert!(
+        branches.contains(&pending_branch),
+        "pending task branch was reclaimed: {branches:?}"
+    );
+    assert!(
+        branches.contains(&running_branch),
+        "running task branch was reclaimed: {branches:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Regression for #206: a headless review-style run must not leak its
+/// `favetto/*` branch or linked worktree after it finishes.
+#[cfg(unix)]
+#[tokio::test]
+async fn review_run_does_not_leak_a_branch() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch_dir("review-run");
+    let repo = dir.join("repo");
+    init_git_repo(&repo).await;
+
+    let script = dir.join("fake-agent.sh");
+    std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let mut cfg = FavettoConfig::default();
+    cfg.agent.default = Some("opencode".to_string());
+    cfg.agents.insert(
+        "opencode".to_string(),
+        crate::config::AgentConfig {
+            command: script.to_string_lossy().into_owned(),
+            ..Default::default()
+        },
+    );
+    cfg.executor.parallel = true;
+
+    let def = crate::tasks::parse_task_md(
+        "review",
+        &format!(
+            "agent = \"opencode\"\ncwd = {:?}\n---\nReview.\n",
+            repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let state = join_state_with_config(&dir, vec![def.clone()], cfg).await;
+
+    let task = lineage_task("review", TaskStatus::Running, None, None);
+    db::insert_task(&state.db, &task).await.unwrap();
+    let plan = make_plan(
+        &state,
+        &state.config.executor,
+        &repo,
+        &task,
+        def.worktree.unwrap_or(true),
+    )
+    .await
+    .unwrap();
+    assert!(plan.worktree.is_some(), "expected an isolated run");
+
+    let run = running_run(task.id);
+    db::insert_task_run(&state.db, &run).await.unwrap();
+    run_one(&state, task.clone(), run, def, plan, None).await;
+
+    let branches = git_branches(&repo).await;
+    assert!(
+        branches.iter().all(|b| !b.starts_with("favetto/")),
+        "a finished review run leaked a branch: {branches:?}"
+    );
+    let worktree = dir.join("worktrees").join(task.id.to_string());
+    assert!(
+        !worktree.exists(),
+        "a finished review run leaked its worktree"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Regression for #206: a task killed/cancelled with a linked worktree and no
+/// tracking row is reclaimed on the next sweep.
+#[tokio::test]
+async fn cancelled_task_leaves_no_branch_or_worktree() {
+    let dir = scratch_dir("sweep-cancelled");
+    let repo = dir.join("repo");
+    init_git_repo(&repo).await;
+    let state = join_state(&dir, vec![repo_def("triage", &repo, "")]).await;
+
+    let task = lineage_task("triage", TaskStatus::Cancelled, None, None);
+    db::insert_task(&state.db, &task).await.unwrap();
+    let branch = branch_name(&task);
+    let worktree = dir.join("worktrees").join(task.id.to_string());
+    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    let wt = worktree.to_string_lossy().into_owned();
+    git_run(&repo, &["worktree", "add", "--force", "-B", &branch, &wt]).await;
+
+    let stats = prune_worktrees(&state).await.unwrap();
+    assert!(stats.untracked_worktrees_removed >= 1, "stats: {stats:?}");
+    assert!(!worktree.exists(), "cancelled task worktree leaked");
+    let branches = git_branches(&repo).await;
+    assert!(
+        !branches.contains(&branch),
+        "cancelled task branch leaked: {branches:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A per-task `worktree = false` opt-out runs read-only tasks in the base dir
+/// (serialized) and never creates a branch.
+#[tokio::test]
+async fn worktree_false_task_runs_in_base_dir_without_branch() {
+    let dir = scratch_dir("worktree-false");
+    let repo = dir.join("repo");
+    init_git_repo(&repo).await;
+    let def = repo_def("review", &repo, "worktree = false\n");
+    let mut cfg = FavettoConfig::default();
+    cfg.executor.parallel = true;
+    let state = join_state_with_config(&dir, vec![def.clone()], cfg).await;
+
+    let task = lineage_task("review", TaskStatus::Pending, None, None);
+    let plan = make_plan(
+        &state,
+        &state.config.executor,
+        &repo,
+        &task,
+        def.worktree.unwrap_or(true),
+    )
+    .await
+    .unwrap();
+
+    assert!(plan.worktree.is_none(), "worktree = false must opt out");
+    assert_eq!(plan.cwd, repo);
+    assert!(plan.needs_lock);
+    assert!(
+        git_branches(&repo)
+            .await
+            .iter()
+            .all(|b| !b.starts_with("favetto/")),
+        "worktree = false created a branch"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Regression for issue #91: resuming an agent session must run in the run's

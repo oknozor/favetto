@@ -1607,6 +1607,7 @@ async fn add_catalog_task(
         spawn_file,
         spawn_new_root,
         sign: None,
+        worktree: None,
         vars: Vec::new(),
         prompt,
     };

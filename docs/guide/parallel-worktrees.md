@@ -27,6 +27,10 @@ What the modes do:
   step on each other. By default the worktree and its branch are removed when the
   task finishes; set `keep_worktree = true` to inspect the agent's branch and
   changes afterwards.
+- **Task with `worktree = false`** → runs directly in its base directory and
+  never creates a branch or linked worktree. Same-directory tasks are serialized
+  (one at a time). Use it for read-only tasks that never commit — triage, review,
+  planning — so a parallel run cannot leave a per-run branch behind.
 - **Parallel + not a repository** → tasks that share a working directory are
   serialized (one at a time); tasks in different directories still run
   concurrently.
@@ -35,6 +39,18 @@ What the modes do:
 `worktree` is ignored unless `parallel = true`. The effective working directory,
 most specific first, is `input.cwd` → task `cwd` → the agent's `cwd` → the
 daemon's working directory.
+
+## Cleanup
+
+Teardown is self-bounding, including after a run is killed or cancelled:
+
+- Removing a worktree first prunes git's stale registration, so a worktree
+  directory cleaned up out-of-band can never pin its branch and leak it.
+- At startup and every six hours the retention sweep also reclaims `favetto/*`
+  branches and linked worktrees that have **no** tracking row — the leftovers an
+  older favetto or a failed record write left behind. A branch whose task is
+  still `pending`/`running`/`awaiting_input`, a live interactive session's
+  worktree, and anything kept by `keep_worktree` are never touched.
 
 `worktree_dir` expands a leading `~` to your home directory; an absolute path is
 used as-is and a non-`~` relative path is resolved against the repo root.

@@ -138,6 +138,11 @@ pub struct TaskDef {
     pub spawn_new_root: bool,
     /// Optional per-task override of the `[git] signing` mode for this run.
     pub sign: Option<GitSigning>,
+    /// Optional per-task override of `[executor].worktree` isolation. When
+    /// `false`, the task runs directly in its base directory (serialized per
+    /// directory) and never creates a `favetto/*` branch or linked worktree.
+    /// `None`/`true` inherits the global setting.
+    pub worktree: Option<bool>,
     /// Manual input variables declared with `[[vars]]`; the TUI prompts for these
     /// before starting the task, and the executor enforces `required` ones.
     pub vars: Vec<TaskVar>,
@@ -167,6 +172,8 @@ struct Header {
     spawn_new_root: bool,
     #[serde(default)]
     sign: Option<GitSigning>,
+    #[serde(default)]
+    worktree: Option<bool>,
     #[serde(default)]
     vars: Vec<TaskVar>,
 }
@@ -305,6 +312,7 @@ pub fn parse_task_md(name: &str, content: &str) -> anyhow::Result<TaskDef> {
         spawn_file: header.spawn_file,
         spawn_new_root: header.spawn_new_root,
         sign: header.sign,
+        worktree: header.worktree,
         vars: header.vars,
         prompt: prompt.trim().to_string(),
     })
@@ -347,6 +355,11 @@ pub fn to_markdown(def: &TaskDef) -> String {
             GitSigning::Ssh => "ssh",
         };
         out.push_str(&format!("sign = {sign:?}\n"));
+    }
+    // Only the `false` opt-out is meaningful to persist: `true`/absent inherit
+    // the global `[executor].worktree`.
+    if def.worktree == Some(false) {
+        out.push_str("worktree = false\n");
     }
     // Array-of-tables must come after every scalar key, so `[[vars]]` is emitted
     // last in the header.
@@ -560,6 +573,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_task_worktree_header() {
+        // Explicit opt-out parses and is the only value serialized.
+        let def = parse_task_md("t", "worktree = false\n---\nbody\n").unwrap();
+        assert_eq!(def.worktree, Some(false));
+        let md = to_markdown(&def);
+        assert!(md.contains("worktree = false"), "{md}");
+        assert_eq!(parse_task_md("t", &md).unwrap().worktree, Some(false));
+
+        // `true` parses but is not persisted (it is the inherited default).
+        let def = parse_task_md("t", "worktree = true\n---\nbody\n").unwrap();
+        assert_eq!(def.worktree, Some(true));
+        assert!(!to_markdown(&def).contains("worktree"), "{def:?}");
+
+        // Absent -> None.
+        assert_eq!(
+            parse_task_md("t", "agent = \"x\"\n---\nbody\n")
+                .unwrap()
+                .worktree,
+            None
+        );
+
+        // A non-boolean value fails to parse.
+        assert!(parse_task_md("t", "worktree = \"yes\"\n---\nbody\n").is_err());
+    }
+
+    #[test]
     fn parses_and_round_trips_all_finished_needs() {
         let def = parse_task_md(
             "join",
@@ -669,6 +708,7 @@ mod tests {
             spawn_file: Some(".favetto/{{ input.id }}/manifest.json".to_string()),
             spawn_new_root: true,
             sign: Some(GitSigning::Off),
+            worktree: None,
             vars: vec![
                 TaskVar {
                     name: "issue_description".to_string(),
@@ -931,6 +971,7 @@ mod tests {
             spawn_file: None,
             spawn_new_root: false,
             sign: None,
+            worktree: None,
             vars: Vec::new(),
             prompt: "nested body".to_string(),
         };
@@ -971,6 +1012,7 @@ mod tests {
             spawn_file: None,
             spawn_new_root: false,
             sign: None,
+            worktree: None,
             vars: Vec::new(),
             prompt: String::new(),
         };
