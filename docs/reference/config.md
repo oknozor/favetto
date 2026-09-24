@@ -43,11 +43,15 @@ under that key (e.g. `"sessionID"`) and stored on the task.
 | `env` | Map<String, string> | `{}` | no | Extra environment variables for the process. |
 | `git` | GitSettings (optional) | — | no | Per-agent override of the global `[git]` section. Only the fields set here replace the global values; the rest are inherited. |
 | `headless_args` | string[] (optional) | — | no | Arguments for unattended task runs without a `model`. `{prompt}` is substituted. |
+| `hooks` | boolean (optional) | — | no | claude only: inject favetto's HTTP hooks through a per-launch `--settings` file. Unset keeps the built-in default. |
 | `interactive_model_args` | string[] (optional) | — | no | Interactive arguments used when a model is selected (e.g. for a one-shot session); `{provider}` and `{model}` are substituted. Lets an agent reach a path that accepts a model when its plain `args` do not. |
+| `output_format` | string (optional) | — | no | Structured stdout format for headless runs and final summaries, e.g. `"opencode-json"`, `"claude-stream-json"`, `"pi-json"`, `"pi-rpc"`, `"vibe-streaming"`, or `"plain-jsonl"`. Unset keeps the default `{ "text": raw }` output. A custom (`configurable`) agent only has a parser for `"plain-jsonl"`. |
 | `prompt_args` | string[] (optional) | — | no | Arguments appended to the interactive command when starting with a prompt. |
 | `resume_args` | string[] (optional) | — | no | Interactive arguments for reopening an existing session; `{session_id}` is substituted. |
 | `run_args` | string[] (optional) | — | no | Arguments for unattended task runs with a `model`; `{prompt}`, `{provider}`, and `{model}` are substituted. |
+| `server` | string (optional) | — | no | opencode only: which server to observe. `"managed"` (favetto-owned `serve`), `"background"` (the registered background service), or a URL. |
 | `session_id_json_key` | string (optional) | — | no | Key under which a run's line-delimited JSON output carries the agent's session id (e.g. `"sessionID"`). Unset disables capture. |
+| `state` | AgentStateMode (optional) | — | no | How to observe the agent's live state. Unset (or `auto`) keeps the built-in default for the agent; `none` forces the screen fallback. |
 | `submit_prompt` | boolean (optional) | — | no | After starting interactively with a prompt via `prompt_args`, send Enter to submit it once the agent's UI has settled (some agents, e.g. opencode, only pre-fill the input with `--prompt`). `None` leaves the built-in default in place. |
 | `type` | string (optional) | — | no | Implementation discriminator: `opencode`, `claude`, `pi`, `vibe`, or `configurable`. Omit to use the built-in whose name matches the entry (or the template-only fallback for a custom name). |
 
@@ -56,6 +60,20 @@ under that key (e.g. `"sessionID"`) and stored on the task.
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
 | `default` | string (optional) | — | no | Name of the default external agent (a key in `[agents.*]`). When set, catalog tasks run through this agent unless a task names its own. |
+
+## AgentStateMode
+
+How an agent's live state is observed (see
+`docs/design/agent-state-adapters.md`).
+
+`auto` keeps the built-in default for the agent; `none` disables structured
+observation entirely (the debounced screen heuristic still runs); `stdout`
+parses the CLI's line-delimited JSON output; `server` observes a long-lived
+HTTP/SSE endpoint (opencode); `hooks` observes via per-launch HTTP hooks
+(claude). A custom agent has no built-in transport, so anything but `auto`
+is purely declarative for it.
+
+string
 
 ## DaemonSettings
 

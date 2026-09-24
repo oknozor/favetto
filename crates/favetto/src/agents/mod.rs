@@ -40,6 +40,7 @@ mod configurable;
 mod detect;
 mod opencode;
 mod pi;
+mod plain_jsonl;
 mod registry;
 mod state;
 #[cfg(test)]
