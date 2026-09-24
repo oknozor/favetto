@@ -101,8 +101,9 @@ pub async fn ws_handler(
     ws: WebSocketUpgrade,
 ) -> Response {
     // A present bearer wins: a valid token must not burn a ticket that was
-    // passed alongside it.
-    let authorized = if crate::ticket::bearer_authorized(&state.token, &headers) {
+    // passed alongside it. `server::bearer_authorized` is the single source of
+    // truth shared with the SSE handler.
+    let authorized = if crate::server::bearer_authorized(&headers, &state.token) {
         true
     } else if let Some(ticket) = query.ticket.as_deref() {
         state.tickets.redeem(ticket).await

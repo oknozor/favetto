@@ -2467,12 +2467,14 @@ async fn handle_request_rejects_malformed_special_params() {
     let state = test_state(&dir, &tasks_dir).await;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(4);
     let subscribed: Attached = Arc::new(Mutex::new(HashSet::new()));
+    let live_task: LiveTask = Arc::new(Mutex::new(None));
 
     for (id, method) in [(1u64, method::AGENTS_ATTACH), (2u64, method::AGENTS_CLOSE)] {
         handle_request(
             &state,
             &tx,
             &subscribed,
+            &live_task,
             Request {
                 id,
                 method: method.to_string(),
@@ -3115,6 +3117,290 @@ async fn http_rpc_rejects_a_body_over_the_frame_limit() {
 
     let (status, _, _) = post_rpc(app, vec![0u8; 2048], Some(state.token.as_str())).await;
     assert_eq!(status, axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+// ---------------------------------------------------------------------------
+// SSE: `GET /events` and the shared `EventBus::resumable` helper
+// ---------------------------------------------------------------------------
+
+/// `Authorization: Bearer <token>` for `state`'s token.
+fn auth_header(state: &State) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_str(&format!("Bearer {}", state.token.as_str()))
+            .expect("valid bearer header"),
+    );
+    headers
+}
+
+/// Collect SSE text until the body goes idle for 150 ms. Used for streams that
+/// replay a finite set of events and then fall silent.
+async fn drain_sse(body: axum::body::Body) -> String {
+    let mut stream = body.into_data_stream();
+    let mut text = String::new();
+    while let Ok(Some(Ok(chunk))) =
+        tokio::time::timeout(std::time::Duration::from_millis(150), stream.next()).await
+    {
+        text.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    text
+}
+
+/// Read exactly one SSE chunk, failing if none arrives within a second.
+async fn first_sse_chunk(body: axum::body::Body) -> String {
+    let mut stream = body.into_data_stream();
+    match tokio::time::timeout(std::time::Duration::from_secs(1), stream.next()).await {
+        Ok(Some(Ok(chunk))) => String::from_utf8_lossy(&chunk).into_owned(),
+        other => panic!("expected an SSE chunk, got {other:?}"),
+    }
+}
+
+/// The `id:` of every `event:` frame, in order. `task.updated` / `catalog.updated`
+/// frames carry no `id:` and are ignored by construction.
+fn replayed_event_ids(text: &str) -> Vec<i64> {
+    text.split("\n\n")
+        .filter(|frame| frame.lines().any(|l| l.trim() == "event: event"))
+        .filter_map(|frame| {
+            frame
+                .lines()
+                .find_map(|l| l.strip_prefix("id: "))
+                .and_then(|id| id.trim().parse::<i64>().ok())
+        })
+        .collect()
+}
+
+/// Call the handler with the given resume inputs and drain the replay.
+async fn sse_replay_text(state: &Arc<State>, headers: HeaderMap, query: EventsQuery) -> String {
+    let resp = events_handler(AxumState(state.clone()), headers, Query(query)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    drain_sse(resp.into_body()).await
+}
+
+#[tokio::test]
+async fn sse_started_task_emits_id_event_and_data() {
+    let dir = temp_dir("sse-start");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    std::fs::write(tasks_dir.join("issue.md"), "agent = \"x\"\n---\nprompt\n").unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+
+    let resp = events_handler(
+        AxumState(state.clone()),
+        auth_header(&state),
+        Query(EventsQuery::default()),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let body = resp.into_body();
+
+    // Starting a catalog task publishes `task.updated` then emits a durable
+    // `TaskIdle` event on the same bus.
+    let started = dispatch(
+        &state,
+        Request {
+            id: 1,
+            method: method::TASKS_START.to_string(),
+            params: serde_json::json!({ "name": "issue" }),
+        },
+    )
+    .await;
+    assert!(started.error.is_none(), "{:?}", started.error);
+
+    let text = drain_sse(body).await;
+    let mut saw_event = false;
+    let mut saw_task_updated = false;
+    for frame in text.split("\n\n") {
+        if frame.lines().any(|l| l.trim() == "event: event") {
+            saw_event = true;
+            assert!(
+                frame.lines().any(|l| l.starts_with("id: ")),
+                "an event frame must carry id: {frame}"
+            );
+            assert!(
+                frame.contains("data: "),
+                "an event frame must carry data: {frame}"
+            );
+        }
+        if frame.lines().any(|l| l.trim() == "event: task.updated") {
+            saw_task_updated = true;
+            assert!(
+                !frame.lines().any(|l| l.starts_with("id: ")),
+                "task.updated must not advance the cursor: {frame}"
+            );
+        }
+    }
+    assert!(saw_event, "no `event:` frame arrived: {text}");
+    assert!(saw_task_updated, "no `task.updated` frame arrived: {text}");
+    assert!(text.contains("\"kind\":\"task_idle\""), "{text}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn sse_replays_from_header_and_query() {
+    let dir = temp_dir("sse-replay");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+
+    for _ in 0..3 {
+        state
+            .emit_event(EventKind::TaskIdle, serde_json::json!({}))
+            .await;
+    }
+
+    // `Last-Event-ID: 1` replays exactly {2, 3}.
+    let mut headers = auth_header(&state);
+    headers.insert("last-event-id", axum::http::HeaderValue::from_static("1"));
+    let text = sse_replay_text(&state, headers, EventsQuery::default()).await;
+    assert_eq!(replayed_event_ids(&text), vec![2, 3], "{text}");
+
+    // `?last_event_id=2` replays exactly {3}.
+    let text = sse_replay_text(
+        &state,
+        auth_header(&state),
+        EventsQuery {
+            last_event_id: Some(2),
+        },
+    )
+    .await;
+    assert_eq!(replayed_event_ids(&text), vec![3], "{text}");
+
+    // The header wins over the query: 1 -> {2, 3}, not {3}.
+    let mut headers = auth_header(&state);
+    headers.insert("last-event-id", axum::http::HeaderValue::from_static("1"));
+    let text = sse_replay_text(
+        &state,
+        headers,
+        EventsQuery {
+            last_event_id: Some(2),
+        },
+    )
+    .await;
+    assert_eq!(replayed_event_ids(&text), vec![2, 3], "{text}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn sse_keep_alive_is_a_comment() {
+    // A live sender with no pushes: only the keep-alive can arrive.
+    let (_tx, rx) = mpsc::channel::<ServerPush>(4);
+    let resp = sse_response(rx, std::time::Duration::from_millis(10));
+    let chunk = first_sse_chunk(resp.into_body()).await;
+    assert!(chunk.contains(": keep-alive"), "{chunk}");
+}
+
+#[tokio::test]
+async fn events_subscribe_uses_the_shared_helper() {
+    let dir = temp_dir("events-subscribe-shared");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+    state
+        .emit_event(EventKind::TaskIdle, serde_json::json!({ "n": 1 }))
+        .await;
+
+    let (tx, mut rx) = mpsc::channel::<Frame>(16);
+    let subscribed: Attached = Arc::new(Mutex::new(HashSet::new()));
+    let live_task: LiveTask = Arc::new(Mutex::new(None));
+
+    let subscribe = |id: u64, cursor: i64| Request {
+        id,
+        method: method::EVENTS_SUBSCRIBE.to_string(),
+        params: serde_json::json!({ "last_event_id": cursor }),
+    };
+
+    // Subscribing from cursor 0 makes the shared helper replay event 1 before
+    // switching to live delivery.
+    handle_request(&state, &tx, &subscribed, &live_task, subscribe(1, 0)).await;
+    assert!(matches!(rx.recv().await.expect("ack"), Frame::Response(_)));
+    match rx.recv().await.expect("a replayed event") {
+        Frame::Notification(n) => {
+            assert_eq!(n.method, push::EVENT);
+            assert_eq!(n.params["id"], 1);
+        }
+        other => panic!("expected a replayed event, got {other:?}"),
+    }
+
+    // A live push after the replay reaches the same connection.
+    state.bus.publish(ServerPush::CatalogUpdated);
+    match rx.recv().await.expect("a live push") {
+        Frame::Notification(n) => assert_eq!(n.method, push::CATALOG_UPDATED),
+        other => panic!("expected a live push, got {other:?}"),
+    }
+
+    // Re-subscribing from the same cursor restarts the pusher rather than adding
+    // a second one: one publish yields exactly one notification.
+    handle_request(&state, &tx, &subscribed, &live_task, subscribe(2, 1)).await;
+    assert!(matches!(
+        rx.recv().await.expect("second ack"),
+        Frame::Response(_)
+    ));
+    state.bus.publish(ServerPush::CatalogUpdated);
+    assert!(matches!(
+        rx.recv().await.expect("one live push"),
+        Frame::Notification(_)
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .is_err(),
+        "a re-subscribe must not leave the previous pusher running"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn events_handler_rejects_missing_or_bad_token() {
+    let dir = temp_dir("sse-auth");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+
+    let resp = events_handler(
+        AxumState(state.clone()),
+        HeaderMap::new(),
+        Query(EventsQuery::default()),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_static("Bearer wrong"),
+    );
+    let resp = events_handler(
+        AxumState(state.clone()),
+        headers,
+        Query(EventsQuery::default()),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = events_handler(
+        AxumState(state.clone()),
+        auth_header(&state),
+        Query(EventsQuery::default()),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

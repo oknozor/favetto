@@ -198,6 +198,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
 
     let app = Router::new()
         .merge(transport::routes())
+        .route("/events", get(crate::server::events_handler))
         .route("/metrics", get(crate::metrics::metrics_handler))
         .merge(crate::webhooks::routes())
         .merge(crate::agent_hooks::routes())
