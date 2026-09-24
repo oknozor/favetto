@@ -186,7 +186,7 @@ fn generated_schema_lists_every_section() {
         .and_then(|v| v.as_object())
         .expect("schema must have top-level properties");
     for section in [
-        "agent", "agents", "daemon", "executor", "git", "webhook", "tui",
+        "agent", "agents", "auth", "daemon", "executor", "git", "webhook", "web", "tui",
     ] {
         assert!(
             properties.contains_key(section),
