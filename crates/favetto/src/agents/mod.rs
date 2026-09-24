@@ -28,7 +28,7 @@ use favetto_core::model::{AgentSessionInfo, AwaitingInputReason};
 
 use crate::config::{FavettoConfig, GitSettings};
 
-use agent::extract_session_id_from_line;
+use agent::{check_arg_sizes, extract_session_id_from_line};
 
 mod agent;
 mod claude;
@@ -288,6 +288,7 @@ impl AgentManager {
         }
 
         let spec = agent.command(&invocation, &ctx)?;
+        check_arg_sizes(&spec.program, &spec.args)?;
         let headless = matches!(&invocation, Invocation::Headless { .. });
 
         let pty_system = native_pty_system();

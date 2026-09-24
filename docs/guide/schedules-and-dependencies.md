@@ -133,6 +133,16 @@ empty fan-out (`[]`) still resolves it. The aggregated results are attached as
 review every child's output and react to `prev.failed`. A fan-in whose target is
 never spawned in a root never fires; only the "spawned zero" case is covered.
 
+::: info Bounded payload
+Because the rendered prompt is passed to the agent as one command-line argument
+and the OS caps a single argument at 128 KiB, large per-run outputs are bounded
+before they are embedded in `_prev`: each `output` is truncated head+tail (the
+tail keeps the run's final summary), a bulky `output.result` duplicate is
+dropped, and the whole `tasks` array is capped. Bounded entries keep their keys
+and set `"truncated": true`. The same bound applies to a single
+`":finished"` dependency's `prev.output`.
+:::
+
 ## Restart a pipeline
 
 A fan-in successor runs **once per workflow root**, so a successor that re-spawns

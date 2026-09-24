@@ -421,6 +421,57 @@ fn truncate_text(s: &str, max: usize) -> (String, bool) {
     )
 }
 
+/// Byte budget for one finished task's `output` when it is embedded in a
+/// dependent's `input._prev`.
+///
+/// The rendered prompt is handed to the agent as a single command-line
+/// argument, and Linux caps one argument at 128 KiB (`MAX_ARG_STRLEN`). When it
+/// is exceeded `execve` fails with `E2BIG`, which the PTY spawner surfaces as an
+/// opaque `fatal runtime error: assertion failed: output.write(&bytes).is_ok()`
+/// abort. Keep the embedded payload well under that limit.
+const PREV_OUTPUT_BYTES: usize = 48 * 1024;
+
+/// Overall byte budget for the `_prev.tasks` array of an `:all_finished` fan-in,
+/// so N runs cannot multiply a full-size output into an oversized prompt.
+const PREV_TASKS_BYTES: usize = 64 * 1024;
+
+/// Smallest meaningful per-task slice of [`PREV_TASKS_BYTES`].
+const MIN_PREV_OUTPUT_BYTES: usize = 512;
+
+/// Bound a finished task's stored `output` (or `input`) before embedding it as
+/// `_prev`. A payload at or under `cap` is returned verbatim. A larger one keeps
+/// its object shape but truncates the bulky `output` field head+tail (the tail
+/// usually carries the agent's final summary) and drops the parsed `result`
+/// duplicate, flagging `truncated`. An unknown shape falls back to a bounded
+/// JSON string so the prompt can never exceed the argument limit.
+fn bounded_prev_value(value: Option<&serde_json::Value>, cap: usize) -> serde_json::Value {
+    let Some(value) = value else {
+        return serde_json::Value::Null;
+    };
+    let serialized = value.to_string();
+    if serialized.len() <= cap {
+        return value.clone();
+    }
+    if let Some(obj) = value.as_object() {
+        let mut obj = obj.clone();
+        let mut changed = false;
+        if let Some(serde_json::Value::String(text)) = obj.get_mut("output") {
+            let (capped, _) = truncate_text(text, cap);
+            *text = capped;
+            changed = true;
+        }
+        if obj.remove("result").is_some() {
+            changed = true;
+        }
+        if changed {
+            obj.insert("truncated".to_string(), serde_json::Value::Bool(true));
+            return serde_json::Value::Object(obj);
+        }
+    }
+    let (capped, _) = truncate_text(&serialized, cap);
+    serde_json::Value::String(capped)
+}
+
 /// Build the persisted `task.output` value from a finished run. Caps the raw
 /// text, records the original size, and drops the default parser's
 /// `{"text": raw}` duplicate.
@@ -1171,7 +1222,7 @@ async fn start_dependents(state: &Arc<State>, ev: &Event) {
                     "name": prev.name,
                     "task_id": prev.id.to_string(),
                     "status": prev.status.as_str(),
-                    "output": prev.output,
+                    "output": bounded_prev_value(prev.output.as_ref(), PREV_OUTPUT_BYTES),
                     "session_id": prev.session_id,
                 }
             }),
@@ -1299,6 +1350,7 @@ async fn join_context(
         .iter()
         .filter(|t| t.status == TaskStatus::Cancelled)
         .count();
+    let per_task = (PREV_TASKS_BYTES / tasks.len().max(1)).max(MIN_PREV_OUTPUT_BYTES);
     let entries: Vec<serde_json::Value> = tasks
         .iter()
         .map(|t| {
@@ -1308,8 +1360,8 @@ async fn join_context(
                 "status": t.status.as_str(),
                 "success": t.status == TaskStatus::Succeeded,
                 "session_id": t.session_id,
-                "input": t.input,
-                "output": t.output,
+                "input": bounded_prev_value(Some(&t.input), per_task),
+                "output": bounded_prev_value(t.output.as_ref(), per_task),
             })
         })
         .collect();
@@ -1965,6 +2017,43 @@ mod tests {
         assert_eq!(value["output"], "done");
         assert_eq!(value["result"], parsed);
         assert_eq!(value["session_id"], "ses_1");
+    }
+
+    #[test]
+    fn bounded_prev_value_truncates_large_shape_and_keeps_small_verbatim() {
+        let small = serde_json::json!({ "ok": true });
+        assert_eq!(
+            bounded_prev_value(Some(&small), PREV_OUTPUT_BYTES),
+            small,
+            "a payload under the cap must be untouched"
+        );
+        assert!(bounded_prev_value(None, PREV_OUTPUT_BYTES).is_null());
+
+        let big = "x".repeat(128 * 1024);
+        let stored = serde_json::json!({
+            "agent": "opencode",
+            "output": big,
+            "result": { "preview": big, "truncated": true },
+            "truncated": true,
+        });
+        let bounded = bounded_prev_value(Some(&stored), PREV_OUTPUT_BYTES);
+        // The shape survives so `prev.output.<key>` still works, but the bulky
+        // duplicate is gone and the raw transcript is capped.
+        assert_eq!(bounded["agent"], "opencode");
+        assert_eq!(bounded["truncated"], true);
+        assert!(bounded["result"].is_null());
+        assert!(bounded["output"].as_str().unwrap().len() <= PREV_OUTPUT_BYTES + 64);
+        assert!(bounded.to_string().len() < PREV_OUTPUT_BYTES + 512);
+
+        // An input-like object with no known heavy field falls back to a bounded
+        // JSON string rather than growing without limit.
+        let nested = serde_json::json!({ "body": "z".repeat(200 * 1024) });
+        let bounded = bounded_prev_value(Some(&nested), PREV_OUTPUT_BYTES);
+        let text = bounded
+            .as_str()
+            .expect("oversized unknown shape becomes text");
+        assert!(text.len() <= PREV_OUTPUT_BYTES + 64);
+        assert!(text.contains("truncated"));
     }
 
     #[test]
@@ -2781,6 +2870,90 @@ mod tests {
         // Replaying the same finish event cannot enqueue the join twice.
         start_dependents(&state, &finished_event("target", b.id)).await;
         assert_eq!(pending_named(&state, "join").await.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn finished_dependency_bounds_large_output() {
+        let dir = std::env::temp_dir().join(format!("favetto-needs-budget-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = join_state(&dir, vec![needs_def("follower", "target:finished")]).await;
+
+        let mut target = lineage_task("target", TaskStatus::Succeeded, None, None);
+        let big = "y".repeat(200 * 1024);
+        target.output = Some(serde_json::json!({
+            "agent": "opencode",
+            "output": big,
+            "result": { "preview": big, "truncated": true },
+        }));
+        db::insert_task(&state.db, &target).await.unwrap();
+
+        start_dependents(&state, &finished_event("target", target.id)).await;
+        let followers = pending_named(&state, "follower").await;
+        assert_eq!(followers.len(), 1);
+        let prev = &followers[0].input["_prev"];
+        assert!(prev["output"]["output"].as_str().unwrap().len() <= PREV_OUTPUT_BYTES + 64);
+        assert!(
+            prev.to_string().len() < PREV_OUTPUT_BYTES + 1024,
+            "single-dep _prev is {} bytes",
+            prev.to_string().len()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn join_aggregate_bounds_large_outputs() {
+        let dir = std::env::temp_dir().join(format!("favetto-join-budget-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = join_state(&dir, vec![needs_def("join", "target:all_finished")]).await;
+        let root = lineage_task("root", TaskStatus::Succeeded, None, None);
+        db::insert_task(&state.db, &root).await.unwrap();
+
+        // Five successes, each with a full-size (~256 KiB) transcript plus the
+        // parsed duplicate: together they used to render a multi-megabyte prompt.
+        // One also carries a huge nested input, which must be bounded too.
+        let big = "x".repeat(256 * 1024);
+        for i in 0..5 {
+            let mut t = lineage_task(
+                "target",
+                TaskStatus::Succeeded,
+                Some(root.id),
+                Some(root.id),
+            );
+            if i == 0 {
+                t.input = serde_json::json!({ "issue_id": 1, "body": "z".repeat(200 * 1024) });
+            }
+            t.output = Some(serde_json::json!({
+                "agent": "opencode",
+                "output": big,
+                "result": { "preview": big, "truncated": true },
+                "truncated": true,
+            }));
+            db::insert_task(&state.db, &t).await.unwrap();
+        }
+
+        evaluate_join_barriers(&state, "target", root.id, Some(root.id)).await;
+        let joins = pending_named(&state, "join").await;
+        assert_eq!(joins.len(), 1);
+        let prev = &joins[0].input["_prev"];
+        assert_eq!(prev["tasks"].as_array().unwrap().len(), 5);
+        let rendered = prev.to_string();
+        assert!(
+            rendered.len() < PREV_TASKS_BYTES + 16 * 1024,
+            "fan-in aggregate is {} bytes, over the {} byte budget",
+            rendered.len(),
+            PREV_TASKS_BYTES
+        );
+        // Metadata is kept; the bulky duplicate, raw transcript, and nested
+        // input are all bounded.
+        let first = &prev["tasks"][0];
+        assert_eq!(first["success"], true);
+        assert_eq!(first["name"], "target");
+        assert_eq!(first["output"]["truncated"], true);
+        assert!(first["output"]["result"].is_null());
+        assert!(first["input"].to_string().len() <= PREV_OUTPUT_BYTES + 1024);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -75,6 +75,33 @@ pub enum SubmitStrategy {
     AfterSettle { delay: Duration, max_sends: u32 },
 }
 
+/// Largest single argv element we hand to `execve`.
+///
+/// Linux caps one argument at `MAX_ARG_STRLEN` (128 KiB on 4 KiB pages). When a
+/// prompt is passed as a single argument and exceeds it, the child's `execve`
+/// fails with `E2BIG`; `portable-pty`'s pre-exec `close_random_fds` has already
+/// closed the error-reporting pipe, so the failure surfaces as the opaque
+/// `fatal runtime error: assertion failed: output.write(&bytes).is_ok()`
+/// abort. Reject it up front with an actionable message instead.
+pub(crate) const MAX_ARG_BYTES: usize = 120 * 1024;
+
+/// Refuse to launch `program` when an argument cannot fit in one `execve` string.
+pub(crate) fn check_arg_sizes(program: &Path, args: &[String]) -> anyhow::Result<()> {
+    for arg in args {
+        if arg.len() > MAX_ARG_BYTES {
+            anyhow::bail!(
+                "refusing to launch {}: an argument is {} bytes, over the {} byte \
+                 command-line limit; the task prompt is too large to pass on the \
+                 command line (bound the data rendered into it, e.g. `{{{{ prev.tasks }}}}`)",
+                program.display(),
+                arg.len(),
+                MAX_ARG_BYTES
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Where to read an agent's own session id from its line-delimited JSON output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionIdProbe {
@@ -318,6 +345,17 @@ mod tests {
 
         let mut args = Vec::new();
         assert!(!append_template(&mut args, &["--auto".to_string()], &[]));
+    }
+
+    #[test]
+    fn check_arg_sizes_rejects_an_oversized_argument() {
+        assert!(check_arg_sizes(Path::new("agent"), &["a".to_string()]).is_ok());
+
+        let big = "x".repeat(MAX_ARG_BYTES + 1);
+        let err = check_arg_sizes(Path::new("opencode"), &["run".to_string(), big]).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("opencode"), "error: {message}");
+        assert!(message.contains("command-line limit"), "error: {message}");
     }
 
     #[test]
