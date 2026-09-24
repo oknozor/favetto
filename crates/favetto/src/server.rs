@@ -9,6 +9,10 @@ use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 
+use axum::extract::{Query, State as AxumState};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response as AxumResponse};
 use base64::Engine as _;
 use chrono::Utc;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
@@ -28,7 +32,7 @@ use favetto_core::workflow::{
 
 use crate::agents::{AgentContext, AgentEvent, Invocation};
 use crate::db;
-use crate::event_bus::ServerPush;
+use crate::event_bus::{OnLag, ServerPush};
 use crate::state::State;
 use crate::tasks::needs_parts;
 
@@ -39,6 +43,43 @@ type Attached = Arc<Mutex<HashSet<String>>>;
 /// Boxed, `Send` frame stream/sink handed over by a transport.
 pub type BoxIn = Pin<Box<dyn Stream<Item = Result<Frame, WireError>> + Send>>;
 pub type BoxOut = Pin<Box<dyn Sink<Frame, Error = WireError> + Send>>;
+
+/// SSE keep-alive interval. `[web].heartbeat_secs` (#221) will make this
+/// configurable; the default matches `docs/design/web-client.md` §6.2.
+const SSE_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Replay page size, shared with the WS `events.subscribe` path.
+const EVENT_REPLAY_LIMIT: i64 = 500;
+
+/// The connection's live-push task. Restarted by `events.subscribe` so replay and
+/// live delivery share [`EventBus::resumable`](crate::event_bus::EventBus::resumable).
+type LiveTask = Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>;
+
+/// Spawn the pusher that forwards a resumable bus stream into `out_tx`.
+fn spawn_pusher(
+    state: &Arc<State>,
+    out_tx: mpsc::Sender<Frame>,
+    last_event_id: Option<i64>,
+    on_lag: OnLag,
+) -> tokio::task::JoinHandle<()> {
+    let mut rx = state
+        .bus
+        .resumable(state.db.clone(), last_event_id, EVENT_REPLAY_LIMIT, on_lag);
+    tokio::spawn(async move {
+        while let Some(push) = rx.recv().await {
+            let frame = match push.into_notification() {
+                Ok(n) => Frame::Notification(n),
+                Err(e) => {
+                    tracing::warn!(error = %e, "dropping push: serialization failed");
+                    continue;
+                }
+            };
+            if out_tx.send(frame).await.is_err() {
+                break;
+            }
+        }
+    })
+}
 
 /// Drive one client connection until it closes.
 ///
@@ -57,33 +98,16 @@ pub async fn serve_connection(state: Arc<State>, mut incoming: BoxIn, mut outgoi
         }
     });
 
-    let push_tx = out_tx.clone();
-    let mut push_rx = state.bus.subscribe();
-    let pusher = tokio::spawn(async move {
-        loop {
-            match push_rx.recv().await {
-                Ok(push) => {
-                    let frame = match push.into_notification() {
-                        Ok(n) => Frame::Notification(n),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "dropping push: serialization failed");
-                            continue;
-                        }
-                    };
-                    if push_tx.send(frame).await.is_err() {
-                        break;
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(
-                        n,
-                        "client fell behind; events skipped (resume via last_event_id)"
-                    );
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
+    // The initial pusher is not gated on `events.subscribe`: some wire clients
+    // (e.g. the Unix-socket e2e test) consume pushes without ever subscribing.
+    // `events.subscribe` restarts it with a cursor so replay and live delivery
+    // share `EventBus::resumable`.
+    let live_task: LiveTask = Arc::new(Mutex::new(Some(spawn_pusher(
+        &state,
+        out_tx.clone(),
+        None,
+        OnLag::Continue,
+    ))));
 
     // Forward agent screen frames to this connection, scoped to the sessions it
     // attached to. This bypasses the event bus (non-durable, high-volume).
@@ -153,14 +177,16 @@ pub async fn serve_connection(state: Arc<State>, mut incoming: BoxIn, mut outgoi
         };
         match frame {
             Frame::Request(req) => {
-                handle_request(&state, &out_tx, &subscribed, req).await;
+                handle_request(&state, &out_tx, &subscribed, &live_task, req).await;
             }
             Frame::Notification(_) | Frame::Response(_) => {}
         }
     }
 
     drop(out_tx);
-    pusher.abort();
+    if let Some(task) = live_task.lock().take() {
+        task.abort();
+    }
     agent_forwarder.abort();
     let _ = writer.await;
 }
@@ -172,6 +198,7 @@ async fn handle_request(
     state: &Arc<State>,
     out_tx: &mpsc::Sender<Frame>,
     subscribed: &Attached,
+    live_task: &LiveTask,
     req: Request,
 ) {
     let id = req.id;
@@ -185,31 +212,21 @@ async fn handle_request(
             )))
             .await;
 
-        // `events.subscribe` never fails on params: a malformed object is treated
-        // as "no replay" so the subscription still succeeds.
+        // A malformed object degrades to "no replay" so the subscription still
+        // succeeds.
         let p: EventsSubscribeParams = parse_params(&req.method, &req.params).unwrap_or_default();
-        if let Some(last) = p.last_event_id {
-            match db::events_after(&state.db, last, 500).await {
-                Ok(events) => {
-                    for ev in events {
-                        let frame = match ev.into_notification() {
-                            Ok(n) => Frame::Notification(n),
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "dropping replayed event: serialization failed"
-                                );
-                                continue;
-                            }
-                        };
-                        if out_tx.send(frame).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-                Err(e) => tracing::warn!(error = %e, "event replay failed"),
-            }
+
+        // Replace the connection pusher with one that replays from the client's
+        // cursor first, then follows live. Replay/live share EventBus::resumable.
+        if let Some(previous) = live_task.lock().take() {
+            previous.abort();
         }
+        *live_task.lock() = Some(spawn_pusher(
+            state,
+            out_tx.clone(),
+            p.last_event_id,
+            OnLag::Continue,
+        ));
         return;
     }
 
@@ -300,6 +317,85 @@ async fn handle_request(
 
     let resp = dispatch(state, req).await;
     let _ = out_tx.send(Frame::Response(resp)).await;
+}
+
+/// `GET /events` query string. `Last-Event-ID` is the canonical SSE resume
+/// channel; `?last_event_id=` is the fallback for clients that cannot set it.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct EventsQuery {
+    #[serde(default)]
+    pub last_event_id: Option<i64>,
+}
+
+/// `GET /events`: bearer-authenticated Server-Sent Events. Replays persisted
+/// events after the cursor, then streams live pushes until the bus lags.
+pub async fn events_handler(
+    AxumState(state): AxumState<Arc<State>>,
+    headers: HeaderMap,
+    Query(query): Query<EventsQuery>,
+) -> AxumResponse {
+    if !bearer_authorized(&headers, &state.token) {
+        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+    }
+    let cursor = last_event_id(&headers).or(query.last_event_id);
+    let rx = state
+        .bus
+        .resumable(state.db.clone(), cursor, EVENT_REPLAY_LIMIT, OnLag::End);
+    sse_response(rx, SSE_HEARTBEAT)
+}
+
+/// Build the SSE response for a resumable push receiver. `heartbeat` is a
+/// parameter so tests can drive it at milliseconds instead of 15 s.
+fn sse_response(rx: mpsc::Receiver<ServerPush>, heartbeat: std::time::Duration) -> AxumResponse {
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|push| (push, rx))
+    })
+    .map(|push| Ok::<_, std::convert::Infallible>(sse_event(push)));
+    let mut response = Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(heartbeat).text("keep-alive"))
+        .into_response();
+    response.headers_mut().insert(
+        "x-accel-buffering",
+        axum::http::HeaderValue::from_static("no"),
+    );
+    response
+}
+
+/// One SSE frame. The JSON payload is produced by `ServerPush::into_notification`
+/// (the same conversion the WS path uses) so the two transports cannot drift;
+/// `id:` is added only for durable events.
+fn sse_event(push: ServerPush) -> Event {
+    let id = push.event_id();
+    let event = match push.into_notification() {
+        Ok(n) => Event::default().event(n.method).data(n.params.to_string()),
+        Err(e) => {
+            tracing::warn!(error = %e, "dropping push: serialization failed");
+            Event::default().comment("dropped unencodable push")
+        }
+    };
+    match id {
+        Some(id) => event.id(id.to_string()),
+        None => event,
+    }
+}
+
+/// Parse `Last-Event-ID`; a malformed value is ignored (treated as absent).
+fn last_event_id(headers: &HeaderMap) -> Option<i64> {
+    headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<i64>().ok())
+}
+
+/// True when `headers` carries a valid `Authorization: Bearer <token>`.
+/// Single source of truth shared with `transport::ws_handler`.
+pub fn bearer_authorized(headers: &HeaderMap, token: &favetto_core::auth::Token) -> bool {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|t| token.verify(t))
+        .unwrap_or(false)
 }
 
 /// Deserialize request `params` into a typed struct, surfacing serde's message as
