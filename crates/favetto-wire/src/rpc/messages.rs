@@ -15,6 +15,8 @@
 
 use std::path::PathBuf;
 
+// `JsonSchema` is only needed by the schema registries, gated behind the `schema` feature.
+#[cfg(feature = "schema")]
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -24,7 +26,7 @@ use crate::agent_state::{AgentActivity, AgentUsage, InputReply, UsagePeriod, Usa
 use crate::model::{
     AgentCatalogEntry, AgentSessionInfo, Event, NotificationRecord, Schedule, Task,
 };
-use crate::tasks::TaskVar;
+use crate::task_var::TaskVar;
 use crate::workflow::{WorkflowCancelResult, WorkflowCreateResult, WorkflowGraph, WorkflowInspect};
 
 use super::method;
@@ -42,7 +44,8 @@ where
 }
 
 /// Params for a method that takes none. Ignored by the daemon.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct EmptyParams {}
 
 // ---------------------------------------------------------------------------
@@ -50,11 +53,13 @@ pub struct EmptyParams {}
 // ---------------------------------------------------------------------------
 
 /// `system.ping` params: none.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PingParams {}
 
 /// `system.ping` result: daemon liveness plus its current working directory.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PingResult {
     /// Always `true` for a live daemon.
     pub pong: bool,
@@ -67,7 +72,8 @@ pub struct PingResult {
 // ---------------------------------------------------------------------------
 
 /// `tasks.list` params. `limit` defaults to 500 and caps at 2000.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TasksListParams {
     #[serde(default, deserialize_with = "lenient")]
     pub limit: Option<u64>,
@@ -78,7 +84,8 @@ pub struct TasksListParams {
 pub type TasksListResult = Vec<Task>;
 
 /// `tasks.get` / `tasks.cancel` / `tasks.retry` params.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TaskIdParams {
     pub id: Uuid,
 }
@@ -94,7 +101,8 @@ pub type TasksRetryResult = Task;
 
 /// `tasks.start` params. `input` defaults to JSON null; `interactive` defaults
 /// to false (headless), so only the TUI opts into the live embedded TUI.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TasksStartParams {
     pub name: String,
     #[serde(default, deserialize_with = "lenient")]
@@ -107,7 +115,8 @@ pub struct TasksStartParams {
 pub type TasksStartResult = Task;
 
 /// `tasks.start_oneshot` params. `rows`/`cols` default to 24/80.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct StartOneshotParams {
     #[serde(default, deserialize_with = "lenient")]
     pub agent: Option<String>,
@@ -125,7 +134,8 @@ pub struct StartOneshotParams {
 
 /// `tasks.start_oneshot` result: the inline task, its live session, and the
 /// current full-screen frame (base64) so the client starts in sync.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct StartOneshotResult {
     pub task: Task,
     pub session: AgentSessionInfo,
@@ -138,7 +148,8 @@ pub struct StartOneshotResult {
 // ---------------------------------------------------------------------------
 
 /// A catalog task as listed by `catalog.list`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CatalogEntry {
     pub name: String,
     pub agent: Option<String>,
@@ -157,19 +168,22 @@ pub struct CatalogEntry {
 pub type CatalogListResult = Vec<CatalogEntry>;
 
 /// `catalog.get` params.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CatalogGetParams {
     pub name: String,
 }
 
 /// `catalog.get` result: the task's raw Markdown source.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CatalogGetResult {
     pub markdown: String,
 }
 
 /// `catalog.add` params. `spawn_new_root` defaults to false, `prompt` to "".
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CatalogAddParams {
     pub name: String,
     #[serde(default, deserialize_with = "lenient")]
@@ -196,7 +210,8 @@ pub struct CatalogAddParams {
 
 /// `catalog.add` result: the added definition. Note this deliberately omits
 /// `prompt` and the `spawn*` fields, unlike [`CatalogEntry`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CatalogAddResult {
     pub name: String,
     pub agent: Option<String>,
@@ -209,14 +224,16 @@ pub struct CatalogAddResult {
 }
 
 /// `catalog.update` params.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CatalogUpdateParams {
     pub name: String,
     pub markdown: String,
 }
 
 /// `catalog.update` result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CatalogUpdateResult {
     pub updated: bool,
 }
@@ -227,7 +244,8 @@ pub struct CatalogUpdateResult {
 
 /// `workflow.get` result: the catalog graph as Graphviz DOT, its persisted path,
 /// and the structured graph.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WorkflowGetResult {
     pub dot: String,
     pub path: String,
@@ -235,7 +253,8 @@ pub struct WorkflowGetResult {
 }
 
 /// `workflow.inspect` / `workflow.cancel` params.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WorkflowInspectParams {
     pub root_id: Uuid,
 }
@@ -244,14 +263,16 @@ pub struct WorkflowInspectParams {
 pub type WorkflowInspectResult = WorkflowInspect;
 
 /// `workflow.retry` params. The workflow API names the task id `task_id`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WorkflowRetryParams {
     pub task_id: Uuid,
 }
 
 /// One node of a `workflow.create` request. `key` is local to the request and is
 /// what sibling nodes reference from `depends_on`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WorkflowCreateTask {
     pub key: String,
     pub name: String,
@@ -263,7 +284,8 @@ pub struct WorkflowCreateTask {
 
 /// `workflow.create` params. `idempotency_key` scopes the per-node dedupe keys;
 /// `root_id` optionally extends an existing root.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WorkflowCreateParams {
     pub idempotency_key: String,
     #[serde(default, deserialize_with = "lenient")]
@@ -276,7 +298,8 @@ pub struct WorkflowCreateParams {
 pub type WorkflowCreateResultBody = WorkflowCreateResult;
 
 /// `workflow.spawn` params.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WorkflowSpawnParams {
     pub name: String,
     #[serde(default, deserialize_with = "lenient")]
@@ -303,7 +326,8 @@ pub type WorkflowRetryResult = Task;
 // ---------------------------------------------------------------------------
 
 /// `events.tail` params. `limit` defaults to 50 and caps at 1000.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct EventsTailParams {
     #[serde(default, deserialize_with = "lenient")]
     pub limit: Option<u64>,
@@ -313,14 +337,16 @@ pub struct EventsTailParams {
 pub type EventsTailResult = Vec<Event>;
 
 /// `events.subscribe` params. A malformed request degrades to "no replay".
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct EventsSubscribeParams {
     #[serde(default, deserialize_with = "lenient")]
     pub last_event_id: Option<i64>,
 }
 
 /// `events.subscribe` result: acknowledgement of the subscription.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct EventsSubscribeResult {
     pub subscribed: bool,
 }
@@ -333,7 +359,8 @@ pub struct EventsSubscribeResult {
 pub type AgentsListResult = Vec<AgentCatalogEntry>;
 
 /// `agents.start` params. `rows`/`cols` default to 24/80, `new` to false.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct StartAgentParams {
     #[serde(default, deserialize_with = "lenient")]
     pub agent: Option<String>,
@@ -359,7 +386,8 @@ pub struct StartAgentParams {
 
 /// `agents.start` / `agents.attach` result: the session plus a replay of its
 /// current full-screen frame (base64).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AgentAttachResult {
     pub session: AgentSessionInfo,
     /// Base64-encoded `vt100` screen frame.
@@ -367,7 +395,8 @@ pub struct AgentAttachResult {
 }
 
 /// `agents.input` params.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AgentInputParams {
     pub session_id: String,
     #[serde(default, deserialize_with = "lenient")]
@@ -375,13 +404,15 @@ pub struct AgentInputParams {
 }
 
 /// `agents.input` result: the number of decoded bytes written to the PTY.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AgentInputResult {
     pub bytes: usize,
 }
 
 /// `agents.resize` params. `rows`/`cols` default to 24/80.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AgentResizeParams {
     pub session_id: String,
     #[serde(default, deserialize_with = "lenient")]
@@ -391,26 +422,30 @@ pub struct AgentResizeParams {
 }
 
 /// `agents.resize` result: the applied size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AgentResizeResult {
     pub rows: u16,
     pub cols: u16,
 }
 
 /// `agents.attach` / `agents.close` params.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionIdParams {
     pub session_id: String,
 }
 
 /// `agents.close` result: the id of the closed session.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AgentCloseResult {
     pub closed: String,
 }
 
 /// `agents.reply` params: answer the request identified by `request_id`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AgentReplyParams {
     pub session_id: String,
     pub request_id: String,
@@ -418,7 +453,8 @@ pub struct AgentReplyParams {
 }
 
 /// `agents.reply` result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AgentReplyResult {
     pub replied: bool,
 }
@@ -429,14 +465,16 @@ pub struct AgentReplyResult {
 
 /// `providers.list` params. `agent` selects an agent; the default agent is used
 /// when absent.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ProvidersListParams {
     #[serde(default, deserialize_with = "lenient")]
     pub agent: Option<String>,
 }
 
 /// A model advertised by a provider, as returned by `providers.list`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ProviderModelInfo {
     pub id: String,
     pub name: String,
@@ -444,7 +482,8 @@ pub struct ProviderModelInfo {
 
 /// A configured provider and its available models, as returned by
 /// `providers.list`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ProviderInfo {
     pub id: String,
     pub name: String,
@@ -452,7 +491,8 @@ pub struct ProviderInfo {
 }
 
 /// `providers.list` result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ProvidersListResult {
     pub providers: Vec<ProviderInfo>,
 }
@@ -465,7 +505,8 @@ pub struct ProvidersListResult {
 pub type SchedulesListResult = Vec<Schedule>;
 
 /// `schedules.upsert` params.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ScheduleUpsertParams {
     #[serde(default, deserialize_with = "lenient")]
     pub id: Option<String>,
@@ -481,13 +522,15 @@ pub struct ScheduleUpsertParams {
 pub type SchedulesUpsertResult = Schedule;
 
 /// `schedules.delete` params.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ScheduleDeleteParams {
     pub id: String,
 }
 
 /// `schedules.delete` result: the id of the deleted schedule.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SchedulesDeleteResult {
     pub deleted: String,
 }
@@ -497,7 +540,8 @@ pub struct SchedulesDeleteResult {
 // ---------------------------------------------------------------------------
 
 /// `notifications.list` params. `limit` defaults to 50 and caps at 1000.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct NotificationsListParams {
     #[serde(default, deserialize_with = "lenient")]
     pub limit: Option<u64>,
@@ -507,7 +551,8 @@ pub struct NotificationsListParams {
 pub type NotificationsListResult = Vec<NotificationRecord>;
 
 /// `notifications.test` params.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct NotificationTestParams {
     pub channel: String,
     #[serde(default, deserialize_with = "lenient")]
@@ -519,13 +564,15 @@ pub struct NotificationTestParams {
 }
 
 /// `notifications.test` result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct NotificationTestResult {
     pub sent: bool,
 }
 
 /// `hooks.upsert` params.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HookUpsertParams {
     pub event: String,
     pub channel: String,
@@ -534,13 +581,15 @@ pub struct HookUpsertParams {
 }
 
 /// `hooks.upsert` result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HookUpsertResult {
     pub added: bool,
 }
 
 /// `usage.stats` params. `period` defaults to `day` when omitted or malformed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UsageStatsParams {
     #[serde(default, deserialize_with = "lenient")]
     pub period: Option<UsagePeriod>,
@@ -554,11 +603,13 @@ pub type UsageStatsResult = UsageStats;
 // ---------------------------------------------------------------------------
 
 /// `catalog.updated` push: no payload.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CatalogUpdatedPush {}
 
 /// `agent.output` push: raw PTY screen data (base64).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AgentOutputPush {
     pub session_id: String,
     /// Base64-encoded `vt100` screen frame.
@@ -566,7 +617,8 @@ pub struct AgentOutputPush {
 }
 
 /// `agent.exit` push: the session's child process exited.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AgentExitPush {
     pub session_id: String,
     /// Process exit code, when one was reported.
@@ -574,7 +626,8 @@ pub struct AgentExitPush {
 }
 
 /// `agent.state` push: the session's folded live state changed.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AgentStatePush {
     pub session_id: String,
     pub activity: Option<AgentActivity>,
@@ -689,12 +742,14 @@ rpc_calls! {
 }
 
 /// The JSON Schema of a type, as a plain JSON value. Used by the doc generator.
+#[cfg(feature = "schema")]
 pub fn schema_of<T: JsonSchema>() -> serde_json::Value {
     serde_json::to_value(schemars::schema_for!(T)).unwrap_or(serde_json::Value::Null)
 }
 
 /// One client → server method's typed metadata, consumed by the generated
 /// remote-API reference.
+#[cfg(feature = "schema")]
 pub struct RpcCallSpec {
     /// The wire method name.
     pub method: &'static str,
@@ -706,6 +761,7 @@ pub struct RpcCallSpec {
 
 /// Every client → server call with its params and result schema, in the same
 /// order as [`CLIENT_METHODS`](super::CLIENT_METHODS).
+#[cfg(feature = "schema")]
 pub const CLIENT_CALLS: &[RpcCallSpec] = &[
     RpcCallSpec {
         method: method::PING,
@@ -880,6 +936,7 @@ pub const CLIENT_CALLS: &[RpcCallSpec] = &[
 ];
 
 /// One server → client push's typed metadata.
+#[cfg(feature = "schema")]
 pub struct PushSpec {
     /// The wire method name.
     pub method: &'static str,
@@ -889,6 +946,7 @@ pub struct PushSpec {
 
 /// Every server → client push with its payload schema, in the same order as
 /// [`SERVER_PUSHES`](super::SERVER_PUSHES).
+#[cfg(feature = "schema")]
 pub const PUSH_CALLS: &[PushSpec] = &[
     PushSpec {
         method: super::push::EVENT,
@@ -919,8 +977,10 @@ pub const PUSH_CALLS: &[PushSpec] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "schema")]
     use std::collections::HashSet;
 
+    #[cfg(feature = "schema")]
     #[test]
     fn client_calls_and_methods_table_agree() {
         let calls: HashSet<&str> = CLIENT_CALLS.iter().map(|c| c.method).collect();
@@ -932,6 +992,7 @@ mod tests {
         assert_eq!(CLIENT_CALLS.len(), super::super::CLIENT_METHODS.len());
     }
 
+    #[cfg(feature = "schema")]
     #[test]
     fn push_calls_and_pushes_table_agree() {
         let calls: HashSet<&str> = PUSH_CALLS.iter().map(|c| c.method).collect();
@@ -943,6 +1004,7 @@ mod tests {
         assert_eq!(PUSH_CALLS.len(), super::super::SERVER_PUSHES.len());
     }
 
+    #[cfg(feature = "schema")]
     #[test]
     fn every_call_has_a_schema_without_duplicate_methods() {
         let mut seen = HashSet::new();
