@@ -16,7 +16,7 @@ use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use favetto_core::model::{
-    Event, EventKind, NotificationRecord, RunStatus, Schedule, Task, TaskRun, TaskStatus,
+    Event, EventKind, Failure, NotificationRecord, RunStatus, Schedule, Task, TaskRun, TaskStatus,
 };
 
 const SCHEMA: &str = r#"
@@ -582,18 +582,106 @@ pub async fn record_delivery(
 // Task queue
 // ---------------------------------------------------------------------------
 
-/// Mark tasks left `running` or `awaiting_input` by a previous daemon instance as
-/// failed — they were interrupted and the agent process is gone. Returns the
-/// number reconciled.
-pub async fn fail_interrupted_tasks(pool: &SqlitePool) -> anyhow::Result<u64> {
+/// Every `pending` task, oldest first (for the startup reconciler).
+pub async fn list_pending_tasks(pool: &SqlitePool) -> anyhow::Result<Vec<Task>> {
+    let rows = sqlx::query(
+        "SELECT id, name, status, attempt, input, dedupe_key, created_at, started_at, finished_at, error, failure, session_id, session_title, parent_id, root_id, interactive \
+         FROM tasks WHERE status = 'pending' ORDER BY created_at ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(row_to_task).collect())
+}
+
+/// Every active task (`running`/`awaiting_input`), oldest first. These are the
+/// tasks a previous daemon left in flight, for the startup reconciler.
+pub async fn list_active_tasks(pool: &SqlitePool) -> anyhow::Result<Vec<Task>> {
+    let rows = sqlx::query(
+        "SELECT id, name, status, attempt, input, dedupe_key, created_at, started_at, finished_at, error, failure, session_id, session_title, parent_id, root_id, interactive \
+         FROM tasks WHERE status IN ('running', 'awaiting_input') ORDER BY created_at ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(row_to_task).collect())
+}
+
+/// Mark an active run `interrupted` (its agent process died with the old
+/// daemon). Only a non-terminal run is touched, so a repeated reconcile is a
+/// no-op. Returns whether a row changed.
+pub async fn interrupt_run(
+    pool: &SqlitePool,
+    id: Uuid,
+    error: &str,
+    failure: &Failure,
+) -> anyhow::Result<bool> {
     let result = sqlx::query(
-        "UPDATE tasks SET status = 'failed', error = 'interrupted by daemon restart', finished_at = ? \
-         WHERE status IN ('running', 'awaiting_input')",
+        "UPDATE task_runs SET status = 'interrupted', finished_at = ?, error = ?, failure = ? \
+         WHERE id = ? AND status IN ('pending', 'running', 'awaiting_input')",
     )
     .bind(ts_ms(Utc::now()))
+    .bind(error)
+    .bind(serde_json::to_string(failure)?)
+    .bind(id.to_string())
     .execute(pool)
     .await?;
-    Ok(result.rows_affected())
+    Ok(result.rows_affected() == 1)
+}
+
+/// Fail an active (`running`/`awaiting_input`) task. Terminal tasks are never
+/// touched, so a repeated reconcile is a no-op. Returns whether a row changed.
+pub async fn fail_stale_task(
+    pool: &SqlitePool,
+    id: Uuid,
+    error: &str,
+    failure: &Failure,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        "UPDATE tasks SET status = 'failed', error = ?, failure = ?, finished_at = ? \
+         WHERE id = ? AND status IN ('running', 'awaiting_input')",
+    )
+    .bind(error)
+    .bind(serde_json::to_string(failure)?)
+    .bind(ts_ms(Utc::now()))
+    .bind(id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Re-enqueue an active (`running`/`awaiting_input`) task for a fresh attempt,
+/// clearing the previous attempt's outcome so the next claim starts clean.
+/// Returns whether a row changed.
+pub async fn retry_stale_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        "UPDATE tasks SET status = 'pending', started_at = NULL, finished_at = NULL, \
+             error = NULL, failure = NULL \
+         WHERE id = ? AND status IN ('running', 'awaiting_input')",
+    )
+    .bind(id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Fail a `pending` task that can no longer run (its catalog definition
+/// vanished). Only a pending row is touched. Returns whether a row changed.
+pub async fn fail_pending_task(
+    pool: &SqlitePool,
+    id: Uuid,
+    error: &str,
+    failure: &Failure,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        "UPDATE tasks SET status = 'failed', error = ?, failure = ?, finished_at = ? \
+         WHERE id = ? AND status = 'pending'",
+    )
+    .bind(error)
+    .bind(serde_json::to_string(failure)?)
+    .bind(ts_ms(Utc::now()))
+    .bind(id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 /// Up to `limit` pending tasks, oldest first (for the parallel executor).

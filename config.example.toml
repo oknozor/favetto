@@ -105,6 +105,7 @@ keep_worktree = false      # default false = remove the worktree when the task e
 # max_output_bytes = 262144  # stored task output cap; longer output is truncated head+tail
 # detect_awaiting_input = true     # surface a blocked agent as `awaiting_input` + notify
 # awaiting_input_quiet_ms = 8000   # PTY quiet time before the generic detector fires
+# stale_run = "fail"         # startup recovery for a task left running by a crash: "fail" | "retry"
 
 # Worktree retention. At daemon start and every six hours, tracked worktrees
 # whose task is finished are removed once older than `days`, orphaned ones are

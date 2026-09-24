@@ -11,7 +11,7 @@ Every section is optional; favetto falls back to built-in defaults for anything 
 | `agent` | AgentSettings | `{}` | no | Default external agent used for catalog tasks and new agent sessions. |
 | `agents` | Map<String, AgentConfig> | `{}` | no | External coding agents by name (e.g. `claude`, `opencode`, `pi`, `vibe`). |
 | `daemon` | DaemonSettings | `{"data_dir":null,"listen":null,"retention":{"days":30,"min_tasks":1000,"vacuum":true},"socket":null,"tasks_dir":null}` | no | Daemon defaults (overridable by CLI flags). |
-| `executor` | ExecutorSettings | `{"awaiting_input_quiet_ms":8000,"detect_awaiting_input":true,"keep_worktree":false,"max_concurrency":4,"max_output_bytes":262144,"parallel":false,"worktree":true,"worktree_retention":{"days":30,"min_worktrees":0}}` | no | Task executor concurrency / isolation. |
+| `executor` | ExecutorSettings | `{"awaiting_input_quiet_ms":8000,"detect_awaiting_input":true,"keep_worktree":false,"max_concurrency":4,"max_output_bytes":262144,"parallel":false,"stale_run":"fail","worktree":true,"worktree_retention":{"days":30,"min_worktrees":0}}` | no | Task executor concurrency / isolation. |
 | `git` | GitSettings | `{}` | no | Non-interactive git provisioning for agent processes. Defaults to `signing = "off"`, which forces `commit.gpgsign = false` so an agent commit can never block on an interactive pinentry/askpass prompt. |
 | `tui` | TuiSettings | `{"sound":{"enabled":true,"events":{"attention":"none","awaiting_input":"attention","task_failed":"failure","task_finished":"success","task_started":"none"},"min_interval_ms":400,"only_when_unfocused":false,"player":"auto"}}` | no | Client-side TUI settings. Ignored by the daemon, which reads the same file. |
 | `webhook` | WebhookSettings | `{"github":{"enabled":false,"rules":[]}}` | no | Webhook trigger rules (currently GitHub). |
@@ -84,6 +84,7 @@ serialized per working directory.
 | `max_concurrency` | integer | `4` | no | Maximum concurrent tasks when `parallel` is true. |
 | `max_output_bytes` | integer | `262144` | no | Cap on the stored `task.output` blob, in bytes (default 256 KiB). Longer output is truncated head+tail and flagged. |
 | `parallel` | boolean | `false` | no | Run multiple tasks at once (default false: one at a time). |
+| `stale_run` | StaleRunPolicy | `fail` | no | Startup policy for a task left in flight by a previous daemon: `"fail"` (default) marks it failed, `"retry"` re-enqueues it for a fresh attempt. |
 | `worktree` | boolean | `true` | no | Give each task its own `git worktree` when it runs in a repository. |
 | `worktree_dir` | string (optional) | — | no | Where worktrees are created: absolute, or relative to the repo root. Defaults to `<data_dir>/worktrees`. |
 | `worktree_retention` | WorktreeRetentionSettings | `{"days":30,"min_worktrees":0}` | no | Retention policy for worktrees left on disk. |
@@ -195,6 +196,13 @@ defaults. Sounds are played on the machine running `favetto tui`.
 | `only_when_unfocused` | boolean | `false` | no | Only play while the terminal is unfocused (best-effort focus reporting). |
 | `player` | string | `auto` | no | `"auto"` (detect a player on `PATH`), `"bell"`, or `"command"`. |
 | `sound_dir` | string (optional) | — | no | Directory for relative `.wav` event values. `~` is expanded. |
+
+## StaleRunPolicy
+
+What the startup reconciler does with a task whose in-flight run was left
+behind by a previous daemon instance.
+
+string
 
 ## TuiSettings
 

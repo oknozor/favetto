@@ -207,6 +207,11 @@
           "description": "Run multiple tasks at once (default false: one at a time).",
           "type": "boolean"
         },
+        "stale_run": {
+          "$ref": "#/$defs/StaleRunPolicy",
+          "default": "fail",
+          "description": "Startup policy for a task left in flight by a previous daemon: `\"fail\"`\n(default) marks it failed, `\"retry\"` re-enqueues it for a fresh attempt."
+        },
         "worktree": {
           "default": true,
           "description": "Give each task its own `git worktree` when it runs in a repository.",
@@ -480,6 +485,21 @@
       },
       "type": "object"
     },
+    "StaleRunPolicy": {
+      "description": "What the startup reconciler does with a task whose in-flight run was left\nbehind by a previous daemon instance.",
+      "oneOf": [
+        {
+          "const": "fail",
+          "description": "Mark the owning task failed (preserves the pre-reconciler behaviour).",
+          "type": "string"
+        },
+        {
+          "const": "retry",
+          "description": "Re-enqueue the owning task so the executor claims a fresh attempt.",
+          "type": "string"
+        }
+      ]
+    },
     "TuiSettings": {
       "description": "TUI-only settings. The daemon parses but ignores this section.",
       "properties": {
@@ -582,6 +602,7 @@
         "max_concurrency": 4,
         "max_output_bytes": 262144,
         "parallel": false,
+        "stale_run": "fail",
         "worktree": true,
         "worktree_retention": {
           "days": 30,
