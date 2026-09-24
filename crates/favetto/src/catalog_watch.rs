@@ -157,7 +157,9 @@ pub(crate) async fn reload(state: &Arc<State>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::event_bus::EventBus;
+    use crate::state::StateInit;
 
     /// A unique scratch directory for watcher tests.
     fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -181,20 +183,22 @@ mod tests {
             crate::tasks::load_catalog(tasks_dir).unwrap(),
         ));
         let scheduler = tokio_cron_scheduler::JobScheduler::new().await.unwrap();
-        Arc::new(State::new(
-            pool,
-            EventBus::new(64),
-            favetto_core::auth::Token::generate(),
-            crate::webhooks::WebhookSecrets::from_config(&crate::config::FavettoConfig::default()),
-            crate::agents::AgentManager::new(),
-            crate::agents::AgentRegistry::default(),
-            Arc::new(crate::config::FavettoConfig::default()),
-            dir.to_path_buf(),
-            tasks_dir.to_path_buf(),
+        Arc::new(State::new(StateInit {
+            db: pool,
+            bus: EventBus::new(64),
+            token: favetto_core::auth::Token::generate(),
+            webhooks: crate::webhooks::WebhookSecrets::from_config(
+                &crate::config::FavettoConfig::default(),
+            ),
+            agents: crate::agents::AgentManager::new(),
+            registry: crate::agents::AgentRegistry::default(),
+            config: Arc::new(crate::config::FavettoConfig::default()),
+            data_dir: dir.to_path_buf(),
+            tasks_dir: tasks_dir.to_path_buf(),
             catalog,
             scheduler,
-            Arc::new(parking_lot::RwLock::new(Vec::new())),
-        ))
+            hook_store: Arc::new(parking_lot::RwLock::new(Vec::new())),
+        }))
     }
 
     /// Poll `cond` until it holds or `timeout` elapses.

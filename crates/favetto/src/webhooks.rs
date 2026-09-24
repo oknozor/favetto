@@ -530,7 +530,9 @@ fn verify_signature(secret: &str, body: &[u8], signature: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::event_bus::EventBus;
+    use crate::state::StateInit;
     use crate::tasks::TaskDef;
     use axum::http::{HeaderMap, HeaderValue};
     use favetto_core::auth::Token;
@@ -574,23 +576,23 @@ mod tests {
         cfg.webhook.github.enabled = true;
         cfg.webhook.github.rules = rules;
 
-        let state = Arc::new(State::new(
-            pool.clone(),
-            EventBus::new(64),
-            Token::generate(),
-            WebhookSecrets {
+        let state = Arc::new(State::new(StateInit {
+            db: pool.clone(),
+            bus: EventBus::new(64),
+            token: Token::generate(),
+            webhooks: WebhookSecrets {
                 github: Some(SECRET.to_string()),
                 linear: None,
             },
-            crate::agents::AgentManager::new(),
-            crate::agents::AgentRegistry::default(),
-            Arc::new(cfg),
-            dir.clone(),
-            dir.clone(),
-            Arc::new(RwLock::new(Vec::<TaskDef>::new())),
-            tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
-            Arc::new(RwLock::new(Vec::new())),
-        ));
+            agents: crate::agents::AgentManager::new(),
+            registry: crate::agents::AgentRegistry::default(),
+            config: Arc::new(cfg),
+            data_dir: dir.clone(),
+            tasks_dir: dir.clone(),
+            catalog: Arc::new(RwLock::new(Vec::<TaskDef>::new())),
+            scheduler: tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
+            hook_store: Arc::new(RwLock::new(Vec::new())),
+        }));
         (state, dir, pool)
     }
 

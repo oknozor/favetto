@@ -188,9 +188,11 @@ async fn resume_task(state: &Arc<State>, task_id: Uuid) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::agents::{AgentContext, AgentManager, AgentRegistry, Invocation};
     use crate::config::{AgentConfig, FavettoConfig};
     use crate::event_bus::EventBus;
+    use crate::state::StateInit;
     use crate::webhooks::WebhookSecrets;
     use favetto_core::auth::Token;
     use parking_lot::RwLock;
@@ -283,23 +285,23 @@ mod tests {
             },
         );
         let registry = AgentRegistry::from_config_with(&cfg, &|_| true).unwrap();
-        Arc::new(State::new(
-            pool,
-            EventBus::new(64),
-            Token::generate(),
-            WebhookSecrets {
+        Arc::new(State::new(StateInit {
+            db: pool,
+            bus: EventBus::new(64),
+            token: Token::generate(),
+            webhooks: WebhookSecrets {
                 github: None,
                 linear: None,
             },
-            AgentManager::new(),
+            agents: AgentManager::new(),
             registry,
-            Arc::new(cfg),
-            dir.clone(),
-            dir.clone(),
-            Arc::new(RwLock::new(Vec::new())),
-            tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
-            Arc::new(RwLock::new(Vec::new())),
-        ))
+            config: Arc::new(cfg),
+            data_dir: dir.clone(),
+            tasks_dir: dir.clone(),
+            catalog: Arc::new(RwLock::new(Vec::new())),
+            scheduler: tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
+            hook_store: Arc::new(RwLock::new(Vec::new())),
+        }))
     }
 
     #[tokio::test]

@@ -102,13 +102,15 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
         Popup::Help { scroll } => draw_help(frame, scroll, theme),
         Popup::Workflow { scroll, hscroll } => draw_workflow(
             frame,
-            scroll,
-            hscroll,
-            workflow_lines.as_deref(),
-            workflow_note.as_deref(),
-            workflow_dot.as_deref(),
-            workflow_path.as_deref(),
-            theme,
+            WorkflowOverlay {
+                scroll,
+                hscroll,
+                lines: workflow_lines.as_deref(),
+                note: workflow_note.as_deref(),
+                dot: workflow_dot.as_deref(),
+                path: workflow_path.as_deref(),
+                theme,
+            },
         ),
         Popup::Sessions { selected, sessions } => {
             draw_sessions_picker(frame, *selected, sessions, theme)
@@ -178,19 +180,32 @@ fn scrolling_body_layout(
     (rect, scroll)
 }
 
-/// Render a growing, scrolling popup whose footer stays docked, returning its
-/// rect so callers/tests can inspect the geometry.
-#[allow(clippy::too_many_arguments)]
-fn draw_growing_popup(
-    frame: &mut Frame,
+/// Arguments for [`draw_growing_popup`], grouping the popup's content, geometry,
+/// and theme so the render helper's signature stays small.
+struct GrowingPopup {
+    /// Outer frame area the popup is centered in.
     area: Rect,
+    /// Popup width as a percentage of `area`.
     width_pct: u16,
     title: String,
     content: Vec<Line<'static>>,
     footer: Vec<Line<'static>>,
     focus_line: usize,
     theme: Theme,
-) -> Rect {
+}
+
+/// Render a growing, scrolling popup whose footer stays docked, returning its
+/// rect so callers/tests can inspect the geometry.
+fn draw_growing_popup(frame: &mut Frame, popup: GrowingPopup) -> Rect {
+    let GrowingPopup {
+        area,
+        width_pct,
+        title,
+        content,
+        footer,
+        focus_line,
+        theme,
+    } = popup;
     let inner_width = centered_rect(area, width_pct, 0).width.saturating_sub(2);
     let content_height = wrapped_height(&content, inner_width);
     let footer_height = wrapped_height(&footer, inner_width); // may wrap too
@@ -392,13 +407,15 @@ fn draw_form(frame: &mut Frame, form: &Form, theme: Theme) -> Rect {
 
     draw_growing_popup(
         frame,
-        area,
-        70,
-        " Step-by-step form ".to_string(),
-        content,
-        footer,
-        focus_line,
-        theme,
+        GrowingPopup {
+            area,
+            width_pct: 70,
+            title: " Step-by-step form ".to_string(),
+            content,
+            footer,
+            focus_line,
+            theme,
+        },
     )
 }
 
@@ -484,13 +501,15 @@ fn draw_wizard(
 
     draw_growing_popup(
         frame,
-        area,
-        70,
-        " New one-shot task ".to_string(),
-        content,
-        footer,
-        focus_line,
-        theme,
+        GrowingPopup {
+            area,
+            width_pct: 70,
+            title: " New one-shot task ".to_string(),
+            content,
+            footer,
+            focus_line,
+            theme,
+        },
     )
 }
 
@@ -576,13 +595,15 @@ fn draw_task_vars(frame: &mut Frame, form: &TaskVarsForm, theme: Theme) -> Rect 
 
     draw_growing_popup(
         frame,
-        area,
-        70,
-        " Task input ".to_string(),
-        content,
-        footer,
-        focus_line,
-        theme,
+        GrowingPopup {
+            area,
+            width_pct: 70,
+            title: " Task input ".to_string(),
+            content,
+            footer,
+            focus_line,
+            theme,
+        },
     )
 }
 
@@ -721,20 +742,31 @@ fn draw_help(frame: &mut Frame, scroll: &mut u16, theme: Theme) {
     frame.render_widget(paragraph.scroll((*scroll, 0)), rect);
 }
 
+/// Arguments for [`draw_workflow`]: the cached structured graph (when present),
+/// the raw DOT fallback, and the scroll offsets the overlay mutates in place.
+struct WorkflowOverlay<'a> {
+    scroll: &'a mut u16,
+    hscroll: &'a mut u16,
+    lines: Option<&'a [String]>,
+    note: Option<&'a str>,
+    dot: Option<&'a str>,
+    path: Option<&'a str>,
+    theme: Theme,
+}
+
 /// Draw the floating workflow overlay. When the structured graph was rendered,
 /// shows the cached box-drawing rows and scrolls both axes; otherwise falls back
 /// to the wrapped raw DOT (with the reason as a leading note line).
-#[allow(clippy::too_many_arguments)]
-fn draw_workflow(
-    frame: &mut Frame,
-    scroll: &mut u16,
-    hscroll: &mut u16,
-    lines: Option<&[String]>,
-    note: Option<&str>,
-    dot: Option<&str>,
-    path: Option<&str>,
-    theme: Theme,
-) {
+fn draw_workflow(frame: &mut Frame, overlay: WorkflowOverlay<'_>) {
+    let WorkflowOverlay {
+        scroll,
+        hscroll,
+        lines,
+        note,
+        dot,
+        path,
+        theme,
+    } = overlay;
     let area = frame.area();
     let rect = centered_rect(area, 90, area.height.saturating_sub(2));
     let hint = " Workflow (w) — ↑/↓/←/→/PgUp/PgDn scroll, Esc/w close ";

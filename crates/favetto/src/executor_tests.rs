@@ -2,6 +2,7 @@ use super::*;
 use crate::agents::{AgentManager, AgentRegistry};
 use crate::config::FavettoConfig;
 use crate::event_bus::EventBus;
+use crate::state::StateInit;
 use crate::tasks::{TaskVar, VarType};
 use crate::webhooks::WebhookSecrets;
 use favetto_core::auth::Token;
@@ -130,23 +131,23 @@ async fn unavailable_agent_fails_with_clear_error() {
     cfg.agent.default = Some("opencode".to_string());
     let registry = AgentRegistry::from_config_with(&cfg, &|_| false).unwrap();
 
-    let state = Arc::new(State::new(
-        pool,
-        EventBus::new(64),
-        Token::generate(),
-        WebhookSecrets {
+    let state = Arc::new(State::new(StateInit {
+        db: pool,
+        bus: EventBus::new(64),
+        token: Token::generate(),
+        webhooks: WebhookSecrets {
             github: None,
             linear: None,
         },
-        AgentManager::new(),
+        agents: AgentManager::new(),
         registry,
-        Arc::new(cfg),
-        dir.clone(),
-        dir.clone(),
-        Arc::new(RwLock::new(Vec::new())),
-        tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
-        Arc::new(RwLock::new(Vec::new())),
-    ));
+        config: Arc::new(cfg),
+        data_dir: dir.clone(),
+        tasks_dir: dir.clone(),
+        catalog: Arc::new(RwLock::new(Vec::new())),
+        scheduler: tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
+        hook_store: Arc::new(RwLock::new(Vec::new())),
+    }));
 
     let task = Task {
         id: Uuid::new_v4(),
@@ -321,23 +322,23 @@ async fn title_state(dir: &Path, command: &Path) -> Arc<State> {
         },
     );
     let registry = AgentRegistry::from_config_with(&cfg, &|_| true).unwrap();
-    Arc::new(State::new(
-        pool,
-        EventBus::new(64),
-        Token::generate(),
-        WebhookSecrets {
+    Arc::new(State::new(StateInit {
+        db: pool,
+        bus: EventBus::new(64),
+        token: Token::generate(),
+        webhooks: WebhookSecrets {
             github: None,
             linear: None,
         },
-        AgentManager::new(),
+        agents: AgentManager::new(),
         registry,
-        Arc::new(cfg),
-        dir.to_path_buf(),
-        dir.to_path_buf(),
-        Arc::new(RwLock::new(Vec::new())),
-        tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
-        Arc::new(RwLock::new(Vec::new())),
-    ))
+        config: Arc::new(cfg),
+        data_dir: dir.to_path_buf(),
+        tasks_dir: dir.to_path_buf(),
+        catalog: Arc::new(RwLock::new(Vec::new())),
+        scheduler: tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
+        hook_store: Arc::new(RwLock::new(Vec::new())),
+    }))
 }
 
 #[cfg(unix)]
@@ -853,23 +854,23 @@ async fn run_one_renders_input_vars_into_the_agent_prompt() {
 
     let pool = crate::db::open(&dir.join("test.db")).await.unwrap();
     crate::db::migrate(&pool).await.unwrap();
-    let state = Arc::new(State::new(
-        pool,
-        EventBus::new(64),
-        Token::generate(),
-        WebhookSecrets {
+    let state = Arc::new(State::new(StateInit {
+        db: pool,
+        bus: EventBus::new(64),
+        token: Token::generate(),
+        webhooks: WebhookSecrets {
             github: None,
             linear: None,
         },
-        AgentManager::new(),
+        agents: AgentManager::new(),
         registry,
-        Arc::new(cfg),
-        dir.clone(),
-        dir.clone(),
-        Arc::new(RwLock::new(Vec::new())),
-        tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
-        Arc::new(RwLock::new(Vec::new())),
-    ));
+        config: Arc::new(cfg),
+        data_dir: dir.clone(),
+        tasks_dir: dir.clone(),
+        catalog: Arc::new(RwLock::new(Vec::new())),
+        scheduler: tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
+        hook_store: Arc::new(RwLock::new(Vec::new())),
+    }));
 
     let def = crate::tasks::parse_task_md(
             "favetto/open_github_issue",
@@ -968,23 +969,23 @@ async fn run_one_binds_and_persists_a_deterministic_session_id() {
 
     let pool = crate::db::open(&dir.join("test.db")).await.unwrap();
     crate::db::migrate(&pool).await.unwrap();
-    let state = Arc::new(State::new(
-        pool,
-        EventBus::new(64),
-        Token::generate(),
-        WebhookSecrets {
+    let state = Arc::new(State::new(StateInit {
+        db: pool,
+        bus: EventBus::new(64),
+        token: Token::generate(),
+        webhooks: WebhookSecrets {
             github: None,
             linear: None,
         },
-        AgentManager::new(),
+        agents: AgentManager::new(),
         registry,
-        Arc::new(cfg),
-        dir.clone(),
-        dir.clone(),
-        Arc::new(RwLock::new(Vec::new())),
-        tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
-        Arc::new(RwLock::new(Vec::new())),
-    ));
+        config: Arc::new(cfg),
+        data_dir: dir.clone(),
+        tasks_dir: dir.clone(),
+        catalog: Arc::new(RwLock::new(Vec::new())),
+        scheduler: tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
+        hook_store: Arc::new(RwLock::new(Vec::new())),
+    }));
 
     let def = crate::tasks::parse_task_md("t", "agent = \"seedy\"\n---\nbody\n").unwrap();
     let task = Task {
@@ -1110,23 +1111,23 @@ async fn run_one_reads_spawn_file_before_reclaiming_worktree() {
 
     let pool = crate::db::open(&root.join("test.db")).await.unwrap();
     crate::db::migrate(&pool).await.unwrap();
-    let state = Arc::new(State::new(
-        pool,
-        EventBus::new(64),
-        Token::generate(),
-        WebhookSecrets {
+    let state = Arc::new(State::new(StateInit {
+        db: pool,
+        bus: EventBus::new(64),
+        token: Token::generate(),
+        webhooks: WebhookSecrets {
             github: None,
             linear: None,
         },
-        AgentManager::new(),
+        agents: AgentManager::new(),
         registry,
-        Arc::new(cfg),
-        root.clone(),
-        root.clone(),
-        Arc::new(RwLock::new(Vec::new())),
-        tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
-        Arc::new(RwLock::new(Vec::new())),
-    ));
+        config: Arc::new(cfg),
+        data_dir: root.clone(),
+        tasks_dir: root.clone(),
+        catalog: Arc::new(RwLock::new(Vec::new())),
+        scheduler: tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
+        hook_store: Arc::new(RwLock::new(Vec::new())),
+    }));
 
     let def = crate::tasks::parse_task_md(
         "favetto/triage_issues",
@@ -1203,23 +1204,23 @@ async fn join_state_with_config(
     let pool = crate::db::open(&dir.join("test.db")).await.unwrap();
     crate::db::migrate(&pool).await.unwrap();
     let registry = AgentRegistry::from_config_with(&cfg, &|_| true).unwrap();
-    Arc::new(State::new(
-        pool,
-        EventBus::new(64),
-        Token::generate(),
-        WebhookSecrets {
+    Arc::new(State::new(StateInit {
+        db: pool,
+        bus: EventBus::new(64),
+        token: Token::generate(),
+        webhooks: WebhookSecrets {
             github: None,
             linear: None,
         },
-        AgentManager::new(),
+        agents: AgentManager::new(),
         registry,
-        Arc::new(cfg),
-        dir.to_path_buf(),
-        dir.to_path_buf(),
-        Arc::new(RwLock::new(catalog)),
-        tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
-        Arc::new(RwLock::new(Vec::new())),
-    ))
+        config: Arc::new(cfg),
+        data_dir: dir.to_path_buf(),
+        tasks_dir: dir.to_path_buf(),
+        catalog: Arc::new(RwLock::new(catalog)),
+        scheduler: tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
+        hook_store: Arc::new(RwLock::new(Vec::new())),
+    }))
 }
 
 /// A `State` whose live catalog is `catalog`, with no usable agent.

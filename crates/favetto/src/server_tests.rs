@@ -2,6 +2,8 @@ use super::*;
 use favetto_core::rpc::error_code;
 use std::path::Path;
 
+use crate::state::StateInit;
+
 /// A unique scratch directory for server tests.
 fn temp_dir(tag: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -24,20 +26,22 @@ async fn test_state(dir: &Path, tasks_dir: &Path) -> Arc<State> {
         crate::tasks::load_catalog(tasks_dir).unwrap(),
     ));
     let scheduler = tokio_cron_scheduler::JobScheduler::new().await.unwrap();
-    Arc::new(State::new(
-        pool,
-        crate::event_bus::EventBus::new(64),
-        favetto_core::auth::Token::generate(),
-        crate::webhooks::WebhookSecrets::from_config(&crate::config::FavettoConfig::default()),
-        crate::agents::AgentManager::new(),
-        crate::agents::AgentRegistry::default(),
-        Arc::new(crate::config::FavettoConfig::default()),
-        dir.to_path_buf(),
-        tasks_dir.to_path_buf(),
+    Arc::new(State::new(StateInit {
+        db: pool,
+        bus: crate::event_bus::EventBus::new(64),
+        token: favetto_core::auth::Token::generate(),
+        webhooks: crate::webhooks::WebhookSecrets::from_config(
+            &crate::config::FavettoConfig::default(),
+        ),
+        agents: crate::agents::AgentManager::new(),
+        registry: crate::agents::AgentRegistry::default(),
+        config: Arc::new(crate::config::FavettoConfig::default()),
+        data_dir: dir.to_path_buf(),
+        tasks_dir: tasks_dir.to_path_buf(),
         catalog,
         scheduler,
-        Arc::new(parking_lot::RwLock::new(Vec::new())),
-    ))
+        hook_store: Arc::new(parking_lot::RwLock::new(Vec::new())),
+    }))
 }
 
 #[tokio::test]
@@ -352,20 +356,20 @@ async fn agent_state_with_config(
         crate::tasks::load_catalog(tasks_dir).unwrap(),
     ));
     let scheduler = tokio_cron_scheduler::JobScheduler::new().await.unwrap();
-    Arc::new(State::new(
-        pool,
-        crate::event_bus::EventBus::new(64),
-        favetto_core::auth::Token::generate(),
-        crate::webhooks::WebhookSecrets::from_config(&cfg),
-        crate::agents::AgentManager::new(),
+    Arc::new(State::new(StateInit {
+        db: pool,
+        bus: crate::event_bus::EventBus::new(64),
+        token: favetto_core::auth::Token::generate(),
+        webhooks: crate::webhooks::WebhookSecrets::from_config(&cfg),
+        agents: crate::agents::AgentManager::new(),
         registry,
-        Arc::new(cfg),
-        dir.to_path_buf(),
-        tasks_dir.to_path_buf(),
+        config: Arc::new(cfg),
+        data_dir: dir.to_path_buf(),
+        tasks_dir: tasks_dir.to_path_buf(),
         catalog,
         scheduler,
-        Arc::new(parking_lot::RwLock::new(Vec::new())),
-    ))
+        hook_store: Arc::new(parking_lot::RwLock::new(Vec::new())),
+    }))
 }
 
 /// A `State` whose registry carries the given `[agents.*]` entries and whose

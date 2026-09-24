@@ -11,7 +11,7 @@ use favetto_core::auth::Token;
 
 use crate::cli::DaemonArgs;
 use crate::config::FavettoConfig;
-use crate::state::State;
+use crate::state::{State, StateInit};
 use crate::webhooks::WebhookSecrets;
 use crate::{db, event_bus, hooks, transport};
 
@@ -111,20 +111,20 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     // Notification hooks start empty; the TUI adds them live via `hooks.upsert`.
     let hook_store = Arc::new(parking_lot::RwLock::new(Vec::new()));
 
-    let state = Arc::new(State::new(
-        pool,
+    let state = Arc::new(State::new(StateInit {
+        db: pool,
         bus,
         token,
         webhooks,
         agents,
         registry,
         config,
-        data_dir.clone(),
+        data_dir: data_dir.clone(),
         tasks_dir,
         catalog,
         scheduler,
-        hook_store.clone(),
-    ));
+        hook_store: hook_store.clone(),
+    }));
 
     // Materialize the catalog graph once at startup so `<data_dir>/workflow.dot`
     // exists even before the first catalog change.
