@@ -57,6 +57,9 @@ pub struct DaemonArgs {
     /// Directory of task-definition `.md` files (the task catalog).
     #[arg(long)]
     pub tasks_dir: Option<PathBuf>,
+    /// Serve the web client from this directory instead of the embedded assets.
+    #[arg(long)]
+    pub web_dir: Option<PathBuf>,
 }
 
 /// Hidden generator: regenerate `docs/reference/{config,cli,events,remote-api}.md`
