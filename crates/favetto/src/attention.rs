@@ -8,9 +8,11 @@
 //!
 //! [`AgentManager::wait`]: crate::agents::AgentManager::wait
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use favetto_core::model::{AwaitingInputReason, EventKind, TaskStatus};
@@ -22,6 +24,15 @@ use crate::state::State;
 
 /// How often the watcher polls the session's screen.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How often a user-started interactive run is probed for turn completion.
+/// The probe shells out to the agent CLI, so it is far less frequent than the
+/// screen poll.
+pub const TURN_PROBE_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Upper bound on a single turn-completion probe, so a wedged agent CLI cannot
+/// freeze the watcher (and the task) indefinitely.
+const TURN_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Consecutive matching polls required before marking (≥2 = 1 s at
 /// [`POLL_INTERVAL`]).
@@ -87,9 +98,20 @@ impl Debouncer {
     }
 }
 
+/// How a watched run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchEnd {
+    /// The session's process exited (or vanished) with this code.
+    Exited(Option<i32>),
+    /// The agent finished its interactive turn; the TUI process is still alive
+    /// and is left open for the user to inspect.
+    TurnFinished { success: bool },
+}
+
 /// Poll `session` until it exits, mirroring awaiting-input transitions onto
 /// `task_id` (when given) and the manager's per-session slot. Returns the exit
-/// code, like [`AgentManager::wait`].
+/// code, like [`AgentManager::wait`]. One-shot sessions end only when the user
+/// exits the CLI, so this never reports a finished turn.
 ///
 /// [`AgentManager::wait`]: crate::agents::AgentManager::wait
 pub async fn watch(
@@ -99,42 +121,119 @@ pub async fn watch(
     task_id: Option<Uuid>,
     quiet: Duration,
 ) -> Option<i32> {
+    match watch_inner(state, session, agent, task_id, quiet, true, None).await {
+        WatchEnd::Exited(code) => code,
+        WatchEnd::TurnFinished { .. } => Some(0),
+    }
+}
+
+/// Everything [`watch_run`] needs to observe one interactive catalog run.
+pub struct WatchRun<'a> {
+    pub session: &'a str,
+    pub agent: Arc<dyn Agent>,
+    pub task_id: Option<Uuid>,
+    /// How long the PTY must be quiet before the generic prompt detector fires.
+    pub quiet: Duration,
+    /// Whether to mirror awaiting-input transitions onto the task row.
+    pub detect: bool,
+    /// The run's working directory; scopes the turn-completion probe.
+    pub cwd: &'a Path,
+    /// When the run started; only sessions created at/after this count.
+    pub since: DateTime<Utc>,
+}
+
+/// Poll a user-started interactive catalog run until its agent finishes the
+/// seeded turn or the process exits.
+///
+/// Unlike [`watch`], this also probes `agent.interactive_turn_done` so an agent
+/// whose TUI stays open after completing its work (opencode) still finishes the
+/// task and fires its `spawn`/`needs` successors.
+pub async fn watch_run(state: &Arc<State>, run: WatchRun<'_>) -> WatchEnd {
+    watch_inner(
+        state,
+        run.session,
+        run.agent,
+        run.task_id,
+        run.quiet,
+        run.detect,
+        Some((run.cwd, run.since)),
+    )
+    .await
+}
+
+/// The shared watch loop. `interactive` carries the `(cwd, since)` used to probe
+/// for a finished interactive turn; `None` keeps the exit-based lifecycle.
+async fn watch_inner(
+    state: &Arc<State>,
+    session: &str,
+    agent: Arc<dyn Agent>,
+    task_id: Option<Uuid>,
+    quiet: Duration,
+    detect: bool,
+    interactive: Option<(&Path, DateTime<Utc>)>,
+) -> WatchEnd {
     let mut debouncer = Debouncer::default();
+    let mut last_probe = std::time::Instant::now();
+    let mut finished: Option<bool> = None;
     loop {
         if !state.agents.is_running(session) {
             break;
         }
-        let next = state
-            .agents
-            .detect_awaiting_input(session, agent.as_ref(), quiet);
-        if let Some(edge) = debouncer.observe(next) {
-            if let Some(task_id) = task_id {
-                match edge {
-                    Edge::Mark(reason) => mark_awaiting(state, task_id, session, &reason).await,
-                    Edge::Clear => {
-                        resume_task(state, task_id).await;
+        if detect {
+            let next = state
+                .agents
+                .detect_awaiting_input(session, agent.as_ref(), quiet);
+            if let Some(edge) = debouncer.observe(next) {
+                if let Some(task_id) = task_id {
+                    match edge {
+                        Edge::Mark(reason) => mark_awaiting(state, task_id, session, &reason).await,
+                        Edge::Clear => {
+                            resume_task(state, task_id).await;
+                        }
                     }
                 }
             }
+            state
+                .agents
+                .set_awaiting_input(session, debouncer.confirmed().cloned());
+            if let Some(task_id) = task_id {
+                // Self-heal: re-assert the confirmed state every poll so an
+                // external overwrite (or resurrection) is repaired within
+                // POLL_INTERVAL.
+                reconcile_task(state, task_id, debouncer.confirmed().is_some()).await;
+            }
         }
-        state
-            .agents
-            .set_awaiting_input(session, debouncer.confirmed().cloned());
-        if let Some(task_id) = task_id {
-            // Self-heal: re-assert the confirmed state every poll so an external
-            // overwrite (or resurrection) is repaired within POLL_INTERVAL.
-            reconcile_task(state, task_id, debouncer.confirmed().is_some()).await;
+
+        if let Some((cwd, since)) = interactive {
+            if last_probe.elapsed() >= TURN_PROBE_INTERVAL {
+                last_probe = std::time::Instant::now();
+                let probe_agent = agent.clone();
+                let probe_cwd = cwd.to_path_buf();
+                let probe = tokio::task::spawn_blocking(move || {
+                    probe_agent.interactive_turn_done(&probe_cwd, since)
+                });
+                if let Ok(Ok(Some(success))) = tokio::time::timeout(TURN_PROBE_TIMEOUT, probe).await
+                {
+                    finished = Some(success);
+                    break;
+                }
+            }
         }
+
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 
-    // The process is gone: drop the slot and restore a non-terminal baseline so
-    // the caller's terminal-state handling (which overwrites the row) is clean.
+    // The process is gone (or the turn finished): drop the slot and restore a
+    // non-terminal baseline so the caller's terminal-state handling (which
+    // overwrites the row) is clean.
     state.agents.set_awaiting_input(session, None);
     if let Some(task_id) = task_id {
         resume_task(state, task_id).await;
     }
-    state.agents.exit_code(session)
+    match finished {
+        Some(success) => WatchEnd::TurnFinished { success },
+        None => WatchEnd::Exited(state.agents.exit_code(session)),
+    }
 }
 
 /// Conditional status write + push. Returns true when a row changed.
@@ -189,7 +288,10 @@ async fn resume_task(state: &Arc<State>, task_id: Uuid) -> bool {
 mod tests {
     use super::*;
 
-    use crate::agents::{AgentContext, AgentManager, AgentRegistry, Invocation};
+    use crate::agents::{
+        Agent, AgentContext, AgentDescriptor, AgentManager, AgentRegistry, CommandSpec, Invocation,
+        SubmitStrategy,
+    };
     use crate::config::{AgentConfig, FavettoConfig};
     use crate::event_bus::EventBus;
     use crate::state::StateInit;
@@ -461,5 +563,211 @@ mod tests {
         let mut rx = state.bus.subscribe();
         assert!(!reconcile_task(&state, task.id, true).await);
         assert!(rx.try_recv().is_err());
+    }
+
+    /// A test agent whose command stays alive and whose turn-completion probe is
+    /// scripted, so `watch_run` can be exercised without a real CLI.
+    struct DoneAgent {
+        descriptor: AgentDescriptor,
+        script: String,
+        done: Option<bool>,
+    }
+
+    impl Agent for DoneAgent {
+        fn descriptor(&self) -> &AgentDescriptor {
+            &self.descriptor
+        }
+
+        fn command(&self, _: &Invocation<'_>, _: &AgentContext) -> anyhow::Result<CommandSpec> {
+            Ok(CommandSpec {
+                program: std::path::PathBuf::from("sh"),
+                args: vec!["-c".to_string(), self.script.clone()],
+                env: Default::default(),
+                cwd: None,
+                stdin_prompt: None,
+                stdin_eof: false,
+                submit: SubmitStrategy::None,
+            })
+        }
+
+        fn interactive_turn_done(&self, _cwd: &Path, _since: DateTime<Utc>) -> Option<bool> {
+            self.done
+        }
+    }
+
+    fn done_agent(script: &str, done: Option<bool>) -> Arc<dyn Agent> {
+        Arc::new(DoneAgent {
+            descriptor: AgentDescriptor {
+                id: "done".to_string(),
+                name: "Done".to_string(),
+                command: "sh".to_string(),
+                available: true,
+                capabilities: favetto_core::model::AgentCapabilities::default(),
+            },
+            script: script.to_string(),
+            done,
+        })
+    }
+
+    /// Insert a `Running` task row for `watch_run` to reconcile against.
+    async fn running_task(state: &Arc<State>) -> Uuid {
+        let task = favetto_core::model::Task {
+            id: Uuid::new_v4(),
+            name: "interactive".to_string(),
+            status: TaskStatus::Running,
+            input: serde_json::json!({}),
+            output: None,
+            dedupe_key: None,
+            created_at: chrono::Utc::now(),
+            started_at: Some(chrono::Utc::now()),
+            finished_at: None,
+            error: None,
+            session_id: None,
+            session_title: None,
+            parent_id: None,
+            root_id: None,
+            interactive: true,
+        };
+        db::insert_task(&state.db, &task).await.unwrap();
+        task.id
+    }
+
+    /// A user-started interactive run whose TUI never exits must still finish:
+    /// `watch_run` probes the agent and returns `TurnFinished` while the process
+    /// is alive, and leaves the session running for the Agent panel.
+    #[tokio::test]
+    async fn watch_run_finishes_a_turn_while_the_process_lives() {
+        let state = state_with_sh("exit 0").await;
+        let agent = done_agent("while true; do sleep 1; done", Some(true));
+        let task_id = running_task(&state).await;
+
+        let info = state
+            .agents
+            .start(
+                "done",
+                agent.clone(),
+                Some(task_id.to_string()),
+                Invocation::Interactive {
+                    prompt: None,
+                    provider: None,
+                    model: None,
+                },
+                AgentContext {
+                    rows: 40,
+                    cols: 120,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let end = watch_run(
+            &state,
+            WatchRun {
+                session: &info.id,
+                agent,
+                task_id: Some(task_id),
+                quiet: Duration::from_millis(50),
+                detect: true,
+                cwd: Path::new("/tmp"),
+                since: chrono::Utc::now(),
+            },
+        )
+        .await;
+
+        assert_eq!(end, WatchEnd::TurnFinished { success: true });
+        // The process is left alive so the panel can still attach to it.
+        assert!(state.agents.is_running(&info.id));
+        // The watcher restored the non-terminal baseline before returning.
+        let stored = db::get_task(&state.db, task_id).await.unwrap().unwrap();
+        assert_eq!(stored.status, TaskStatus::Running);
+
+        state.agents.close(&info.id).ok();
+    }
+
+    /// A failed turn is reported as such rather than as a clean completion.
+    #[tokio::test]
+    async fn watch_run_reports_a_failed_turn() {
+        let state = state_with_sh("exit 0").await;
+        let agent = done_agent("while true; do sleep 1; done", Some(false));
+        let task_id = running_task(&state).await;
+
+        let info = state
+            .agents
+            .start(
+                "done",
+                agent.clone(),
+                Some(task_id.to_string()),
+                Invocation::Interactive {
+                    prompt: None,
+                    provider: None,
+                    model: None,
+                },
+                AgentContext {
+                    rows: 40,
+                    cols: 120,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let end = watch_run(
+            &state,
+            WatchRun {
+                session: &info.id,
+                agent,
+                task_id: Some(task_id),
+                quiet: Duration::from_millis(50),
+                detect: true,
+                cwd: Path::new("/tmp"),
+                since: chrono::Utc::now(),
+            },
+        )
+        .await;
+
+        assert_eq!(end, WatchEnd::TurnFinished { success: false });
+        state.agents.close(&info.id).ok();
+    }
+
+    /// An agent with no turn probe keeps the exit-based lifecycle.
+    #[tokio::test]
+    async fn watch_run_without_a_probe_waits_for_exit() {
+        let state = state_with_sh("exit 0").await;
+        let agent = done_agent("sleep 0.2; exit 0", None);
+        let task_id = running_task(&state).await;
+
+        let info = state
+            .agents
+            .start(
+                "done",
+                agent.clone(),
+                Some(task_id.to_string()),
+                Invocation::Interactive {
+                    prompt: None,
+                    provider: None,
+                    model: None,
+                },
+                AgentContext {
+                    rows: 40,
+                    cols: 120,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let end = watch_run(
+            &state,
+            WatchRun {
+                session: &info.id,
+                agent,
+                task_id: Some(task_id),
+                quiet: Duration::from_millis(50),
+                detect: true,
+                cwd: Path::new("/tmp"),
+                since: chrono::Utc::now(),
+            },
+        )
+        .await;
+
+        assert_eq!(end, WatchEnd::Exited(Some(0)));
     }
 }

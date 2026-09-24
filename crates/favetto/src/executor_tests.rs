@@ -207,6 +207,7 @@ fn failed_run_preserves_session_info() {
             session_id: Some("ses_1".to_string()),
             session_title: Some("Fix the widget".to_string()),
             error: Some("exit 1".to_string()),
+            alive: false,
         }),
     );
     assert!(!success);
@@ -228,6 +229,7 @@ fn successful_run_records_output_and_session() {
             session_id: Some("ses_1".to_string()),
             session_title: Some("Fix the widget".to_string()),
             error: None,
+            alive: false,
         }),
     );
     assert!(success);
@@ -261,6 +263,7 @@ fn terminal_outcome_overrides_awaiting_input_status() {
             session_id: None,
             session_title: None,
             error: None,
+            alive: false,
         }),
     );
     assert!(success);
@@ -275,6 +278,7 @@ fn terminal_outcome_overrides_awaiting_input_status() {
             session_id: None,
             session_title: None,
             error: Some("exit 1".to_string()),
+            alive: false,
         }),
     );
     assert!(!success);
@@ -1118,6 +1122,85 @@ async fn run_one_runs_user_started_tasks_interactively() {
         output.contains("INTERACTIVE-SCREEN"),
         "screen text was not captured: {output:?}"
     );
+
+    state.agents.close(&live.id).ok();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Regression: a user-started interactive task whose TUI never exits must still
+/// complete once the agent finishes the seeded turn, so its `spawn` successors
+/// are launched. The fake `opencode` stays alive for the TUI but answers the
+/// turn-completion probe with a `succeeded` session outcome.
+#[cfg(unix)]
+#[tokio::test]
+async fn run_one_finishes_a_live_interactive_task_and_spawns() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("favetto-live-iv-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // The handoff the interactive task produces.
+    std::fs::write(dir.join("manifest.json"), r#"["child-input"]"#).unwrap();
+
+    let script = dir.join("fake-opencode.sh");
+    let script_body = r#"#!/bin/sh
+if [ "$1" = "api" ]; then
+  printf '{"data":[{"id":"ses_fake","outcome":"succeeded","location":{"directory":"%s"},"time":{"created":%s}}]}' "$(pwd)" "$(date +%s%3N)"
+  exit 0
+fi
+printf 'FAKE-OPENCODE-TUI\n'
+while true; do sleep 1; done
+"#;
+    std::fs::write(&script, script_body).unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let mut cfg = FavettoConfig::default();
+    cfg.agents.insert(
+        "opencode".to_string(),
+        crate::config::AgentConfig {
+            command: script.to_string_lossy().into_owned(),
+            ..Default::default()
+        },
+    );
+    let def = crate::tasks::parse_task_md(
+        "t",
+        "agent = \"opencode\"\nspawn = \"child\"\nspawn_file = \"manifest.json\"\n---\nbody\n",
+    )
+    .unwrap();
+    let state = join_state_with_config(&dir, vec![def.clone()], cfg).await;
+
+    let mut task = task_with_session(None, None);
+    task.interactive = true;
+    db::insert_task(&state.db, &task).await.unwrap();
+
+    let plan = Plan {
+        cwd: dir.clone(),
+        needs_lock: false,
+        worktree: None,
+    };
+    run_one(&state, task.clone(), def, plan, None).await;
+
+    let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Succeeded);
+
+    // The TUI process is still alive so the Agent panel can attach to it.
+    let live = state
+        .agents
+        .find_latest_by_task(&task.id.to_string())
+        .expect("interactive session retained");
+    assert!(!live.headless);
+    assert!(state.agents.is_running(&live.id));
+
+    // The successor was enqueued from the handoff — the part that regressed.
+    let children: Vec<_> = db::list_tasks(&state.db, 500)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.name == "child")
+        .collect();
+    assert_eq!(children.len(), 1, "spawn child was not enqueued");
+    assert_eq!(children[0].status, TaskStatus::Pending);
 
     state.agents.close(&live.id).ok();
     let _ = std::fs::remove_dir_all(&dir);

@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use favetto_core::model::AwaitingInputReason;
 use futures_util::future::BoxFuture;
 
@@ -118,6 +119,55 @@ impl Agent for OpenCodeAgent {
     fn awaiting_input(&self, screen: &vt100::Screen) -> Option<AwaitingInputReason> {
         super::detect::opencode_awaiting_input(&screen.contents())
     }
+
+    /// Ask the opencode server about the task's session, rather than waiting for
+    /// the TUI to exit. The background service tracks a per-session `outcome`
+    /// ("succeeded"/failed) once a turn completes, which is exactly the signal
+    /// needed to finish an interactive catalog task while its TUI stays open.
+    ///
+    /// `opencode api GET /api/session` returns every session with its
+    /// `location.directory` and `time.created`; we keep the newest one created in
+    /// this task's working directory at or after `since`, so a leftover session
+    /// from an earlier run in the same directory cannot be mistaken for this one.
+    fn interactive_turn_done(&self, cwd: &Path, since: DateTime<Utc>) -> Option<bool> {
+        let out = std::process::Command::new(&self.template.config.command)
+            .args(["api", "GET", "/api/session"])
+            .current_dir(cwd)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        // opencode resolves the directory it was launched in; canonicalize ours
+        // too so a symlinked path (e.g. `/tmp` on some hosts) compares equal.
+        let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        interactive_turn_done_from_json(
+            &String::from_utf8_lossy(&out.stdout),
+            &cwd,
+            since.timestamp_millis(),
+        )
+    }
+}
+
+/// Parse `opencode api GET /api/session` output and report the newest session in
+/// `cwd` created at or after `since_ms`: `None` while it is still running (no
+/// `outcome`), otherwise whether it succeeded.
+fn interactive_turn_done_from_json(raw: &str, cwd: &Path, since_ms: i64) -> Option<bool> {
+    let cwd = cwd.to_string_lossy();
+    let response: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let sessions = response.get("data")?.as_array()?;
+    let created_ms = |s: &serde_json::Value| {
+        s.pointer("/time/created")
+            .and_then(|t| t.as_i64())
+            .unwrap_or(i64::MIN)
+    };
+    let session = sessions
+        .iter()
+        .filter(|s| s.pointer("/location/directory").and_then(|d| d.as_str()) == Some(cwd.as_ref()))
+        .filter(|s| created_ms(s) >= since_ms)
+        .max_by_key(|s| created_ms(s))?;
+    let outcome = session.get("outcome").and_then(|o| o.as_str())?;
+    Some(outcome == "succeeded")
 }
 
 /// Find `session_id`'s title in `opencode session list --format json` output:
@@ -340,5 +390,77 @@ mod tests {
         let mut parser = vt100::Parser::new(10, 60, 0);
         parser.process(b"Ask anything...");
         assert!(agent().awaiting_input(parser.screen()).is_none());
+    }
+
+    /// A session still in flight has no `outcome` (it is not a required field):
+    /// the probe must not report it as finished, or an interactive task would
+    /// complete before doing any work.
+    #[test]
+    fn interactive_turn_done_ignores_a_session_without_outcome() {
+        let raw = r#"{"data":[{"id":"ses_1",
+            "location":{"directory":"/work/a"},
+            "time":{"created":2000}}]}"#;
+        assert_eq!(
+            interactive_turn_done_from_json(raw, Path::new("/work/a"), 1000),
+            None
+        );
+    }
+
+    #[test]
+    fn interactive_turn_done_reads_the_outcome() {
+        let raw = r#"{"data":[
+            {"id":"ses_old","outcome":"succeeded",
+             "location":{"directory":"/work/a"},"time":{"created":100}},
+            {"id":"ses_new","outcome":"succeeded",
+             "location":{"directory":"/work/a"},"time":{"created":2000}}
+        ]}"#;
+        assert_eq!(
+            interactive_turn_done_from_json(raw, Path::new("/work/a"), 1000),
+            Some(true)
+        );
+
+        // Any other terminal outcome (`failed`, `interrupted`) is not a success.
+        for outcome in ["failed", "interrupted"] {
+            let other = raw.replace(
+                "\"ses_new\",\"outcome\":\"succeeded\"",
+                &format!("\"ses_new\",\"outcome\":\"{outcome}\""),
+            );
+            assert_eq!(
+                interactive_turn_done_from_json(&other, Path::new("/work/a"), 1000),
+                Some(false),
+                "outcome: {outcome}"
+            );
+        }
+    }
+
+    /// A finished session from an earlier run in the same directory must not
+    /// complete the current task: only sessions created at/after `since` count.
+    #[test]
+    fn interactive_turn_done_ignores_sessions_older_than_since() {
+        let raw = r#"{"data":[{"id":"ses_old","outcome":"succeeded",
+            "location":{"directory":"/work/a"},
+            "time":{"created":100}}]}"#;
+        assert_eq!(
+            interactive_turn_done_from_json(raw, Path::new("/work/a"), 1000),
+            None
+        );
+        // A different directory is ignored even when newer.
+        let other = raw.replace("/work/a", "/work/b");
+        assert_eq!(
+            interactive_turn_done_from_json(&other, Path::new("/work/a"), 1000),
+            None
+        );
+    }
+
+    #[test]
+    fn interactive_turn_done_rejects_malformed_output() {
+        assert_eq!(
+            interactive_turn_done_from_json("not json", Path::new("/work/a"), 0),
+            None
+        );
+        assert_eq!(
+            interactive_turn_done_from_json("{}", Path::new("/work/a"), 0),
+            None
+        );
     }
 }

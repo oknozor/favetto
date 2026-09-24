@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
 
 use favetto_core::model::{AgentCapabilities, AwaitingInputReason};
@@ -215,6 +216,26 @@ pub trait Agent: Send + Sync {
     /// (a permission dialog, confirmation, choice, …). Defaults to `None`; the
     /// generic fallback in `AgentManager` still applies.
     fn awaiting_input(&self, _screen: &vt100::Screen) -> Option<AwaitingInputReason> {
+        None
+    }
+
+    /// Whether a user-started interactive run's seeded turn has already finished,
+    /// without waiting for the TUI process to exit.
+    ///
+    /// Some interactive CLIs (notably opencode) keep their TUI alive after the
+    /// agent answers the prompt, so a task would otherwise stay `running` forever
+    /// and never fire its `spawn`/`needs` successors. An implementation asks the
+    /// CLI's own session store about the most recent session created in `cwd` at
+    /// or after `since`:
+    ///
+    /// - `Some(true)` — the turn finished successfully;
+    /// - `Some(false)` — the turn finished with a failure;
+    /// - `None` — no signal, or the turn is still in flight (keep waiting).
+    ///
+    /// The default returns `None`, so an agent whose interactive mode exits on
+    /// its own keeps the exit-based lifecycle. This is a blocking probe: callers
+    /// run it off the async runtime.
+    fn interactive_turn_done(&self, _cwd: &Path, _since: DateTime<Utc>) -> Option<bool> {
         None
     }
 }

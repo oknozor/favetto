@@ -41,6 +41,9 @@ struct RunOutcome {
     session_id: Option<String>,
     session_title: Option<String>,
     error: Option<String>,
+    /// The interactive TUI process is still alive after its turn finished. Its
+    /// worktree must be kept, since the session still runs inside it.
+    alive: bool,
 }
 
 /// Fold a finished (or failed-to-start) agent run onto the task row. Returns
@@ -297,6 +300,9 @@ async fn run_one(
         )),
     };
 
+    // An interactive run that finished its turn keeps its TUI (and therefore its
+    // worktree) alive so the Agent panel can still attach to it.
+    let session_alive = matches!(&outcome, Ok(run) if run.alive);
     let success = record_run_outcome(&mut task, outcome);
     task.finished_at = Some(Utc::now());
 
@@ -364,6 +370,13 @@ async fn run_one(
     if let Some(wt) = &plan.worktree {
         if config.executor.keep_worktree {
             tracing::info!(path = %wt.path.display(), "worktree kept");
+        } else if session_alive {
+            // The interactive session still runs inside this worktree; retention
+            // (or a later disconnect) reclaims it once the task is terminal.
+            tracing::info!(
+                path = %wt.path.display(),
+                "worktree kept while the interactive session is still live"
+            );
         } else {
             remove_worktree(&state.db, task.id, &wt.repo, &wt.path, &wt.branch).await;
         }
@@ -671,10 +684,37 @@ async fn run_agent_task(
         state.config.executor.detect_awaiting_input,
         Duration::from_millis(state.config.executor.awaiting_input_quiet_ms),
     );
-    let code = if detect {
-        crate::attention::watch(state, &info.id, agent.clone(), Some(task.id), quiet).await
+    // A user-started interactive run is watched for a finished turn as well as
+    // for the process exit: opencode's TUI stays open after the agent answers
+    // the prompt, so waiting for it to exit would leave the task `running`
+    // forever and never fire its `spawn`/`needs` successors.
+    let end = if interactive {
+        let since = task.started_at.unwrap_or_else(Utc::now);
+        crate::attention::watch_run(
+            state,
+            crate::attention::WatchRun {
+                session: &info.id,
+                agent: agent.clone(),
+                task_id: Some(task.id),
+                quiet,
+                detect,
+                cwd,
+                since,
+            },
+        )
+        .await
+    } else if detect {
+        crate::attention::WatchEnd::Exited(
+            crate::attention::watch(state, &info.id, agent.clone(), Some(task.id), quiet).await,
+        )
     } else {
-        state.agents.wait(&info.id).await
+        crate::attention::WatchEnd::Exited(state.agents.wait(&info.id).await)
+    };
+    let (code, turn_finished) = match end {
+        crate::attention::WatchEnd::Exited(code) => (code, false),
+        crate::attention::WatchEnd::TurnFinished { success } => {
+            (Some(if success { 0 } else { 1 }), true)
+        }
     };
     // An interactive run's PTY holds a TUI, not machine output; capture the
     // emulator's plain-text screen instead of the raw escape stream.
@@ -692,14 +732,26 @@ async fn run_agent_task(
     // Prefer the title resolved (and already published) while the run was still
     // in progress. Only fall back to a fresh bounded lookup when the watcher
     // never saw a session id, so the retry budget is never spent twice in a row.
-    let session_title = match title_watch {
-        Some(handle) => match handle.await {
+    //
+    // When the task ended because the agent finished its turn, the process is
+    // still alive and (for an interactive run) never reports a session id, so
+    // the title watcher would block forever. Drop it and resolve best-effort.
+    let session_title = match (turn_finished, title_watch) {
+        (true, handle) => {
+            if let Some(handle) = handle {
+                handle.abort();
+            }
+            resolve_title_fallback(agent.clone(), result.session_id.clone(), cwd).await
+        }
+        (false, Some(handle)) => match handle.await {
             Ok(TitleWatch::Observed(title)) => title,
             Ok(TitleWatch::Skipped) | Err(_) => {
                 resolve_title_fallback(agent.clone(), result.session_id.clone(), cwd).await
             }
         },
-        None => resolve_title_fallback(agent.clone(), result.session_id.clone(), cwd).await,
+        (false, None) => {
+            resolve_title_fallback(agent.clone(), result.session_id.clone(), cwd).await
+        }
     };
     // The run's PTY only carried machine output (e.g. JSON events); drop it once
     // its session id is captured, since reattaching launches a fresh interactive
@@ -719,6 +771,9 @@ async fn run_agent_task(
     );
     let error = match result.exit_code {
         Some(0) => None,
+        Some(_) if turn_finished => Some(format!(
+            "agent '{agent_name}' finished the task unsuccessfully"
+        )),
         Some(c) => Some(format!("agent '{agent_name}' exited with {c}:\n{raw}")),
         None => Some(format!("agent '{agent_name}' session disappeared")),
     };
@@ -727,6 +782,7 @@ async fn run_agent_task(
         session_id: result.session_id,
         session_title,
         error,
+        alive: interactive && turn_finished,
     })
 }
 

@@ -41,6 +41,10 @@ mod vibe;
 
 pub(crate) use agent::{resolve_session_title, TITLE_POLL_ATTEMPTS, TITLE_POLL_INTERVAL};
 pub use agent::{Agent, AgentContext, Invocation, SubmitStrategy};
+// Re-exported for in-crate tests that build a fake `Agent`; the public trait
+// signature already names these types, so this is not a new public surface.
+#[cfg(test)]
+pub(crate) use agent::{AgentDescriptor, CommandSpec};
 pub use registry::AgentRegistry;
 
 /// Scrollback lines retained by each session's server-side emulator.

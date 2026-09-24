@@ -128,9 +128,12 @@ marked completed/failed when that session exits.
 A catalog task started with **Enter** on the Catalog tab runs the same way: the
 daemon launches the agent's real TUI (seeded with the rendered prompt) and the
 Agent panel attaches to it live and writable. The task is marked
-completed/failed when that session exits, so quit the agent CLI when the work is
-done. Only programmatic runs (schedules, hooks/webhooks, `needs`, `spawn`) stay
-headless and finish on their own.
+completed/failed as soon as the agent finishes the seeded turn, so a `spawn` or
+`needs` pipeline continues without you having to quit the CLI; the TUI is then
+left open so you can still inspect it or keep working by hand. Agents whose
+interactive mode exits on its own are completed/failed when the session exits
+instead. Only programmatic runs (schedules, hooks/webhooks, `needs`, `spawn`)
+stay headless and finish on their own.
 
 ## Workflow overlay
 

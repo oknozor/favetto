@@ -136,9 +136,13 @@ does, so tasks can be resumed after a restart.
 How a catalog task runs depends on who started it. A task you start from the
 **Catalog** runs in the agent's real interactive TUI, seeded with the rendered
 prompt (`prompt_args` plus `submit_prompt`, or the prompt on stdin); the Agent
-panel attaches to that single session live and writable, and the task finishes
-when the session exits — quit the TUI (or send the CLI's exit key) when the work
-is done. A task started programmatically — by a schedule, a webhook/hook,
+panel attaches to that single session live and writable. The task finishes as
+soon as the agent completes the seeded turn, so its `spawn`/`needs` successors
+fire without you having to quit the TUI: the daemon asks the agent's own session
+store whether that turn is done (opencode's per-session `outcome`) and keeps the
+TUI open afterwards for inspection, so you can still interact with it by hand.
+An agent whose interactive mode exits on its own finishes the task at exit
+instead. A task started programmatically — by a schedule, a webhook/hook,
 `needs`, or `spawn` — runs headless, using `headless_args` (or `run_args` when a
 model is set), so it completes unattended and captures structured output and the
 agent session id. A task with no agent and no default fails to start, and an
