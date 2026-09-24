@@ -42,6 +42,9 @@ pub struct StateContext {
     pub favetto_session: String,
     /// The agent's external session id, when known before launch.
     pub external_session: Option<String>,
+    /// The task/interactive prompt to send once the transport is ready, when the
+    /// launch did not already place it on the command line (RPC transports).
+    pub prompt: Option<String>,
     pub headless: bool,
     pub cwd: Option<PathBuf>,
     pub program: PathBuf,
