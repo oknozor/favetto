@@ -14,6 +14,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -28,7 +29,7 @@ fn dot_escape(s: &str) -> String {
 /// One node of the structured workflow graph: a catalog task or an `external`
 /// reference to a name absent from the catalog. `scheduled` mirrors
 /// `TaskDef::schedule`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowNode {
     pub name: String,
     #[serde(default)]
@@ -43,7 +44,7 @@ pub struct WorkflowNode {
 /// [`NeedsSucceeded`](Self::NeedsSucceeded), `needs = "other:failed"` is
 /// [`NeedsFailed`](Self::NeedsFailed), and the root-scoped fan-in
 /// `needs = "other:all_finished"` is [`Join`](Self::Join).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowEdgeKind {
     Spawn,
@@ -54,7 +55,7 @@ pub enum WorkflowEdgeKind {
 }
 
 /// One directed edge of the workflow graph (`from -> to`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowEdge {
     pub from: String,
     pub to: String,
@@ -63,7 +64,7 @@ pub struct WorkflowEdge {
 
 /// Structured, deterministic counterpart of [`build_dot`] — the graph the TUI
 /// lays out instead of parsing DOT.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowGraph {
     pub nodes: Vec<WorkflowNode>,
     pub edges: Vec<WorkflowEdge>,
@@ -73,7 +74,7 @@ pub struct WorkflowGraph {
 ///
 /// Deliberately excludes `output` and every other blob: per-task detail stays
 /// behind `tasks.get`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowTaskView {
     pub id: Uuid,
     pub name: String,
@@ -92,7 +93,7 @@ fn default_attempt() -> u32 {
 }
 
 /// Overall state of a workflow root in the runtime view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowState {
     Running,
@@ -104,7 +105,7 @@ pub enum WorkflowState {
 /// The runtime graph returned by `workflow.inspect`: the root's task instances
 /// plus id buckets. `ready`/`blocked` are the `Pending` split by whether a
 /// `needs` predecessor is still active.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowInspect {
     pub root_id: Uuid,
     pub root_task: String,
@@ -118,7 +119,7 @@ pub struct WorkflowInspect {
 
 /// One node created by `workflow.create`: the caller's local `key` plus the id
 /// and catalog name assigned to the new (or already-existing) task instance.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowNodeRef {
     /// The caller's local key, used by other nodes' `depends_on`.
     pub key: String,
@@ -128,7 +129,7 @@ pub struct WorkflowNodeRef {
 
 /// The result of `workflow.create`: the root the DAG belongs to and one
 /// [`WorkflowNodeRef`] per submitted task, in request order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowCreateResult {
     pub root_id: Uuid,
     pub tasks: Vec<WorkflowNodeRef>,
@@ -139,7 +140,7 @@ pub struct WorkflowCreateResult {
 ///
 /// Tasks that were already terminal are omitted, so `cancelled.len()` is the
 /// number of `TaskCancelled` events emitted for this request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowCancelResult {
     pub root_id: Uuid,
     pub cancelled: Vec<Uuid>,

@@ -8,6 +8,10 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod messages;
+
+pub use messages::*;
+
 /// Correlation id for a request/response pair. The TUI client increments a counter.
 pub type RequestId = u64;
 

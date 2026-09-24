@@ -159,6 +159,15 @@ fn description(node: &serde_json::Value) -> String {
         .to_string()
 }
 
+/// The purpose text for `method` from a `(name, purpose)` table.
+fn purpose_of<'a>(table: &'a [(&str, &str)], method: &str) -> &'a str {
+    table
+        .iter()
+        .find(|(name, _)| *name == method)
+        .map(|(_, purpose)| *purpose)
+        .unwrap_or("")
+}
+
 /// Render one object node as a `## <Title>` heading plus a field table.
 fn render_object(out: &mut String, title: &str, node: &serde_json::Value) {
     let _ = writeln!(out, "## {title}\n");
@@ -167,6 +176,56 @@ fn render_object(out: &mut String, title: &str, node: &serde_json::Value) {
         let _ = writeln!(out, "{}\n", desc.trim());
     }
 
+    let Some(properties) = node.get("properties").and_then(|v| v.as_object()) else {
+        let _ = writeln!(out, "{}\n", type_label(node));
+        return;
+    };
+
+    let required: Vec<&str> = node
+        .get("required")
+        .and_then(|v| v.as_array())
+        .map(|values| values.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    out.push_str(FIELD_TABLE);
+    for (name, property) in properties {
+        let is_required = required.contains(&name.as_str());
+        let default = property
+            .get("default")
+            .map(default_label)
+            .unwrap_or_else(|| "—".to_string());
+        let _ = writeln!(
+            out,
+            "| `{name}` | {} | {default} | {} | {} |",
+            cell(&type_label(property)),
+            if is_required { "yes" } else { "no" },
+            cell(&description(property)),
+        );
+    }
+    let _ = writeln!(out);
+}
+
+/// Resolve a single `$ref` against the schema's `$defs`/`definitions`, falling
+/// back to the node itself when it is not a reference (or the target is absent).
+fn resolve<'a>(
+    schema: &'a serde_json::Value,
+    node: &'a serde_json::Value,
+) -> &'a serde_json::Value {
+    if let Some(reference) = node.get("$ref").and_then(|v| v.as_str()) {
+        if let Some(target) = defs(schema)
+            .and_then(|d| d.as_object())
+            .and_then(|defs| defs.get(ref_name(reference)))
+        {
+            return target;
+        }
+    }
+    node
+}
+
+/// Render a schema node as a field table, or a single type label when it has no
+/// `properties` (e.g. a `Vec<T>` result or a scalar alias).
+fn render_schema_fields(out: &mut String, schema: &serde_json::Value, node: &serde_json::Value) {
+    let node = resolve(schema, node);
     let Some(properties) = node.get("properties").and_then(|v| v.as_object()) else {
         let _ = writeln!(out, "{}\n", type_label(node));
         return;
@@ -338,12 +397,41 @@ pub fn render_remote_api() -> String {
     }
     let _ = writeln!(out);
 
+    out.push_str(CLIENT_SCHEMAS_HEADING);
+    for spec in rpc::CLIENT_CALLS {
+        let _ = writeln!(out, "### `{}`\n", spec.method);
+        let _ = writeln!(
+            out,
+            "{}\n",
+            cell(purpose_of(rpc::CLIENT_METHODS, spec.method))
+        );
+        out.push_str(REQUEST_HEADING);
+        let params = (spec.params_schema)();
+        render_schema_fields(&mut out, &params, &params);
+        out.push_str(RESPONSE_HEADING);
+        let result = (spec.result_schema)();
+        render_schema_fields(&mut out, &result, &result);
+    }
+
     out.push_str(SERVER_PUSHES_HEADING);
     out.push_str(METHOD_TABLE);
     for (name, purpose) in rpc::SERVER_PUSHES {
         let _ = writeln!(out, "| `{name}` | {} |", cell(purpose));
     }
     let _ = writeln!(out);
+
+    out.push_str(SERVER_SCHEMAS_HEADING);
+    for spec in rpc::PUSH_CALLS {
+        let _ = writeln!(out, "### `{}`\n", spec.method);
+        let _ = writeln!(
+            out,
+            "{}\n",
+            cell(purpose_of(rpc::SERVER_PUSHES, spec.method))
+        );
+        out.push_str(PAYLOAD_HEADING);
+        let payload = (spec.params_schema)();
+        render_schema_fields(&mut out, &payload, &payload);
+    }
 
     out.push_str(ERROR_CODES_HEADING);
     out.push_str(ERROR_TABLE);
@@ -524,6 +612,22 @@ mod tests {
         for (name, _) in rpc::SERVER_PUSHES {
             assert!(rendered.contains(name), "remote API is missing {name}");
         }
+    }
+
+    /// The per-method request/response tables are generated from the typed
+    /// metadata, not hand-maintained.
+    #[test]
+    fn render_remote_api_includes_typed_request_and_response_tables() {
+        let rendered = render_remote_api();
+        assert!(rendered.contains(CLIENT_SCHEMAS_HEADING));
+        assert!(rendered.contains(SERVER_SCHEMAS_HEADING));
+        // A typed params field and a typed result field render as table rows.
+        assert!(rendered.contains("**Request**"));
+        assert!(rendered.contains("**Response**"));
+        assert!(rendered.contains("`session_id`"), "{rendered}");
+        // A `Vec<T>` result renders as a type label rather than a table.
+        assert!(rendered.contains("Task[]"), "{rendered}");
+        assert!(rendered.contains("**Payload**"));
     }
 
     #[test]

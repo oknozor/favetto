@@ -15,7 +15,7 @@ use tokio::net::UnixStream;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::codec::Framed;
 
-use favetto_core::rpc::{Frame, Notification, Request, RequestId, Response};
+use favetto_core::rpc::{Frame, Notification, Request, RequestId, Response, RpcCall};
 use favetto_core::wire::FrameCodec;
 
 use crate::ws;
@@ -169,6 +169,36 @@ impl Client {
     /// Subscribe to server pushes (events, task updates, log lines).
     pub fn subscribe(&self) -> broadcast::Receiver<Notification> {
         self.push_tx.subscribe()
+    }
+
+    /// Send a typed request and await its typed result (5s timeout).
+    ///
+    /// The typed layer is a thin wrapper over [`Client::request`]: params are
+    /// serialized to the same JSON/MessagePack representation and the result is
+    /// decoded into the method's [`RpcCall::Result`]. A method error becomes an
+    /// `anyhow` error carrying the numeric code and message.
+    pub async fn call<C: RpcCall>(&self, params: C::Params) -> anyhow::Result<C::Result> {
+        self.call_with_timeout::<C>(params, Duration::from_secs(5))
+            .await
+    }
+
+    /// Send a typed request and await its typed result with an explicit timeout.
+    pub async fn call_with_timeout<C: RpcCall>(
+        &self,
+        params: C::Params,
+        timeout: Duration,
+    ) -> anyhow::Result<C::Result> {
+        let params = serde_json::to_value(params).context("serialize params")?;
+        let response = self
+            .request_with_timeout(C::METHOD, params, timeout)
+            .await?;
+        if let Some(error) = response.error {
+            anyhow::bail!("rpc error {}: {}", error.code, error.message);
+        }
+        let result = response
+            .result
+            .ok_or_else(|| anyhow::anyhow!("rpc returned no result"))?;
+        serde_json::from_value(result).context("decode result")
     }
 }
 
@@ -430,5 +460,71 @@ mod tests {
             "connect blocked for {:?}",
             started.elapsed()
         );
+    }
+
+    /// A typed `call` serializes its params, sends the method name, and decodes
+    /// the typed result; a typed RPC error surfaces with its code.
+    #[tokio::test]
+    async fn call_round_trips_a_typed_result_and_surfaces_errors() {
+        use favetto_core::rpc::{
+            PingCall, PingResult, Response, RpcError, TaskIdParams, TasksGetCall,
+        };
+        use tokio_util::codec::Framed;
+
+        async fn connect(reply: Frame) -> (Client, tokio::task::JoinHandle<Request>) {
+            let (a, b) = tokio::io::duplex(4096);
+            let (client_out, client_in) = Framed::new(a, FrameCodec).split();
+            let incoming: ClientStream =
+                Box::pin(client_in.map(|r| r.map_err(|e| anyhow::anyhow!(e))));
+            let outgoing: ClientSink = Box::pin(client_out.sink_map_err(|e| anyhow::anyhow!(e)));
+            let client = Client::from_streams(incoming, outgoing).unwrap();
+
+            let server = tokio::spawn(async move {
+                let mut framed = Framed::new(b, FrameCodec);
+                let req = match framed.next().await {
+                    Some(Ok(Frame::Request(req))) => req,
+                    other => panic!("expected a request, got {other:?}"),
+                };
+                let mut reply = reply;
+                if let Frame::Response(resp) = &mut reply {
+                    resp.id = req.id;
+                }
+                framed.send(reply).await.unwrap();
+                req
+            });
+            (client, server)
+        }
+
+        let ok = Frame::Response(Response::ok(
+            0,
+            serde_json::to_value(PingResult {
+                pong: true,
+                cwd: "/daemon".to_string(),
+            })
+            .unwrap(),
+        ));
+        let (client, server) = connect(ok).await;
+        let result: PingResult = client.call::<PingCall>(Default::default()).await.unwrap();
+        assert!(result.pong);
+        assert_eq!(result.cwd, "/daemon");
+        let request = server.await.unwrap();
+        assert_eq!(request.method, "system.ping");
+
+        let err = Frame::Response(Response {
+            id: 0,
+            result: None,
+            error: Some(RpcError::InvalidParams("task not found".to_string()).to_object()),
+        });
+        let (client, server) = connect(err).await;
+        let error = client
+            .call::<TasksGetCall>(TaskIdParams {
+                id: uuid::Uuid::new_v4(),
+            })
+            .await
+            .expect_err("an error response must surface");
+        assert!(error.to_string().contains("task not found"), "{error}");
+        let request = server.await.unwrap();
+        assert_eq!(request.method, "tasks.get");
+        assert!(request.params.get("id").is_some());
     }
 }
