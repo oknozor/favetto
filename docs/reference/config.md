@@ -1,6 +1,6 @@
 # Configuration reference
 
-Generated from `crates/favetto/src/config.rs` by the docs generator. Do not edit by hand.
+Generated from `crates/favetto-core/src/config.rs` by the docs generator. Do not edit by hand.
 
 Every section is optional; favetto falls back to built-in defaults for anything you omit. Values resolve in the order **CLI flag → config file → built-in default**, and every `FAVETTO__SECTION__KEY` environment variable overrides the file.
 

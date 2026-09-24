@@ -19,7 +19,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Daemon(args) => favetto::daemon::run(args).await,
-        Command::Tui(args) => favetto::tui::run(args).await,
+        Command::Tui(args) => favetto_tui::tui::run(args).await,
         Command::Pair(args) => favetto::pair::run(args).await,
         Command::TokenRotate(args) => token_rotate(args),
         Command::Doc(args) => favetto::docgen::run(&args),
