@@ -22,9 +22,12 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+use crate::model::{Failure, FailureKind};
 
 #[derive(Debug, Clone, Default, JsonSchema, Serialize, Deserialize)]
 pub struct FavettoConfig {
@@ -457,6 +460,22 @@ fn default_awaiting_input_quiet_ms() -> u64 {
     8000
 }
 
+fn default_retry_max_attempts() -> u32 {
+    1
+}
+
+fn default_retry_initial_ms() -> u64 {
+    5_000
+}
+
+fn default_retry_max_ms() -> u64 {
+    300_000
+}
+
+fn default_retry_on() -> Vec<FailureKind> {
+    vec![FailureKind::Infrastructure, FailureKind::Timeout]
+}
+
 /// What the startup reconciler does with a task whose in-flight run was left
 /// behind by a previous daemon instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, JsonSchema, Serialize, Deserialize)]
@@ -467,6 +486,86 @@ pub enum StaleRunPolicy {
     Fail,
     /// Re-enqueue the owning task so the executor claims a fresh attempt.
     Retry,
+}
+
+/// How the delay between automatic retry attempts grows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, JsonSchema, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Backoff {
+    /// `initial_ms * 2^(attempt - 1)`, capped at `max_ms`.
+    #[default]
+    Exponential,
+    /// A constant `initial_ms` between every attempt.
+    Fixed,
+}
+
+/// Automatic retry policy for retryable task failures (`[executor.retry]`).
+///
+/// Retries are opt-in: the default `max_attempts = 1` means a task runs exactly
+/// once. When enabled, after a failed attempt whose [`FailureKind`] is listed in
+/// `retry_on`, the executor re-enqueues the task for `attempt + 1` after the
+/// backoff, recording one run per attempt. Agent and invalid-input failures are
+/// excluded from the default `retry_on`, so a genuine failure is never retried
+/// on its own.
+#[derive(Debug, Clone, PartialEq, Eq, JsonSchema, Serialize, Deserialize)]
+pub struct RetrySettings {
+    /// Total execution attempts allowed per task, including the first. `1`
+    /// (default) disables automatic retries.
+    #[serde(default = "default_retry_max_attempts")]
+    pub max_attempts: u32,
+    /// How the delay between attempts grows.
+    #[serde(default)]
+    pub backoff: Backoff,
+    /// Base delay before the second attempt, in milliseconds.
+    #[serde(default = "default_retry_initial_ms")]
+    pub initial_ms: u64,
+    /// Upper bound on any single backoff delay, in milliseconds.
+    #[serde(default = "default_retry_max_ms")]
+    pub max_ms: u64,
+    /// Failure kinds eligible for automatic retry. Defaults to infrastructure
+    /// and timeout faults; `agent` and `invalid_input` should stay out.
+    #[serde(default = "default_retry_on")]
+    pub retry_on: Vec<FailureKind>,
+}
+
+impl Default for RetrySettings {
+    fn default() -> Self {
+        Self {
+            max_attempts: default_retry_max_attempts(),
+            backoff: Backoff::default(),
+            initial_ms: default_retry_initial_ms(),
+            max_ms: default_retry_max_ms(),
+            retry_on: default_retry_on(),
+        }
+    }
+}
+
+impl RetrySettings {
+    /// Whether `failure` from attempt `attempt` (1-based) should be retried
+    /// automatically. The failure must be marked retryable (so a producer can
+    /// veto a retry per failure), its kind must be enabled in `retry_on`, and
+    /// the attempt budget (`max_attempts`) must not be exhausted.
+    pub fn should_retry(&self, attempt: u32, failure: &Failure) -> bool {
+        attempt >= 1
+            && attempt < self.max_attempts
+            && failure.retryable
+            && self.retry_on.contains(&failure.kind)
+    }
+
+    /// The delay before the attempt that follows a failure at `attempt`
+    /// (1-based). Exponential backoff doubles from `initial_ms`, capped at
+    /// `max_ms`; fixed backoff always returns `initial_ms` (also capped).
+    pub fn backoff_delay(&self, attempt: u32) -> Duration {
+        let exponent = attempt.saturating_sub(1).min(31);
+        let ms = match self.backoff {
+            Backoff::Fixed => self.initial_ms,
+            Backoff::Exponential => {
+                let factor = 1u64.checked_shl(exponent).unwrap_or(u64::MAX);
+                self.initial_ms.saturating_mul(factor)
+            }
+        };
+        Duration::from_millis(ms.min(self.max_ms))
+    }
 }
 
 /// How the executor runs tasks: concurrency and directory/worktree isolation.
@@ -515,6 +614,9 @@ pub struct ExecutorSettings {
     /// (default) marks it failed, `"retry"` re-enqueues it for a fresh attempt.
     #[serde(default)]
     pub stale_run: StaleRunPolicy,
+    /// Automatic retry policy for retryable failures. Disabled by default.
+    #[serde(default)]
+    pub retry: RetrySettings,
 }
 
 impl Default for ExecutorSettings {
@@ -530,6 +632,7 @@ impl Default for ExecutorSettings {
             detect_awaiting_input: true,
             awaiting_input_quiet_ms: default_awaiting_input_quiet_ms(),
             stale_run: StaleRunPolicy::default(),
+            retry: RetrySettings::default(),
         }
     }
 }
@@ -831,6 +934,96 @@ mod tests {
 
         let explicit: FavettoConfig = toml::from_str("[executor]\nstale_run = \"fail\"\n").unwrap();
         assert_eq!(explicit.executor.stale_run, StaleRunPolicy::Fail);
+    }
+
+    #[test]
+    fn retry_defaults_disable_automatic_retries() {
+        let cfg: FavettoConfig = toml::from_str("").unwrap();
+        let retry = &cfg.executor.retry;
+        assert_eq!(retry.max_attempts, 1);
+        assert_eq!(retry.backoff, Backoff::Exponential);
+        assert_eq!(retry.initial_ms, 5_000);
+        assert_eq!(retry.max_ms, 300_000);
+        assert_eq!(
+            retry.retry_on,
+            vec![FailureKind::Infrastructure, FailureKind::Timeout]
+        );
+    }
+
+    #[test]
+    fn parses_executor_retry() {
+        let cfg: FavettoConfig = toml::from_str(
+            r#"
+            [executor.retry]
+            max_attempts = 4
+            backoff = "fixed"
+            initial_ms = 250
+            max_ms = 1000
+            retry_on = ["infrastructure", "agent"]
+            "#,
+        )
+        .unwrap();
+        let retry = &cfg.executor.retry;
+        assert_eq!(retry.max_attempts, 4);
+        assert_eq!(retry.backoff, Backoff::Fixed);
+        assert_eq!(retry.initial_ms, 250);
+        assert_eq!(retry.max_ms, 1000);
+        assert_eq!(
+            retry.retry_on,
+            vec![FailureKind::Infrastructure, FailureKind::Agent]
+        );
+    }
+
+    #[test]
+    fn retry_decision_respects_kind_and_attempt_budget() {
+        let retry = RetrySettings {
+            max_attempts: 3,
+            ..RetrySettings::default()
+        };
+        let infra = Failure::new(FailureKind::Infrastructure, "PTY died");
+        let agent = Failure::new(FailureKind::Agent, "exit 1");
+
+        assert!(retry.should_retry(1, &infra));
+        assert!(retry.should_retry(2, &infra));
+        // The third attempt is the last: no fourth attempt.
+        assert!(!retry.should_retry(3, &infra));
+        // Attempt 0 means the task never ran: nothing to retry.
+        assert!(!retry.should_retry(0, &infra));
+        // Agent failures are never in the default `retry_on`.
+        assert!(!retry.should_retry(1, &agent));
+        // A producer can veto a retry even for an enabled kind.
+        let vetoed = Failure {
+            kind: FailureKind::Infrastructure,
+            message: "do not retry".to_string(),
+            retryable: false,
+        };
+        assert!(!retry.should_retry(1, &vetoed));
+        // Disabled by default.
+        assert!(!RetrySettings::default().should_retry(1, &infra));
+    }
+
+    #[test]
+    fn backoff_delay_grows_exponentially_and_is_capped() {
+        let retry = RetrySettings {
+            backoff: Backoff::Exponential,
+            initial_ms: 100,
+            max_ms: 1_000,
+            ..RetrySettings::default()
+        };
+        assert_eq!(retry.backoff_delay(1), Duration::from_millis(100));
+        assert_eq!(retry.backoff_delay(2), Duration::from_millis(200));
+        assert_eq!(retry.backoff_delay(3), Duration::from_millis(400));
+        // 100 * 2^4 = 1600, capped at max_ms.
+        assert_eq!(retry.backoff_delay(5), Duration::from_millis(1_000));
+
+        let fixed = RetrySettings {
+            backoff: Backoff::Fixed,
+            initial_ms: 100,
+            max_ms: 1_000,
+            ..RetrySettings::default()
+        };
+        assert_eq!(fixed.backoff_delay(1), Duration::from_millis(100));
+        assert_eq!(fixed.backoff_delay(9), Duration::from_millis(100));
     }
 
     #[test]

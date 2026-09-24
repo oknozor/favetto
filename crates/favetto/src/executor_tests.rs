@@ -381,6 +381,7 @@ async fn fail_task_records_the_requested_kind() {
 fn finished_payload_keeps_legacy_fields_and_adds_context() {
     let mut task = task_with_session(None, None);
     task.status = TaskStatus::Succeeded;
+    task.attempt = 1;
     task.output = Some(serde_json::json!({
         "envelope": { "summary": "Added the widget" }
     }));
@@ -399,6 +400,7 @@ fn finished_payload_keeps_legacy_fields_and_adds_context() {
 fn finished_payload_reports_a_retryable_failure() {
     let mut task = task_with_session(None, None);
     task.status = TaskStatus::Failed;
+    task.attempt = 1;
     task.error = Some("PTY died".to_string());
     task.failure = Some(Failure::new(FailureKind::Infrastructure, "PTY died"));
 
@@ -463,7 +465,10 @@ async fn fail_task_emits_an_enriched_finished_event() {
     std::fs::create_dir_all(&dir).unwrap();
     let state = join_state(&dir, Vec::new()).await;
 
-    let task = task_with_session(None, None);
+    let mut task = task_with_session(None, None);
+    // A pre-dispatch failure is still `pending` when `fail_task` runs, so the
+    // claim succeeds and the failed run is counted as attempt 1.
+    task.status = TaskStatus::Pending;
     db::insert_task(&state.db, &task).await.unwrap();
 
     fail_task(
@@ -1444,6 +1449,175 @@ async fn run_one_records_a_failed_run() {
     assert_eq!(
         runs[0].failure.as_ref().map(|f| f.kind),
         Some(FailureKind::Agent)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A retryable failure re-enqueues the task for a fresh attempt instead of
+/// finalizing it. The failed attempt still records exactly one run, and no
+/// `TaskFinished` fires until the attempt budget is spent.
+#[tokio::test]
+async fn run_one_auto_retries_an_infrastructure_failure() {
+    let dir = std::env::temp_dir().join(format!("favetto-auto-retry-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut cfg = FavettoConfig::default();
+    // No `[agents.ghost]` entry: resolving it is an infrastructure failure.
+    cfg.agent.default = Some("ghost".to_string());
+    cfg.executor.retry.max_attempts = 2;
+    cfg.executor.retry.retry_on = vec![FailureKind::Infrastructure];
+    cfg.executor.retry.initial_ms = 0;
+    let def = crate::tasks::parse_task_md("t", "---\nbody\n").unwrap();
+    let state = join_state_with_config(&dir, vec![def.clone()], cfg).await;
+
+    let task = task_with_session(None, None);
+    db::insert_task(&state.db, &task).await.unwrap();
+
+    let plan = Plan {
+        cwd: dir.clone(),
+        needs_lock: false,
+        worktree: None,
+    };
+    let run = running_run(task.id);
+    db::insert_task_run(&state.db, &run).await.unwrap();
+    run_one(&state, task.clone(), run, def, plan, None).await;
+
+    // The failed attempt is recorded, but the task is back in the queue.
+    let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Pending);
+    assert_eq!(stored.attempt, 1);
+    assert!(
+        stored.failure.is_none(),
+        "the retry clears the visible failure"
+    );
+    let runs = db::list_task_runs(&state.db, task.id).await.unwrap();
+    assert_eq!(runs.len(), 1, "exactly one run per attempt");
+    assert_eq!(runs[0].status, RunStatus::Failed);
+    assert_eq!(runs[0].attempt, 1);
+    assert_eq!(
+        runs[0].failure.as_ref().map(|f| f.kind),
+        Some(FailureKind::Infrastructure)
+    );
+
+    // The attempt is not terminal yet: no terminal event fires.
+    let events = db::tail_events(&state.db, 20).await.unwrap();
+    assert!(
+        events.iter().all(|e| e.kind != EventKind::TaskFinished),
+        "a retried attempt must not emit TaskFinished"
+    );
+    assert!(events.iter().all(|e| e.kind != EventKind::TaskFailed));
+
+    // Once the (zero-length) backoff passes, the next claim records attempt 2.
+    let pending = db::next_pending_tasks(&state.db, 10).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    let run = db::claim_task(&state.db, &pending[0])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.attempt, 2);
+    assert_eq!(
+        db::list_task_runs(&state.db, task.id).await.unwrap().len(),
+        2
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A genuine agent failure is not in the default `retry_on`, so it terminates
+/// immediately even with a retry budget configured.
+#[cfg(unix)]
+#[tokio::test]
+async fn run_one_does_not_auto_retry_agent_failures() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("favetto-no-retry-agent-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("fake-fail.sh");
+    std::fs::write(&script, "#!/bin/sh\nexit 3\n").unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let mut cfg = FavettoConfig::default();
+    cfg.agent.default = Some("fail".to_string());
+    cfg.agents.insert(
+        "fail".to_string(),
+        crate::config::AgentConfig {
+            command: script.to_string_lossy().into_owned(),
+            headless_args: Some(vec!["{prompt}".to_string()]),
+            ..Default::default()
+        },
+    );
+    cfg.executor.retry.max_attempts = 3;
+    let def = crate::tasks::parse_task_md("t", "---\nbody\n").unwrap();
+    let state = join_state_with_config(&dir, vec![def.clone()], cfg).await;
+
+    let task = task_with_session(None, None);
+    db::insert_task(&state.db, &task).await.unwrap();
+
+    let plan = Plan {
+        cwd: dir.clone(),
+        needs_lock: false,
+        worktree: None,
+    };
+    let run = running_run(task.id);
+    db::insert_task_run(&state.db, &run).await.unwrap();
+    run_one(&state, task.clone(), run, def, plan, None).await;
+
+    let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Failed);
+    assert_eq!(
+        stored.failure.as_ref().map(|f| f.kind),
+        Some(FailureKind::Agent)
+    );
+    let events = db::tail_events(&state.db, 20).await.unwrap();
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::TaskFinished),
+        "a terminal agent failure emits TaskFinished"
+    );
+    assert_eq!(
+        db::list_task_runs(&state.db, task.id).await.unwrap().len(),
+        1
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Once the attempt budget is spent, even a retryable failure terminates.
+#[tokio::test]
+async fn run_one_stops_retrying_once_the_attempt_budget_is_spent() {
+    let dir = std::env::temp_dir().join(format!("favetto-retry-budget-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut cfg = FavettoConfig::default();
+    cfg.agent.default = Some("ghost".to_string());
+    cfg.executor.retry.max_attempts = 2;
+    cfg.executor.retry.retry_on = vec![FailureKind::Infrastructure];
+    let def = crate::tasks::parse_task_md("t", "---\nbody\n").unwrap();
+    let state = join_state_with_config(&dir, vec![def.clone()], cfg).await;
+
+    let task = task_with_session(None, None);
+    db::insert_task(&state.db, &task).await.unwrap();
+
+    let plan = Plan {
+        cwd: dir.clone(),
+        needs_lock: false,
+        worktree: None,
+    };
+    // The second attempt is already the last one.
+    let mut run = running_run(task.id);
+    run.attempt = 2;
+    db::insert_task_run(&state.db, &run).await.unwrap();
+    run_one(&state, task.clone(), run, def, plan, None).await;
+
+    let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Failed);
+    assert_eq!(stored.attempt, 2);
+    let events = db::tail_events(&state.db, 20).await.unwrap();
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::TaskFinished),
+        "the final attempt emits TaskFinished"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

@@ -168,7 +168,7 @@ pub struct TaskRun {
 
 /// Why a task ended in failure, so a controller can distinguish a genuine
 /// agent failure from an infrastructure fault.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureKind {
     /// The agent ran and reported failure (non-zero exit, rejected work, …).

@@ -29,7 +29,7 @@ use favetto_core::model::{
 };
 
 use crate::agents::{resolve_session_title, Agent, TITLE_POLL_ATTEMPTS, TITLE_POLL_INTERVAL};
-use crate::config::{ExecutorSettings, StaleRunPolicy};
+use crate::config::{ExecutorSettings, RetrySettings, StaleRunPolicy};
 use crate::db;
 use crate::event_bus::ServerPush;
 use crate::state::State;
@@ -95,6 +95,52 @@ fn record_run_outcome(task: &mut Task, outcome: Result<RunOutcome, RunError>) ->
             task.status = TaskStatus::Failed;
             task.error = Some(e.message.clone());
             task.failure = Some(Failure::new(e.kind, e.message));
+            false
+        }
+    }
+}
+
+/// Persist an automatic retry for a failed attempt and announce the re-enqueue.
+///
+/// The task is flipped back to `pending` with a `retry_at` deadline (the
+/// configured backoff after the attempt that just failed); the dispatcher claims
+/// it once the deadline passes and records the next run under `attempt + 1`. The
+/// failed run history is kept. Returns `true` when a retry was scheduled, so the
+/// caller suppresses the terminal events for this attempt.
+async fn schedule_auto_retry(state: &State, task: &Task, retry: &RetrySettings) -> bool {
+    let Some(failure) = task.failure.as_ref() else {
+        return false;
+    };
+    if !retry.should_retry(task.attempt, failure) {
+        return false;
+    }
+    let delay = retry.backoff_delay(task.attempt);
+    let at =
+        Utc::now() + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::zero());
+    match db::schedule_task_retry(&state.db, task.id, at).await {
+        Ok(true) => {
+            tracing::info!(
+                task_id = %task.id,
+                attempt = task.attempt,
+                retry_in_ms = delay.as_millis(),
+                "scheduling automatic retry"
+            );
+            if let Ok(Some(fresh)) = db::get_task(&state.db, task.id).await {
+                state
+                    .bus
+                    .publish(ServerPush::TaskUpdated(Box::new(fresh.summary())));
+                state
+                    .emit_event(
+                        EventKind::TaskIdle,
+                        serde_json::json!({ "name": fresh.name, "task_id": fresh.id }),
+                    )
+                    .await;
+            }
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            tracing::warn!(task_id = %task.id, error = %e, "failed to schedule automatic retry");
             false
         }
     }
@@ -584,31 +630,38 @@ async fn run_one(
         }
     }
 
-    let kind = if success {
-        EventKind::TaskCompleted
-    } else {
-        EventKind::TaskFailed
-    };
-    state
-        .emit_event(kind, serde_json::json!({ "task_id": task.id }))
-        .await;
-    state
-        .emit_event(EventKind::TaskFinished, finished_payload(&task, success))
-        .await;
+    // A failure eligible for an automatic retry re-enqueues the task for a fresh
+    // attempt instead of ending it: the attempt is not terminal, so the terminal
+    // events (and any `spawn`) wait for a later attempt.
+    let retrying = !success && schedule_auto_retry(state, &task, &config.executor.retry).await;
 
-    if success {
-        if let Some(spawn_task) = def.spawn.clone() {
-            if let Err(e) = spawn_from_manifest(state, &task, &def, &plan.cwd).await {
-                tracing::warn!(task = %task.name, error = %e, "failed to spawn tasks from handoff");
-            }
-            // The parent's own `TaskFinished` was emitted above, before the
-            // manifest was read, so a fan-in on the spawned child is evaluated
-            // here instead. This is also what lets an empty manifest (`[]`)
-            // resolve the barrier. A new-root spawn starts independent workflows,
-            // so the parent's root has no barrier of its own to resolve for them.
-            if !def.spawn_new_root {
-                evaluate_join_barriers(state, &spawn_task, task.root_or_self(), Some(task.id))
-                    .await;
+    if !retrying {
+        let kind = if success {
+            EventKind::TaskCompleted
+        } else {
+            EventKind::TaskFailed
+        };
+        state
+            .emit_event(kind, serde_json::json!({ "task_id": task.id }))
+            .await;
+        state
+            .emit_event(EventKind::TaskFinished, finished_payload(&task, success))
+            .await;
+
+        if success {
+            if let Some(spawn_task) = def.spawn.clone() {
+                if let Err(e) = spawn_from_manifest(state, &task, &def, &plan.cwd).await {
+                    tracing::warn!(task = %task.name, error = %e, "failed to spawn tasks from handoff");
+                }
+                // The parent's own `TaskFinished` was emitted above, before the
+                // manifest was read, so a fan-in on the spawned child is evaluated
+                // here instead. This is also what lets an empty manifest (`[]`)
+                // resolve the barrier. A new-root spawn starts independent workflows,
+                // so the parent's root has no barrier of its own to resolve for them.
+                if !def.spawn_new_root {
+                    evaluate_join_barriers(state, &spawn_task, task.root_or_self(), Some(task.id))
+                        .await;
+                }
             }
         }
     }
@@ -769,15 +822,15 @@ fn finished_summary(task: &Task) -> Option<String> {
 /// `status`, `attempt`, `retryable` and an optional bounded `summary`, so a
 /// consumer can interpret a finish without a follow-up `tasks.get`.
 ///
-/// `attempt` is `1` until the executor records per-attempt runs (#147); this
-/// mirrors `workflow.inspect`, which reports the same value today.
+/// `attempt` is the 1-based attempt counter recorded on the task (0 only for a
+/// task that never reached a claim), matching `workflow.inspect`.
 pub(crate) fn finished_payload(task: &Task, success: bool) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "name": &task.name,
         "task_id": task.id,
         "success": success,
         "status": task.status.as_str(),
-        "attempt": 1u32,
+        "attempt": task.attempt,
         "retryable": task.failure.as_ref().is_some_and(|f| f.retryable),
     });
     if let Some(summary) = finished_summary(task) {
@@ -1393,6 +1446,12 @@ async fn fail_task(state: &State, task: Task, kind: FailureKind, error: &str) {
     state
         .bus
         .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
+    // Pre-dispatch failures can be retryable too (e.g. a transient worktree
+    // setup fault); only finalize the task with a `TaskFinished` when no retry
+    // was scheduled.
+    if schedule_auto_retry(state, &task, &state.config.executor.retry).await {
+        return;
+    }
     state
         .emit_event(EventKind::TaskFinished, finished_payload(&task, false))
         .await;
@@ -1620,7 +1679,7 @@ async fn remove_worktree(pool: &SqlitePool, task_id: Uuid, repo: &Path, path: &P
 }
 
 /// A terminal task is finished: its worktree may be reclaimed by retention.
-fn is_terminal(status: TaskStatus) -> bool {
+pub(crate) fn is_terminal(status: TaskStatus) -> bool {
     matches!(
         status,
         TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled

@@ -192,6 +192,21 @@
         }
       ]
     },
+    "Backoff": {
+      "description": "How the delay between automatic retry attempts grows.",
+      "oneOf": [
+        {
+          "const": "exponential",
+          "description": "`initial_ms * 2^(attempt - 1)`, capped at `max_ms`.",
+          "type": "string"
+        },
+        {
+          "const": "fixed",
+          "description": "A constant `initial_ms` between every attempt.",
+          "type": "string"
+        }
+      ]
+    },
     "DaemonSettings": {
       "properties": {
         "data_dir": {
@@ -269,6 +284,20 @@
           "description": "Run multiple tasks at once (default false: one at a time).",
           "type": "boolean"
         },
+        "retry": {
+          "$ref": "#/$defs/RetrySettings",
+          "default": {
+            "backoff": "exponential",
+            "initial_ms": 5000,
+            "max_attempts": 1,
+            "max_ms": 300000,
+            "retry_on": [
+              "infrastructure",
+              "timeout"
+            ]
+          },
+          "description": "Automatic retry policy for retryable failures. Disabled by default."
+        },
         "stale_run": {
           "$ref": "#/$defs/StaleRunPolicy",
           "default": "fail",
@@ -296,6 +325,51 @@
         }
       },
       "type": "object"
+    },
+    "FailureKind": {
+      "description": "Why a task ended in failure, so a controller can distinguish a genuine\nagent failure from an infrastructure fault.",
+      "oneOf": [
+        {
+          "const": "agent",
+          "description": "The agent ran and reported failure (non-zero exit, rejected work, …).",
+          "type": "string"
+        },
+        {
+          "const": "infrastructure",
+          "description": "The daemon could not start or supervise the run (spawn/PTY/daemon fault).",
+          "type": "string"
+        },
+        {
+          "const": "timeout",
+          "description": "The run exceeded its deadline.",
+          "type": "string"
+        },
+        {
+          "const": "invalid_input",
+          "description": "Input was invalid (missing required vars, unparseable manifest, …).",
+          "type": "string"
+        },
+        {
+          "const": "dependency",
+          "description": "A dependency could not be satisfied.",
+          "type": "string"
+        },
+        {
+          "const": "cancelled",
+          "description": "Cancelled by a user or controller.",
+          "type": "string"
+        },
+        {
+          "const": "blocked",
+          "description": "Cannot proceed until something external changes; terminal and never\nretried automatically.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "Unclassified failure.",
+          "type": "string"
+        }
+      ]
     },
     "GitSettings": {
       "description": "Non-interactive git provisioning for agent processes.\n\n`signing = None` means \"unset\" so a per-agent/per-task override can be merged\nover the global section; the effective default is [`GitSigning::Off`]. The\nsettings are injected into the agent's environment through git's *environment\nconfig* (`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_<i>`/`GIT_CONFIG_VALUE_<i>`, git ≥\n2.31) and `GIT_AUTHOR_*`/`GIT_COMMITTER_*`; the operator's real git config is\nnever touched.",
@@ -491,6 +565,49 @@
       },
       "type": "object"
     },
+    "RetrySettings": {
+      "description": "Automatic retry policy for retryable task failures (`[executor.retry]`).\n\nRetries are opt-in: the default `max_attempts = 1` means a task runs exactly\nonce. When enabled, after a failed attempt whose [`FailureKind`] is listed in\n`retry_on`, the executor re-enqueues the task for `attempt + 1` after the\nbackoff, recording one run per attempt. Agent and invalid-input failures are\nexcluded from the default `retry_on`, so a genuine failure is never retried\non its own.",
+      "properties": {
+        "backoff": {
+          "$ref": "#/$defs/Backoff",
+          "default": "exponential",
+          "description": "How the delay between attempts grows."
+        },
+        "initial_ms": {
+          "default": 5000,
+          "description": "Base delay before the second attempt, in milliseconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_attempts": {
+          "default": 1,
+          "description": "Total execution attempts allowed per task, including the first. `1`\n(default) disables automatic retries.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_ms": {
+          "default": 300000,
+          "description": "Upper bound on any single backoff delay, in milliseconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "retry_on": {
+          "default": [
+            "infrastructure",
+            "timeout"
+          ],
+          "description": "Failure kinds eligible for automatic retry. Defaults to infrastructure\nand timeout faults; `agent` and `invalid_input` should stay out.",
+          "items": {
+            "$ref": "#/$defs/FailureKind"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
     "SoundSettings": {
       "description": "Client-side sound notifications for the TUI.\n\nPrecedence is CLI flags (`--sound`/`--no-sound`/`--sound-command`) over the\n`FAVETTO_SOUND*` environment variables over this section over built-in\ndefaults. Sounds are played on the machine running `favetto tui`.",
       "properties": {
@@ -664,6 +781,16 @@
         "max_concurrency": 4,
         "max_output_bytes": 262144,
         "parallel": false,
+        "retry": {
+          "backoff": "exponential",
+          "initial_ms": 5000,
+          "max_attempts": 1,
+          "max_ms": 300000,
+          "retry_on": [
+            "infrastructure",
+            "timeout"
+          ]
+        },
         "stale_run": "fail",
         "worktree": true,
         "worktree_retention": {

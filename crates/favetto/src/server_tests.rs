@@ -551,7 +551,7 @@ fn oneshot_task() -> Task {
         id: Uuid::new_v4(),
         name: "one-shot".to_string(),
         status: TaskStatus::Running,
-        attempt: 0,
+        attempt: 1,
         input: serde_json::json!({ "oneshot": true }),
         output: None,
         dedupe_key: None,
@@ -1585,6 +1585,128 @@ async fn tasks_list_omits_output_and_honours_limit_and_get_returns_it() {
         Request {
             id: 4,
             method: method::TASKS_GET.to_string(),
+            params: serde_json::json!({ "id": Uuid::new_v4() }),
+        },
+    )
+    .await;
+    assert_eq!(resp.error.unwrap().code, error_code::INVALID_PARAMS);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `tasks.retry` re-enqueues a terminal task and keeps its run history, but is
+/// rejected while a run is still live.
+#[tokio::test]
+async fn tasks_retry_requeues_terminal_tasks_and_rejects_live_runs() {
+    use favetto_core::model::{Failure, FailureKind, RunStatus, TaskRun};
+
+    let dir = temp_dir("tasks-retry");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+
+    let make = |name: &str, status: TaskStatus| Task {
+        id: Uuid::new_v4(),
+        name: name.to_string(),
+        status,
+        attempt: 1,
+        input: serde_json::json!({}),
+        output: None,
+        dedupe_key: None,
+        created_at: Utc::now(),
+        started_at: Some(Utc::now()),
+        finished_at: Some(Utc::now()),
+        error: None,
+        failure: None,
+        session_id: None,
+        session_title: None,
+        parent_id: None,
+        root_id: None,
+        interactive: false,
+    };
+    let run = |task_id: Uuid, attempt: u32, status: RunStatus| TaskRun {
+        id: Uuid::new_v4(),
+        task_id,
+        attempt,
+        status,
+        agent: None,
+        session_id: None,
+        started_at: Some(Utc::now()),
+        finished_at: None,
+        exit_code: None,
+        error: None,
+        failure: None,
+    };
+
+    // A failed task with run history can be retried; the history is kept.
+    let mut failed = make("failed", TaskStatus::Failed);
+    failed.error = Some("boom".to_string());
+    failed.failure = Some(Failure::new(FailureKind::Agent, "boom"));
+    db::upsert_task(&state.db, &failed).await.unwrap();
+    db::insert_task_run(&state.db, &run(failed.id, 1, RunStatus::Failed))
+        .await
+        .unwrap();
+
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 1,
+            method: method::TASKS_RETRY.to_string(),
+            params: serde_json::json!({ "id": failed.id }),
+        },
+    )
+    .await;
+    let result = resp.result.expect("retry result");
+    assert_eq!(result["status"], "pending");
+    assert_eq!(result["attempt"], 1);
+    assert_eq!(
+        db::list_task_runs(&state.db, failed.id)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "manual retry preserves run history"
+    );
+
+    // A live run is rejected.
+    let running = make("running", TaskStatus::Running);
+    db::upsert_task(&state.db, &running).await.unwrap();
+    db::insert_task_run(&state.db, &run(running.id, 1, RunStatus::Running))
+        .await
+        .unwrap();
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 2,
+            method: method::TASKS_RETRY.to_string(),
+            params: serde_json::json!({ "id": running.id }),
+        },
+    )
+    .await;
+    let err = resp.error.expect("live run rejected");
+    assert_eq!(err.code, error_code::INVALID_PARAMS);
+    assert!(err.message.contains("live run"), "{}", err.message);
+
+    // A pending task is not terminal either.
+    let pending = make("pending", TaskStatus::Pending);
+    db::upsert_task(&state.db, &pending).await.unwrap();
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 3,
+            method: method::TASKS_RETRY.to_string(),
+            params: serde_json::json!({ "id": pending.id }),
+        },
+    )
+    .await;
+    assert_eq!(resp.error.unwrap().code, error_code::INVALID_PARAMS);
+
+    // An unknown id is invalid params, not an internal error.
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 4,
+            method: method::TASKS_RETRY.to_string(),
             params: serde_json::json!({ "id": Uuid::new_v4() }),
         },
     )
