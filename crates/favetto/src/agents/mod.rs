@@ -442,6 +442,7 @@ impl AgentManager {
         let state_ctx = StateContext {
             favetto_session: id.clone(),
             external_session: ctx.session_id.clone(),
+            prompt: ctx.prompt.clone(),
             headless,
             cwd: spec.cwd.clone(),
             program: spec.program.clone(),
