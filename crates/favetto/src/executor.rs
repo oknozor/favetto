@@ -239,7 +239,7 @@ async fn enqueue_with_lineage(
         root_id: lineage.root_id,
     };
     db::insert_task(&state.db, &task).await?;
-    crate::metrics::inc_tasks();
+    state.metrics.inc_tasks();
     state
         .bus
         .publish(ServerPush::TaskUpdated(Box::new(task.summary())));

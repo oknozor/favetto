@@ -30,7 +30,7 @@ pub async fn send(state: &State, channel: &str, config: &Value, subject: &str, b
     if let Err(e) = result {
         tracing::warn!(channel, subject, error = %e, "notification failed");
     }
-    crate::metrics::inc_notifications();
+    state.metrics.inc_notifications();
     if let Err(e) = db::insert_notification(&state.db, channel, subject, body, status).await {
         tracing::warn!(error = %e, "failed to persist notification");
     }
