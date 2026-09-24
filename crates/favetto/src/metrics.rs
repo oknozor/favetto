@@ -74,26 +74,30 @@ mod tests {
     use axum::body::to_bytes;
     use axum::response::IntoResponse;
 
+    use crate::state::StateInit;
+
     /// A `State` backed by a scratch SQLite database, for exercising the handler.
     async fn test_state() -> Arc<crate::state::State> {
         let dir = std::env::temp_dir().join(format!("favetto-metrics-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let pool = crate::db::open(&dir.join("test.db")).await.unwrap();
         crate::db::migrate(&pool).await.unwrap();
-        Arc::new(crate::state::State::new(
-            pool,
-            crate::event_bus::EventBus::new(8),
-            favetto_core::auth::Token::generate(),
-            crate::webhooks::WebhookSecrets::from_config(&crate::config::FavettoConfig::default()),
-            crate::agents::AgentManager::new(),
-            crate::agents::AgentRegistry::default(),
-            Arc::new(crate::config::FavettoConfig::default()),
-            dir.clone(),
-            dir.clone(),
-            Arc::new(parking_lot::RwLock::new(Vec::new())),
-            tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
-            Arc::new(parking_lot::RwLock::new(Vec::new())),
-        ))
+        Arc::new(crate::state::State::new(StateInit {
+            db: pool,
+            bus: crate::event_bus::EventBus::new(8),
+            token: favetto_core::auth::Token::generate(),
+            webhooks: crate::webhooks::WebhookSecrets::from_config(
+                &crate::config::FavettoConfig::default(),
+            ),
+            agents: crate::agents::AgentManager::new(),
+            registry: crate::agents::AgentRegistry::default(),
+            config: Arc::new(crate::config::FavettoConfig::default()),
+            data_dir: dir.clone(),
+            tasks_dir: dir.clone(),
+            catalog: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            scheduler: tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
+            hook_store: Arc::new(parking_lot::RwLock::new(Vec::new())),
+        }))
     }
 
     #[test]

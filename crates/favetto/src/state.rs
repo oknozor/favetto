@@ -51,36 +51,39 @@ pub struct State {
     pub metrics: Metrics,
 }
 
+/// Arguments for [`State::new`], grouped into a struct so the constructor's
+/// signature stays stable as the daemon gains owned resources.
+pub struct StateInit {
+    pub db: SqlitePool,
+    pub bus: EventBus,
+    pub token: Token,
+    pub webhooks: WebhookSecrets,
+    pub agents: AgentManager,
+    pub registry: AgentRegistry,
+    pub config: Arc<FavettoConfig>,
+    pub data_dir: PathBuf,
+    pub tasks_dir: PathBuf,
+    pub catalog: Arc<RwLock<Vec<TaskDef>>>,
+    pub scheduler: JobScheduler,
+    pub hook_store: Arc<RwLock<Vec<Hook>>>,
+}
+
 impl State {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        db: SqlitePool,
-        bus: EventBus,
-        token: Token,
-        webhooks: WebhookSecrets,
-        agents: AgentManager,
-        registry: AgentRegistry,
-        config: Arc<FavettoConfig>,
-        data_dir: PathBuf,
-        tasks_dir: PathBuf,
-        catalog: Arc<RwLock<Vec<TaskDef>>>,
-        scheduler: JobScheduler,
-        hook_store: Arc<RwLock<Vec<Hook>>>,
-    ) -> Self {
+    pub fn new(init: StateInit) -> Self {
         Self {
-            db,
-            bus,
-            token,
-            webhooks,
-            agents,
-            registry,
-            config,
-            data_dir,
-            tasks_dir,
-            catalog,
-            scheduler,
+            db: init.db,
+            bus: init.bus,
+            token: init.token,
+            webhooks: init.webhooks,
+            agents: init.agents,
+            registry: init.registry,
+            config: init.config,
+            data_dir: init.data_dir,
+            tasks_dir: init.tasks_dir,
+            catalog: init.catalog,
+            scheduler: init.scheduler,
             pair: PairStore::new(),
-            hook_store,
+            hook_store: init.hook_store,
             providers_cache: tokio::sync::Mutex::new(HashMap::new()),
             metrics: Metrics::default(),
         }
