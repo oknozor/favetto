@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::agents::{AgentManager, AgentRegistry};
 use crate::config::FavettoConfig;
