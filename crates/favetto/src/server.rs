@@ -19,7 +19,7 @@ use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
 use favetto_core::model::{AgentCatalogEntry, AgentSessionInfo, EventKind, Task, TaskStatus};
-use favetto_core::rpc::{error_code, method, push, Frame, Notification, Request, Response};
+use favetto_core::rpc::{method, push, Frame, Notification, Request, Response, RpcError};
 use favetto_core::wire::WireError;
 
 use crate::agents::{AgentContext, AgentEvent, Invocation};
@@ -212,9 +212,9 @@ async fn handle_request(
                         }),
                     )
                 }
-                Err(e) => Response::err(id, error_code::INTERNAL, e.to_string()),
+                Err(e) => Response::error(id, RpcError::Internal(e.to_string())),
             },
-            Err(e) => Response::err(id, error_code::INVALID_PARAMS, e.to_string()),
+            Err(e) => Response::error(id, RpcError::InvalidParams(e.to_string())),
         };
         let _ = out_tx.send(Frame::Response(resp)).await;
         return;
@@ -234,7 +234,7 @@ async fn handle_request(
                 }
                 Response::ok(id, value)
             }
-            Err(e) => Response::err(id, error_code::INTERNAL, e.to_string()),
+            Err(e) => Response::error(id, RpcError::Internal(e.to_string())),
         };
         let _ = out_tx.send(Frame::Response(resp)).await;
         return;
@@ -254,9 +254,9 @@ async fn handle_request(
                         }),
                     )
                 }
-                Err(e) => Response::err(id, error_code::INTERNAL, e.to_string()),
+                Err(e) => Response::error(id, RpcError::Internal(e.to_string())),
             },
-            Err((code, message)) => Response::err(id, code, message),
+            Err(error) => Response::error(id, error),
         };
         let _ = out_tx.send(Frame::Response(resp)).await;
         return;
@@ -268,10 +268,10 @@ async fn handle_request(
                 subscribed.lock().remove(&p.session_id);
                 match state.agents.close(&p.session_id) {
                     Ok(()) => Response::ok(id, serde_json::json!({ "closed": p.session_id })),
-                    Err(e) => Response::err(id, error_code::INTERNAL, e.to_string()),
+                    Err(e) => Response::error(id, RpcError::Internal(e.to_string())),
                 }
             }
-            Err((code, message)) => Response::err(id, code, message),
+            Err(error) => Response::error(id, error),
         };
         let _ = out_tx.send(Frame::Response(resp)).await;
         return;
@@ -301,17 +301,13 @@ fn parse_value<T: DeserializeOwned>(params: &serde_json::Value) -> anyhow::Resul
 
 /// Deserialize request `params` into the typed struct for `method`.
 ///
-/// A malformed object is an `INVALID_PARAMS` error with a stable message.
+/// A malformed object is an [`RpcError::InvalidParams`] with a stable message.
 fn parse_params<T: DeserializeOwned>(
     method: &str,
     params: &serde_json::Value,
-) -> Result<T, (i32, String)> {
-    parse_value(params).map_err(|err| {
-        (
-            error_code::INVALID_PARAMS,
-            format!("invalid params for {method}: {err}"),
-        )
-    })
+) -> Result<T, RpcError> {
+    parse_value(params)
+        .map_err(|err| RpcError::InvalidParams(format!("invalid params for {method}: {err}")))
 }
 
 /// `tasks.list` params. `limit` defaults to 500 and caps at 2000.
@@ -513,15 +509,12 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
     let id = req.id;
     match dispatch_method(state, &req).await {
         Ok(value) => Response::ok(id, value),
-        Err((code, message)) => Response::err(id, code, message),
+        Err(error) => Response::error(id, error),
     }
 }
 
 /// Resolve a method's typed params and produce its result value.
-async fn dispatch_method(
-    state: &Arc<State>,
-    req: &Request,
-) -> Result<serde_json::Value, (i32, String)> {
+async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json::Value, RpcError> {
     match req.method.as_str() {
         method::PING => Ok(serde_json::json!({
             "pong": true,
@@ -535,7 +528,7 @@ async fn dispatch_method(
             let limit = p.limit.unwrap_or(500).min(2000) as i64;
             match db::list_tasks(&state.db, limit).await {
                 Ok(tasks) => Ok(serde_json::json!(tasks)),
-                Err(e) => Err((error_code::INTERNAL, e.to_string())),
+                Err(e) => Err(RpcError::Internal(e.to_string())),
             }
         }
 
@@ -543,8 +536,8 @@ async fn dispatch_method(
             let p: TaskIdParams = parse_params(&req.method, &req.params)?;
             match db::get_task(&state.db, p.id).await {
                 Ok(Some(task)) => Ok(serde_json::json!(task)),
-                Ok(None) => Err((error_code::INVALID_PARAMS, "task not found".to_string())),
-                Err(e) => Err((error_code::INTERNAL, e.to_string())),
+                Ok(None) => Err(RpcError::InvalidParams("task not found".to_string())),
+                Err(e) => Err(RpcError::Internal(e.to_string())),
             }
         }
 
@@ -552,7 +545,7 @@ async fn dispatch_method(
             let p: TaskIdParams = parse_params(&req.method, &req.params)?;
             match cancel_task(state, p.id).await {
                 Ok(task) => Ok(serde_json::json!(task)),
-                Err(e) => Err((error_code::INTERNAL, e.to_string())),
+                Err(e) => Err(RpcError::Internal(e.to_string())),
             }
         }
 
@@ -561,7 +554,7 @@ async fn dispatch_method(
             let input = p.input.unwrap_or(serde_json::Value::Null);
             match crate::executor::enqueue_task(state, p.name, input, None).await {
                 Ok(task) => Ok(serde_json::json!(task)),
-                Err(e) => Err((error_code::INTERNAL, e.to_string())),
+                Err(e) => Err(RpcError::Internal(e.to_string())),
             }
         }
 
@@ -590,7 +583,7 @@ async fn dispatch_method(
             let p: CatalogGetParams = parse_params(&req.method, &req.params)?;
             let name = p.name;
             if let Err(e) = crate::tasks::validate_task_path(&name) {
-                Err((error_code::INVALID_PARAMS, e.to_string()))
+                Err(RpcError::InvalidParams(e.to_string()))
             } else {
                 let path = state.tasks_dir.join(format!("{name}.md"));
                 let markdown = std::fs::read_to_string(&path).ok().or_else(|| {
@@ -603,7 +596,7 @@ async fn dispatch_method(
                 });
                 match markdown {
                     Some(markdown) => Ok(serde_json::json!({ "markdown": markdown })),
-                    None => Err((error_code::INVALID_PARAMS, format!("unknown task '{name}'"))),
+                    None => Err(RpcError::InvalidParams(format!("unknown task '{name}'"))),
                 }
             }
         }
@@ -619,12 +612,12 @@ async fn dispatch_method(
                 "needs": def.needs,
                 "vars": def.vars,
             })),
-            Err(e) => Err((error_code::INTERNAL, e.to_string())),
+            Err(e) => Err(RpcError::Internal(e.to_string())),
         },
 
         method::CATALOG_UPDATE => match update_catalog_task(state, &req.params).await {
             Ok(()) => Ok(serde_json::json!({ "updated": true })),
-            Err(e) => Err((error_code::INVALID_PARAMS, e.to_string())),
+            Err(e) => Err(RpcError::InvalidParams(e.to_string())),
         },
 
         method::WORKFLOW_GET => {
@@ -641,7 +634,7 @@ async fn dispatch_method(
             let limit = p.limit.unwrap_or(50).min(1000) as i64;
             match db::tail_events(&state.db, limit).await {
                 Ok(events) => Ok(serde_json::json!(events)),
-                Err(e) => Err((error_code::INTERNAL, e.to_string())),
+                Err(e) => Err(RpcError::Internal(e.to_string())),
             }
         }
 
@@ -691,7 +684,7 @@ async fn dispatch_method(
             let p: ProvidersListParams = parse_params(&req.method, &req.params)?;
             match list_providers(state, p.agent.as_deref()).await {
                 Ok(providers) => Ok(serde_json::json!({ "providers": providers })),
-                Err(e) => Err((error_code::INTERNAL, e.to_string())),
+                Err(e) => Err(RpcError::Internal(e.to_string())),
             }
         }
 
@@ -703,7 +696,7 @@ async fn dispatch_method(
                 .unwrap_or_default();
             match state.agents.input(&p.session_id, &data) {
                 Ok(()) => Ok(serde_json::json!({ "bytes": data.len() })),
-                Err(e) => Err((error_code::INTERNAL, e.to_string())),
+                Err(e) => Err(RpcError::Internal(e.to_string())),
             }
         }
 
@@ -713,25 +706,25 @@ async fn dispatch_method(
             let cols = p.cols.unwrap_or(80) as u16;
             match state.agents.resize(&p.session_id, rows, cols) {
                 Ok(()) => Ok(serde_json::json!({ "rows": rows, "cols": cols })),
-                Err(e) => Err((error_code::INTERNAL, e.to_string())),
+                Err(e) => Err(RpcError::Internal(e.to_string())),
             }
         }
 
         method::SCHEDULES_LIST => match db::list_schedules(&state.db).await {
             Ok(schedules) => Ok(serde_json::json!(schedules)),
-            Err(e) => Err((error_code::INTERNAL, e.to_string())),
+            Err(e) => Err(RpcError::Internal(e.to_string())),
         },
 
         method::SCHEDULES_UPSERT => match upsert_schedule(state, &req.params).await {
             Ok(schedule) => Ok(serde_json::json!(schedule)),
-            Err(e) => Err((error_code::INTERNAL, e.to_string())),
+            Err(e) => Err(RpcError::Internal(e.to_string())),
         },
 
         method::SCHEDULES_DELETE => {
             let p: ScheduleDeleteParams = parse_params(&req.method, &req.params)?;
             match delete_schedule(state, &p.id).await {
                 Ok(()) => Ok(serde_json::json!({ "deleted": p.id })),
-                Err(e) => Err((error_code::INTERNAL, e.to_string())),
+                Err(e) => Err(RpcError::Internal(e.to_string())),
             }
         }
 
@@ -740,7 +733,7 @@ async fn dispatch_method(
             let limit = p.limit.unwrap_or(50).min(1000) as i64;
             match db::list_notifications(&state.db, limit).await {
                 Ok(notifications) => Ok(serde_json::json!(notifications)),
-                Err(e) => Err((error_code::INTERNAL, e.to_string())),
+                Err(e) => Err(RpcError::Internal(e.to_string())),
             }
         }
 
@@ -755,13 +748,13 @@ async fn dispatch_method(
 
         method::HOOKS_UPSERT => match upsert_hook(state, &req.params) {
             Ok(()) => Ok(serde_json::json!({ "added": true })),
-            Err(e) => Err((error_code::INVALID_PARAMS, e.to_string())),
+            Err(e) => Err(RpcError::InvalidParams(e.to_string())),
         },
 
-        _ => Err((
-            error_code::METHOD_NOT_FOUND,
-            format!("unknown method: {}", req.method),
-        )),
+        _ => Err(RpcError::MethodNotFound(format!(
+            "unknown method: {}",
+            req.method
+        ))),
     }
 }
 
@@ -1391,6 +1384,7 @@ pub fn log_line(level: &str, message: impl Into<String>) -> Notification {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use favetto_core::rpc::error_code;
     use std::path::Path;
 
     /// A unique scratch directory for server tests.
@@ -2796,5 +2790,21 @@ mod tests {
         .unwrap();
         assert_eq!(p.rows, None);
         assert_eq!(p.cols, None);
+    }
+
+    /// Parameter validation surfaces a typed [`RpcError::InvalidParams`] rather
+    /// than a bare tuple, and it maps to the original wire code and message.
+    #[test]
+    fn parse_params_returns_a_typed_invalid_params_error() {
+        let error = parse_params::<TaskIdParams>(method::TASKS_GET, &serde_json::json!({}))
+            .expect_err("missing `id` must be rejected");
+        assert!(matches!(error, RpcError::InvalidParams(_)), "{error:?}");
+        assert_eq!(error.code(), error_code::INVALID_PARAMS);
+        assert!(
+            error.message().starts_with("invalid params for tasks.get:"),
+            "{}",
+            error.message()
+        );
+        assert_eq!(error.to_object().code, error_code::INVALID_PARAMS);
     }
 }
