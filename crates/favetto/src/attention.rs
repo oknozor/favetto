@@ -176,15 +176,30 @@ async fn watch_inner(
     let mut debouncer = Debouncer::default();
     let mut last_probe = std::time::Instant::now();
     let mut finished: Option<bool> = None;
-    // When the session has a structured state source, its `InputRequested`/
-    // `InputResolved` events are authoritative and the debounced screen heuristic
-    // is disabled for it. Sessions without a source keep the screen poll below.
+    // A structured state source only becomes authoritative after its **first**
+    // event; until then the debounced screen heuristic still runs, so a hook
+    // endpoint silently blocked by `allowedHttpHookUrls` behaves exactly like
+    // today's screen path. Once an event arrives, the screen signal is dropped.
     let mut state_rx = state.agents.subscribe_state(session);
+    let mut state_authoritative = false;
     loop {
         if !state.agents.is_running(session) {
             break;
         }
         if let Some(rx) = state_rx.as_mut() {
+            // The first buffered event makes the source authoritative. Clear any
+            // screen-derived state *before* folding it, so a first
+            // `InputRequested` is not immediately wiped by the warm-up reset.
+            if !state_authoritative && !rx.is_empty() {
+                if let Some(task_id) = task_id {
+                    if debouncer.confirmed().is_some() {
+                        resume_task(state, task_id).await;
+                    }
+                }
+                state.agents.set_awaiting_input(session, None);
+                debouncer = Debouncer::default();
+                state_authoritative = true;
+            }
             loop {
                 match rx.try_recv() {
                     Ok(event) => observe_state(state, session, task_id, event).await,
@@ -196,7 +211,8 @@ async fn watch_inner(
                     }
                 }
             }
-        } else if detect {
+        }
+        if !state_authoritative && detect {
             let next = state
                 .agents
                 .detect_awaiting_input(session, agent.as_ref(), quiet);
@@ -932,6 +948,110 @@ mod tests {
         assert!(resolved, "task never resumed");
 
         state.agents.close(&info.id).ok();
+        let _ = handle.await;
+    }
+
+    /// A state source that stays silent must not disable the screen heuristic:
+    /// the debounced fallback still marks a visible prompt, and only the first
+    /// structured event takes over.
+    #[tokio::test]
+    async fn state_source_without_events_keeps_screen_fallback() {
+        use favetto_core::model::{AwaitingInputKind, InputRequest};
+
+        let state = state_with_sh("exit 0").await;
+        let fake = crate::agents::testing::fake_state_agent(
+            "printf 'Permission required: allow this tool? '; sleep 5",
+        );
+        let task_id = running_task(&state).await;
+
+        let session_id = state
+            .agents
+            .start(
+                "fake",
+                fake.agent.clone(),
+                Some(task_id.to_string()),
+                Invocation::Interactive {
+                    prompt: None,
+                    provider: None,
+                    model: None,
+                },
+                AgentContext {
+                    rows: 40,
+                    cols: 120,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .id;
+
+        let handle = tokio::spawn({
+            let state = state.clone();
+            let session = session_id.clone();
+            let agent = fake.agent.clone();
+            async move {
+                watch(
+                    &state,
+                    &session,
+                    agent,
+                    Some(task_id),
+                    Duration::from_millis(50),
+                )
+                .await
+            }
+        });
+
+        // The source is silent, so only the screen signal can mark the task.
+        let mut marked = false;
+        for _ in 0..120 {
+            let task = db::get_task(&state.db, task_id).await.unwrap().unwrap();
+            if task.status == TaskStatus::AwaitingInput {
+                marked = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(marked, "screen fallback never marked the task");
+
+        // The first structured event takes over: the awaited request id must now
+        // come from the source, not the screen heuristic.
+        let request = InputRequest {
+            id: "perm_struct".to_string(),
+            kind: AwaitingInputKind::Permission,
+            message: "Allow?".to_string(),
+            options: Vec::new(),
+            allow_always: false,
+        };
+        let mut took_over = false;
+        for _ in 0..100 {
+            let info = state
+                .agents
+                .sessions()
+                .into_iter()
+                .find(|s| s.id == session_id);
+            if let Some(info) = info {
+                if info
+                    .awaiting_input
+                    .as_ref()
+                    .and_then(|reason| reason.request_id.as_deref())
+                    == Some("perm_struct")
+                {
+                    took_over = true;
+                    break;
+                }
+            }
+            fake.events
+                .send(AgentStateEvent::InputRequested {
+                    request: request.clone(),
+                })
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            took_over,
+            "structured event did not take over awaiting-input"
+        );
+
+        state.agents.close(&session_id).ok();
         let _ = handle.await;
     }
 }

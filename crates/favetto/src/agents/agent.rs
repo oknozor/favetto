@@ -20,6 +20,7 @@ use futures_util::future::BoxFuture;
 use favetto_core::model::{AgentCapabilities, AwaitingInputReason};
 
 use super::state::{StateSource, StateSourceConfig};
+use crate::agent_hooks::{AgentHookLaunch, HookInjection};
 
 /// Delay before the first submit-Enter, and the maximum number of sends.
 pub(crate) const SUBMIT_DELAY: Duration = Duration::from_millis(1200);
@@ -220,6 +221,16 @@ pub trait Agent: Send + Sync {
     /// heuristic. An implementation that returns a source opts its sessions into
     /// structured state (and, where supported, structured input replies).
     fn state_source(&self, _cfg: &StateSourceConfig) -> Option<Box<dyn StateSource>> {
+        None
+    }
+
+    /// Extra args/env to register per-launch state hooks, if this agent has a
+    /// hook transport.
+    ///
+    /// The manager prepends the returned args and merges the env into the launch
+    /// spec when a hook receiver is configured. The default `None` keeps every
+    /// existing agent unchanged.
+    fn hook_injection(&self, _launch: &AgentHookLaunch) -> Option<HookInjection> {
         None
     }
 
@@ -440,6 +451,13 @@ mod tests {
 
         // The default has no structured state source (screen fallback).
         assert!(Dummy.state_source(&StateSourceConfig::default()).is_none());
+
+        // The default hook transport is "none": an agent opts in explicitly.
+        let launch = crate::agent_hooks::AgentHookLaunch {
+            endpoint: "http://127.0.0.1:1/agent-hooks/claude".to_string(),
+            dir: std::path::PathBuf::from("favetto-none"),
+        };
+        assert!(Dummy.hook_injection(&launch).is_none());
     }
 
     /// A title-capable fixture: returns `"Late title"` once `fail_first` lookups

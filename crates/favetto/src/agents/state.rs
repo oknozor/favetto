@@ -27,6 +27,8 @@ use tokio::sync::mpsc;
 
 use favetto_core::model::{AgentActivity, AgentStateEvent, AgentUsage, InputReply, RunSummary};
 
+use crate::agent_hooks::HookRouter;
+
 /// A transport that produces normalized state for one agent session.
 pub trait StateSource: Send + Sync {
     /// Stable label for diagnostics (`"opencode-server"`, `"pi-rpc"`, …).
@@ -69,6 +71,9 @@ pub struct StateSourceConfig {
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub cwd: Option<PathBuf>,
+    /// The daemon's hook receiver, when one is configured. A source that wants to
+    /// observe over HTTP hooks registers its per-launch token here.
+    pub hook_router: Option<Arc<HookRouter>>,
 }
 
 /// Stops a detached transport (server/SSE/hook) when dropped or called.
