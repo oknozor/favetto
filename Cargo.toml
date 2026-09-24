@@ -4,6 +4,7 @@ members = [
     "crates/favetto-core",
     "crates/favetto-providers",
     "crates/favetto-tui",
+    "crates/favetto-mcp",
     "crates/favetto",
 ]
 
