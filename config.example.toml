@@ -86,8 +86,8 @@ default = "opencode"
 # args = []
 # prompt_args = ["{prompt}"]
 # submit_prompt = true
-# headless_args = ["-p", "{prompt}", "--auto-approve"]
-# run_args = ["-p", "--provider", "{provider}", "--model", "{model}", "{prompt}", "--auto-approve"]
+# headless_args = ["-p", "{prompt}", "--output", "streaming", "--auto-approve"]
+# run_args = ["-p", "--provider", "{provider}", "--model", "{model}", "{prompt}", "--output", "streaming", "--auto-approve"]
 # interactive_model_args = ["--provider", "{provider}", "--model", "{model}"]
 #
 # A custom CLI that emits line-delimited JSON opt into a structured summary with
