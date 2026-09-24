@@ -671,40 +671,65 @@ impl Drop for SoundPlayer {
     }
 }
 
+/// Render the `--test-sound` report: the master switch, the resolved player, and
+/// the per-cue mapping.
+///
+/// This report is the command's stdout contract (documented in
+/// `docs/guide/tui.md`), so [`test`] writes it to stdout unchanged and it stays
+/// scriptable. Diagnostics about the resolved `sound_dir` and about a
+/// sound-enabled configuration with no playable cues go through `tracing`
+/// instead.
+fn write_report<W: Write>(
+    cfg: &ResolvedSound,
+    player: &PlayerMode,
+    out: &mut W,
+) -> std::io::Result<()> {
+    writeln!(
+        out,
+        "sound: {}",
+        if cfg.enabled { "enabled" } else { "disabled" }
+    )?;
+    writeln!(out, "player: {}", player_label(player))?;
+    if cfg.enabled {
+        for (key, spec) in &cfg.events {
+            let label = match spec {
+                SoundSpec::None => "none".to_string(),
+                other => format!("{other:?}"),
+            };
+            writeln!(out, "  {key} -> {label}")?;
+        }
+    }
+    Ok(())
+}
+
 /// Play every configured cue once and report the resolved player. Used by
 /// `favetto tui --test-sound`, before the terminal is initialised.
+///
+/// The report goes to stdout; only diagnostics use `tracing`, so the terminal is
+/// never written to from inside the TUI loop.
 pub fn test(cfg: &ResolvedSound) -> anyhow::Result<()> {
     let player = match &cfg.player {
         PlayerMode::Auto => detect_player(),
         other => other.clone(),
     };
-    eprintln!(
-        "sound: {}",
-        if cfg.enabled { "enabled" } else { "disabled" }
-    );
-    eprintln!("player: {}", player_label(&player));
     if let Some(dir) = &cfg.sound_dir {
-        eprintln!("sound_dir: {}", dir.display());
+        tracing::debug!(sound_dir = %dir.display(), "resolved sound directory");
     }
+    write_report(cfg, &player, &mut std::io::stdout())?;
     if !cfg.enabled {
         return Ok(());
     }
 
     let mut cache = WavCache::new();
     let mut played = 0;
-    for (key, spec) in &cfg.events {
-        let label = match spec {
-            SoundSpec::None => "none".to_string(),
-            other => format!("{other:?}"),
-        };
-        eprintln!("  {key} -> {label}");
+    for spec in cfg.events.values() {
         if !matches!(spec, SoundSpec::None) {
             play_spec(spec, &player, &mut cache)?;
             played += 1;
         }
     }
     if played == 0 {
-        eprintln!("(no cues enabled)");
+        tracing::warn!("sound is enabled but no cues are configured to play");
     }
     Ok(())
 }
@@ -857,6 +882,35 @@ mod tests {
         assert_eq!(
             resolved.events["task_finished"],
             SoundSpec::Builtin(BuiltinSound::Success)
+        );
+    }
+
+    #[test]
+    fn test_sound_report_lists_state_player_and_cues() {
+        let cfg = resolve(SoundSettings::default(), &no_env, &CliSound::default());
+        let mut out = Vec::new();
+        write_report(&cfg, &PlayerMode::Bell, &mut out).unwrap();
+        let report = String::from_utf8(out).unwrap();
+
+        assert!(report.starts_with("sound: enabled\n"), "{report}");
+        assert!(report.contains("player: bell\n"), "{report}");
+        assert!(
+            report.contains("  task_finished -> Builtin(Success)\n"),
+            "{report}"
+        );
+        assert!(report.contains("  task_started -> none\n"), "{report}");
+    }
+
+    #[test]
+    fn test_sound_report_omits_cues_when_disabled() {
+        let mut cfg = resolve(SoundSettings::default(), &no_env, &CliSound::default());
+        cfg.enabled = false;
+        let mut out = Vec::new();
+        write_report(&cfg, &PlayerMode::Bell, &mut out).unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "sound: disabled\nplayer: bell\n"
         );
     }
 

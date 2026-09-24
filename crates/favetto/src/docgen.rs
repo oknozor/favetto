@@ -483,6 +483,11 @@ pub fn render_remote_api() -> String {
 }
 
 /// Write every generated document under `docs/`, printing each path.
+///
+/// The `wrote <path>` line is intentional CLI progress on stdout — the doc
+/// generator is meant to be run by hand and its output is scriptable — so it is
+/// deliberately a `println!` rather than a `tracing` event. Route new
+/// diagnostics through `tracing` instead.
 pub fn run(args: &DocArgs) -> anyhow::Result<()> {
     let docs = docs_dir(args.docs_dir.as_deref());
     let reference = docs.join("reference");
