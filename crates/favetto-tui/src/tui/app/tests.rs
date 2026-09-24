@@ -66,7 +66,12 @@ fn agent_session(id: &str, headless: bool, running: bool, awaiting: bool) -> Age
         awaiting_input: awaiting.then(|| favetto_core::model::AwaitingInputReason {
             kind: favetto_core::model::AwaitingInputKind::Other,
             message: "allow?".to_string(),
+            request_id: None,
+            options: Vec::new(),
+            allow_always: false,
         }),
+        activity: None,
+        usage: None,
     }
 }
 

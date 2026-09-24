@@ -14,6 +14,8 @@ fn session(id: &str, agent: &str, headless: bool, running: bool) -> AgentSession
         headless,
         session_id: None,
         awaiting_input: None,
+        activity: None,
+        usage: None,
     }
 }
 

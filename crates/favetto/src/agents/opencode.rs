@@ -9,8 +9,11 @@ use futures_util::future::BoxFuture;
 
 use crate::config::AgentConfig;
 
-use super::agent::{extract_session_id, Agent, AgentRunResult, ProviderSource};
+use super::agent::{Agent, AgentRunResult, ProviderSource};
 use super::configurable::{delegate_to_template, overlay, TemplateAgent};
+
+mod json;
+use json::OpenCodeJsonlParser;
 
 /// The built-in defaults, matching `config.example.toml`.
 fn base_config() -> AgentConfig {
@@ -81,33 +84,14 @@ impl Agent for OpenCodeAgent {
     }
 
     fn parse_output(&self, raw: &str, exit_code: Option<i32>) -> AgentRunResult {
-        let mut events = Vec::new();
-        let mut session_id = None;
-        for line in raw.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-                // Not the structured format we expected: keep the raw text.
-                return AgentRunResult {
-                    exit_code,
-                    session_id,
-                    output: serde_json::json!({ "text": raw }),
-                    raw: raw.to_string(),
-                };
-            };
-            if session_id.is_none() {
-                if let Some(probe) = &self.template.probe {
-                    session_id = extract_session_id(&value, probe);
-                }
-            }
-            events.push(value);
-        }
+        let mut parser = OpenCodeJsonlParser::new(self.template.probe.clone());
+        parser.push(raw.as_bytes());
+        parser.finish(exit_code);
+        let summary = parser.summary();
         AgentRunResult {
             exit_code,
-            session_id,
-            output: serde_json::Value::Array(events),
+            session_id: summary.session_id.clone(),
+            output: serde_json::to_value(summary).unwrap_or(serde_json::Value::Null),
             raw: raw.to_string(),
         }
     }
@@ -331,19 +315,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_output_reads_line_delimited_json() {
-        let raw = "{\"sessionID\":\"ses_9\",\"type\":\"text\"}\n{\"type\":\"done\"}\n";
+    fn parse_output_returns_a_run_summary() {
+        let raw = "{\"sessionID\":\"ses_9\",\"type\":\"text\",\"part\":{\"text\":\"hi\"}}\n\
+                   {\"sessionID\":\"ses_9\",\"type\":\"step_finish\",\"part\":{\"reason\":\"stop\",\
+                   \"tokens\":{\"input\":2}}}";
         let result = agent().parse_output(raw, Some(0));
         assert_eq!(result.session_id.as_deref(), Some("ses_9"));
-        assert_eq!(result.output.as_array().unwrap().len(), 2);
-        assert_eq!(result.output[0]["sessionID"], "ses_9");
+        assert_eq!(result.output["session_id"], "ses_9");
+        assert_eq!(result.output["text"], "hi");
+        assert_eq!(result.output["outcome"], "succeeded");
+        assert_eq!(result.output["usage"]["input_tokens"], 2);
+        assert_eq!(result.raw, raw);
     }
 
     #[test]
-    fn parse_output_falls_back_to_text() {
-        let result = agent().parse_output("plain output", Some(1));
-        assert_eq!(result.output, serde_json::json!({ "text": "plain output" }));
-        assert!(result.session_id.is_none());
+    fn parse_output_ignores_noise_and_keeps_the_session_id() {
+        let raw = "not json\n\
+                   {\"sessionID\":\"ses_7\",\"type\":\"text\",\"part\":{\"text\":\"ok\"}}\n\
+                   { broken\n\
+                   {\"type\":\"step_finish\",\"sessionID\":\"ses_7\",\"part\":{\"reason\":\"stop\"}}\n";
+        let result = agent().parse_output(raw, Some(0));
+        assert_eq!(result.session_id.as_deref(), Some("ses_7"));
+        assert_eq!(result.output["text"], "ok");
+        assert_eq!(result.output["outcome"], "succeeded");
     }
 
     #[test]
