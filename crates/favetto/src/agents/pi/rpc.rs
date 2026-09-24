@@ -1,11 +1,14 @@
 //! pi's `--mode rpc` transport: a [`StateSource`] over the PTY.
 //!
 //! RPC mode is a long-lived JSONL protocol. favetto writes commands
-//! (`get_state`, `prompt`, `get_messages`, `abort`) to the agent's stdin and
-//! reads `response`/event records from stdout through [`PiJsonlParser`]. When pi
-//! raises an `extension_ui_request` dialog, [`PiRpcResponder`] answers with a
-//! correlating `extension_ui_response` on stdin and synthesizes the
-//! [`AgentStateEvent::InputResolved`] the stream does not echo.
+//! (`get_state`, `prompt`, `get_messages`, `get_session_stats`, `abort`) to the
+//! agent's stdin and reads `response`/event records from stdout through
+//! [`PiJsonlParser`]. The parser itself requests `get_session_stats` at
+//! turn/settle boundaries so the authoritative usage/cost totals are captured
+//! before shutdown. When pi raises an `extension_ui_request` dialog,
+//! [`PiRpcResponder`] answers with a correlating `extension_ui_response` on
+//! stdin and synthesizes the [`AgentStateEvent::InputResolved`] the stream does
+//! not echo.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -68,6 +71,14 @@ impl PiRpcClient {
     #[allow(dead_code)]
     pub(crate) fn get_messages(&self) -> anyhow::Result<String> {
         self.send(json!({ "id": self.next_id(), "type": "get_messages" }))
+    }
+
+    /// The authoritative whole-session token/cost totals. The parser also
+    /// writes this command itself at turn/settle boundaries (it owns the
+    /// parser-side writer); the method is the typed equivalent.
+    #[allow(dead_code)]
+    pub(crate) fn get_session_stats(&self) -> anyhow::Result<String> {
+        self.send(json!({ "id": self.next_id(), "type": "get_session_stats" }))
     }
 
     pub(crate) fn abort(&self) -> anyhow::Result<String> {
@@ -327,6 +338,7 @@ mod tests {
         client.get_state().unwrap();
         client.prompt("hi").unwrap();
         client.get_messages().unwrap();
+        client.get_session_stats().unwrap();
         client.abort().unwrap();
 
         let lines = lines(&buffer);
@@ -334,7 +346,16 @@ mod tests {
             .iter()
             .map(|line| line["type"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(types, vec!["get_state", "prompt", "get_messages", "abort"]);
+        assert_eq!(
+            types,
+            vec![
+                "get_state",
+                "prompt",
+                "get_messages",
+                "get_session_stats",
+                "abort"
+            ]
+        );
         // Ids are unique and every command is one LF-terminated line.
         let ids: Vec<_> = lines.iter().map(|line| line["id"].clone()).collect();
         let mut unique = ids.clone();

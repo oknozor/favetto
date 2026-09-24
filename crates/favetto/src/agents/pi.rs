@@ -3,8 +3,11 @@
 //! Headless runs launch pi in its long-lived `--mode rpc` protocol and attach a
 //! [`PiRpcSource`](rpc::PiRpcSource) state source, so a task reports its session
 //! id, assistant text, tool calls, usage, and dialog prompts through the
-//! structured `StateSource` seam. Interactive pi keeps the bare TUI and the
-//! debounced screen fallback; it does not attach a state source.
+//! structured `StateSource` seam. Interactive and resumed runs keep the bare TUI
+//! and attach a bounded, read-only
+//! [`PiSessionFileSource`](file_tail::PiSessionFileSource) that tails pi's own
+//! session JSONL for best-effort activity, usage and cost; the debounced screen
+//! fallback still covers awaiting-input.
 
 use std::path::{Path, PathBuf};
 
@@ -17,6 +20,7 @@ use super::agent::{
 use super::configurable::{overlay, TemplateAgent};
 use super::state::{StateSource, StateSourceConfig};
 
+mod file_tail;
 mod json;
 mod rpc;
 mod session_file;
@@ -72,8 +76,9 @@ impl PiAgent {
         let mut config = base_config();
         overlay(&mut config, overrides);
         let mut template = TemplateAgent::new(name, "Pi", config);
-        // pi's RPC transport reports live state and answers dialogs through
-        // `extension_ui_response`.
+        // Headless pi reports live state and answers dialogs over RPC
+        // (`extension_ui_response`); interactive pi reports best-effort state
+        // from its session file, with dialogs left to the TUI/screen fallback.
         template.descriptor.capabilities.reports_state = true;
         template.descriptor.capabilities.permission_channel = true;
         Self { template }
@@ -134,15 +139,19 @@ impl Agent for PiAgent {
     }
 
     fn state_source(&self, cfg: &StateSourceConfig) -> Option<Box<dyn StateSource>> {
-        // Only a headless launch that actually resolved to `--mode rpc` opts in;
-        // interactive pi (and any overridden non-RPC headless invocation) keeps
-        // the screen fallback.
+        // A headless launch that resolved to `--mode rpc` speaks the structured
+        // protocol; every other pi launch (interactive/resume) is observed
+        // best-effort by tailing its session file, which needs the launch cwd.
         let is_rpc = cfg.headless
             && cfg
                 .args
                 .windows(2)
                 .any(|pair| pair[0] == "--mode" && pair[1] == "rpc");
-        is_rpc.then(|| Box::new(rpc::PiRpcSource::new()) as Box<dyn StateSource>)
+        if is_rpc {
+            return Some(Box::new(rpc::PiRpcSource::new()) as Box<dyn StateSource>);
+        }
+        (!cfg.headless && cfg.cwd.is_some())
+            .then(|| Box::new(file_tail::PiSessionFileSource::new()) as Box<dyn StateSource>)
     }
 
     fn parse_output(&self, raw: &str, exit_code: Option<i32>) -> AgentRunResult {
@@ -193,6 +202,7 @@ mod tests {
         StateSourceConfig {
             headless,
             args: args.into_iter().map(str::to_string).collect(),
+            cwd: Some(PathBuf::from("/home/me/proj")),
             ..Default::default()
         }
     }
@@ -336,9 +346,20 @@ mod tests {
     }
 
     #[test]
-    fn interactive_has_no_state_source() {
-        // The interactive TUI keeps the screen heuristic.
-        assert!(agent().state_source(&state_config(false, vec![])).is_none());
+    fn interactive_uses_a_session_file_source() {
+        // The interactive TUI has no RPC channel; its session file is tailed
+        // when the launch working directory is known.
+        assert!(agent().state_source(&state_config(false, vec![])).is_some());
+        assert!(agent()
+            .state_source(&state_config(false, vec!["--session", "ses-1234"]))
+            .is_some());
+        // Without a working directory there is nothing to tail: keep the screen
+        // heuristic rather than pinning activity at "starting" forever.
+        let no_cwd = StateSourceConfig {
+            headless: false,
+            ..Default::default()
+        };
+        assert!(agent().state_source(&no_cwd).is_none());
         // A headless launch that is not RPC (a user override) does too.
         assert!(agent()
             .state_source(&state_config(true, vec!["-p", "{prompt}"]))
