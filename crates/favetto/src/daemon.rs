@@ -202,6 +202,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         .merge(crate::webhooks::routes())
         .merge(crate::agent_hooks::routes())
         .merge(crate::pair::routes())
+        .merge(crate::ticket::routes())
         .with_state(state.clone());
     let http_task = tokio::spawn(async move { transport::serve_http(&listen, app).await });
 

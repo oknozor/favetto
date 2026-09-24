@@ -6,11 +6,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State as AxumState;
+use axum::extract::{Query, State as AxumState};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use tokio::net::UnixListener;
 use tokio_util::codec::Framed;
 
@@ -49,18 +50,32 @@ pub async fn serve_http(listen: &str, app: Router) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Reject the upgrade unless the `Authorization: Bearer <token>` header verifies.
+/// Query parameters accepted on the upgrade, so a browser that cannot set an
+/// `Authorization` header can present a ticket from `POST /auth/ticket`.
+#[derive(Debug, Default, Deserialize)]
+pub struct WsQuery {
+    /// A single-use, short-lived ticket (see [`crate::ticket::TicketStore`]).
+    #[serde(default)]
+    pub ticket: Option<String>,
+}
+
+/// Reject the upgrade unless a valid `Authorization: Bearer <token>` header is
+/// present, or a `?ticket=<t>` from `POST /auth/ticket` redeems exactly once.
 pub async fn ws_handler(
     AxumState(state): AxumState<Arc<State>>,
     headers: HeaderMap,
+    Query(query): Query<WsQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let authorized = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|t| state.token.verify(t))
-        .unwrap_or(false);
+    // A present bearer wins: a valid token must not burn a ticket that was
+    // passed alongside it.
+    let authorized = if crate::ticket::bearer_authorized(&state.token, &headers) {
+        true
+    } else if let Some(ticket) = query.ticket.as_deref() {
+        state.tickets.redeem(ticket).await
+    } else {
+        false
+    };
 
     if !authorized {
         return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
