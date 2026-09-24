@@ -516,6 +516,7 @@ impl AgentManager {
         // heuristic without affecting the session.
         let state_cfg = StateSourceConfig {
             headless,
+            managed_session: ctx.managed_session,
             program: spec.program.clone(),
             args: spec.args.clone(),
             env: spec.env.clone(),
@@ -1905,10 +1906,12 @@ mod tests {
     }
 
     /// A probe adapter records whether the `StateSourceConfig` it receives knows
-    /// about the hook router, so the manager wiring is asserted directly.
+    /// about the hook router and the managed-session flag, so the manager wiring
+    /// is asserted directly.
     struct CfgProbeAgent {
         descriptor: AgentDescriptor,
         seen_hook_router: Arc<parking_lot::Mutex<Option<bool>>>,
+        seen_managed_session: Arc<parking_lot::Mutex<Option<bool>>>,
     }
 
     impl Agent for CfgProbeAgent {
@@ -1933,6 +1936,7 @@ mod tests {
             cfg: &StateSourceConfig,
         ) -> Option<Box<dyn crate::agents::state::StateSource>> {
             *self.seen_hook_router.lock() = Some(cfg.hook_router.is_some());
+            *self.seen_managed_session.lock() = Some(cfg.managed_session);
             None
         }
     }
@@ -1940,6 +1944,7 @@ mod tests {
     #[tokio::test]
     async fn state_source_config_sees_hooks_only_after_configure() {
         let seen = Arc::new(parking_lot::Mutex::new(None));
+        let seen_managed = Arc::new(parking_lot::Mutex::new(None));
         let descriptor = AgentDescriptor {
             id: "probe".to_string(),
             name: "Probe".to_string(),
@@ -1950,6 +1955,7 @@ mod tests {
         let agent: Arc<dyn Agent> = Arc::new(CfgProbeAgent {
             descriptor,
             seen_hook_router: seen.clone(),
+            seen_managed_session: seen_managed,
         });
 
         let mgr = AgentManager::new();
@@ -1982,6 +1988,61 @@ mod tests {
                     model: None,
                 },
                 context(None, 24, 80),
+            )
+            .unwrap();
+        assert_eq!(*seen.lock(), Some(true));
+        mgr.close(&info.id).unwrap();
+    }
+
+    /// The manager must forward the launch's managed-session flag into
+    /// `StateSourceConfig`; the opencode observer selects its transport from it.
+    #[tokio::test]
+    async fn state_source_config_sees_the_managed_session_flag() {
+        let seen = Arc::new(parking_lot::Mutex::new(None));
+        let descriptor = AgentDescriptor {
+            id: "probe".to_string(),
+            name: "Probe".to_string(),
+            command: "sh".to_string(),
+            available: true,
+            capabilities: Default::default(),
+        };
+        let agent: Arc<dyn Agent> = Arc::new(CfgProbeAgent {
+            descriptor,
+            seen_hook_router: Arc::new(parking_lot::Mutex::new(None)),
+            seen_managed_session: seen.clone(),
+        });
+        let mgr = AgentManager::new();
+
+        let info = mgr
+            .start(
+                "probe",
+                agent.clone(),
+                None,
+                Invocation::Headless {
+                    prompt: "do it",
+                    provider: None,
+                    model: None,
+                },
+                context(None, 24, 80),
+            )
+            .unwrap();
+        assert_eq!(*seen.lock(), Some(false));
+        mgr.close(&info.id).unwrap();
+
+        let mut ctx = context(None, 24, 80);
+        ctx.session_id = Some("ses_managed".to_string());
+        ctx.managed_session = true;
+        let info = mgr
+            .start(
+                "probe",
+                agent,
+                None,
+                Invocation::Headless {
+                    prompt: "do it",
+                    provider: None,
+                    model: None,
+                },
+                ctx,
             )
             .unwrap();
         assert_eq!(*seen.lock(), Some(true));

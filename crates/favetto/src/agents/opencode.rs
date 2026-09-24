@@ -185,9 +185,12 @@ impl Agent for OpenCodeAgent {
     }
 
     /// The managed server is the live-state transport for interactive sessions.
-    /// Headless runs keep the tolerant stdout JSONL parser.
+    /// A headless run created on the managed server (`prepare_launch`) keeps
+    /// its session too, so it is observed over the same SSE channel and reports
+    /// live activity/usage without an Agent-panel visit. A headless run with no
+    /// managed session keeps the tolerant stdout JSONL fallback.
     fn state_source(&self, cfg: &StateSourceConfig) -> Option<Box<dyn StateSource>> {
-        if cfg.headless {
+        if cfg.headless && !cfg.managed_session {
             return None;
         }
         let endpoint = server::endpoint()?;
@@ -676,20 +679,33 @@ mod tests {
         server::install_endpoint_for_test(None);
     }
 
+    /// A plain headless run has no server transport to observe; an interactive
+    /// launch and a headless run that owns a managed session both do. Every
+    /// variant still requires a live endpoint.
     #[test]
-    fn state_source_is_interactive_only_and_needs_an_endpoint() {
+    fn state_source_needs_an_endpoint_and_a_managed_transport() {
         let headless = StateSourceConfig {
             headless: true,
             ..Default::default()
         };
+        let managed_headless = StateSourceConfig {
+            headless: true,
+            managed_session: true,
+            ..Default::default()
+        };
+        let interactive = StateSourceConfig::default();
+
+        // Without an endpoint none of the variants can observe anything.
         assert!(agent().state_source(&headless).is_none());
-        assert!(agent()
-            .state_source(&StateSourceConfig::default())
-            .is_none());
+        assert!(agent().state_source(&managed_headless).is_none());
+        assert!(agent().state_source(&interactive).is_none());
+
         install_endpoint();
-        assert!(agent()
-            .state_source(&StateSourceConfig::default())
-            .is_some());
+        // A headless run with no managed session keeps the stdout fallback.
+        assert!(agent().state_source(&headless).is_none());
+        // Managed headless and interactive launches get the SSE observer.
+        assert!(agent().state_source(&managed_headless).is_some());
+        assert!(agent().state_source(&interactive).is_some());
         server::install_endpoint_for_test(None);
     }
 

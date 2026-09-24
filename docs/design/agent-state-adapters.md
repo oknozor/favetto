@@ -280,9 +280,11 @@ fn state_source(&self, cfg: &StateSourceConfig) -> Option<Box<dyn StateSource>> 
 ```
 
 `StateSourceConfig` is the resolved launch description
-(`headless`, `command`, `args`, `env`, `cwd`) so an implementation can decide
-between transports (e.g. opencode: server when a session exists, stdout JSONL
-otherwise). Every existing agent keeps the default `None` until adopted.
+(`headless`, `managed_session`, `program`, `args`, `env`, `cwd`) so an
+implementation can decide between transports (e.g. opencode: server when a
+session exists — including a headless run that owns a managed-server session —
+stdout JSONL otherwise). Every existing agent keeps the default `None` until
+adopted.
 
 `parse_output` becomes a thin, tolerant helper used only when no `StdoutParser`
 ran; the normalized path supersedes it for structured agents.
