@@ -114,6 +114,16 @@ fn all_popups_render_without_panic() {
                     session("s2", "pi", true, false),
                 ],
             },
+            Popup::Reply(ReplyPrompt::new(
+                "s1".to_string(),
+                favetto_core::model::InputRequest {
+                    id: "perm_1".to_string(),
+                    kind: favetto_core::model::AwaitingInputKind::Permission,
+                    message: "Allow bash?".to_string(),
+                    options: vec!["Allow once".to_string(), "Reject".to_string()],
+                    allow_always: true,
+                },
+            )),
         ] {
             let mut app = App::with_theme(theme);
             app.popup = popup;
@@ -454,6 +464,103 @@ fn session_picker_renders_each_session() {
         text.contains("headless"),
         "headless state missing: {text:?}"
     );
+}
+
+#[test]
+fn session_picker_renders_activity_and_usage() {
+    let mut app = App::new();
+    let mut agent = session("s1", "opencode", false, true);
+    agent.activity = Some(favetto_core::model::AgentActivity::Waiting {
+        request: favetto_core::model::InputRequest {
+            id: "perm_1".to_string(),
+            kind: favetto_core::model::AwaitingInputKind::Permission,
+            message: "Allow?".to_string(),
+            options: Vec::new(),
+            allow_always: false,
+        },
+    });
+    agent.usage = Some(favetto_core::model::AgentUsage {
+        input_tokens: 900,
+        ..Default::default()
+    });
+    app.open_sessions(vec![agent]);
+
+    let text = render_text(&mut app, 120, 24);
+    assert!(text.contains("waiting"), "activity missing: {text:?}");
+    assert!(text.contains("900/0 tok"), "usage missing: {text:?}");
+}
+
+#[test]
+fn tasks_table_renders_activity_and_usage_cells() {
+    let mut app = App::new();
+    let id = uuid::Uuid::new_v4();
+    let mut task = geom_task("agent-task");
+    task.id = id;
+    app.tasks = vec![task];
+
+    let mut agent = session("s1", "opencode", false, true);
+    agent.task_id = Some(id.to_string());
+    agent.activity = Some(favetto_core::model::AgentActivity::Tool {
+        name: "bash".to_string(),
+        description: None,
+    });
+    agent.usage = Some(favetto_core::model::AgentUsage {
+        input_tokens: 1500,
+        output_tokens: 20,
+        ..Default::default()
+    });
+    app.set_agent_sessions(vec![agent]);
+
+    let text = render_text(&mut app, 120, 24);
+    assert!(
+        text.contains("ACTIVITY"),
+        "activity header missing: {text:?}"
+    );
+    assert!(text.contains("USAGE"), "usage header missing: {text:?}");
+    assert!(text.contains("tool: bash"), "activity missing: {text:?}");
+    assert!(text.contains("1.5k/20 tok"), "usage missing: {text:?}");
+}
+
+#[test]
+fn reply_popup_renders_message_and_options() {
+    let mut app = App::new();
+    let request = favetto_core::model::InputRequest {
+        id: "perm_1".to_string(),
+        kind: favetto_core::model::AwaitingInputKind::Permission,
+        message: "Allow bash to run tests?".to_string(),
+        options: vec!["Allow once".to_string(), "Reject".to_string()],
+        allow_always: true,
+    };
+    app.popup = Popup::Reply(ReplyPrompt::new("s1".to_string(), request));
+
+    let text = render_text(&mut app, 100, 30);
+    assert!(text.contains("Ctrl+R"), "title missing: {text:?}");
+    assert!(
+        text.contains("Allow bash to run tests?"),
+        "message missing: {text:?}"
+    );
+    assert!(text.contains("Allow once"), "option missing: {text:?}");
+    assert!(text.contains("Reject"), "option missing: {text:?}");
+}
+
+#[test]
+fn status_bar_hints_ctrl_r_for_a_pending_prompt() {
+    let mut app = App::new();
+    app.agent_session_id = Some("s1".to_string());
+    let mut agent = session("s1", "opencode", false, true);
+    agent.activity = Some(favetto_core::model::AgentActivity::Waiting {
+        request: favetto_core::model::InputRequest {
+            id: "perm_1".to_string(),
+            kind: favetto_core::model::AwaitingInputKind::Permission,
+            message: "Allow?".to_string(),
+            options: Vec::new(),
+            allow_always: false,
+        },
+    });
+    app.set_agent_sessions(vec![agent]);
+
+    let text = render_text(&mut app, 220, 24);
+    assert!(text.contains("[Ctrl+R] answer"), "hint missing: {text:?}");
 }
 
 #[test]

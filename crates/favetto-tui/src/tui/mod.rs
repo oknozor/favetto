@@ -340,6 +340,7 @@ async fn sync_initial(client: &Client, app: &mut App) {
     .await;
 
     fetch_catalog(client, app).await;
+    fetch_agent_sessions(client, app).await;
 }
 
 /// Fetch the task catalog.
@@ -444,6 +445,7 @@ async fn refresh_lists(client: &Client, app: &mut App) {
         }
     }
     fetch_catalog(client, app).await;
+    fetch_agent_sessions(client, app).await;
 }
 
 /// Send a `tasks.start` request and refresh the list tabs afterwards.
@@ -713,6 +715,9 @@ async fn run_session(
                                 }
                                 refresh_lists(client, app).await;
                             }
+                            UiAction::Reply { session_id, request_id, reply } => {
+                                send_agent_reply(client, app, session_id, request_id, reply).await;
+                            }
                             UiAction::None => {}
                         }
                     }
@@ -887,10 +892,11 @@ async fn fetch_sessions(client: &Client, app: &mut App) {
         Ok(resp) => match resp.result {
             Some(v) => match serde_json::from_value::<Vec<AgentCatalogEntry>>(v) {
                 Ok(agents) => {
-                    let sessions = agents
+                    let sessions: Vec<AgentSessionInfo> = agents
                         .into_iter()
                         .flat_map(|agent| agent.sessions)
                         .collect();
+                    app.set_agent_sessions(sessions.clone());
                     app.open_sessions(sessions);
                 }
                 Err(e) => agent_request_failed(app, "agents.list", &e.to_string()),
@@ -905,6 +911,29 @@ async fn fetch_sessions(client: &Client, app: &mut App) {
             }
         },
         Err(e) => agent_request_failed(app, "agents.list", &e.to_string()),
+    }
+}
+
+/// Fetch `agents.list` and cache every live/retained session so the Tasks table
+/// and the Ctrl+O picker can show activity/usage. Best-effort: a failure leaves
+/// the previous cache in place.
+async fn fetch_agent_sessions(client: &Client, app: &mut App) {
+    match client
+        .request(method::AGENTS_LIST, serde_json::json!({}))
+        .await
+    {
+        Ok(resp) => {
+            if let Some(v) = resp.result {
+                match serde_json::from_value::<Vec<AgentCatalogEntry>>(v) {
+                    Ok(agents) => {
+                        let sessions = agents.into_iter().flat_map(|a| a.sessions).collect();
+                        app.set_agent_sessions(sessions);
+                    }
+                    Err(e) => app.logs.push_back(format!("agents.list: {e}")),
+                }
+            }
+        }
+        Err(e) => app.logs.push_back(format!("agents.list failed: {e}")),
     }
 }
 
@@ -988,6 +1017,37 @@ async fn send_agent_input(client: &Client, app: &mut App, bytes: &[u8]) {
     {
         app.logs.push_back(format!("agent.input failed: {e}"));
     }
+}
+
+/// Answer a session's structured input request through `agents.reply`, then
+/// re-sync the cached sessions so the resolved prompt disappears promptly.
+async fn send_agent_reply(
+    client: &Client,
+    app: &mut App,
+    session_id: String,
+    request_id: String,
+    reply: favetto_core::model::InputReply,
+) {
+    let params = serde_json::json!({
+        "session_id": session_id,
+        "request_id": request_id,
+        "reply": reply,
+    });
+    match client.request(method::AGENTS_REPLY, params).await {
+        Ok(resp) => match resp.result {
+            Some(_) => app.logs.push_back("agents.reply: ok".to_string()),
+            None => {
+                let message = resp
+                    .error
+                    .as_ref()
+                    .map(|e| e.message.clone())
+                    .unwrap_or_else(|| "agents.reply failed".to_string());
+                app.agent_error = Some(message);
+            }
+        },
+        Err(e) => app.agent_error = Some(e.to_string()),
+    }
+    fetch_agent_sessions(client, app).await;
 }
 
 /// What [`disconnected_pump`] decided to do next.

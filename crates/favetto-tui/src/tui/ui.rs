@@ -12,8 +12,9 @@ use ratatui::Frame;
 use favetto_core::model::{AgentSessionInfo, TaskStatus};
 
 use super::app::{
-    table_rows_area, App, CatalogRow, ClickAction, ClickRegion, ConnState, Form, ListGeometry,
-    Popup, Tab, TaskVarsForm, Wizard, WizardStep, MENU_OPTIONS,
+    activity_cell, format_activity, format_usage, table_rows_area, usage_cell, App, CatalogRow,
+    ClickAction, ClickRegion, ConnState, Form, ListGeometry, Popup, ReplyPrompt, Tab, TaskVarsForm,
+    Wizard, WizardStep, MENU_OPTIONS,
 };
 use super::text_buffer::TextBuffer;
 use super::theme::Theme;
@@ -115,6 +116,7 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
         Popup::Sessions { selected, sessions } => {
             draw_sessions_picker(frame, *selected, sessions, theme)
         }
+        Popup::Reply(prompt) => draw_reply(frame, prompt, theme),
     }
 }
 
@@ -348,8 +350,17 @@ fn draw_sessions_picker(
                 .as_deref()
                 .map(|t| format!(" · task {}", short_str(t)))
                 .unwrap_or_default();
+            let mut detail = String::new();
+            if let Some(activity) = &s.activity {
+                detail.push_str(&format!(" · {}", format_activity(activity)));
+            }
+            if let Some(usage) = &s.usage {
+                if !usage.is_empty() {
+                    detail.push_str(&format!(" · {}", format_usage(usage)));
+                }
+            }
             ListItem::new(Line::from(Span::styled(
-                format!(" {} · {state}{task} ", s.agent),
+                format!(" {} · {state}{task}{detail} ", s.agent),
                 style,
             )))
         })
@@ -367,6 +378,58 @@ fn draw_sessions_picker(
     frame.render_widget(Clear, rect);
     frame.buffer_mut().set_style(rect, theme.surface_style());
     frame.render_widget(list, rect);
+}
+
+/// Draw the Ctrl+R reply popup: the precise prompt from the agent's state
+/// channel, its selectable options (or a free-form input), and the send keys.
+fn draw_reply(frame: &mut Frame, prompt: &ReplyPrompt, theme: Theme) {
+    let area = frame.area();
+    let mut content: Vec<Line<'static>> = Vec::new();
+    content.push(Line::from(Span::styled(
+        format!("Agent is waiting on {}", short_str(&prompt.session_id)),
+        Style::default().fg(theme.muted),
+    )));
+    content.push(Line::from(""));
+    for line in prompt.request.message.lines() {
+        content.push(Line::from(line.to_string()));
+    }
+    content.push(Line::from(""));
+    if prompt.has_options() {
+        for (i, option) in prompt.request.options.iter().enumerate() {
+            let style = if i == prompt.selected {
+                theme.selected()
+            } else {
+                Style::default()
+            };
+            content.push(Line::from(Span::styled(format!("  {option} "), style)));
+        }
+    } else {
+        let mut spans = vec![Span::styled("> ", Style::default().fg(theme.accent))];
+        push_caret_line(&mut spans, &prompt.input, Style::default().fg(theme.accent));
+        content.push(Line::from(spans));
+    }
+
+    let footer = vec![Line::from(Span::styled(
+        if prompt.has_options() {
+            "↑/↓ select · Enter send · Esc cancel"
+        } else {
+            "type answer · Enter send · Esc cancel"
+        },
+        Style::default().fg(theme.muted),
+    ))];
+
+    draw_growing_popup(
+        frame,
+        GrowingPopup {
+            area,
+            width_pct: 60,
+            title: " Ctrl+R — reply ".to_string(),
+            content,
+            footer,
+            focus_line: 0,
+            theme,
+        },
+    );
 }
 
 fn draw_form(frame: &mut Frame, form: &Form, theme: Theme) -> Rect {
@@ -616,6 +679,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Shift+Tab / ←", "previous tab"),
             ("Ctrl+P", "open the action menu"),
             ("Ctrl+O", "pick a live/retained agent session"),
+            ("Ctrl+R", "answer a pending agent prompt"),
             ("?", "open/close this help"),
             ("w", "open/close the workflow graph"),
             ("M", "mute/unmute sound"),
@@ -649,6 +713,10 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+Y", "toggle focus: agent ↔ favetto"),
             ("(agent focus)", "every key is forwarded to the agent"),
             ("(favetto focus) Ctrl+O", "switch to another session"),
+            (
+                "(pending prompt) Ctrl+R",
+                "answer the agent's permission/dialog prompt",
+            ),
             ("(favetto focus) Ctrl+Q", "leave the panel"),
             ("(favetto focus) Ctrl+N", "start a new session"),
             ("(favetto focus) Esc", "back to Tasks"),
@@ -1157,28 +1225,37 @@ fn status_ok(s: &str, theme: Theme) -> Line<'static> {
 fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     let widths = [
         Constraint::Length(10),
-        Constraint::Length(22),
-        Constraint::Length(30),
+        Constraint::Length(20),
+        Constraint::Length(24),
         Constraint::Length(12),
+        Constraint::Length(14),
+        Constraint::Length(18),
         Constraint::Length(8),
         Constraint::Min(0),
     ];
-    let header = Row::new(vec!["ID", "TASK", "SESSION", "STATUS", "AGE", "ERROR"])
-        .style(theme.table_header());
+    let header = Row::new(vec![
+        "ID", "TASK", "SESSION", "STATUS", "ACTIVITY", "USAGE", "AGE", "ERROR",
+    ])
+    .style(theme.table_header());
 
     let state = app.throbber_state.clone();
     let rows: Vec<Row> = app
         .tasks
         .iter()
         .map(|t| {
+            let session = app.task_session(&t.id.to_string());
+            let activity = activity_cell(session.and_then(|s| s.activity.as_ref()));
+            let usage = usage_cell(session.and_then(|s| s.usage.as_ref()));
             Row::new(vec![
                 Cell::from(short_id(&t.id)),
                 Cell::from(t.name.clone()),
                 Cell::from(truncate_ellipsis(
                     t.session_title.as_deref().unwrap_or(""),
-                    28,
+                    22,
                 )),
                 Cell::from(status_line(t.status, theme, &state)),
+                Cell::from(activity),
+                Cell::from(usage),
                 Cell::from(age(t.created_at)),
                 Cell::from(t.error.clone().unwrap_or_default()),
             ])
@@ -1460,15 +1537,18 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
         ("favetto", theme.accent)
     };
 
-    let hint = if app.tab == Tab::Agent {
+    let mut hint = if app.tab == Tab::Agent {
         if agent_focused {
-            "[Ctrl+Y] favetto keys"
+            "[Ctrl+Y] favetto keys".to_string()
         } else {
-            "[Ctrl+Y] agent keys  [Ctrl+O] sessions  [Ctrl+Q] leave  [?] help"
+            "[Ctrl+Y] agent keys  [Ctrl+O] sessions  [Ctrl+Q] leave  [?] help".to_string()
         }
     } else {
-        "[↑↓] select  [Enter] agent  [Tab] switch  [q] quit  [?] help"
+        "[↑↓] select  [Enter] agent  [Tab] switch  [q] quit  [?] help".to_string()
     };
+    if app.pending_request().is_some() {
+        hint.push_str("  [Ctrl+R] answer");
+    }
 
     // Sound badge: muted wins visually; a disabled engine shows `sound off`.
     let (sound_txt, sound_color) = if !app.sound_enabled {

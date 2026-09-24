@@ -53,6 +53,19 @@ impl App {
             };
         }
 
+        // Ctrl+R answers a precise input request on the attached session. It is
+        // intercepted only while such a request is pending, so sessions without a
+        // state channel (and the agent's own Ctrl+R) keep their existing handling.
+        if ctrl
+            && matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R'))
+            && matches!(self.popup, Popup::None)
+        {
+            if let Some((session_id, request)) = self.pending_request() {
+                self.popup = Popup::Reply(ReplyPrompt::new(session_id, request));
+                return UiAction::None;
+            }
+        }
+
         // A popup owns the keyboard while it is open.
         match &self.popup {
             Popup::Form(_) => return self.handle_form_key(key),
@@ -62,6 +75,7 @@ impl App {
             Popup::Help { .. } => return self.handle_help_key(key.code),
             Popup::Workflow { .. } => return self.handle_workflow_key(key.code),
             Popup::Sessions { .. } => return self.handle_sessions_key(key.code),
+            Popup::Reply(_) => return self.handle_reply_key(key),
             Popup::None => {}
         }
 
@@ -456,6 +470,58 @@ impl App {
             }
             _ => UiAction::None,
         }
+    }
+
+    /// Keys while the Ctrl+R reply popup is open: arrows pick an option, Enter
+    /// sends `agents.reply`, and a free-form prompt edits its value buffer.
+    pub(super) fn handle_reply_key(&mut self, key: KeyEvent) -> UiAction {
+        if key.code == KeyCode::Esc {
+            self.popup = Popup::None;
+            return UiAction::None;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let has_options = match &self.popup {
+            Popup::Reply(prompt) => prompt.has_options(),
+            _ => return UiAction::None,
+        };
+        if key.code == KeyCode::Enter {
+            let (session_id, request_id, reply) = match &self.popup {
+                Popup::Reply(prompt) => (
+                    prompt.session_id.clone(),
+                    prompt.request.id.clone(),
+                    prompt.reply(),
+                ),
+                _ => return UiAction::None,
+            };
+            self.popup = Popup::None;
+            return UiAction::Reply {
+                session_id,
+                request_id,
+                reply,
+            };
+        }
+        let Popup::Reply(prompt) = &mut self.popup else {
+            return UiAction::None;
+        };
+        match key.code {
+            KeyCode::Up if has_options => {
+                prompt.selected = prompt.selected.saturating_sub(1);
+            }
+            KeyCode::Down if has_options => {
+                prompt.selected =
+                    (prompt.selected + 1).min(prompt.request.options.len().saturating_sub(1));
+            }
+            KeyCode::Backspace if !has_options => prompt.input.backspace(),
+            KeyCode::Delete if !has_options => prompt.input.delete(),
+            KeyCode::Left if !has_options => prompt.input.move_left(),
+            KeyCode::Right if !has_options => prompt.input.move_right(),
+            KeyCode::Home if !has_options => prompt.input.home(),
+            KeyCode::End if !has_options => prompt.input.end(),
+            KeyCode::Char(c) if !has_options && !ctrl && !alt => prompt.input.insert_char(c),
+            _ => {}
+        }
+        UiAction::None
     }
 
     pub(super) fn handle_menu_key(&mut self, code: KeyCode) -> UiAction {
