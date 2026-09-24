@@ -6,6 +6,7 @@
 //! [`Notification`]s (events, task updates, log lines) unsolicited.
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 /// Correlation id for a request/response pair. The TUI client increments a counter.
 pub type RequestId = u64;
@@ -19,6 +20,76 @@ pub mod error_code {
     pub const INTERNAL: i32 = -32603;
     /// Caller not authenticated / token rejected.
     pub const UNAUTHORIZED: i32 = -32001;
+}
+
+/// A typed domain/RPC error, one variant per [`error_code`] constant.
+///
+/// The daemon's dispatch and parameter validation return this instead of bare
+/// `(i32, String)` tuples. [`RpcError::to_object`] is the single place it is
+/// converted to the wire [`RpcErrorObject`], so the numeric code and message
+/// always come from the enum.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum RpcError {
+    /// Invalid JSON / MessagePack frame.
+    #[error("{0}")]
+    Parse(String),
+    /// Not a valid request object.
+    #[error("{0}")]
+    InvalidRequest(String),
+    /// Unknown method.
+    #[error("{0}")]
+    MethodNotFound(String),
+    /// Invalid method parameters.
+    #[error("{0}")]
+    InvalidParams(String),
+    /// Internal server error.
+    #[error("{0}")]
+    Internal(String),
+    /// Missing or rejected bearer token.
+    #[error("{0}")]
+    Unauthorized(String),
+}
+
+impl RpcError {
+    /// The numeric code sent on the wire for this error.
+    pub fn code(&self) -> i32 {
+        match self {
+            Self::Parse(_) => error_code::PARSE,
+            Self::InvalidRequest(_) => error_code::INVALID_REQUEST,
+            Self::MethodNotFound(_) => error_code::METHOD_NOT_FOUND,
+            Self::InvalidParams(_) => error_code::INVALID_PARAMS,
+            Self::Internal(_) => error_code::INTERNAL,
+            Self::Unauthorized(_) => error_code::UNAUTHORIZED,
+        }
+    }
+
+    /// The human-readable message sent on the wire for this error.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Parse(message)
+            | Self::InvalidRequest(message)
+            | Self::MethodNotFound(message)
+            | Self::InvalidParams(message)
+            | Self::Internal(message)
+            | Self::Unauthorized(message) => message,
+        }
+    }
+
+    /// Convert to the wire representation. This is the single conversion point
+    /// between the typed domain error and the protocol.
+    pub fn to_object(&self) -> RpcErrorObject {
+        RpcErrorObject {
+            code: self.code(),
+            message: self.message().to_string(),
+            data: None,
+        }
+    }
+}
+
+impl From<RpcError> for RpcErrorObject {
+    fn from(error: RpcError) -> Self {
+        error.to_object()
+    }
 }
 
 /// Well-known client → server method names.
@@ -197,9 +268,10 @@ pub struct Request {
     pub params: serde_json::Value,
 }
 
-/// A structured error carried by a [`Response`].
+/// A structured error carried by a [`Response`]: the wire representation of an
+/// [`RpcError`], built by [`RpcError::to_object`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RpcError {
+pub struct RpcErrorObject {
     pub code: i32,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -213,7 +285,7 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<RpcError>,
+    pub error: Option<RpcErrorObject>,
 }
 
 impl Response {
@@ -225,15 +297,12 @@ impl Response {
         }
     }
 
-    pub fn err(id: RequestId, code: i32, message: impl Into<String>) -> Self {
+    /// Build an error reply from a typed [`RpcError`].
+    pub fn error(id: RequestId, error: RpcError) -> Self {
         Self {
             id,
             result: None,
-            error: Some(RpcError {
-                code,
-                message: message.into(),
-                data: None,
-            }),
+            error: Some(error.to_object()),
         }
     }
 }
@@ -334,5 +403,55 @@ mod tests {
             assert!(pushes.contains(name), "undocumented constant `{name}`");
         }
         assert_eq!(pushes.len(), SERVER_PUSHES.len());
+    }
+
+    /// Every typed error variant maps to its `error_code` constant and keeps its
+    /// message verbatim when converted to the wire object.
+    #[test]
+    fn rpc_errors_map_to_wire_codes_and_messages() {
+        let cases = [
+            (RpcError::Parse("parse".to_string()), error_code::PARSE),
+            (
+                RpcError::InvalidRequest("invalid request".to_string()),
+                error_code::INVALID_REQUEST,
+            ),
+            (
+                RpcError::MethodNotFound("unknown method".to_string()),
+                error_code::METHOD_NOT_FOUND,
+            ),
+            (
+                RpcError::InvalidParams("invalid params".to_string()),
+                error_code::INVALID_PARAMS,
+            ),
+            (RpcError::Internal("boom".to_string()), error_code::INTERNAL),
+            (
+                RpcError::Unauthorized("denied".to_string()),
+                error_code::UNAUTHORIZED,
+            ),
+        ];
+
+        for (error, code) in cases {
+            assert_eq!(error.code(), code, "{error:?}");
+            let object = error.to_object();
+            assert_eq!(object.code, code, "{error:?}");
+            assert_eq!(object.message, error.message(), "{error:?}");
+            assert!(object.data.is_none(), "{error:?}");
+            // `From` is the same conversion, so it must agree with `to_object`.
+            assert_eq!(RpcErrorObject::from(error).message, object.message);
+        }
+    }
+
+    /// A typed error becomes a wire reply with no result and the mapped code.
+    #[test]
+    fn response_error_carries_the_typed_error() {
+        let response = Response::error(
+            7,
+            RpcError::MethodNotFound("unknown method: nope".to_string()),
+        );
+        assert_eq!(response.id, 7);
+        assert!(response.result.is_none());
+        let object = response.error.expect("error object");
+        assert_eq!(object.code, error_code::METHOD_NOT_FOUND);
+        assert_eq!(object.message, "unknown method: nope");
     }
 }

@@ -1198,7 +1198,10 @@ mod tests {
     #[test]
     fn apply_agent_response_surfaces_errors_in_the_status_bar() {
         let mut app = App::new();
-        let resp = favetto_core::rpc::Response::err(1, -32603, "task is already running headless");
+        let resp = favetto_core::rpc::Response::error(
+            1,
+            favetto_core::rpc::RpcError::Internal("task is already running headless".to_string()),
+        );
         apply_agent_response(&mut app, resp);
         assert_eq!(
             app.agent_error.as_deref(),
