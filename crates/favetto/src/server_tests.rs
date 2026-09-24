@@ -628,6 +628,46 @@ async fn finish_oneshot_failure_keeps_session_info() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `finish_oneshot` emits the same enriched `TaskFinished` payload as the
+/// executor, so the event shape does not depend on how a task was run.
+#[cfg(unix)]
+#[tokio::test]
+async fn finish_oneshot_emits_an_enriched_finished_event() {
+    let dir = temp_dir("oneshot-enriched");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let script = session_list_script(&dir, r#"[{"id":"ses_1","title":"Fixture title"}]"#);
+    let state = title_state(&dir, &tasks_dir, &script).await;
+
+    let task = oneshot_task();
+    db::insert_task(&state.db, &task).await.unwrap();
+
+    finish_oneshot(
+        &state,
+        task.id,
+        "opencode",
+        Some("ses_1".to_string()),
+        &dir,
+        Some(1),
+    )
+    .await;
+
+    let events = db::tail_events(&state.db, 10).await.unwrap();
+    let finished = events
+        .iter()
+        .rev()
+        .find(|e| e.kind == EventKind::TaskFinished)
+        .expect("TaskFinished emitted");
+    assert_eq!(finished.payload["name"], task.name);
+    assert_eq!(finished.payload["task_id"], task.id.to_string());
+    assert_eq!(finished.payload["success"], false);
+    assert_eq!(finished.payload["status"], "failed");
+    assert_eq!(finished.payload["attempt"], 1);
+    assert_eq!(finished.payload["retryable"], false);
+    assert_eq!(finished.payload["summary"], "agent session exited with 1");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn finish_oneshot_without_session_id_is_blank() {

@@ -514,10 +514,7 @@ async fn run_one(
         .emit_event(kind, serde_json::json!({ "task_id": task.id }))
         .await;
     state
-        .emit_event(
-            EventKind::TaskFinished,
-            serde_json::json!({ "name": task.name, "task_id": task.id, "success": success }),
-        )
+        .emit_event(EventKind::TaskFinished, finished_payload(&task, success))
         .await;
 
     if success {
@@ -662,6 +659,52 @@ fn synthesized_summary(capped_raw: &str) -> String {
         .map(str::trim)
         .unwrap_or("");
     tail_truncate(last, ENVELOPE_SUMMARY_BYTES)
+}
+
+/// Byte cap for the `summary` carried by a `TaskFinished` event. Reuses the
+/// envelope cap so an event can never be larger than a `_prev` summary.
+const FINISHED_SUMMARY_BYTES: usize = ENVELOPE_SUMMARY_BYTES;
+
+/// The optional bounded summary for a finish: the result envelope's `summary`
+/// when the run produced output, else the human-readable error (a task that never
+/// started has no output). `None` when there is nothing to say.
+fn finished_summary(task: &Task) -> Option<String> {
+    let text = task
+        .output
+        .as_ref()
+        .and_then(|o| o.get("envelope"))
+        .and_then(|e| e.get("summary"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            task.error
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })?;
+    Some(tail_truncate(text, FINISHED_SUMMARY_BYTES))
+}
+
+/// Additive `TaskFinished` payload: the legacy `{name, task_id, success}` plus
+/// `status`, `attempt`, `retryable` and an optional bounded `summary`, so a
+/// consumer can interpret a finish without a follow-up `tasks.get`.
+///
+/// `attempt` is `1` until the executor records per-attempt runs (#147); this
+/// mirrors `workflow.inspect`, which reports the same value today.
+pub(crate) fn finished_payload(task: &Task, success: bool) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "name": &task.name,
+        "task_id": task.id,
+        "success": success,
+        "status": task.status.as_str(),
+        "attempt": 1u32,
+        "retryable": task.failure.as_ref().is_some_and(|f| f.retryable),
+    });
+    if let Some(summary) = finished_summary(task) {
+        payload["summary"] = serde_json::Value::String(summary);
+    }
+    payload
 }
 
 /// The envelope for a run whose agent produced no structured one: a summary
@@ -1269,10 +1312,7 @@ async fn fail_task(state: &State, task: Task, kind: FailureKind, error: &str) {
         .bus
         .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
     state
-        .emit_event(
-            EventKind::TaskFinished,
-            serde_json::json!({ "name": task.name, "task_id": task.id, "success": false }),
-        )
+        .emit_event(EventKind::TaskFinished, finished_payload(&task, false))
         .await;
 }
 
