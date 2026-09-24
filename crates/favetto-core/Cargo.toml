@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Shared wire protocol, domain types, and configuration for favetto."
 
 [dependencies]
+favetto-wire = { path = "../favetto-wire", features = ["schema"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = "1"
@@ -18,7 +19,6 @@ schemars = { version = "1", features = ["derive", "chrono04", "uuid1"] }
 toml = "0.8"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 subtle = "2"
 bytes = "1"

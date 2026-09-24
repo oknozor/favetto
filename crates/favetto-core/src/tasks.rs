@@ -35,71 +35,10 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
-use schemars::JsonSchema;
-
 use crate::config::GitSigning;
 
-/// The declared type of a manual input variable. `int`/`bool` values are coerced
-/// to JSON numbers/bools before being stored in the task's `input`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, serde::Serialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum VarType {
-    #[default]
-    String,
-    Int,
-    Bool,
-}
-
-/// A manual input variable declared in a task's `[[vars]]` front-matter. The
-/// collected value becomes `input.<name>` and renders through `{{ input.<name> }}`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize, JsonSchema)]
-pub struct TaskVar {
-    /// The `input` key. `[a-zA-Z0-9_]+`, unique within the file, never `_prev`.
-    pub name: String,
-    /// The label/question shown in the TUI prompt popup.
-    pub prompt: String,
-    /// Optional value pre-filled in the popup.
-    #[serde(default)]
-    pub default: Option<String>,
-    /// When true, submission is blocked while the field is empty.
-    #[serde(default)]
-    pub required: bool,
-    /// When true, `Enter` inserts a newline and the submit chord completes the form.
-    #[serde(default)]
-    pub multiline: bool,
-    /// The value type; `int`/`bool` are parsed before being stored.
-    #[serde(default, rename = "type")]
-    pub var_type: VarType,
-    /// Optional fixed list of options, rendered as a selectable list.
-    #[serde(default)]
-    pub choices: Option<Vec<String>>,
-}
-
-impl TaskVar {
-    /// Coerce a raw string entered by the user into the var's JSON representation.
-    pub fn coerce(&self, raw: &str) -> anyhow::Result<serde_json::Value> {
-        if let Some(choices) = &self.choices {
-            if !choices.iter().any(|c| c == raw) {
-                anyhow::bail!("must be one of: {}", choices.join(", "));
-            }
-        }
-        match self.var_type {
-            VarType::String => Ok(serde_json::Value::String(raw.to_string())),
-            VarType::Int => {
-                let n = raw
-                    .trim()
-                    .parse::<i64>()
-                    .map_err(|_| anyhow::anyhow!("must be an integer"))?;
-                Ok(serde_json::Value::Number(n.into()))
-            }
-            VarType::Bool => match raw.trim().to_ascii_lowercase().as_str() {
-                "true" | "1" => Ok(serde_json::Value::Bool(true)),
-                "false" | "0" => Ok(serde_json::Value::Bool(false)),
-                _ => anyhow::bail!("must be true or false"),
-            },
-        }
-    }
-}
+// The pure value types moved to `favetto-wire`; keep the old paths resolving.
+pub use favetto_wire::task_var::{TaskVar, VarType};
 
 /// A task definition from a `*.md` file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -808,41 +747,6 @@ mod tests {
         assert!(parse("[[vars]]\nname = \"a\"\nprompt = \"\"\n").is_err());
         assert!(parse("[[vars]]\nname = \"\"\nprompt = \"p\"\n").is_err());
         assert!(parse("[[vars]]\nname = \"ok\"\nprompt = \"p\"\n").is_ok());
-    }
-
-    #[test]
-    fn coerces_typed_values() {
-        let var = |var_type, choices| TaskVar {
-            name: "v".to_string(),
-            prompt: "p".to_string(),
-            default: None,
-            required: false,
-            multiline: false,
-            var_type,
-            choices,
-        };
-        assert_eq!(
-            var(VarType::String, None).coerce("hi").unwrap(),
-            serde_json::json!("hi")
-        );
-        assert_eq!(
-            var(VarType::Int, None).coerce(" 3 ").unwrap(),
-            serde_json::json!(3)
-        );
-        assert!(var(VarType::Int, None).coerce("not an int").is_err());
-        assert_eq!(
-            var(VarType::Bool, None).coerce("True").unwrap(),
-            serde_json::json!(true)
-        );
-        assert_eq!(
-            var(VarType::Bool, None).coerce("0").unwrap(),
-            serde_json::json!(false)
-        );
-        assert!(var(VarType::Bool, None).coerce("maybe").is_err());
-
-        let choices = Some(vec!["a".to_string(), "b".to_string()]);
-        assert!(var(VarType::String, choices.clone()).coerce("a").is_ok());
-        assert!(var(VarType::String, choices).coerce("c").is_err());
     }
 
     /// A unique scratch directory for catalog tests.

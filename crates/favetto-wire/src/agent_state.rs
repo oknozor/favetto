@@ -9,7 +9,6 @@
 //! client or daemon decodes a newer payload unchanged.
 
 use chrono::{DateTime, Utc};
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use std::str::FromStr;
@@ -17,7 +16,8 @@ use std::str::FromStr;
 use crate::model::{AwaitingInputKind, MessageRole};
 
 /// What an agent is doing right now (coarse, for the task list / picker).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentActivity {
     /// The process is starting up.
@@ -41,7 +41,8 @@ pub enum AgentActivity {
 }
 
 /// A prompt the agent is blocked on.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct InputRequest {
     /// Transport-specific correlation id (permission id, extension-ui id, …).
     pub id: String,
@@ -57,7 +58,8 @@ pub struct InputRequest {
 }
 
 /// The answer to an [`InputRequest`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "reply", rename_all = "snake_case")]
 pub enum InputReply {
     /// Allow this one occurrence.
@@ -75,7 +77,8 @@ pub enum InputReply {
 }
 
 /// Token/cost usage reported by an agent for a turn or a whole run.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AgentUsage {
     #[serde(default)]
     pub input_tokens: u64,
@@ -123,7 +126,8 @@ impl AgentUsage {
 }
 
 /// The aggregation window requested from `usage.stats`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum UsagePeriod {
     /// Hourly buckets over the last 24 hours.
@@ -191,7 +195,8 @@ impl FromStr for UsagePeriod {
 }
 
 /// One time bucket of aggregated usage in a [`UsageStats`] result.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UsageBucket {
     /// Inclusive bucket start (UTC).
     pub start: DateTime<Utc>,
@@ -212,7 +217,8 @@ impl UsageBucket {
 }
 
 /// Overall totals for a [`UsageStats`] result: the sum of every bucket.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UsageTotals {
     pub usage: AgentUsage,
     /// Number of finished runs in the whole window.
@@ -228,7 +234,8 @@ impl UsageTotals {
 
 /// `usage.stats` result: a per-bucket token/cost series plus window totals for
 /// the requested [`UsagePeriod`].
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UsageStats {
     pub period: UsagePeriod,
     pub totals: UsageTotals,

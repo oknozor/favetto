@@ -1023,9 +1023,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
- "chrono",
  "config",
  "dirs",
+ "favetto-wire",
  "proptest",
  "rmp-serde",
  "schemars",
@@ -1094,6 +1094,18 @@ dependencies = [
  "unicode-segmentation",
  "uuid",
  "vt100",
+]
+
+[[package]]
+name = "favetto-wire"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "uuid",
 ]
 
 [[package]]
