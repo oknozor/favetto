@@ -57,7 +57,6 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | `event` | A persisted event. |
 | `task.updated` | A task row changed. |
 | `catalog.updated` | The task catalog changed on disk; clients should re-fetch it. |
-| `log.line` | A daemon log line. |
 | `agent.output` | Raw PTY output (base64) from a running agent session. |
 | `agent.exit` | An agent session's child process exited. |
 

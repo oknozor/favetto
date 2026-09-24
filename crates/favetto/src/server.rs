@@ -1372,15 +1372,6 @@ async fn cancel_task(state: &State, id: Uuid) -> anyhow::Result<favetto_core::mo
     Ok(task.summary())
 }
 
-/// Build a log-line push (used by later milestones; wired up for completeness).
-#[allow(dead_code)]
-pub fn log_line(level: &str, message: impl Into<String>) -> Notification {
-    Notification {
-        method: push::LOG_LINE.to_string(),
-        params: serde_json::json!({ "level": level, "message": message.into() }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
