@@ -46,7 +46,7 @@ You also need an agent CLI (for example opencode) on your `PATH`. See the
 ./target/debug/favetto tui
 
 # or attach remotely over WebSocket (token auto-created in ~/.local/share/favetto/token)
-./target/debug/favetto tui --remote ws://127.0.0.1:7878 \
+./target/debug/favetto tui --remote ws://127.0.0.1:7878/rpc \
     --token-file ~/.local/share/favetto/token
 ```
 

@@ -48,7 +48,7 @@ The same client attaches over the network. The daemon writes a bearer token to
 `~/.local/share/favetto/token` on first start:
 
 ```bash
-favetto tui --remote ws://127.0.0.1:7878 \
+favetto tui --remote ws://127.0.0.1:7878/rpc \
     --token-file ~/.local/share/favetto/token
 ```
 
@@ -58,9 +58,9 @@ pass it with `--pair-code`:
 ```bash
 favetto pair
 # pairing code (valid 60s): 123456
-# attach with: favetto tui --remote ws://HOST:7878 --pair-code 123456
+# attach with: favetto tui --remote ws://HOST:7878/rpc --pair-code 123456
 
-favetto tui --remote ws://127.0.0.1:7878 --pair-code 123456
+favetto tui --remote ws://127.0.0.1:7878/rpc --pair-code 123456
 ```
 
 See [Remote access](./remote-access) for the full flow.

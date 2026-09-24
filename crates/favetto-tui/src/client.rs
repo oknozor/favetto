@@ -183,20 +183,65 @@ async fn unix_connect(path: &PathBuf) -> anyhow::Result<(ClientStream, ClientSin
     Ok((incoming, outgoing))
 }
 
+/// Normalize a remote WebSocket URL to the daemon's `/rpc` upgrade path.
+///
+/// `--remote`/`FAVETTO_URL` accept either a base URL (`ws://HOST:7878`,
+/// `wss://HOST:7878/`) or an explicit endpoint. When the URL has no path a
+/// `/rpc` suffix is appended; an already-present `/rpc` (or any other path, so a
+/// reverse-proxy mount is not rewritten) is left untouched. The rewrite is
+/// idempotent.
+pub fn normalize_ws_url(url: &str) -> String {
+    match url.parse::<http::Uri>() {
+        Ok(uri)
+            if matches!(uri.scheme_str(), Some("ws") | Some("wss"))
+                && matches!(uri.path(), "" | "/") =>
+        {
+            format!("{}/rpc", url.trim_end_matches('/'))
+        }
+        _ => url.to_string(),
+    }
+}
+
+/// Derive the HTTP base for the one-off pairing exchange from a remote
+/// WebSocket URL: the scheme is swapped for its HTTP equivalent and a trailing
+/// `/rpc` path is stripped. Both `ws://HOST:7878` and `ws://HOST:7878/rpc`
+/// therefore yield `http://HOST:7878`.
+pub fn pair_http_base(url: &str) -> String {
+    let http = match url.split_once("://") {
+        Some(("wss", rest)) => format!("https://{rest}"),
+        Some(("ws", rest)) => format!("http://{rest}"),
+        _ => url.to_string(),
+    };
+    let base = http.trim_end_matches('/');
+    base.strip_suffix("/rpc").unwrap_or(base).to_string()
+}
+
 /// Connect over a WebSocket. Both `ws://` and `wss://` are supported: the
 /// `rustls-tls-webpki-roots` feature lets `connect_async` negotiate TLS for
 /// `wss://` URLs, validating the server certificate against the Mozilla root
 /// store (invalid certificates are rejected; there is no insecure fallback).
+///
+/// The URL is normalized with [`normalize_ws_url`] first, so a base URL
+/// (`ws://HOST:7878`) targets the daemon's `/rpc` route.
 async fn ws_connect(url: &str, token: Option<&str>) -> anyhow::Result<(ClientStream, ClientSink)> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-    let mut builder = http::Request::builder().uri(url);
-    if let Some(t) = token {
-        builder = builder.header(http::header::AUTHORIZATION, format!("Bearer {t}"));
-    }
-    let request = builder
-        .body(())
+    let url = normalize_ws_url(url);
+    // `into_client_request` adds the mandatory upgrade headers (`Host`,
+    // `Connection`, `Upgrade`, `Sec-WebSocket-*`); a bare `http::Request` is
+    // rejected by the server's handshake before any route is reached.
+    let mut request = url
+        .as_str()
+        .into_client_request()
         .map_err(|e| anyhow::anyhow!("bad URL: {e}"))?;
+    if let Some(t) = token {
+        let value = http::HeaderValue::from_str(&format!("Bearer {t}"))
+            .map_err(|e| anyhow::anyhow!("bad bearer token: {e}"))?;
+        request
+            .headers_mut()
+            .insert(http::header::AUTHORIZATION, value);
+    }
     let (ws, _) = tokio_tungstenite::connect_async(request)
         .await
         .context("connect websocket")?;
@@ -256,6 +301,85 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "connect blocked for {:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn normalize_ws_url_appends_the_rpc_path() {
+        assert_eq!(
+            normalize_ws_url("ws://127.0.0.1:7878"),
+            "ws://127.0.0.1:7878/rpc"
+        );
+        assert_eq!(normalize_ws_url("wss://HOST:7878/"), "wss://HOST:7878/rpc");
+    }
+
+    #[test]
+    fn normalize_ws_url_is_idempotent() {
+        assert_eq!(
+            normalize_ws_url("ws://127.0.0.1:7878/rpc"),
+            "ws://127.0.0.1:7878/rpc"
+        );
+        assert_eq!(
+            normalize_ws_url("wss://HOST:7878/rpc"),
+            "wss://HOST:7878/rpc"
+        );
+        // Any other path (a reverse-proxy mount) is preserved verbatim.
+        assert_eq!(
+            normalize_ws_url("wss://HOST:7878/favetto"),
+            "wss://HOST:7878/favetto"
+        );
+    }
+
+    #[test]
+    fn pair_http_base_swaps_scheme_and_strips_rpc() {
+        assert_eq!(
+            pair_http_base("ws://127.0.0.1:7878"),
+            "http://127.0.0.1:7878"
+        );
+        assert_eq!(
+            pair_http_base("ws://127.0.0.1:7878/rpc"),
+            "http://127.0.0.1:7878"
+        );
+        assert_eq!(pair_http_base("wss://HOST:7878/rpc"), "https://HOST:7878");
+        assert_eq!(pair_http_base("wss://HOST:7878/rpc/"), "https://HOST:7878");
+    }
+
+    /// A base URL (`ws://HOST:PORT` with no path) must set the HTTP request path
+    /// to `/rpc`, matching the daemon's only upgrade route.
+    #[tokio::test]
+    async fn connect_normalizes_a_base_url_to_the_rpc_path() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+                // Stay silent: the upgrade never completes, so the connect
+                // future is cancelled by its timeout once the path is asserted.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+
+        // The server never answers the upgrade, so this resolves as a timeout;
+        // the assertion is on the request the client actually sent.
+        let _ = Client::connect_with_timeout(
+            Transport::Ws {
+                url: format!("ws://{addr}"),
+                token: None,
+            },
+            Duration::from_millis(500),
+        )
+        .await;
+
+        let head = rx.await.expect("server should receive the upgrade request");
+        let request_line = head.lines().next().unwrap_or_default();
+        assert!(
+            request_line.contains("/rpc"),
+            "base URL should be normalized to /rpc, got: {request_line}"
         );
     }
 

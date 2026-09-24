@@ -11,7 +11,7 @@ On first start the daemon writes a bearer token to `<data_dir>/token`
 machine and point the TUI at the daemon's WebSocket:
 
 ```bash
-favetto tui --remote ws://HOST:7878 --token-file ~/.local/share/favetto/token
+favetto tui --remote ws://HOST:7878/rpc --token-file ~/.local/share/favetto/token
 ```
 
 If the daemon listens somewhere else, set `--listen` on the daemon and use the
@@ -19,7 +19,7 @@ same address here. `FAVETTO_URL` provides a default remote URL so you can run
 `favetto tui` with no flags:
 
 ```bash
-export FAVETTO_URL=ws://HOST:7878
+export FAVETTO_URL=ws://HOST:7878/rpc
 favetto tui
 ```
 
@@ -28,7 +28,7 @@ favetto tui
 The client attaches over TLS when the URL uses the `wss://` scheme:
 
 ```bash
-favetto tui --remote wss://HOST:7878 --token-file ~/.local/share/favetto/token
+favetto tui --remote wss://HOST:7878/rpc --token-file ~/.local/share/favetto/token
 ```
 
 The TLS handshake is validated against the bundled Mozilla root store; there is
@@ -49,8 +49,9 @@ There are two supported deployments:
   names.
 
 `wss://` also works with pairing: `exchange_pair_code` rewrites the WebSocket
-scheme to `https://` for the one-off `POST /pair/exchange` call, so
-`favetto tui --remote wss://HOST:7878 --pair-code 123456` talks to
+scheme to `https://` and strips the `/rpc` path for the one-off
+`POST /pair/exchange` call, so
+`favetto tui --remote wss://HOST:7878/rpc --pair-code 123456` talks to
 `https://HOST:7878` and then attaches over the validated WebSocket.
 
 ## Pairing
@@ -62,11 +63,11 @@ daemon for a short-lived code and exchange it for the token during attach:
 # on any machine that can reach the daemon's HTTP endpoint
 favetto pair --url http://HOST:7878
 # pairing code (valid 60s): 123456
-# attach with: favetto tui --remote ws://HOST:7878 --pair-code 123456
+# attach with: favetto tui --remote ws://HOST:7878/rpc --pair-code 123456
 ```
 
 ```bash
-favetto tui --remote ws://HOST:7878 --pair-code 123456
+favetto tui --remote ws://HOST:7878/rpc --pair-code 123456
 ```
 
 The code is valid for 60 seconds and is consumed on first use. Under the hood

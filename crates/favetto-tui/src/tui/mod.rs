@@ -40,7 +40,7 @@ use favetto_core::rpc::method;
 use favetto_providers::Provider;
 
 use crate::cli::TuiArgs;
-use crate::client::{Client, Transport};
+use crate::client::{normalize_ws_url, pair_http_base, Client, Transport};
 use crate::config::FavettoConfig;
 use app::{App, CatalogEntry, ConnState, Popup, UiAction};
 use sound::{CliSound, SoundPlayer};
@@ -1190,14 +1190,14 @@ async fn resolve_transport(args: &TuiArgs) -> Transport {
 
     if let Some(remote) = &args.remote {
         return Transport::Ws {
-            url: remote.clone(),
+            url: normalize_ws_url(remote),
             token: pair_token.or_else(|| read_token(args)),
         };
     }
     if let Ok(url) = std::env::var("FAVETTO_URL") {
         if !url.is_empty() {
             return Transport::Ws {
-                url,
+                url: normalize_ws_url(&url),
                 token: read_token(args),
             };
         }
@@ -1210,12 +1210,14 @@ async fn resolve_transport(args: &TuiArgs) -> Transport {
 }
 
 /// Exchange a pairing code for the daemon's token over the HTTP pairing endpoint.
+///
+/// The pairing endpoint is derived from the remote WebSocket URL by
+/// [`pair_http_base`], so both a base URL and an explicit `/rpc` URL reach the
+/// daemon's HTTP router.
 async fn exchange_pair_code(remote: &str, code: &str) -> anyhow::Result<String> {
-    let http_url = remote
-        .replace("wss://", "https://")
-        .replace("ws://", "http://");
+    let http_url = pair_http_base(remote);
     let resp: serde_json::Value = reqwest::Client::new()
-        .post(format!("{}/pair/exchange", http_url.trim_end_matches('/')))
+        .post(format!("{http_url}/pair/exchange"))
         .json(&serde_json::json!({ "code": code }))
         .send()
         .await?

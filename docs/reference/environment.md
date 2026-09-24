@@ -11,7 +11,7 @@ and integration secrets. Anything not listed here is configured in
 | `FAVETTO_CONFIG` | daemon, TUI | Path to the config file. Overrides the default `~/.config/favetto/config.toml`; `--config` overrides both. |
 | `FAVETTO_DATA_DIR` | daemon, TUI | Directory for SQLite and the bearer token. Defaults to `~/.local/share/favetto`. |
 | `FAVETTO__SECTION__KEY` | daemon, TUI | Override any config key, e.g. `FAVETTO__DAEMON__LISTEN=127.0.0.1:9000`. The separator is a double underscore. |
-| `FAVETTO_URL` | TUI | Default remote WebSocket URL used when `--remote` is not given. |
+| `FAVETTO_URL` | TUI | Default remote WebSocket URL used when `--remote` is not given. A base URL (`ws://HOST:PORT`) targets the daemon's `/rpc` path. |
 
 ## Client behaviour
 

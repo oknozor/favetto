@@ -345,3 +345,37 @@ async fn websocket_rejects_a_wrong_bearer_token() {
         Err(other) => panic!("expected an HTTP 401 rejection, got {other:?}"),
     }
 }
+
+/// The TUI's remote attach uses the `favetto-tui` client (not the raw test
+/// client above). A base URL without `/rpc` must still reach the daemon, which
+/// only upgrades WebSockets at `/rpc`.
+#[tokio::test]
+async fn websocket_remote_attach_accepts_a_base_url() {
+    use favetto_tui::client::{Client, Transport};
+
+    let daemon = DaemonHarness::spawn();
+    wait_for_tcp(daemon.listen(), &daemon).await;
+    let token = std::fs::read_to_string(daemon.root.join("data/token"))
+        .expect("daemon token")
+        .trim()
+        .to_string();
+
+    // A base URL with no path: the client must append `/rpc` for the upgrade.
+    let client = Client::connect(Transport::Ws {
+        url: format!("ws://{}", daemon.listen()),
+        token: Some(token),
+    })
+    .await
+    .expect("remote attach over a base WebSocket URL");
+
+    let resp = client
+        .request(method::TASKS_LIST, serde_json::json!({}))
+        .await
+        .expect("rpc round trip over the WebSocket");
+    assert!(
+        resp.error.is_none(),
+        "tasks.list failed over the WebSocket: {:?}",
+        resp.error
+    );
+    assert!(resp.result.is_some(), "tasks.list returned no result");
+}
