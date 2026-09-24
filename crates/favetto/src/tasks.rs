@@ -486,6 +486,7 @@ pub fn write_task_md(dir: &Path, def: &TaskDef) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn parses_agent_and_cwd_header() {
@@ -925,5 +926,46 @@ mod tests {
         assert!(write_task_md(&dir, &def).is_err());
         assert!(!dir.join("..").join("escape.md").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn arb_utf8() -> impl Strategy<Value = String> {
+        prop::collection::vec(any::<char>(), 0..200)
+            .prop_map(|chars| chars.into_iter().collect::<String>())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn parse_task_md_never_panics_on_arbitrary_utf8(input in arb_utf8()) {
+            let first = parse_task_md("proptest", &input);
+            let second = parse_task_md("proptest", &input);
+            // Parsing is deterministic: same input, same outcome.
+            prop_assert_eq!(first.is_ok(), second.is_ok());
+            if let (Ok(a), Ok(b)) = (&first, &second) {
+                prop_assert_eq!(a, b);
+            }
+        }
+    }
+
+    /// Inputs that historically stress the frame/header split and the validators.
+    #[test]
+    fn parse_task_md_handles_adversarial_corpus() {
+        for input in [
+            "",
+            "---",
+            "---\n",
+            "---\n---\n---\n",
+            "\u{feff}---\nbody\n",
+            "agent = \"x\"\n---",
+            "needs = \":\"\n---\nbody\n",
+            "needs = \"a:\"\n---\nbody\n",
+            "needs = \"a:all_finished\"\n---\nbody\n",
+            "[[vars]]\n",
+            "[[vars]]\nname = \"\"\nprompt = \"p\"\n---\n",
+            "agent = \"x\"\n---\n\u{0}\u{1}\u{2}\n",
+        ] {
+            let _ = parse_task_md("t", input); // must not panic
+        }
     }
 }
