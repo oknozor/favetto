@@ -8,12 +8,13 @@
 //! All types are additive on the wire: every new field defaults, so an older
 //! client or daemon decodes a newer payload unchanged.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{AwaitingInputKind, MessageRole};
 
 /// What an agent is doing right now (coarse, for the task list / picker).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentActivity {
     /// The process is starting up.
@@ -37,7 +38,7 @@ pub enum AgentActivity {
 }
 
 /// A prompt the agent is blocked on.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct InputRequest {
     /// Transport-specific correlation id (permission id, extension-ui id, …).
     pub id: String,
@@ -53,7 +54,7 @@ pub struct InputRequest {
 }
 
 /// The answer to an [`InputRequest`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "reply", rename_all = "snake_case")]
 pub enum InputReply {
     /// Allow this one occurrence.
@@ -71,7 +72,7 @@ pub enum InputReply {
 }
 
 /// Token/cost usage reported by an agent for a turn or a whole run.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentUsage {
     #[serde(default)]
     pub input_tokens: u64,

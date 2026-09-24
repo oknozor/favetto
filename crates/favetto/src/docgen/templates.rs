@@ -86,6 +86,31 @@ pub(crate) const METHOD_TABLE: &str = "| Method | Purpose |\n\
 /// Heading of the server → client pushes section.
 pub(crate) const SERVER_PUSHES_HEADING: &str = "## Server → client pushes\n\n";
 
+/// Heading of the per-method request/response schema section.
+pub(crate) const CLIENT_SCHEMAS_HEADING: &str = "\
+## Client → server request & response types
+
+Every method's `params` and `result` are typed in `favetto-core::rpc::messages`. The tables below are generated from those types' JSON Schemas.
+
+";
+
+/// Heading of a method's request sub-section.
+pub(crate) const REQUEST_HEADING: &str = "**Request**\n\n";
+
+/// Heading of a method's response sub-section.
+pub(crate) const RESPONSE_HEADING: &str = "**Response**\n\n";
+
+/// Heading of the per-push payload schema section.
+pub(crate) const SERVER_SCHEMAS_HEADING: &str = "\
+## Server → client push payloads
+
+Notifications carry the same typed payloads as the matching `favetto-core` types.
+
+";
+
+/// Heading of a push's payload sub-section.
+pub(crate) const PAYLOAD_HEADING: &str = "**Payload**\n\n";
+
 /// Heading of the error-codes section.
 pub(crate) const ERROR_CODES_HEADING: &str = "## Error codes\n\n";
 

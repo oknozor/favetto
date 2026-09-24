@@ -35,11 +35,13 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
+use schemars::JsonSchema;
+
 use crate::config::GitSigning;
 
 /// The declared type of a manual input variable. `int`/`bool` values are coerced
 /// to JSON numbers/bools before being stored in the task's `input`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, serde::Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum VarType {
     #[default]
@@ -50,7 +52,7 @@ pub enum VarType {
 
 /// A manual input variable declared in a task's `[[vars]]` front-matter. The
 /// collected value becomes `input.<name>` and renders through `{{ input.<name> }}`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize, JsonSchema)]
 pub struct TaskVar {
     /// The `input` key. `[a-zA-Z0-9_]+`, unique within the file, never `_prev`.
     pub name: String,

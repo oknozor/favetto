@@ -1,8 +1,14 @@
 use super::*;
+use favetto_core::model::InputReply;
 use favetto_core::rpc::error_code;
 use std::path::Path;
 
 use crate::state::StateInit;
+
+/// Deserialize a JSON params object for a direct helper call in a test.
+fn json_params<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> T {
+    serde_json::from_value(value).expect("test params")
+}
 
 /// A unique scratch directory for server tests.
 fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -446,7 +452,9 @@ async fn add_catalog_task_writes_dot_and_pushes_catalog_updated() {
         "agent": "x",
         "prompt": "hello",
     });
-    let def = add_catalog_task(&state, &params).await.unwrap();
+    let def = add_catalog_task(&state, json_params(params.clone()))
+        .await
+        .unwrap();
     assert_eq!(def.name, "newtask");
 
     let dot = std::fs::read_to_string(dir.join("workflow.dot")).unwrap();
@@ -469,7 +477,9 @@ async fn add_catalog_task_dot_reflects_spawn() {
         "agent": "x",
         "spawn": "child",
     });
-    add_catalog_task(&state, &params).await.unwrap();
+    add_catalog_task(&state, json_params(params.clone()))
+        .await
+        .unwrap();
 
     let dot = std::fs::read_to_string(dir.join("workflow.dot")).unwrap();
     assert!(
@@ -493,7 +503,9 @@ async fn add_catalog_task_with_schedule_registers_cron() {
         "prompt": "hello",
         "schedule": "0 0 8 * * *",
     });
-    add_catalog_task(&state, &params).await.unwrap();
+    add_catalog_task(&state, json_params(params.clone()))
+        .await
+        .unwrap();
 
     let scheduled = crate::db::list_schedules(&state.db).await.unwrap();
     let entry = scheduled
@@ -517,7 +529,9 @@ async fn update_catalog_task_rewrites_file_and_publishes() {
 
     let updated = "agent = \"x\"\n---\nupdated body\n";
     let params = serde_json::json!({ "name": "a", "markdown": updated });
-    update_catalog_task(&state, &params).await.unwrap();
+    update_catalog_task(&state, json_params(params.clone()))
+        .await
+        .unwrap();
 
     assert_eq!(
         std::fs::read_to_string(tasks_dir.join("a.md")).unwrap(),
@@ -550,7 +564,9 @@ async fn update_catalog_task_nested_path() {
 
     let updated = "agent = \"x\"\n---\ntwo\n";
     let params = serde_json::json!({ "name": "pipelines/plan", "markdown": updated });
-    update_catalog_task(&state, &params).await.unwrap();
+    update_catalog_task(&state, json_params(params.clone()))
+        .await
+        .unwrap();
 
     assert_eq!(
         std::fs::read_to_string(tasks_dir.join("pipelines/plan.md")).unwrap(),
@@ -576,7 +592,9 @@ async fn update_catalog_task_rejects_unknown_name() {
         "name": "ghost",
         "markdown": "agent = \"x\"\n---\nhi\n",
     });
-    let err = update_catalog_task(&state, &params).await.unwrap_err();
+    let err = update_catalog_task(&state, json_params(params.clone()))
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("unknown task"), "{err}");
     assert!(!tasks_dir.join("ghost.md").exists());
 
@@ -593,7 +611,9 @@ async fn update_catalog_task_rejects_invalid_markdown() {
     let state = test_state(&dir, &tasks_dir).await;
 
     let params = serde_json::json!({ "name": "a", "markdown": "agent = \n---\nbroken\n" });
-    let err = update_catalog_task(&state, &params).await.unwrap_err();
+    let err = update_catalog_task(&state, json_params(params.clone()))
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("invalid task"), "{err}");
     assert_eq!(
         std::fs::read_to_string(tasks_dir.join("a.md")).unwrap(),
@@ -614,7 +634,9 @@ async fn update_catalog_task_rejects_traversal() {
         "name": "../escape",
         "markdown": "agent = \"x\"\n---\nhi\n",
     });
-    let err = update_catalog_task(&state, &params).await.unwrap_err();
+    let err = update_catalog_task(&state, json_params(params.clone()))
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("invalid task path"), "{err}");
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -1042,12 +1064,12 @@ async fn agents_start_renders_catalog_prompt_with_task_input() {
     // against the task's collected input before seeding the session.
     start_agent(
         &state,
-        &serde_json::json!({
+        json_params(serde_json::json!({
             "task_id": task.id.to_string(),
             "prompt": "Target repository: `{{ input.repo }}`",
             "rows": 40,
             "cols": 120,
-        }),
+        })),
     )
     .await
     .expect("start_agent");
@@ -1113,7 +1135,7 @@ async fn agents_start_uses_catalog_provider_and_model() {
 
     start_agent(
         &state,
-        &serde_json::json!({ "task_id": task.id.to_string() }),
+        json_params(serde_json::json!({ "task_id": task.id.to_string() })),
     )
     .await
     .expect("start_agent");
@@ -1335,7 +1357,7 @@ async fn agents_start_attaches_a_live_headless_run_without_duplicating() {
 
     let attached = start_agent(
         &state,
-        &serde_json::json!({ "task_id": task.id.to_string(), "agent": "plain" }),
+        json_params(serde_json::json!({ "task_id": task.id.to_string(), "agent": "plain" })),
     )
     .await
     .expect("a live headless run must be attached, not duplicated");
@@ -1440,7 +1462,7 @@ async fn agents_start_does_not_resume_a_live_headless_writer() {
 
     let attached = start_agent(
         &state,
-        &serde_json::json!({ "task_id": task.id.to_string(), "agent": "rsm" }),
+        json_params(serde_json::json!({ "task_id": task.id.to_string(), "agent": "rsm" })),
     )
     .await
     .expect("a live headless writer must be attached, not resumed");
@@ -1457,7 +1479,7 @@ async fn agents_start_does_not_resume_a_live_headless_writer() {
     state.agents.close(&info.id).ok();
     let resumed = start_agent(
         &state,
-        &serde_json::json!({ "task_id": task.id.to_string(), "agent": "rsm" }),
+        json_params(serde_json::json!({ "task_id": task.id.to_string(), "agent": "rsm" })),
     )
     .await
     .expect("a finished resumable run must resume");
@@ -1567,13 +1589,13 @@ async fn agents_start_resumes_in_the_runs_worktree() {
 
     let info = start_agent(
         &state,
-        &serde_json::json!({
+        json_params(serde_json::json!({
             "task_id": task.id.to_string(),
             "agent": "rsm",
             // The TUI sends the task's base repo as `cwd`; resume must ignore
             // it in favour of the run's worktree.
             "cwd": repo.to_string_lossy(),
-        }),
+        })),
     )
     .await
     .expect("start_agent");
@@ -1679,7 +1701,7 @@ async fn agents_start_replays_a_finished_headless_run() {
 
     let replayed = start_agent(
         &state,
-        &serde_json::json!({ "task_id": task.id.to_string(), "agent": "plain" }),
+        json_params(serde_json::json!({ "task_id": task.id.to_string(), "agent": "plain" })),
     )
     .await
     .expect("a finished headless run must be replayed");

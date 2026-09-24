@@ -14,13 +14,11 @@ use chrono::Utc;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
-use favetto_core::model::{
-    AgentCatalogEntry, AgentSessionInfo, EventKind, InputReply, Task, TaskStatus,
-};
+use favetto_core::model::{AgentCatalogEntry, AgentSessionInfo, EventKind, Task, TaskStatus};
+use favetto_core::rpc::messages::*;
 use favetto_core::rpc::{method, push, Frame, Notification, Request, Response, RpcError};
 use favetto_core::wire::WireError;
 use favetto_core::workflow::{
@@ -105,21 +103,24 @@ pub async fn serve_connection(state: Arc<State>, mut incoming: BoxIn, mut outgoi
                         let (method, params) = match ev {
                             AgentEvent::Output { data, .. } => (
                                 push::AGENT_OUTPUT,
-                                serde_json::json!({
-                                    "session_id": sid,
-                                    "data": base64::engine::general_purpose::STANDARD.encode(&data),
+                                encode(AgentOutputPush {
+                                    session_id: sid,
+                                    data: base64::engine::general_purpose::STANDARD.encode(&data),
                                 }),
                             ),
                             AgentEvent::Exit { code, .. } => (
                                 push::AGENT_EXIT,
-                                serde_json::json!({ "session_id": sid, "code": code }),
+                                encode(AgentExitPush {
+                                    session_id: sid,
+                                    code,
+                                }),
                             ),
                             AgentEvent::State { live, .. } => (
                                 push::AGENT_STATE,
-                                serde_json::json!({
-                                    "session_id": sid,
-                                    "activity": live.activity,
-                                    "usage": live.usage,
+                                encode(AgentStatePush {
+                                    session_id: sid,
+                                    activity: live.activity,
+                                    usage: live.usage,
                                 }),
                             ),
                         };
@@ -180,7 +181,7 @@ async fn handle_request(
         let _ = out_tx
             .send(Frame::Response(Response::ok(
                 id,
-                serde_json::json!({ "subscribed": true }),
+                encode(EventsSubscribeResult { subscribed: true }),
             )))
             .await;
 
@@ -215,21 +216,24 @@ async fn handle_request(
     // `agents.start` spawns the PTY and immediately attaches, returning the current
     // full-screen frame so the client starts in sync.
     if req.method == method::AGENTS_START {
-        let resp = match start_agent(state, &req.params).await {
-            Ok(session) => match state.agents.attach(&session.id) {
-                Ok((session, data)) => {
-                    subscribed.lock().insert(session.id.clone());
-                    Response::ok(
-                        id,
-                        serde_json::json!({
-                            "session": session,
-                            "data": base64::engine::general_purpose::STANDARD.encode(&data),
-                        }),
-                    )
-                }
-                Err(e) => Response::error(id, RpcError::Internal(e.to_string())),
+        let resp = match parse_params::<StartAgentParams>(&req.method, &req.params) {
+            Ok(params) => match start_agent(state, params).await {
+                Ok(session) => match state.agents.attach(&session.id) {
+                    Ok((session, data)) => {
+                        subscribed.lock().insert(session.id.clone());
+                        Response::ok(
+                            id,
+                            encode(AgentAttachResult {
+                                session,
+                                data: base64::engine::general_purpose::STANDARD.encode(&data),
+                            }),
+                        )
+                    }
+                    Err(e) => Response::error(id, RpcError::Internal(e.to_string())),
+                },
+                Err(e) => Response::error(id, RpcError::InvalidParams(e.to_string())),
             },
-            Err(e) => Response::error(id, RpcError::InvalidParams(e.to_string())),
+            Err(error) => Response::error(id, error),
         };
         let _ = out_tx.send(Frame::Response(resp)).await;
         return;
@@ -238,18 +242,15 @@ async fn handle_request(
     // `tasks.start_oneshot` creates an inline task and opens its interactive
     // session; subscribe this connection so the Agent panel receives its frames.
     if req.method == method::TASKS_START_ONESHOT {
-        let resp = match start_oneshot_task(state, &req.params).await {
-            Ok(value) => {
-                if let Some(sid) = value
-                    .get("session")
-                    .and_then(|s| s.get("id"))
-                    .and_then(|v| v.as_str())
-                {
-                    subscribed.lock().insert(sid.to_string());
+        let resp = match parse_params::<StartOneshotParams>(&req.method, &req.params) {
+            Ok(params) => match start_oneshot_task(state, params).await {
+                Ok(result) => {
+                    subscribed.lock().insert(result.session.id.clone());
+                    Response::ok(id, encode(result))
                 }
-                Response::ok(id, value)
-            }
-            Err(e) => Response::error(id, RpcError::Internal(e.to_string())),
+                Err(e) => Response::error(id, RpcError::Internal(e.to_string())),
+            },
+            Err(error) => Response::error(id, error),
         };
         let _ = out_tx.send(Frame::Response(resp)).await;
         return;
@@ -263,9 +264,9 @@ async fn handle_request(
                     subscribed.lock().insert(p.session_id);
                     Response::ok(
                         id,
-                        serde_json::json!({
-                            "session": session,
-                            "data": base64::engine::general_purpose::STANDARD.encode(&data),
+                        encode(AgentAttachResult {
+                            session,
+                            data: base64::engine::general_purpose::STANDARD.encode(&data),
                         }),
                     )
                 }
@@ -282,7 +283,12 @@ async fn handle_request(
             Ok(p) => {
                 subscribed.lock().remove(&p.session_id);
                 match state.agents.close(&p.session_id) {
-                    Ok(()) => Response::ok(id, serde_json::json!({ "closed": p.session_id })),
+                    Ok(()) => Response::ok(
+                        id,
+                        encode(AgentCloseResult {
+                            closed: p.session_id,
+                        }),
+                    ),
                     Err(e) => Response::error(id, RpcError::Internal(e.to_string())),
                 }
             }
@@ -294,18 +300,6 @@ async fn handle_request(
 
     let resp = dispatch(state, req).await;
     let _ = out_tx.send(Frame::Response(resp)).await;
-}
-
-/// Deserialize an optional field leniently: a missing or ill-typed value becomes
-/// `None`, matching the `params.get(..).and_then(..)` chains these typed params
-/// replace. Required fields deliberately do not use this.
-fn lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: DeserializeOwned,
-{
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 /// Deserialize request `params` into a typed struct, surfacing serde's message as
@@ -325,260 +319,6 @@ fn parse_params<T: DeserializeOwned>(
         .map_err(|err| RpcError::InvalidParams(format!("invalid params for {method}: {err}")))
 }
 
-/// `tasks.list` params. `limit` defaults to 500 and caps at 2000.
-#[derive(Debug, Default, Deserialize)]
-struct TasksListParams {
-    #[serde(default, deserialize_with = "lenient")]
-    limit: Option<u64>,
-}
-
-/// `tasks.get` / `tasks.cancel` params.
-#[derive(Debug, Deserialize)]
-struct TaskIdParams {
-    id: Uuid,
-}
-
-/// `workflow.inspect` / `workflow.cancel` params.
-#[derive(Debug, Deserialize)]
-struct WorkflowInspectParams {
-    root_id: Uuid,
-}
-
-/// `workflow.retry` params. The workflow API names the task id `task_id`.
-#[derive(Debug, Deserialize)]
-struct WorkflowRetryParams {
-    task_id: Uuid,
-}
-
-/// One node of a `workflow.create` request. `key` is local to the request and is
-/// what sibling nodes reference from `depends_on`.
-#[derive(Debug, Deserialize)]
-struct WorkflowCreateTask {
-    key: String,
-    name: String,
-    #[serde(default, deserialize_with = "lenient")]
-    input: Option<serde_json::Value>,
-    #[serde(default, deserialize_with = "lenient")]
-    depends_on: Option<Vec<String>>,
-}
-
-/// `workflow.create` params. `idempotency_key` scopes the per-node dedupe keys;
-/// `root_id` optionally extends an existing root.
-#[derive(Debug, Deserialize)]
-struct WorkflowCreateParams {
-    idempotency_key: String,
-    #[serde(default, deserialize_with = "lenient")]
-    root_id: Option<Uuid>,
-    #[serde(default, deserialize_with = "lenient")]
-    tasks: Option<Vec<WorkflowCreateTask>>,
-}
-
-/// `workflow.spawn` params.
-#[derive(Debug, Deserialize)]
-struct WorkflowSpawnParams {
-    name: String,
-    #[serde(default, deserialize_with = "lenient")]
-    input: Option<serde_json::Value>,
-    #[serde(default, deserialize_with = "lenient")]
-    root_id: Option<Uuid>,
-    #[serde(default, deserialize_with = "lenient")]
-    depends_on: Option<Vec<Uuid>>,
-    #[serde(default, deserialize_with = "lenient")]
-    dedupe_key: Option<String>,
-}
-
-/// `tasks.start` params. `input` defaults to JSON null; `interactive` defaults
-/// to false (headless), so only the TUI opts into the live embedded TUI.
-#[derive(Debug, Deserialize)]
-struct TasksStartParams {
-    name: String,
-    #[serde(default, deserialize_with = "lenient")]
-    input: Option<serde_json::Value>,
-    #[serde(default, deserialize_with = "lenient")]
-    interactive: Option<bool>,
-}
-
-/// `catalog.get` params.
-#[derive(Debug, Deserialize)]
-struct CatalogGetParams {
-    name: String,
-}
-
-/// `events.tail` params. `limit` defaults to 50 and caps at 1000.
-#[derive(Debug, Default, Deserialize)]
-struct EventsTailParams {
-    #[serde(default, deserialize_with = "lenient")]
-    limit: Option<u64>,
-}
-
-/// `events.subscribe` params. A malformed request degrades to "no replay".
-#[derive(Debug, Default, Deserialize)]
-struct EventsSubscribeParams {
-    #[serde(default, deserialize_with = "lenient")]
-    last_event_id: Option<i64>,
-}
-
-/// `notifications.list` params. `limit` defaults to 50 and caps at 1000.
-#[derive(Debug, Default, Deserialize)]
-struct NotificationsListParams {
-    #[serde(default, deserialize_with = "lenient")]
-    limit: Option<u64>,
-}
-
-/// `agents.attach` / `agents.close` params.
-#[derive(Debug, Deserialize)]
-struct SessionIdParams {
-    session_id: String,
-}
-
-/// `agents.input` params.
-#[derive(Debug, Deserialize)]
-struct AgentInputParams {
-    session_id: String,
-    #[serde(default, deserialize_with = "lenient")]
-    data: Option<String>,
-}
-
-/// `agents.resize` params. `rows`/`cols` default to 24/80.
-#[derive(Debug, Deserialize)]
-struct AgentResizeParams {
-    session_id: String,
-    #[serde(default, deserialize_with = "lenient")]
-    rows: Option<u64>,
-    #[serde(default, deserialize_with = "lenient")]
-    cols: Option<u64>,
-}
-
-/// `agents.reply` params: answer the request identified by `request_id`.
-#[derive(Debug, Deserialize)]
-struct AgentReplyParams {
-    session_id: String,
-    request_id: String,
-    reply: InputReply,
-}
-
-/// `providers.list` params.
-#[derive(Debug, Default, Deserialize)]
-struct ProvidersListParams {
-    #[serde(default, deserialize_with = "lenient")]
-    agent: Option<String>,
-}
-
-/// `schedules.delete` params.
-#[derive(Debug, Deserialize)]
-struct ScheduleDeleteParams {
-    id: String,
-}
-
-/// `schedules.upsert` params.
-#[derive(Debug, Deserialize)]
-struct ScheduleUpsertParams {
-    #[serde(default, deserialize_with = "lenient")]
-    id: Option<String>,
-    cron: String,
-    task: String,
-    #[serde(default, deserialize_with = "lenient")]
-    input: Option<serde_json::Value>,
-    #[serde(default, deserialize_with = "lenient")]
-    enabled: Option<bool>,
-}
-
-/// `notifications.test` params.
-#[derive(Debug, Deserialize)]
-struct NotificationTestParams {
-    channel: String,
-    #[serde(default, deserialize_with = "lenient")]
-    config: Option<serde_json::Value>,
-    #[serde(default, deserialize_with = "lenient")]
-    subject: Option<String>,
-    #[serde(default, deserialize_with = "lenient")]
-    body: Option<String>,
-}
-
-/// `hooks.upsert` params.
-#[derive(Debug, Deserialize)]
-struct HookUpsertParams {
-    event: String,
-    channel: String,
-    #[serde(default, deserialize_with = "lenient")]
-    config: Option<serde_json::Value>,
-}
-
-/// `catalog.add` params. `spawn_new_root` defaults to false, `prompt` to "".
-#[derive(Debug, Deserialize)]
-struct CatalogAddParams {
-    name: String,
-    #[serde(default, deserialize_with = "lenient")]
-    agent: Option<String>,
-    #[serde(default, deserialize_with = "lenient")]
-    provider: Option<String>,
-    #[serde(default, deserialize_with = "lenient")]
-    model: Option<String>,
-    #[serde(default, deserialize_with = "lenient")]
-    cwd: Option<String>,
-    #[serde(default, deserialize_with = "lenient")]
-    schedule: Option<String>,
-    #[serde(default, deserialize_with = "lenient")]
-    needs: Option<String>,
-    #[serde(default, deserialize_with = "lenient")]
-    spawn: Option<String>,
-    #[serde(default, deserialize_with = "lenient")]
-    spawn_file: Option<String>,
-    #[serde(default, deserialize_with = "lenient")]
-    spawn_new_root: Option<bool>,
-    #[serde(default, deserialize_with = "lenient")]
-    prompt: Option<String>,
-}
-
-/// `catalog.update` params.
-#[derive(Debug, Deserialize)]
-struct CatalogUpdateParams {
-    name: String,
-    markdown: String,
-}
-
-/// `agents.start` params. `rows`/`cols` default to 24/80, `new` to false.
-#[derive(Debug, Default, Deserialize)]
-struct StartAgentParams {
-    #[serde(default, deserialize_with = "lenient")]
-    agent: Option<String>,
-    #[serde(default, deserialize_with = "lenient")]
-    task_id: Option<String>,
-    #[serde(default, deserialize_with = "lenient")]
-    prompt: Option<String>,
-    #[serde(default, deserialize_with = "lenient")]
-    session_id: Option<String>,
-    #[serde(default, deserialize_with = "lenient")]
-    rows: Option<u64>,
-    #[serde(default, deserialize_with = "lenient")]
-    cols: Option<u64>,
-    #[serde(default, deserialize_with = "lenient")]
-    new: Option<bool>,
-    #[serde(default, deserialize_with = "lenient")]
-    provider: Option<String>,
-    #[serde(default, deserialize_with = "lenient")]
-    model: Option<String>,
-    #[serde(default, deserialize_with = "lenient")]
-    cwd: Option<std::path::PathBuf>,
-}
-
-/// `tasks.start_oneshot` params. `rows`/`cols` default to 24/80.
-#[derive(Debug, Default, Deserialize)]
-struct StartOneshotParams {
-    #[serde(default, deserialize_with = "lenient")]
-    agent: Option<String>,
-    #[serde(default, deserialize_with = "lenient")]
-    provider: Option<String>,
-    #[serde(default, deserialize_with = "lenient")]
-    model: Option<String>,
-    #[serde(default, deserialize_with = "lenient")]
-    cwd: Option<String>,
-    #[serde(default, deserialize_with = "lenient")]
-    rows: Option<u64>,
-    #[serde(default, deserialize_with = "lenient")]
-    cols: Option<u64>,
-}
-
 /// Execute a request and build its response.
 pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
     let id = req.id;
@@ -588,21 +328,49 @@ pub async fn dispatch(state: &Arc<State>, req: Request) -> Response {
     }
 }
 
+/// Serialize a typed result into the `Value` envelope, mapping a serialization
+/// failure to an internal error.
+fn to_value<T: serde::Serialize>(value: T) -> Result<serde_json::Value, RpcError> {
+    serde_json::to_value(value).map_err(|e| RpcError::Internal(e.to_string()))
+}
+
+/// Serialize a value that cannot fail. Used by the handlers that build a frame
+/// outside [`dispatch_method`] (subscribe ack, agent attach, one-shot start).
+fn encode<T: serde::Serialize>(value: T) -> serde_json::Value {
+    serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
+}
+
+/// Map the provider catalog's type into the wire type owned by `favetto-core`.
+fn provider_info(provider: &favetto_providers::Provider) -> ProviderInfo {
+    ProviderInfo {
+        id: provider.id.clone(),
+        name: provider.name.clone(),
+        models: provider
+            .models
+            .iter()
+            .map(|model| ProviderModelInfo {
+                id: model.id.clone(),
+                name: model.name.clone(),
+            })
+            .collect(),
+    }
+}
+
 /// Resolve a method's typed params and produce its result value.
 async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json::Value, RpcError> {
     match req.method.as_str() {
-        method::PING => Ok(serde_json::json!({
-            "pong": true,
-            "cwd": std::env::current_dir()
+        method::PING => to_value(PingResult {
+            pong: true,
+            cwd: std::env::current_dir()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default(),
-        })),
+        }),
 
         method::TASKS_LIST => {
             let p: TasksListParams = parse_params(&req.method, &req.params)?;
             let limit = p.limit.unwrap_or(500).min(2000) as i64;
             match db::list_tasks(&state.db, limit).await {
-                Ok(tasks) => Ok(serde_json::json!(tasks)),
+                Ok(tasks) => to_value(tasks),
                 Err(e) => Err(RpcError::Internal(e.to_string())),
             }
         }
@@ -610,7 +378,7 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
         method::TASKS_GET => {
             let p: TaskIdParams = parse_params(&req.method, &req.params)?;
             match db::get_task(&state.db, p.id).await {
-                Ok(Some(task)) => Ok(serde_json::json!(task)),
+                Ok(Some(task)) => to_value(task),
                 Ok(None) => Err(RpcError::InvalidParams("task not found".to_string())),
                 Err(e) => Err(RpcError::Internal(e.to_string())),
             }
@@ -619,16 +387,14 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
         method::TASKS_CANCEL => {
             let p: TaskIdParams = parse_params(&req.method, &req.params)?;
             match cancel_task(state, p.id).await {
-                Ok(task) => Ok(serde_json::json!(task)),
+                Ok(task) => to_value(task),
                 Err(e) => Err(RpcError::Internal(e.to_string())),
             }
         }
 
         method::TASKS_RETRY => {
             let p: TaskIdParams = parse_params(&req.method, &req.params)?;
-            retry_task(state, p.id)
-                .await
-                .map(|task| serde_json::json!(task))
+            retry_task(state, p.id).await.and_then(to_value)
         }
 
         method::TASKS_START => {
@@ -636,30 +402,28 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
             let input = p.input.unwrap_or(serde_json::Value::Null);
             let interactive = p.interactive.unwrap_or(false);
             match crate::executor::enqueue_task(state, p.name, input, None, interactive).await {
-                Ok(task) => Ok(serde_json::json!(task)),
+                Ok(task) => to_value(task),
                 Err(e) => Err(RpcError::Internal(e.to_string())),
             }
         }
 
         method::CATALOG_LIST => {
             let catalog = state.catalog.read().clone();
-            let list: Vec<serde_json::Value> = catalog
+            let list: Vec<CatalogEntry> = catalog
                 .iter()
-                .map(|d| {
-                    serde_json::json!({
-                        "name": d.name,
-                        "agent": d.agent,
-                        "provider": d.provider,
-                        "model": d.model,
-                        "cwd": d.cwd,
-                        "schedule": d.schedule,
-                        "needs": d.needs,
-                        "vars": d.vars,
-                        "prompt": d.prompt,
-                    })
+                .map(|d| CatalogEntry {
+                    name: d.name.clone(),
+                    agent: d.agent.clone(),
+                    provider: d.provider.clone(),
+                    model: d.model.clone(),
+                    cwd: d.cwd.clone(),
+                    schedule: d.schedule.clone(),
+                    needs: d.needs.clone(),
+                    vars: d.vars.clone(),
+                    prompt: d.prompt.clone(),
                 })
                 .collect();
-            Ok(serde_json::json!(list))
+            to_value(list)
         }
 
         method::CATALOG_GET => {
@@ -678,80 +442,78 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
                         .map(crate::tasks::to_markdown)
                 });
                 match markdown {
-                    Some(markdown) => Ok(serde_json::json!({ "markdown": markdown })),
+                    Some(markdown) => to_value(CatalogGetResult { markdown }),
                     None => Err(RpcError::InvalidParams(format!("unknown task '{name}'"))),
                 }
             }
         }
 
-        method::CATALOG_ADD => match add_catalog_task(state, &req.params).await {
-            Ok(def) => Ok(serde_json::json!({
-                "name": def.name,
-                "agent": def.agent,
-                "provider": def.provider,
-                "model": def.model,
-                "cwd": def.cwd,
-                "schedule": def.schedule,
-                "needs": def.needs,
-                "vars": def.vars,
-            })),
-            Err(e) => Err(RpcError::Internal(e.to_string())),
-        },
+        method::CATALOG_ADD => {
+            let p: CatalogAddParams = parse_params(&req.method, &req.params)?;
+            match add_catalog_task(state, p).await {
+                Ok(def) => to_value(CatalogAddResult {
+                    name: def.name,
+                    agent: def.agent,
+                    provider: def.provider,
+                    model: def.model,
+                    cwd: def.cwd,
+                    schedule: def.schedule,
+                    needs: def.needs,
+                    vars: def.vars,
+                }),
+                Err(e) => Err(RpcError::Internal(e.to_string())),
+            }
+        }
 
-        method::CATALOG_UPDATE => match update_catalog_task(state, &req.params).await {
-            Ok(()) => Ok(serde_json::json!({ "updated": true })),
-            Err(e) => Err(RpcError::InvalidParams(e.to_string())),
-        },
+        method::CATALOG_UPDATE => {
+            let p: CatalogUpdateParams = parse_params(&req.method, &req.params)?;
+            match update_catalog_task(state, p).await {
+                Ok(()) => to_value(CatalogUpdateResult { updated: true }),
+                Err(e) => Err(RpcError::InvalidParams(e.to_string())),
+            }
+        }
 
         method::WORKFLOW_GET => {
             let catalog = state.catalog.read().clone();
-            Ok(serde_json::json!({
-                "dot": crate::workflow::build_dot(&catalog),
-                "path": crate::workflow::dot_path(&state.data_dir).to_string_lossy(),
-                "graph": crate::workflow::build_graph(&catalog),
-            }))
+            to_value(WorkflowGetResult {
+                dot: crate::workflow::build_dot(&catalog),
+                path: crate::workflow::dot_path(&state.data_dir)
+                    .to_string_lossy()
+                    .into_owned(),
+                graph: crate::workflow::build_graph(&catalog),
+            })
         }
 
         method::WORKFLOW_INSPECT => {
             let p: WorkflowInspectParams = parse_params(&req.method, &req.params)?;
-            inspect_workflow(state, p.root_id)
-                .await
-                .map(|view| serde_json::json!(view))
+            inspect_workflow(state, p.root_id).await.and_then(to_value)
         }
 
         method::WORKFLOW_CREATE => {
             let p: WorkflowCreateParams = parse_params(&req.method, &req.params)?;
-            create_workflow(state, p)
-                .await
-                .map(|result| serde_json::json!(result))
+            create_workflow(state, p).await.and_then(to_value)
         }
 
         method::WORKFLOW_SPAWN => {
             let p: WorkflowSpawnParams = parse_params(&req.method, &req.params)?;
-            spawn_workflow(state, p)
-                .await
-                .map(|task| serde_json::json!(task))
+            spawn_workflow(state, p).await.and_then(to_value)
         }
 
         method::WORKFLOW_CANCEL => {
             let p: WorkflowInspectParams = parse_params(&req.method, &req.params)?;
-            cancel_workflow(state, p.root_id)
-                .await
-                .map(|result| serde_json::json!(result))
+            cancel_workflow(state, p.root_id).await.and_then(to_value)
         }
 
         method::WORKFLOW_RETRY => {
             let p: WorkflowRetryParams = parse_params(&req.method, &req.params)?;
-            retry_task(state, p.task_id)
-                .await
-                .map(|task| serde_json::json!(task))
+            retry_task(state, p.task_id).await.and_then(to_value)
         }
 
         method::EVENTS_TAIL => {
             let p: EventsTailParams = parse_params(&req.method, &req.params)?;
             let limit = p.limit.unwrap_or(50).min(1000) as i64;
             match db::tail_events(&state.db, limit).await {
-                Ok(events) => Ok(serde_json::json!(events)),
+                Ok(events) => to_value(events),
                 Err(e) => Err(RpcError::Internal(e.to_string())),
             }
         }
@@ -795,13 +557,15 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
                 }
             }
             entries.sort_by(|a, b| a.name.cmp(&b.name));
-            Ok(serde_json::json!(entries))
+            to_value(entries)
         }
 
         method::PROVIDERS_LIST => {
             let p: ProvidersListParams = parse_params(&req.method, &req.params)?;
             match list_providers(state, p.agent.as_deref()).await {
-                Ok(providers) => Ok(serde_json::json!({ "providers": providers })),
+                Ok(providers) => to_value(ProvidersListResult {
+                    providers: providers.iter().map(provider_info).collect(),
+                }),
                 Err(e) => Err(RpcError::Internal(e.to_string())),
             }
         }
@@ -813,7 +577,7 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
                 .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
                 .unwrap_or_default();
             match state.agents.input(&p.session_id, &data) {
-                Ok(()) => Ok(serde_json::json!({ "bytes": data.len() })),
+                Ok(()) => to_value(AgentInputResult { bytes: data.len() }),
                 Err(e) => Err(RpcError::Internal(e.to_string())),
             }
         }
@@ -823,7 +587,7 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
             let rows = p.rows.unwrap_or(24) as u16;
             let cols = p.cols.unwrap_or(80) as u16;
             match state.agents.resize(&p.session_id, rows, cols) {
-                Ok(()) => Ok(serde_json::json!({ "rows": rows, "cols": cols })),
+                Ok(()) => to_value(AgentResizeResult { rows, cols }),
                 Err(e) => Err(RpcError::Internal(e.to_string())),
             }
         }
@@ -835,25 +599,28 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
                 .reply(&p.session_id, &p.request_id, p.reply)
                 .await
             {
-                Ok(()) => Ok(serde_json::json!({ "replied": true })),
+                Ok(()) => to_value(AgentReplyResult { replied: true }),
                 Err(e) => Err(RpcError::Internal(e.to_string())),
             }
         }
 
         method::SCHEDULES_LIST => match db::list_schedules(&state.db).await {
-            Ok(schedules) => Ok(serde_json::json!(schedules)),
+            Ok(schedules) => to_value(schedules),
             Err(e) => Err(RpcError::Internal(e.to_string())),
         },
 
-        method::SCHEDULES_UPSERT => match upsert_schedule(state, &req.params).await {
-            Ok(schedule) => Ok(serde_json::json!(schedule)),
-            Err(e) => Err(RpcError::Internal(e.to_string())),
-        },
+        method::SCHEDULES_UPSERT => {
+            let p: ScheduleUpsertParams = parse_params(&req.method, &req.params)?;
+            match upsert_schedule(state, p).await {
+                Ok(schedule) => to_value(schedule),
+                Err(e) => Err(RpcError::Internal(e.to_string())),
+            }
+        }
 
         method::SCHEDULES_DELETE => {
             let p: ScheduleDeleteParams = parse_params(&req.method, &req.params)?;
             match delete_schedule(state, &p.id).await {
-                Ok(()) => Ok(serde_json::json!({ "deleted": p.id })),
+                Ok(()) => to_value(SchedulesDeleteResult { deleted: p.id }),
                 Err(e) => Err(RpcError::Internal(e.to_string())),
             }
         }
@@ -862,7 +629,7 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
             let p: NotificationsListParams = parse_params(&req.method, &req.params)?;
             let limit = p.limit.unwrap_or(50).min(1000) as i64;
             match db::list_notifications(&state.db, limit).await {
-                Ok(notifications) => Ok(serde_json::json!(notifications)),
+                Ok(notifications) => to_value(notifications),
                 Err(e) => Err(RpcError::Internal(e.to_string())),
             }
         }
@@ -873,13 +640,16 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
             let subject = p.subject.as_deref().unwrap_or("test");
             let body = p.body.as_deref().unwrap_or("test notification");
             crate::notify::send(state, &p.channel, &config, subject, body).await;
-            Ok(serde_json::json!({ "sent": true }))
+            to_value(NotificationTestResult { sent: true })
         }
 
-        method::HOOKS_UPSERT => match upsert_hook(state, &req.params) {
-            Ok(()) => Ok(serde_json::json!({ "added": true })),
-            Err(e) => Err(RpcError::InvalidParams(e.to_string())),
-        },
+        method::HOOKS_UPSERT => {
+            let p: HookUpsertParams = parse_params(&req.method, &req.params)?;
+            match upsert_hook(state, p) {
+                Ok(()) => to_value(HookUpsertResult { added: true }),
+                Err(e) => Err(RpcError::InvalidParams(e.to_string())),
+            }
+        }
 
         _ => Err(RpcError::MethodNotFound(format!(
             "unknown method: {}",
@@ -1302,7 +1072,7 @@ fn workflow_state(tasks: &[WorkflowTaskView]) -> WorkflowState {
 /// (`AgentSessionInfo::headless` tells the client not to forward keystrokes).
 async fn start_agent(
     state: &Arc<State>,
-    params: &serde_json::Value,
+    params: StartAgentParams,
 ) -> anyhow::Result<AgentSessionInfo> {
     let StartAgentParams {
         agent: requested,
@@ -1315,7 +1085,7 @@ async fn start_agent(
         provider: requested_provider,
         model: requested_model,
         cwd,
-    } = parse_value(params)?;
+    } = params;
     let rows = rows.unwrap_or(24) as u16;
     let cols = cols.unwrap_or(80) as u16;
     let force_new = force_new.unwrap_or(false);
@@ -1513,8 +1283,8 @@ async fn list_providers(
 /// normal task lifecycle and finishes the task when the session exits.
 async fn start_oneshot_task(
     state: &Arc<State>,
-    params: &serde_json::Value,
-) -> anyhow::Result<serde_json::Value> {
+    params: StartOneshotParams,
+) -> anyhow::Result<StartOneshotResult> {
     let StartOneshotParams {
         agent: requested,
         provider,
@@ -1522,7 +1292,7 @@ async fn start_oneshot_task(
         cwd,
         rows,
         cols,
-    } = parse_value(params)?;
+    } = params;
     let cwd = cwd
         .map(|cwd| cwd.trim().to_string())
         .filter(|cwd| !cwd.is_empty());
@@ -1646,11 +1416,11 @@ async fn start_oneshot_task(
     }
 
     let (session_info, frame) = state.agents.attach(&info.id)?;
-    Ok(serde_json::json!({
-        "task": task,
-        "session": session_info,
-        "data": base64::engine::general_purpose::STANDARD.encode(&frame),
-    }))
+    Ok(StartOneshotResult {
+        task,
+        session: session_info,
+        data: base64::engine::general_purpose::STANDARD.encode(&frame),
+    })
 }
 
 /// Mark a one-shot task finished once its interactive session exits.
@@ -1736,7 +1506,7 @@ async fn finish_oneshot(
 /// Create or update a schedule: (re)register its cron job and persist it.
 async fn upsert_schedule(
     state: &Arc<State>,
-    params: &serde_json::Value,
+    params: ScheduleUpsertParams,
 ) -> anyhow::Result<favetto_core::model::Schedule> {
     use favetto_core::model::Schedule;
 
@@ -1746,7 +1516,7 @@ async fn upsert_schedule(
         task,
         input,
         enabled,
-    } = parse_value(params)?;
+    } = params;
     let id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let input = input.unwrap_or(serde_json::Value::Null);
     let enabled = enabled.unwrap_or(true);
@@ -1767,7 +1537,7 @@ async fn upsert_schedule(
 /// Add a task definition to the catalog (writes the `.md` file + updates memory).
 async fn add_catalog_task(
     state: &Arc<State>,
-    params: &serde_json::Value,
+    params: CatalogAddParams,
 ) -> anyhow::Result<crate::tasks::TaskDef> {
     use crate::tasks::TaskDef;
 
@@ -1783,7 +1553,7 @@ async fn add_catalog_task(
         spawn_file,
         spawn_new_root,
         prompt,
-    } = parse_value(params)?;
+    } = params;
     crate::tasks::validate_task_path(&name)?;
     if agent.is_none() {
         anyhow::bail!("a task needs an 'agent'");
@@ -1837,8 +1607,11 @@ async fn add_catalog_task(
 /// Validates the path and the Markdown before writing so a malformed save can
 /// never clobber a good task file; the raw bytes are written unchanged so the
 /// user's formatting is preserved.
-async fn update_catalog_task(state: &Arc<State>, params: &serde_json::Value) -> anyhow::Result<()> {
-    let CatalogUpdateParams { name, markdown } = parse_value(params)?;
+async fn update_catalog_task(
+    state: &Arc<State>,
+    params: CatalogUpdateParams,
+) -> anyhow::Result<()> {
+    let CatalogUpdateParams { name, markdown } = params;
     crate::tasks::validate_task_path(&name)?;
     if !state.catalog.read().iter().any(|d| d.name == name) {
         anyhow::bail!("unknown task '{name}'");
@@ -1859,12 +1632,12 @@ async fn delete_schedule(state: &Arc<State>, id: &str) -> anyhow::Result<()> {
 }
 
 /// Add a notification hook reacting to an event kind (live, in-memory).
-fn upsert_hook(state: &Arc<State>, params: &serde_json::Value) -> anyhow::Result<()> {
+fn upsert_hook(state: &Arc<State>, params: HookUpsertParams) -> anyhow::Result<()> {
     let HookUpsertParams {
         event,
         channel,
         config,
-    } = parse_value(params)?;
+    } = params;
     let event = favetto_core::model::EventKind::from_name(&event)
         .ok_or_else(|| anyhow::anyhow!("missing or invalid 'event' kind"))?;
     let config = config.unwrap_or(serde_json::Value::Null);

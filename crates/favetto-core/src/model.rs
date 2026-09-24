@@ -3,6 +3,7 @@
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -14,7 +15,7 @@ pub use crate::agent_state::{
 };
 
 /// Lifecycle of a single task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     /// Queued, not yet picked up by the agent runtime.
@@ -201,7 +202,7 @@ impl FailureKind {
 
 /// A machine-readable task failure. `Task.error` remains the human-readable
 /// view; this is what controllers branch on.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Failure {
     pub kind: FailureKind,
     pub message: String,
@@ -225,7 +226,7 @@ impl Failure {
 /// Tasks are created by integrations, hooks, the scheduler, or manually via the
 /// API, then handed to the executor which runs the referenced catalog task through
 /// its external agent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Task {
     pub id: Uuid,
     /// Name of the catalog task (the `*.md` file) that defines how to run this.
@@ -324,7 +325,7 @@ macro_rules! event_kinds {
         $(#[$meta:meta])*
         $variant:ident => $snake:literal, $pascal:literal, $description:literal;
     )*) => {
-        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
         #[serde(rename_all = "snake_case")]
         pub enum EventKind {
             $(
@@ -431,7 +432,7 @@ impl FromStr for EventKind {
 /// `id` is a monotonically increasing integer (SQLite `INTEGER PRIMARY KEY`
 /// AUTOINCREMENT) and doubles as the resume cursor for remote TUI subscriptions:
 /// a client reconnecting with `last_event_id` replays everything after it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Event {
     pub id: i64,
     pub kind: EventKind,
@@ -515,7 +516,7 @@ impl ChatMessage {
 }
 
 /// What kind of decision an agent is blocked on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AwaitingInputKind {
     /// A tool/command permission prompt.
@@ -531,7 +532,7 @@ pub enum AwaitingInputKind {
 }
 
 /// Why a session is considered blocked on the user.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AwaitingInputReason {
     pub kind: AwaitingInputKind,
     /// The prompt text (the last visible lines), for context.
@@ -550,7 +551,7 @@ pub struct AwaitingInputReason {
 }
 
 /// A live external-agent session (a PTY running an agent CLI on the daemon).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentSessionInfo {
     pub id: String,
     /// Name of the `[agents.*]` entry that launched it.
@@ -582,7 +583,7 @@ pub struct AgentSessionInfo {
 ///
 /// Every field defaults to `false` and is additive on the wire: an entry written
 /// by an older version decodes with all capabilities off.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentCapabilities {
     /// Can run an attachable interactive TUI (the Agent panel).
     #[serde(default)]
@@ -628,7 +629,7 @@ fn default_available() -> bool {
 
 /// A configured external agent plus its live-session state, as returned by
 /// `agents.list`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentCatalogEntry {
     /// Configured/built-in key, e.g. `opencode`.
     pub name: String,
@@ -648,7 +649,7 @@ pub struct AgentCatalogEntry {
 }
 
 /// A cron schedule that enqueues a task (and emits a `CronTick`) on fire.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Schedule {
     pub id: String,
     pub cron: String,
@@ -660,7 +661,7 @@ pub struct Schedule {
 }
 
 /// A persisted notification record (sent history).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct NotificationRecord {
     pub id: i64,
     pub channel: String,
