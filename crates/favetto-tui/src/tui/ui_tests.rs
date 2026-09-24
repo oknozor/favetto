@@ -360,6 +360,58 @@ fn help_overlay_lists_editor_key() {
     );
 }
 
+/// Look up a `?` overlay section by its title. Panics if the section is missing,
+/// which is itself a regression: the tests below pin the sections that must exist.
+fn help_section(name: &str) -> &'static [(&'static str, &'static str)] {
+    HELP_SECTIONS
+        .iter()
+        .find(|(section, _)| *section == name)
+        .map(|(_, rows)| *rows)
+        .unwrap_or_else(|| panic!("help section not found: {name}"))
+}
+
+fn help_section_has_key(name: &str, key: &str) -> bool {
+    help_section(name).iter().any(|(k, _)| *k == key)
+}
+
+#[test]
+fn help_page_keys_scoped_to_events_and_catalog() {
+    // ↑/↓ select on every list, but page keys only move/scroll the lists that
+    // actually handle them (Events and Catalog's preview pane).
+    let lists = help_section("Lists (Tasks, Catalog, Events, Scheduler, Notifications)");
+    assert!(lists.iter().any(|(k, _)| *k == "↑ / ↓"));
+    assert!(
+        lists.iter().all(|(k, _)| !k.contains("PageUp")),
+        "page keys must not be advertised for every list: {lists:?}"
+    );
+    assert!(help_section_has_key("Events tab", "PageUp / PageDown"));
+    assert!(help_section_has_key(
+        "Catalog tab",
+        "PageUp / PageDown / wheel"
+    ));
+}
+
+#[test]
+fn help_multiline_and_submit_keys_scoped_to_task_input() {
+    // The generic form treats every Enter as next/submit and the wizard uses ↑/↓
+    // for selection, so these rows only hold for the task-input form.
+    let text_fields = help_section("Text fields (task input / forms / wizard)");
+    for key in ["↑ / ↓", "Shift+Enter / Alt+Enter", "Ctrl+Enter"] {
+        assert!(
+            !text_fields.iter().any(|(k, _)| *k == key),
+            "generic text fields must not claim {key}: {text_fields:?}"
+        );
+    }
+
+    let task_input = help_section("Task input (multiline vars)");
+    for key in ["↑ / ↓", "Shift+Enter / Alt+Enter", "Ctrl+Enter"] {
+        assert!(
+            task_input.iter().any(|(k, _)| *k == key),
+            "task input must document {key}: {task_input:?}"
+        );
+    }
+}
+
 #[test]
 fn workflow_overlay_renders_graph() {
     let mut app = App::new();
