@@ -89,6 +89,11 @@ async fn exchange(
 }
 
 /// `favetto pair`: request a code from the daemon and print it for the user.
+///
+/// The two `println!` lines at the end are this command's stdout contract, not
+/// diagnostics: scripts parse the pairing code from the first line and the
+/// ready-to-run attach command from the second. Keep them on stdout; route any
+/// new status or error detail through `tracing` instead.
 pub async fn run(args: crate::cli::PairArgs) -> anyhow::Result<()> {
     let resp: Value = reqwest::Client::new()
         .post(format!("{}/pair/generate", args.url.trim_end_matches('/')))
