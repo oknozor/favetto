@@ -3,6 +3,9 @@ name = "favetto"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Long-running, LLM-driven agent orchestrator daemon and CLI."
 
 [lib]
 name = "favetto"

@@ -17,6 +17,7 @@ you push.
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo nextest run --locked --workspace   # install: cargo install cargo-nextest
+cargo deny check                         # install: cargo install cargo-deny --locked
 ```
 
 The generated reference is also checked by CI and must not drift. Regenerate it,
@@ -78,8 +79,9 @@ ignored. Only `main` receives version bumps (`branch_whitelist = ["main"]` in
   - `crates/favetto-core` — shared wire protocol, domain types, config/tasks/workflow (no HTTP/DB/LLM).
   - `crates/favetto-providers` — provider/model catalog (opencode auth + models.dev).
   - `crates/favetto-tui` — the dependency-light terminal client binary.
+  - `crates/favetto-mcp` — the stdio MCP supervisor server for the workflow plane.
   - `crates/favetto` — the daemon binary and doc generator.
-- Rust edition 2021, `rust-version = 1.92`, workspace resolver `2`.
+- Rust edition 2021, `rust-version = 1.94`, workspace resolver `2`.
 - Tests are inline `#[cfg(test)]` modules next to the code they cover, often
   using `#[tokio::test]`; add cases there.
 - Tasks live in `tasks/` — `*.md` files with a TOML header followed by the prompt.

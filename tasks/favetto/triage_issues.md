@@ -21,7 +21,7 @@ next.
 
 ## Repository context
 
-`oknozor/favetto` is a Rust workspace (edition 2021, MSRV 1.92) with four
+`oknozor/favetto` is a Rust workspace (edition 2021, MSRV 1.94) with five
 crates:
 
 - `crates/favetto-core` — shared MessagePack wire protocol and domain types

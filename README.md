@@ -86,6 +86,7 @@ crates/
   favetto-core/          shared wire protocol + domain types (no HTTP/DB/LLM)
   favetto-providers/     provider/model catalog (opencode auth + models.dev)
   favetto-tui/           dependency-light terminal client binary
+  favetto-mcp/           MCP supervisor server (stdio)
   favetto/               daemon binary + doc generator
 tasks/                   task catalog: `*.md` files with TOML header + prompt
 docs/                    VitePress site (guide + generated reference)
@@ -99,6 +100,7 @@ CI runs the same gates locally:
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo nextest run --locked --workspace   # install: cargo install cargo-nextest
+cargo deny check                         # install: cargo install cargo-deny --locked
 
 # regenerate the reference and fail if it drifts
 cargo run -p favetto -- __doc
@@ -129,3 +131,16 @@ choose a bump (`auto` is the default); it runs the CI gates, bumps
 `[workspace.package] version`, updates `CHANGELOG.md`, tags `vX.Y.Z`, and opens a
 GitHub release. See the [releasing guide](https://oknozor.github.io/favetto/guide/releasing)
 or `docs/guide/releasing.md`.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this project by you, as defined in the Apache-2.0 license, shall
+be dual licensed as above, without any additional terms or conditions.

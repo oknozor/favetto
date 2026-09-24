@@ -3,6 +3,9 @@ name = "favetto-mcp"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MCP supervisor server for the favetto workflow control plane."
 
 [lib]
 name = "favetto_mcp"

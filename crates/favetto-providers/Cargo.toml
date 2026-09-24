@@ -3,6 +3,9 @@ name = "favetto-providers"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Provider and model catalog for favetto (opencode auth + models.dev)."
 
 [dependencies]
 anyhow = "1"

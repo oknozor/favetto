@@ -5,7 +5,7 @@ external coding-agent CLI for it to orchestrate.
 
 ## Prerequisites
 
-- **Rust** 1.92 or newer (edition 2021): <https://rustup.rs>.
+- **Rust** 1.94 or newer (edition 2021): <https://rustup.rs>.
 - **An agent CLI** on your `PATH` — for example
   [opencode](https://opencode.ai), Claude Code, pi, or Mistral Vibe. favetto
   never implements its own agent loop, so a task cannot start without one.

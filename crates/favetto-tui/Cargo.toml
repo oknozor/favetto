@@ -3,6 +3,9 @@ name = "favetto-tui"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Terminal client for the favetto agent orchestrator."
 
 [lib]
 name = "favetto_tui"
