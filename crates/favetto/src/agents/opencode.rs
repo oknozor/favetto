@@ -69,6 +69,9 @@ impl OpenCodeAgent {
         // The managed server observer reports live state and answers permissions.
         template.descriptor.capabilities.reports_state = true;
         template.descriptor.capabilities.permission_channel = true;
+        // Headless runs go through the same managed server, so the panel can
+        // attach a real interactive session to the run's session concurrently.
+        template.descriptor.capabilities.concurrent_attach = true;
         Self { template }
     }
 }
@@ -78,8 +81,8 @@ impl Agent for OpenCodeAgent {
         &self.template.descriptor
     }
 
-    /// Render the template command, then route interactive/resume launches
-    /// through the managed server when one is running (and, for a fresh
+    /// Render the template command, then route interactive/resume/headless
+    /// launches through the managed server when one is running (and, for a fresh
     /// session, once `prepare_launch` has created and seeded it).
     fn command(
         &self,
@@ -110,7 +113,22 @@ impl Agent for OpenCodeAgent {
                     endpoint.password.clone(),
                 );
             }
-            Invocation::Headless { .. } => {}
+            Invocation::Headless { .. } => {
+                // A headless run created its session on the managed server in
+                // `prepare_launch`; point `run` at that server session so a
+                // concurrent interactive attach can show the same turn. A
+                // deterministic id that was never created on the server must not
+                // be handed to `--session`.
+                if ctx.managed_session {
+                    if let Some(session_id) = ctx.session_id.as_deref() {
+                        insert_server_args(&mut spec.args, &endpoint, Some(session_id));
+                        spec.env.insert(
+                            "OPENCODE_SERVER_PASSWORD".to_string(),
+                            endpoint.password.clone(),
+                        );
+                    }
+                }
+            }
         }
         Ok(spec)
     }
@@ -176,17 +194,29 @@ impl Agent for OpenCodeAgent {
         Some(Box::new(observer::OpenCodeServer::new(endpoint)))
     }
 
-    /// Create and seed the session on the managed server before the PTY spawns.
-    /// Any failure is swallowed: the launch then falls back to the old
-    /// `--prompt` + timed-Enter path.
+    /// Create the session on the managed server before the PTY spawns.
+    ///
+    /// Interactive launches also seed the prompt (the TUI then attaches to the
+    /// seeded turn); headless launches only create the session, because the
+    /// `run` process itself submits the prompt against `--session`. Any failure
+    /// is swallowed: the launch then falls back to the old stdout path.
     fn prepare_launch<'a>(
         &'a self,
         invocation: &'a Invocation<'_>,
         ctx: &'a mut AgentContext,
     ) -> futures_util::future::BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
-            if !matches!(invocation, Invocation::Interactive { .. }) {
-                return Ok(());
+            let headless = match invocation {
+                Invocation::Interactive { .. } => false,
+                Invocation::Headless { .. } => true,
+                Invocation::Resume(_) => return Ok(()),
+            };
+            // A headless launch's session id must come from the managed server:
+            // drop the caller's deterministic placeholder so the fallback (no
+            // server) does not hand `--session` a session that does not exist.
+            if headless {
+                ctx.session_id = None;
+                ctx.managed_session = false;
             }
             let Some(endpoint) =
                 server::ensure_started(Path::new(&self.template.config.command)).await
@@ -205,11 +235,14 @@ impl Agent for OpenCodeAgent {
                 }
             };
             ctx.session_id = Some(session_id.clone());
-            if let Some(prompt) = ctx.prompt.clone() {
-                match server::prompt(&endpoint, &session_id, &prompt).await {
-                    Ok(()) => ctx.prompt = None,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "opencode prompt seeding failed; using the prompt fallback");
+            ctx.managed_session = true;
+            if !headless {
+                if let Some(prompt) = ctx.prompt.clone() {
+                    match server::prompt(&endpoint, &session_id, &prompt).await {
+                        Ok(()) => ctx.prompt = None,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "opencode prompt seeding failed; using the prompt fallback");
+                        }
                     }
                 }
             }
@@ -252,7 +285,7 @@ impl Agent for OpenCodeAgent {
 }
 
 /// Insert `--server <url>` (and, when known, `--session <id>`) after a leading
-/// subcommand token (`mini`) or at the front.
+/// subcommand token (`mini`, `run`) or at the front.
 fn insert_server_args(
     args: &mut Vec<String>,
     endpoint: &server::Endpoint,
@@ -263,7 +296,11 @@ fn insert_server_args(
         introduced.push("--session".to_string());
         introduced.push(session_id.to_string());
     }
-    let at = if args.first().map(|arg| arg == "mini").unwrap_or(false) {
+    let at = if args
+        .first()
+        .map(|arg| arg == "mini" || arg == "run")
+        .unwrap_or(false)
+    {
         1
     } else {
         0
@@ -431,6 +468,66 @@ mod tests {
         );
     }
 
+    /// A headless run whose session was created on the managed server targets
+    /// that server session, so the panel can attach to it concurrently.
+    #[test]
+    fn headless_with_managed_server_targets_the_session() {
+        let endpoint = install_endpoint();
+        let ctx = AgentContext {
+            session_id: Some("ses_1".to_string()),
+            managed_session: true,
+            prompt: Some("do it".to_string()),
+            ..Default::default()
+        };
+        let spec = agent()
+            .command(
+                &Invocation::Headless {
+                    prompt: "do it",
+                    provider: None,
+                    model: None,
+                },
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(
+            spec.args,
+            vec![
+                "run".to_string(),
+                "--server".to_string(),
+                endpoint.url.clone(),
+                "--session".to_string(),
+                "ses_1".to_string(),
+                "--auto".to_string(),
+                "do it".to_string(),
+            ]
+        );
+        assert_eq!(
+            spec.env.get("OPENCODE_SERVER_PASSWORD").map(String::as_str),
+            Some("pw")
+        );
+        server::install_endpoint_for_test(None);
+    }
+
+    /// Without a session created on the managed server, a headless run keeps
+    /// the plain command even when a server endpoint exists.
+    #[test]
+    fn headless_without_a_managed_session_keeps_the_plain_run() {
+        install_endpoint();
+        let spec = agent()
+            .command(
+                &Invocation::Headless {
+                    prompt: "do it",
+                    provider: None,
+                    model: None,
+                },
+                &ctx(Some("do it"), None, None),
+            )
+            .unwrap();
+        assert_eq!(spec.args, vec!["run", "--auto", "do it"]);
+        assert!(!spec.env.contains_key("OPENCODE_SERVER_PASSWORD"));
+        server::install_endpoint_for_test(None);
+    }
+
     #[test]
     fn resume_uses_resume_args() {
         let ctx = AgentContext {
@@ -454,6 +551,7 @@ mod tests {
         assert!(caps.prompt_prefill);
         assert!(caps.reports_state);
         assert!(caps.permission_channel);
+        assert!(caps.concurrent_attach);
         assert!(agent().has_session_titles());
     }
 
@@ -667,6 +765,68 @@ mod tests {
         assert!(bodies
             .iter()
             .any(|b| b.get("text").and_then(|v| v.as_str()) == Some("do it")));
+        server::install_endpoint_for_test(None);
+    }
+
+    /// A headless launch creates its session on the managed server but leaves the
+    /// prompt for `run` to submit, and records the session as managed so the
+    /// manager can surface it before the run emits anything.
+    #[tokio::test]
+    async fn prepare_launch_creates_a_headless_session_without_seeding() {
+        use axum::routing::post;
+        let recorded = mock_state();
+        let app = axum::Router::new()
+            .route("/api/session", post(record_create))
+            .route("/api/session/{id}/prompt", post(record_prompt))
+            .with_state(recorded.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        server::install_endpoint_for_test(Some(server::Endpoint {
+            url: format!("http://{addr}"),
+            password: "pw".to_string(),
+        }));
+
+        let mut launch_ctx = AgentContext {
+            cwd: Some(PathBuf::from("/tmp")),
+            prompt: Some("do it".to_string()),
+            session_id: Some("deterministic".to_string()),
+            ..Default::default()
+        };
+        agent()
+            .prepare_launch(
+                &Invocation::Headless {
+                    prompt: "do it",
+                    provider: None,
+                    model: None,
+                },
+                &mut launch_ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(launch_ctx.session_id.as_deref(), Some("ses_mock"));
+        assert_eq!(
+            launch_ctx.prompt.as_deref(),
+            Some("do it"),
+            "a headless run submits its own prompt, so it must not be pre-seeded"
+        );
+        assert!(launch_ctx.managed_session);
+
+        let bodies = recorded.lock().unwrap().clone();
+        assert!(
+            bodies
+                .iter()
+                .any(|b| b.pointer("/location/directory").is_some()),
+            "the managed session was not created: {bodies:?}"
+        );
+        assert!(
+            !bodies
+                .iter()
+                .any(|b| b.get("text").and_then(|v| v.as_str()) == Some("do it")),
+            "a headless launch must not seed the prompt: {bodies:?}"
+        );
         server::install_endpoint_for_test(None);
     }
 

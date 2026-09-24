@@ -115,6 +115,21 @@ fn open_agent_keeps_interactive_sessions_writable() {
     assert!(!app.agent_read_only);
     assert!(app.agent_capture);
     assert!(app.agent_status.is_empty());
+    assert!(!app.agent_structured);
+}
+
+#[test]
+fn open_agent_marks_headless_runs_structured() {
+    // A live headless run with no interactive attach: structured, never JSON.
+    let mut app = App::new();
+    app.open_agent(agent_session("s5", true, true, false), b"");
+    assert!(app.agent_structured);
+    assert!(app.agent_read_only && !app.agent_capture);
+
+    // A blocked headless run is interactive so its dialog stays visible.
+    app.open_agent(agent_session("s6", true, true, true), b"");
+    assert!(!app.agent_structured);
+    assert!(!app.agent_read_only);
 }
 
 #[test]

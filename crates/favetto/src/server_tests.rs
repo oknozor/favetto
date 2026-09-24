@@ -1146,7 +1146,7 @@ fn should_attach_to_live_allows_awaiting_headless_session() {
     // Live interactive TUI: attach.
     assert!(should_attach_to_live(&live_session(true, false, false)));
     // Running headless without a prompt: this check declines; `start_agent`
-    // keeps the retained PTY read-only until the run exits.
+    // opens a concurrent attach (or a structured view) instead of the PTY.
     assert!(!should_attach_to_live(&live_session(true, true, false)));
     // Headless but blocked on the user: attach so keystrokes reach it.
     assert!(should_attach_to_live(&live_session(true, true, true)));
@@ -1557,9 +1557,10 @@ async fn agents_start_attaches_a_live_headless_run_without_duplicating() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A resumable agent whose headless run is still writing its session must not
-/// be resumed concurrently: `start_agent` attaches the retained PTY instead.
-/// Once the run is gone, a persisted session id resumes the interactive TUI.
+/// A resumable agent **without** `concurrent_attach` whose headless run is still
+/// writing its session must not be resumed concurrently: `start_agent` attaches
+/// the retained PTY instead. Once the run is gone, a persisted session id resumes
+/// the interactive TUI.
 #[cfg(unix)]
 #[tokio::test]
 async fn agents_start_does_not_resume_a_live_headless_writer() {
@@ -1668,6 +1669,108 @@ async fn agents_start_does_not_resume_a_live_headless_writer() {
     );
 
     state.agents.close(&resumed.id).ok();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An agent with `concurrent_attach` (opencode) attaches a **new interactive
+/// session** to a live headless run's agent session, leaving the run itself
+/// running in the background — the panel never gets the machine PTY.
+#[cfg(unix)]
+#[tokio::test]
+async fn agents_start_concurrently_attaches_a_live_headless_run() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_dir("start-concurrent");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    std::fs::write(
+        tasks_dir.join("issue.md"),
+        "agent = \"opencode\"\n---\nbody\n",
+    )
+    .unwrap();
+
+    // A fake opencode whose run stays alive; the attach also just sleeps.
+    let script = dir.join("fake-opencode.sh");
+    std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let state = title_state(&dir, &tasks_dir, &script).await;
+
+    let task = Task {
+        id: Uuid::new_v4(),
+        name: "issue".to_string(),
+        status: TaskStatus::Running,
+        attempt: 0,
+        input: serde_json::json!({}),
+        output: None,
+        dedupe_key: None,
+        created_at: Utc::now(),
+        started_at: Some(Utc::now()),
+        finished_at: None,
+        error: None,
+        failure: None,
+        session_id: Some("ses-live".to_string()),
+        session_title: None,
+        parent_id: None,
+        root_id: None,
+        interactive: false,
+    };
+    db::insert_task(&state.db, &task).await.unwrap();
+
+    let agent = state.registry.get_checked("opencode").unwrap();
+    assert!(agent.capabilities().concurrent_attach);
+    let info = state
+        .agents
+        .start(
+            "opencode",
+            agent,
+            Some(task.id.to_string()),
+            Invocation::Headless {
+                prompt: "body",
+                provider: None,
+                model: None,
+            },
+            AgentContext {
+                rows: 24,
+                cols: 80,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(info.headless && info.running);
+
+    let attached = start_agent(
+        &state,
+        &serde_json::json!({ "task_id": task.id.to_string(), "agent": "opencode" }),
+    )
+    .await
+    .expect("a concurrent-capable live run must open an interactive attach");
+    assert_ne!(
+        attached.id, info.id,
+        "the panel must not be handed the headless machine PTY"
+    );
+    assert!(
+        !attached.headless && attached.running,
+        "the attach must be a live interactive session: {attached:?}"
+    );
+
+    let sessions = state.agents.sessions();
+    assert_eq!(
+        sessions.len(),
+        2,
+        "the headless run must keep running alongside the attach: {sessions:?}"
+    );
+    assert!(
+        sessions
+            .iter()
+            .any(|s| s.id == info.id && s.headless && s.running),
+        "the background headless run was dropped: {sessions:?}"
+    );
+
+    state.agents.close(&info.id).ok();
+    state.agents.close(&attached.id).ok();
     let _ = std::fs::remove_dir_all(&dir);
 }
 

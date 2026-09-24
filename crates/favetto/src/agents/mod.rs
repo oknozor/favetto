@@ -346,6 +346,15 @@ impl AgentManager {
             .map(|s| s.info())
     }
 
+    /// Whether a live interactive (non-headless) session is attached to
+    /// `task_id`. A concurrently attached Agent-panel session keeps the task's
+    /// worktree alive after the headless run it mirrors has exited.
+    pub fn has_live_interactive(&self, task_id: &str) -> bool {
+        self.sessions.lock().values().any(|s| {
+            s.task_id.as_deref() == Some(task_id) && !s.headless && s.running.load(Ordering::SeqCst)
+        })
+    }
+
     /// Spawn `agent` in a PTY for `invocation`.
     ///
     /// The agent builds the [`CommandSpec`]; the manager only owns PTY/emulator
@@ -486,8 +495,10 @@ impl AgentManager {
         // A headless agent that does not report its own session id gets the
         // deterministic one the caller generated (bound via `{session_id}`), so
         // the task row and reattach path see it even if the process dies before
-        // emitting anything. Agents with a probe (opencode) capture their real id.
-        let seeded_session_id = if headless && probe.is_none() {
+        // emitting anything. Agents with a probe (opencode) capture their real id
+        // — unless the id was created on a managed transport, where it is already
+        // authoritative and must be visible before the run emits anything.
+        let seeded_session_id = if headless && (probe.is_none() || ctx.managed_session) {
             ctx.session_id.clone()
         } else {
             None

@@ -584,8 +584,11 @@ async fn run_one(
     };
 
     // An interactive run that finished its turn keeps its TUI (and therefore its
-    // worktree) alive so the Agent panel can still attach to it.
-    let session_alive = matches!(&outcome, Ok(run) if run.alive);
+    // worktree) alive so the Agent panel can still attach to it. A headless run
+    // may also have a concurrently attached interactive panel session bound to
+    // the task; that session still lives in the worktree, so keep it too.
+    let session_alive = matches!(&outcome, Ok(run) if run.alive)
+        || state.agents.has_live_interactive(&task.id.to_string());
     let exit_code = outcome.as_ref().ok().and_then(|run| run.exit_code);
     let success = record_run_outcome(&mut task, outcome);
     task.finished_at = Some(Utc::now());
@@ -1161,6 +1164,7 @@ async fn run_agent_task(
         model: def.model.clone(),
         prompt: Some(prompt.to_string()),
         session_id: (!interactive).then(|| Uuid::new_v4().to_string()),
+        managed_session: false,
         rows: 40,
         cols: 120,
         git_signing: def.sign,
@@ -1788,7 +1792,14 @@ fn select_prunable(
 pub async fn prune_worktrees(state: &State) -> anyhow::Result<WorktreePruneStats> {
     let cfg = state.config.executor.clone();
     let retention = cfg.worktree_retention.clone();
-    let records = db::list_worktrees(&state.db).await?;
+    let all_records = db::list_worktrees(&state.db).await?;
+
+    // A worktree whose task still has a live interactive Agent-panel session
+    // attached must not be reclaimed: that session runs inside it.
+    let records: Vec<db::WorktreeRecord> = all_records
+        .into_iter()
+        .filter(|r| !state.agents.has_live_interactive(&r.task_id.to_string()))
+        .collect();
 
     let mut tasks = HashMap::new();
     for r in &records {

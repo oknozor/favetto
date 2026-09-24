@@ -284,6 +284,7 @@ pub(crate) fn capabilities_from_config(config: &AgentConfig) -> AgentCapabilitie
             config.state,
             Some(AgentStateMode::Server | AgentStateMode::Hooks)
         ),
+        concurrent_attach: false,
     }
 }
 

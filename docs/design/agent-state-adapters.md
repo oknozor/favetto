@@ -184,6 +184,9 @@ pub struct AwaitingInputReason {
 pub reports_state: bool,
 /// Can answer permission/dialog prompts through the channel.
 pub permission_channel: bool,
+/// Can open an interactive session attached to an already-running headless run
+/// without racing its session file (opencode's managed server).
+pub concurrent_attach: bool,
 ```
 
 `RunSummary` replaces the ad-hoc `AgentRunResult.output`:
@@ -361,6 +364,14 @@ Rules:
 `output.summary` = the `RunSummary`, plus the existing capped `raw`. This makes
 a dependent task's `prev.output` carry real text/tools/usage/outcome instead of
 a raw JSON event dump.
+
+The headless stream is a background concern: the Agent panel never renders it. A
+headless run consumes its own stdout for state/usage/session id, while the panel
+opens a **concurrent interactive attach** when the agent advertises
+`concurrent_attach` (opencode: the headless `run` and the interactive session
+share one managed-server session). Agents without it render the structured state
+view instead, so goal 7 ("the user can always hop into the Agent tab and drive
+the real TUI") holds without exposing machine output.
 
 ---
 

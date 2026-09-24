@@ -1069,12 +1069,12 @@ fn workflow_state(tasks: &[WorkflowTaskView]) -> WorkflowState {
 /// Resolve the requested (or default) agent and spawn a PTY session.
 ///
 /// Task runs are headless (their PTY carries machine output such as JSON), so
-/// once the run has exited and a session id is known — from the request, the task
-/// row, or the exited run — the agent's `resume_args` open a real interactive TUI.
-/// A live interactive session is attached directly. A headless run still in
-/// flight (or an agent that cannot resume) keeps its retained PTY: a finished run
-/// is replayed and a still-running run is attached read-only
-/// (`AgentSessionInfo::headless` tells the client not to forward keystrokes).
+/// the panel is **never** shown that machine PTY. A live interactive session is
+/// attached directly; a live headless run is either concurrently attached to a
+/// real interactive session (when the agent supports it, e.g. opencode through
+/// its managed server) or handed back for the client to render as a structured
+/// state view. Once a run has exited and a session id is known, the agent's
+/// `resume_args` open a real interactive TUI.
 async fn start_agent(
     state: &Arc<State>,
     params: StartAgentParams,
@@ -1154,20 +1154,22 @@ async fn start_agent(
             }
         }
 
-        // A headless run that is still in flight owns its session file: resuming
-        // it here would race two writers on the same agent session. Attach the
-        // retained PTY read-only until it exits (or blocks on the user, above).
-        if let Some(existing) = &live {
-            if existing.running && existing.headless {
-                return Ok(existing.clone());
-            }
-        }
+        // A live headless run's PTY carries machine output, so it is never handed
+        // to the panel. An agent that can attach concurrently (opencode, through
+        // its managed server) opens a real interactive session on the run's agent
+        // session id and leaves the run running in the background. Any other
+        // agent falls through to the retained session below, which the client
+        // renders as a structured state view rather than raw JSON.
+        let live_headless_writer = live.as_ref().is_some_and(|s| s.running && s.headless);
+        let can_attach_concurrently = agent.capabilities().concurrent_attach;
 
         // Otherwise resume the agent's own session, never the headless run's PTY
         // (whose screen is machine output). The id comes from the request, the
         // task row, or an exited run whose session id was captured (the row write
-        // may not have landed yet).
-        if agent.capabilities().resume {
+        // may not have landed yet). A still-writing headless run is only reopened
+        // when the agent supports a concurrent attach; otherwise resuming would
+        // race two writers on the same session file.
+        if agent.capabilities().resume && (!live_headless_writer || can_attach_concurrently) {
             let sid = match session_id.clone() {
                 Some(sid) => Some(sid),
                 None => match persisted_session_id(state, task_id.as_deref()).await {
@@ -1193,11 +1195,10 @@ async fn start_agent(
             }
         }
 
-        // Any other retained PTY bound to the task is shown in the panel rather
-        // than seeding a duplicate run: a finished run's final screen is replayed,
-        // and a still-running headless run is attached read-only (its PTY drives
-        // itself, so the client must not forward keystrokes). The session info's
-        // `headless` flag tells the client which mode to use.
+        // No interactive session is available (a non-attachable headless run, or
+        // one whose agent session id is not known yet): hand back the retained
+        // session so the client renders its structured state view instead of the
+        // machine PTY.
         if let Some(existing) = &live {
             return Ok(existing.clone());
         }
