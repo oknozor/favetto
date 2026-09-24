@@ -1326,16 +1326,19 @@ impl DirLocks {
     }
 }
 
-/// React to a `TaskFinished` event: start the `:finished` dependents (once per
-/// finished instance) and resolve any `:all_finished` fan-in barriers targeting
-/// the finished task's name.
+/// React to a `TaskFinished` event: start the outcome dependents (`:finished`,
+/// `:terminal`, `:succeeded`, `:failed` — once per matching instance) and resolve
+/// any `:all_finished` fan-in barriers targeting the finished task's name.
 ///
-/// `needs` (and `spawn`) values are relative-path names, so a dependency on a
-/// task in a subfolder is written as `pipelines/plan:finished`.
+/// `:finished` / `:terminal` fire on either outcome; `:succeeded` and `:failed`
+/// filter on the `success` field carried by the event. `needs` (and `spawn`)
+/// values are relative-path names, so a dependency on a task in a subfolder is
+/// written as `pipelines/plan:finished`.
 async fn start_dependents(state: &Arc<State>, ev: &Event) {
     let Some(name) = ev.payload.get("name").and_then(|n| n.as_str()) else {
         return;
     };
+    let success = ev.payload.get("success").and_then(|v| v.as_bool());
 
     let catalog = state.catalog.read().clone();
     let mut finished: Vec<String> = Vec::new();
@@ -1350,6 +1353,9 @@ async fn start_dependents(state: &Arc<State>, ev: &Event) {
         }
         match kind {
             NeedsKind::Finished => finished.push(def.name.clone()),
+            NeedsKind::Succeeded if success == Some(true) => finished.push(def.name.clone()),
+            NeedsKind::Failed if success == Some(false) => finished.push(def.name.clone()),
+            NeedsKind::Succeeded | NeedsKind::Failed => {}
             NeedsKind::AllFinished => joins.push(def.name.clone()),
         }
     }

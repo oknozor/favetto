@@ -50,6 +50,35 @@ structured JSON.
 A `needs` successor is an unattended run: no `[[vars]]` form is shown, so
 `required` variables must be provided by the predecessor or the run fails fast.
 
+### Branch on the outcome
+
+`needs = "<task>:finished"` fires on **either** terminal outcome, so a controller
+must inspect `prev.success` to branch. When the branch is known ahead of time,
+use an outcome condition instead:
+
+| `needs` value | Starts when the predecessor… |
+|---------------|--------------------------------|
+| `<task>` / `<task>:finished` / `<task>:terminal` | finishes, successfully **or** not |
+| `<task>:succeeded` | succeeds |
+| `<task>:failed` | fails |
+
+All forms behave the same otherwise: the successor is an unattended run that
+still receives the predecessor result as <span v-pre>`{{ prev.* }}`</span>, and
+`:terminal` is just an explicit spelling of `:finished`. This lets one step fan
+out to an `implement` task on success and a `diagnose` task on failure without a
+controller:
+
+```md
+agent = "opencode"
+needs = "research:failed"
+---
+The research step failed with:
+
+{{ prev.output }}
+
+Diagnose the failure and propose a fix.
+```
+
 ## Chain a pipeline with `spawn`
 
 `spawn` + `spawn_file` fan a task out into children. When a task succeeds, the
@@ -168,14 +197,15 @@ silently dropped. Write `[]` in the handoff to end the loop. Without
 most once per pipeline.
 
 ::: tip Inspect the graph
-Press `w` in the TUI to render the catalog's `needs`, `spawn`, and fan-in `join`
-edges as a box-drawing graph (also persisted as Graphviz DOT at
-`<data_dir>/workflow.dot`).
+Press `w` in the TUI to render the catalog's `needs`, outcome-condition
+(`needs:succeeded` / `needs:failed`), `spawn`, and fan-in `join` edges as a
+box-drawing graph (also persisted as Graphviz DOT at `<data_dir>/workflow.dot`).
 :::
 
 ![favetto workflow graph](/screenshots/workflow-graph.png)
 
-*The `w` workflow overlay: `needs`, `spawn`, and `join` edges between tasks.*
+*The `w` workflow overlay: `needs`, outcome, `spawn`, and `join` edges between
+tasks.*
 
 See the [task file format reference](../reference/tasks) for the exact header
 keys, and [Events](../reference/events) for `task_finished` and the other

@@ -1665,13 +1665,19 @@ fn lineage_task(name: &str, status: TaskStatus, root: Option<Uuid>, parent: Opti
 }
 
 fn finished_event(name: &str, id: Uuid) -> Event {
+    finished_event_at(1, name, id, true)
+}
+
+/// A `TaskFinished` event with an explicit id and outcome, so tests can tell
+/// success from failure and control the `needs:` dedupe key.
+fn finished_event_at(event_id: i64, name: &str, id: Uuid, success: bool) -> Event {
     Event {
-        id: 1,
+        id: event_id,
         kind: EventKind::TaskFinished,
         payload: serde_json::json!({
             "name": name,
             "task_id": id.to_string(),
-            "success": true,
+            "success": success,
         }),
         created_at: Utc::now(),
     }
@@ -1752,6 +1758,73 @@ async fn finished_dependency_fires_per_instance_with_lineage() {
     // root here, so the root is inherited.
     assert_eq!(followers[0].parent_id, Some(target.id));
     assert_eq!(followers[0].root_id, Some(target.id));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn succeeded_dependency_fires_only_on_success() {
+    let dir = std::env::temp_dir().join(format!("favetto-needs-ok-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let state = join_state(&dir, vec![needs_def("ok", "target:succeeded")]).await;
+
+    let target = lineage_task("target", TaskStatus::Succeeded, None, None);
+    db::insert_task(&state.db, &target).await.unwrap();
+
+    // A failure outcome must not start a `:succeeded` dependent.
+    start_dependents(&state, &finished_event_at(1, "target", target.id, false)).await;
+    assert!(
+        pending_named(&state, "ok").await.is_empty(),
+        "`:succeeded` fired on a failed predecessor"
+    );
+
+    start_dependents(&state, &finished_event_at(2, "target", target.id, true)).await;
+    assert_eq!(pending_named(&state, "ok").await.len(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn failed_dependency_fires_only_on_failure() {
+    let dir = std::env::temp_dir().join(format!("favetto-needs-bad-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let state = join_state(&dir, vec![needs_def("bad", "target:failed")]).await;
+
+    let target = lineage_task("target", TaskStatus::Failed, None, None);
+    db::insert_task(&state.db, &target).await.unwrap();
+
+    // A success outcome must not start a `:failed` dependent.
+    start_dependents(&state, &finished_event_at(1, "target", target.id, true)).await;
+    assert!(
+        pending_named(&state, "bad").await.is_empty(),
+        "`:failed` fired on a successful predecessor"
+    );
+
+    start_dependents(&state, &finished_event_at(2, "target", target.id, false)).await;
+    assert_eq!(pending_named(&state, "bad").await.len(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn finished_and_terminal_dependencies_fire_on_failure() {
+    let dir = std::env::temp_dir().join(format!("favetto-needs-terminal-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let state = join_state(
+        &dir,
+        vec![
+            needs_def("legacy", "target"),
+            needs_def("either", "target:terminal"),
+        ],
+    )
+    .await;
+
+    let target = lineage_task("target", TaskStatus::Failed, None, None);
+    db::insert_task(&state.db, &target).await.unwrap();
+
+    start_dependents(&state, &finished_event_at(1, "target", target.id, false)).await;
+    assert_eq!(pending_named(&state, "legacy").await.len(), 1);
+    assert_eq!(pending_named(&state, "either").await.len(), 1);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

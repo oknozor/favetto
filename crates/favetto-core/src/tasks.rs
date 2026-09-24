@@ -7,7 +7,9 @@
 //! model = "1.13"                         # optional — model id (uses run_args)
 //! cwd = "/path/to/repo"                  # optional — working directory
 //! schedule = "0 0 * * * *"               # optional — makes this a recurring task
-//! needs = "another_task:finished"        # optional — start when `another_task` ends
+//! needs = "another_task:finished"        # optional — start when `another_task` ends (either outcome)
+//! needs = "another_task:succeeded"       # optional — start only when `another_task` succeeds
+//! needs = "another_task:failed"          # optional — start only when `another_task` fails
 //! needs = "another_task:all_finished"    # optional — start once after every run in the root
 //! spawn = "child_task"                   # optional — fan out from a handoff file
 //! spawn_file = ".favetto/{{ task.id }}/manifest.json"  # array → one child per item
@@ -203,8 +205,13 @@ fn validate_vars(vars: &[TaskVar]) -> anyhow::Result<()> {
 /// How a `needs` dependency reacts to its predecessor's `TaskFinished` event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NeedsKind {
-    /// Start once per finished predecessor instance (`<task>:finished`).
+    /// Start once per finished predecessor instance, on either terminal outcome
+    /// (`<task>:finished`, its alias `<task>:terminal`, or a bare `<task>`).
     Finished,
+    /// Start once per successful predecessor instance (`<task>:succeeded`).
+    Succeeded,
+    /// Start once per failed predecessor instance (`<task>:failed`).
+    Failed,
     /// Start once per workflow root, after every `<task>` instance of that root
     /// is terminal (`<task>:all_finished`).
     AllFinished,
@@ -219,13 +226,21 @@ pub fn needs_parts(needs: &str) -> (&str, NeedsKind) {
         (source, NeedsKind::AllFinished)
     } else if let Some(source) = needs.strip_suffix(":finished") {
         (source, NeedsKind::Finished)
+    } else if let Some(source) = needs.strip_suffix(":terminal") {
+        // `:terminal` is an explicit alias for `:finished`: either outcome.
+        (source, NeedsKind::Finished)
+    } else if let Some(source) = needs.strip_suffix(":succeeded") {
+        (source, NeedsKind::Succeeded)
+    } else if let Some(source) = needs.strip_suffix(":failed") {
+        (source, NeedsKind::Failed)
     } else {
         (needs, NeedsKind::Finished)
     }
 }
 
-/// Validate a `needs` header value: either a bare legacy task name, or
-/// `<task>:finished` / `<task>:all_finished`. An invalid value makes the whole
+/// Validate a `needs` header value: either a bare legacy task name, or one of
+/// `<task>:finished` / `<task>:terminal` / `<task>:succeeded` /
+/// `<task>:failed` / `<task>:all_finished`. An invalid value makes the whole
 /// file fail to parse, so `reload_catalog` keeps the previous definition.
 fn validate_needs(needs: Option<&str>) -> anyhow::Result<()> {
     let Some(needs) = needs else {
@@ -238,9 +253,17 @@ fn validate_needs(needs: Option<&str>) -> anyhow::Result<()> {
     if source.is_empty() {
         anyhow::bail!("`needs` must name a task before its suffix");
     }
-    if needs.contains(':') && !(needs.ends_with(":finished") || needs.ends_with(":all_finished")) {
+    const SUFFIXES: [&str; 5] = [
+        ":finished",
+        ":terminal",
+        ":succeeded",
+        ":failed",
+        ":all_finished",
+    ];
+    if needs.contains(':') && !SUFFIXES.iter().any(|suffix| needs.ends_with(suffix)) {
         anyhow::bail!(
-            "invalid `needs` value '{needs}': expected '<task>:finished' or '<task>:all_finished'"
+            "invalid `needs` value '{needs}': expected '<task>:finished', '<task>:terminal', \
+             '<task>:succeeded', '<task>:failed' or '<task>:all_finished'"
         );
     }
     Ok(())
@@ -560,6 +583,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_and_round_trips_outcome_needs() {
+        for (suffix, kind) in [
+            ("succeeded", NeedsKind::Succeeded),
+            ("failed", NeedsKind::Failed),
+            // `:terminal` is an explicit alias for `:finished`.
+            ("terminal", NeedsKind::Finished),
+        ] {
+            let value = format!("target:{suffix}");
+            let def = parse_task_md(
+                "follower",
+                &format!("agent = \"x\"\nneeds = {value:?}\n---\nbody\n"),
+            )
+            .unwrap_or_else(|e| panic!("`{value}` must parse: {e}"));
+            assert_eq!(def.needs.as_deref(), Some(value.as_str()));
+            // The `needs` key round-trips verbatim.
+            let md = to_markdown(&def);
+            assert!(md.contains(&format!("needs = {value:?}")), "{md}");
+            assert_eq!(parse_task_md("follower", &md).unwrap().needs, def.needs);
+            assert_eq!(needs_parts(&value), ("target", kind));
+        }
+    }
+
+    #[test]
     fn rejects_unknown_needs_suffix() {
         let parse = |needs: &str| {
             parse_task_md(
@@ -568,6 +614,9 @@ mod tests {
             )
         };
         assert!(parse("target:finished").is_ok());
+        assert!(parse("target:terminal").is_ok());
+        assert!(parse("target:succeeded").is_ok());
+        assert!(parse("target:failed").is_ok());
         assert!(parse("target:all_finished").is_ok());
         // Legacy bare names stay valid.
         assert!(parse("target").is_ok());
