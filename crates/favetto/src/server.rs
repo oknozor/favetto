@@ -5,7 +5,7 @@
 //! just different ways of producing those two halves, which is why local attach is
 //! merely a special case of remote attach.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -21,11 +21,13 @@ use uuid::Uuid;
 use favetto_core::model::{AgentCatalogEntry, AgentSessionInfo, EventKind, Task, TaskStatus};
 use favetto_core::rpc::{method, push, Frame, Notification, Request, Response, RpcError};
 use favetto_core::wire::WireError;
+use favetto_core::workflow::{WorkflowInspect, WorkflowState, WorkflowTaskView};
 
 use crate::agents::{AgentContext, AgentEvent, Invocation};
 use crate::db;
 use crate::event_bus::ServerPush;
 use crate::state::State;
+use crate::tasks::needs_parts;
 
 /// Per-connection set of attached agent sessions. Used to scope screen frames to
 /// interested clients.
@@ -321,6 +323,12 @@ struct TasksListParams {
 #[derive(Debug, Deserialize)]
 struct TaskIdParams {
     id: Uuid,
+}
+
+/// `workflow.inspect` params.
+#[derive(Debug, Deserialize)]
+struct WorkflowInspectParams {
+    root_id: Uuid,
 }
 
 /// `tasks.start` params. `input` defaults to JSON null; `interactive` defaults
@@ -633,6 +641,13 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
             }))
         }
 
+        method::WORKFLOW_INSPECT => {
+            let p: WorkflowInspectParams = parse_params(&req.method, &req.params)?;
+            inspect_workflow(state, p.root_id)
+                .await
+                .map(|view| serde_json::json!(view))
+        }
+
         method::EVENTS_TAIL => {
             let p: EventsTailParams = parse_params(&req.method, &req.params)?;
             let limit = p.limit.unwrap_or(50).min(1000) as i64;
@@ -759,6 +774,110 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
             "unknown method: {}",
             req.method
         ))),
+    }
+}
+
+/// Build the runtime workflow view for `root_id` from the DB and the catalog's
+/// `needs` declarations.
+async fn inspect_workflow(state: &State, root_id: Uuid) -> Result<WorkflowInspect, RpcError> {
+    let tasks = db::list_root_tasks(&state.db, root_id)
+        .await
+        .map_err(|e| RpcError::Internal(e.to_string()))?;
+    if tasks.is_empty() {
+        return Err(RpcError::InvalidParams(
+            "workflow root not found".to_string(),
+        ));
+    }
+
+    // `needs` by task name, copied out so no lock guard is held across await.
+    let needs_of: HashMap<String, String> = {
+        let catalog = state.catalog.read();
+        catalog
+            .iter()
+            .filter_map(|d| d.needs.as_ref().map(|n| (d.name.clone(), n.clone())))
+            .collect()
+    };
+
+    // Names with at least one non-terminal instance in this root: the exact set
+    // `db::list_active_tasks_in_root` treats as an unmet dependency.
+    let active: HashSet<&str> = tasks
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.status,
+                TaskStatus::Pending | TaskStatus::Running | TaskStatus::AwaitingInput
+            )
+        })
+        .map(|t| t.name.as_str())
+        .collect();
+
+    let root_task = tasks
+        .iter()
+        .find(|t| t.id == root_id)
+        .map(|t| t.name.clone())
+        .unwrap_or_else(|| tasks[0].name.clone());
+
+    let mut views: Vec<WorkflowTaskView> = Vec::with_capacity(tasks.len());
+    let mut ready = Vec::new();
+    let mut running = Vec::new();
+    let mut failed = Vec::new();
+    let mut blocked = Vec::new();
+
+    for task in &tasks {
+        let is_blocked = task.status == TaskStatus::Pending
+            && needs_of
+                .get(&task.name)
+                .map(|needs| {
+                    let (source, _) = needs_parts(needs);
+                    active.contains(source)
+                })
+                .unwrap_or(false);
+
+        match task.status {
+            TaskStatus::Pending if is_blocked => blocked.push(task.id),
+            TaskStatus::Pending => ready.push(task.id),
+            TaskStatus::Running | TaskStatus::AwaitingInput => running.push(task.id),
+            TaskStatus::Failed => failed.push(task.id),
+            TaskStatus::Succeeded | TaskStatus::Cancelled => {}
+        }
+
+        views.push(WorkflowTaskView {
+            id: task.id,
+            name: task.name.clone(),
+            status: task.status,
+            attempt: 1,
+            summary: task.error.clone(),
+        });
+    }
+
+    let overall = workflow_state(&views);
+    Ok(WorkflowInspect {
+        root_id,
+        root_task,
+        state: overall,
+        tasks: views,
+        ready,
+        running,
+        failed,
+        blocked,
+    })
+}
+
+/// Derive the root's overall state: still `running` while any task is
+/// non-terminal, otherwise the worst terminal outcome.
+fn workflow_state(tasks: &[WorkflowTaskView]) -> WorkflowState {
+    use TaskStatus::*;
+    if tasks
+        .iter()
+        .any(|t| matches!(t.status, Pending | Running | AwaitingInput))
+    {
+        WorkflowState::Running
+    } else if tasks.iter().any(|t| t.status == Failed) {
+        WorkflowState::Failed
+    } else if tasks.iter().any(|t| t.status == Cancelled) {
+        WorkflowState::Cancelled
+    } else {
+        WorkflowState::Succeeded
     }
 }
 

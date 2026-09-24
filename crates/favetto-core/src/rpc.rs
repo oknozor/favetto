@@ -114,6 +114,9 @@ pub mod method {
     pub const CATALOG_UPDATE: &str = "catalog.update";
     /// Fetch the catalog workflow graph as Graphviz DOT (`dot` + persisted `path`).
     pub const WORKFLOW_GET: &str = "workflow.get";
+    /// Fetch the runtime workflow graph for a root: task instances plus
+    /// `ready`/`running`/`failed`/`blocked` buckets. No output blobs.
+    pub const WORKFLOW_INSPECT: &str = "workflow.inspect";
     pub const EVENTS_TAIL: &str = "events.tail";
     /// (Re)subscribe to the live event stream. Accepts `last_event_id` to replay
     /// missed events before switching to live delivery.
@@ -194,6 +197,11 @@ pub const CLIENT_METHODS: &[(&str, &str)] = &[
     (
         method::WORKFLOW_GET,
         "Fetch the catalog workflow graph as Graphviz DOT plus a structured graph.",
+    ),
+    (
+        method::WORKFLOW_INSPECT,
+        "Fetch the runtime workflow graph for a root (task instances plus \
+         ready/running/failed/blocked buckets).",
     ),
     (method::EVENTS_TAIL, "Tail persisted events."),
     (
@@ -364,6 +372,7 @@ mod tests {
             method::CATALOG_ADD,
             method::CATALOG_UPDATE,
             method::WORKFLOW_GET,
+            method::WORKFLOW_INSPECT,
             method::EVENTS_TAIL,
             method::EVENTS_SUBSCRIBE,
             method::AGENTS_LIST,
