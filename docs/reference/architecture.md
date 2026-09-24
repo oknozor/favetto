@@ -75,4 +75,6 @@ This keeps the boundary above intact: favetto validates and executes, while all
 judgment — which task to spawn, when to retry, when to stop — stays outside.
 There is no LLM or agent loop in the daemon, and the daemon stores no supervisor
 state. The full observation and decision schema and the action-to-RPC mapping
-live in the [Supervisor contract reference](./supervisor-contract).
+live in the [Supervisor contract reference](./supervisor-contract). An
+MCP-speaking supervisor ships as the `favetto-mcp` binary; see the
+[MCP supervisor guide](../guide/mcp).

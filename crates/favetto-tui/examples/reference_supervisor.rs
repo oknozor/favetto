@@ -27,7 +27,7 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::Parser;
 
-use favetto_tui::client::{Client, Transport};
+use favetto_tui::client::Client;
 use favetto_tui::supervisor::{self, Action, Policy};
 
 #[derive(Parser)]
@@ -71,7 +71,11 @@ async fn main() -> anyhow::Result<()> {
 
     let input: serde_json::Value =
         serde_json::from_str(&args.input).context("--input must be valid JSON")?;
-    let transport = resolve_transport(&args);
+    let transport = favetto_tui::client::resolve_transport(
+        args.remote.clone(),
+        args.socket.clone(),
+        args.token_file.clone(),
+    );
     let client = Client::connect(transport)
         .await
         .context("connect to the favetto daemon")?;
@@ -107,35 +111,4 @@ async fn main() -> anyhow::Result<()> {
         Action::Escalate => anyhow::bail!("escalated: {}", outcome.terminal.reason),
         other => anyhow::bail!("unexpected terminal decision {other:?}"),
     }
-}
-
-/// Resolve the transport the same way the TUI does: explicit `--remote`, then
-/// `$FAVETTO_URL`, then the local Unix socket.
-fn resolve_transport(args: &Args) -> Transport {
-    if let Some(remote) = &args.remote {
-        return Transport::Ws {
-            url: remote.clone(),
-            token: read_token(args.token_file.clone()),
-        };
-    }
-    if let Ok(url) = std::env::var("FAVETTO_URL") {
-        if !url.is_empty() {
-            return Transport::Ws {
-                url,
-                token: read_token(args.token_file.clone()),
-            };
-        }
-    }
-    let socket = args
-        .socket
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("/tmp/favetto.sock"));
-    Transport::Unix(socket)
-}
-
-fn read_token(path: Option<PathBuf>) -> Option<String> {
-    let path = path.unwrap_or_else(favetto_tui::cli::default_token_path);
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|token| token.trim().to_string())
 }

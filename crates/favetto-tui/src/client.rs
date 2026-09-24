@@ -36,6 +36,43 @@ pub enum Transport {
 /// loop) for the OS TCP timeout; the timeout cancels the pending connect.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Resolve where a client should attach.
+///
+/// Precedence, shared by the TUI, the reference supervisor and `favetto-mcp`:
+/// an explicit `--remote` wins, then `$FAVETTO_URL`, then an explicit `--socket`,
+/// then the default local socket `/tmp/favetto.sock`.
+pub fn resolve_transport(
+    remote: Option<String>,
+    socket: Option<PathBuf>,
+    token_file: Option<PathBuf>,
+) -> Transport {
+    if let Some(remote) = remote {
+        return Transport::Ws {
+            url: remote,
+            token: read_token(token_file),
+        };
+    }
+    if let Ok(url) = std::env::var("FAVETTO_URL") {
+        if !url.is_empty() {
+            return Transport::Ws {
+                url,
+                token: read_token(token_file),
+            };
+        }
+    }
+    Transport::Unix(socket.unwrap_or_else(|| PathBuf::from("/tmp/favetto.sock")))
+}
+
+/// Read a bearer token for a remote attach, defaulting to the standard token
+/// path. A missing/unreadable file yields `None` (the daemon will reject an
+/// unauthenticated WebSocket, surfacing the real error to the caller).
+pub fn read_token(path: Option<PathBuf>) -> Option<String> {
+    let path = path.unwrap_or_else(crate::cli::default_token_path);
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|token| token.trim().to_string())
+}
+
 #[derive(Clone)]
 pub struct Client {
     out_tx: mpsc::Sender<Frame>,
@@ -69,6 +106,22 @@ impl Client {
         })
         .await
         .map_err(|_| anyhow::anyhow!("connect timed out after {timeout:?}"))??;
+        Self::from_streams(incoming, outgoing)
+    }
+
+    /// Build a client over an already-connected framed byte stream.
+    ///
+    /// This is the in-process counterpart of [`Client::connect`]: an embedder or
+    /// test can supply its own `AsyncRead + AsyncWrite` transport (for example a
+    /// `tokio::io::duplex`) without going through a Unix socket or WebSocket.
+    pub fn connect_io<S>(stream: S) -> anyhow::Result<Self>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+    {
+        let framed = Framed::new(stream, FrameCodec);
+        let (sink, source) = framed.split();
+        let incoming: ClientStream = Box::pin(source.map(|r| r.map_err(|e| anyhow::anyhow!(e))));
+        let outgoing: ClientSink = Box::pin(sink.sink_map_err(|e| anyhow::anyhow!(e)));
         Self::from_streams(incoming, outgoing)
     }
 
@@ -225,6 +278,29 @@ async fn ws_connect(url: &str, token: Option<&str>) -> anyhow::Result<(ClientStr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_takes_precedence_over_socket() {
+        let transport = resolve_transport(
+            Some("ws://example/rpc".to_string()),
+            Some(PathBuf::from("/tmp/x.sock")),
+            None,
+        );
+        match transport {
+            Transport::Ws { url, .. } => assert_eq!(url, "ws://example/rpc"),
+            other => panic!("expected WebSocket, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn socket_is_the_local_fallback() {
+        std::env::remove_var("FAVETTO_URL");
+        let transport = resolve_transport(None, Some(PathBuf::from("/tmp/x.sock")), None);
+        match transport {
+            Transport::Unix(path) => assert_eq!(path, PathBuf::from("/tmp/x.sock")),
+            other => panic!("expected Unix socket, got {other:?}"),
+        }
+    }
 
     /// A peer that accepts the TCP connection but never answers the WebSocket
     /// handshake must be cancelled by the connect timeout instead of hanging the

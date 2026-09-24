@@ -983,6 +983,7 @@ dependencies = [
  "config",
  "dirs",
  "favetto-core",
+ "favetto-mcp",
  "favetto-providers",
  "favetto-tui",
  "futures-util",
@@ -1035,6 +1036,22 @@ dependencies = [
  "tokio-util",
  "toml 0.8.23",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "favetto-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "favetto-core",
+ "favetto-tui",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
