@@ -124,6 +124,12 @@ fn all_popups_render_without_panic() {
                     allow_always: true,
                 },
             )),
+            Popup::Confirm(ConfirmPrompt {
+                title: " Cancel task ",
+                message: vec!["Cancel task 'stuck' (attempt 2)?".to_string()],
+                method: favetto_core::rpc::method::TASKS_CANCEL,
+                params: serde_json::json!({ "id": uuid::Uuid::nil() }),
+            }),
         ] {
             let mut app = App::with_theme(theme);
             app.popup = popup;
@@ -494,6 +500,35 @@ fn help_multiline_and_submit_keys_scoped_to_task_input() {
 }
 
 #[test]
+fn help_overlay_lists_cancel_and_retry() {
+    let mut app = App::new();
+    app.popup = Popup::Help { scroll: 0 };
+    // Tall enough that the Tasks section is visible without scrolling.
+    let text = render_text(&mut app, 120, 60);
+    assert!(
+        text.contains("cancel the selected non-terminal task"),
+        "cancel help row missing: {text:?}"
+    );
+    assert!(
+        text.contains("retry the selected terminal task"),
+        "retry help row missing: {text:?}"
+    );
+    assert!(
+        text.contains("workflow root"),
+        "root cancel help row missing: {text:?}"
+    );
+}
+
+#[test]
+fn status_bar_surfaces_a_task_command_notice() {
+    let mut app = App::new();
+    app.notice = Some("tasks.retry: task 'x' still has a live run".to_string());
+    let text = render_text(&mut app, 200, 24);
+    assert!(text.contains("tasks.retry"), "notice missing: {text:?}");
+    assert!(text.contains("live run"), "notice text missing: {text:?}");
+}
+
+#[test]
 fn workflow_overlay_renders_graph() {
     let mut app = App::new();
     app.popup = Popup::Workflow {
@@ -674,6 +709,22 @@ fn reply_popup_renders_message_and_options() {
     );
     assert!(text.contains("Allow once"), "option missing: {text:?}");
     assert!(text.contains("Reject"), "option missing: {text:?}");
+}
+
+#[test]
+fn confirm_popup_renders_message_and_keys() {
+    let mut app = App::new();
+    app.popup = Popup::Confirm(ConfirmPrompt {
+        title: " Cancel task ",
+        message: vec!["Cancel task 'stuck' (attempt 2)?".to_string()],
+        method: favetto_core::rpc::method::TASKS_CANCEL,
+        params: serde_json::json!({ "id": uuid::Uuid::nil() }),
+    });
+
+    let text = render_text(&mut app, 100, 30);
+    assert!(text.contains("Cancel task"), "title missing: {text:?}");
+    assert!(text.contains("attempt 2"), "message missing: {text:?}");
+    assert!(text.contains("confirm"), "footer missing: {text:?}");
 }
 
 #[test]

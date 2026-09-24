@@ -2264,3 +2264,229 @@ fn wizard_lists_unavailable_agent_but_skips_it() {
         assert!(w.error.is_some());
     }
 }
+
+/// A task with an explicit lifecycle status, for cancel/retry eligibility.
+fn task_with(name: &str, status: TaskStatus) -> Task {
+    let mut t = task(name);
+    t.status = status;
+    t
+}
+
+#[test]
+fn cancel_key_confirms_then_submits_tasks_cancel() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    let mut running = task_with("stuck", TaskStatus::Running);
+    running.attempt = 2;
+    app.tasks = vec![running];
+    let id = app.tasks[0].id;
+
+    assert!(matches!(
+        app.handle_key(key(KeyCode::Char('c'), KeyModifiers::empty())),
+        UiAction::None
+    ));
+    match &app.popup {
+        Popup::Confirm(prompt) => {
+            assert_eq!(prompt.method, method::TASKS_CANCEL);
+            assert_eq!(prompt.params["id"], serde_json::json!(id));
+        }
+        _ => panic!("expected Confirm"),
+    }
+
+    match app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())) {
+        UiAction::TaskCommand { method: m, params } => {
+            assert_eq!(m, method::TASKS_CANCEL);
+            assert_eq!(params["id"], serde_json::json!(id));
+        }
+        _ => panic!("expected TaskCommand"),
+    }
+    assert!(matches!(app.popup, Popup::None));
+}
+
+#[test]
+fn confirm_popup_dismisses_on_escape_n_and_the_initiating_key() {
+    for code in [
+        KeyCode::Esc,
+        KeyCode::Char('n'),
+        KeyCode::Char('c'),
+        KeyCode::Char('C'),
+    ] {
+        let mut app = App::new();
+        app.tab = Tab::Tasks;
+        app.tasks = vec![task_with("stuck", TaskStatus::Running)];
+        app.handle_key(key(KeyCode::Char('c'), KeyModifiers::empty()));
+        assert!(matches!(app.popup, Popup::Confirm(_)));
+        assert!(matches!(
+            app.handle_key(key(code, KeyModifiers::empty())),
+            UiAction::None
+        ));
+        assert!(matches!(app.popup, Popup::None));
+    }
+}
+
+#[test]
+fn retry_key_confirms_then_submits_tasks_retry() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    let mut failed = task_with("boom", TaskStatus::Failed);
+    failed.attempt = 3;
+    app.tasks = vec![failed];
+    let id = app.tasks[0].id;
+
+    app.handle_key(key(KeyCode::Char('r'), KeyModifiers::empty()));
+    match &app.popup {
+        Popup::Confirm(prompt) => {
+            assert_eq!(prompt.method, method::TASKS_RETRY);
+            assert_eq!(prompt.params["id"], serde_json::json!(id));
+        }
+        _ => panic!("expected Confirm"),
+    }
+
+    match app.handle_key(key(KeyCode::Char('y'), KeyModifiers::empty())) {
+        UiAction::TaskCommand { method: m, params } => {
+            assert_eq!(m, method::TASKS_RETRY);
+            assert_eq!(params["id"], serde_json::json!(id));
+        }
+        _ => panic!("expected TaskCommand"),
+    }
+}
+
+#[test]
+fn cancel_and_retry_ignore_ineligible_statuses() {
+    // A terminal task has nothing to cancel.
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    app.tasks = vec![task_with("done", TaskStatus::Succeeded)];
+    assert!(matches!(
+        app.handle_key(key(KeyCode::Char('c'), KeyModifiers::empty())),
+        UiAction::None
+    ));
+    assert!(matches!(app.popup, Popup::None));
+
+    // A live task may not be retried.
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    app.tasks = vec![task_with("live", TaskStatus::Running)];
+    assert!(matches!(
+        app.handle_key(key(KeyCode::Char('r'), KeyModifiers::empty())),
+        UiAction::None
+    ));
+    assert!(matches!(app.popup, Popup::None));
+
+    // Awaiting input is non-terminal: cancel is offered, retry is not.
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    app.tasks = vec![task_with("blocked", TaskStatus::AwaitingInput)];
+    app.handle_key(key(KeyCode::Char('c'), KeyModifiers::empty()));
+    assert!(matches!(app.popup, Popup::Confirm(_)));
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    app.tasks = vec![task_with("blocked", TaskStatus::AwaitingInput)];
+    assert!(matches!(
+        app.handle_key(key(KeyCode::Char('r'), KeyModifiers::empty())),
+        UiAction::None
+    ));
+}
+
+#[test]
+fn shift_c_confirms_workflow_cancel_for_a_rooted_task() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    let root = uuid::Uuid::new_v4();
+    let mut child = task_with("child", TaskStatus::Running);
+    child.root_id = Some(root);
+    app.tasks = vec![child];
+
+    app.handle_key(key(KeyCode::Char('C'), KeyModifiers::empty()));
+    match &app.popup {
+        Popup::Confirm(prompt) => {
+            assert_eq!(prompt.method, method::WORKFLOW_CANCEL);
+            assert_eq!(prompt.params["root_id"], serde_json::json!(root));
+        }
+        _ => panic!("expected Confirm"),
+    }
+
+    match app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())) {
+        UiAction::TaskCommand { method: m, params } => {
+            assert_eq!(m, method::WORKFLOW_CANCEL);
+            assert_eq!(params["root_id"], serde_json::json!(root));
+        }
+        _ => panic!("expected TaskCommand"),
+    }
+}
+
+#[test]
+fn shift_c_is_noop_for_a_task_without_a_root() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    // A directly-started task has no `root_id`: there is no separate root.
+    app.tasks = vec![task_with("root", TaskStatus::Running)];
+    assert!(matches!(
+        app.handle_key(key(KeyCode::Char('C'), KeyModifiers::empty())),
+        UiAction::None
+    ));
+    assert!(matches!(app.popup, Popup::None));
+}
+
+#[test]
+fn cancel_and_retry_bindings_are_tasks_tab_only() {
+    let mut app = App::new();
+    app.tab = Tab::Catalog;
+    app.tasks = vec![task_with("x", TaskStatus::Running)];
+    for code in [KeyCode::Char('c'), KeyCode::Char('C'), KeyCode::Char('r')] {
+        assert!(matches!(
+            app.handle_key(key(code, KeyModifiers::empty())),
+            UiAction::None
+        ));
+    }
+    assert!(matches!(app.popup, Popup::None));
+}
+
+#[test]
+fn cancel_keys_forward_to_a_captured_agent() {
+    let mut app = App::new();
+    app.tab = Tab::Agent;
+    app.agent_capture = true;
+    for (code, byte) in [
+        (KeyCode::Char('c'), b'c'),
+        (KeyCode::Char('C'), b'C'),
+        (KeyCode::Char('r'), b'r'),
+    ] {
+        match app.handle_key(key(code, KeyModifiers::empty())) {
+            UiAction::AgentInput(bytes) => assert_eq!(bytes, vec![byte]),
+            _ => panic!("expected AgentInput for {code:?}"),
+        }
+    }
+    assert!(matches!(app.popup, Popup::None));
+}
+
+#[test]
+fn cancel_and_retry_are_literal_inside_a_form() {
+    let mut app = App::new();
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
+    app.handle_key(key(KeyCode::Char('c'), KeyModifiers::empty()));
+    app.handle_key(key(KeyCode::Char('r'), KeyModifiers::empty()));
+    let Popup::Form(form) = &app.popup else {
+        panic!("expected form");
+    };
+    assert_eq!(form.input, "cr");
+}
+
+#[test]
+fn task_updated_push_replaces_a_cancelled_row_in_place() {
+    let mut app = App::new();
+    let running = task_with("stuck", TaskStatus::Running);
+    app.tasks = vec![task("before"), running.clone()];
+    let mut cancelled = running.clone();
+    cancelled.status = TaskStatus::Cancelled;
+
+    app.handle_notification(Notification {
+        method: push::TASK_UPDATED.to_string(),
+        params: serde_json::to_value(&cancelled).unwrap(),
+    });
+
+    assert_eq!(app.tasks.len(), 2, "push must replace, not insert");
+    assert_eq!(app.tasks[1].status, TaskStatus::Cancelled);
+}

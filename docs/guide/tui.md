@@ -45,6 +45,9 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 | Global | `q` / `Esc` | quit |
 | Lists | `↑` / `↓` | move selection |
 | Tasks | `Enter` | open the selected task's agent session |
+| Tasks | `c` | cancel the selected non-terminal task (confirm) |
+| Tasks | `r` | retry the selected terminal task (confirm) |
+| Tasks | `C` | cancel every task in the selected task's workflow root (confirm) |
 | Catalog | `Enter` | start the task; on a folder, fold/unfold |
 | Catalog | `e` | edit the selected task in `$VISUAL`/`$EDITOR` |
 | Catalog | `Space` | fold/unfold the selected folder |
@@ -75,9 +78,27 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 | Mouse | click a catalog folder | fold/unfold it |
 | Mouse | click a catalog/task row | select; click again starts it |
 
-`?`, `w`, `p`, and `e` are forwarded to the embedded agent while the Agent panel
-has keyboard capture, and are typed literally into form/wizard fields when one is
-open. `p` only toggles the preview and `e` only edits on the Catalog tab.
+`?`, `w`, `p`, `e`, `c`, `r`, and `C` are forwarded to the embedded agent while
+the Agent panel has keyboard capture, and are typed literally into form/wizard
+fields when one is open. `p` only toggles the preview and `e` only edits on the
+Catalog tab; `c`, `r`, and `C` only act on the Tasks tab.
+
+## Cancel and retry
+
+On the **Tasks** tab you can act on the selected row without reaching for the API:
+
+- **c** cancels a non-terminal task (pending, running, or awaiting input).
+- **r** retries a terminal task (succeeded, failed, or cancelled), recording a new
+  attempt and keeping the prior run history.
+- **C** cancels *every* non-terminal task in the selected task's workflow root, so
+  a whole `spawn`/`needs` pipeline can be abandoned. It is offered only for a task
+  that belongs to a workflow root (a spawned child, i.e. `root_id` is set).
+
+Each key opens a confirmation popup first: `Enter`/`y` confirms, `Esc`/`n`
+dismisses. Nothing is applied optimistically — the daemon pushes `task.updated`
+for every changed task, so the row (or rows, for `C`) updates live. A rejected
+command (for example retrying a task whose run is still live) is reported in the
+status bar.
 
 ## Agent session picker
 
