@@ -1,14 +1,19 @@
-//! The two transports that expose the daemon: a Unix domain socket (local attach)
-//! and a WebSocket endpoint (remote attach). Both adapt their I/O into the same
-//! frame `Stream`/`Sink` and hand off to [`serve_connection`](crate::server::serve_connection).
+//! The transports that expose the daemon: a Unix domain socket (local attach),
+//! a WebSocket endpoint (remote attach), and an HTTP `POST /rpc` request/response
+//! endpoint. The socket/WebSocket paths adapt their I/O into the same frame
+//! `Stream`/`Sink` and hand off to
+//! [`serve_connection`](crate::server::serve_connection); the HTTP path decodes a
+//! single frame and calls [`crate::server::dispatch`].
 
 use std::path::Path;
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State as AxumState};
+use axum::extract::{DefaultBodyLimit, Query, State as AxumState};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::routing::get;
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -16,7 +21,7 @@ use tokio::net::UnixListener;
 use tokio_util::codec::Framed;
 
 use favetto_core::rpc::Frame;
-use favetto_core::wire::{FrameCodec, WireError};
+use favetto_core::wire::{self, FrameCodec, WireError};
 
 use crate::server::{self, BoxIn, BoxOut};
 use crate::state::State;
@@ -50,6 +55,34 @@ pub async fn serve_http(listen: &str, app: Router) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The `/rpc` transport: WebSocket upgrade (GET) and HTTP request/response
+/// (POST), with the frame body limit applied to this route only.
+pub fn routes() -> Router<Arc<State>> {
+    rpc_routes(wire::MAX_FRAME_LEN)
+}
+
+/// [`routes`] with an explicit body limit, so tests can exercise the limit
+/// without allocating a 64 MiB body.
+pub(crate) fn rpc_routes(limit: usize) -> Router<Arc<State>> {
+    Router::new()
+        .route("/rpc", get(ws_handler).post(rpc_handler))
+        .layer(DefaultBodyLimit::max(limit))
+}
+
+/// True when `headers` carries a valid `Authorization: Bearer <token>`.
+fn authorized(state: &State, headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|t| state.token.verify(t))
+        .unwrap_or(false)
+}
+
+fn unauthorized() -> Response {
+    (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response()
+}
+
 /// Query parameters accepted on the upgrade, so a browser that cannot set an
 /// `Authorization` header can present a ticket from `POST /auth/ticket`.
 #[derive(Debug, Default, Deserialize)]
@@ -78,12 +111,49 @@ pub async fn ws_handler(
     };
 
     if !authorized {
-        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+        return unauthorized();
     }
 
     ws.on_upgrade(move |socket| async move {
         serve_socket(state, socket).await;
     })
+}
+
+/// `POST /rpc`: read one MessagePack `Frame::Request` and write one
+/// `Frame::Response`, delegating all logic to [`crate::server::dispatch`].
+pub async fn rpc_handler(
+    AxumState(state): AxumState<Arc<State>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !authorized(&state, &headers) {
+        return unauthorized();
+    }
+
+    let req = match wire::decode(&body) {
+        Ok(Frame::Request(req)) => req,
+        // A well-formed frame with no request id has nothing to reply to.
+        Ok(_) => return (StatusCode::BAD_REQUEST, "expected a request frame").into_response(),
+        Err(_) => return (StatusCode::BAD_REQUEST, "malformed frame").into_response(),
+    };
+
+    state.metrics.inc_rpc();
+    let resp = server::dispatch(&state, req).await;
+    match wire::encode(&Frame::Response(resp)) {
+        Ok(bytes) => (
+            [(axum::http::header::CONTENT_TYPE, "application/x-msgpack")],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to encode rpc response");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to encode response",
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Adapt an axum WebSocket into frame stream/sink halves and serve the connection.

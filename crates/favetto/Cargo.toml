@@ -60,4 +60,5 @@ notify = "8.2.0"
 
 [dev-dependencies]
 favetto-mcp = { path = "../favetto-mcp" }
+tower = { version = "0.5", features = ["util"] }
 proptest = { workspace = true }
