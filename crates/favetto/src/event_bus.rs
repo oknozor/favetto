@@ -88,6 +88,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             error: None,
+            failure: None,
             session_id: None,
             session_title: None,
             parent_id: None,

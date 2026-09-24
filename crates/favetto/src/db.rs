@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     started_at  INTEGER,
     finished_at INTEGER,
     error       TEXT,
+    failure     TEXT,
     session_id  TEXT,
     session_title TEXT,
     parent_id   TEXT,
@@ -117,6 +118,10 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN session_id TEXT")
         .execute(pool)
         .await;
+    // Typed failure JSON. Legacy rows keep NULL and decode as `None`.
+    let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN failure TEXT")
+        .execute(pool)
+        .await;
     let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN session_title TEXT")
         .execute(pool)
         .await;
@@ -143,8 +148,8 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
 /// Insert a task, silently ignoring a duplicate dedupe key.
 pub async fn insert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT OR IGNORE INTO tasks (id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title, parent_id, root_id, interactive)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO tasks (id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title, parent_id, root_id, interactive, failure)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(task.id.to_string())
     .bind(&task.name)
@@ -161,6 +166,7 @@ pub async fn insert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
     .bind(task.parent_id.map(|id| id.to_string()))
     .bind(task.root_id.map(|id| id.to_string()))
     .bind(task.interactive as i64)
+    .bind(task.failure.as_ref().map(serde_json::to_string).transpose()?)
     .execute(pool)
     .await?;
     Ok(())
@@ -169,14 +175,15 @@ pub async fn insert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
 /// Insert-or-update a task (full overwrite of mutable fields).
 pub async fn upsert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO tasks (id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title, parent_id, root_id, interactive)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "INSERT INTO tasks (id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title, parent_id, root_id, interactive, failure)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
              status = excluded.status,
              output = excluded.output,
              started_at = excluded.started_at,
              finished_at = excluded.finished_at,
              error = excluded.error,
+             failure = excluded.failure,
              session_id = excluded.session_id,
              session_title = excluded.session_title",
     )
@@ -195,6 +202,7 @@ pub async fn upsert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
     .bind(task.parent_id.map(|id| id.to_string()))
     .bind(task.root_id.map(|id| id.to_string()))
     .bind(task.interactive as i64)
+    .bind(task.failure.as_ref().map(serde_json::to_string).transpose()?)
     .execute(pool)
     .await?;
     Ok(())
@@ -203,7 +211,7 @@ pub async fn upsert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
 /// Fetch a single task by id.
 pub async fn get_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Option<Task>> {
     let row = sqlx::query(
-        "SELECT id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title, parent_id, root_id, interactive \
+        "SELECT id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, failure, session_id, session_title, parent_id, root_id, interactive \
          FROM tasks WHERE id = ?",
     )
     .bind(id.to_string())
@@ -216,7 +224,7 @@ pub async fn get_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Option<Task
 /// is fetched on demand with [`get_task`].
 pub async fn list_tasks(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec<Task>> {
     let rows = sqlx::query(
-        "SELECT id, name, status, input, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title, parent_id, root_id, interactive \
+        "SELECT id, name, status, input, dedupe_key, created_at, started_at, finished_at, error, failure, session_id, session_title, parent_id, root_id, interactive \
          FROM tasks ORDER BY created_at DESC LIMIT ?",
     )
     .bind(limit.max(1))
@@ -279,6 +287,11 @@ fn row_to_task(row: &SqliteRow) -> Task {
         started_at: row.get::<Option<i64>, _>("started_at").map(from_ms),
         finished_at: row.get::<Option<i64>, _>("finished_at").map(from_ms),
         error: row.get("error"),
+        failure: row
+            .try_get::<Option<String>, _>("failure")
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok()),
         session_id: row
             .try_get::<Option<String>, _>("session_id")
             .ok()
@@ -492,7 +505,7 @@ pub async fn fail_interrupted_tasks(pool: &SqlitePool) -> anyhow::Result<u64> {
 /// Up to `limit` pending tasks, oldest first (for the parallel executor).
 pub async fn next_pending_tasks(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec<Task>> {
     let rows = sqlx::query(
-        "SELECT id, name, status, input, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title, parent_id, root_id, interactive \
+        "SELECT id, name, status, input, dedupe_key, created_at, started_at, finished_at, error, failure, session_id, session_title, parent_id, root_id, interactive \
          FROM tasks WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?",
     )
     .bind(limit.max(1))
@@ -523,7 +536,7 @@ pub async fn list_tasks_in_root(
     name: &str,
 ) -> anyhow::Result<Vec<Task>> {
     let rows = sqlx::query(
-        "SELECT id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title, parent_id, root_id, interactive \
+        "SELECT id, name, status, input, output, dedupe_key, created_at, started_at, finished_at, error, failure, session_id, session_title, parent_id, root_id, interactive \
          FROM tasks WHERE (root_id = ? OR id = ?) AND name = ? ORDER BY created_at ASC",
     )
     .bind(root_id.to_string())
@@ -542,7 +555,7 @@ pub async fn list_active_tasks_in_root(
     name: &str,
 ) -> anyhow::Result<Vec<Task>> {
     let rows = sqlx::query(
-        "SELECT id, name, status, input, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title, parent_id, root_id, interactive \
+        "SELECT id, name, status, input, dedupe_key, created_at, started_at, finished_at, error, failure, session_id, session_title, parent_id, root_id, interactive \
          FROM tasks WHERE (root_id = ? OR id = ?) AND name = ? AND status IN ('pending', 'running', 'awaiting_input') ORDER BY created_at ASC",
     )
     .bind(root_id.to_string())

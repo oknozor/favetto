@@ -24,7 +24,7 @@ use tokio::process::Command;
 use tokio::sync::{OwnedMutexGuard, Semaphore};
 use uuid::Uuid;
 
-use favetto_core::model::{Event, EventKind, Task, TaskStatus};
+use favetto_core::model::{Event, EventKind, Failure, FailureKind, Task, TaskStatus};
 
 use crate::agents::{resolve_session_title, Agent, TITLE_POLL_ATTEMPTS, TITLE_POLL_INTERVAL};
 use crate::config::ExecutorSettings;
@@ -33,40 +33,64 @@ use crate::event_bus::ServerPush;
 use crate::state::State;
 use crate::tasks::{needs_parts, NeedsKind, TaskDef};
 
-/// The result of an agent run. `error` is `Some` for a non-zero exit or a
+/// The result of an agent run. `failure` is `Some` for a non-zero exit or a
 /// missing session; `session_id`/`session_title` are carried either way so a
 /// failed run keeps its reattach handle and its title.
 struct RunOutcome {
     output: serde_json::Value,
     session_id: Option<String>,
     session_title: Option<String>,
-    error: Option<String>,
+    /// `Some` for a non-zero exit / vanished session / failed turn.
+    failure: Option<Failure>,
     /// The interactive TUI process is still alive after its turn finished. Its
     /// worktree must be kept, since the session still runs inside it.
     alive: bool,
 }
 
+/// A run that failed before producing a [`RunOutcome`], tagged with its kind.
+/// Used for failures raised before the agent is launched (no agent configured,
+/// agent unavailable, PTY spawn fault).
+struct RunError {
+    kind: FailureKind,
+    message: String,
+}
+
+impl RunError {
+    fn new(kind: FailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
 /// Fold a finished (or failed-to-start) agent run onto the task row. Returns
 /// whether the run succeeded. Session info is assigned on both arms.
-fn record_run_outcome(task: &mut Task, outcome: anyhow::Result<RunOutcome>) -> bool {
+fn record_run_outcome(task: &mut Task, outcome: Result<RunOutcome, RunError>) -> bool {
     match outcome {
         Ok(run) => {
             task.session_id = run.session_id;
             task.session_title = run.session_title;
-            if let Some(err) = run.error {
-                task.status = TaskStatus::Failed;
-                task.error = Some(err);
-                false
-            } else {
-                task.status = TaskStatus::Succeeded;
-                task.output = Some(run.output);
-                task.error = None;
-                true
+            match run.failure {
+                Some(failure) => {
+                    task.status = TaskStatus::Failed;
+                    task.error = Some(failure.message.clone());
+                    task.failure = Some(failure);
+                    false
+                }
+                None => {
+                    task.status = TaskStatus::Succeeded;
+                    task.output = Some(run.output);
+                    task.error = None;
+                    task.failure = None;
+                    true
+                }
             }
         }
         Err(e) => {
             task.status = TaskStatus::Failed;
-            task.error = Some(e.to_string());
+            task.error = Some(e.message.clone());
+            task.failure = Some(Failure::new(e.kind, e.message));
             false
         }
     }
@@ -126,7 +150,13 @@ async fn dispatch_loop(state: Arc<State>, cfg: ExecutorSettings) {
             };
 
             let Some(def) = lookup_def(&state, &task.name) else {
-                fail_task(&state, task, "task not found in the catalog").await;
+                fail_task(
+                    &state,
+                    task,
+                    FailureKind::InvalidInput,
+                    "task not found in the catalog",
+                )
+                .await;
                 continue;
             };
 
@@ -136,6 +166,7 @@ async fn dispatch_loop(state: Arc<State>, cfg: ExecutorSettings) {
                 fail_task(
                     &state,
                     task,
+                    FailureKind::InvalidInput,
                     &format!("task '{}' requires input variable '{missing}'", def.name),
                 )
                 .await;
@@ -146,7 +177,13 @@ async fn dispatch_loop(state: Arc<State>, cfg: ExecutorSettings) {
             let plan = match make_plan(&state, &cfg, &base, &task).await {
                 Ok(p) => p,
                 Err(e) => {
-                    fail_task(&state, task, &format!("worktree setup failed: {e}")).await;
+                    fail_task(
+                        &state,
+                        task,
+                        FailureKind::Infrastructure,
+                        &format!("worktree setup failed: {e}"),
+                    )
+                    .await;
                     continue;
                 }
             };
@@ -247,6 +284,7 @@ async fn enqueue_with_lineage(
         started_at: None,
         finished_at: None,
         error: None,
+        failure: None,
         session_id: None,
         session_title: None,
         parent_id: lineage.parent_id,
@@ -292,11 +330,16 @@ async fn run_one(
     let prompt = render_task_prompt(&def, &task);
 
     let agent_name = def.agent.clone().or_else(|| config.agent.default.clone());
-    let outcome = match agent_name.as_deref() {
-        Some(name) => run_agent_task(state, &task, name, &def, &prompt, &plan.cwd).await,
-        None => Err(anyhow::anyhow!(
-            "task '{}' has no agent: set `agent` in the task or `[agent].default` in the config",
-            def.name
+    let outcome: Result<RunOutcome, RunError> = match agent_name.as_deref() {
+        Some(name) => run_agent_task(state, &task, name, &def, &prompt, &plan.cwd)
+            .await
+            .map_err(|e| RunError::new(FailureKind::Infrastructure, e.to_string())),
+        None => Err(RunError::new(
+            FailureKind::InvalidInput,
+            format!(
+                "task '{}' has no agent: set `agent` in the task or `[agent].default` in the config",
+                def.name
+            ),
         )),
     };
 
@@ -769,19 +812,27 @@ async fn run_agent_task(
         session_title.clone(),
         max,
     );
-    let error = match result.exit_code {
+    let failure = match result.exit_code {
         Some(0) => None,
-        Some(_) if turn_finished => Some(format!(
-            "agent '{agent_name}' finished the task unsuccessfully"
+        Some(_) if turn_finished => Some(Failure::new(
+            FailureKind::Agent,
+            format!("agent '{agent_name}' finished the task unsuccessfully"),
         )),
-        Some(c) => Some(format!("agent '{agent_name}' exited with {c}:\n{raw}")),
-        None => Some(format!("agent '{agent_name}' session disappeared")),
+        Some(c) => Some(Failure::new(
+            FailureKind::Agent,
+            format!("agent '{agent_name}' exited with {c}:\n{raw}"),
+        )),
+        // No exit code: the PTY/session disappeared, i.e. a daemon/supervisor fault.
+        None => Some(Failure::new(
+            FailureKind::Infrastructure,
+            format!("agent '{agent_name}' session disappeared"),
+        )),
     };
     Ok(RunOutcome {
         output,
         session_id: result.session_id,
         session_title,
-        error,
+        failure,
         alive: interactive && turn_finished,
     })
 }
@@ -918,10 +969,11 @@ async fn backfill_title(
 }
 
 /// Mark a task failed (used when it can't even be started).
-async fn fail_task(state: &State, task: Task, error: &str) {
+async fn fail_task(state: &State, task: Task, kind: FailureKind, error: &str) {
     let mut task = task;
     task.status = TaskStatus::Failed;
     task.error = Some(error.to_string());
+    task.failure = Some(Failure::new(kind, error));
     task.finished_at = Some(Utc::now());
     let _ = db::upsert_task(&state.db, &task).await;
     state
