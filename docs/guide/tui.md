@@ -135,6 +135,14 @@ interactive mode exits on its own are completed/failed when the session exits
 instead. Only programmatic runs (schedules, hooks/webhooks, `needs`, `spawn`)
 stay headless and finish on their own.
 
+Opening the Agent panel on a running task never shows the headless machine output
+(raw JSON). For **opencode** the daemon attaches a genuine interactive session to
+the run's session on its managed server while the headless process keeps running
+in the background; for agents that cannot attach concurrently it renders the
+structured state view (activity, usage, session id) instead. A headless run that
+is blocked on a user answer is the exception: the panel shows its screen so you
+can type the answer.
+
 ## Workflow overlay
 
 Press **w** to render the catalog's `needs`/`spawn` edges as box-drawing art (the

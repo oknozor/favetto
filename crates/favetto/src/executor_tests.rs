@@ -2094,6 +2094,173 @@ async fn run_one_reads_spawn_file_before_reclaiming_worktree() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A live interactive Agent-panel session attached to a task keeps the task's
+/// worktree alive after its headless run exits (the session still runs inside
+/// it).
+#[cfg(unix)]
+#[tokio::test]
+async fn run_one_keeps_the_worktree_while_an_attach_is_live() {
+    use crate::agents::{AgentContext, Invocation};
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::env::temp_dir().join(format!("favetto-attach-wt-{}", Uuid::new_v4()));
+    let repo = root.join("repo");
+    let worktree = root.join("worktree");
+    std::fs::create_dir_all(&repo).unwrap();
+
+    let run_git = |dir: PathBuf, args: Vec<String>| async move {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(&args)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    };
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "t@example.com"],
+        vec!["config", "user.name", "t"],
+    ] {
+        run_git(repo.clone(), args.into_iter().map(String::from).collect()).await;
+    }
+    std::fs::write(repo.join("README.md"), "seed").unwrap();
+    for args in [vec!["add", "-A"], vec!["commit", "-qm", "init"]] {
+        run_git(repo.clone(), args.into_iter().map(String::from).collect()).await;
+    }
+
+    let branch = "favetto/attach-test";
+    run_git(
+        repo.clone(),
+        vec![
+            "worktree".into(),
+            "add".into(),
+            "--force".into(),
+            "-B".into(),
+            branch.into(),
+            worktree.to_string_lossy().into_owned(),
+        ],
+    )
+    .await;
+
+    // The headless `run` exits; the interactive attach sleeps, staying live.
+    let script = root.join("fake-agent.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\ncase \"$1\" in run) exit 0;; *) sleep 30;; esac\n",
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let mut cfg = FavettoConfig::default();
+    cfg.agent.default = Some("opencode".to_string());
+    cfg.agents.insert(
+        "opencode".to_string(),
+        crate::config::AgentConfig {
+            command: script.to_string_lossy().into_owned(),
+            ..Default::default()
+        },
+    );
+    let registry = AgentRegistry::from_config_with(&cfg, &|_| true).unwrap();
+
+    let pool = crate::db::open(&root.join("test.db")).await.unwrap();
+    crate::db::migrate(&pool).await.unwrap();
+    let state = Arc::new(State::new(StateInit {
+        db: pool,
+        bus: EventBus::new(64),
+        token: Token::generate(),
+        webhooks: WebhookSecrets {
+            github: None,
+            linear: None,
+        },
+        agents: AgentManager::new(),
+        registry,
+        config: Arc::new(cfg),
+        data_dir: root.clone(),
+        tasks_dir: root.clone(),
+        catalog: Arc::new(RwLock::new(Vec::new())),
+        scheduler: tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
+        hook_store: Arc::new(RwLock::new(Vec::new())),
+    }));
+
+    let def =
+        crate::tasks::parse_task_md("favetto/attach_test", "agent = \"opencode\"\n---\nBody.\n")
+            .unwrap();
+    let task = Task {
+        id: Uuid::new_v4(),
+        name: def.name.clone(),
+        status: TaskStatus::Running,
+        attempt: 0,
+        input: serde_json::json!({}),
+        output: None,
+        dedupe_key: None,
+        created_at: Utc::now(),
+        started_at: Some(Utc::now()),
+        finished_at: None,
+        error: None,
+        failure: None,
+        session_id: None,
+        session_title: None,
+        parent_id: None,
+        root_id: None,
+        interactive: false,
+    };
+    db::insert_task(&state.db, &task).await.unwrap();
+
+    // A live interactive panel session bound to the task, running in the
+    // worktree (the fake `attach` path).
+    let agent = state.registry.get_checked("opencode").unwrap();
+    let attached = state
+        .agents
+        .start(
+            "opencode",
+            agent,
+            Some(task.id.to_string()),
+            Invocation::Interactive {
+                prompt: None,
+                provider: None,
+                model: None,
+            },
+            AgentContext {
+                cwd: Some(worktree.clone()),
+                rows: 24,
+                cols: 80,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(!attached.headless && attached.running);
+
+    let plan = Plan {
+        cwd: worktree.clone(),
+        needs_lock: false,
+        worktree: Some(Worktree {
+            repo: repo.clone(),
+            path: worktree.clone(),
+            branch: branch.to_string(),
+        }),
+    };
+    let run = running_run(task.id);
+    db::insert_task_run(&state.db, &run).await.unwrap();
+    run_one(&state, task, run, def, plan, None).await;
+
+    assert!(
+        worktree.exists(),
+        "the worktree must be kept while the interactive attach is live"
+    );
+
+    state.agents.close(&attached.id).ok();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A `State` whose live catalog is `catalog`, built from an explicit config,
 /// with no usable agent.
 async fn join_state_with_config(

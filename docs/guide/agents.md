@@ -92,21 +92,31 @@ A task you start from the **Catalog** runs in this real TUI (see
 [Lifecycle](#lifecycle)): the panel attaches to the live session **writable**, so
 you can watch the agent work, answer a permission prompt, or take over by hand.
 Programmatic runs — started by a schedule, a webhook/hook, `needs`, or `spawn` —
-stay headless; for those, the panel keeps the read-only fallback described below.
+are executed headlessly, but the panel **never** shows the headless machine
+output (the JSON event stream). Instead, opening the panel on a running task
+always yields a real interactive view:
+
+- **opencode** runs its headless turn against the same managed server that backs
+  the interactive TUI (`concurrent_attach`), so the panel opens a genuine,
+  writable `opencode` session on the run's agent session id while the headless
+  process keeps running in the background. You see the agent's reasoning and tool
+  calls live and can answer prompts without waiting for the run to finish.
+- Agents that cannot attach concurrently show a **structured state view** —
+  agent, activity, token usage, session id and task status — not raw JSON. A
+  finished run shows the same view (or the real session, when the agent can
+  resume/open one), never a JSON replay.
 
 When a task's row shows **awaiting input** (see [Lifecycle](#lifecycle)), pressing
 **Enter** attaches to the *live blocked PTY* rather than launching a fresh
 session, so anything you type — a permission key, a passphrase — reaches the
-prompt the agent is waiting on.
+prompt the agent is waiting on. This applies to headless runs too: a blocked
+machine PTY is the one case where the panel shows it, because the prompt on
+screen is exactly what you must answer.
 
-For a **headless** (programmatic) run, agents that cannot resume (`claude`,
-`vibe`, custom) still open: the daemon retains the run's PTY, so a **finished**
-run is replayed from its final screen and a **still-running** run is attached
-**read-only** — the panel shows it without forwarding keystrokes into its machine
-output. A resumable agent is only resumed once its run has exited (or is blocked
-on the user): while the writer is still in flight the retained PTY is attached
-read-only, so two processes never write the same session. Concurrent sessions can
-be switched between with **Ctrl+O** (see the [TUI
+A resumable agent that cannot attach concurrently is only resumed once its run
+has exited (or is blocked on the user): while the writer is still in flight no
+interactive view is opened, so two processes never write the same session.
+Concurrent sessions can be switched between with **Ctrl+O** (see the [TUI
 keybindings](./tui#agent-session-picker)), which lists every live and retained
 session regardless of agent.
 
@@ -145,9 +155,12 @@ An agent whose interactive mode exits on its own finishes the task at exit
 instead. A task started programmatically — by a schedule, a webhook/hook,
 `needs`, or `spawn` — runs headless, using `headless_args` (or `run_args` when a
 model is set), so it completes unattended and captures structured output and the
-agent session id. A task with no agent and no default fails to start, and an
-agent with no way to seed an interactive prompt (`prompt_args`/`submit_prompt`)
-falls back to a headless run even when started by hand.
+agent session id. Its machine PTY is never shown in the panel: opening a running
+task opens a concurrent interactive attach where the agent supports one
+(opencode), or the structured state view otherwise. A task with no agent and no
+default fails to start, and an agent with no way to seed an interactive prompt
+(`prompt_args`/`submit_prompt`) falls back to a headless run even when started by
+hand.
 
 While a run is in flight the daemon watches its terminal screen. If the agent
 blocks on something only a human can answer — a tool permission dialog, a

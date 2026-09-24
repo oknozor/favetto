@@ -1344,6 +1344,13 @@ fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
         return;
     }
 
+    // A headless run has no interactive view: render its structured state, never
+    // the raw machine-output PTY (JSON event stream).
+    if app.agent_structured {
+        draw_agent_structured(frame, app, inner_area, theme);
+        return;
+    }
+
     let screen = app.term.screen();
     let (screen_rows, screen_cols) = screen.size();
     let hide_cursor = screen.hide_cursor();
@@ -1386,6 +1393,67 @@ fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     if !hide_cursor && cursor_row < inner_area.height && cursor_col < inner_area.width {
         frame.set_cursor_position((inner_area.x + cursor_col, inner_area.y + cursor_row));
     }
+}
+
+/// The Agent-panel body for a headless run that has no interactive view: a
+/// structured state snapshot instead of the machine PTY's raw JSON stream.
+fn draw_agent_structured(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
+    let session = app
+        .agent_session_id
+        .as_deref()
+        .and_then(|id| app.agent_sessions.get(id));
+    let name = app.agent_name.as_deref().unwrap_or("agent");
+    let state = if app.agent_running {
+        "running"
+    } else {
+        "finished"
+    };
+    let heading = if app.agent_running {
+        "Running headless — no interactive view available"
+    } else {
+        "Headless run finished — no interactive view available"
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            heading,
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!("Agent     {name}")),
+        Line::from(format!("State     {state}")),
+    ];
+    if !app.agent_status.is_empty() {
+        lines.push(Line::from(format!("Status    {}", app.agent_status)));
+    }
+    if let Some(session) = session {
+        lines.push(Line::from(format!(
+            "Activity  {}",
+            activity_cell(session.activity.as_ref())
+        )));
+        lines.push(Line::from(format!(
+            "Usage     {}",
+            usage_cell(session.usage.as_ref())
+        )));
+        if let Some(session_id) = &session.session_id {
+            lines.push(Line::from(format!("Session   {session_id}")));
+        }
+    }
+    lines.push(Line::from(""));
+    let note = if app.agent_running {
+        "The run continues in the background; its output feeds agent state, usage \
+         and the task result. This agent cannot open an interactive session while \
+         the run is in flight."
+    } else {
+        "The run has finished; its structured output and result are on the task. \
+         This agent has no interactive session to reopen."
+    };
+    lines.push(Line::from(Span::styled(
+        note,
+        Style::default().fg(theme.muted),
+    )));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
 }
 
 /// Map a vt100 cell's attributes to a ratatui style, defaulting unset colours to

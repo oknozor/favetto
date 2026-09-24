@@ -618,6 +618,12 @@ pub struct AgentCapabilities {
     /// Can answer permission/dialog prompts through the channel.
     #[serde(default)]
     pub permission_channel: bool,
+    /// Can open a second, interactive session attached to an already-running
+    /// headless run without racing its session file (e.g. opencode's managed
+    /// server), so the Agent panel can show the real TUI concurrently with the
+    /// run instead of its machine output.
+    #[serde(default)]
+    pub concurrent_attach: bool,
 }
 
 /// Default for a payload that omits `available`: older daemons/clients only know
@@ -694,6 +700,7 @@ mod tests {
                 interactive_prompt: true,
                 reports_state: true,
                 permission_channel: true,
+                concurrent_attach: true,
             },
             sessions: Vec::new(),
         };

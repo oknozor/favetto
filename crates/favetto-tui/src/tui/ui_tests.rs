@@ -576,6 +576,42 @@ fn agent_tab_marks_a_headless_session_read_only() {
     assert!(text.contains("Ctrl+O"), "sessions hint missing: {text:?}");
 }
 
+/// A headless run with no interactive view renders its structured state, never
+/// the machine PTY's raw JSON event stream.
+#[test]
+fn agent_tab_renders_structured_state_not_headless_json() {
+    let mut app = App::new();
+    app.tab = Tab::Agent;
+    let mut headless = session("s1", "opencode", true, true);
+    headless.activity = Some(favetto_core::model::AgentActivity::Tool {
+        name: "bash".to_string(),
+        description: None,
+    });
+    headless.usage = Some(favetto_core::model::AgentUsage {
+        input_tokens: 1500,
+        output_tokens: 20,
+        ..Default::default()
+    });
+    headless.session_id = Some("ses_1".to_string());
+    // Feed the raw JSON the headless PTY would carry: it must not be rendered.
+    app.open_agent(
+        headless,
+        br#"{"sessionID":"ses_1","type":"text","part":{"text":"hi"}}"#,
+    );
+
+    let text = render_text(&mut app, 100, 24);
+    assert!(
+        text.contains("Running headless"),
+        "structured heading missing: {text:?}"
+    );
+    assert!(text.contains("tool: bash"), "activity missing: {text:?}");
+    assert!(text.contains("1.5k/20 tok"), "usage missing: {text:?}");
+    assert!(
+        !text.contains("sessionID") && !text.contains("part"),
+        "raw JSON leaked into the panel: {text:?}"
+    );
+}
+
 #[test]
 fn help_overlay_lists_session_picker() {
     let mut app = App::new();

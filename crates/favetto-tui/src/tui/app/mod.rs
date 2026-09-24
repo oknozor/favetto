@@ -461,6 +461,9 @@ pub struct App {
     /// True when the panel is showing a retained headless PTY that must not
     /// receive keystrokes (a read-only replay or a live unattended run).
     pub agent_read_only: bool,
+    /// True when the panel renders the structured state view for a headless run
+    /// instead of the machine PTY's screen (which carries raw JSON events).
+    pub agent_structured: bool,
     /// The last `agents.start` / `agents.attach` error, shown in the status bar.
     pub agent_error: Option<String>,
     /// Cached `agents.list` sessions keyed by daemon session id. The source of
@@ -551,6 +554,7 @@ impl App {
             agent_status: String::new(),
             agent_capture: false,
             agent_read_only: false,
+            agent_structured: false,
             agent_error: None,
             agent_sessions: HashMap::new(),
             agent_area: None,
@@ -830,13 +834,16 @@ impl App {
     /// A retained headless PTY (an unattended run, or a finished run being
     /// replayed) is shown **read-only**: it is displayed but never receives
     /// keystrokes. A headless run that is blocked on the user is the exception —
-    /// attaching is what lets the answer reach its prompt.
+    /// attaching is what lets the answer reach its prompt. A headless run whose
+    /// panel has no interactive view is rendered as a structured state view, so
+    /// its raw JSON event stream is never shown.
     pub fn open_agent(&mut self, session: AgentSessionInfo, frame: &[u8]) {
         // Cache the session so its activity/usage show in the Tasks table and the
         // Ctrl+R reply sees the latest prompt without waiting for an `agents.list`.
         self.agent_sessions
             .insert(session.id.clone(), session.clone());
-        let read_only = session.headless && session.awaiting_input.is_none();
+        let structured = session.headless && session.awaiting_input.is_none();
+        let read_only = structured;
         let status = if !session.headless {
             String::new()
         } else if session.awaiting_input.is_some() {
@@ -856,6 +863,7 @@ impl App {
         self.agent_name = Some(session.agent);
         self.agent_running = session.running;
         self.agent_read_only = read_only;
+        self.agent_structured = structured;
         self.agent_status = status;
         self.agent_error = None;
         // The embedded agent owns the keyboard as soon as the panel is opened,
