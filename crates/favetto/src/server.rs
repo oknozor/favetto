@@ -23,7 +23,9 @@ use favetto_core::model::{
 };
 use favetto_core::rpc::{method, push, Frame, Notification, Request, Response, RpcError};
 use favetto_core::wire::WireError;
-use favetto_core::workflow::{WorkflowInspect, WorkflowState, WorkflowTaskView};
+use favetto_core::workflow::{
+    WorkflowCreateResult, WorkflowInspect, WorkflowNodeRef, WorkflowState, WorkflowTaskView,
+};
 
 use crate::agents::{AgentContext, AgentEvent, Invocation};
 use crate::db;
@@ -339,6 +341,43 @@ struct TaskIdParams {
 #[derive(Debug, Deserialize)]
 struct WorkflowInspectParams {
     root_id: Uuid,
+}
+
+/// One node of a `workflow.create` request. `key` is local to the request and is
+/// what sibling nodes reference from `depends_on`.
+#[derive(Debug, Deserialize)]
+struct WorkflowCreateTask {
+    key: String,
+    name: String,
+    #[serde(default, deserialize_with = "lenient")]
+    input: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "lenient")]
+    depends_on: Option<Vec<String>>,
+}
+
+/// `workflow.create` params. `idempotency_key` scopes the per-node dedupe keys;
+/// `root_id` optionally extends an existing root.
+#[derive(Debug, Deserialize)]
+struct WorkflowCreateParams {
+    idempotency_key: String,
+    #[serde(default, deserialize_with = "lenient")]
+    root_id: Option<Uuid>,
+    #[serde(default, deserialize_with = "lenient")]
+    tasks: Option<Vec<WorkflowCreateTask>>,
+}
+
+/// `workflow.spawn` params.
+#[derive(Debug, Deserialize)]
+struct WorkflowSpawnParams {
+    name: String,
+    #[serde(default, deserialize_with = "lenient")]
+    input: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "lenient")]
+    root_id: Option<Uuid>,
+    #[serde(default, deserialize_with = "lenient")]
+    depends_on: Option<Vec<Uuid>>,
+    #[serde(default, deserialize_with = "lenient")]
+    dedupe_key: Option<String>,
 }
 
 /// `tasks.start` params. `input` defaults to JSON null; `interactive` defaults
@@ -666,6 +705,20 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
                 .map(|view| serde_json::json!(view))
         }
 
+        method::WORKFLOW_CREATE => {
+            let p: WorkflowCreateParams = parse_params(&req.method, &req.params)?;
+            create_workflow(state, p)
+                .await
+                .map(|result| serde_json::json!(result))
+        }
+
+        method::WORKFLOW_SPAWN => {
+            let p: WorkflowSpawnParams = parse_params(&req.method, &req.params)?;
+            spawn_workflow(state, p)
+                .await
+                .map(|task| serde_json::json!(task))
+        }
+
         method::EVENTS_TAIL => {
             let p: EventsTailParams = parse_params(&req.method, &req.params)?;
             let limit = p.limit.unwrap_or(50).min(1000) as i64;
@@ -841,6 +894,27 @@ async fn inspect_workflow(state: &State, root_id: Uuid) -> Result<WorkflowInspec
         .map(|t| t.name.as_str())
         .collect();
 
+    // Runtime per-instance dependencies (from `workflow.create`/`spawn`), keyed
+    // by dependent id. A missing predecessor is simply absent from `active_ids`,
+    // so it never blocks.
+    let active_ids: HashSet<Uuid> = tasks
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.status,
+                TaskStatus::Pending | TaskStatus::Running | TaskStatus::AwaitingInput
+            )
+        })
+        .map(|t| t.id)
+        .collect();
+    let mut runtime_deps: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    for (task_id, depends_on) in db::list_root_dependencies(&state.db, root_id)
+        .await
+        .map_err(|e| RpcError::Internal(e.to_string()))?
+    {
+        runtime_deps.entry(task_id).or_default().push(depends_on);
+    }
+
     let root_task = tasks
         .iter()
         .find(|t| t.id == root_id)
@@ -854,14 +928,18 @@ async fn inspect_workflow(state: &State, root_id: Uuid) -> Result<WorkflowInspec
     let mut blocked = Vec::new();
 
     for task in &tasks {
-        let is_blocked = task.status == TaskStatus::Pending
-            && needs_of
-                .get(&task.name)
-                .map(|needs| {
-                    let (source, _) = needs_parts(needs);
-                    active.contains(source)
-                })
-                .unwrap_or(false);
+        let catalog_blocked = needs_of
+            .get(&task.name)
+            .map(|needs| {
+                let (source, _) = needs_parts(needs);
+                active.contains(source)
+            })
+            .unwrap_or(false);
+        let runtime_blocked = runtime_deps
+            .get(&task.id)
+            .map(|predecessors| predecessors.iter().any(|p| active_ids.contains(p)))
+            .unwrap_or(false);
+        let is_blocked = task.status == TaskStatus::Pending && (catalog_blocked || runtime_blocked);
 
         match task.status {
             TaskStatus::Pending if is_blocked => blocked.push(task.id),
@@ -891,6 +969,243 @@ async fn inspect_workflow(state: &State, root_id: Uuid) -> Result<WorkflowInspec
         failed,
         blocked,
     })
+}
+
+/// Validate a `workflow.create` request before any row is inserted: non-empty,
+/// unique, catalog-known names, in-request `depends_on` keys, and an acyclic
+/// graph.
+fn validate_create_dag(state: &State, tasks: &[WorkflowCreateTask]) -> Result<(), RpcError> {
+    if tasks.is_empty() {
+        return Err(RpcError::InvalidParams(
+            "workflow.create requires at least one task".to_string(),
+        ));
+    }
+
+    let catalog_names: HashSet<String> = {
+        let catalog = state.catalog.read();
+        catalog.iter().map(|d| d.name.clone()).collect()
+    };
+
+    let mut keys: HashSet<&str> = HashSet::new();
+    for spec in tasks {
+        if spec.key.trim().is_empty() {
+            return Err(RpcError::InvalidParams(
+                "workflow.create task keys must be non-empty".to_string(),
+            ));
+        }
+        if !keys.insert(spec.key.as_str()) {
+            return Err(RpcError::InvalidParams(format!(
+                "workflow.create duplicate task key '{}'",
+                spec.key
+            )));
+        }
+        if !catalog_names.contains(&spec.name) {
+            return Err(RpcError::InvalidParams(format!(
+                "unknown task '{}'",
+                spec.name
+            )));
+        }
+    }
+
+    // Every dependency must name a key in this request, and the graph must be a
+    // DAG. Kahn's algorithm: repeatedly drop nodes with no incoming edges.
+    let mut indegree: HashMap<&str, usize> = tasks.iter().map(|s| (s.key.as_str(), 0)).collect();
+    let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
+    for spec in tasks {
+        for dep in spec.depends_on.as_deref().unwrap_or_default() {
+            if !keys.contains(dep.as_str()) {
+                return Err(RpcError::InvalidParams(format!(
+                    "workflow.create task '{}' depends on unknown key '{dep}'",
+                    spec.key
+                )));
+            }
+            edges
+                .entry(dep.as_str())
+                .or_default()
+                .push(spec.key.as_str());
+            *indegree.get_mut(spec.key.as_str()).expect("key seeded") += 1;
+        }
+    }
+
+    let mut ready: Vec<&str> = indegree
+        .iter()
+        .filter(|(_, degree)| **degree == 0)
+        .map(|(key, _)| *key)
+        .collect();
+    let mut visited = 0usize;
+    while let Some(key) = ready.pop() {
+        visited += 1;
+        if let Some(successors) = edges.get(key) {
+            for successor in successors {
+                let degree = indegree.get_mut(successor).expect("key seeded");
+                *degree -= 1;
+                if *degree == 0 {
+                    ready.push(successor);
+                }
+            }
+        }
+    }
+    if visited != tasks.len() {
+        return Err(RpcError::InvalidParams(
+            "workflow.create task graph contains a cycle".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// `workflow.create`: build a validated, idempotent runtime DAG of catalog tasks
+/// with per-instance dependencies.
+async fn create_workflow(
+    state: &Arc<State>,
+    params: WorkflowCreateParams,
+) -> Result<WorkflowCreateResult, RpcError> {
+    let specs = params.tasks.unwrap_or_default();
+    validate_create_dag(state, &specs)?;
+
+    if let Some(root_id) = params.root_id {
+        if db::get_task(&state.db, root_id)
+            .await
+            .map_err(|e| RpcError::Internal(e.to_string()))?
+            .is_none()
+        {
+            return Err(RpcError::InvalidParams(format!(
+                "workflow root '{root_id}' not found"
+            )));
+        }
+    }
+
+    // Resolve every node's id up front so dependency rows can be written when
+    // each task is inserted. A re-submission finds the row by its per-node dedupe
+    // key and reuses the canonical id; everything else gets a fresh one.
+    let mut ids: HashMap<String, Uuid> = HashMap::new();
+    let mut existing: HashSet<Uuid> = HashSet::new();
+    for spec in &specs {
+        let dedupe_key = format!("workflow:{}:{}", params.idempotency_key, spec.key);
+        match db::get_task_by_dedupe_key(&state.db, &dedupe_key)
+            .await
+            .map_err(|e| RpcError::Internal(e.to_string()))?
+        {
+            Some(task) => {
+                existing.insert(task.id);
+                ids.insert(spec.key.clone(), task.id);
+            }
+            None => {
+                ids.insert(spec.key.clone(), Uuid::new_v4());
+            }
+        }
+    }
+
+    // The root is the caller's root, or the first task (which becomes its own
+    // root, matching `Task::root_or_self`).
+    let root_id = match params.root_id {
+        Some(root_id) => root_id,
+        None => *ids.get(&specs[0].key).expect("every key resolved"),
+    };
+
+    for spec in &specs {
+        let id = ids[&spec.key];
+        let depends_on: Vec<Uuid> = spec
+            .depends_on
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|key| ids[key])
+            .collect();
+        if existing.contains(&id) {
+            // Already inserted by an earlier submission; just make sure its
+            // dependency edges are present (idempotent).
+            let now = Utc::now();
+            for predecessor in &depends_on {
+                db::insert_dependency(&state.db, id, *predecessor, now)
+                    .await
+                    .map_err(|e| RpcError::Internal(e.to_string()))?;
+            }
+            continue;
+        }
+        let dedupe_key = format!("workflow:{}:{}", params.idempotency_key, spec.key);
+        let parent_id = if id == root_id { None } else { Some(root_id) };
+        crate::executor::enqueue_dynamic(
+            state,
+            crate::executor::DynamicNode {
+                id,
+                name: spec.name.clone(),
+                input: spec.input.clone().unwrap_or(serde_json::Value::Null),
+                dedupe_key: Some(dedupe_key),
+                root_id,
+                parent_id,
+                depends_on,
+            },
+        )
+        .await
+        .map_err(|e| RpcError::Internal(e.to_string()))?;
+    }
+
+    let tasks = specs
+        .iter()
+        .map(|spec| WorkflowNodeRef {
+            key: spec.key.clone(),
+            id: ids[&spec.key],
+            name: spec.name.clone(),
+        })
+        .collect();
+
+    Ok(WorkflowCreateResult { root_id, tasks })
+}
+
+/// `workflow.spawn`: add one runtime task to an existing root (or as its own
+/// root) with per-instance dependencies on existing task ids.
+async fn spawn_workflow(state: &Arc<State>, params: WorkflowSpawnParams) -> Result<Task, RpcError> {
+    let catalog_names: HashSet<String> = {
+        let catalog = state.catalog.read();
+        catalog.iter().map(|d| d.name.clone()).collect()
+    };
+    if !catalog_names.contains(&params.name) {
+        return Err(RpcError::InvalidParams(format!(
+            "unknown task '{}'",
+            params.name
+        )));
+    }
+
+    if let Some(root_id) = params.root_id {
+        if db::get_task(&state.db, root_id)
+            .await
+            .map_err(|e| RpcError::Internal(e.to_string()))?
+            .is_none()
+        {
+            return Err(RpcError::InvalidParams(format!(
+                "workflow root '{root_id}' not found"
+            )));
+        }
+    }
+
+    let depends_on = params.depends_on.unwrap_or_default();
+    for predecessor in &depends_on {
+        let task = db::get_task(&state.db, *predecessor)
+            .await
+            .map_err(|e| RpcError::Internal(e.to_string()))?
+            .ok_or_else(|| {
+                RpcError::InvalidParams(format!("dependency task '{predecessor}' not found"))
+            })?;
+        if let Some(root_id) = params.root_id {
+            if task.root_or_self() != root_id {
+                return Err(RpcError::InvalidParams(format!(
+                    "dependency task '{predecessor}' does not belong to root '{root_id}'"
+                )));
+            }
+        }
+    }
+
+    crate::executor::spawn_dynamic(
+        state,
+        params.name,
+        params.input.unwrap_or(serde_json::Value::Null),
+        params.root_id,
+        &depends_on,
+        params.dedupe_key,
+    )
+    .await
+    .map_err(|e| RpcError::Internal(e.to_string()))
 }
 
 /// Derive the root's overall state: still `running` while any task is
