@@ -26,6 +26,9 @@ use favetto_core::rpc::{self, error_code};
 
 use crate::cli::{Cli, DocArgs};
 use crate::config::FavettoConfig;
+use templates::*;
+
+mod templates;
 
 /// Resolve the docs directory: an explicit `--docs-dir`, else `<repo>/docs`.
 pub fn docs_dir(explicit: Option<&Path>) -> PathBuf {
@@ -175,8 +178,7 @@ fn render_object(out: &mut String, title: &str, node: &serde_json::Value) {
         .map(|values| values.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
 
-    let _ = writeln!(out, "| Field | Type | Default | Required | Description |");
-    let _ = writeln!(out, "|-------|------|---------|----------|-------------|");
+    out.push_str(FIELD_TABLE);
     for (name, property) in properties {
         let is_required = required.contains(&name.as_str());
         let default = property
@@ -198,18 +200,7 @@ fn render_object(out: &mut String, title: &str, node: &serde_json::Value) {
 /// optional `$defs`/`definitions`).
 pub fn render_config(schema: &serde_json::Value) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "# Configuration reference\n");
-    let _ = writeln!(
-        out,
-        "Generated from `crates/favetto/src/config.rs` by the docs generator. \
-         Do not edit by hand.\n"
-    );
-    let _ = writeln!(
-        out,
-        "Every section is optional; favetto falls back to built-in defaults for anything \
-         you omit. Values resolve in the order **CLI flag → config file → built-in default**, \
-         and every `FAVETTO__SECTION__KEY` environment variable overrides the file.\n"
-    );
+    out.push_str(CONFIG_INTRO);
 
     let root_title = schema
         .get("title")
@@ -239,8 +230,7 @@ fn render_args(out: &mut String, sub: &clap::Command) {
         return;
     }
 
-    let _ = writeln!(out, "| Flag | Value | Default | Description |");
-    let _ = writeln!(out, "|------|-------|---------|-------------|");
+    out.push_str(ARGS_TABLE);
     for arg in args {
         let long = arg.get_long().map(|l| format!("`--{l}`"));
         let short = arg.get_short().map(|s| format!("`-{s}`"));
@@ -305,18 +295,7 @@ fn render_command(out: &mut String, path: &str, cmd: &clap::Command) {
 /// Render the CLI reference from the clap command tree.
 pub fn render_cli(cmd: &clap::Command) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "# CLI reference\n");
-    let _ = writeln!(
-        out,
-        "Generated from `crates/favetto/src/cli.rs` by the docs generator. \
-         Do not edit by hand.\n"
-    );
-    let _ = writeln!(
-        out,
-        "`favetto` is a single binary: `daemon` runs the scheduler, task queue, persistence \
-         and remote API; `tui` attaches a client. Run `favetto <command> --help` for the same \
-         information at the terminal.\n"
-    );
+    out.push_str(CLI_INTRO);
     for sub in cmd.get_subcommands() {
         if sub.is_hide_set() {
             continue;
@@ -333,20 +312,8 @@ pub fn render_cli(cmd: &clap::Command) -> String {
 /// Render the event-kind reference.
 pub fn render_events() -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "# Event kinds\n");
-    let _ = writeln!(
-        out,
-        "Generated from `crates/favetto-core/src/model.rs` by the docs generator. \
-         Do not edit by hand.\n"
-    );
-    let _ = writeln!(
-        out,
-        "Every event persisted on the bus is one of the kinds below. The **Event** column \
-         is the stable `snake_case` wire and storage form; `from_name` also accepts the \
-         spec's `PascalCase` spelling.\n"
-    );
-    let _ = writeln!(out, "| Event | Description |");
-    let _ = writeln!(out, "|-------|-------------|");
+    out.push_str(EVENTS_INTRO);
+    out.push_str(EVENTS_TABLE);
     for kind in EventKind::ALL {
         let _ = writeln!(
             out,
@@ -362,68 +329,24 @@ pub fn render_events() -> String {
 /// Render the remote API reference (methods, pushes, errors, HTTP endpoints).
 pub fn render_remote_api() -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "# Remote API\n");
-    let _ = writeln!(
-        out,
-        "Generated from `crates/favetto-core/src/rpc.rs` by the docs generator. \
-         Do not edit by hand.\n"
-    );
-    let _ = writeln!(
-        out,
-        "The daemon exposes one wire protocol over two transports:\n"
-    );
-    let _ = writeln!(
-        out,
-        "- **Unix socket** `/tmp/favetto.sock` (local, trusted)."
-    );
-    let _ = writeln!(
-        out,
-        "- **WebSocket** `ws://127.0.0.1:7878/rpc` (bearer token required).\n"
-    );
-    let _ = writeln!(
-        out,
-        "Both carry the same MessagePack-encoded frames. A frame is a tagged envelope with \
-         one of three shapes:\n"
-    );
-    let _ = writeln!(out, "```rust");
-    let _ = writeln!(out, "enum Frame {{");
-    let _ = writeln!(out, "    Request(Request),           // client → server");
-    let _ = writeln!(
-        out,
-        "    Response(Response),         // server → client reply"
-    );
-    let _ = writeln!(
-        out,
-        "    Notification(Notification), // unsolicited server push"
-    );
-    let _ = writeln!(out, "}}");
-    let _ = writeln!(out, "```\n");
-    let _ = writeln!(
-        out,
-        "A `Request` carries `id`, `method`, and `params`; the matching `Response` carries \
-         the same `id` plus either `result` or a structured `error` (`code`, `message`, \
-         optional `data`).\n"
-    );
+    out.push_str(REMOTE_API_INTRO);
 
-    let _ = writeln!(out, "## Client → server methods\n");
-    let _ = writeln!(out, "| Method | Purpose |");
-    let _ = writeln!(out, "|--------|---------|");
+    out.push_str(CLIENT_METHODS_HEADING);
+    out.push_str(METHOD_TABLE);
     for (name, purpose) in rpc::CLIENT_METHODS {
         let _ = writeln!(out, "| `{name}` | {} |", cell(purpose));
     }
     let _ = writeln!(out);
 
-    let _ = writeln!(out, "## Server → client pushes\n");
-    let _ = writeln!(out, "| Method | Purpose |");
-    let _ = writeln!(out, "|--------|---------|");
+    out.push_str(SERVER_PUSHES_HEADING);
+    out.push_str(METHOD_TABLE);
     for (name, purpose) in rpc::SERVER_PUSHES {
         let _ = writeln!(out, "| `{name}` | {} |", cell(purpose));
     }
     let _ = writeln!(out);
 
-    let _ = writeln!(out, "## Error codes\n");
-    let _ = writeln!(out, "| Code | Meaning |");
-    let _ = writeln!(out, "|------|---------|");
+    out.push_str(ERROR_CODES_HEADING);
+    out.push_str(ERROR_TABLE);
     for (code, meaning) in [
         (error_code::PARSE, "Invalid JSON / MessagePack frame."),
         (error_code::INVALID_REQUEST, "Not a valid request object."),
@@ -439,45 +362,22 @@ pub fn render_remote_api() -> String {
     }
     let _ = writeln!(out);
 
-    let _ = writeln!(out, "## Example\n");
-    let _ = writeln!(
-        out,
-        "A request is a single MessagePack map; in JSON it looks like:\n"
-    );
-    let _ = writeln!(out, "```json");
-    let _ = writeln!(
-        out,
-        r#"{{"type":"request","id":1,"method":"tasks.start","params":{{"name":"hello"}}}}"#
-    );
-    let _ = writeln!(out, "```\n");
-    let _ = writeln!(out, "and the reply:\n");
-    let _ = writeln!(out, "```json");
-    let _ = writeln!(
-        out,
-        r#"{{"type":"response","id":1,"result":{{"task_id":"…","status":"idle"}}}}"#
-    );
-    let _ = writeln!(out, "```\n");
-    let _ = writeln!(
-        out,
-        "Subscribing with `events.subscribe` and `last_event_id` replays persisted events \
-         before switching to live delivery, so a TUI that reconnects never misses a task \
-         result.\n"
-    );
+    out.push_str(EXAMPLE_HEADING);
+    out.push_str(EXAMPLE_INTRO);
+    out.push_str(JSON_FENCE_OPEN);
+    let _ = writeln!(out, "{EXAMPLE_REQUEST}");
+    out.push_str(CODE_FENCE_CLOSE);
+    out.push_str(EXAMPLE_REPLY_INTRO);
+    out.push_str(JSON_FENCE_OPEN);
+    let _ = writeln!(out, "{EXAMPLE_REPLY}");
+    out.push_str(CODE_FENCE_CLOSE);
+    out.push_str(EXAMPLE_OUTRO);
 
-    let _ = writeln!(out, "## HTTP endpoints\n");
-    let _ = writeln!(
-        out,
-        "The daemon also serves HTTP endpoints alongside the RPC transports:\n"
-    );
-    let _ = writeln!(out, "- `GET /metrics` — Prometheus metrics.");
-    let _ = writeln!(
-        out,
-        "- `POST /pair/generate` and `POST /pair/exchange` — pairing."
-    );
-    let _ = writeln!(
-        out,
-        "- `POST /webhooks/github` — GitHub webhook receiver (see [Webhooks & hooks](../guide/webhooks))."
-    );
+    out.push_str(HTTP_ENDPOINTS_HEADING);
+    out.push_str(HTTP_ENDPOINTS_INTRO);
+    out.push_str(HTTP_ENDPOINT_METRICS);
+    out.push_str(HTTP_ENDPOINT_PAIR);
+    out.push_str(HTTP_ENDPOINT_WEBHOOKS);
     let _ = writeln!(out);
     out
 }
@@ -624,6 +524,18 @@ mod tests {
         for (name, _) in rpc::SERVER_PUSHES {
             assert!(rendered.contains(name), "remote API is missing {name}");
         }
+    }
+
+    #[test]
+    fn renderers_emit_their_static_scaffolding() {
+        assert!(render_config(&handbuilt_schema()).contains(CONFIG_INTRO));
+        assert!(render_cli(&Cli::command()).contains(CLI_INTRO));
+        assert!(render_events().contains(EVENTS_TABLE));
+        let remote = render_remote_api();
+        assert!(remote.contains(CLIENT_METHODS_HEADING));
+        assert!(remote.contains(SERVER_PUSHES_HEADING));
+        assert!(remote.contains(ERROR_CODES_HEADING));
+        assert!(remote.contains(HTTP_ENDPOINTS_HEADING));
     }
 
     #[test]
