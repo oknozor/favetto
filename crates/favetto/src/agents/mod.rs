@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -28,6 +29,7 @@ use favetto_core::model::{
     AgentActivity, AgentSessionInfo, AgentStateEvent, AwaitingInputReason, InputReply,
 };
 
+use crate::agent_hooks::{AgentHookLaunch, HookRouteError, HookRouter, HookRuntime};
 use crate::config::{FavettoConfig, GitSettings};
 
 use agent::{check_arg_sizes, extract_session_id_from_line};
@@ -87,6 +89,21 @@ fn terminate(pid: Option<u32>) {
     }
     #[cfg(not(unix))]
     let _ = pid;
+}
+
+/// Build the loopback hook base URL for a daemon listen address. An unspecified
+/// host resolves to `127.0.0.1`; an IPv6 host is bracketed.
+fn hook_base_url(addr: SocketAddr) -> String {
+    let ip = if addr.ip().is_unspecified() {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    } else {
+        addr.ip()
+    };
+    let host = match ip {
+        IpAddr::V6(v6) => format!("[{v6}]"),
+        IpAddr::V4(v4) => v4.to_string(),
+    };
+    format!("http://{host}:{}/agent-hooks/claude", addr.port())
 }
 
 /// A full-screen terminal frame, a child exit, or a folded live-state snapshot,
@@ -206,6 +223,8 @@ pub struct AgentManager {
     tx: broadcast::Sender<AgentEvent>,
     next_order: AtomicU64,
     git: GitRuntime,
+    /// The daemon's per-launch HTTP hook receiver, once configured.
+    hooks: Option<HookRuntime>,
 }
 
 impl Default for AgentManager {
@@ -234,6 +253,46 @@ impl AgentManager {
             tx,
             next_order: AtomicU64::new(0),
             git: GitRuntime::default(),
+            hooks: None,
+        }
+    }
+
+    /// Resolve the daemon's per-launch hook receiver from the HTTP listen
+    /// address.
+    ///
+    /// Claude sessions get an ephemeral `--settings` file pointing at
+    /// `http://<loopback>:<port>/agent-hooks/claude/<token>`; the router behind
+    /// it routes each payload to the session that registered the token. An
+    /// unspecified host (`0.0.0.0`, `::`) resolves to loopback. A malformed
+    /// `listen` leaves hooks disabled (sessions keep the screen heuristic).
+    pub fn configure_hooks(&mut self, listen: &str, data_dir: PathBuf) {
+        let Ok(addr) = listen.parse::<SocketAddr>() else {
+            tracing::warn!(
+                listen,
+                "cannot parse daemon listen address; agent hooks disabled"
+            );
+            self.hooks = None;
+            return;
+        };
+        self.hooks = Some(HookRuntime {
+            router: Arc::new(HookRouter::new()),
+            launch: AgentHookLaunch {
+                endpoint: hook_base_url(addr),
+                dir: data_dir.join("agent-hooks"),
+            },
+        });
+    }
+
+    /// The hook router, when hooks are configured (the axum handler's target).
+    pub fn hook_router(&self) -> Option<Arc<HookRouter>> {
+        self.hooks.as_ref().map(|hooks| hooks.router.clone())
+    }
+
+    /// Route one raw hook delivery to its session's state channel.
+    pub fn route_hook(&self, token: &str, body: &[u8]) -> Result<usize, HookRouteError> {
+        match self.hook_router() {
+            Some(router) => router.route(token, body),
+            None => Err(HookRouteError::Disabled),
         }
     }
 
@@ -324,7 +383,18 @@ impl AgentManager {
             }
         }
 
-        let spec = agent.command(&invocation, &ctx)?;
+        let mut spec = agent.command(&invocation, &ctx)?;
+        // Register per-launch hooks before the args are frozen: claude gets an
+        // ephemeral `--settings` file plus endpoint env vars, and the state
+        // source below recovers the token from `spec.env`.
+        if let Some(hooks) = &self.hooks {
+            if let Some(injection) = agent.hook_injection(&hooks.launch) {
+                spec.args.splice(0..0, injection.args);
+                for (key, value) in injection.env {
+                    spec.env.insert(key, value);
+                }
+            }
+        }
         check_arg_sizes(&spec.program, &spec.args)?;
         let headless = matches!(&invocation, Invocation::Headless { .. });
 
@@ -438,6 +508,7 @@ impl AgentManager {
             args: spec.args.clone(),
             env: spec.env.clone(),
             cwd: spec.cwd.clone(),
+            hook_router: self.hooks.as_ref().map(|hooks| hooks.router.clone()),
         };
         let state_ctx = StateContext {
             favetto_session: id.clone(),
@@ -993,6 +1064,17 @@ fn spawn_state_task(
                 }
                 AgentStateEvent::InputResolved { .. } | AgentStateEvent::Idle { .. } => {
                     *session.awaiting_input.lock() = None;
+                }
+                AgentStateEvent::Session {
+                    session_id: Some(session_id),
+                    ..
+                } if !session_id.is_empty() => {
+                    // Hook/stream identity can arrive after a seeded id; only
+                    // fill an empty slot so a probe/source never masks the real id.
+                    let mut slot = session.external_session_id.lock();
+                    if slot.is_none() {
+                        *slot = Some(session_id.clone());
+                    }
                 }
                 _ => {}
             }
@@ -1699,5 +1781,134 @@ mod tests {
 
         mgr.close(&info.id).unwrap();
         mgr.close(&plain.id).unwrap();
+    }
+
+    #[test]
+    fn hook_base_url_uses_loopback_for_unspecified_hosts() {
+        assert_eq!(
+            hook_base_url("127.0.0.1:7878".parse().unwrap()),
+            "http://127.0.0.1:7878/agent-hooks/claude"
+        );
+        assert_eq!(
+            hook_base_url("0.0.0.0:9000".parse().unwrap()),
+            "http://127.0.0.1:9000/agent-hooks/claude"
+        );
+        assert_eq!(
+            hook_base_url("[::1]:9000".parse().unwrap()),
+            "http://[::1]:9000/agent-hooks/claude"
+        );
+    }
+
+    #[test]
+    fn configure_hooks_enables_a_router_and_route_hook() {
+        let mut mgr = AgentManager::new();
+        assert!(mgr.hook_router().is_none());
+        assert_eq!(mgr.route_hook("tok", b"{}"), Err(HookRouteError::Disabled));
+
+        let dir = std::env::temp_dir().join(format!("favetto-hooks-{}", uuid::Uuid::new_v4()));
+        mgr.configure_hooks("0.0.0.0:7878", dir.clone());
+        let router = mgr.hook_router().expect("router configured");
+        assert!(Arc::ptr_eq(&router, &mgr.hooks.as_ref().unwrap().router));
+        // The route is live but no session has registered the token yet.
+        assert_eq!(
+            mgr.route_hook("tok", b"{}"),
+            Err(HookRouteError::UnknownToken)
+        );
+        assert!(matches!(
+            mgr.route_hook("tok", b"not json"),
+            Err(HookRouteError::BadRequest(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_listen_disables_hooks() {
+        let mut mgr = AgentManager::new();
+        mgr.configure_hooks("not-an-address", std::env::temp_dir());
+        assert!(mgr.hook_router().is_none());
+    }
+
+    /// A probe adapter records whether the `StateSourceConfig` it receives knows
+    /// about the hook router, so the manager wiring is asserted directly.
+    struct CfgProbeAgent {
+        descriptor: AgentDescriptor,
+        seen_hook_router: Arc<parking_lot::Mutex<Option<bool>>>,
+    }
+
+    impl Agent for CfgProbeAgent {
+        fn descriptor(&self) -> &AgentDescriptor {
+            &self.descriptor
+        }
+
+        fn command(&self, _: &Invocation<'_>, _: &AgentContext) -> anyhow::Result<CommandSpec> {
+            Ok(CommandSpec {
+                program: PathBuf::from("sh"),
+                args: vec!["-c".to_string(), "sleep 1".to_string()],
+                env: Default::default(),
+                cwd: None,
+                stdin_prompt: None,
+                stdin_eof: false,
+                submit: SubmitStrategy::None,
+            })
+        }
+
+        fn state_source(
+            &self,
+            cfg: &StateSourceConfig,
+        ) -> Option<Box<dyn crate::agents::state::StateSource>> {
+            *self.seen_hook_router.lock() = Some(cfg.hook_router.is_some());
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn state_source_config_sees_hooks_only_after_configure() {
+        let seen = Arc::new(parking_lot::Mutex::new(None));
+        let descriptor = AgentDescriptor {
+            id: "probe".to_string(),
+            name: "Probe".to_string(),
+            command: "sh".to_string(),
+            available: true,
+            capabilities: Default::default(),
+        };
+        let agent: Arc<dyn Agent> = Arc::new(CfgProbeAgent {
+            descriptor,
+            seen_hook_router: seen.clone(),
+        });
+
+        let mgr = AgentManager::new();
+        let info = mgr
+            .start(
+                "probe",
+                agent.clone(),
+                None,
+                Invocation::Interactive {
+                    prompt: None,
+                    provider: None,
+                    model: None,
+                },
+                context(None, 24, 80),
+            )
+            .unwrap();
+        assert_eq!(*seen.lock(), Some(false));
+        mgr.close(&info.id).unwrap();
+
+        let mut mgr = AgentManager::new();
+        mgr.configure_hooks("127.0.0.1:7878", std::env::temp_dir());
+        let info = mgr
+            .start(
+                "probe",
+                agent,
+                None,
+                Invocation::Interactive {
+                    prompt: None,
+                    provider: None,
+                    model: None,
+                },
+                context(None, 24, 80),
+            )
+            .unwrap();
+        assert_eq!(*seen.lock(), Some(true));
+        mgr.close(&info.id).unwrap();
     }
 }

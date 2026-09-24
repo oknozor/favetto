@@ -56,9 +56,10 @@ default = "opencode"
 # command = "claude"
 # args = []
 # prompt_args = ["{prompt}"]
-# headless_args = ["-p", "{prompt}"]
-# run_args = ["-p", "--model", "{model}", "{prompt}"]
+# headless_args = ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "{prompt}"]
+# run_args = ["-p", "--model", "{model}", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "{prompt}"]
 # interactive_model_args = ["--model", "{model}"]
+# session_id_json_key = "session_id"
 #
 # [agents.pi]
 # command = "pi"
