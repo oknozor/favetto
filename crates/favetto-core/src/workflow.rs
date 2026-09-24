@@ -14,7 +14,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
+use crate::model::TaskStatus;
 use crate::tasks::{needs_parts, NeedsKind, TaskDef};
 
 /// Escape a name/label for inclusion in a quoted DOT id or label.
@@ -59,6 +61,53 @@ pub struct WorkflowEdge {
 pub struct WorkflowGraph {
     pub nodes: Vec<WorkflowNode>,
     pub edges: Vec<WorkflowEdge>,
+}
+
+/// One task instance in the runtime workflow view (`workflow.inspect`).
+///
+/// Deliberately excludes `output` and every other blob: per-task detail stays
+/// behind `tasks.get`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowTaskView {
+    pub id: Uuid,
+    pub name: String,
+    pub status: TaskStatus,
+    /// Run attempt. Always `1` until task runs land (#147 advances it).
+    #[serde(default = "default_attempt")]
+    pub attempt: u32,
+    /// Bounded outcome text: `Task::error` for failures/cancellations, `None`
+    /// for successes until the result envelope (#144) provides one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+fn default_attempt() -> u32 {
+    1
+}
+
+/// Overall state of a workflow root in the runtime view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowState {
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+/// The runtime graph returned by `workflow.inspect`: the root's task instances
+/// plus id buckets. `ready`/`blocked` are the `Pending` split by whether a
+/// `needs` predecessor is still active.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowInspect {
+    pub root_id: Uuid,
+    pub root_task: String,
+    pub state: WorkflowState,
+    pub tasks: Vec<WorkflowTaskView>,
+    pub ready: Vec<Uuid>,
+    pub running: Vec<Uuid>,
+    pub failed: Vec<Uuid>,
+    pub blocked: Vec<Uuid>,
 }
 
 /// Build the catalog's `needs`/`spawn` graph as structured data.
@@ -482,5 +531,47 @@ mod tests {
         });
         assert!(!leftovers);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inspect_view_round_trips_with_snake_case_and_omitted_summary() {
+        let root_id = Uuid::new_v4();
+        let running_id = Uuid::new_v4();
+        let view = WorkflowInspect {
+            root_id,
+            root_task: "root".to_string(),
+            state: WorkflowState::Running,
+            tasks: vec![
+                WorkflowTaskView {
+                    id: running_id,
+                    name: "child".to_string(),
+                    status: TaskStatus::AwaitingInput,
+                    attempt: 1,
+                    summary: None,
+                },
+                WorkflowTaskView {
+                    id: Uuid::new_v4(),
+                    name: "child".to_string(),
+                    status: TaskStatus::Failed,
+                    attempt: 1,
+                    summary: Some("boom".to_string()),
+                },
+            ],
+            ready: vec![],
+            running: vec![running_id],
+            failed: vec![],
+            blocked: vec![],
+        };
+
+        let value = serde_json::to_value(&view).unwrap();
+        assert_eq!(value["state"], "running");
+        assert_eq!(value["tasks"][0]["status"], "awaiting_input");
+        assert_eq!(value["tasks"][0]["attempt"], 1);
+        // A missing summary is omitted, not serialized as null.
+        assert!(value["tasks"][0].get("summary").is_none());
+        assert_eq!(value["tasks"][1]["summary"], "boom");
+
+        let decoded: WorkflowInspect = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, view);
     }
 }

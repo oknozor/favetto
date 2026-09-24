@@ -553,6 +553,21 @@ pub async fn list_active_tasks_in_root(
     Ok(rows.iter().map(row_to_task).collect())
 }
 
+/// Every task belonging to workflow root `root_id` (the root row itself is
+/// included via `id = root_id`), oldest first, **without** output blobs.
+/// Runtime view for `workflow.inspect`.
+pub async fn list_root_tasks(pool: &SqlitePool, root_id: Uuid) -> anyhow::Result<Vec<Task>> {
+    let rows = sqlx::query(
+        "SELECT id, name, status, input, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title, parent_id, root_id, interactive \
+         FROM tasks WHERE root_id = ? OR id = ? ORDER BY created_at ASC",
+    )
+    .bind(root_id.to_string())
+    .bind(root_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(row_to_task).collect())
+}
+
 /// Set a task's status only when it currently has `from`. Targeted, so it can
 /// never overwrite `session_id`, `session_title`, `output`, or terminal fields
 /// written concurrently. Returns whether a row changed.

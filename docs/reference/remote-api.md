@@ -34,6 +34,7 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | `catalog.add` | Add a task definition to the catalog (does not run it). |
 | `catalog.update` | Replace an existing catalog task's raw Markdown source (does not run it). |
 | `workflow.get` | Fetch the catalog workflow graph as Graphviz DOT plus a structured graph. |
+| `workflow.inspect` | Fetch the runtime workflow graph for a root (task instances plus ready/running/failed/blocked buckets). |
 | `events.tail` | Tail persisted events. |
 | `events.subscribe` | (Re)subscribe to the live event stream; accepts `last_event_id` to replay missed events before switching to live delivery. |
 | `agents.list` | List configured external agents and live agent sessions, including each agent's `available` flag and capability flags. |

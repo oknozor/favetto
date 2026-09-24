@@ -97,6 +97,145 @@ async fn workflow_get_returns_dot_and_path() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Decode a `workflow.inspect` id bucket into `Uuid`s.
+fn id_list(result: &serde_json::Value, field: &str) -> Vec<Uuid> {
+    result[field]
+        .as_array()
+        .unwrap_or_else(|| panic!("{field} must be an array"))
+        .iter()
+        .map(|v| Uuid::parse_str(v.as_str().expect("uuid string")).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn workflow_inspect_buckets_a_spawn_all_finished_root() {
+    let dir = temp_dir("workflow-inspect");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    std::fs::write(tasks_dir.join("root.md"), "agent = \"x\"\n---\nroot\n").unwrap();
+    std::fs::write(tasks_dir.join("child.md"), "agent = \"x\"\n---\nchild\n").unwrap();
+    std::fs::write(
+        tasks_dir.join("join.md"),
+        "agent = \"x\"\nneeds = \"child:all_finished\"\n---\njoin\n",
+    )
+    .unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+
+    let root = Uuid::new_v4();
+    let mut root_task = oneshot_task();
+    root_task.id = root;
+    root_task.name = "root".to_string();
+    root_task.root_id = None;
+
+    let mut child_fail = oneshot_task();
+    child_fail.name = "child".to_string();
+    child_fail.status = TaskStatus::Failed;
+    child_fail.finished_at = Some(Utc::now());
+    child_fail.error = Some("boom".to_string());
+    child_fail.root_id = Some(root);
+    child_fail.parent_id = Some(root);
+
+    let mut child_open = oneshot_task();
+    child_open.name = "child".to_string();
+    child_open.root_id = Some(root);
+    child_open.parent_id = Some(root);
+
+    let mut join = oneshot_task();
+    join.name = "join".to_string();
+    join.status = TaskStatus::Pending;
+    join.started_at = None;
+    join.root_id = Some(root);
+    join.parent_id = Some(root);
+
+    for task in [&root_task, &child_fail, &child_open, &join] {
+        db::upsert_task(&state.db, task).await.unwrap();
+    }
+
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 1,
+            method: method::WORKFLOW_INSPECT.to_string(),
+            params: serde_json::json!({ "root_id": root }),
+        },
+    )
+    .await;
+    let result = resp.result.expect("workflow.inspect result");
+
+    assert_eq!(result["root_task"], "root");
+    assert_eq!(result["state"], "running");
+    let tasks = result["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks.len(), 4);
+    assert!(
+        tasks.iter().all(|t| t.get("output").is_none()),
+        "runtime view must not carry output blobs: {tasks:?}"
+    );
+    let mut running = id_list(&result, "running");
+    running.sort();
+    let mut expected_running = vec![root, child_open.id];
+    expected_running.sort();
+    assert_eq!(running, expected_running);
+    assert_eq!(id_list(&result, "failed"), vec![child_fail.id]);
+    assert_eq!(id_list(&result, "blocked"), vec![join.id]);
+    assert!(id_list(&result, "ready").is_empty());
+
+    // The failed task surfaces its error as the bounded summary.
+    let failed_view = tasks
+        .iter()
+        .find(|t| t["id"] == child_fail.id.to_string())
+        .expect("failed child view");
+    assert_eq!(failed_view["summary"], "boom");
+    assert_eq!(failed_view["attempt"], 1);
+
+    // Once the last active child finishes, the all_finished barrier unblocks.
+    let mut child_done = child_open.clone();
+    child_done.status = TaskStatus::Succeeded;
+    child_done.finished_at = Some(Utc::now());
+    db::upsert_task(&state.db, &child_done).await.unwrap();
+
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 2,
+            method: method::WORKFLOW_INSPECT.to_string(),
+            params: serde_json::json!({ "root_id": root }),
+        },
+    )
+    .await;
+    let result = resp.result.expect("second workflow.inspect result");
+    assert!(id_list(&result, "blocked").is_empty());
+    assert_eq!(id_list(&result, "ready"), vec![join.id]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn workflow_inspect_unknown_root_is_invalid_params() {
+    let dir = temp_dir("workflow-inspect-missing");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 1,
+            method: method::WORKFLOW_INSPECT.to_string(),
+            params: serde_json::json!({ "root_id": Uuid::new_v4() }),
+        },
+    )
+    .await;
+    assert!(resp.result.is_none());
+    let error = resp.error.expect("unknown root must error");
+    assert_eq!(error.code, error_code::INVALID_PARAMS);
+    assert!(
+        error.message.contains("workflow root not found"),
+        "{error:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn add_catalog_task_writes_dot_and_pushes_catalog_updated() {
     let dir = temp_dir("add");

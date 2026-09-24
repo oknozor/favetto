@@ -530,6 +530,51 @@ async fn list_tasks_in_root_scopes_by_root_and_name() {
 }
 
 #[tokio::test]
+async fn list_root_tasks_includes_root_and_descendants_without_output() {
+    let (dir, pool) = scratch_pool("root-tasks").await;
+    let root = Uuid::new_v4();
+    let other_root = Uuid::new_v4();
+
+    // The root task carries no `root_id` of its own; it is included via `id = ?`.
+    let mut root_task = task_at(Utc::now(), None, Some(serde_json::json!({ "big": "x" })));
+    root_task.id = root;
+    root_task.name = "root".to_string();
+    root_task.status = TaskStatus::Running;
+
+    let mut child = task_at(Utc::now(), None, Some(serde_json::json!({ "child": true })));
+    child.name = "child".to_string();
+    child.root_id = Some(root);
+    child.parent_id = Some(root);
+
+    let mut other = task_at(Utc::now(), None, None);
+    other.name = "elsewhere".to_string();
+    other.root_id = Some(other_root);
+
+    for task in [&root_task, &child, &other] {
+        upsert_task(&pool, task).await.unwrap();
+    }
+
+    let got = list_root_tasks(&pool, root).await.unwrap();
+    assert_eq!(got.len(), 2, "root + child only");
+    assert!(
+        got.iter().any(|t| t.id == root),
+        "the root row is included via `id = ?`"
+    );
+    assert!(got.iter().any(|t| t.id == child.id));
+    assert!(
+        got.iter().all(|t| t.id != other.id),
+        "an unrelated root must not leak in"
+    );
+    // The SELECT drops the blob even though the column is populated.
+    assert!(
+        got.iter().all(|t| t.output.is_none()),
+        "list_root_tasks must not carry output blobs"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn set_task_session_never_touches_status() {
     let (dir, pool) = scratch_pool("set-session").await;
     let mut task = task_at(Utc::now(), None, None);
