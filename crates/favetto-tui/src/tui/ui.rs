@@ -688,10 +688,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
     ),
     (
         "Lists (Tasks, Catalog, Events, Scheduler, Notifications)",
-        &[
-            ("↑ / ↓", "move selection"),
-            ("PageUp / PageDown", "move/scroll by a page"),
-        ],
+        &[("↑ / ↓", "move selection")],
     ),
     (
         "Tasks tab",
@@ -706,6 +703,10 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("p", "show/hide the preview pane"),
             ("PageUp / PageDown / wheel", "scroll the preview pane"),
         ],
+    ),
+    (
+        "Events tab",
+        &[("PageUp / PageDown", "move the selection by a page")],
     ),
     (
         "Agent tab",
@@ -729,14 +730,16 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("← / →", "move the caret by character"),
             ("Alt+← / Alt+→ (or Ctrl+←/→)", "move by word"),
             ("Home / End (or Ctrl+A / Ctrl+E)", "start / end of line"),
-            (
-                "↑ / ↓",
-                "move line in multiline values, else previous/next field",
-            ),
             ("Backspace / Delete", "delete before / at the caret"),
             ("Alt+Backspace / Ctrl+W", "delete the word before"),
             ("Ctrl+U / Ctrl+K", "delete to line start / end"),
-            ("Shift+Enter / Alt+Enter", "newline in multiline values"),
+        ],
+    ),
+    (
+        "Task input (multiline vars)",
+        &[
+            ("↑ / ↓", "move the caret between lines"),
+            ("Shift+Enter / Alt+Enter", "insert a newline"),
             ("Ctrl+Enter", "submit the form"),
         ],
     ),

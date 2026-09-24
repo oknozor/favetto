@@ -1483,6 +1483,70 @@ fn clicking_events_row_selects_newest_first() {
 }
 
 #[test]
+fn page_keys_move_events_selection_only() {
+    use favetto_core::model::{NotificationRecord, Schedule};
+
+    let mut app = App::new();
+
+    // Events: PageDown/PageUp move the selection by ten, clamped to the list.
+    app.tab = Tab::Events;
+    for id in 1..=25 {
+        app.ingest_event(Event {
+            id,
+            kind: EventKind::Unknown,
+            payload: serde_json::json!({}),
+            created_at: Utc::now(),
+        });
+    }
+    app.handle_key(key(KeyCode::PageDown, KeyModifiers::empty()));
+    assert_eq!(app.events_selected, 10);
+    app.handle_key(key(KeyCode::PageUp, KeyModifiers::empty()));
+    assert_eq!(app.events_selected, 0);
+
+    // The other lists ignore page keys; only ↑/↓ move their selection.
+    app.tasks = (0..25).map(|i| task(&format!("t{i}"))).collect();
+    app.schedules = vec![Schedule {
+        id: "s1".to_string(),
+        cron: "* * * * *".to_string(),
+        task: "t".to_string(),
+        input: serde_json::json!({}),
+        enabled: true,
+        last_run: None,
+    }];
+    app.notifications = vec![NotificationRecord {
+        id: 1,
+        channel: "cli".to_string(),
+        subject: "s".to_string(),
+        body: "b".to_string(),
+        status: "ok".to_string(),
+        sent_at: Utc::now(),
+    }];
+
+    for tab in [Tab::Tasks, Tab::Scheduler, Tab::Notifications] {
+        app.tab = tab;
+        let selected = |app: &App| match tab {
+            Tab::Tasks => app.tasks_selected,
+            Tab::Scheduler => app.schedules_selected,
+            Tab::Notifications => app.notifications_selected,
+            _ => unreachable!(),
+        };
+        let before = selected(&app);
+        app.handle_key(key(KeyCode::PageDown, KeyModifiers::empty()));
+        app.handle_key(key(KeyCode::PageUp, KeyModifiers::empty()));
+        assert_eq!(selected(&app), before, "{tab:?} must ignore page keys");
+    }
+
+    // Catalog page keys scroll the preview, not the tree selection.
+    app.tab = Tab::Catalog;
+    app.catalog = (0..25).map(|i| catalog_entry(&format!("t{i}"))).collect();
+    app.catalog_selected = 5;
+    app.catalog_preview_max_scroll = 100;
+    app.handle_key(key(KeyCode::PageDown, KeyModifiers::empty()));
+    assert_eq!(app.catalog_selected, 5);
+    assert_eq!(app.catalog_preview_scroll, 10);
+}
+
+#[test]
 fn clicking_scheduler_and_notifications_rows_selects_only() {
     let mut app = App::new();
     app.schedules = vec![Schedule {

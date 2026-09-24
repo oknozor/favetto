@@ -44,13 +44,13 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 | Global | `M` | mute/unmute sound |
 | Global | `q` / `Esc` | quit |
 | Lists | `↑` / `↓` | move selection |
-| Lists | `PageUp` / `PageDown` | move or scroll by a page |
 | Tasks | `Enter` | open the selected task's agent session |
 | Catalog | `Enter` | start the task; on a folder, fold/unfold |
 | Catalog | `e` | edit the selected task in `$VISUAL`/`$EDITOR` |
 | Catalog | `Space` | fold/unfold the selected folder |
 | Catalog | `p` | show/hide the preview pane |
 | Catalog | `PageUp` / `PageDown` / wheel | scroll the preview pane |
+| Events | `PageUp` / `PageDown` | move the selection by a page |
 | Agent | `Ctrl+Y` | toggle focus: agent ↔ favetto |
 | Agent | *(agent focus)* | every key is forwarded to the agent |
 | Agent | *(favetto focus)* `Ctrl+O` | switch to another session |
@@ -63,12 +63,12 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 | Text fields | `←` / `→` | move the caret |
 | Text fields | `Alt+←` / `Alt+→` (or `Ctrl+←`/`Ctrl+→`) | move by word |
 | Text fields | `Home` / `End` (or `Ctrl+A` / `Ctrl+E`) | start / end of line |
-| Text fields | `↑` / `↓` | move the caret between lines in multiline values; otherwise previous/next field |
 | Text fields | `Backspace` / `Delete` | delete before / at the caret |
 | Text fields | `Alt+Backspace` / `Ctrl+W` | delete the word before the caret |
 | Text fields | `Ctrl+U` / `Ctrl+K` | delete to the start / end of the line |
-| Text fields | `Shift+Enter` / `Alt+Enter` | insert a newline in multiline values |
-| Text fields | `Ctrl+Enter` | submit the form |
+| Task input | `↑` / `↓` | move the caret between lines in multiline values |
+| Task input | `Shift+Enter` / `Alt+Enter` | insert a newline in multiline values |
+| Task input | `Ctrl+Enter` | submit the form |
 | Workflow (`w`) | `↑` / `↓` / `PageUp` / `PageDown` | scroll the graph source |
 | Workflow (`w`) | `Esc` / `w` | close |
 | Mouse | click the tab bar | switch tabs |
