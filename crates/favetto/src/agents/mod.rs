@@ -862,6 +862,24 @@ impl AgentManager {
         Ok(())
     }
 
+    /// Terminate every live session attached to `task_id` and drop it from the
+    /// registry. Used when a task is cancelled so its in-flight agent process is
+    /// stopped immediately instead of outliving the cancellation.
+    pub fn close_by_task(&self, task_id: &str) {
+        let ids: Vec<String> = self
+            .sessions
+            .lock()
+            .values()
+            .filter(|session| session.task_id.as_deref() == Some(task_id))
+            .map(|session| session.id.clone())
+            .collect();
+        for id in ids {
+            // A session may have exited and been removed between the snapshot and
+            // here; closing an unknown id is a no-op.
+            let _ = self.close(&id);
+        }
+    }
+
     fn get(&self, session_id: &str) -> anyhow::Result<Arc<Session>> {
         self.sessions
             .lock()
@@ -1238,6 +1256,40 @@ mod tests {
         // An unknown session has no screen.
         assert_eq!(mgr.screen_text("missing"), "");
         mgr.close(&info.id).unwrap();
+    }
+
+    #[test]
+    fn close_by_task_terminates_only_that_tasks_sessions() {
+        let mgr = AgentManager::new();
+        let agent = template("sh", cfg("sh", &["-c", "sleep 30"]));
+        let start = |task: &str| {
+            mgr.start(
+                "sh",
+                agent.clone(),
+                Some(task.to_string()),
+                Invocation::Interactive {
+                    prompt: None,
+                    provider: None,
+                    model: None,
+                },
+                context(None, 24, 80),
+            )
+            .unwrap()
+        };
+        let a = start("task-a");
+        let b = start("task-b");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(mgr.is_running(&a.id));
+        assert!(mgr.is_running(&b.id));
+
+        mgr.close_by_task("task-a");
+        assert!(mgr.find_latest_by_task("task-a").is_none());
+        assert!(mgr.find_latest_by_task("task-b").is_some());
+        // A second close is a no-op, and an unknown task id is harmless.
+        mgr.close_by_task("task-a");
+        mgr.close_by_task("task-missing");
+
+        mgr.close(&b.id).unwrap();
     }
 
     #[test]

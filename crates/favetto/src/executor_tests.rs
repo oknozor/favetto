@@ -1454,6 +1454,86 @@ async fn run_one_records_a_failed_run() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Regression: `tasks.cancel` marks a running task `cancelled` and terminates
+/// its agent. When the run's coroutine then unwinds, its own outcome must not
+/// overwrite the cancelled row nor emit `TaskFinished` (which would schedule
+/// `needs`/join successors).
+#[cfg(unix)]
+#[tokio::test]
+async fn run_one_does_not_overwrite_a_cancelled_task() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("favetto-cancel-run-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("fake-slow.sh");
+    std::fs::write(&script, "#!/bin/sh\nwhile true; do sleep 1; done\n").unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let mut cfg = FavettoConfig::default();
+    cfg.agent.default = Some("slow".to_string());
+    cfg.agents.insert(
+        "slow".to_string(),
+        crate::config::AgentConfig {
+            command: script.to_string_lossy().into_owned(),
+            headless_args: Some(vec!["{prompt}".to_string()]),
+            ..Default::default()
+        },
+    );
+    cfg.executor.detect_awaiting_input = false;
+    let def = crate::tasks::parse_task_md("t", "agent = \"slow\"\n---\nbody\n").unwrap();
+    let state = join_state_with_config(&dir, vec![def.clone()], cfg).await;
+
+    let task = task_with_session(None, None);
+    db::insert_task(&state.db, &task).await.unwrap();
+
+    let plan = Plan {
+        cwd: dir.clone(),
+        needs_lock: false,
+        worktree: None,
+    };
+    let run = running_run(task.id);
+    db::insert_task_run(&state.db, &run).await.unwrap();
+
+    let handle = {
+        let state = state.clone();
+        let task = task.clone();
+        tokio::spawn(async move { run_one(&state, task, run, def, plan, None).await })
+    };
+
+    // Wait for the agent PTY to be live, then cancel it the way the server does.
+    let session = loop {
+        if let Some(info) = state.agents.find_latest_by_task(&task.id.to_string()) {
+            break info;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(state.agents.is_running(&session.id));
+    assert!(db::cancel_active_task(&state.db, task.id).await.unwrap());
+    state.agents.close_by_task(&task.id.to_string());
+
+    handle.await.unwrap();
+
+    // The cancelled row stands; the run history records the cancelled attempt.
+    let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Cancelled);
+    let runs = db::list_task_runs(&state.db, task.id).await.unwrap();
+    assert_eq!(runs.len(), 1, "exactly one run per attempt");
+    assert_eq!(runs[0].status, RunStatus::Cancelled);
+
+    // No terminal event fired: a cancelled run cannot trigger `needs`/join work.
+    let events = db::tail_events(&state.db, 50).await.unwrap();
+    assert!(
+        events.iter().all(|e| e.kind != EventKind::TaskFinished
+            && e.kind != EventKind::TaskCompleted
+            && e.kind != EventKind::TaskFailed),
+        "a cancelled run must not emit terminal events: {events:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A retryable failure re-enqueues the task for a fresh attempt instead of
 /// finalizing it. The failed attempt still records exactly one run, and no
 /// `TaskFinished` fires until the attempt budget is spent.

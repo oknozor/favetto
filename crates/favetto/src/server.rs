@@ -1001,10 +1001,11 @@ async fn inspect_workflow(state: &State, root_id: Uuid) -> Result<WorkflowInspec
 
 /// `workflow.cancel`: cancel every non-terminal task in `root_id`.
 ///
-/// Each task transitioned to `cancelled` gets a `task.updated` push and a
-/// `TaskCancelled` event; already-terminal tasks are left untouched. Because no
-/// `TaskFinished` is emitted, the `needs`/join listeners never fire for them, so
-/// no follow-on work is scheduled. Single-task `tasks.cancel` is unchanged.
+/// Each task transitioned to `cancelled` has its live agent session terminated
+/// and gets a `task.updated` push and a `TaskCancelled` event; already-terminal
+/// tasks are left untouched. Because no `TaskFinished` is emitted, the
+/// `needs`/join listeners never fire for them, so no follow-on work is scheduled.
+/// Single-task `tasks.cancel` uses the same terminal-safe path.
 async fn cancel_workflow(state: &State, root_id: Uuid) -> Result<WorkflowCancelResult, RpcError> {
     let tasks = db::list_root_tasks(&state.db, root_id)
         .await
@@ -1023,6 +1024,10 @@ async fn cancel_workflow(state: &State, root_id: Uuid) -> Result<WorkflowCancelR
         match db::cancel_active_task(&state.db, task.id).await {
             Ok(true) => {
                 cancelled.push(task.id);
+                // Stop the run's agent process so it cannot outlive the
+                // cancellation; its eventual outcome is rejected by
+                // `db::finish_active_task` and never fires `TaskFinished`.
+                state.agents.close_by_task(&task.id.to_string());
                 // Re-read so the push carries the persisted `cancelled` status.
                 if let Ok(Some(fresh)) = db::get_task(&state.db, task.id).await {
                     announce_cancelled(state, &fresh).await;
@@ -1711,7 +1716,14 @@ async fn finish_oneshot(
         ))
     };
     task.finished_at = Some(Utc::now());
-    let _ = db::upsert_task(&state.db, &task).await;
+    // Compare-and-set: a cancellation while the exit-time title lookup was in
+    // flight wins; never resurrect the row nor fire `TaskFinished` for it.
+    if !db::finish_active_task(&state.db, &task)
+        .await
+        .unwrap_or(false)
+    {
+        return;
+    }
     state
         .bus
         .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
@@ -1933,16 +1945,25 @@ async fn retry_task(state: &State, id: Uuid) -> Result<favetto_core::model::Task
     Ok(fresh.summary())
 }
 
-/// Mark a task cancelled, persist it, and announce the change.
+/// Mark a task cancelled, terminate its live agent session, and announce it.
+///
+/// The status write is a compare-and-set over the non-terminal states, so an
+/// already-terminal task is returned untouched and no second `TaskCancelled` is
+/// emitted. Tearing down the task's live agent session stops the in-flight run,
+/// whose eventual outcome is then rejected by `db::finish_active_task`.
 async fn cancel_task(state: &State, id: Uuid) -> anyhow::Result<favetto_core::model::Task> {
-    let Some(mut task) = db::get_task(&state.db, id).await? else {
+    let Some(task) = db::get_task(&state.db, id).await? else {
         anyhow::bail!("task not found");
     };
-    task.status = favetto_core::model::TaskStatus::Cancelled;
-    task.finished_at = Some(chrono::Utc::now());
-    db::upsert_task(&state.db, &task).await?;
-    announce_cancelled(state, &task).await;
-    Ok(task.summary())
+    if !db::cancel_active_task(&state.db, id).await? {
+        // Already terminal: never overwrite or re-announce it.
+        return Ok(task.summary());
+    }
+    // Only a task this call actually cancelled gets its agent torn down.
+    state.agents.close_by_task(&id.to_string());
+    let cancelled = db::get_task(&state.db, id).await?.unwrap_or(task);
+    announce_cancelled(state, &cancelled).await;
+    Ok(cancelled.summary())
 }
 
 /// Publish the `task.updated` push and persist + push the `TaskCancelled` event
