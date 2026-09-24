@@ -131,6 +131,10 @@ fn all_popups_render_without_panic() {
                 method: favetto_core::rpc::method::TASKS_CANCEL,
                 params: serde_json::json!({ "id": uuid::Uuid::nil() }),
             }),
+            // Renders the "no longer in the list" fallback for an unknown id.
+            Popup::TaskError {
+                task_id: uuid::Uuid::new_v4(),
+            },
         ] {
             let mut app = App::with_theme(theme);
             app.popup = popup;
@@ -271,10 +275,11 @@ fn failed_task_renders_typed_failure_and_retryability() {
         message: "PTY died".to_string(),
         retryable: true,
     });
+    let task_id = task.id;
     app.tasks = vec![task];
+    app.popup = Popup::TaskError { task_id };
 
     let text = render_text(&mut app, 200, 24);
-    assert!(text.contains("#2"), "attempt missing: {text:?}");
     assert!(text.contains("infrastructure"), "kind missing: {text:?}");
     assert!(text.contains("PTY died"), "message missing: {text:?}");
     assert!(text.contains("retryable"), "retryability missing: {text:?}");
@@ -297,7 +302,9 @@ fn failed_task_renders_non_retryable_hint() {
         message: "exit 1".to_string(),
         retryable: false,
     });
+    let task_id = task.id;
     app.tasks = vec![task];
+    app.popup = Popup::TaskError { task_id };
 
     let text = render_text(&mut app, 200, 24);
     assert!(text.contains("agent"), "kind missing: {text:?}");
@@ -312,10 +319,46 @@ fn failed_task_without_typed_failure_falls_back_to_error() {
     let mut task = geom_task("legacy");
     task.status = TaskStatus::Failed;
     task.error = Some("boom".to_string());
+    let task_id = task.id;
     app.tasks = vec![task];
+    app.popup = Popup::TaskError { task_id };
 
     let text = render_text(&mut app, 200, 24);
     assert!(text.contains("boom"), "error missing: {text:?}");
+}
+
+#[test]
+fn task_error_popup_shows_missing_hint() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    let task = geom_task("clean");
+    let task_id = task.id;
+    app.tasks = vec![task];
+    app.popup = Popup::TaskError { task_id };
+
+    let text = render_text(&mut app, 200, 24);
+    assert!(
+        text.contains("(no error recorded)"),
+        "empty-state hint missing: {text:?}"
+    );
+}
+
+#[test]
+fn tasks_table_omits_the_error_column() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    let mut task = geom_task("legacy");
+    task.status = TaskStatus::Failed;
+    task.error = Some("inline-boom".to_string());
+    app.tasks = vec![task];
+
+    let text = render_text(&mut app, 200, 24);
+    assert!(text.contains("TOKEN"), "token header missing: {text:?}");
+    assert!(text.contains("$COST"), "cost header missing: {text:?}");
+    assert!(
+        !text.contains("inline-boom"),
+        "error text must not render inline: {text:?}"
+    );
 }
 
 #[test]
@@ -342,7 +385,8 @@ fn task_session_title_renders_in_session_column() {
     task.session_title = Some("Implement issue 31 title column".to_string());
     app.tasks = vec![task];
 
-    let text = render_text(&mut app, 120, 24);
+    // Wide enough that every fixed column fits and SESSION is not compressed.
+    let text = render_text(&mut app, 200, 24);
     assert!(text.contains("SESSION"), "header missing: {text:?}");
     assert!(
         text.contains("Implement issue 31"),
@@ -517,6 +561,14 @@ fn help_overlay_lists_cancel_and_retry() {
     assert!(
         text.contains("workflow root"),
         "root cancel help row missing: {text:?}"
+    );
+}
+
+#[test]
+fn help_overlay_lists_task_error_key() {
+    assert!(
+        help_section_has_key("Tasks tab", "x"),
+        "task-error help row missing"
     );
 }
 
@@ -732,13 +784,15 @@ fn session_picker_renders_activity_and_usage() {
     });
     agent.usage = Some(favetto_core::model::AgentUsage {
         input_tokens: 900,
+        cost_usd: Some(0.25),
         ..Default::default()
     });
     app.open_sessions(vec![agent]);
 
     let text = render_text(&mut app, 120, 24);
     assert!(text.contains("waiting"), "activity missing: {text:?}");
-    assert!(text.contains("900/0 tok"), "usage missing: {text:?}");
+    assert!(text.contains("900/0 tok"), "token detail missing: {text:?}");
+    assert!(text.contains("$0.2500"), "cost detail missing: {text:?}");
 }
 
 #[test]
@@ -758,6 +812,7 @@ fn tasks_table_renders_activity_and_usage_cells() {
     agent.usage = Some(favetto_core::model::AgentUsage {
         input_tokens: 1500,
         output_tokens: 20,
+        cost_usd: Some(0.5),
         ..Default::default()
     });
     app.set_agent_sessions(vec![agent]);
@@ -767,9 +822,12 @@ fn tasks_table_renders_activity_and_usage_cells() {
         text.contains("ACTIVITY"),
         "activity header missing: {text:?}"
     );
-    assert!(text.contains("USAGE"), "usage header missing: {text:?}");
+    assert!(text.contains("TOKEN"), "token header missing: {text:?}");
+    assert!(text.contains("$COST"), "cost header missing: {text:?}");
+    assert!(!text.contains("USAGE"), "stale usage header: {text:?}");
     assert!(text.contains("tool: bash"), "activity missing: {text:?}");
-    assert!(text.contains("1.5k/20 tok"), "usage missing: {text:?}");
+    assert!(text.contains("1.5k/20 tok"), "token cell missing: {text:?}");
+    assert!(text.contains("$0.5000"), "cost cell missing: {text:?}");
 }
 
 #[test]
@@ -857,6 +915,7 @@ fn agent_tab_renders_structured_state_not_headless_json() {
     headless.usage = Some(favetto_core::model::AgentUsage {
         input_tokens: 1500,
         output_tokens: 20,
+        cost_usd: Some(0.5),
         ..Default::default()
     });
     headless.session_id = Some("ses_1".to_string());
@@ -872,7 +931,13 @@ fn agent_tab_renders_structured_state_not_headless_json() {
         "structured heading missing: {text:?}"
     );
     assert!(text.contains("tool: bash"), "activity missing: {text:?}");
-    assert!(text.contains("1.5k/20 tok"), "usage missing: {text:?}");
+    assert!(text.contains("Token"), "token label missing: {text:?}");
+    assert!(text.contains("Cost"), "cost label missing: {text:?}");
+    assert!(
+        text.contains("1.5k/20 tok"),
+        "token detail missing: {text:?}"
+    );
+    assert!(text.contains("$0.5000"), "cost detail missing: {text:?}");
     assert!(
         !text.contains("sessionID") && !text.contains("part"),
         "raw JSON leaked into the panel: {text:?}"

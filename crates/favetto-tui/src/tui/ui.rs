@@ -13,7 +13,7 @@ use favetto_core::model::{AgentSessionInfo, FailureKind, Task, TaskStatus};
 use favetto_core::workflow::{WorkflowInspect, WorkflowState};
 
 use super::app::{
-    activity_cell, format_activity, format_usage, table_rows_area, usage_cell, App, CatalogRow,
+    activity_cell, cost_cell, format_activity, table_rows_area, token_cell, App, CatalogRow,
     ClickAction, ClickRegion, ConfirmPrompt, ConnState, Form, ListGeometry, Popup, ReplyPrompt,
     Tab, TaskVarsForm, Wizard, WizardStep, MENU_OPTIONS,
 };
@@ -88,6 +88,15 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
         return;
     }
 
+    // The task-error popup renders from `app.tasks`, so copy the id out and
+    // render it before `popup` is borrowed mutably below.
+    if let Popup::TaskError { task_id } = &app.popup {
+        let task_id = *task_id;
+        let theme = app.theme;
+        draw_task_error(frame, app, task_id, theme);
+        return;
+    }
+
     // Copy the theme and clone the throbber state before borrowing `popup`, so
     // the wizard can render a spinner without holding a borrow of `app`.
     let theme = app.theme;
@@ -130,6 +139,8 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
         }
         // Handled above, before `popup` is borrowed, so the full `App` is available.
         Popup::WorkflowRuntime(_) => {}
+        // Handled above, before `popup` is borrowed.
+        Popup::TaskError { .. } => {}
     }
 }
 
@@ -369,7 +380,10 @@ fn draw_sessions_picker(
             }
             if let Some(usage) = &s.usage {
                 if !usage.is_empty() {
-                    detail.push_str(&format!(" · {}", format_usage(usage)));
+                    detail.push_str(&format!(" · {}", token_cell(Some(usage))));
+                }
+                if usage.cost_usd.is_some() {
+                    detail.push_str(&format!(" · {}", cost_cell(Some(usage))));
                 }
             }
             ListItem::new(Line::from(Span::styled(
@@ -466,6 +480,50 @@ fn draw_confirm(frame: &mut Frame, prompt: &ConfirmPrompt, theme: Theme) {
             area,
             width_pct: 60,
             title: prompt.title.to_string(),
+            content,
+            footer,
+            focus_line: 0,
+            theme,
+        },
+    );
+}
+
+/// Draw the `x` popup: the selected task's error in full, using the same typed
+/// `[kind] message (retryability)` formatting as the old inline ERROR cell.
+fn draw_task_error(frame: &mut Frame, app: &App, task_id: uuid::Uuid, theme: Theme) {
+    let mut content: Vec<Line<'static>> = Vec::new();
+    match app.tasks.iter().find(|t| t.id == task_id) {
+        Some(task) => {
+            content.push(Line::from(Span::styled(
+                format!("{} · {}", short_id(&task.id), task.name),
+                theme.title(),
+            )));
+            content.push(Line::from(""));
+            let line = error_cell(task, theme);
+            if line.spans.is_empty() {
+                content.push(Line::from(Span::styled(
+                    "(no error recorded)",
+                    Style::default().fg(theme.muted),
+                )));
+            } else {
+                content.push(line);
+            }
+        }
+        None => content.push(Line::from(Span::styled(
+            "the task is no longer in the list",
+            Style::default().fg(theme.muted),
+        ))),
+    }
+    let footer = vec![Line::from(Span::styled(
+        "Esc / x close",
+        Style::default().fg(theme.muted),
+    ))];
+    draw_growing_popup(
+        frame,
+        GrowingPopup {
+            area: frame.area(),
+            width_pct: 70,
+            title: " Task error ".to_string(),
             content,
             footer,
             focus_line: 0,
@@ -743,6 +801,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
                 "C",
                 "cancel every task in the selected task's workflow root",
             ),
+            ("x", "show the selected task's error in full"),
         ],
     ),
     (
@@ -1423,19 +1482,19 @@ fn status_ok(s: &str, theme: Theme) -> Line<'static> {
 
 fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     let widths = [
-        Constraint::Length(10),
-        Constraint::Length(20),
+        Constraint::Length(10), // ID
+        Constraint::Length(20), // TASK
         // Session titles are truncated to 22 chars, so the column matches that.
-        Constraint::Length(22),
+        Constraint::Length(22), // SESSION
         // Wide enough for `✓ succeeded #10`, the longest status plus an attempt.
-        Constraint::Length(15),
-        Constraint::Length(14),
-        Constraint::Length(18),
-        Constraint::Length(8),
-        Constraint::Min(0),
+        Constraint::Length(15), // STATUS
+        Constraint::Min(14),    // ACTIVITY — absorbs the width freed by ERROR
+        Constraint::Length(14), // TOKEN
+        Constraint::Length(11), // $COST
+        Constraint::Length(8),  // AGE
     ];
     let header = Row::new(vec![
-        "ID", "TASK", "SESSION", "STATUS", "ACTIVITY", "USAGE", "AGE", "ERROR",
+        "ID", "TASK", "SESSION", "STATUS", "ACTIVITY", "TOKEN", "$COST", "AGE",
     ])
     .style(theme.table_header());
 
@@ -1444,9 +1503,7 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
         .tasks
         .iter()
         .map(|t| {
-            let session = app.task_session(&t.id.to_string());
-            let activity = activity_cell(session.and_then(|s| s.activity.as_ref()));
-            let usage = usage_cell(session.and_then(|s| s.usage.as_ref()));
+            let (activity, usage) = app.task_activity_usage(&t.id.to_string());
             Row::new(vec![
                 Cell::from(short_id(&t.id)),
                 Cell::from(t.name.clone()),
@@ -1455,10 +1512,10 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
                     22,
                 )),
                 Cell::from(status_line(t.status, t.attempt, theme, &state)),
-                Cell::from(activity),
-                Cell::from(usage),
+                Cell::from(activity_cell(activity)),
+                Cell::from(token_cell(usage)),
+                Cell::from(cost_cell(usage)),
                 Cell::from(age(t.created_at)),
-                Cell::from(error_cell(t, theme)),
             ])
         })
         .collect();
@@ -1634,8 +1691,12 @@ fn draw_agent_structured(frame: &mut Frame, app: &App, area: Rect, theme: Theme)
             activity_cell(session.activity.as_ref())
         )));
         lines.push(Line::from(format!(
-            "Usage     {}",
-            usage_cell(session.usage.as_ref())
+            "Token     {}",
+            token_cell(session.usage.as_ref())
+        )));
+        lines.push(Line::from(format!(
+            "Cost      {}",
+            cost_cell(session.usage.as_ref())
         )));
         if let Some(session_id) = &session.session_id {
             lines.push(Line::from(format!("Session   {session_id}")));

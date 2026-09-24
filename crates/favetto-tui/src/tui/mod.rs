@@ -717,6 +717,8 @@ async fn run_session(
     let mut ping = tokio::time::interval(Duration::from_secs(5));
     let mut anim = tokio::time::interval(Duration::from_millis(80));
     anim.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut agents_refresh = tokio::time::interval(Duration::from_secs(3));
+    agents_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         // The tick is only consumed while something on screen animates; an idle
@@ -843,6 +845,11 @@ async fn run_session(
             _ = ping.tick() => {
                 if client.request(method::PING, serde_json::json!({})).await.is_err() {
                     return SessionOutcome::Disconnected;
+                }
+            }
+            _ = agents_refresh.tick() => {
+                if app.wants_agent_refresh() {
+                    fetch_agent_sessions(client, app).await;
                 }
             }
         }

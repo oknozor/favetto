@@ -233,6 +233,140 @@ fn agent_state_push_folds_activity_and_usage() {
         params: serde_json::json!({ "session_id": "nope", "activity": { "kind": "idle" } }),
     });
     assert_eq!(app.agent_sessions.len(), 1);
+    // A session with no task never creates retained task state.
+    assert!(app.task_state.is_empty());
+}
+
+#[test]
+fn task_live_state_survives_session_removal() {
+    let mut app = App::new();
+    let mut session = agent_session("s1", false, true, false);
+    session.task_id = Some("t1".to_string());
+    session.activity = Some(AgentActivity::Thinking);
+    session.usage = Some(AgentUsage {
+        input_tokens: 10,
+        output_tokens: 2,
+        cost_usd: Some(0.1),
+        ..Default::default()
+    });
+    app.set_agent_sessions(vec![session]);
+
+    // The session leaves the registry; the retained state must remain.
+    app.set_agent_sessions(Vec::new());
+    let (activity, usage) = app.task_activity_usage("t1");
+    assert_eq!(activity, Some(&AgentActivity::Thinking));
+    let usage = usage.expect("usage retained");
+    assert_eq!(usage.input_tokens, 10);
+    assert_eq!(usage.cost_usd, Some(0.1));
+    assert!(app.task_session("t1").is_none());
+}
+
+#[test]
+fn agent_state_push_updates_retained_task_state() {
+    let mut app = App::new();
+    let mut session = agent_session("s1", false, true, false);
+    session.task_id = Some("t1".to_string());
+    app.set_agent_sessions(vec![session]);
+
+    app.handle_notification(Notification {
+        method: push::AGENT_STATE.to_string(),
+        params: serde_json::json!({
+            "session_id": "s1",
+            "activity": { "kind": "thinking" },
+            "usage": { "input_tokens": 5, "output_tokens": 1, "cost_usd": 0.02 },
+        }),
+    });
+
+    let (activity, usage) = app.task_activity_usage("t1");
+    assert_eq!(activity, Some(&AgentActivity::Thinking));
+    let usage = usage.expect("usage retained");
+    assert_eq!(usage.input_tokens, 5);
+    assert_eq!(usage.cost_usd, Some(0.02));
+}
+
+#[test]
+fn retry_clears_retained_task_state() {
+    let mut app = App::new();
+    let mut current = task("retryable");
+    current.status = TaskStatus::Failed;
+    current.attempt = 1;
+    let id = current.id;
+    app.tasks = vec![current];
+
+    // Seed retained state for the finished attempt.
+    app.task_state.insert(
+        id.to_string(),
+        (
+            Some(AgentActivity::Exited { code: Some(1) }),
+            Some(AgentUsage {
+                input_tokens: 9,
+                ..Default::default()
+            }),
+        ),
+    );
+    assert!(app.task_activity_usage(&id.to_string()).1.is_some());
+
+    let mut updated = task("retryable");
+    updated.id = id;
+    updated.status = TaskStatus::Running;
+    updated.attempt = 2;
+    app.handle_notification(Notification {
+        method: push::TASK_UPDATED.to_string(),
+        params: serde_json::to_value(updated).unwrap(),
+    });
+
+    assert_eq!(app.task_activity_usage(&id.to_string()), (None, None));
+}
+
+#[test]
+fn x_opens_the_task_error_popup() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    let mut broken = task("broken");
+    broken.status = TaskStatus::Failed;
+    broken.error = Some("boom".to_string());
+    let id = broken.id;
+    app.tasks = vec![broken];
+
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::empty()));
+    match &app.popup {
+        Popup::TaskError { task_id } => assert_eq!(*task_id, id),
+        _ => panic!("expected the task-error popup"),
+    }
+
+    // `Esc` closes the popup.
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::empty()));
+    assert!(matches!(app.popup, Popup::None));
+
+    // A second `x` closes it too.
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::empty()));
+    assert!(matches!(app.popup, Popup::TaskError { .. }));
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::empty()));
+    assert!(matches!(app.popup, Popup::None));
+
+    // The binding is Tasks-only.
+    app.tab = Tab::Catalog;
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::empty()));
+    assert!(matches!(app.popup, Popup::None));
+}
+
+#[test]
+fn wants_agent_refresh_tracks_live_tasks_and_sessions() {
+    let mut app = App::new();
+    // Nothing live: an idle TUI must not poll.
+    assert!(!app.wants_agent_refresh());
+
+    // A non-terminal task asks for refreshes.
+    app.tasks = vec![task("pending")];
+    assert!(app.wants_agent_refresh());
+
+    // A terminal task with no running session is quiet again.
+    app.tasks[0].status = TaskStatus::Succeeded;
+    assert!(!app.wants_agent_refresh());
+
+    // A running cached session keeps the refresh alive.
+    app.set_agent_sessions(vec![agent_session("s1", false, true, false)]);
+    assert!(app.wants_agent_refresh());
 }
 
 #[test]
@@ -402,7 +536,7 @@ fn reply_popup_free_form_types_a_value() {
 }
 
 #[test]
-fn activity_and_usage_cells_render_compactly() {
+fn activity_token_and_cost_cells_render_compactly() {
     assert_eq!(activity_cell(None), "—");
     assert_eq!(activity_cell(Some(&AgentActivity::Thinking)), "thinking");
     assert_eq!(
@@ -412,8 +546,12 @@ fn activity_and_usage_cells_render_compactly() {
         })),
         "tool: read"
     );
-    assert_eq!(usage_cell(None), "—");
-    assert_eq!(usage_cell(Some(&AgentUsage::default())), "—");
+
+    assert_eq!(token_cell(None), "—");
+    assert_eq!(token_cell(Some(&AgentUsage::default())), "—");
+    assert_eq!(cost_cell(None), "—");
+    assert_eq!(cost_cell(Some(&AgentUsage::default())), "—");
+
     let usage = AgentUsage {
         input_tokens: 1500,
         output_tokens: 20,
@@ -422,7 +560,8 @@ fn activity_and_usage_cells_render_compactly() {
         cache_write_tokens: 0,
         cost_usd: Some(0.5),
     };
-    assert_eq!(usage_cell(Some(&usage)), "1.5k/20 tok $0.5000");
+    assert_eq!(token_cell(Some(&usage)), "1.5k/20 tok");
+    assert_eq!(cost_cell(Some(&usage)), "$0.5000");
 }
 
 fn event(id: i64, kind: EventKind, payload: serde_json::Value) -> Event {
