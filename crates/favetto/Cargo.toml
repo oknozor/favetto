@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[lib]
+name = "favetto"
+path = "src/lib.rs"
+
 [[bin]]
 name = "favetto"
 path = "src/main.rs"
