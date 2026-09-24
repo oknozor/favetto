@@ -13,8 +13,8 @@ use favetto_core::model::{AgentSessionInfo, FailureKind, Task, TaskStatus};
 
 use super::app::{
     activity_cell, format_activity, format_usage, table_rows_area, usage_cell, App, CatalogRow,
-    ClickAction, ClickRegion, ConnState, Form, ListGeometry, Popup, ReplyPrompt, Tab, TaskVarsForm,
-    Wizard, WizardStep, MENU_OPTIONS,
+    ClickAction, ClickRegion, ConfirmPrompt, ConnState, Form, ListGeometry, Popup, ReplyPrompt,
+    Tab, TaskVarsForm, Wizard, WizardStep, MENU_OPTIONS,
 };
 use super::text_buffer::TextBuffer;
 use super::theme::Theme;
@@ -117,6 +117,9 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
             draw_sessions_picker(frame, *selected, sessions, theme)
         }
         Popup::Reply(prompt) => draw_reply(frame, prompt, theme),
+        Popup::Confirm(prompt) => {
+            draw_confirm(frame, prompt, theme);
+        }
     }
 }
 
@@ -432,6 +435,35 @@ fn draw_reply(frame: &mut Frame, prompt: &ReplyPrompt, theme: Theme) {
     );
 }
 
+/// Draw the confirmation gate shown before `tasks.cancel`, `tasks.retry`, and
+/// `workflow.cancel`. It only presents an intent already decided by the app; the
+/// RPC runs on confirm and the daemon's `task.updated` push updates the row.
+fn draw_confirm(frame: &mut Frame, prompt: &ConfirmPrompt, theme: Theme) {
+    let area = frame.area();
+    let content: Vec<Line<'static>> = prompt
+        .message
+        .iter()
+        .map(|line| Line::from(line.clone()))
+        .collect();
+    let footer = vec![Line::from(Span::styled(
+        "Enter/y confirm · Esc/n cancel",
+        Style::default().fg(theme.muted),
+    ))];
+
+    draw_growing_popup(
+        frame,
+        GrowingPopup {
+            area,
+            width_pct: 60,
+            title: prompt.title.to_string(),
+            content,
+            footer,
+            focus_line: 0,
+            theme,
+        },
+    );
+}
+
 fn draw_form(frame: &mut Frame, form: &Form, theme: Theme) -> Rect {
     let area = frame.area();
 
@@ -692,7 +724,15 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
     ),
     (
         "Tasks tab",
-        &[("Enter", "open the selected task's agent session")],
+        &[
+            ("Enter", "open the selected task's agent session"),
+            ("c", "cancel the selected non-terminal task (confirm)"),
+            ("r", "retry the selected terminal task (confirm)"),
+            (
+                "C",
+                "cancel every task in the selected task's workflow root",
+            ),
+        ],
     ),
     (
         "Catalog tab",
@@ -1548,6 +1588,8 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
         } else {
             "[Ctrl+Y] agent keys  [Ctrl+O] sessions  [Ctrl+Q] leave  [?] help".to_string()
         }
+    } else if app.tab == Tab::Tasks {
+        "[↑↓] select  [Enter] agent  [c] cancel  [r] retry  [C] cancel root".to_string()
     } else {
         "[↑↓] select  [Enter] agent  [Tab] switch  [q] quit  [?] help".to_string()
     };
@@ -1605,6 +1647,16 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             format!("⚠ agent: {err}"),
+            Style::default()
+                .fg(theme.danger)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    if let Some(notice) = &app.notice {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("⚠ {notice}"),
             Style::default()
                 .fg(theme.danger)
                 .add_modifier(Modifier::BOLD),

@@ -718,6 +718,9 @@ async fn run_session(
                             UiAction::Reply { session_id, request_id, reply } => {
                                 send_agent_reply(client, app, session_id, request_id, reply).await;
                             }
+                            UiAction::TaskCommand { method, params } => {
+                                task_command(client, app, method, params).await;
+                            }
                             UiAction::None => {}
                         }
                     }
@@ -1048,6 +1051,32 @@ async fn send_agent_reply(
         Err(e) => app.agent_error = Some(e.to_string()),
     }
     fetch_agent_sessions(client, app).await;
+}
+
+/// Apply a task command (`tasks.cancel`, `tasks.retry`, `workflow.cancel`).
+///
+/// The daemon pushes `task.updated` (and `task.cancelled` events) for every
+/// change, so a success never mutates a row here; it only re-syncs the list as a
+/// safety net. A failure is surfaced in the status bar, where the TUI also shows
+/// connection and agent errors, instead of only the internal log ring.
+async fn task_command(client: &Client, app: &mut App, method: &str, params: serde_json::Value) {
+    match client.request(method, params).await {
+        Ok(resp) => match resp.result {
+            Some(_) => {
+                app.notice = None;
+                refresh_lists(client, app).await;
+            }
+            None => {
+                let message = resp
+                    .error
+                    .as_ref()
+                    .map(|e| e.message.clone())
+                    .unwrap_or_else(|| format!("{method} failed"));
+                app.notice = Some(format!("{method}: {message}"));
+            }
+        },
+        Err(e) => app.notice = Some(format!("{method} failed: {e}")),
+    }
 }
 
 /// What [`disconnected_pump`] decided to do next.

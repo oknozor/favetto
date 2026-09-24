@@ -76,6 +76,7 @@ impl App {
             Popup::Workflow { .. } => return self.handle_workflow_key(key.code),
             Popup::Sessions { .. } => return self.handle_sessions_key(key.code),
             Popup::Reply(_) => return self.handle_reply_key(key),
+            Popup::Confirm(_) => return self.handle_confirm_key(key.code),
             Popup::None => {}
         }
 
@@ -524,6 +525,33 @@ impl App {
         UiAction::None
     }
 
+    /// Keys while the confirmation popup is open (`c` cancel / `C` cancel root /
+    /// `r` retry): `Enter`/`y` submits the destructive RPC, `Esc`/`n` (or the
+    /// initiating key) dismisses it without acting.
+    pub(super) fn handle_confirm_key(&mut self, code: KeyCode) -> UiAction {
+        match code {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let (method, params) = match &self.popup {
+                    Popup::Confirm(prompt) => (prompt.method, prompt.params.clone()),
+                    _ => return UiAction::None,
+                };
+                self.popup = Popup::None;
+                UiAction::TaskCommand { method, params }
+            }
+            KeyCode::Esc
+            | KeyCode::Char('n')
+            | KeyCode::Char('N')
+            | KeyCode::Char('c')
+            | KeyCode::Char('C')
+            | KeyCode::Char('r')
+            | KeyCode::Char('R') => {
+                self.popup = Popup::None;
+                UiAction::None
+            }
+            _ => UiAction::None,
+        }
+    }
+
     pub(super) fn handle_menu_key(&mut self, code: KeyCode) -> UiAction {
         match code {
             KeyCode::Esc => {
@@ -555,6 +583,8 @@ impl App {
 
     pub(super) fn handle_normal_key(&mut self, key: &KeyEvent) -> UiAction {
         let code = key.code;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
 
         match code {
             KeyCode::Char('q') | KeyCode::Esc => UiAction::Quit,
@@ -669,6 +699,21 @@ impl App {
                     Some(entry) => UiAction::EditCatalog(entry.name.clone()),
                     None => UiAction::None,
                 }
+            }
+            // Tasks: `c` cancels a non-terminal task, `C` cancels its whole
+            // workflow root, `r` retries a terminal task. Each opens a
+            // confirmation popup first; the daemon's `task.updated` push keeps
+            // the row live. Bare letters only (Ctrl+R keeps its reply binding,
+            // Ctrl+C stays inert); all three are forwarded to the agent while it
+            // captures the keyboard, before this function is reached.
+            KeyCode::Char('c') if self.tab == Tab::Tasks && !ctrl && !alt => {
+                self.confirm_cancel_task()
+            }
+            KeyCode::Char('C') if self.tab == Tab::Tasks && !ctrl && !alt => {
+                self.confirm_cancel_root()
+            }
+            KeyCode::Char('r') if self.tab == Tab::Tasks && !ctrl && !alt => {
+                self.confirm_retry_task()
             }
             _ => UiAction::None,
         }

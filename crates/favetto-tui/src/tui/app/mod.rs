@@ -119,6 +119,13 @@ pub enum UiAction {
         request_id: String,
         reply: InputReply,
     },
+    /// Cancel or retry a task, or cancel a whole workflow root, over RPC. The
+    /// daemon pushes `task.updated` for every change, so the client never
+    /// mutates a row optimistically.
+    TaskCommand {
+        method: &'static str,
+        params: Value,
+    },
 }
 
 /// The Ctrl+P popup: either the top-level menu, a step-by-step form, the
@@ -150,6 +157,9 @@ pub enum Popup {
     /// The Ctrl+R reply prompt: answer a session's structured input request
     /// (`AgentActivity::Waiting { request }`) through `agents.reply`.
     Reply(ReplyPrompt),
+    /// A destructive task action (`c` cancel / `C` cancel root / `r` retry)
+    /// awaiting explicit confirmation before its RPC is submitted.
+    Confirm(ConfirmPrompt),
 }
 
 pub struct Form {
@@ -300,6 +310,22 @@ impl ReplyPrompt {
     pub fn reply(&self) -> InputReply {
         reply_for(&self.request, self.selected, self.input.value())
     }
+}
+
+/// A destructive task action awaiting explicit confirmation.
+///
+/// Holds the RPC to submit on confirm so the popup stays a pure view of an
+/// intent already decided by [`App::handle_key`]. Nothing here mutates a task
+/// row: the daemon's `task.updated` push is the single source of truth.
+pub struct ConfirmPrompt {
+    /// Overlay title, e.g. ` Cancel task `.
+    pub title: &'static str,
+    /// Consequence lines, one per rendered row.
+    pub message: Vec<String>,
+    /// The RPC submitted when the prompt is confirmed.
+    pub method: &'static str,
+    /// The RPC params submitted when the prompt is confirmed.
+    pub params: Value,
 }
 
 /// A task-definition entry in the catalog (as returned by `catalog.list`).
@@ -463,6 +489,9 @@ pub struct App {
     pub agent_read_only: bool,
     /// The last `agents.start` / `agents.attach` error, shown in the status bar.
     pub agent_error: Option<String>,
+    /// The last task-command error (`tasks.cancel` / `tasks.retry` /
+    /// `workflow.cancel`), shown in the status bar. Cleared by a later success.
+    pub notice: Option<String>,
     /// Cached `agents.list` sessions keyed by daemon session id. The source of
     /// the Tasks-table Activity/Usage cells and the Ctrl+R reply target.
     pub agent_sessions: HashMap<String, AgentSessionInfo>,
@@ -552,6 +581,7 @@ impl App {
             agent_capture: false,
             agent_read_only: false,
             agent_error: None,
+            notice: None,
             agent_sessions: HashMap::new(),
             agent_area: None,
             agent_resize: None,
@@ -615,6 +645,76 @@ impl App {
 
     pub fn select_prev(&mut self) {
         self.tasks_selected = self.tasks_selected.saturating_sub(1);
+    }
+
+    /// The task currently selected on the Tasks tab, if any.
+    pub fn selected_task(&self) -> Option<&Task> {
+        self.tasks.get(self.tasks_selected)
+    }
+
+    /// Open the confirmation popup to cancel the selected task (`tasks.cancel`).
+    ///
+    /// No-op on a terminal task (nothing to cancel) or an empty list.
+    fn confirm_cancel_task(&mut self) -> UiAction {
+        let (name, attempt, id) = match self.selected_task() {
+            Some(t) if !task_status_is_terminal(t.status) => (t.name.clone(), t.attempt, t.id),
+            _ => return UiAction::None,
+        };
+        self.popup = Popup::Confirm(ConfirmPrompt {
+            title: " Cancel task ",
+            message: vec![
+                format!("Cancel task '{name}' (attempt {attempt})?"),
+                "A live agent is stopped; the task cannot be resumed.".to_string(),
+            ],
+            method: method::TASKS_CANCEL,
+            params: serde_json::json!({ "id": id }),
+        });
+        UiAction::None
+    }
+
+    /// Open the confirmation popup to cancel every non-terminal task in the
+    /// selected task's workflow root (`workflow.cancel`).
+    ///
+    /// Only offered for a spawned child, i.e. a task whose `root_id` is set; a
+    /// directly-started task has no separate root to abandon.
+    fn confirm_cancel_root(&mut self) -> UiAction {
+        let (name, root_id) = match self
+            .selected_task()
+            .and_then(|t| t.root_id.map(|r| (&t.name, r)))
+        {
+            Some((name, root_id)) => (name.clone(), root_id),
+            None => return UiAction::None,
+        };
+        self.popup = Popup::Confirm(ConfirmPrompt {
+            title: " Cancel workflow ",
+            message: vec![
+                format!("Cancel every non-terminal task in workflow {root_id}?"),
+                format!("Selected task: '{name}'"),
+            ],
+            method: method::WORKFLOW_CANCEL,
+            params: serde_json::json!({ "root_id": root_id }),
+        });
+        UiAction::None
+    }
+
+    /// Open the confirmation popup to retry the selected terminal task
+    /// (`tasks.retry`). No-op while the task is live: the daemon rejects a retry
+    /// with an active run.
+    fn confirm_retry_task(&mut self) -> UiAction {
+        let (name, attempt, id) = match self.selected_task() {
+            Some(t) if task_status_is_terminal(t.status) => (t.name.clone(), t.attempt, t.id),
+            _ => return UiAction::None,
+        };
+        self.popup = Popup::Confirm(ConfirmPrompt {
+            title: " Retry task ",
+            message: vec![
+                format!("Retry task '{name}' (attempt {attempt})?"),
+                "A new attempt is recorded; prior runs are kept.".to_string(),
+            ],
+            method: method::TASKS_RETRY,
+            params: serde_json::json!({ "id": id }),
+        });
+        UiAction::None
     }
 
     /// Replace the catalog, clamping the selection to the new visible rows and
@@ -1532,6 +1632,15 @@ fn shift_index(current: usize, delta: i32, len: usize) -> usize {
     } else {
         current.saturating_sub(delta.unsigned_abs() as usize)
     }
+}
+
+/// Whether a task lifecycle status is terminal: cancel/retry eligibility is
+/// decided client-side from this, and re-validated by the daemon.
+fn task_status_is_terminal(status: TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled
+    )
 }
 
 /// Build the `input` object for a completed variable form. Required empty fields
