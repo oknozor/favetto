@@ -17,7 +17,7 @@ use favetto_core::model::{
 use favetto_core::rpc::{method, push, Notification};
 use favetto_providers::Provider;
 
-use crate::tasks::TaskVar;
+use favetto_core::tasks::TaskVar;
 
 use super::sound::SoundCue;
 use super::term::TerminalView;
@@ -580,7 +580,7 @@ impl App {
         &mut self,
         dot: String,
         path: Option<String>,
-        graph: Option<crate::workflow::WorkflowGraph>,
+        graph: Option<favetto_core::workflow::WorkflowGraph>,
     ) {
         self.workflow_dot = Some(dot);
         self.workflow_path = path;
@@ -2471,7 +2471,7 @@ mod tests {
     use chrono::Utc;
     use favetto_core::model::{EventKind, TaskStatus};
 
-    use crate::tasks::VarType;
+    use favetto_core::tasks::VarType;
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
@@ -2896,8 +2896,8 @@ mod tests {
         assert!(app.workflow_dot.is_none());
         assert!(app.workflow_path.is_none());
         assert!(app.workflow_lines.is_none());
-        let graph = crate::workflow::WorkflowGraph {
-            nodes: vec![crate::workflow::WorkflowNode {
+        let graph = favetto_core::workflow::WorkflowGraph {
+            nodes: vec![favetto_core::workflow::WorkflowNode {
                 name: "a".to_string(),
                 scheduled: false,
                 external: false,

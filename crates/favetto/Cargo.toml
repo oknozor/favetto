@@ -17,12 +17,10 @@ favetto-core = { path = "../favetto-core" }
 favetto-providers = { path = "../favetto-providers" }
 
 anyhow = "1"
-ascii-dag = "0.11"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
-config = "0.15"
 dirs = "7"
 futures-util = "0.3"
 glob = "0.3"
@@ -31,7 +29,6 @@ hmac = "0.13"
 http = "1"
 libc = "0.2"
 parking_lot = "0.12"
-ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 portable-pty = "0.9"
 schemars = { version = "1", features = ["derive"] }
 serde = { workspace = true }
@@ -41,14 +38,11 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 subtle = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-cron-scheduler = "0.15"
-tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-unicode-segmentation = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
-throbber-widgets-tui = "0.11"
 vt100 = "0.16"
 
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
@@ -56,3 +50,4 @@ notify = "8.2.0"
 
 [dev-dependencies]
 proptest = { workspace = true }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }

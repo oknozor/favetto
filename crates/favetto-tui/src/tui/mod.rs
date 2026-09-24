@@ -41,8 +41,8 @@ use favetto_providers::Provider;
 
 use crate::cli::TuiArgs;
 use crate::client::{Client, Transport};
-use crate::config::FavettoConfig;
 use app::{App, CatalogEntry, ConnState, Popup, UiAction};
+use favetto_core::config::FavettoConfig;
 use sound::{CliSound, SoundPlayer};
 
 /// Outcome of a connected session: the user quit, or the link dropped.
@@ -101,7 +101,7 @@ pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
     let config_path = args
         .config
         .clone()
-        .unwrap_or_else(crate::cli::default_config_path);
+        .unwrap_or_else(favetto_core::paths::default_config_path);
     let config = FavettoConfig::load_from(&config_path).unwrap_or_default();
 
     // Editor precedence: `[tui].editor` > `$VISUAL` > `$EDITOR` > `vi`.
@@ -366,10 +366,9 @@ async fn fetch_workflow(client: &Client, app: &mut App) {
                     .to_string();
                 let path = v.get("path").and_then(|p| p.as_str()).map(str::to_string);
                 // Additive field: older daemons omit it, so fall back to DOT.
-                let graph = v
-                    .get("graph")
-                    .cloned()
-                    .and_then(|g| serde_json::from_value::<crate::workflow::WorkflowGraph>(g).ok());
+                let graph = v.get("graph").cloned().and_then(|g| {
+                    serde_json::from_value::<favetto_core::workflow::WorkflowGraph>(g).ok()
+                });
                 app.set_workflow(dot, path, graph);
             }
             None => app.set_workflow(String::new(), None, None),
@@ -1135,7 +1134,7 @@ fn read_token(args: &TuiArgs) -> Option<String> {
     let path = args
         .token_file
         .clone()
-        .unwrap_or_else(crate::cli::default_token_path);
+        .unwrap_or_else(favetto_core::paths::default_token_path);
     std::fs::read_to_string(path)
         .ok()
         .map(|s| s.trim().to_string())

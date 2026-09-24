@@ -21,7 +21,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::config::SoundSettings;
+use favetto_core::config::SoundSettings;
 
 /// Terminal bell, used as the always-available fallback cue.
 pub const BELL: &[u8] = b"\x07";
@@ -188,7 +188,7 @@ pub fn resolve(
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
         .or_else(|| file.sound_dir.clone())
-        .map(crate::paths::expand_tilde);
+        .map(favetto_core::paths::expand_tilde);
 
     ResolvedSound {
         enabled,

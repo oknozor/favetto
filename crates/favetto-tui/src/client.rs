@@ -18,7 +18,7 @@ use tokio_util::codec::Framed;
 use favetto_core::rpc::{Frame, Notification, Request, RequestId, Response};
 use favetto_core::wire::FrameCodec;
 
-use crate::ws;
+use favetto_core::ws;
 
 type ClientStream = Pin<Box<dyn Stream<Item = anyhow::Result<Frame>> + Send>>;
 type ClientSink = Pin<Box<dyn Sink<Frame, Error = anyhow::Error> + Send>>;

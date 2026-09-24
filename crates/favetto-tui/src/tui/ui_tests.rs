@@ -86,13 +86,13 @@ fn all_popups_render_without_panic() {
             }),
             Popup::TaskVars(TaskVarsForm {
                 task: "issue".to_string(),
-                vars: vec![crate::tasks::TaskVar {
+                vars: vec![favetto_core::tasks::TaskVar {
                     name: "description".to_string(),
                     prompt: "Describe".to_string(),
                     default: Some("draft".to_string()),
                     required: true,
                     multiline: false,
-                    var_type: crate::tasks::VarType::String,
+                    var_type: favetto_core::tasks::VarType::String,
                     choices: None,
                 }],
                 current: 0,
@@ -894,7 +894,7 @@ fn drawn_schedules_and_notifications_record_geometry() {
 
 #[test]
 fn task_vars_popup_renders_prompts_and_task_name() {
-    use crate::tasks::{TaskVar, VarType};
+    use favetto_core::tasks::{TaskVar, VarType};
 
     let mut app = App::new();
     app.popup = Popup::TaskVars(TaskVarsForm {
@@ -928,7 +928,7 @@ fn task_vars_popup_renders_prompts_and_task_name() {
 
 #[test]
 fn task_vars_popup_keeps_cursor_visible_for_long_multiline_value() {
-    use crate::tasks::{TaskVar, VarType};
+    use favetto_core::tasks::{TaskVar, VarType};
 
     let mut value = (0..30)
         .map(|i| format!("line {i}"))
@@ -962,7 +962,7 @@ fn task_vars_popup_keeps_cursor_visible_for_long_multiline_value() {
 
 #[test]
 fn task_vars_short_value_keeps_fixed_height() {
-    use crate::tasks::{TaskVar, VarType};
+    use favetto_core::tasks::{TaskVar, VarType};
 
     let mut app = App::new();
     app.popup = Popup::TaskVars(TaskVarsForm {
@@ -1002,7 +1002,7 @@ fn task_vars_short_value_keeps_fixed_height() {
 
 #[test]
 fn task_vars_renders_caret_in_the_middle_of_a_value() {
-    use crate::tasks::{TaskVar, VarType};
+    use favetto_core::tasks::{TaskVar, VarType};
 
     let mut buffer = TextBuffer::new("abcd");
     buffer.move_left(); // caret before the trailing 'd'

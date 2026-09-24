@@ -6,6 +6,9 @@
 //! treated as relative and silently joined onto another directory. Every
 //! configured path that reaches the filesystem goes through [`expand_tilde`]
 //! first.
+//!
+//! The `default_*` helpers centralize the XDG locations the daemon and the TUI
+//! client resolve when no explicit path is given.
 
 use std::path::{Path, PathBuf};
 
@@ -29,6 +32,35 @@ pub fn expand_tilde(path: impl AsRef<Path>) -> PathBuf {
     } else {
         home.join(rest)
     }
+}
+
+/// Default data directory (SQLite + token): `$FAVETTO_DATA_DIR`, else the XDG
+/// data dir (`~/.local/share/favetto`).
+pub fn default_data_dir() -> PathBuf {
+    std::env::var("FAVETTO_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::data_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("favetto")
+        })
+}
+
+/// Default config file: `$FAVETTO_CONFIG`, else `~/.config/favetto/config.toml`.
+pub fn default_config_path() -> PathBuf {
+    std::env::var("FAVETTO_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::config_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("favetto")
+                .join("config.toml")
+        })
+}
+
+/// Default bearer-token file: `<data_dir>/token`.
+pub fn default_token_path() -> PathBuf {
+    default_data_dir().join("token")
 }
 
 #[cfg(test)]

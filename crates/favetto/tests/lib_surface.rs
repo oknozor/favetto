@@ -3,9 +3,12 @@
 //! `favetto` is built as both a binary and a library. These references only
 //! compile when the modules the binary and future consumers rely on stay public
 //! in the library crate — the whole point of the library target.
+//!
+//! The TUI client was extracted into the `favetto-tui` crate (issue #107), so
+//! the wire client and its `Client`/`Transport` types are no longer part of this
+//! surface; `favetto::tui` is now only the dispatcher.
 
 use favetto::cli::{Cli, Command, DaemonArgs, DocArgs, PairArgs, TokenRotateArgs, TuiArgs};
-use favetto::client::{Client, Transport, CONNECT_TIMEOUT};
 use favetto::config::FavettoConfig;
 use favetto::paths::expand_tilde;
 use favetto::tasks::TaskDef;
@@ -23,7 +26,8 @@ fn library_target_exposes_the_reusable_surface() {
     ];
     assert!(entry_points.iter().all(|name| !name.is_empty()));
 
-    // Modules shared between the daemon and the TUI client.
+    // Modules shared between the daemon and the TUI client (re-exported from
+    // `favetto-core`).
     let shared = [
         std::any::type_name::<Cli>(),
         std::any::type_name::<Command>(),
@@ -32,8 +36,6 @@ fn library_target_exposes_the_reusable_surface() {
         std::any::type_name::<PairArgs>(),
         std::any::type_name::<TokenRotateArgs>(),
         std::any::type_name::<TuiArgs>(),
-        std::any::type_name::<Client>(),
-        std::any::type_name::<Transport>(),
         std::any::type_name::<FavettoConfig>(),
         std::any::type_name::<TaskDef>(),
         std::any::type_name::<WorkflowGraph>(),
@@ -45,6 +47,5 @@ fn library_target_exposes_the_reusable_surface() {
 
     // Spot-check a couple of pure helpers so the imports are exercised.
     assert_eq!(render("{{ x }}", &serde_json::json!({ "x": 1 })), "1");
-    assert!(CONNECT_TIMEOUT.as_secs() > 0);
     assert!(expand_tilde("~").is_absolute());
 }

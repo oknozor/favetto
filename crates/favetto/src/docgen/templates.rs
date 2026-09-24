@@ -13,7 +13,7 @@
 pub(crate) const CONFIG_INTRO: &str = "\
 # Configuration reference
 
-Generated from `crates/favetto/src/config.rs` by the docs generator. Do not edit by hand.
+Generated from `crates/favetto-core/src/config.rs` by the docs generator. Do not edit by hand.
 
 Every section is optional; favetto falls back to built-in defaults for anything you omit. Values resolve in the order **CLI flag → config file → built-in default**, and every `FAVETTO__SECTION__KEY` environment variable overrides the file.
 
@@ -29,7 +29,7 @@ pub(crate) const CLI_INTRO: &str = "\
 
 Generated from `crates/favetto/src/cli.rs` by the docs generator. Do not edit by hand.
 
-`favetto` is a single binary: `daemon` runs the scheduler, task queue, persistence and remote API; `tui` attaches a client. Run `favetto <command> --help` for the same information at the terminal.
+`favetto` is the daemon and doc generator; its `tui` subcommand execs the sibling `favetto-tui` client binary. Run `favetto <command> --help` for the same information at the terminal.
 
 ";
 

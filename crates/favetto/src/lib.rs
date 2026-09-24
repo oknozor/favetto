@@ -11,15 +11,11 @@ pub mod daemon;
 pub mod docgen;
 pub mod tui;
 
-// Modules shared between the daemon and the TUI client.
-pub mod client;
-pub mod config;
 pub mod pair;
-pub mod paths;
-pub mod tasks;
-pub mod template;
-pub mod workflow;
-pub mod ws;
+
+// Shared pure modules now live in `favetto-core`; re-exported here so the
+// daemon's internal `crate::<module>` paths keep resolving unchanged.
+pub use favetto_core::{config, paths, tasks, template, workflow, ws};
 
 // Daemon internals — not part of the reusable surface.
 mod agents;

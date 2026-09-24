@@ -2,7 +2,7 @@
 
 Generated from `crates/favetto/src/cli.rs` by the docs generator. Do not edit by hand.
 
-`favetto` is a single binary: `daemon` runs the scheduler, task queue, persistence and remote API; `tui` attaches a client. Run `favetto <command> --help` for the same information at the terminal.
+`favetto` is the daemon and doc generator; its `tui` subcommand execs the sibling `favetto-tui` client binary. Run `favetto <command> --help` for the same information at the terminal.
 
 ## `favetto daemon`
 

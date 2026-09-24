@@ -153,7 +153,7 @@ async fn handle_github(state: &State, headers: &HeaderMap, body: &[u8]) -> Respo
     }
 
     for rule in &gh.rules {
-        if !rule.matches(event, action, &summary) {
+        if !github_rule_matches(rule, event, action, &summary) {
             continue;
         }
         let dedupe = delivery.map(|d| format!("webhook:{d}:{}", rule.name));
@@ -389,53 +389,49 @@ fn supported_github_event(event: &str) -> bool {
     )
 }
 
-impl GithubFilter {
-    /// Every configured field must match; unset fields match anything.
-    fn matches(&self, summary: &Value) -> bool {
-        fn field<'a>(summary: &'a Value, key: &str) -> &'a str {
-            summary.get(key).and_then(|v| v.as_str()).unwrap_or("")
-        }
+/// Whether every configured field of `filter` matches; unset fields match anything.
+fn github_filter_matches(filter: &GithubFilter, summary: &Value) -> bool {
+    fn field<'a>(summary: &'a Value, key: &str) -> &'a str {
+        summary.get(key).and_then(|v| v.as_str()).unwrap_or("")
+    }
 
-        for (pattern, key) in [
-            (&self.repo, "repo"),
-            (&self.author, "author"),
-            (&self.base_ref, "base_ref"),
-            (&self.head_ref, "head_ref"),
-        ] {
-            if let Some(pattern) = pattern {
-                if !glob_match(pattern, field(summary, key)) {
-                    return false;
-                }
-            }
-        }
-
-        if !self.labels_contains.is_empty() {
-            let labels: Vec<&str> = summary
-                .get("labels")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|l| l.as_str()).collect())
-                .unwrap_or_default();
-            if !self
-                .labels_contains
-                .iter()
-                .any(|want| labels.contains(&want.as_str()))
-            {
+    for (pattern, key) in [
+        (&filter.repo, "repo"),
+        (&filter.author, "author"),
+        (&filter.base_ref, "base_ref"),
+        (&filter.head_ref, "head_ref"),
+    ] {
+        if let Some(pattern) = pattern {
+            if !glob_match(pattern, field(summary, key)) {
                 return false;
             }
         }
-
-        true
     }
+
+    if !filter.labels_contains.is_empty() {
+        let labels: Vec<&str> = summary
+            .get("labels")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|l| l.as_str()).collect())
+            .unwrap_or_default();
+        if !filter
+            .labels_contains
+            .iter()
+            .any(|want| labels.contains(&want.as_str()))
+        {
+            return false;
+        }
+    }
+
+    true
 }
 
-impl GithubRule {
-    /// Whether this rule applies to a summarised event.
-    fn matches(&self, event: &str, action: &str, summary: &Value) -> bool {
-        self.enabled
-            && self.event == event
-            && self.action.as_deref().is_none_or(|a| a == action)
-            && self.filter.matches(summary)
-    }
+/// Whether `rule` applies to a summarised event.
+fn github_rule_matches(rule: &GithubRule, event: &str, action: &str, summary: &Value) -> bool {
+    rule.enabled
+        && rule.event == event
+        && rule.action.as_deref().is_none_or(|a| a == action)
+        && github_filter_matches(&rule.filter, summary)
 }
 
 /// Glob match with the `glob` crate's default options (so `*` also crosses `/`).
@@ -792,50 +788,67 @@ mod tests {
     #[test]
     fn filter_matches_globs_and_labels() {
         let summary = summarize_github("issues", &issue_opened_body());
-        assert!(GithubFilter {
-            repo: Some("oknozor/*".to_string()),
-            ..Default::default()
-        }
-        .matches(&summary));
-        assert!(GithubFilter {
-            author: Some("okn*".to_string()),
-            ..Default::default()
-        }
-        .matches(&summary));
-        assert!(GithubFilter {
-            labels_contains: vec!["bug".to_string(), "nope".to_string()],
-            ..Default::default()
-        }
-        .matches(&summary));
-        assert!(!GithubFilter {
-            labels_contains: vec!["nope".to_string()],
-            ..Default::default()
-        }
-        .matches(&summary));
+        assert!(github_filter_matches(
+            &GithubFilter {
+                repo: Some("oknozor/*".to_string()),
+                ..Default::default()
+            },
+            &summary
+        ));
+        assert!(github_filter_matches(
+            &GithubFilter {
+                author: Some("okn*".to_string()),
+                ..Default::default()
+            },
+            &summary
+        ));
+        assert!(github_filter_matches(
+            &GithubFilter {
+                labels_contains: vec!["bug".to_string(), "nope".to_string()],
+                ..Default::default()
+            },
+            &summary
+        ));
+        assert!(!github_filter_matches(
+            &GithubFilter {
+                labels_contains: vec!["nope".to_string()],
+                ..Default::default()
+            },
+            &summary
+        ));
         // A set field that fails vetoes the match.
-        assert!(!GithubFilter {
-            repo: Some("someone-else/*".to_string()),
-            ..Default::default()
-        }
-        .matches(&summary));
+        assert!(!github_filter_matches(
+            &GithubFilter {
+                repo: Some("someone-else/*".to_string()),
+                ..Default::default()
+            },
+            &summary
+        ));
         // Unset filters match everything.
-        assert!(GithubFilter::default().matches(&summary));
+        assert!(github_filter_matches(&GithubFilter::default(), &summary));
     }
 
     #[test]
     fn rule_matches_event_action_and_enabled() {
         let summary = summarize_github("issues", &issue_opened_body());
         let r = rule("r", Some("opened"), GithubFilter::default());
-        assert!(r.matches("issues", "opened", &summary));
-        assert!(!r.matches("issues", "closed", &summary));
-        assert!(!r.matches("pull_request", "opened", &summary));
+        assert!(github_rule_matches(&r, "issues", "opened", &summary));
+        assert!(!github_rule_matches(&r, "issues", "closed", &summary));
+        assert!(!github_rule_matches(&r, "pull_request", "opened", &summary));
 
         let any_action = rule("r", None, GithubFilter::default());
-        assert!(any_action.matches("issues", "closed", &summary));
+        assert!(github_rule_matches(
+            &any_action,
+            "issues",
+            "closed",
+            &summary
+        ));
 
         let mut disabled = rule("r", None, GithubFilter::default());
         disabled.enabled = false;
-        assert!(!disabled.matches("issues", "opened", &summary));
+        assert!(!github_rule_matches(
+            &disabled, "issues", "opened", &summary
+        ));
     }
 
     fn catalog() -> Vec<TaskDef> {

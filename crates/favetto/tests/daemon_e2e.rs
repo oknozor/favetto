@@ -6,9 +6,9 @@
 //! a catalog task to completion, and the WebSocket surface is checked for its
 //! bearer-token rejection.
 //!
-//! The `favetto` crate has no library target (it is a single binary), so the
-//! client here is a deliberately small reimplementation of the wire framing over
-//! [`favetto_core::wire::FrameCodec`] rather than a reuse of `favetto::client`.
+//! The TUI client's wire client lives in the separate `favetto-tui` crate, so
+//! the client here is a deliberately small reimplementation of the wire framing
+//! over [`favetto_core::wire::FrameCodec`] rather than a reuse of it.
 
 #![cfg(unix)]
 

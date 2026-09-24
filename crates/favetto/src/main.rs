@@ -15,11 +15,14 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let cli = cli::Cli::parse();
+    let raw: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let cli = cli::Cli::parse_from(&raw);
 
     match cli.command {
         Command::Daemon(args) => favetto::daemon::run(args).await,
-        Command::Tui(args) => favetto::tui::run(args).await,
+        // The TUI client ships as the standalone `favetto-tui` binary; `tui` is
+        // a thin dispatcher that execs it with the original flags.
+        Command::Tui(_) => favetto::tui::run(&raw),
         Command::Pair(args) => favetto::pair::run(args).await,
         Command::TokenRotate(args) => token_rotate(args),
         Command::Doc(args) => favetto::docgen::run(&args),

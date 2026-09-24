@@ -18,11 +18,18 @@ cd favetto
 cargo build --release
 ```
 
-The binary lands at `target/release/favetto`. To put it on your `PATH`:
+The binaries land at `target/release/favetto` (daemon) and
+`target/release/favetto-tui` (TUI client). To put both on your `PATH`:
 
 ```bash
 cargo install --path crates/favetto
+cargo install --path crates/favetto-tui
 ```
+
+::: tip One command to attach
+The `favetto` launcher execs the sibling `favetto-tui` binary for
+`favetto tui …`, so install both to keep that invocation working.
+:::
 
 ## Verify
 

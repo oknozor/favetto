@@ -110,30 +110,47 @@ pub struct TokenRotateArgs {
     pub data_dir: Option<PathBuf>,
 }
 
-/// Default data directory (SQLite + token): `$FAVETTO_DATA_DIR`, else the XDG data
-/// dir (`~/.local/share/favetto`).
-pub fn default_data_dir() -> PathBuf {
-    std::env::var("FAVETTO_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::data_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("favetto")
-        })
-}
+/// Default paths (data dir, config file, token file), re-exported from
+/// `favetto-core` so the daemon and the TUI client resolve them identically.
+pub use favetto_core::paths::{default_config_path, default_data_dir, default_token_path};
 
-/// Default config file: `$FAVETTO_CONFIG`, else `~/.config/favetto/config.toml`.
-pub fn default_config_path() -> PathBuf {
-    std::env::var("FAVETTO_CONFIG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::config_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("favetto")
-                .join("config.toml")
-        })
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
 
-pub fn default_token_path() -> PathBuf {
-    default_data_dir().join("token")
+    /// The long flags the `tui` subcommand forwards to the standalone
+    /// `favetto-tui` binary. `crates/favetto-tui/src/cli.rs` pins the same list;
+    /// a flag added on one side without the other breaks `favetto tui …`.
+    const TUI_LONG_FLAGS: &[&str] = &[
+        "config",
+        "no-sound",
+        "pair-code",
+        "remote",
+        "socket",
+        "sound",
+        "sound-command",
+        "test-sound",
+        "token-file",
+    ];
+
+    fn long_flags(cmd: &clap::Command) -> Vec<String> {
+        let mut longs: Vec<String> = cmd
+            .get_arguments()
+            .filter_map(|arg| arg.get_long().map(str::to_string))
+            .filter(|long| long != "help" && long != "version")
+            .collect();
+        longs.sort();
+        longs
+    }
+
+    #[test]
+    fn tui_subcommand_forwards_the_expected_flags() {
+        let cmd = Cli::command();
+        let tui = cmd
+            .get_subcommands()
+            .find(|sub| sub.get_name() == "tui")
+            .expect("tui subcommand");
+        assert_eq!(long_flags(tui), TUI_LONG_FLAGS);
+    }
 }

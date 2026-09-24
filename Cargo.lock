@@ -975,12 +975,10 @@ name = "favetto"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "ascii-dag",
  "axum",
  "base64 0.23.1",
  "chrono",
  "clap",
- "config",
  "dirs",
  "favetto-core",
  "favetto-providers",
@@ -994,7 +992,6 @@ dependencies = [
  "parking_lot",
  "portable-pty",
  "proptest",
- "ratatui",
  "reqwest",
  "schemars",
  "serde",
@@ -1002,7 +999,6 @@ dependencies = [
  "sha2 0.11.0",
  "sqlx",
  "subtle",
- "throbber-widgets-tui",
  "tokio",
  "tokio-cron-scheduler",
  "tokio-tungstenite 0.30.0",
@@ -1010,7 +1006,6 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
- "unicode-segmentation",
  "uuid",
  "vt100",
 ]
@@ -1019,15 +1014,21 @@ dependencies = [
 name = "favetto-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bytes",
  "chrono",
+ "config",
+ "dirs",
  "proptest",
  "rmp-serde",
+ "schemars",
  "serde",
  "serde_json",
  "subtle",
  "thiserror 2.0.20",
  "tokio-util",
+ "toml 0.8.23",
+ "tracing",
  "uuid",
 ]
 
@@ -1040,6 +1041,36 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "favetto-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ascii-dag",
+ "base64 0.23.1",
+ "chrono",
+ "clap",
+ "favetto-core",
+ "favetto-providers",
+ "futures-util",
+ "http",
+ "libc",
+ "parking_lot",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "throbber-widgets-tui",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-segmentation",
+ "uuid",
+ "vt100",
 ]
 
 [[package]]

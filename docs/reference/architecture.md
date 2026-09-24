@@ -38,9 +38,10 @@ embedded as live terminals — the orchestrator never implements its own agent l
 
 ```
 crates/
-  favetto-core/          shared wire protocol + domain types (no HTTP/DB/LLM)
+  favetto-core/          shared wire protocol, domain types, and pure modules
   favetto-providers/     provider/model catalog (opencode auth + models.dev)
-  favetto/               single binary: daemon, tui, doc generator
+  favetto-tui/           standalone TUI client binary
+  favetto/               daemon + doc generator; `tui` execs favetto-tui
 tasks/                        task catalog: `*.md` files with TOML header + prompt
 docs/                         VitePress site: guide + generated reference
 ```

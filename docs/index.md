@@ -41,6 +41,7 @@ git clone https://github.com/oknozor/favetto
 cd favetto
 cargo build --release
 cargo install --path crates/favetto
+cargo install --path crates/favetto-tui
 ```
 
 You also need an agent CLI (for example opencode) on your `PATH`. See

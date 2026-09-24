@@ -1,8 +1,10 @@
 # Getting started
 
-favetto is a single binary that runs in two roles: a long-lived **daemon**
-(scheduler, task queue, persistence, remote API) and a **TUI client**. This page
-starts both and attaches the client. It takes about two minutes.
+favetto runs in two roles: a long-lived **daemon** (scheduler, task queue,
+persistence, remote API) and a **TUI client**. The daemon is the `favetto`
+binary; the client lives in the sibling `favetto-tui` binary and is launched
+transparently by `favetto tui`. This page starts both and attaches the client.
+It takes about two minutes.
 
 If you have not built favetto yet, start with [Installation](./installation).
 

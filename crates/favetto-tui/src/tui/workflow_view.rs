@@ -10,13 +10,13 @@ use std::collections::HashMap;
 
 use ascii_dag::{BoxedNode, Graph, LabelOverflow, NodeId, RenderOptions, AUTO};
 
-use crate::workflow::{WorkflowEdgeKind, WorkflowGraph};
+use favetto_core::workflow::{WorkflowEdgeKind, WorkflowGraph};
 
 /// Render `graph` as box-drawing text (one entry per output row).
 ///
 /// Node labels carry the `(external)`/`(scheduled)` suffixes; edge labels are
 /// `spawn`/`needs`. Returns `Err` only when an edge references an unknown node,
-/// which [`crate::workflow::build_graph`] never produces — the caller then
+/// which [`favetto_core::workflow::build_graph`] never produces — the caller then
 /// falls back to raw DOT.
 pub fn render(graph: &WorkflowGraph) -> Result<String, String> {
     // Labels live here so `BoxedNode` can borrow them for the graph's lifetime.
@@ -67,7 +67,7 @@ pub fn render(graph: &WorkflowGraph) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workflow::{WorkflowEdge, WorkflowNode};
+    use favetto_core::workflow::{WorkflowEdge, WorkflowNode};
 
     fn node(name: &str) -> WorkflowNode {
         WorkflowNode {
