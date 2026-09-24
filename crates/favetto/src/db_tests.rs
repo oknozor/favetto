@@ -1,6 +1,6 @@
 use super::*;
 use chrono::Utc;
-use favetto_core::model::{Event, Failure, FailureKind};
+use favetto_core::model::{Event, Failure, FailureKind, RunStatus, TaskRun};
 
 #[tokio::test]
 async fn event_replay_resumes_from_cursor() {
@@ -278,6 +278,22 @@ fn task_at(
         parent_id: None,
         root_id: None,
         interactive: false,
+    }
+}
+
+fn run_at(task_id: Uuid, attempt: u32) -> TaskRun {
+    TaskRun {
+        id: Uuid::new_v4(),
+        task_id,
+        attempt,
+        status: RunStatus::Running,
+        agent: None,
+        session_id: None,
+        started_at: Some(Utc::now()),
+        finished_at: None,
+        exit_code: None,
+        error: None,
+        failure: None,
     }
 }
 
@@ -732,5 +748,277 @@ async fn migrate_creates_worktrees_table() {
         names.iter().any(|n| n == "worktrees"),
         "missing worktrees table in {names:?}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn migrate_creates_task_runs_table_and_index() {
+    let (dir, pool) = scratch_pool("task-runs-table").await;
+    let tables: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        tables.iter().any(|n| n == "task_runs"),
+        "missing task_runs table in {tables:?}"
+    );
+    let indexes: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'index'")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    for expected in ["idx_task_runs_task_attempt", "idx_task_runs_status"] {
+        assert!(
+            indexes.iter().any(|n| n == expected),
+            "missing index `{expected}` in {indexes:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn task_run_round_trips() {
+    let (dir, pool) = scratch_pool("task-run-roundtrip").await;
+    let task = task_at(Utc::now(), Some(Utc::now()), None);
+    upsert_task(&pool, &task).await.unwrap();
+
+    let started = Utc::now();
+    let finished = started + ChronoDuration::seconds(3);
+    let mut first = run_at(task.id, 1);
+    first.status = RunStatus::Succeeded;
+    first.agent = Some("opencode".to_string());
+    first.session_id = Some("ses_1".to_string());
+    first.started_at = Some(started);
+    first.finished_at = Some(finished);
+    first.exit_code = Some(0);
+    let mut second = run_at(task.id, 2);
+    second.status = RunStatus::Failed;
+    second.exit_code = Some(1);
+    second.error = Some("boom".to_string());
+    second.failure = Some(Failure::new(FailureKind::Infrastructure, "boom"));
+    let mut third = run_at(task.id, 3);
+    third.status = RunStatus::TimedOut;
+    third.failure = Some(Failure::new(FailureKind::Timeout, "deadline"));
+
+    // Insert out of order to prove the list sort is by attempt, not insert order.
+    for run in [&second, &first, &third] {
+        insert_task_run(&pool, run).await.unwrap();
+    }
+
+    let got = get_task_run(&pool, first.id).await.unwrap().unwrap();
+    assert_eq!(got.task_id, task.id);
+    assert_eq!(got.attempt, 1);
+    assert_eq!(got.status, RunStatus::Succeeded);
+    assert_eq!(got.agent.as_deref(), Some("opencode"));
+    assert_eq!(got.session_id.as_deref(), Some("ses_1"));
+    assert_eq!(got.exit_code, Some(0));
+    assert_eq!(
+        got.started_at.map(|t| t.timestamp_millis()),
+        Some(started.timestamp_millis())
+    );
+    assert_eq!(
+        got.finished_at.map(|t| t.timestamp_millis()),
+        Some(finished.timestamp_millis())
+    );
+
+    let listed = list_task_runs(&pool, task.id).await.unwrap();
+    assert_eq!(listed.len(), 3);
+    assert_eq!(
+        listed.iter().map(|r| r.attempt).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "runs must come back oldest-first"
+    );
+    assert_eq!(
+        listed[1].failure.as_ref().unwrap().kind,
+        FailureKind::Infrastructure
+    );
+    assert_eq!(
+        listed[2].failure.as_ref().unwrap().kind,
+        FailureKind::Timeout
+    );
+    // A different task has no runs.
+    assert!(list_task_runs(&pool, Uuid::new_v4())
+        .await
+        .unwrap()
+        .is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn active_run_is_latest_non_terminal() {
+    let (dir, pool) = scratch_pool("active-run").await;
+    let task = task_at(Utc::now(), None, None);
+    upsert_task(&pool, &task).await.unwrap();
+
+    let mut failed = run_at(task.id, 1);
+    failed.status = RunStatus::Failed;
+    failed.finished_at = Some(Utc::now());
+    let mut running = run_at(task.id, 2);
+    running.status = RunStatus::Running;
+    insert_task_run(&pool, &failed).await.unwrap();
+    insert_task_run(&pool, &running).await.unwrap();
+
+    let active = get_active_task_run(&pool, task.id).await.unwrap().unwrap();
+    assert_eq!(active.id, running.id);
+    assert_eq!(active.attempt, 2);
+
+    let all_active = list_active_task_runs(&pool).await.unwrap();
+    assert_eq!(all_active.len(), 1);
+    assert_eq!(all_active[0].id, running.id);
+
+    // Finalizing the running attempt leaves no active run.
+    let mut done = running.clone();
+    done.status = RunStatus::Succeeded;
+    done.finished_at = Some(Utc::now());
+    done.exit_code = Some(0);
+    assert!(finalize_task_run(&pool, &done).await.unwrap());
+    assert!(get_active_task_run(&pool, task.id).await.unwrap().is_none());
+    assert!(list_active_task_runs(&pool).await.unwrap().is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn finalize_task_run_writes_outcome_and_keeps_started() {
+    let (dir, pool) = scratch_pool("finalize-run").await;
+    let task = task_at(Utc::now(), None, None);
+    upsert_task(&pool, &task).await.unwrap();
+
+    let started = Utc::now();
+    let mut run = run_at(task.id, 1);
+    run.started_at = Some(started);
+    run.agent = Some("opencode".to_string());
+    run.session_id = Some("ses_keep".to_string());
+    insert_task_run(&pool, &run).await.unwrap();
+
+    let finished = started + ChronoDuration::seconds(7);
+    let mut outcome = run.clone();
+    outcome.status = RunStatus::Succeeded;
+    outcome.finished_at = Some(finished);
+    outcome.exit_code = Some(0);
+    // Passing `None` must not clobber the session id written at insert time.
+    outcome.session_id = None;
+    assert!(finalize_task_run(&pool, &outcome).await.unwrap());
+
+    let got = get_task_run(&pool, run.id).await.unwrap().unwrap();
+    assert_eq!(got.status, RunStatus::Succeeded);
+    assert_eq!(got.exit_code, Some(0));
+    assert_eq!(got.session_id.as_deref(), Some("ses_keep"));
+    assert_eq!(got.agent.as_deref(), Some("opencode"));
+    assert_eq!(
+        got.started_at.map(|t| t.timestamp_millis()),
+        Some(started.timestamp_millis()),
+        "finalize must not touch started_at"
+    );
+    assert_eq!(
+        got.finished_at.map(|t| t.timestamp_millis()),
+        Some(finished.timestamp_millis())
+    );
+
+    // A second finalization to a failure round-trips the typed failure.
+    let mut timeout = run.clone();
+    timeout.status = RunStatus::TimedOut;
+    timeout.finished_at = Some(Utc::now());
+    timeout.error = Some("deadline".to_string());
+    timeout.failure = Some(Failure::new(FailureKind::Timeout, "deadline"));
+    assert!(finalize_task_run(&pool, &timeout).await.unwrap());
+    let got = get_task_run(&pool, run.id).await.unwrap().unwrap();
+    assert_eq!(got.status, RunStatus::TimedOut);
+    assert_eq!(got.failure.as_ref().unwrap().kind, FailureKind::Timeout);
+    assert_eq!(got.failure.as_ref().unwrap().message, "deadline");
+    assert_eq!(got.error.as_deref(), Some("deadline"));
+
+    // Unknown id: no row matched.
+    let mut missing = run.clone();
+    missing.id = Uuid::new_v4();
+    assert!(!finalize_task_run(&pool, &missing).await.unwrap());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn prune_cascades_task_runs() {
+    let (dir, pool) = scratch_pool("prune-runs").await;
+    let old = Utc::now() - ChronoDuration::days(60);
+    // Four old terminal tasks, each with one run. `min_tasks = 2` keeps two.
+    let mut kept_ids = Vec::new();
+    for i in 0..4 {
+        let created = old + ChronoDuration::hours(i);
+        let task = task_at(created, Some(created), None);
+        upsert_task(&pool, &task).await.unwrap();
+        insert_task_run(&pool, &run_at(task.id, 1)).await.unwrap();
+        if i >= 2 {
+            kept_ids.push(task.id);
+        }
+    }
+    // An orphan run whose owning task row does not exist is dead history too.
+    let orphan = run_at(Uuid::new_v4(), 1);
+    insert_task_run(&pool, &orphan).await.unwrap();
+
+    let stats = prune(&pool, 30, 2, false).await.unwrap();
+    // Two deleted tasks' runs plus the orphan.
+    assert_eq!(stats.tasks_deleted, 2);
+    assert_eq!(stats.runs_deleted, 3);
+    assert_eq!(
+        list_task_runs(&pool, orphan.task_id).await.unwrap().len(),
+        0
+    );
+    for id in &kept_ids {
+        assert_eq!(list_task_runs(&pool, *id).await.unwrap().len(), 1);
+    }
+    assert_eq!(list_active_task_runs(&pool).await.unwrap().len(), 2);
+
+    // `days = 0` is still a no-op and leaves runs untouched.
+    let noop = prune(&pool, 0, 0, true).await.unwrap();
+    assert_eq!(noop, PruneStats::default());
+    assert_eq!(stats.runs_deleted, 3);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn migrate_adds_task_runs_to_legacy_database() {
+    let dir = std::env::temp_dir().join(format!("favetto-legacy-runs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let pool = open(&dir.join("test.db")).await.unwrap();
+
+    // A pre-migration database: the tasks table predates `session_title` and
+    // there is no `task_runs` table at all.
+    sqlx::query(
+        "CREATE TABLE tasks (
+                id          TEXT PRIMARY KEY,
+                name        TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                input       TEXT NOT NULL,
+                output      TEXT,
+                dedupe_key  TEXT UNIQUE,
+                created_at  INTEGER NOT NULL,
+                started_at  INTEGER,
+                finished_at INTEGER,
+                error       TEXT,
+                session_id  TEXT
+            )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Running the migration twice is a no-op the second time; both must succeed
+    // and add the new table.
+    migrate(&pool).await.unwrap();
+    migrate(&pool).await.unwrap();
+
+    let task = task_at(Utc::now(), None, None);
+    upsert_task(&pool, &task).await.unwrap();
+    let run = run_at(task.id, 1);
+    insert_task_run(&pool, &run).await.unwrap();
+    let got = list_task_runs(&pool, task.id).await.unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].id, run.id);
+    assert_eq!(got[0].status, RunStatus::Running);
+
     let _ = std::fs::remove_dir_all(&dir);
 }

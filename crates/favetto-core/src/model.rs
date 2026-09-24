@@ -63,6 +63,109 @@ impl FromStr for TaskStatus {
     }
 }
 
+/// Lifecycle of a single execution attempt of a task.
+///
+/// A [`Task`] is the logical work item; each time the daemon runs it, a new
+/// [`TaskRun`] records that attempt. `RunStatus` mirrors [`TaskStatus`] but adds
+/// the run-only outcomes a daemon restart can produce (`interrupted`) and the
+/// deadline case (`timed_out`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStatus {
+    /// Created, not yet picked up by the agent runtime.
+    Pending,
+    /// Currently being executed.
+    Running,
+    /// Running, but the agent is blocked waiting for user input.
+    AwaitingInput,
+    /// The attempt completed successfully.
+    Succeeded,
+    /// The attempt failed.
+    Failed,
+    /// The attempt was cancelled before completion.
+    Cancelled,
+    /// The daemon/supervisor lost the attempt (e.g. restart reconciliation).
+    Interrupted,
+    /// The attempt exceeded its deadline.
+    TimedOut,
+}
+
+impl RunStatus {
+    /// Stable string form used for persistence and on-the-wire encoding.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunStatus::Pending => "pending",
+            RunStatus::Running => "running",
+            RunStatus::AwaitingInput => "awaiting_input",
+            RunStatus::Succeeded => "succeeded",
+            RunStatus::Failed => "failed",
+            RunStatus::Cancelled => "cancelled",
+            RunStatus::Interrupted => "interrupted",
+            RunStatus::TimedOut => "timed_out",
+        }
+    }
+
+    /// Whether the run is finished and will not change again.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            RunStatus::Succeeded
+                | RunStatus::Failed
+                | RunStatus::Cancelled
+                | RunStatus::Interrupted
+                | RunStatus::TimedOut
+        )
+    }
+}
+
+impl FromStr for RunStatus {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "pending" => RunStatus::Pending,
+            "running" => RunStatus::Running,
+            "awaiting_input" => RunStatus::AwaitingInput,
+            "succeeded" => RunStatus::Succeeded,
+            "failed" => RunStatus::Failed,
+            "cancelled" => RunStatus::Cancelled,
+            "interrupted" => RunStatus::Interrupted,
+            "timed_out" => RunStatus::TimedOut,
+            _ => return Err(()),
+        })
+    }
+}
+
+/// One execution attempt of a [`Task`]. The task is the logical work item; a run
+/// is one attempt at it. Run rows are history/metrics/reconciliation records,
+/// not a second source of truth for the task's live state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRun {
+    pub id: Uuid,
+    pub task_id: Uuid,
+    /// 1-based attempt counter within the task.
+    pub attempt: u32,
+    pub status: RunStatus,
+    /// Name of the agent that ran (or was configured for) this attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The agent's own session id for this attempt, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Machine-readable classification, defined by #141. Absent while the run is
+    /// still in flight or when it did not fail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<Failure>,
+}
+
 /// Why a task ended in failure, so a controller can distinguish a genuine
 /// agent failure from an infrastructure fault.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -843,6 +946,127 @@ mod tests {
             );
         }
         assert_eq!(TaskStatus::AwaitingInput.as_str(), "awaiting_input");
+    }
+
+    #[test]
+    fn run_status_round_trips() {
+        for status in [
+            RunStatus::Pending,
+            RunStatus::Running,
+            RunStatus::AwaitingInput,
+            RunStatus::Succeeded,
+            RunStatus::Failed,
+            RunStatus::Cancelled,
+            RunStatus::Interrupted,
+            RunStatus::TimedOut,
+        ] {
+            assert_eq!(
+                status.as_str().parse::<RunStatus>(),
+                Ok(status),
+                "from_str/as_str mismatch for {status:?}"
+            );
+            let json = serde_json::to_value(status).unwrap();
+            let back: RunStatus = serde_json::from_value(json).unwrap();
+            assert_eq!(back, status);
+        }
+        // The wire spellings are stable.
+        assert_eq!(RunStatus::AwaitingInput.as_str(), "awaiting_input");
+        assert_eq!(RunStatus::TimedOut.as_str(), "timed_out");
+        assert_eq!(RunStatus::Interrupted.as_str(), "interrupted");
+    }
+
+    #[test]
+    fn run_status_is_terminal() {
+        for status in [
+            RunStatus::Succeeded,
+            RunStatus::Failed,
+            RunStatus::Cancelled,
+            RunStatus::Interrupted,
+            RunStatus::TimedOut,
+        ] {
+            assert!(status.is_terminal(), "{status:?} must be terminal");
+        }
+        for status in [
+            RunStatus::Pending,
+            RunStatus::Running,
+            RunStatus::AwaitingInput,
+        ] {
+            assert!(!status.is_terminal(), "{status:?} must be non-terminal");
+        }
+    }
+
+    #[test]
+    fn task_run_round_trips() {
+        let id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let started_at = Utc::now();
+        let finished_at = started_at + chrono::Duration::seconds(5);
+        let run = TaskRun {
+            id,
+            task_id,
+            attempt: 2,
+            status: RunStatus::Failed,
+            agent: Some("opencode".to_string()),
+            session_id: Some("ses_1".to_string()),
+            started_at: Some(started_at),
+            finished_at: Some(finished_at),
+            exit_code: Some(1),
+            error: Some("boom".to_string()),
+            failure: Some(Failure::new(FailureKind::Infrastructure, "boom")),
+        };
+
+        let json = serde_json::to_value(&run).unwrap();
+        assert_eq!(json["id"], id.to_string());
+        assert_eq!(json["task_id"], task_id.to_string());
+        assert_eq!(json["status"], "failed");
+        assert_eq!(json["attempt"], 2);
+        assert_eq!(json["exit_code"], 1);
+        assert_eq!(json["failure"]["kind"], "infrastructure");
+        assert_eq!(json["failure"]["message"], "boom");
+
+        let back: TaskRun = serde_json::from_value(json).unwrap();
+        assert_eq!(back.id, run.id);
+        assert_eq!(back.task_id, run.task_id);
+        assert_eq!(back.attempt, run.attempt);
+        assert_eq!(back.status, run.status);
+        assert_eq!(back.agent, run.agent);
+        assert_eq!(back.session_id, run.session_id);
+        assert_eq!(
+            back.started_at.map(|t| t.timestamp_millis()),
+            run.started_at.map(|t| t.timestamp_millis())
+        );
+        assert_eq!(
+            back.finished_at.map(|t| t.timestamp_millis()),
+            run.finished_at.map(|t| t.timestamp_millis())
+        );
+        assert_eq!(back.exit_code, run.exit_code);
+        assert_eq!(back.error, run.error);
+        assert_eq!(back.failure, run.failure);
+    }
+
+    #[test]
+    fn task_run_defaults_optional_fields() {
+        // A minimal payload omitting every optional key still decodes.
+        let legacy: TaskRun = serde_json::from_str(
+            r#"{
+                "id": "00000000-0000-0000-0000-000000000000",
+                "task_id": "11111111-1111-1111-1111-111111111111",
+                "attempt": 1,
+                "status": "pending"
+            }"#,
+        )
+        .unwrap();
+        assert!(legacy.agent.is_none());
+        assert!(legacy.session_id.is_none());
+        assert!(legacy.started_at.is_none());
+        assert!(legacy.finished_at.is_none());
+        assert!(legacy.exit_code.is_none());
+        assert!(legacy.error.is_none());
+        assert!(legacy.failure.is_none());
+        // Absent optional fields are omitted from the serialized form.
+        let json = serde_json::to_value(&legacy).unwrap();
+        assert!(json.get("agent").is_none());
+        assert!(json.get("failure").is_none());
     }
 
     #[test]

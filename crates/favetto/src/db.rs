@@ -15,7 +15,9 @@ use sqlx::sqlite::{
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
-use favetto_core::model::{Event, EventKind, NotificationRecord, Schedule, Task, TaskStatus};
+use favetto_core::model::{
+    Event, EventKind, NotificationRecord, RunStatus, Schedule, Task, TaskRun, TaskStatus,
+};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS tasks (
@@ -79,10 +81,26 @@ CREATE TABLE IF NOT EXISTS worktrees (
     created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS task_runs (
+    id          TEXT PRIMARY KEY,
+    task_id     TEXT NOT NULL,
+    attempt     INTEGER NOT NULL,
+    status      TEXT NOT NULL,
+    agent       TEXT,
+    session_id  TEXT,
+    started_at  INTEGER,
+    finished_at INTEGER,
+    exit_code   INTEGER,
+    error       TEXT,
+    failure     TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tasks_status_created_at ON tasks(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);
 CREATE INDEX IF NOT EXISTS idx_notifications_sent_at ON notifications(sent_at);
+CREATE INDEX IF NOT EXISTS idx_task_runs_task_attempt ON task_runs(task_id, attempt);
+CREATE INDEX IF NOT EXISTS idx_task_runs_status ON task_runs(status);
 "#;
 
 fn ts_ms(dt: DateTime<Utc>) -> i64 {
@@ -314,6 +332,40 @@ fn row_to_task(row: &SqliteRow) -> Task {
             .try_get::<i64, _>("interactive")
             .map(|v| v != 0)
             .unwrap_or(false),
+    }
+}
+
+fn row_to_task_run(row: &SqliteRow) -> TaskRun {
+    TaskRun {
+        id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap_or_default(),
+        task_id: Uuid::parse_str(&row.get::<String, _>("task_id")).unwrap_or_default(),
+        attempt: row.get::<i64, _>("attempt").max(0) as u32,
+        status: row
+            .get::<String, _>("status")
+            .parse()
+            .unwrap_or(RunStatus::Pending),
+        agent: row.try_get::<Option<String>, _>("agent").ok().flatten(),
+        session_id: row
+            .try_get::<Option<String>, _>("session_id")
+            .ok()
+            .flatten(),
+        started_at: row
+            .try_get::<Option<i64>, _>("started_at")
+            .ok()
+            .flatten()
+            .map(from_ms),
+        finished_at: row
+            .try_get::<Option<i64>, _>("finished_at")
+            .ok()
+            .flatten()
+            .map(from_ms),
+        exit_code: row.try_get::<Option<i32>, _>("exit_code").ok().flatten(),
+        error: row.try_get::<Option<String>, _>("error").ok().flatten(),
+        failure: row
+            .try_get::<Option<String>, _>("failure")
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok()),
     }
 }
 
@@ -624,6 +676,131 @@ pub async fn set_task_session(
 }
 
 // ---------------------------------------------------------------------------
+// Task runs
+// ---------------------------------------------------------------------------
+
+/// Insert a run row.
+///
+/// Generic over the sqlx executor so #147 can create the run inside the
+/// `claim_task` transaction; passing a plain `&pool` works too.
+#[allow(dead_code)] // consumed by the executor (#147); unit-tested here.
+pub async fn insert_task_run<'e, E>(executor: E, run: &TaskRun) -> anyhow::Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query(
+        "INSERT INTO task_runs
+            (id, task_id, attempt, status, agent, session_id, started_at, finished_at, exit_code, error, failure)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(run.id.to_string())
+    .bind(run.task_id.to_string())
+    .bind(run.attempt as i64)
+    .bind(run.status.as_str())
+    .bind(&run.agent)
+    .bind(&run.session_id)
+    .bind(run.started_at.map(ts_ms))
+    .bind(run.finished_at.map(ts_ms))
+    .bind(run.exit_code)
+    .bind(&run.error)
+    .bind(run.failure.as_ref().map(serde_json::to_string).transpose()?)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Fetch a single run by id.
+#[allow(dead_code)] // consumed by the executor (#147); unit-tested here.
+pub async fn get_task_run(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Option<TaskRun>> {
+    let row = sqlx::query(
+        "SELECT id, task_id, attempt, status, agent, session_id, started_at, finished_at, exit_code, error, failure \
+         FROM task_runs WHERE id = ?",
+    )
+    .bind(id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.as_ref().map(row_to_task_run))
+}
+
+/// A task's runs, oldest-first (attempt ascending).
+#[allow(dead_code)] // consumed by the executor (#147); unit-tested here.
+pub async fn list_task_runs(pool: &SqlitePool, task_id: Uuid) -> anyhow::Result<Vec<TaskRun>> {
+    let rows = sqlx::query(
+        "SELECT id, task_id, attempt, status, agent, session_id, started_at, finished_at, exit_code, error, failure \
+         FROM task_runs WHERE task_id = ? ORDER BY attempt ASC, started_at ASC",
+    )
+    .bind(task_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(row_to_task_run).collect())
+}
+
+/// The task's current non-terminal run, if any (latest attempt first).
+#[allow(dead_code)] // consumed by the executor (#147); unit-tested here.
+pub async fn get_active_task_run(
+    pool: &SqlitePool,
+    task_id: Uuid,
+) -> anyhow::Result<Option<TaskRun>> {
+    let row = sqlx::query(
+        "SELECT id, task_id, attempt, status, agent, session_id, started_at, finished_at, exit_code, error, failure \
+         FROM task_runs WHERE task_id = ? AND status IN ('pending', 'running', 'awaiting_input') \
+         ORDER BY attempt DESC LIMIT 1",
+    )
+    .bind(task_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.as_ref().map(row_to_task_run))
+}
+
+/// Every non-terminal run across all tasks, oldest-first (for the reconciler).
+#[allow(dead_code)] // consumed by the startup reconciler (#148); unit-tested here.
+pub async fn list_active_task_runs(pool: &SqlitePool) -> anyhow::Result<Vec<TaskRun>> {
+    let rows = sqlx::query(
+        "SELECT id, task_id, attempt, status, agent, session_id, started_at, finished_at, exit_code, error, failure \
+         FROM task_runs WHERE status IN ('pending', 'running', 'awaiting_input') \
+         ORDER BY started_at ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(row_to_task_run).collect())
+}
+
+/// Finalize a run's outcome columns by id. Returns whether a row matched.
+///
+/// Only the outcome fields are written; `started_at`, `agent` and `attempt` are
+/// left as inserted. `session_id` uses `COALESCE`, so an id persisted earlier is
+/// kept when `None` is passed. Takes a whole [`TaskRun`] because the executor
+/// already has one in hand when finishing an attempt.
+#[allow(dead_code)] // consumed by the executor (#147); unit-tested here.
+pub async fn finalize_task_run(pool: &SqlitePool, run: &TaskRun) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        "UPDATE task_runs SET
+             status = ?,
+             session_id = COALESCE(?, session_id),
+             finished_at = ?,
+             exit_code = ?,
+             error = ?,
+             failure = ?
+         WHERE id = ?",
+    )
+    .bind(run.status.as_str())
+    .bind(&run.session_id)
+    .bind(run.finished_at.map(ts_ms))
+    .bind(run.exit_code)
+    .bind(&run.error)
+    .bind(
+        run.failure
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+    )
+    .bind(run.id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+// ---------------------------------------------------------------------------
 // Retention
 // ---------------------------------------------------------------------------
 
@@ -632,6 +809,7 @@ pub async fn set_task_session(
 pub struct PruneStats {
     pub outputs_cleared: u64,
     pub tasks_deleted: u64,
+    pub runs_deleted: u64,
     pub events_deleted: u64,
     pub notifications_deleted: u64,
     pub webhook_deliveries_deleted: u64,
@@ -670,6 +848,13 @@ pub async fn prune(
     .execute(pool)
     .await?
     .rows_affected();
+    // No foreign keys are enabled in SQLite, so cascade manually: any run whose
+    // owning task row is gone is dead history.
+    stats.runs_deleted =
+        sqlx::query("DELETE FROM task_runs WHERE task_id NOT IN (SELECT id FROM tasks)")
+            .execute(pool)
+            .await?
+            .rows_affected();
     stats.events_deleted = sqlx::query("DELETE FROM events WHERE created_at < ?")
         .bind(cutoff)
         .execute(pool)
@@ -689,6 +874,7 @@ pub async fn prune(
     if vacuum
         && (stats.outputs_cleared
             + stats.tasks_deleted
+            + stats.runs_deleted
             + stats.events_deleted
             + stats.notifications_deleted
             + stats.webhook_deliveries_deleted)
