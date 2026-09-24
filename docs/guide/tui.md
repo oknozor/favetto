@@ -48,6 +48,7 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 | Tasks | `c` | cancel the selected non-terminal task (confirm) |
 | Tasks | `r` | retry the selected terminal task (confirm) |
 | Tasks | `C` | cancel every task in the selected task's workflow root (confirm) |
+| Tasks | `i` | inspect the selected task's runtime workflow |
 | Catalog | `Enter` | start the task; on a folder, fold/unfold |
 | Catalog | `e` | edit the selected task in `$VISUAL`/`$EDITOR` |
 | Catalog | `Space` | fold/unfold the selected folder |
@@ -74,14 +75,19 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 | Task input | `Ctrl+Enter` | submit the form |
 | Workflow (`w`) | `↑` / `↓` / `PageUp` / `PageDown` | scroll the graph source |
 | Workflow (`w`) | `Esc` / `w` | close |
+| Runtime workflow (`i`) | `↑` / `↓` | select an instance |
+| Runtime workflow (`i`) | `c` | cancel the root |
+| Runtime workflow (`i`) | `r` | retry the selected instance |
+| Runtime workflow (`i`) | `Esc` / `i` | close |
 | Mouse | click the tab bar | switch tabs |
 | Mouse | click a catalog folder | fold/unfold it |
 | Mouse | click a catalog/task row | select; click again starts it |
 
-`?`, `w`, `p`, `e`, `c`, `r`, and `C` are forwarded to the embedded agent while
-the Agent panel has keyboard capture, and are typed literally into form/wizard
-fields when one is open. `p` only toggles the preview and `e` only edits on the
-Catalog tab; `c`, `r`, and `C` only act on the Tasks tab.
+`?`, `w`, `i`, `p`, `e`, `c`, `r`, and `C` are forwarded to the embedded agent
+while the Agent panel has keyboard capture, and are typed literally into
+form/wizard fields when one is open. `p` only toggles the preview and `e` only
+edits on the Catalog tab; `i` only inspects on the Tasks tab, and `c`, `r`, and
+`C` only act on the Tasks tab.
 
 ## Cancel and retry
 
@@ -179,6 +185,25 @@ references to names outside the catalog show `(external)`. Scroll with
 unavailable (an older daemon) or cannot be rendered, the overlay falls back to
 the raw DOT with a short explanation. It refreshes while open when the catalog
 changes.
+
+## Runtime workflow inspector
+
+Press **i** on the Tasks tab to inspect the **selected task's root** live through
+`workflow.inspect` — the catalog graph above shows the *declared* tasks, while
+this overlay shows the durable runtime instances of one root (whether created by
+`needs`/`spawn` or by `workflow.create`/`workflow.spawn`). The title shows the
+root task and its overall state (`running`, `succeeded`, `failed`, `cancelled`),
+followed by a line of `ready`/`running`/`failed`/`blocked` bucket counts and a
+per-instance table with each instance's **status**, **task name**, **attempt**,
+and **summary** (the bounded failure/cancellation reason).
+
+`↑`/`↓` moves the instance selection, **c** cancels every non-terminal instance
+in the root (`workflow.cancel`), and **r** retries the selected instance
+(`workflow.retry`). `Esc` or `i` closes the overlay. The view is summary-only —
+it never fetches `output` blobs — and refreshes as the daemon pushes
+`task.updated`/`event` frames, so instances appear and change state while it is
+open. A directly started task is its own root; a spawned child inspects the root
+it inherited.
 
 ## Events panel
 

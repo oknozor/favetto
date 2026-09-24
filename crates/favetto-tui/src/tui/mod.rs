@@ -37,7 +37,9 @@ use favetto_core::model::{
     AgentCatalogEntry, AgentSessionInfo, Event, NotificationRecord, Schedule, Task,
 };
 use favetto_core::rpc::method;
+use favetto_core::workflow::WorkflowInspect;
 use favetto_providers::Provider;
+use uuid::Uuid;
 
 use crate::cli::TuiArgs;
 use crate::client::{normalize_ws_url, pair_http_base, Client, Transport};
@@ -382,6 +384,91 @@ async fn fetch_workflow(client: &Client, app: &mut App) {
     }
 }
 
+/// Fetch the runtime workflow view for `root_id` (`workflow.inspect`) and fold
+/// it into the open runtime inspector. The view is summary-only: no `output`
+/// blobs are carried.
+async fn fetch_workflow_inspect(client: &Client, app: &mut App, root_id: Uuid) {
+    match client
+        .request(
+            method::WORKFLOW_INSPECT,
+            serde_json::json!({ "root_id": root_id }),
+        )
+        .await
+    {
+        Ok(resp) => match resp.result {
+            Some(v) => match serde_json::from_value::<WorkflowInspect>(v) {
+                Ok(view) => app.set_workflow_inspect(view),
+                Err(e) => app.set_workflow_inspect_error(format!("workflow.inspect: {e}")),
+            },
+            None => {
+                let message = resp
+                    .error
+                    .as_ref()
+                    .map(|e| e.message.clone())
+                    .unwrap_or_else(|| "workflow.inspect failed".to_string());
+                app.set_workflow_inspect_error(message);
+            }
+        },
+        Err(e) => app.set_workflow_inspect_error(format!("workflow.inspect failed: {e}")),
+    }
+}
+
+/// `workflow.cancel` every non-terminal task in `root_id`, then refresh the
+/// runtime view so the cancelled instances show immediately.
+async fn cancel_root_workflow(client: &Client, app: &mut App, root_id: Uuid) {
+    match client
+        .request(
+            method::WORKFLOW_CANCEL,
+            serde_json::json!({ "root_id": root_id }),
+        )
+        .await
+    {
+        Ok(resp) => match resp.result {
+            Some(_) => app.logs.push_back("workflow.cancel: ok".to_string()),
+            None => {
+                let message = resp
+                    .error
+                    .as_ref()
+                    .map(|e| e.message.clone())
+                    .unwrap_or_else(|| "workflow.cancel failed".to_string());
+                app.set_workflow_inspect_error(message);
+            }
+        },
+        Err(e) => app.set_workflow_inspect_error(format!("workflow.cancel failed: {e}")),
+    }
+    fetch_workflow_inspect(client, app, root_id).await;
+}
+
+/// `workflow.retry` one terminal instance, then refresh the list tabs and the
+/// runtime view so its new run attempt shows.
+async fn retry_instance_workflow(client: &Client, app: &mut App, task_id: Uuid) {
+    let root_id = app.workflow_inspect_root();
+    match client
+        .request(
+            method::WORKFLOW_RETRY,
+            serde_json::json!({ "task_id": task_id }),
+        )
+        .await
+    {
+        Ok(resp) => match resp.result {
+            Some(_) => app.logs.push_back("workflow.retry: ok".to_string()),
+            None => {
+                let message = resp
+                    .error
+                    .as_ref()
+                    .map(|e| e.message.clone())
+                    .unwrap_or_else(|| "workflow.retry failed".to_string());
+                app.set_workflow_inspect_error(message);
+            }
+        },
+        Err(e) => app.set_workflow_inspect_error(format!("workflow.retry failed: {e}")),
+    }
+    refresh_lists(client, app).await;
+    if let Some(root_id) = root_id {
+        fetch_workflow_inspect(client, app, root_id).await;
+    }
+}
+
 /// Load the raw Markdown for the selected catalog task, if the preview needs it.
 async fn maybe_load_catalog_preview(client: &Client, app: &mut App) {
     let Some(name) = app.catalog_preview_target() else {
@@ -697,6 +784,15 @@ async fn run_session(
                             UiAction::OpenWorkflow => {
                                 fetch_workflow(client, app).await;
                             }
+                            UiAction::OpenWorkflowInspect(root_id) => {
+                                fetch_workflow_inspect(client, app, root_id).await;
+                            }
+                            UiAction::CancelWorkflow(root_id) => {
+                                cancel_root_workflow(client, app, root_id).await;
+                            }
+                            UiAction::RetryWorkflowTask(task_id) => {
+                                retry_instance_workflow(client, app, task_id).await;
+                            }
                             UiAction::WizardLoadProviders => {
                                 load_wizard_providers(client, app).await;
                             }
@@ -770,6 +866,14 @@ async fn run_session(
             fetch_catalog(client, app).await;
             if matches!(app.popup, Popup::Workflow { .. }) {
                 fetch_workflow(client, app).await;
+            }
+        }
+        // A `task.updated`/`event` push while the runtime inspector is open
+        // re-fetches `workflow.inspect` to keep its table live.
+        if app.workflow_inspect_dirty {
+            app.workflow_inspect_dirty = false;
+            if let Some(root_id) = app.workflow_inspect_root() {
+                fetch_workflow_inspect(client, app, root_id).await;
             }
         }
         maybe_load_catalog_preview(client, app).await;

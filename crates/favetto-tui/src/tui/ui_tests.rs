@@ -107,6 +107,7 @@ fn all_popups_render_without_panic() {
                 scroll: 0,
                 hscroll: 0,
             },
+            runtime_popup(uuid::Uuid::new_v4(), None),
             Popup::Sessions {
                 selected: 0,
                 sessions: vec![
@@ -589,6 +590,88 @@ fn workflow_overlay_renders_loading_state() {
     assert!(
         text.contains("Loading workflow graph"),
         "loading placeholder missing: {text:?}"
+    );
+}
+
+fn runtime_popup(root: uuid::Uuid, view: Option<favetto_core::workflow::WorkflowInspect>) -> Popup {
+    let loading = view.is_none();
+    Popup::WorkflowRuntime(crate::tui::app::WorkflowRuntime {
+        root_id: root,
+        view,
+        error: None,
+        selected: 0,
+        loading,
+    })
+}
+
+fn runtime_view(root: uuid::Uuid) -> favetto_core::workflow::WorkflowInspect {
+    use favetto_core::workflow::{WorkflowInspect, WorkflowState, WorkflowTaskView};
+    let running = uuid::Uuid::new_v4();
+    WorkflowInspect {
+        root_id: root,
+        root_task: "root".to_string(),
+        state: WorkflowState::Running,
+        tasks: vec![
+            WorkflowTaskView {
+                id: running,
+                name: "build".to_string(),
+                status: TaskStatus::Running,
+                attempt: 2,
+                summary: None,
+            },
+            WorkflowTaskView {
+                id: uuid::Uuid::new_v4(),
+                name: "test".to_string(),
+                status: TaskStatus::Failed,
+                attempt: 1,
+                summary: Some("agent exited 1".to_string()),
+            },
+        ],
+        ready: vec![uuid::Uuid::new_v4()],
+        running: vec![running],
+        failed: vec![uuid::Uuid::new_v4()],
+        blocked: Vec::new(),
+    }
+}
+
+#[test]
+fn runtime_workflow_overlay_renders_root_state_buckets_and_instances() {
+    let mut app = App::new();
+    let root = uuid::Uuid::new_v4();
+    app.popup = runtime_popup(root, Some(runtime_view(root)));
+    let text = render_text(&mut app, 120, 40);
+    assert!(text.contains("Runtime workflow"), "{text:?}");
+    for bucket in ["ready", "running", "failed", "blocked"] {
+        assert!(text.contains(bucket), "bucket {bucket} missing: {text:?}");
+    }
+    assert!(text.contains("build"), "first instance missing: {text:?}");
+    assert!(text.contains("test"), "second instance missing: {text:?}");
+    assert!(text.contains("ATTEMPT"), "attempt column missing: {text:?}");
+    assert!(text.contains("agent exited 1"), "summary missing: {text:?}");
+}
+
+#[test]
+fn runtime_workflow_overlay_renders_loading_state() {
+    let mut app = App::new();
+    app.popup = runtime_popup(uuid::Uuid::new_v4(), None);
+    let text = render_text(&mut app, 100, 40);
+    assert!(
+        text.contains("Loading workflow.inspect"),
+        "loading placeholder missing: {text:?}"
+    );
+}
+
+#[test]
+fn help_overlay_lists_runtime_inspector_key() {
+    let text: String = help_lines(Theme::dark())
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.to_string())
+        .collect::<Vec<_>>()
+        .join("");
+    assert!(
+        text.contains("runtime workflow"),
+        "runtime inspector help row missing: {text:?}"
     );
 }
 

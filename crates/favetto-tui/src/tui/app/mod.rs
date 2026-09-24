@@ -7,6 +7,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::layout::Rect;
 use serde_json::Value;
+use uuid::Uuid;
 
 use base64::Engine as _;
 
@@ -16,6 +17,7 @@ use favetto_core::model::{
     Task, TaskStatus,
 };
 use favetto_core::rpc::{method, push, Notification};
+use favetto_core::workflow::WorkflowInspect;
 use favetto_providers::Provider;
 
 use crate::tasks::TaskVar;
@@ -99,6 +101,13 @@ pub enum UiAction {
     OpenWizard,
     /// Fetch the catalog workflow graph (`workflow.get`) and show the overlay.
     OpenWorkflow,
+    /// Fetch the runtime workflow view (`workflow.inspect`) for a root and show
+    /// the runtime inspector overlay.
+    OpenWorkflowInspect(Uuid),
+    /// Cancel every non-terminal task in a workflow root (`workflow.cancel`).
+    CancelWorkflow(Uuid),
+    /// Retry a terminal task instance (`workflow.retry`).
+    RetryWorkflowTask(Uuid),
     /// The wizard needs the configured provider/model catalog (`providers.list`).
     WizardLoadProviders,
     /// The wizard completed: start an inline, interactive one-shot task.
@@ -148,6 +157,9 @@ pub enum Popup {
         scroll: u16,
         hscroll: u16,
     },
+    /// Live runtime workflow inspector (`workflow.inspect`), opened with `i` on
+    /// the Tasks tab for the selected task's root.
+    WorkflowRuntime(WorkflowRuntime),
     /// The Ctrl+O session picker: the daemon's live/retained agent sessions,
     /// listed so the Agent panel can hop between concurrent runs.
     Sessions {
@@ -328,6 +340,24 @@ pub struct ConfirmPrompt {
     pub params: Value,
 }
 
+/// State for the runtime workflow inspector (`i` on the Tasks tab), backed by
+/// `workflow.inspect`: the root's state, the ready/running/failed/blocked
+/// buckets, and a per-instance status/attempt/summary table.
+///
+/// The view is summary-only — `workflow.inspect` never carries `output` blobs.
+pub struct WorkflowRuntime {
+    /// The root being inspected (the selected task's `root_or_self`).
+    pub root_id: Uuid,
+    /// The latest fetched view, or `None` while the initial fetch is in flight.
+    pub view: Option<WorkflowInspect>,
+    /// Fetch/cancel/retry error surfaced in the overlay (a stale view stays put).
+    pub error: Option<String>,
+    /// Selected instance row (index into `view.tasks`).
+    pub selected: usize,
+    /// True while the initial `workflow.inspect` is in flight.
+    pub loading: bool,
+}
+
 /// A task-definition entry in the catalog (as returned by `catalog.list`).
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct CatalogEntry {
@@ -465,6 +495,10 @@ pub struct App {
     /// Set when the daemon pushes `catalog.updated`; the session loop re-fetches
     /// the catalog and clears it.
     pub catalog_dirty: bool,
+    /// Set when a `task.updated`/`event` push arrives while the runtime workflow
+    /// inspector is open; the session loop re-fetches `workflow.inspect` and
+    /// clears it.
+    pub workflow_inspect_dirty: bool,
 
     /// The catalog workflow graph in DOT, fetched for the workflow overlay.
     pub workflow_dot: Option<String>,
@@ -572,6 +606,7 @@ impl App {
             catalog_preview_area: None,
             catalog_preview_visible: true,
             catalog_dirty: false,
+            workflow_inspect_dirty: false,
             workflow_dot: None,
             workflow_path: None,
             workflow_lines: None,
@@ -762,6 +797,71 @@ impl App {
                 self.workflow_note =
                     Some("structured graph unavailable; showing raw DOT".to_string());
             }
+        }
+    }
+
+    /// Open the runtime workflow inspector for the selected Tasks-tab row's root
+    /// (`root_id` when spawned, else the task's own id).
+    fn open_workflow_inspect(&mut self) -> UiAction {
+        let Some(task) = self.tasks.get(self.tasks_selected) else {
+            return UiAction::None;
+        };
+        let root_id = task.root_or_self();
+        self.popup = Popup::WorkflowRuntime(WorkflowRuntime {
+            root_id,
+            view: None,
+            error: None,
+            selected: 0,
+            loading: true,
+        });
+        UiAction::OpenWorkflowInspect(root_id)
+    }
+
+    /// The root of the open runtime inspector, if any.
+    pub fn workflow_inspect_root(&self) -> Option<Uuid> {
+        match &self.popup {
+            Popup::WorkflowRuntime(rt) => Some(rt.root_id),
+            _ => None,
+        }
+    }
+
+    /// Store a fetched `workflow.inspect` view, clamping the row selection.
+    pub fn set_workflow_inspect(&mut self, view: WorkflowInspect) {
+        let Popup::WorkflowRuntime(rt) = &mut self.popup else {
+            return;
+        };
+        rt.selected = if view.tasks.is_empty() {
+            0
+        } else {
+            rt.selected.min(view.tasks.len() - 1)
+        };
+        rt.root_id = view.root_id;
+        rt.view = Some(view);
+        rt.loading = false;
+        rt.error = None;
+    }
+
+    /// Surface an error in the runtime inspector, leaving any stale view in place.
+    pub fn set_workflow_inspect_error(&mut self, message: String) {
+        if let Popup::WorkflowRuntime(rt) = &mut self.popup {
+            rt.loading = false;
+            rt.error = Some(message);
+        }
+    }
+
+    /// The selected instance id in the runtime inspector, if any.
+    pub fn workflow_runtime_selected_task(&self) -> Option<Uuid> {
+        let Popup::WorkflowRuntime(rt) = &self.popup else {
+            return None;
+        };
+        rt.view.as_ref()?.tasks.get(rt.selected).map(|t| t.id)
+    }
+
+    /// Request a refresh of the open runtime inspector. Called for pushes
+    /// (`task.updated`/`event`) while the overlay is open; a no-op otherwise.
+    pub fn mark_workflow_inspect_dirty(&mut self) {
+        if matches!(&self.popup, Popup::WorkflowRuntime(_)) {
+            self.workflow_inspect_dirty = true;
         }
     }
 
@@ -1372,6 +1472,7 @@ impl App {
                 if let Ok(ev) = serde_json::from_value::<Event>(n.params) {
                     self.ingest_event(ev);
                 }
+                self.mark_workflow_inspect_dirty();
             }
             push::TASK_UPDATED => {
                 if let Ok(t) = serde_json::from_value::<Task>(n.params) {
@@ -1380,6 +1481,7 @@ impl App {
                         None => self.tasks.insert(0, t),
                     }
                 }
+                self.mark_workflow_inspect_dirty();
             }
             push::CATALOG_UPDATED => {
                 // The list is re-fetched by the session loop, which owns the client.

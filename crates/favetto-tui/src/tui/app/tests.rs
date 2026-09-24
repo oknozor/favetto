@@ -750,6 +750,217 @@ fn workflow_scroll_via_arrow_keys() {
     assert!(matches!(app.popup, Popup::Workflow { hscroll: 2, .. }));
 }
 
+fn inspect_view(
+    root_id: Uuid,
+    tasks: Vec<favetto_core::workflow::WorkflowTaskView>,
+) -> WorkflowInspect {
+    WorkflowInspect {
+        root_id,
+        root_task: "root".to_string(),
+        state: favetto_core::workflow::WorkflowState::Running,
+        ready: Vec::new(),
+        running: Vec::new(),
+        failed: Vec::new(),
+        blocked: Vec::new(),
+        tasks,
+    }
+}
+
+fn inspect_task(
+    id: Uuid,
+    name: &str,
+    status: TaskStatus,
+) -> favetto_core::workflow::WorkflowTaskView {
+    favetto_core::workflow::WorkflowTaskView {
+        id,
+        name: name.to_string(),
+        status,
+        attempt: 1,
+        summary: None,
+    }
+}
+
+#[test]
+fn inspect_key_opens_runtime_overlay_for_the_selected_tasks_root() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    let root = Uuid::new_v4();
+    let mut child = task("child");
+    child.root_id = Some(root);
+    app.tasks = vec![child];
+
+    match app.handle_key(key(KeyCode::Char('i'), KeyModifiers::empty())) {
+        UiAction::OpenWorkflowInspect(id) => assert_eq!(id, root),
+        _ => panic!("expected OpenWorkflowInspect"),
+    }
+    match &app.popup {
+        Popup::WorkflowRuntime(rt) => {
+            assert_eq!(rt.root_id, root);
+            assert!(rt.view.is_none());
+            assert!(rt.loading);
+        }
+        _ => panic!("expected the runtime inspector popup"),
+    }
+}
+
+#[test]
+fn inspect_key_uses_root_or_self_for_a_directly_started_task() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    let only = task("root");
+    let id = only.id;
+    app.tasks = vec![only];
+
+    match app.handle_key(key(KeyCode::Char('i'), KeyModifiers::empty())) {
+        UiAction::OpenWorkflowInspect(root) => assert_eq!(root, id),
+        _ => panic!("expected OpenWorkflowInspect"),
+    }
+}
+
+#[test]
+fn inspect_key_is_a_no_op_without_a_selected_task() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    assert!(matches!(
+        app.handle_key(key(KeyCode::Char('i'), KeyModifiers::empty())),
+        UiAction::None
+    ));
+    assert!(matches!(app.popup, Popup::None));
+}
+
+#[test]
+fn inspect_key_only_opens_on_the_tasks_tab() {
+    let mut app = App::new();
+    app.tab = Tab::Catalog;
+    app.tasks = vec![task("root")];
+    assert!(matches!(
+        app.handle_key(key(KeyCode::Char('i'), KeyModifiers::empty())),
+        UiAction::None
+    ));
+    assert!(matches!(app.popup, Popup::None));
+}
+
+#[test]
+fn workflow_runtime_key_moves_selection_and_clamps() {
+    let mut app = App::new();
+    let root = Uuid::new_v4();
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    app.popup = Popup::WorkflowRuntime(WorkflowRuntime {
+        root_id: root,
+        view: Some(inspect_view(
+            root,
+            vec![
+                inspect_task(first, "a", TaskStatus::Running),
+                inspect_task(second, "b", TaskStatus::Failed),
+            ],
+        )),
+        error: None,
+        selected: 0,
+        loading: false,
+    });
+
+    app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+    app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+    match &app.popup {
+        Popup::WorkflowRuntime(rt) => assert_eq!(rt.selected, 1, "selection must clamp"),
+        _ => panic!("expected the runtime inspector popup"),
+    }
+    app.handle_key(key(KeyCode::Up, KeyModifiers::empty()));
+    match &app.popup {
+        Popup::WorkflowRuntime(rt) => assert_eq!(rt.selected, 0),
+        _ => panic!("expected the runtime inspector popup"),
+    }
+
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::empty()));
+    assert!(matches!(app.popup, Popup::None));
+}
+
+#[test]
+fn workflow_runtime_key_cancels_the_root_and_retries_the_selection() {
+    let mut app = App::new();
+    let root = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    app.popup = Popup::WorkflowRuntime(WorkflowRuntime {
+        root_id: root,
+        view: Some(inspect_view(
+            root,
+            vec![inspect_task(target, "a", TaskStatus::Failed)],
+        )),
+        error: None,
+        selected: 0,
+        loading: false,
+    });
+
+    match app.handle_key(key(KeyCode::Char('c'), KeyModifiers::empty())) {
+        UiAction::CancelWorkflow(id) => assert_eq!(id, root),
+        _ => panic!("expected CancelWorkflow"),
+    }
+    match app.handle_key(key(KeyCode::Char('r'), KeyModifiers::empty())) {
+        UiAction::RetryWorkflowTask(id) => assert_eq!(id, target),
+        _ => panic!("expected RetryWorkflowTask"),
+    }
+
+    // `i` also closes the overlay.
+    app.handle_key(key(KeyCode::Char('i'), KeyModifiers::empty()));
+    assert!(matches!(app.popup, Popup::None));
+}
+
+#[test]
+fn set_workflow_inspect_clamps_the_selection_and_clears_loading() {
+    let mut app = App::new();
+    let root = Uuid::new_v4();
+    app.popup = Popup::WorkflowRuntime(WorkflowRuntime {
+        root_id: root,
+        view: None,
+        error: Some("stale".to_string()),
+        selected: 5,
+        loading: true,
+    });
+
+    app.set_workflow_inspect(inspect_view(
+        root,
+        vec![
+            inspect_task(Uuid::new_v4(), "a", TaskStatus::Succeeded),
+            inspect_task(Uuid::new_v4(), "b", TaskStatus::Running),
+        ],
+    ));
+    match &app.popup {
+        Popup::WorkflowRuntime(rt) => {
+            assert_eq!(rt.selected, 1, "selection clamps to the new row count");
+            assert!(rt.view.is_some());
+            assert!(!rt.loading);
+            assert!(rt.error.is_none());
+        }
+        _ => panic!("expected the runtime inspector popup"),
+    }
+}
+
+#[test]
+fn task_updated_push_marks_the_runtime_inspector_dirty_only_while_open() {
+    let mut app = App::new();
+    app.popup = Popup::WorkflowRuntime(WorkflowRuntime {
+        root_id: Uuid::new_v4(),
+        view: None,
+        error: None,
+        selected: 0,
+        loading: true,
+    });
+    app.handle_notification(Notification {
+        method: push::TASK_UPDATED.to_string(),
+        params: serde_json::to_value(task("child")).unwrap(),
+    });
+    assert!(app.workflow_inspect_dirty);
+
+    // With no runtime overlay open the flag stays untouched.
+    let mut app = App::new();
+    app.handle_notification(Notification {
+        method: push::TASK_UPDATED.to_string(),
+        params: serde_json::to_value(task("child")).unwrap(),
+    });
+    assert!(!app.workflow_inspect_dirty);
+}
+
 #[test]
 fn catalog_preview_scrolls_with_keys_and_wheel() {
     let mut app = App::new();
