@@ -2,6 +2,20 @@
 //!
 //! Thin entry point: the implementation lives in the `favetto` library crate.
 
+// Same panic-safety policy as the library crate (issue #207); see
+// `docs/design/panic-safety.md`. The binary currently has no panic sites.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
+
 use clap::Parser;
 
 use favetto::cli::{self, Command};

@@ -6,6 +6,24 @@
 //! shared between the daemon and the TUI client. The TUI client itself lives in
 //! the separate, dependency-light `favetto-tui` crate.
 
+// Panic-safety policy for the daemon's production code (issue #207): a reachable
+// panic in the request loop can drop every attached TUI session. The restriction
+// lints below are scoped to the non-test build so the crate's inline/dedicated
+// test modules keep using `unwrap()`/`expect()` freely; see
+// `docs/design/panic-safety.md`. Sites that are provably infallible carry a
+// targeted `#[allow(..., reason = ...)]`.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
+
 // Subcommand entry points.
 pub mod cli;
 pub mod daemon;

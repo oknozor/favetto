@@ -713,11 +713,13 @@ async fn inspect_workflow(state: &State, root_id: Uuid) -> Result<WorkflowInspec
         runtime_deps.entry(task_id).or_default().push(depends_on);
     }
 
+    // `tasks` is non-empty here, and the root id is normally present; fall back
+    // to the first task's name instead of indexing so a missing root cannot panic.
     let root_task = tasks
         .iter()
         .find(|t| t.id == root_id)
         .map(|t| t.name.clone())
-        .unwrap_or_else(|| tasks[0].name.clone());
+        .unwrap_or_else(|| tasks.first().map(|t| t.name.clone()).unwrap_or_default());
 
     let mut views: Vec<WorkflowTaskView> = Vec::with_capacity(tasks.len());
     let mut ready = Vec::new();
@@ -863,7 +865,11 @@ fn validate_create_dag(state: &State, tasks: &[WorkflowCreateTask]) -> Result<()
                 .entry(dep.as_str())
                 .or_default()
                 .push(spec.key.as_str());
-            *indegree.get_mut(spec.key.as_str()).expect("key seeded") += 1;
+            // Every spec key is seeded above; guard so a future change cannot
+            // make a malformed request panic the request loop.
+            if let Some(degree) = indegree.get_mut(spec.key.as_str()) {
+                *degree += 1;
+            }
         }
     }
 
@@ -877,10 +883,11 @@ fn validate_create_dag(state: &State, tasks: &[WorkflowCreateTask]) -> Result<()
         visited += 1;
         if let Some(successors) = edges.get(key) {
             for successor in successors {
-                let degree = indegree.get_mut(successor).expect("key seeded");
-                *degree -= 1;
-                if *degree == 0 {
-                    ready.push(successor);
+                if let Some(degree) = indegree.get_mut(successor) {
+                    *degree -= 1;
+                    if *degree == 0 {
+                        ready.push(successor);
+                    }
                 }
             }
         }
@@ -937,21 +944,31 @@ async fn create_workflow(
     }
 
     // The root is the caller's root, or the first task (which becomes its own
-    // root, matching `Task::root_or_self`).
+    // root, matching `Task::root_or_self`). `validate_create_dag` guarantees at
+    // least one spec, and every spec key resolved into `ids` above; the lookups
+    // below are still defended so a future change cannot panic the request loop.
     let root_id = match params.root_id {
         Some(root_id) => root_id,
-        None => *ids.get(&specs[0].key).expect("every key resolved"),
+        None => *ids
+            .get(&specs[0].key)
+            .ok_or_else(|| RpcError::Internal("workflow.create: task ids unresolved".into()))?,
     };
 
     for spec in &specs {
-        let id = ids[&spec.key];
+        let id = *ids
+            .get(&spec.key)
+            .ok_or_else(|| RpcError::Internal("workflow.create: task ids unresolved".into()))?;
         let depends_on: Vec<Uuid> = spec
             .depends_on
             .as_deref()
             .unwrap_or_default()
             .iter()
-            .map(|key| ids[key])
-            .collect();
+            .map(|key| {
+                ids.get(key).copied().ok_or_else(|| {
+                    RpcError::Internal("workflow.create: task ids unresolved".into())
+                })
+            })
+            .collect::<Result<_, _>>()?;
         if existing.contains(&id) {
             // Already inserted by an earlier submission; just make sure its
             // dependency edges are present (idempotent).
@@ -983,12 +1000,16 @@ async fn create_workflow(
 
     let tasks = specs
         .iter()
-        .map(|spec| WorkflowNodeRef {
-            key: spec.key.clone(),
-            id: ids[&spec.key],
-            name: spec.name.clone(),
+        .map(|spec| {
+            Ok(WorkflowNodeRef {
+                key: spec.key.clone(),
+                id: *ids.get(&spec.key).ok_or_else(|| {
+                    RpcError::Internal("workflow.create: task ids unresolved".into())
+                })?,
+                name: spec.name.clone(),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, RpcError>>()?;
 
     Ok(WorkflowCreateResult { root_id, tasks })
 }

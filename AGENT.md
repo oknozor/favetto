@@ -38,6 +38,14 @@ cd docs && npm ci && npm run docs:check
 > commands above before you finish. CI uses `--locked` everywhere, so keep
 > `Cargo.lock` in sync.
 
+**Panic safety.** The daemon crate denies `clippy::unwrap_used`,
+`clippy::expect_used`, `clippy::panic`, `clippy::unreachable`, `clippy::todo`
+and `clippy::unimplemented` in its non-test build (scoped with
+`cfg_attr(not(test))`, so test modules are exempt). New production panic sites
+must be fixed or carry a reasoned `#[allow(..., reason = ...)]`; the inventory,
+the output bound and the guard tests live in
+[`docs/design/panic-safety.md`](docs/design/panic-safety.md).
+
 ## Commit conventions (mandatory)
 
 History must follow [Conventional Commits](https://www.conventionalcommits.org/).

@@ -26,7 +26,11 @@ pub fn render(template: &str, context: &Value) -> String {
                 continue;
             }
         }
-        let ch = template[i..].chars().next().unwrap();
+        // `i < template.len()` guarantees the slice has at least one char; the
+        // `else` keeps that infallible even if the loop condition changes.
+        let Some(ch) = template[i..].chars().next() else {
+            break;
+        };
         out.push(ch);
         i += ch.len_utf8();
     }

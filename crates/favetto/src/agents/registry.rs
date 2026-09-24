@@ -88,6 +88,10 @@ pub struct AgentRegistry {
 }
 
 impl Default for AgentRegistry {
+    #[allow(
+        clippy::expect_used,
+        reason = "the default FavettoConfig configures only built-in agents, which always construct"
+    )]
     fn default() -> Self {
         Self::from_config(&FavettoConfig::default()).expect("built-in-only registry always builds")
     }
