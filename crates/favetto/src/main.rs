@@ -36,6 +36,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Tui(args) => favetto_tui::tui::run(args).await,
         Command::Pair(args) => favetto::pair::run(args).await,
         Command::TokenRotate(args) => token_rotate(args),
+        Command::Validate(args) => favetto::validate::run(&args),
         Command::Doc(args) => favetto::docgen::run(&args),
         Command::InternalAgentExec { argv } => agent_exec(argv),
     }

@@ -28,6 +28,8 @@ pub enum Command {
     Pair(PairArgs),
     /// Rotate the bearer token.
     TokenRotate(TokenRotateArgs),
+    /// Validate a task-definition file without starting a daemon.
+    Validate(ValidateArgs),
     /// Internal: regenerate the generated documentation reference.
     #[command(name = "__doc", hide = true)]
     Doc(DocArgs),
@@ -83,4 +85,13 @@ pub struct TokenRotateArgs {
     /// Directory for the token file.
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
+}
+
+#[derive(Args)]
+pub struct ValidateArgs {
+    /// Path to a task `.md` file. Reads the definition from stdin when omitted.
+    pub file: Option<PathBuf>,
+    /// Task identity to validate under; defaults to the file stem.
+    #[arg(long)]
+    pub name: Option<String>,
 }

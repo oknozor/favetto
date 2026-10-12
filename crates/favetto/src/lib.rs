@@ -29,6 +29,7 @@ pub mod cli;
 pub mod daemon;
 pub mod docgen;
 pub mod pair;
+pub mod validate;
 
 // Modules shared between the daemon and the TUI client live in `favetto-core`
 // and are re-exported here so the daemon keeps its `crate::{config,tasks,…}`

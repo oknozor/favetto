@@ -1,0 +1,15 @@
+{
+  "skills": [
+    {
+      "name": "favetto-task-authoring",
+      "version": "1",
+      "files": [
+        "SKILL.md",
+        "references/task-format.md",
+        "references/templating-and-graph.md",
+        "references/examples.md",
+        "assets/task-template.md"
+      ]
+    }
+  ]
+}

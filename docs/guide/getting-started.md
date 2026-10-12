@@ -76,4 +76,5 @@ query, then `COLORFGBG`, then dark). Override it with `FAVETTO_THEME=dark` or
 - [Your first task](./first-task) — create a task and run it end to end.
 - [Catalog](./catalog) — how task files are discovered and started.
 - [Embedded agents](./agents) — configure the agent CLIs favetto drives.
+- [Agent skill](./agent-skill) — the bundled skill for authoring tasks with an agent.
 - [Configuration](./configuration) — daemon, executor, git, and sound settings.

@@ -49,3 +49,12 @@ Rotate the bearer token
 |------|-------|---------|-------------|
 | `--data-dir` | `<DATA_DIR>` | — | Directory for the token file |
 
+## `favetto validate`
+
+Validate a task-definition file without starting a daemon
+
+| Flag | Value | Default | Description |
+|------|-------|---------|-------------|
+| file | `<FILE>` | — | Path to a task `.md` file. Reads the definition from stdin when omitted |
+| `--name` | `<NAME>` | — | Task identity to validate under; defaults to the file stem |
+

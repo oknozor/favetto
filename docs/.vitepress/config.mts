@@ -39,6 +39,7 @@ export default defineConfig({
             { text: "Git & signing", link: "/guide/git-signing" },
             { text: "Remote access", link: "/guide/remote-access" },
             { text: "MCP supervisor", link: "/guide/mcp" },
+            { text: "Agent skill", link: "/guide/agent-skill" },
             { text: "Configuration", link: "/guide/configuration" },
             { text: "TUI", link: "/guide/tui" },
             { text: "Troubleshooting", link: "/guide/troubleshooting" },

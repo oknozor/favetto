@@ -62,6 +62,13 @@ Then start it from the **Catalog** tab. The
 [first-task walkthrough](https://oknozor.github.io/favetto/guide/first-task)
 covers this end to end.
 
+A task file is a TOML header followed by the prompt. Check one without starting a
+daemon:
+
+```sh
+favetto validate tasks/hello.md
+```
+
 ## Documentation
 
 The published site is the manual:
@@ -72,6 +79,7 @@ The published site is the manual:
 | [CLI reference](https://oknozor.github.io/favetto/reference/cli) | Every subcommand and flag, generated from clap. |
 | [Configuration reference](https://oknozor.github.io/favetto/reference/config) | Every config section and field, generated from the Rust types. |
 | [Task file format](https://oknozor.github.io/favetto/reference/tasks) | Header keys, `[[vars]]`, and prompt templates. |
+| [Agent skill](https://oknozor.github.io/favetto/guide/agent-skill) | The bundled skill for authoring tasks with an agent. |
 | [Event kinds](https://oknozor.github.io/favetto/reference/events) | Every event on the bus, generated from the enum. |
 | [Remote API](https://oknozor.github.io/favetto/reference/remote-api) | Methods, pushes, and error codes, generated from the RPC constants. |
 | [Architecture](https://oknozor.github.io/favetto/reference/architecture) | Design and milestones. |
@@ -89,6 +97,7 @@ crates/
   favetto-mcp/           MCP supervisor server (stdio)
   favetto/               daemon binary + doc generator
 tasks/                   task catalog: `*.md` files with TOML header + prompt
+skills/                  portable agent skills (e.g. favetto-task-authoring)
 docs/                    VitePress site (guide + generated reference)
 ```
 
