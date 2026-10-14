@@ -2,7 +2,7 @@ agent = "opencode"
 provider = "deepseek"  
 model = "deepseek-flash" 
 cwd = "/code/che"
-spawn = "favetto/implement_issue"
+spawn = "repo:Favetto/implement_issue"
 spawn_file = ".favetto/plans/{{ input.issue_id }}/handoff.json"
 ---
 
@@ -28,7 +28,7 @@ crates:
 
 Tests are inline `#[cfg(test)]` modules next to the code they cover (many are
 `#[tokio::test]`); some crates also have integration tests under `tests/`. The
-`tasks/` directory defines favetto's own triage → plan → implement pipeline —
+`.favetto/tasks/` directory defines favetto's own triage → plan → implement pipeline —
 treat it as product code, not scratch files.
 
 ## Steps
