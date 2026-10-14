@@ -168,6 +168,13 @@ pub struct AppState {
     pub pending_pair_code: Signal<Option<String>>,
     /// Task/event/catalog caches plus the resume cursor.
     pub cache: Signal<Cache>,
+    /// Bumped by a `catalog.updated` push so the Catalog view re-fetches.
+    pub catalog_version: Signal<u64>,
+}
+
+/// Whether a push method should make the Catalog view re-fetch.
+pub fn is_catalog_push(method: &str) -> bool {
+    method == push::CATALOG_UPDATED
 }
 
 impl AppState {
@@ -184,6 +191,7 @@ impl AppState {
             daemon_url: Signal::new(load_daemon_url()),
             pending_pair_code: Signal::new(None),
             cache: Signal::new(cache),
+            catalog_version: Signal::new(0),
         }
     }
 
@@ -225,6 +233,12 @@ impl AppState {
     pub fn set_cursor(&mut self, cursor: i64) {
         save_cursor(cursor);
         self.cache.write().cursor = Some(cursor);
+    }
+
+    /// Signal a catalog change to the Catalog view.
+    pub fn bump_catalog(&mut self) {
+        let next = (self.catalog_version)() + 1;
+        self.catalog_version.set(next);
     }
 }
 
@@ -368,6 +382,13 @@ mod tests {
         // Task deserialization is strict; an empty payload is ignored, not fatal.
         assert!(!cache.apply_push(push::TASK_UPDATED, &serde_json::json!({})));
         assert!(!cache.apply_push(push::CATALOG_UPDATED, &serde_json::json!({})));
+    }
+
+    #[test]
+    fn is_catalog_push_matches_only_catalog_updated() {
+        assert!(is_catalog_push(push::CATALOG_UPDATED));
+        assert!(!is_catalog_push(push::EVENT));
+        assert!(!is_catalog_push(push::TASK_UPDATED));
     }
 
     #[test]
