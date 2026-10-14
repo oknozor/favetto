@@ -17,3 +17,16 @@ fuzz/target/
 fuzz/corpus/
 fuzz/artifacts/
 fuzz/coverage/
+
+# Dioxus web client build output. `dx build` writes the web bundle to
+# `web/dist/public` and `dx bundle` drops the Android APK in `web/dist`; CI
+# stages the former into `web/dist` for the daemon's `rust-embed`. None of it is
+# committed. The committed `web/dist/index.html` is the no-assets placeholder.
+/web/target/
+/web/dist/public/
+/web/dist/assets/
+/web/dist/*.js
+/web/dist/*.wasm
+/web/dist/*.css
+/web/dist/*.apk
+/web/dist/*.aab

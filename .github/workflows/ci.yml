@@ -119,3 +119,164 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # The `web/` Dioxus client is a standalone workspace (see the root `exclude`);
+  # these jobs own its toolchain. `dx` is pinned to the version the client is
+  # locked against, and wasm-bindgen is resolved by `dx` from `web/Cargo.lock`.
+  web:
+    name: web (wasm)
+    runs-on: ubuntu-latest
+    env:
+      # Keep in lockstep with `dioxus` in `web/Cargo.toml`.
+      DX_VERSION: 0.7.10
+      # Gzipped WASM budget, in bytes: warn over 500 KB, fail over 1 MB.
+      WEB_WARN_BYTES: "500000"
+      WEB_FAIL_BYTES: "1000000"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust with rustfmt and the wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: web
+      - name: Cache the pinned Dioxus CLI
+        id: dx-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/dx
+          key: dx-${{ env.DX_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Install the pinned Dioxus CLI
+        if: steps.dx-cache.outputs.cache-hit != 'true'
+        run: cargo install dioxus-cli --version "$DX_VERSION" --locked
+      - name: Cache the Dioxus toolchain downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/.dx
+          key: dx-tools-${{ runner.os }}-${{ env.DX_VERSION }}
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+        working-directory: web
+      - name: Run the client unit tests
+        run: cargo test --locked
+        working-directory: web
+      - name: Build the web bundle
+        run: dx bundle --locked --release --platform web
+        working-directory: web
+      - name: Stage the bundle for the daemon's rust-embed
+        # Dioxus 0.7 emits the web bundle under `dist/public`; the daemon embeds
+        # `web/dist`, so flatten it there (the committed `index.html` is only the
+        # no-assets placeholder).
+        run: |
+          set -euo pipefail
+          rm -rf dist/assets
+          cp -R dist/public/. dist/
+          rm -rf dist/public
+        working-directory: web
+      - name: Check the gzipped WASM budget
+        run: |
+          set -euo pipefail
+          wasm=$(find dist/assets -name '*.wasm' -print -quit)
+          if [ -z "$wasm" ]; then
+            echo "::error::no hashed .wasm asset found under web/dist/assets"
+            exit 1
+          fi
+          bytes=$(gzip -c "$wasm" | wc -c | tr -d ' ')
+          kib=$((bytes / 1024))
+          echo "gzipped WASM: $kib KiB ($bytes bytes) — $(basename "$wasm")"
+          if [ "$bytes" -gt "$WEB_FAIL_BYTES" ]; then
+            echo "::error::gzipped WASM is over the 1 MB budget ($kib KiB)"
+            exit 1
+          fi
+          if [ "$bytes" -gt "$WEB_WARN_BYTES" ]; then
+            echo "::warning::gzipped WASM is over the 500 KB budget ($kib KiB)"
+          fi
+        working-directory: web
+      - name: Upload the staged web bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          if-no-files-found: error
+
+  android:
+    name: android (apk)
+    runs-on: ubuntu-latest
+    env:
+      DX_VERSION: 0.7.10
+      ANDROID_TARGET: aarch64-linux-android
+      ANDROID_PLATFORM: "34"
+      NDK_VERSION: 27.0.12077973
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Set up the Android SDK and NDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: >-
+            platform-tools
+            platforms;android-${{ env.ANDROID_PLATFORM }}
+            build-tools;${{ env.ANDROID_PLATFORM }}.0.0
+            ndk;${{ env.NDK_VERSION }}
+      - name: Export the Android toolchain paths
+        run: |
+          set -euo pipefail
+          sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/.android/sdk}}"
+          ndk="$sdk/ndk/$NDK_VERSION"
+          if [ ! -d "$ndk" ]; then
+            ndk="$(find "$sdk/ndk" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n1)"
+          fi
+          {
+            echo "ANDROID_SDK_ROOT=$sdk"
+            echo "ANDROID_HOME=$sdk"
+            echo "ANDROID_NDK_HOME=$ndk"
+            echo "NDK_HOME=$ndk"
+          } >> "$GITHUB_ENV"
+      - name: Install Rust with the Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: web
+      - name: Cache the pinned Dioxus CLI
+        id: dx-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/dx
+          key: dx-${{ env.DX_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Install the pinned Dioxus CLI
+        if: steps.dx-cache.outputs.cache-hit != 'true'
+        run: cargo install dioxus-cli --version "$DX_VERSION" --locked
+      - name: Cache the Dioxus toolchain downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/.dx
+          key: dx-tools-${{ runner.os }}-${{ env.DX_VERSION }}
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ env.DX_VERSION }}-${{ hashFiles('web/Cargo.lock') }}
+      - name: Build the Android library
+        run: dx build --locked --release --platform android --features mobile --target "$ANDROID_TARGET"
+        working-directory: web
+      - name: Bundle the APK
+        run: >-
+          dx bundle --locked --platform android --package-types apk
+          --features mobile --target "$ANDROID_TARGET"
+        working-directory: web
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: favetto-android-apk
+          path: web/dist/*.apk
+          if-no-files-found: error

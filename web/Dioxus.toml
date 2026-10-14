@@ -1,0 +1,16 @@
+[application]
+name = "favetto"
+out_dir = "dist"
+asset_dir = "assets"
+
+[web.app]
+title = "favetto"
+
+[web.watcher]
+reload_html = true
+watch_path = ["src", "assets"]
+
+[bundle]
+identifier = "dev.favetto.app"
+publisher = "favetto"
+icon = ["assets/icon.png"]

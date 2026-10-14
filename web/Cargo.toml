@@ -1,0 +1,28 @@
+[package]
+name = "favetto-web"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/oknozor/favetto"
+description = "Dioxus (Rust to WASM/Android) client for the favetto daemon."
+
+# Standalone workspace: `web/` is deliberately excluded from the root cargo
+# workspace (see the root `Cargo.toml` `exclude` list) so the native
+# `cargo clippy`/`nextest` gates are unaffected by the Dioxus toolchain.
+[workspace]
+
+[dependencies]
+# The wasm-clean shared types. The client speaks the exact same MessagePack
+# wire protocol as the TUI and MCP clients.
+favetto-wire = { path = "../crates/favetto-wire" }
+# Pinned to the version validated with `dx` 0.7.10; update `dx` in lockstep.
+dioxus = { version = "=0.7.10", features = ["router"] }
+
+[features]
+# Web (wasm32) is the default so a plain `dx build` produces the embedded SPA.
+default = ["web"]
+web = ["dioxus/web"]
+# Android native. Cross-compiled only; a host build of this feature is not
+# supported (it requires the Android SDK/NDK and an Android target triple).
+mobile = ["dioxus/mobile"]
