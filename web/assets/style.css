@@ -1065,3 +1065,309 @@ textarea.input {
 .confirm-dialog {
   width: min(24rem, 100%);
 }
+
+/* ---------------------------------------------------------------------------
+   Inbox view
+   --------------------------------------------------------------------------- */
+
+.inbox-view {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  touch-action: pan-y;
+}
+
+.inbox-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.inbox-header h1 {
+  margin: 0;
+  font-size: 1.5rem;
+}
+
+.inbox-refresh {
+  min-height: 44px;
+}
+
+.inbox-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.inbox-section h2 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+/* Task cards ------------------------------------------------------------- */
+
+.task-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+  border-radius: 0.5rem;
+  color: inherit;
+  text-decoration: none;
+}
+
+.task-card:hover,
+.task-card:focus-visible {
+  background: rgba(42, 109, 244, 0.08);
+  outline: none;
+}
+
+.task-card-icon {
+  font-size: 1.1rem;
+  line-height: 1.4;
+}
+
+.task-card-main {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  min-width: 0;
+}
+
+.task-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.6rem;
+}
+
+.task-card-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-card-awaiting {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #7a5200;
+}
+
+.task-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.75rem;
+  font-size: 0.85rem;
+  color: #666;
+}
+
+.task-card-detail {
+  overflow-wrap: anywhere;
+}
+
+/* Awaiting-input cards --------------------------------------------------- */
+
+.awaiting-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid #d9a441;
+  border-radius: 0.5rem;
+  background: rgba(217, 164, 65, 0.12);
+}
+
+.awaiting-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.6rem;
+}
+
+.awaiting-name {
+  font-weight: 600;
+  color: inherit;
+  text-decoration: none;
+}
+
+.awaiting-name:hover {
+  text-decoration: underline;
+}
+
+.awaiting-age {
+  font-size: 0.8rem;
+  opacity: 0.7;
+}
+
+.awaiting-prompt {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.awaiting-hint {
+  margin: 0;
+  font-size: 0.8rem;
+  opacity: 0.75;
+}
+
+.awaiting-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.option-button {
+  min-height: 44px;
+}
+
+.awaiting-free-text {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.awaiting-input {
+  flex: 1 1 12rem;
+  min-height: 44px;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
+  border-radius: 0.4rem;
+  background: Canvas;
+  color: inherit;
+  font: inherit;
+}
+
+/* Event feed ------------------------------------------------------------- */
+
+.event-feed {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.event-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid color-mix(in srgb, currentColor 10%, transparent);
+  font-size: 0.85rem;
+}
+
+.event-badge {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  background: #e3e3e3;
+  color: #333;
+  white-space: nowrap;
+}
+
+/* One colour per event-kind family. The class is `event-<snake_case kind>`, so
+   the family is matched by substring. */
+.event-badge[class*="event-task"] {
+  background: #cfe3ff;
+  color: #14509e;
+}
+
+.event-badge[class*="event-pr"] {
+  background: #d8c7f0;
+  color: #4a2a7a;
+}
+
+.event-badge[class*="event-issue"] {
+  background: #cdeccd;
+  color: #1c5c1c;
+}
+
+.event-badge[class*="event-push"] {
+  background: #ffe9b8;
+  color: #7a5200;
+}
+
+.event-badge[class*="event-ticket"],
+.event-badge[class*="event-email"],
+.event-badge[class*="event-action"],
+.event-badge[class*="event-check"],
+.event-badge[class*="event-cron"] {
+  background: #e0d8ee;
+  color: #4a3a66;
+}
+
+.event-time {
+  margin-left: auto;
+  color: #666;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Spinner, toast and helpers -------------------------------------------- */
+
+.spinner {
+  width: 1.4rem;
+  height: 1.4rem;
+  margin: 0.5rem auto;
+  border: 2px solid color-mix(in srgb, currentColor 25%, transparent);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: spinner-rotate 0.8s linear infinite;
+}
+
+@keyframes spinner-rotate {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 1.25rem;
+  transform: translateX(-50%);
+  max-width: min(90vw, 24rem);
+  padding: 0.6rem 1rem;
+  border-radius: 999px;
+  background: #222;
+  color: #fff;
+  box-shadow: 0 2px 10px rgb(0 0 0 / 35%);
+  font-size: 0.85rem;
+  z-index: 20;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (prefers-color-scheme: dark) {
+  .awaiting-card {
+    border-color: #a97b1e;
+    background: rgba(217, 164, 65, 0.16);
+  }
+
+  .task-card-meta,
+  .event-time {
+    color: #aaa;
+  }
+
+  .toast {
+    background: #f0f0f0;
+    color: #111;
+  }
+}
