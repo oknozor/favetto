@@ -65,6 +65,8 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 | Agent | *(favetto focus)* `Ctrl+Q` | leave the panel |
 | Agent | *(favetto focus)* `Ctrl+N` | start a new session |
 | Agent | *(favetto focus)* `Esc` | back to Tasks |
+| Agent | drag with the left button | select output; copies to the clipboard on release |
+| Agent | `Shift`+drag | forward the drag to the agent's own mouse UI |
 | Popups | `↑` / `↓` | select |
 | Popups | `Enter` | confirm / next field |
 | Popups | `Esc` | cancel / close |
@@ -91,7 +93,9 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 while the Agent panel has keyboard capture, and are typed literally into
 form/wizard fields when one is open. `p` only toggles the preview and `e` only
 edits on the Catalog tab; `i` only inspects on the Tasks tab, and `c`, `r`, and
-`C` only act on the Tasks tab.
+`C` only act on the Tasks tab. A plain left-button drag on the Agent panel is
+captured for copy-on-select instead of being forwarded; hold **Shift** to pass
+the drag through to the agent's own mouse UI.
 
 ## Cancel and retry
 
@@ -124,7 +128,23 @@ If accepting the picker or opening a task fails, the error is shown in the statu
 bar (the same place the connection state and counts live) rather than only in the
 internal log ring.
 
-## Ctrl+P menu
+## Copy agent output
+
+Drag with the left mouse button over the **Agent** panel to select text; the
+selection is highlighted and copied to the clipboard as soon as the button is
+released, with no keyboard shortcut. The status bar confirms with
+`copied N chars`.
+
+The copy always emits an **OSC 52** escape (so it still works over SSH, `tmux`,
+and containers that forward the sequence) and additionally tries the local
+clipboard tools `wl-copy`, `xclip`, or `xsel` on Linux, `pbcopy` on macOS, or
+`clip` on Windows. When only the escape is available the status bar reads
+`copied N chars (OSC 52)`.
+
+A plain click (no drag) selects nothing. Because copy-on-select takes priority
+over the agent's own mouse handling, hold **Shift** while dragging to forward the
+drag to an agent that reports mouse events. A finished interactive agent stays
+selectable; the structured view shown for headless runs is not.
 
 Press **Ctrl+P** for guided, step-by-step forms:
 

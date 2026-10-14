@@ -1025,6 +1025,10 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("(favetto focus) Ctrl+Q", "leave the panel"),
             ("(favetto focus) Ctrl+N", "start a new session"),
             ("(favetto focus) Esc", "back to Tasks"),
+            (
+                "(mouse) drag",
+                "select output; copies to the clipboard on release",
+            ),
             ("headless runs", "shown read-only; keys are not forwarded"),
         ],
     ),
@@ -1997,6 +2001,7 @@ fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
         return;
     }
 
+    let selection = app.agent_selection;
     let screen = app.term.screen();
     let (screen_rows, screen_cols) = screen.size();
     let hide_cursor = screen.hide_cursor();
@@ -2014,7 +2019,10 @@ fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
             if cell.is_wide_continuation() {
                 continue;
             }
-            let style = cell_style(cell, theme);
+            let mut style = cell_style(cell, theme);
+            if selection.map(|s| s.contains((row, col))).unwrap_or(false) {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
             let contents = cell.contents();
             let text = if contents.is_empty() { " " } else { contents };
             if run_style == Some(style) {
@@ -2344,6 +2352,17 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
                 format!("⚠ {notice}"),
                 Style::default()
                     .fg(theme.danger())
+                    .add_modifier(Modifier::BOLD),
+            )],
+        ));
+    }
+    if let Some(msg) = &app.copy_notice {
+        segments.push((
+            1,
+            vec![Span::styled(
+                msg.clone(),
+                Style::default()
+                    .fg(theme.success())
                     .add_modifier(Modifier::BOLD),
             )],
         ));

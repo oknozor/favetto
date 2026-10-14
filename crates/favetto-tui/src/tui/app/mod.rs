@@ -144,6 +144,8 @@ pub enum UiAction {
         method: &'static str,
         params: Value,
     },
+    /// Copy the selected Agent-panel text to the clipboard (copy-on-select).
+    CopySelection(String),
 }
 
 /// The Ctrl+P popup: either the top-level menu, a step-by-step form, the
@@ -519,6 +521,77 @@ pub fn repo_label(repo: Option<&str>) -> &str {
     repo.unwrap_or("global")
 }
 
+/// A favetto-side text selection in the Agent panel, in grid coordinates
+/// `(row, col)` relative to [`App::agent_area`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentSelection {
+    /// Where the drag started.
+    pub anchor: (u16, u16),
+    /// The cell the pointer is currently over.
+    pub cursor: (u16, u16),
+    /// Set once a `Drag` moved the cursor, so a plain click copies nothing.
+    pub moved: bool,
+}
+
+impl AgentSelection {
+    pub fn new(cell: (u16, u16)) -> Self {
+        Self {
+            anchor: cell,
+            cursor: cell,
+            moved: false,
+        }
+    }
+
+    /// `(start, end)` in reading order (row-major; tuple ordering is lexicographic).
+    pub fn normalized(&self) -> ((u16, u16), (u16, u16)) {
+        if self.anchor <= self.cursor {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
+        }
+    }
+
+    /// Whether `cell` falls inside the linear selection.
+    pub fn contains(&self, cell: (u16, u16)) -> bool {
+        let (start, end) = self.normalized();
+        cell >= start && cell <= end
+    }
+}
+
+/// Extract `sel` from a vt100 grid: read row-major, clamp to the screen, skip
+/// wide-continuation cells, render blank cells as spaces, trim trailing blanks
+/// per row, drop trailing blank lines, and join with `\n`.
+pub fn extract_selection(screen: &vt100::Screen, sel: &AgentSelection) -> String {
+    let (rows, cols) = screen.size();
+    if rows == 0 || cols == 0 {
+        return String::new();
+    }
+    let (start, end) = sel.normalized();
+    let last_row = end.0.min(rows - 1);
+    let mut lines: Vec<String> = Vec::new();
+    for row in start.0.min(rows - 1)..=last_row {
+        let lo = if row == start.0 { start.1 } else { 0 };
+        let hi = if row == end.0 { end.1 } else { cols - 1 };
+        let hi = hi.min(cols - 1);
+        let mut line = String::new();
+        for col in lo..=hi {
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let contents = cell.contents();
+            line.push_str(if contents.is_empty() { " " } else { contents });
+        }
+        lines.push(line.trim_end().to_string());
+    }
+    while lines.last().map(|l| l.is_empty()).unwrap_or(false) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
 pub struct App {
     /// The colour palette every widget paints through.
     pub theme: Theme,
@@ -618,6 +691,10 @@ pub struct App {
     /// The last task-command error (`tasks.cancel` / `tasks.retry` /
     /// `workflow.cancel`), shown in the status bar. Cleared by a later success.
     pub notice: Option<String>,
+    /// The active copy-on-select range in the Agent panel, if any.
+    pub agent_selection: Option<AgentSelection>,
+    /// The last copy-on-select result, shown in the status bar.
+    pub copy_notice: Option<String>,
     /// Cached `agents.list` sessions keyed by daemon session id. The source of
     /// the Tasks-table Activity/Usage cells and the Ctrl+R reply target.
     pub agent_sessions: HashMap<String, AgentSessionInfo>,
@@ -734,6 +811,8 @@ impl App {
             agent_structured: false,
             agent_error: None,
             notice: None,
+            agent_selection: None,
+            copy_notice: None,
             agent_sessions: HashMap::new(),
             task_state: HashMap::new(),
             usage_period: UsagePeriod::default(),
@@ -813,6 +892,10 @@ impl App {
         if tab == Tab::Usage && self.tab != Tab::Usage {
             self.usage_dirty = true;
         }
+        // A selection only makes sense on the Agent panel; leaving it drops the
+        // highlight and the confirmation.
+        self.agent_selection = None;
+        self.copy_notice = None;
         self.tab = tab;
     }
 
@@ -1367,6 +1450,7 @@ impl App {
         self.agent_structured = structured;
         self.agent_status = status;
         self.agent_error = None;
+        self.agent_selection = None;
         // The embedded agent owns the keyboard as soon as the panel is opened,
         // unless the PTY is read-only.
         self.agent_capture = !read_only;

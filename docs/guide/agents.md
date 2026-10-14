@@ -134,6 +134,11 @@ device attributes, colours, mode reports) are answered by the daemon on the PTY.
   favetto: a click selects a row and a second click runs its primary action.
   Clicks in the terminal area are forwarded to the agent as mouse reports when it
   has enabled them.
+- **Copy.** Drag with the left mouse button over the terminal area to select text;
+  releasing copies it to the clipboard (OSC 52 plus a best-effort local tool) and
+  the status bar confirms with `copied N chars`. Hold **Shift** while dragging to
+  forward the drag to the agent's own mouse UI instead (see
+  [Copy agent output](./tui#copy-agent-output)).
 
 ## Lifecycle
 
