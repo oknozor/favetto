@@ -18,6 +18,8 @@ use favetto_wire::model::{Event, Task};
 use favetto_wire::rpc::{push, CatalogEntry};
 use uuid::Uuid;
 
+use crate::notifications::Permission;
+
 /// `localStorage` key for the bearer token.
 pub const TOKEN_KEY: &str = "favetto.token";
 /// `localStorage` key for the daemon base URL (empty = same origin / unset).
@@ -170,6 +172,8 @@ pub struct AppState {
     pub cache: Signal<Cache>,
     /// Bumped by a `catalog.updated` push so the Catalog view re-fetches.
     pub catalog_version: Signal<u64>,
+    /// Browser/WebView notification permission, mirrored from `Notification.permission`.
+    pub notification_permission: Signal<Permission>,
 }
 
 /// Whether a push method should make the Catalog view re-fetch.
@@ -192,6 +196,7 @@ impl AppState {
             pending_pair_code: Signal::new(None),
             cache: Signal::new(cache),
             catalog_version: Signal::new(0),
+            notification_permission: Signal::new(Permission::default()),
         }
     }
 

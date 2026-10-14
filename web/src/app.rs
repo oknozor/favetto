@@ -38,6 +38,9 @@ pub enum Route {
     /// Deep-linkable alias for the Inbox (`ntfy` links use `/inbox/:task_id`).
     #[route("/inbox")]
     Inbox {},
+    /// Deep link for notification clicks: `/inbox/:task_id`.
+    #[route("/inbox/:task_id")]
+    InboxTask { task_id: String },
     /// The task list, filterable by status.
     #[route("/tasks")]
     TasksList {},
@@ -88,6 +91,19 @@ fn AppNav() -> Element {
     }
 }
 
+/// The `/inbox/:task_id` deep link from a notification click.
+///
+/// The canonical task page stays at `/tasks/:id`; this lands on the Inbox,
+/// mirroring the `ntfy` deep link. The `task_id` is kept so a later enhancement
+/// can focus the awaiting card.
+#[component]
+fn InboxTask(task_id: String) -> Element {
+    let _ = task_id;
+    rsx! {
+        Inbox {}
+    }
+}
+
 /// The application root: stylesheet, layout shell, and router outlet.
 #[component]
 pub fn App() -> Element {
@@ -100,6 +116,14 @@ pub fn App() -> Element {
             if let Some(code) = crate::views::pair::pair_code_from_url() {
                 state.pending_pair_code.set(Some(code));
             }
+        }
+    });
+
+    // Mirror the browser's current permission into state once the app mounts.
+    use_effect(move || {
+        let current = crate::notifications::current_permission();
+        if (state.notification_permission)() != current {
+            state.notification_permission.set(current);
         }
     });
 
@@ -249,7 +273,38 @@ fn apply_event(mut state: AppState, event: crate::sse::SseEvent) {
         state.bump_catalog();
     }
     if let Ok(params) = serde_json::from_str::<serde_json::Value>(&data) {
+        if method == favetto_wire::rpc::push::EVENT {
+            if let Ok(event) = serde_json::from_value::<favetto_wire::model::Event>(params.clone())
+            {
+                handle_awaiting(state, &event);
+            }
+        }
         state.cache.write().apply_push(method, &params);
+    }
+}
+
+/// Raise a notification for a `task_awaiting_input` event.
+///
+/// The first awaiting event asks for permission (fire-and-forget); every later
+/// event notifies when permission is granted and the app is visible.
+#[cfg(target_arch = "wasm32")]
+fn handle_awaiting(mut state: AppState, event: &favetto_wire::model::Event) {
+    use crate::notifications;
+
+    let Some(alert) = notifications::awaiting_alert(event) else {
+        return;
+    };
+    let permission = (state.notification_permission)();
+    if permission.needs_request() {
+        spawn(async move {
+            let next = notifications::request_permission().await;
+            state.notification_permission.set(next);
+            if notifications::should_notify(next, notifications::document_hidden()) {
+                notifications::notify(&alert.title, &alert.body, &alert.task_id);
+            }
+        });
+    } else if notifications::should_notify(permission, notifications::document_hidden()) {
+        notifications::notify(&alert.title, &alert.body, &alert.task_id);
     }
 }
 
@@ -309,5 +364,23 @@ mod tests {
         assert_eq!(Route::Inbox {}.to_string(), "/inbox");
         assert_eq!("/".parse::<Route>().unwrap(), Route::Home {});
         assert_eq!("/inbox".parse::<Route>().unwrap(), Route::Inbox {});
+    }
+
+    /// A notification click deep-links to `/inbox/:task_id`.
+    #[test]
+    fn inbox_task_route_round_trips() {
+        assert_eq!(
+            Route::InboxTask {
+                task_id: "abc".into()
+            }
+            .to_string(),
+            "/inbox/abc"
+        );
+        assert_eq!(
+            "/inbox/abc".parse::<Route>().unwrap(),
+            Route::InboxTask {
+                task_id: "abc".into()
+            }
+        );
     }
 }

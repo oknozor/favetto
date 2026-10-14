@@ -14,3 +14,9 @@ watch_path = ["src", "assets"]
 identifier = "dev.favetto.app"
 publisher = "favetto"
 icon = ["assets/icon.png"]
+
+# Declare Android 13+ POST_NOTIFICATIONS. `dx` maps `notifications` to
+# `android.permission.POST_NOTIFICATIONS` in the generated AndroidManifest.xml;
+# the web Notification API inside the WebView drives the runtime request.
+[permissions]
+notifications = { description = "Tell you when a task needs your input" }
