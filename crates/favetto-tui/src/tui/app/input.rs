@@ -289,13 +289,15 @@ impl App {
     pub(super) fn select_row(&mut self, tab: Tab, index: usize) -> UiAction {
         match tab {
             Tab::Tasks => {
-                if self.tasks.is_empty() {
+                let len = self.visible_tasks().len();
+                if len == 0 {
                     return UiAction::None;
                 }
+                let index = index.min(len - 1);
                 let already = self.tasks_selected == index;
-                self.tasks_selected = index.min(self.tasks.len() - 1);
+                self.tasks_selected = index;
                 if already {
-                    if let Some(t) = self.tasks.get(index) {
+                    if let Some(t) = self.selected_task() {
                         return UiAction::OpenAgent(t.id.to_string());
                     }
                 }
@@ -325,8 +327,9 @@ impl App {
                 UiAction::None
             }
             Tab::Events => {
-                if !self.events.is_empty() {
-                    self.events_selected = index.min(self.events.len() - 1);
+                let len = self.visible_events().len();
+                if len > 0 {
+                    self.events_selected = index.min(len - 1);
                 }
                 UiAction::None
             }
@@ -361,7 +364,8 @@ impl App {
         }
         match tab {
             Tab::Tasks => {
-                self.tasks_selected = shift_index(self.tasks_selected, delta, self.tasks.len());
+                let len = self.visible_tasks().len();
+                self.tasks_selected = shift_index(self.tasks_selected, delta, len);
             }
             Tab::Catalog => {
                 let len = self.catalog_rows().len();
@@ -369,7 +373,8 @@ impl App {
                 self.select_catalog_row(next);
             }
             Tab::Events => {
-                self.events_selected = shift_index(self.events_selected, delta, self.events.len());
+                let len = self.visible_events().len();
+                self.events_selected = shift_index(self.events_selected, delta, len);
             }
             Tab::Scheduler => {
                 self.schedules_selected =
@@ -737,9 +742,11 @@ impl App {
                         let next = self.catalog_selected + 1;
                         self.select_catalog_row(next);
                     }
-                    Tab::Events if !self.events.is_empty() => {
-                        self.events_selected =
-                            (self.events_selected + 1).min(self.events.len() - 1);
+                    Tab::Events => {
+                        let len = self.visible_events().len();
+                        if len > 0 {
+                            self.events_selected = (self.events_selected + 1).min(len - 1);
+                        }
                     }
                     Tab::Scheduler if !self.schedules.is_empty() => {
                         self.schedules_selected =
@@ -769,9 +776,9 @@ impl App {
             KeyCode::PageDown => {
                 match self.tab {
                     Tab::Events => {
-                        if !self.events.is_empty() {
-                            self.events_selected =
-                                (self.events_selected + 10).min(self.events.len() - 1);
+                        let len = self.visible_events().len();
+                        if len > 0 {
+                            self.events_selected = (self.events_selected + 10).min(len - 1);
                         }
                     }
                     Tab::Catalog => {
@@ -784,7 +791,7 @@ impl App {
             }
             KeyCode::Enter => {
                 if self.tab == Tab::Tasks {
-                    if let Some(t) = self.tasks.get(self.tasks_selected) {
+                    if let Some(t) = self.selected_task() {
                         return UiAction::OpenAgent(t.id.to_string());
                     }
                 }

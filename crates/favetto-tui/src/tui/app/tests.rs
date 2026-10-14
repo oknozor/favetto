@@ -3057,3 +3057,159 @@ fn active_repo_label_defaults_to_global() {
     app.set_repos(Vec::new(), Some("favetto".to_string()));
     assert_eq!(app.active_repo_label(), "repo: favetto");
 }
+
+#[test]
+fn visible_tasks_filters_by_active_repo() {
+    let mut app = App::new();
+    app.tasks = vec![task("global_task"), task("repo:a/one"), task("repo:b/two")];
+    // The global view lists everything.
+    assert_eq!(app.visible_tasks().len(), 3);
+
+    app.active_repo = Some("a".to_string());
+    let visible = app.visible_tasks();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].name, "repo:a/one");
+    assert_eq!(task_repo(&visible[0].name), Some("a"));
+    assert_eq!(repo_label(task_repo(&visible[0].name)), "a");
+    assert_eq!(repo_label(None), "global");
+
+    app.active_repo = None;
+    assert_eq!(app.visible_tasks().len(), 3);
+}
+
+#[test]
+fn selected_and_next_follow_the_visible_tasks() {
+    let mut app = App::new();
+    app.tasks = vec![task("repo:a/one"), task("repo:b/two")];
+    app.active_repo = Some("b".to_string());
+
+    // Only the `b` row is addressable.
+    assert_eq!(
+        app.selected_task().map(|t| t.name.as_str()),
+        Some("repo:b/two")
+    );
+    app.select_next();
+    assert_eq!(app.tasks_selected, 0, "one visible row cannot move");
+
+    app.tasks_selected = 9;
+    assert_eq!(
+        app.selected_task().map(|t| t.name.as_str()),
+        Some("repo:b/two"),
+        "an out-of-range selection clamps into view"
+    );
+}
+
+#[test]
+fn event_repo_derives_from_name_and_task_id() {
+    let mut app = App::new();
+    let local = task("repo:a/build");
+    let local_id = local.id.to_string();
+    app.tasks = vec![local];
+
+    // Lifecycle events carry `name` directly.
+    let named = event(
+        1,
+        EventKind::TaskStarted,
+        serde_json::json!({ "name": "repo:a/build" }),
+    );
+    assert_eq!(app.event_repo(&named).as_deref(), Some("a"));
+
+    // A bare name is global.
+    let global_named = event(
+        2,
+        EventKind::TaskStarted,
+        serde_json::json!({ "name": "build" }),
+    );
+    assert_eq!(app.event_repo(&global_named), None);
+
+    // Terminal/cron events carry only `task_id`, resolved against the list.
+    let by_id = event(
+        3,
+        EventKind::TaskCompleted,
+        serde_json::json!({ "task_id": local_id }),
+    );
+    assert_eq!(app.event_repo(&by_id).as_deref(), Some("a"));
+
+    // An unresolved task id and an integration event both fall back to global.
+    let unknown = event(
+        4,
+        EventKind::TaskFailed,
+        serde_json::json!({ "task_id": uuid::Uuid::new_v4().to_string() }),
+    );
+    assert_eq!(app.event_repo(&unknown), None);
+    let integration = event(
+        5,
+        EventKind::IssueCreated,
+        serde_json::json!({ "repo": "owner/name" }),
+    );
+    assert_eq!(app.event_repo(&integration), None);
+}
+
+#[test]
+fn visible_events_filters_and_selection_counts_from_newest() {
+    let mut app = App::new();
+    let local = task("repo:a/build");
+    let local_id = local.id.to_string();
+    app.tasks = vec![local];
+
+    app.ingest_event(event(
+        1,
+        EventKind::TaskStarted,
+        serde_json::json!({ "name": "repo:a/build" }),
+    ));
+    app.ingest_event(event(
+        2,
+        EventKind::TaskStarted,
+        serde_json::json!({ "name": "global_task" }),
+    ));
+    app.ingest_event(event(
+        3,
+        EventKind::TaskCompleted,
+        serde_json::json!({ "task_id": local_id }),
+    ));
+
+    assert_eq!(app.visible_events().len(), 3);
+
+    app.active_repo = Some("a".to_string());
+    let visible = app.visible_events();
+    assert_eq!(visible.len(), 2);
+    assert_eq!(visible[0].id, 1, "visible events stay oldest-first");
+    assert_eq!(visible[1].id, 3);
+    assert!(visible
+        .iter()
+        .all(|e| app.event_repo(e).as_deref() == Some("a")));
+
+    // Offset 0 is the newest visible row.
+    app.events_selected = 0;
+    assert_eq!(app.selected_event().map(|e| e.id), Some(3));
+    app.events_selected = 1;
+    assert_eq!(app.selected_event().map(|e| e.id), Some(1));
+}
+
+#[test]
+fn switching_repo_clamps_the_task_and_event_selection() {
+    let mut app = App::new();
+    app.tasks = vec![task("repo:a/one")];
+    app.ingest_event(event(
+        1,
+        EventKind::TaskStarted,
+        serde_json::json!({ "name": "repo:a/one" }),
+    ));
+    app.tasks_selected = 0;
+    app.events_selected = 0;
+
+    // Switching to a repo with no matching rows empties both lists and resets
+    // the selections.
+    app.set_repos(Vec::new(), Some("empty".to_string()));
+    assert!(app.visible_tasks().is_empty());
+    assert!(app.visible_events().is_empty());
+    assert!(app.selected_task().is_none());
+    assert!(app.selected_event().is_none());
+    assert_eq!(app.tasks_selected, 0);
+    assert_eq!(app.events_selected, 0);
+
+    // Switching back restores the full, labelled lists.
+    app.set_repos(Vec::new(), None);
+    assert_eq!(app.visible_tasks().len(), 1);
+    assert_eq!(app.visible_events().len(), 1);
+}

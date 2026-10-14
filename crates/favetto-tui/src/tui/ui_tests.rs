@@ -928,7 +928,9 @@ fn tasks_table_renders_activity_and_usage_cells() {
     });
     app.set_agent_sessions(vec![agent]);
 
-    let text = render_text(&mut app, 120, 24);
+    // Wide enough that every fixed column fits: the Tasks table now carries the
+    // REPO and STARTED/DURATION columns, so at 120 it would be compressed.
+    let text = render_text(&mut app, 200, 24);
     assert!(
         text.contains("ACTIVITY"),
         "activity header missing: {text:?}"
@@ -1804,4 +1806,76 @@ fn status_bar_shows_the_active_repo_badge() {
     app.set_repos(Vec::new(), None);
     let text = render_text(&mut app, 120, 24);
     assert!(text.contains("repo: global"), "{text:?}");
+}
+
+#[test]
+fn tasks_table_shows_repo_column_and_labels_global() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    app.tasks = vec![geom_task("repo:my-repo/triage"), geom_task("bare")];
+
+    let text = render_text(&mut app, 220, 24);
+    assert!(text.contains("REPO"), "repo header missing: {text:?}");
+    assert!(text.contains("my-repo"), "repo name missing: {text:?}");
+    assert!(text.contains("global"), "global label missing: {text:?}");
+}
+
+#[test]
+fn tasks_table_filters_to_the_active_repo() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    app.tasks = vec![geom_task("repo:my-repo/triage"), geom_task("other_task")];
+    app.active_repo = Some("my-repo".to_string());
+
+    let text = render_text(&mut app, 220, 24);
+    assert!(
+        text.contains("repo:my-repo/triage"),
+        "local task missing: {text:?}"
+    );
+    assert!(
+        !text.contains("other_task"),
+        "foreign task must be filtered: {text:?}"
+    );
+    assert_eq!(app.tasks_geom.len, 1, "geometry tracks the visible rows");
+}
+
+#[test]
+fn events_list_shows_repo_column_and_filters_to_the_active_repo() {
+    use chrono::Utc;
+    use favetto_core::model::{Event, EventKind};
+
+    let mut app = App::new();
+    app.tab = Tab::Events;
+    app.ingest_event(Event {
+        id: 1,
+        kind: EventKind::TaskStarted,
+        payload: serde_json::json!({ "name": "repo:my-repo/build" }),
+        created_at: Utc::now(),
+    });
+    app.ingest_event(Event {
+        id: 2,
+        kind: EventKind::TaskStarted,
+        payload: serde_json::json!({ "name": "global_task" }),
+        created_at: Utc::now(),
+    });
+
+    let text = render_text(&mut app, 120, 30);
+    assert!(text.contains("REPO"), "repo header missing: {text:?}");
+    assert!(text.contains("my-repo"), "repo label missing: {text:?}");
+    assert!(
+        text.contains("Events (2)"),
+        "global count missing: {text:?}"
+    );
+
+    app.active_repo = Some("my-repo".to_string());
+    let text = render_text(&mut app, 120, 30);
+    assert!(
+        text.contains("Events (1)"),
+        "filtered count missing: {text:?}"
+    );
+    assert!(
+        !text.contains("global_task"),
+        "foreign event must be filtered: {text:?}"
+    );
+    assert_eq!(app.events_geom.len, 1, "geometry tracks the visible rows");
 }
