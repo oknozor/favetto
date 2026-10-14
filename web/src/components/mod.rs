@@ -3,6 +3,7 @@
 pub mod agent_feed;
 pub mod common;
 pub mod dialog;
+pub mod highlight;
 pub mod markdown;
 pub mod nav;
 pub mod output_viewer;

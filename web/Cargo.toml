@@ -48,6 +48,8 @@ web-sys = { version = "0.3", features = [
     "NotificationOptions",
     "NotificationPermission",
     "Document",
+    # The feed's scroll container is read and driven directly (`Element`).
+    "Element",
 ] }
 
 [features]

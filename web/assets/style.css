@@ -60,6 +60,13 @@
   --accent: #4a3a66;
   --accent-soft: #e0d8ee;
 
+  /* JSON syntax roles (live agent feed / highlighted code) */
+  --syn-key: #1d4ed8;
+  --syn-string: #15803d;
+  --syn-number: #7a5200;
+  --syn-bool: #b3261e;
+  --syn-punct: #5c6169;
+
   /* Foregrounds for solid semantic buttons */
   --danger-fg: #ffffff;
   --success-fg: #ffffff;
@@ -104,6 +111,11 @@
     --neutral-soft: #2a2e36;
     --accent: #c9b6ee;
     --accent-soft: #2e2740;
+    --syn-key: #4c8bf5;
+    --syn-string: #81c995;
+    --syn-number: #f5c469;
+    --syn-bool: #f28b82;
+    --syn-punct: #9aa1ab;
     --danger-fg: #3a0a06;
     --success-fg: #0b2010;
     --code-bg: #1f1f1f;
@@ -1641,6 +1653,10 @@ textarea.input {
   margin-top: var(--space-5);
 }
 
+.agent-feed-wrap {
+  position: relative;
+}
+
 .agent-feed {
   display: flex;
   flex-direction: column;
@@ -1651,6 +1667,36 @@ textarea.input {
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--surface);
+  scroll-behavior: smooth;
+}
+
+/* Zero-height sentinel at the end of the list; it is re-keyed (and remounted)
+   whenever an event arrives, which drives the auto-follow scroll. */
+.feed-anchor {
+  height: 0;
+}
+
+.feed-jump {
+  position: absolute;
+  right: var(--space-3);
+  bottom: var(--space-3);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 0.25rem 0.7rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-pill);
+  background: var(--surface-2);
+  color: var(--fg);
+  font: inherit;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: var(--shadow-2);
+}
+
+.feed-jump-arrow {
+  font-size: 0.9em;
 }
 
 .feed-item {
@@ -1669,9 +1715,48 @@ textarea.input {
   color: var(--muted);
 }
 
+/* Per-action accents: assistant prose, user/system/tool text, and the
+   dimmed "thinking" stream are each tinted distinctly. */
+.feed-role.role-assistant {
+  color: var(--primary);
+}
+
+.feed-role.role-user {
+  color: var(--accent);
+}
+
+.feed-role.role-system {
+  color: var(--info);
+}
+
+.feed-role.role-tool {
+  color: var(--warning);
+}
+
+.feed-role.role-reasoning {
+  color: var(--muted);
+}
+
+.feed-message.role-assistant {
+  border-left: 3px solid var(--primary);
+}
+
+.feed-message.role-user {
+  border-left: 3px solid var(--accent);
+}
+
+.feed-message.role-system {
+  border-left: 3px solid var(--info);
+}
+
+.feed-message.role-tool {
+  border-left: 3px solid var(--warning);
+}
+
 .feed-text,
 .feed-tool-input,
-.feed-tool-output {
+.feed-tool-output,
+.feed-code {
   margin: 0;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 0.8rem;
@@ -1681,18 +1766,46 @@ textarea.input {
 }
 
 .feed-reasoning {
+  border-left: 3px solid color-mix(in srgb, var(--muted) 40%, transparent);
   color: var(--muted);
   font-style: italic;
+}
+
+.feed-markdown {
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+
+.feed-markdown.clamped {
+  max-height: 20rem;
+  overflow: hidden;
 }
 
 .feed-tool {
   border-left: 3px solid var(--border);
 }
 
+.feed-tool.tool-running {
+  border-left-color: var(--primary);
+}
+
+.feed-tool.tool-ok {
+  border-left-color: var(--success);
+}
+
+.feed-tool.tool-error {
+  border-left-color: var(--danger);
+}
+
 .feed-tool-head {
   display: flex;
   align-items: center;
   gap: var(--space-2);
+}
+
+.feed-tool-icon {
+  line-height: 1;
+  color: var(--muted);
 }
 
 .feed-tool-name {
@@ -1722,6 +1835,28 @@ textarea.input {
 .tool-error {
   background: color-mix(in srgb, var(--danger) 20%, transparent);
   color: var(--danger);
+}
+
+/* JSON syntax roles (tool cards and Markdown code blocks). */
+.syn-key {
+  color: var(--syn-key);
+}
+
+.syn-string {
+  color: var(--syn-string);
+}
+
+.syn-number {
+  color: var(--syn-number);
+}
+
+.syn-bool {
+  color: var(--syn-bool);
+  font-weight: 600;
+}
+
+.syn-punct {
+  color: var(--syn-punct);
 }
 
 .feed-tool-input {
@@ -1977,5 +2112,9 @@ textarea.input {
 
   .skip-link {
     transition: none;
+  }
+
+  .agent-feed {
+    scroll-behavior: auto;
   }
 }

@@ -3,6 +3,8 @@
 use dioxus::prelude::*;
 use pulldown_cmark::{html, Event, Options, Parser};
 
+use crate::components::highlight::highlight_fenced_json;
+
 /// Split a catalog `.md` file into its TOML front-matter header and Markdown
 /// body. The separator is the first line whose trimmed content is exactly `---`.
 /// A file with no separator is all body.
@@ -32,7 +34,8 @@ pub fn render_markdown(source: &str) -> String {
         .filter(|event| !matches!(event, Event::Html(_) | Event::InlineHtml(_)));
     let mut out = String::new();
     html::push_html(&mut out, parser);
-    out
+    // Fenced `json` blocks get the same syntax highlighting as tool cards.
+    highlight_fenced_json(&out)
 }
 
 /// A rendered Markdown block. The HTML is produced by [`render_markdown`],
@@ -62,6 +65,19 @@ mod tests {
         assert!(
             html.contains("<a href=\"https://e\""),
             "link missing from {html}"
+        );
+    }
+
+    #[test]
+    fn fenced_json_code_blocks_are_highlighted() {
+        let html = render_markdown("```json\n{\n  \"answer\": 42\n}\n```\n");
+        assert!(
+            html.contains("<span class=\"syn-key\">\"answer\"</span>"),
+            "json key not highlighted in {html}"
+        );
+        assert!(
+            html.contains("<span class=\"syn-number\">42</span>"),
+            "json number not highlighted in {html}"
         );
     }
 

@@ -8,6 +8,8 @@
 use dioxus::prelude::*;
 use favetto_wire::model::RunSummary;
 
+use crate::components::highlight::pretty;
+
 /// Number of lines shown before the "Show more" expander is offered.
 pub const COLLAPSED_LINES: usize = 200;
 
@@ -48,24 +50,6 @@ pub fn extract_run_summary(value: &serde_json::Value) -> Option<RunSummary> {
         .unwrap_or(value);
     let summary: RunSummary = serde_json::from_value(candidate.clone()).ok()?;
     (!summary.is_empty()).then_some(summary)
-}
-
-/// Render a JSON value for a tool card: a string is shown verbatim (ANSI
-/// stripped), an empty/null value renders to nothing, scalars use their plain
-/// form, and only a genuinely nested object/array is pretty-printed.
-pub fn readable_value(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::Null => String::new(),
-        serde_json::Value::String(text) => strip_ansi(text),
-        serde_json::Value::Bool(value) => value.to_string(),
-        serde_json::Value::Number(value) => value.to_string(),
-        _ => pretty(value),
-    }
-}
-
-/// Pretty-print a JSON value, degrading to an empty string on failure.
-pub fn pretty(value: &serde_json::Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_default()
 }
 
 /// Remove ANSI/VT100 escape sequences so the pane shows plain text.
@@ -246,20 +230,6 @@ mod tests {
             "result": { "title": "Fix it" },
         }))
         .is_none());
-    }
-
-    #[test]
-    fn readable_value_unwraps_strings_and_pretty_prints_objects() {
-        assert_eq!(readable_value(&serde_json::json!("plain")), "plain");
-        assert_eq!(readable_value(&serde_json::json!(42)), "42");
-        assert_eq!(readable_value(&serde_json::json!(true)), "true");
-        assert_eq!(readable_value(&serde_json::Value::Null), "");
-        assert_eq!(
-            readable_value(&serde_json::json!("\u{1b}[31mred\u{1b}[0m")),
-            "red"
-        );
-        let nested = readable_value(&serde_json::json!({ "a": 1 }));
-        assert!(nested.contains("\"a\""), "nested object: {nested}");
     }
 
     #[test]
