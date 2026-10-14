@@ -27,7 +27,7 @@ use crate::components::common::{EmptyState, EventBadge, Spinner};
 use crate::components::task_card::TaskCard;
 use crate::components::toast::{Toast, ToastKind};
 use crate::config;
-use crate::state::{onboarding_step, AppState, OnboardingStep};
+use crate::state::{onboarding_step, repo_label, task_repo, AppState, OnboardingStep};
 use crate::views::tasks::{format_age, now_ms, status_label};
 
 /// How many recent failures the Inbox shows.
@@ -284,10 +284,12 @@ pub fn Inbox() -> Element {
 
     let now = now_ms();
     let cache = (state.cache)();
-    let tasks: Vec<Task> = cache.tasks.values().cloned().collect();
+    // Scope the whole Inbox to the active repo (all rows when global).
+    let tasks: Vec<Task> = cache.visible_tasks().into_iter().cloned().collect();
     let awaiting = awaiting_tasks(&tasks);
     let failures = recent_failures(&tasks, FAILURES_LIMIT);
-    let events = recent_events(&cache.events, EVENTS_LIMIT);
+    let visible_events: Vec<Event> = cache.visible_events().into_iter().cloned().collect();
+    let events = recent_events(&visible_events, EVENTS_LIMIT);
     let agent_list = agents();
 
     let awaiting_rows: Vec<(Task, Option<AwaitingCard>)> = awaiting
@@ -366,6 +368,7 @@ pub fn Inbox() -> Element {
                                 status: task.status,
                                 age: format_age(task.created_at.timestamp_millis(), now),
                                 awaiting: true,
+                                repo: Some(repo_label(task_repo(&task.name)).to_string()),
                             }
                         }
                     }
@@ -382,6 +385,7 @@ pub fn Inbox() -> Element {
                             status: task.status,
                             age: format_age(task.created_at.timestamp_millis(), now),
                             detail: task.error.clone(),
+                            repo: Some(repo_label(task_repo(&task.name)).to_string()),
                         }
                     }
                 }

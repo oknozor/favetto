@@ -12,6 +12,7 @@
 use dioxus::prelude::*;
 
 use crate::app::Route;
+use crate::components::repo_switcher::RepoSwitcher;
 
 /// One top-level destination in the primary navigation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -116,6 +117,7 @@ pub fn AppNav() -> Element {
                     span { class: "app-nav-label", "{section.label()}" }
                 }
             }
+            RepoSwitcher {}
         }
     }
 }

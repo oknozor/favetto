@@ -33,6 +33,9 @@ pub fn TaskCard(
     age: String,
     #[props(default = false)] awaiting: bool,
     #[props(default)] detail: Option<String>,
+    /// The repo namespace (`global` for an unscoped task), shown as a chip.
+    #[props(default)]
+    repo: Option<String>,
 ) -> Element {
     let badge = format!("status-badge status-{}", status.as_str());
     let icon = status_icon(status);
@@ -47,6 +50,9 @@ pub fn TaskCard(
                     span { class: badge, "{status_label(status)}" }
                     if awaiting {
                         span { class: "task-card-awaiting", "needs input" }
+                    }
+                    if let Some(repo) = repo {
+                        span { class: "task-card-repo", "{repo}" }
                     }
                 }
                 div { class: "task-card-meta",

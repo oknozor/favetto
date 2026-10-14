@@ -87,8 +87,12 @@ pub fn Catalog() -> Element {
         Some(Ok(list)) => list.clone(),
         _ => Vec::new(),
     };
+    // Scope to the active repo, then the search box. A repo-local entry carries
+    // its namespace in `repo`; global entries are unscoped.
+    let cache = (state.cache)();
     let visible: Vec<CatalogEntry> = entries
         .iter()
+        .filter(|entry| cache.repo_visible(entry.repo.as_deref()))
         .filter(|entry| matches_query(entry, &query()))
         .cloned()
         .collect();
@@ -96,6 +100,9 @@ pub fn Catalog() -> Element {
     rsx! {
         main { id: "favetto-app", class: "catalog",
             h1 { "Catalog" }
+            if let Some(repo) = &cache.active_repo {
+                p { class: "catalog-scope", "Showing entries in repo: {repo}" }
+            }
             input {
                 class: "catalog-search",
                 r#type: "search",
