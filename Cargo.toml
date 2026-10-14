@@ -8,6 +8,9 @@ members = [
     "crates/favetto-mcp",
     "crates/favetto",
 ]
+# The Dioxus client is a standalone workspace with its own toolchain (`dx`);
+# excluding it keeps the native clippy/nextest gates off the WASM/Android deps.
+exclude = ["web"]
 
 [workspace.package]
 version = "0.1.0"
