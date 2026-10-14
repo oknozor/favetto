@@ -1,6 +1,10 @@
 /target
 **/*.rs.bk
-.favetto/
+# Daemon scratch tree (plans, handoffs, triage reports) is ignored, but the
+# repo-local task catalog `.favetto/tasks/` is committable.
+.favetto/*
+!.favetto/tasks/
+!.favetto/tasks/**
 workdir/SUMMARY.md
 
 # VitePress docs

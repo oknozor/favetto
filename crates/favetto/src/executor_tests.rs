@@ -3632,3 +3632,60 @@ async fn reconcile_fails_pending_tasks_with_a_vanished_catalog_definition() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A repo-local task defaults to its repo root as the base directory, and a
+/// worktree-isolated run targets that repo's git toplevel.
+#[tokio::test]
+async fn repo_task_runs_in_and_branches_the_repo() {
+    let dir = scratch_dir("repo-base-global");
+    std::fs::create_dir_all(&dir).unwrap();
+    let repo = scratch_dir("repo-base-checkout");
+    init_git_repo(&repo).await;
+    std::fs::create_dir_all(repo.join(".favetto/tasks")).unwrap();
+    std::fs::write(
+        repo.join(".favetto/tasks/triage.md"),
+        "agent = \"x\"\n---\nbody\n",
+    )
+    .unwrap();
+
+    let mut cfg = FavettoConfig::default();
+    cfg.executor.parallel = true;
+    let state = join_state_with_config(&dir, Vec::new(), cfg).await;
+    crate::repos::add(
+        &state,
+        favetto_core::rpc::ReposAddParams {
+            path: repo.to_string_lossy().into_owned(),
+            name: Some("myrepo".to_string()),
+        },
+    )
+    .await
+    .unwrap();
+
+    let def = state
+        .catalog
+        .read()
+        .iter()
+        .find(|d| d.name == "repo:myrepo/triage")
+        .cloned()
+        .expect("repo task loaded");
+    // The loader defaulted `cwd` to the repo root.
+    assert_eq!(def.cwd.as_deref(), Some(repo.to_string_lossy().as_ref()));
+
+    let task = lineage_task(&def.name, TaskStatus::Pending, None, None);
+    let base = resolve_base_dir(&def, &task);
+    assert_eq!(base, repo);
+
+    let plan = make_plan(&state, &state.config.executor, &base, &task, true)
+        .await
+        .unwrap();
+    let worktree = plan.worktree.expect("parallel task gets a worktree");
+    assert_eq!(
+        worktree.repo,
+        std::fs::canonicalize(&repo).unwrap(),
+        "worktree must belong to the repo checkout"
+    );
+    assert_eq!(worktree.branch, branch_name(&task));
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&repo);
+}

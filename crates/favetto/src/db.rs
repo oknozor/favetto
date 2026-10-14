@@ -85,6 +85,22 @@ CREATE TABLE IF NOT EXISTS worktrees (
     created_at INTEGER NOT NULL
 );
 
+-- Known repositories whose `.favetto/tasks/` catalogs the daemon loads. `path`
+-- is the absolute daemon-host directory; `name` is the namespace key used in
+-- `repo:<name>/<path>` task identities and is unique.
+CREATE TABLE IF NOT EXISTS known_repos (
+    path     TEXT PRIMARY KEY,
+    name     TEXT NOT NULL UNIQUE,
+    added_at INTEGER NOT NULL
+);
+
+-- Small key/value store for daemon-wide settings that survive restarts (the
+-- active repo is key `active_repo`).
+CREATE TABLE IF NOT EXISTS daemon_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS task_runs (
     id          TEXT PRIMARY KEY,
     task_id     TEXT NOT NULL,
@@ -597,6 +613,79 @@ fn row_to_schedule(row: &SqliteRow) -> Schedule {
         enabled: row.get::<i64, _>("enabled") != 0,
         last_run: row.get::<Option<i64>, _>("last_run").map(from_ms),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Known repos + daemon state
+// ---------------------------------------------------------------------------
+
+/// List known repositories as `(name, path)`, sorted by name.
+pub async fn list_repos(pool: &SqlitePool) -> anyhow::Result<Vec<(String, String)>> {
+    let rows = sqlx::query("SELECT name, path FROM known_repos ORDER BY name")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| (r.get::<String, _>("name"), r.get::<String, _>("path")))
+        .collect())
+}
+
+/// The `name` of the known repo registered at `path`, if any.
+pub async fn repo_name_for_path(pool: &SqlitePool, path: &str) -> anyhow::Result<Option<String>> {
+    let row = sqlx::query("SELECT name FROM known_repos WHERE path = ?")
+        .bind(path)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|r| r.get::<String, _>("name")))
+}
+
+/// Insert a known repo. Fails on a duplicate `name` or `path`.
+pub async fn insert_repo(pool: &SqlitePool, name: &str, path: &str) -> anyhow::Result<()> {
+    sqlx::query("INSERT INTO known_repos (name, path, added_at) VALUES (?, ?, ?)")
+        .bind(name)
+        .bind(path)
+        .bind(ts_ms(Utc::now()))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Delete a known repo by name. Returns whether a row was removed.
+pub async fn delete_repo(pool: &SqlitePool, name: &str) -> anyhow::Result<bool> {
+    let result = sqlx::query("DELETE FROM known_repos WHERE name = ?")
+        .bind(name)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// The daemon-wide active repo name, if set.
+pub async fn get_active_repo(pool: &SqlitePool) -> anyhow::Result<Option<String>> {
+    let row = sqlx::query("SELECT value FROM daemon_state WHERE key = 'active_repo'")
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|r| r.get::<String, _>("value")))
+}
+
+/// Persist (or clear, when `name` is `None`) the daemon-wide active repo.
+pub async fn set_active_repo(pool: &SqlitePool, name: Option<&str>) -> anyhow::Result<()> {
+    match name {
+        Some(name) => {
+            sqlx::query(
+                "INSERT INTO daemon_state (key, value) VALUES ('active_repo', ?)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(name)
+            .execute(pool)
+            .await?;
+        }
+        None => {
+            sqlx::query("DELETE FROM daemon_state WHERE key = 'active_repo'")
+                .execute(pool)
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

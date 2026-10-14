@@ -18,38 +18,59 @@ use crate::state::State;
 /// single reload.
 pub const DEBOUNCE: Duration = Duration::from_millis(200);
 
-/// Watch the tasks directory and reload the catalog on changes.
+/// Watch the catalog roots and reload the catalog on changes.
 ///
-/// The OS watcher is set up synchronously so that, once this returns, no further
-/// change can be missed; the debounced reload loop then runs on a background
-/// task for the lifetime of the process. When the tasks directory does not exist
-/// yet, its nearest existing ancestor is watched instead and the watcher
-/// re-targets once the directory appears.
+/// The watched roots are the global tasks directory plus every known repo's
+/// `.favetto/tasks/` directory. The OS watcher is set up synchronously so that,
+/// once this returns, no further change can be missed; the debounced reload loop
+/// then runs on a background task for the lifetime of the process. A root that
+/// does not exist yet is represented by its nearest existing ancestor and
+/// re-targeted once it appears. Adding/removing a repo sends a control signal on
+/// [`State::watch_tx`] which re-targets the watcher and reloads.
 pub fn spawn(state: Arc<State>) -> anyhow::Result<()> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let ctrl_rx = state
+        .watch_rx
+        .lock()
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("catalog watcher already spawned"))?;
+    let (fs_tx, fs_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut watcher =
         notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
             Ok(ev) => {
                 if event_relevant(&ev) {
-                    let _ = tx.send(());
+                    let _ = fs_tx.send(());
                 }
             }
             Err(e) => tracing::warn!(error = %e, "catalog watch error"),
         })?;
-    let watching = watch_target(&state.tasks_dir);
-    watcher.watch(&watching, RecursiveMode::Recursive)?;
+
+    let mut watching = Vec::new();
+    for target in desired_targets(&state) {
+        if let Err(e) = watcher.watch(&target, RecursiveMode::Recursive) {
+            tracing::warn!(dir = %target.display(), error = %e, "failed to watch catalog root");
+        } else {
+            watching.push(target);
+        }
+    }
     tracing::info!(
-        dir = %watching.display(),
+        roots = watching.len(),
         tasks_dir = %state.tasks_dir.display(),
-        "watching task catalog for changes"
+        "watching task catalogs for changes"
     );
 
-    tokio::spawn(debounce_loop(watcher, watching, rx, state));
+    tokio::spawn(debounce_loop(watcher, watching, fs_rx, ctrl_rx, state));
     Ok(())
 }
 
-/// The path to watch: the tasks directory when it exists, otherwise its nearest
-/// existing ancestor so that creating the directory later is observed.
+/// Signal the catalog watcher to re-target its roots and reload (a repo was
+/// added or removed). Non-blocking; the watcher coalesces the work.
+pub fn resync(state: &State) {
+    let _ = state.watch_tx.send(());
+}
+
+/// The path to watch for a catalog root: the directory when it exists,
+/// otherwise its nearest existing ancestor so that creating it later is
+/// observed.
 fn watch_target(tasks_dir: &Path) -> PathBuf {
     if tasks_dir.exists() {
         return tasks_dir.to_path_buf();
@@ -64,41 +85,73 @@ fn watch_target(tasks_dir: &Path) -> PathBuf {
     PathBuf::from(".")
 }
 
-/// Re-point the watcher when the tasks directory appears or disappears, falling
-/// back to its nearest existing ancestor.
-fn retarget(watcher: &mut RecommendedWatcher, watching: &mut PathBuf, tasks_dir: &Path) {
-    if *watching == tasks_dir && watching.exists() {
-        return;
-    }
-    let target = watch_target(tasks_dir);
-    if target == *watching {
-        return;
-    }
-    match watcher.watch(&target, RecursiveMode::Recursive) {
-        Ok(()) => {
-            let _ = watcher.unwatch(watching);
-            tracing::info!(dir = %target.display(), "catalog watch re-targeted");
-            *watching = target;
-        }
-        Err(e) => {
-            tracing::warn!(dir = %target.display(), error = %e, "failed to re-target catalog watch")
+/// The set of paths the watcher should currently watch: the global tasks
+/// directory plus each known repo's `.favetto/tasks/` (when its checkout
+/// exists), each mapped through [`watch_target`] and de-duplicated.
+fn desired_targets(state: &State) -> Vec<PathBuf> {
+    let mut roots = vec![state.tasks_dir.clone()];
+    for repo in state.repos.read().iter() {
+        if repo.path.exists() {
+            roots.push(repo.tasks_dir());
         }
     }
+    let mut targets: Vec<PathBuf> = roots.iter().map(|root| watch_target(root)).collect();
+    targets.sort();
+    targets.dedup();
+    targets
 }
 
-/// Debounce filesystem events, then reload the catalog once the stream is quiet.
+/// Re-point the watcher at the current set of desired targets, adding new roots
+/// and dropping removed ones.
+fn retarget_all(watcher: &mut RecommendedWatcher, watching: &mut Vec<PathBuf>, state: &State) {
+    let desired = desired_targets(state);
+    for target in watching.iter() {
+        if !desired.contains(target) {
+            let _ = watcher.unwatch(target);
+        }
+    }
+    for target in &desired {
+        if !watching.contains(target) {
+            match watcher.watch(target, RecursiveMode::Recursive) {
+                Ok(()) => tracing::info!(dir = %target.display(), "catalog watch added a root"),
+                Err(e) => {
+                    tracing::warn!(dir = %target.display(), error = %e, "failed to watch catalog root")
+                }
+            }
+        }
+    }
+    watching.retain(|target| desired.contains(target));
+}
+
+/// Debounce filesystem and control events, then reload the catalog once the
+/// stream is quiet.
 ///
 /// Reloads never overlap: this loop is the only caller and it awaits each one, so
 /// the last filesystem state always wins.
 async fn debounce_loop(
     mut watcher: RecommendedWatcher,
-    mut watching: PathBuf,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    mut watching: Vec<PathBuf>,
+    mut fs_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    mut ctrl_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
     state: Arc<State>,
 ) {
-    while rx.recv().await.is_some() {
+    loop {
+        tokio::select! {
+            event = fs_rx.recv() => {
+                if event.is_none() {
+                    return;
+                }
+            }
+            signal = ctrl_rx.recv() => {
+                if signal.is_none() {
+                    return;
+                }
+                // The repo set changed: re-target before reloading.
+                retarget_all(&mut watcher, &mut watching, &state);
+            }
+        }
         loop {
-            match tokio::time::timeout(DEBOUNCE, rx.recv()).await {
+            match tokio::time::timeout(DEBOUNCE, fs_rx.recv()).await {
                 // Another change arrived within the debounce window: keep waiting.
                 Ok(Some(())) => continue,
                 // The watcher went away: stop the loop.
@@ -107,7 +160,7 @@ async fn debounce_loop(
                 Err(_) => break,
             }
         }
-        retarget(&mut watcher, &mut watching, &state.tasks_dir);
+        retarget_all(&mut watcher, &mut watching, &state);
         reload(&state).await;
     }
 }
@@ -133,7 +186,7 @@ fn event_relevant(ev: &notify::Event) -> bool {
 /// changed, no client push is emitted.
 pub(crate) async fn reload(state: &Arc<State>) {
     let prior = state.catalog.read().clone();
-    let updated = crate::tasks::reload_catalog(&state.tasks_dir, &prior);
+    let updated = crate::repos::load_all(state, &prior);
     if updated == prior {
         return;
     }
@@ -511,6 +564,175 @@ mod tests {
             Some("0 30 8 * * *")
         );
         assert!(scheduled.iter().any(|s| s.id == "manual"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod repo_tests {
+    use super::*;
+    use crate::event_bus::EventBus;
+    use crate::state::StateInit;
+    use std::time::Duration;
+
+    /// A unique scratch directory for repo watcher tests.
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "favetto-watch-repo-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    async fn test_state(dir: &std::path::Path, tasks_dir: &std::path::Path) -> Arc<State> {
+        let pool = crate::db::open(&dir.join("test.db")).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        let catalog = Arc::new(parking_lot::RwLock::new(
+            crate::tasks::load_catalog(tasks_dir).unwrap(),
+        ));
+        let scheduler = tokio_cron_scheduler::JobScheduler::new().await.unwrap();
+        Arc::new(State::new(StateInit {
+            db: pool,
+            bus: EventBus::new(64),
+            token: favetto_core::auth::Token::generate(),
+            webhooks: crate::webhooks::WebhookSecrets::from_config(
+                &crate::config::FavettoConfig::default(),
+            ),
+            agents: crate::agents::AgentManager::new(),
+            registry: crate::agents::AgentRegistry::default(),
+            config: Arc::new(crate::config::FavettoConfig::default()),
+            data_dir: dir.to_path_buf(),
+            tasks_dir: tasks_dir.to_path_buf(),
+            catalog,
+            scheduler,
+            hook_store: Arc::new(parking_lot::RwLock::new(Vec::new())),
+        }))
+    }
+
+    async fn wait_for<F: Fn() -> bool>(timeout: Duration, cond: F) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if cond() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn watcher_tracks_a_repo_added_and_removed_at_runtime() {
+        let dir = temp_dir("runtime");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::write(tasks_dir.join("a.md"), "agent = \"x\"\n---\na\n").unwrap();
+
+        let repo = dir.join("myrepo");
+        std::fs::create_dir_all(repo.join(".favetto/tasks")).unwrap();
+        std::fs::write(
+            repo.join(".favetto/tasks/triage.md"),
+            "agent = \"x\"\n---\nrepo\n",
+        )
+        .unwrap();
+
+        let state = test_state(&dir, &tasks_dir).await;
+        spawn(state.clone()).unwrap();
+
+        // Registering the repo immediately picks up its catalog via reload.
+        crate::repos::add(
+            &state,
+            favetto_core::rpc::ReposAddParams {
+                path: repo.to_string_lossy().into_owned(),
+                name: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(state
+            .catalog
+            .read()
+            .iter()
+            .any(|d| d.name == "repo:myrepo/triage"));
+
+        // The watcher re-targeted onto the repo's tasks dir: a new file appears.
+        std::fs::write(
+            repo.join(".favetto/tasks/second.md"),
+            "agent = \"x\"\n---\nsecond\n",
+        )
+        .unwrap();
+        let added = wait_for(Duration::from_secs(5), || {
+            state
+                .catalog
+                .read()
+                .iter()
+                .any(|d| d.name == "repo:myrepo/second")
+        })
+        .await;
+        assert!(added, "a new repo task should be discovered");
+
+        // Removing the repo drops its tasks.
+        crate::repos::remove(&state, "myrepo").await.unwrap();
+        let removed = wait_for(Duration::from_secs(5), || {
+            !state
+                .catalog
+                .read()
+                .iter()
+                .any(|d| d.name.starts_with("repo:myrepo/"))
+        })
+        .await;
+        assert!(removed, "removing a repo should drop its tasks");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn repo_qualified_schedule_registers_and_retires() {
+        let dir = temp_dir("schedule");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let repo = dir.join("myrepo");
+        std::fs::create_dir_all(repo.join(".favetto/tasks")).unwrap();
+        std::fs::write(
+            repo.join(".favetto/tasks/cron.md"),
+            "agent = \"x\"\nschedule = \"0 0 8 * * *\"\n---\nbody\n",
+        )
+        .unwrap();
+
+        let state = test_state(&dir, &tasks_dir).await;
+        crate::repos::add(
+            &state,
+            favetto_core::rpc::ReposAddParams {
+                path: repo.to_string_lossy().into_owned(),
+                name: None,
+            },
+        )
+        .await
+        .unwrap();
+        crate::scheduler::reconcile_catalog_schedules(&state)
+            .await
+            .unwrap();
+        let scheduled = crate::db::list_schedules(&state.db).await.unwrap();
+        let entry = scheduled
+            .iter()
+            .find(|s| s.id == "catalog:repo:myrepo/cron")
+            .expect("qualified catalog schedule");
+        assert_eq!(entry.task, "repo:myrepo/cron");
+
+        // Removing the repo retires its schedule.
+        crate::repos::remove(&state, "myrepo").await.unwrap();
+        crate::scheduler::reconcile_catalog_schedules(&state)
+            .await
+            .unwrap();
+        let scheduled = crate::db::list_schedules(&state.db).await.unwrap();
+        assert!(!scheduled.iter().any(|s| s.id.starts_with("catalog:repo:")));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

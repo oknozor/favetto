@@ -272,6 +272,10 @@ pub const EXCLUDED: &[&str] = &[
     method::NOTIFICATIONS_TEST,
     method::HOOKS_UPSERT,
     method::PING,
+    method::REPOS_LIST,
+    method::REPOS_ADD,
+    method::REPOS_REMOVE,
+    method::REPOS_ACTIVATE,
 ];
 
 /// Build a JSON Schema object with `additionalProperties: false`.

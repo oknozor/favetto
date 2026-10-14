@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::agent_state::{AgentActivity, AgentUsage, InputReply, UsagePeriod, UsageStats};
 use crate::model::{
-    AgentCatalogEntry, AgentSessionInfo, Event, NotificationRecord, Schedule, Task,
+    AgentCatalogEntry, AgentSessionInfo, Event, NotificationRecord, RepoInfo, Schedule, Task,
 };
 use crate::task_var::TaskVar;
 use crate::workflow::{WorkflowCancelResult, WorkflowCreateResult, WorkflowGraph, WorkflowInspect};
@@ -162,6 +162,10 @@ pub struct CatalogEntry {
     pub vars: Vec<TaskVar>,
     /// The raw prompt template.
     pub prompt: String,
+    /// For a repo-local task, the repo namespace it belongs to (the `<name>` in
+    /// `repo:<name>/<path>`); `None` for global tasks.
+    #[serde(default)]
+    pub repo: Option<String>,
 }
 
 /// `catalog.list` result: every catalog definition, sorted by name.
@@ -599,6 +603,57 @@ pub struct UsageStatsParams {
 pub type UsageStatsResult = UsageStats;
 
 // ---------------------------------------------------------------------------
+// repos
+// ---------------------------------------------------------------------------
+
+/// `repos.list` result: known repositories plus the active repo name (if any).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ReposListResult {
+    pub repos: Vec<RepoInfo>,
+    #[serde(default)]
+    pub active: Option<String>,
+}
+
+/// `repos.add` params: a daemon-host path and an optional display name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ReposAddParams {
+    pub path: String,
+    #[serde(default, deserialize_with = "lenient")]
+    pub name: Option<String>,
+}
+
+/// `repos.add` result: the registered repo.
+pub type ReposAddResult = RepoInfo;
+
+/// `repos.remove` params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ReposRemoveParams {
+    pub name: String,
+}
+
+/// `repos.remove` result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ReposRemoveResult {
+    pub removed: bool,
+}
+
+/// `repos.activate` params: the repo name, or `null`/absent to clear the active
+/// repo (falling back to the global catalog).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ReposActivateParams {
+    #[serde(default, deserialize_with = "lenient")]
+    pub name: Option<String>,
+}
+
+/// `repos.activate` result: the updated repo list.
+pub type ReposActivateResult = ReposListResult;
+
+// ---------------------------------------------------------------------------
 // push payloads
 // ---------------------------------------------------------------------------
 
@@ -739,6 +794,14 @@ rpc_calls! {
     HooksUpsertCall => method::HOOKS_UPSERT, HookUpsertParams, HookUpsertResult;
     /// Typed call for `usage.stats`.
     UsageStatsCall => method::USAGE_STATS, UsageStatsParams, UsageStatsResult;
+    /// Typed call for `repos.list`.
+    ReposListCall => method::REPOS_LIST, EmptyParams, ReposListResult;
+    /// Typed call for `repos.add`.
+    ReposAddCall => method::REPOS_ADD, ReposAddParams, ReposAddResult;
+    /// Typed call for `repos.remove`.
+    ReposRemoveCall => method::REPOS_REMOVE, ReposRemoveParams, ReposRemoveResult;
+    /// Typed call for `repos.activate`.
+    ReposActivateCall => method::REPOS_ACTIVATE, ReposActivateParams, ReposActivateResult;
 }
 
 /// The JSON Schema of a type, as a plain JSON value. Used by the doc generator.
@@ -933,6 +996,26 @@ pub const CLIENT_CALLS: &[RpcCallSpec] = &[
         params_schema: schema_of::<UsageStatsParams>,
         result_schema: schema_of::<UsageStatsResult>,
     },
+    RpcCallSpec {
+        method: method::REPOS_LIST,
+        params_schema: schema_of::<EmptyParams>,
+        result_schema: schema_of::<ReposListResult>,
+    },
+    RpcCallSpec {
+        method: method::REPOS_ADD,
+        params_schema: schema_of::<ReposAddParams>,
+        result_schema: schema_of::<ReposAddResult>,
+    },
+    RpcCallSpec {
+        method: method::REPOS_REMOVE,
+        params_schema: schema_of::<ReposRemoveParams>,
+        result_schema: schema_of::<ReposRemoveResult>,
+    },
+    RpcCallSpec {
+        method: method::REPOS_ACTIVATE,
+        params_schema: schema_of::<ReposActivateParams>,
+        result_schema: schema_of::<ReposActivateResult>,
+    },
 ];
 
 /// One server → client push's typed metadata.
@@ -1063,10 +1146,12 @@ mod tests {
             needs: None,
             vars: Vec::new(),
             prompt: "p".to_string(),
+            repo: None,
         };
         let json = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["agent"], serde_json::Value::Null);
         assert_eq!(json["prompt"], "p");
+        assert_eq!(json["repo"], serde_json::Value::Null);
 
         let add = CatalogAddResult {
             name: "t".to_string(),

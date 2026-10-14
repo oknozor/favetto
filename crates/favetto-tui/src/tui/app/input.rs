@@ -79,6 +79,7 @@ impl App {
             Popup::Reply(_) => return self.handle_reply_key(key),
             Popup::Confirm(_) => return self.handle_confirm_key(key.code),
             Popup::TaskError { .. } => return self.handle_task_error_key(key.code),
+            Popup::RepoPicker { .. } => return self.handle_repo_picker_key(key),
             Popup::None => {}
         }
 
@@ -524,6 +525,49 @@ impl App {
                     None => UiAction::None,
                 }
             }
+            _ => UiAction::None,
+        }
+    }
+
+    /// Keys while the Ctrl+P "Switch repo" picker is open: printable characters
+    /// build the filter, arrows move, Enter activates the selection (or clears the
+    /// active repo for the `global` row), Esc closes.
+    pub(super) fn handle_repo_picker_key(&mut self, key: KeyEvent) -> UiAction {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Esc => {
+                self.popup = Popup::None;
+                UiAction::None
+            }
+            KeyCode::Up => {
+                if let Popup::RepoPicker { selected, .. } = &mut self.popup {
+                    *selected = selected.saturating_sub(1);
+                }
+                UiAction::None
+            }
+            KeyCode::Down => {
+                let len = self.repo_picker_entries().len();
+                if let Popup::RepoPicker { selected, .. } = &mut self.popup {
+                    *selected = (*selected + 1).min(len.saturating_sub(1));
+                }
+                UiAction::None
+            }
+            KeyCode::Backspace => {
+                if let Popup::RepoPicker { filter, .. } = &mut self.popup {
+                    filter.backspace();
+                }
+                self.clamp_repo_picker_selection();
+                UiAction::None
+            }
+            KeyCode::Char(c) if !ctrl && !alt => {
+                if let Popup::RepoPicker { filter, .. } = &mut self.popup {
+                    filter.insert_char(c);
+                }
+                self.clamp_repo_picker_selection();
+                UiAction::None
+            }
+            KeyCode::Enter => self.activate_selected_repo(),
             _ => UiAction::None,
         }
     }

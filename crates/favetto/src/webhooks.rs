@@ -944,6 +944,21 @@ mod tests {
         assert!(validate_rules(&cfg_with(vec![r]), &nested).is_err());
     }
 
+    #[test]
+    fn validate_rules_accepts_a_repo_qualified_task() {
+        let mut catalog = catalog();
+        catalog[0].name = "repo:favetto/triage".to_string();
+
+        let mut r = rule("r", None, GithubFilter::default());
+        r.task = "repo:favetto/triage".to_string();
+        assert!(validate_rules(&cfg_with(vec![r]), &catalog).is_ok());
+
+        // A repo-qualified rule naming an unknown repo/task is rejected.
+        let mut r = rule("r", None, GithubFilter::default());
+        r.task = "repo:web/triage".to_string();
+        assert!(validate_rules(&cfg_with(vec![r]), &catalog).is_err());
+    }
+
     #[tokio::test]
     async fn handle_github_enqueues_on_match() {
         let (state, dir, pool) = test_state(vec![rule(

@@ -1856,3 +1856,63 @@ async fn migrate_adds_usage_columns_to_a_legacy_task_runs_table() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn known_repos_and_daemon_state_migrate_and_round_trip() {
+    let (dir, pool) = scratch_pool("repos").await;
+
+    // The migration creates both tables.
+    let tables: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(tables.iter().any(|t| t == "known_repos"), "{tables:?}");
+    assert!(tables.iter().any(|t| t == "daemon_state"), "{tables:?}");
+
+    // Empty by default.
+    assert!(list_repos(&pool).await.unwrap().is_empty());
+    assert!(get_active_repo(&pool).await.unwrap().is_none());
+
+    insert_repo(&pool, "favetto", "/code/favetto")
+        .await
+        .unwrap();
+    insert_repo(&pool, "web", "/code/web").await.unwrap();
+    let repos = list_repos(&pool).await.unwrap();
+    assert_eq!(
+        repos,
+        vec![
+            ("favetto".to_string(), "/code/favetto".to_string()),
+            ("web".to_string(), "/code/web".to_string()),
+        ]
+    );
+    assert_eq!(
+        repo_name_for_path(&pool, "/code/favetto").await.unwrap(),
+        Some("favetto".to_string())
+    );
+
+    // A duplicate name or path is rejected.
+    assert!(insert_repo(&pool, "favetto", "/other").await.is_err());
+    assert!(insert_repo(&pool, "other", "/code/favetto").await.is_err());
+
+    // Active repo persists and can be cleared.
+    set_active_repo(&pool, Some("web")).await.unwrap();
+    assert_eq!(
+        get_active_repo(&pool).await.unwrap(),
+        Some("web".to_string())
+    );
+    set_active_repo(&pool, Some("favetto")).await.unwrap();
+    assert_eq!(
+        get_active_repo(&pool).await.unwrap(),
+        Some("favetto".to_string())
+    );
+    set_active_repo(&pool, None).await.unwrap();
+    assert!(get_active_repo(&pool).await.unwrap().is_none());
+
+    // Deleting a repo reports whether a row was removed.
+    assert!(delete_repo(&pool, "web").await.unwrap());
+    assert!(!delete_repo(&pool, "web").await.unwrap());
+    assert_eq!(list_repos(&pool).await.unwrap().len(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

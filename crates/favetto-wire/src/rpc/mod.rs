@@ -169,6 +169,14 @@ pub mod method {
     /// Aggregate persisted per-run token/cost usage into a per-bucket series for
     /// a day/week/month/year period, plus window totals.
     pub const USAGE_STATS: &str = "usage.stats";
+    /// List known repositories and the active one.
+    pub const REPOS_LIST: &str = "repos.list";
+    /// Register a repository (by daemon-host path) as a known repo.
+    pub const REPOS_ADD: &str = "repos.add";
+    /// Remove a known repository by name.
+    pub const REPOS_REMOVE: &str = "repos.remove";
+    /// Set (or clear) the daemon-wide active repository.
+    pub const REPOS_ACTIVATE: &str = "repos.activate";
 }
 
 /// Well-known server → client push (notification) method names.
@@ -303,6 +311,19 @@ pub const CLIENT_METHODS: &[(&str, &str)] = &[
         method::USAGE_STATS,
         "Aggregate persisted per-run token/cost usage into a per-bucket series \
          (day/week/month/year) plus window totals.",
+    ),
+    (
+        method::REPOS_LIST,
+        "List known repositories and the daemon-wide active one.",
+    ),
+    (
+        method::REPOS_ADD,
+        "Register a repository (by daemon-host path) as a known repo.",
+    ),
+    (method::REPOS_REMOVE, "Remove a known repository by name."),
+    (
+        method::REPOS_ACTIVATE,
+        "Set (or clear) the daemon-wide active repository.",
     ),
 ];
 
@@ -456,6 +477,10 @@ mod tests {
             method::NOTIFICATIONS_TEST,
             method::HOOKS_UPSERT,
             method::USAGE_STATS,
+            method::REPOS_LIST,
+            method::REPOS_ADD,
+            method::REPOS_REMOVE,
+            method::REPOS_ACTIVATE,
         ]
         .into_iter()
         .collect();

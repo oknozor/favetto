@@ -40,6 +40,10 @@ pub struct FavettoConfig {
     /// Daemon defaults (overridable by CLI flags).
     #[serde(default)]
     pub daemon: DaemonSettings,
+    /// Repo-local task catalogs: the known-repos registry seed and the active
+    /// repo. Ignored by clients; the daemon persists changes in SQLite.
+    #[serde(default)]
+    pub repos: ReposSettings,
     /// Task executor concurrency / isolation.
     #[serde(default)]
     pub executor: ExecutorSettings,
@@ -411,6 +415,32 @@ pub struct DaemonSettings {
     /// Bounded database growth. On by default; `days = 0` keeps everything.
     #[serde(default)]
     pub retention: RetentionSettings,
+}
+
+/// Repo-local task catalog settings (`[repos]`).
+///
+/// `known` seeds the daemon's persisted known-repos registry at startup (the
+/// registry survives config edits); `active` selects the daemon-wide active repo
+/// by name at startup. Repo task files live in `<repo>/.favetto/tasks/`.
+#[derive(Debug, Clone, Default, JsonSchema, Serialize, Deserialize)]
+pub struct ReposSettings {
+    /// Repositories to register at startup, by daemon-host path.
+    #[serde(default)]
+    pub known: Vec<RepoSeed>,
+    /// The active repo's name at startup; unset means the global catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<String>,
+}
+
+/// One `[[repos.known]]` entry: a repository path and an optional display name.
+#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
+pub struct RepoSeed {
+    /// Absolute (or `~`-expanded) path to the repository on the daemon host.
+    pub path: PathBuf,
+    /// Display name used as the namespace key; defaults to the directory
+    /// basename.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 fn default_retention_days() -> u64 {
@@ -1239,5 +1269,34 @@ mod tests {
         assert_eq!(cfg.web.dir, PathBuf::from("/srv/favetto/web"));
         assert_eq!(cfg.web.heartbeat_secs, 5);
         assert_eq!(cfg.auth.ticket_ttl_secs, 60);
+    }
+
+    #[test]
+    fn parses_repos_settings() {
+        let cfg: FavettoConfig = toml::from_str(
+            r#"
+            [repos]
+            active = "favetto"
+
+            [[repos.known]]
+            path = "~/code/favetto"
+
+            [[repos.known]]
+            path = "/srv/web"
+            name = "web"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.repos.active.as_deref(), Some("favetto"));
+        assert_eq!(cfg.repos.known.len(), 2);
+        assert_eq!(cfg.repos.known[0].path, PathBuf::from("~/code/favetto"));
+        assert!(cfg.repos.known[0].name.is_none());
+        assert_eq!(cfg.repos.known[1].path, PathBuf::from("/srv/web"));
+        assert_eq!(cfg.repos.known[1].name.as_deref(), Some("web"));
+
+        // Absent -> empty registry, no active repo.
+        let default: FavettoConfig = toml::from_str("").unwrap();
+        assert!(default.repos.known.is_empty());
+        assert!(default.repos.active.is_none());
     }
 }

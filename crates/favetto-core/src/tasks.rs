@@ -340,12 +340,104 @@ pub fn load_catalog(dir: &Path) -> anyhow::Result<Vec<TaskDef>> {
     Ok(reload_catalog(dir, &[]))
 }
 
+/// Reserved prefix for repo-qualified task identities (`repo:<name>/<path>`).
+///
+/// Global task paths may not start with it, so a repo-local task can never
+/// collide with a global one.
+pub const REPO_PREFIX: &str = "repo:";
+
+/// Split a repo-qualified name into `(repo_name, relative_path)`.
+///
+/// Returns `None` for a bare (global) name, for a missing/empty repo or relative
+/// path, or for anything that does not start with [`REPO_PREFIX`].
+pub fn split_repo(name: &str) -> Option<(&str, &str)> {
+    let rest = name.strip_prefix(REPO_PREFIX)?;
+    let (repo, rel) = rest.split_once('/')?;
+    if repo.is_empty() || rel.is_empty() {
+        return None;
+    }
+    Some((repo, rel))
+}
+
+/// Build a repo-qualified task identity: `repo:<name>/<relative-path>`.
+pub fn qualify(repo: &str, rel: &str) -> String {
+    format!("{REPO_PREFIX}{repo}/{rel}")
+}
+
+/// Load a repository's `.favetto/tasks` catalog, qualified under `repo`.
+///
+/// `prior` is the previous *full* catalog (global + all repos); only this repo's
+/// entries are considered, with their `repo:<name>/` prefix stripped so
+/// merge-on-error still keeps a previously valid definition. Every returned
+/// definition carries the qualified name, and a definition without an explicit
+/// `cwd` defaults to the repo root.
+pub fn load_repo_catalog(repo: &str, repo_root: &Path, prior: &[TaskDef]) -> Vec<TaskDef> {
+    let dir = repo_root.join(".favetto/tasks");
+    let stripped: Vec<TaskDef> = prior
+        .iter()
+        .filter_map(|d| match split_repo(&d.name) {
+            Some((r, rel)) if r == repo => Some(TaskDef {
+                name: rel.to_string(),
+                ..d.clone()
+            }),
+            _ => None,
+        })
+        .collect();
+
+    let mut defs = reload_catalog(&dir, &stripped);
+    for def in &mut defs {
+        def.name = qualify(repo, &def.name);
+        if def.cwd.is_none() {
+            def.cwd = Some(repo_root.to_string_lossy().into_owned());
+        }
+    }
+    defs.sort_by(|a, b| a.name.cmp(&b.name));
+    defs
+}
+
+/// Resolve bare `needs`/`spawn` references inside repo-local tasks to the same
+/// repo's qualified name when that repo defines the referenced task.
+///
+/// Global tasks (bare names) are left untouched, and a reference that already
+/// names a repo (or a bare name the repo does not define) is left as-is so it
+/// can still resolve against the global catalog. Reference suffixes such as
+/// `:finished`/`:all_finished` are preserved.
+pub fn resolve_repo_refs(defs: &mut [TaskDef]) {
+    let names: std::collections::HashSet<String> = defs.iter().map(|d| d.name.clone()).collect();
+    for def in defs.iter_mut() {
+        let Some(repo) = split_repo(&def.name).map(|(repo, _)| repo.to_string()) else {
+            continue;
+        };
+        if let Some(needs) = def.needs.clone() {
+            let (source, _) = needs_parts(&needs);
+            if split_repo(source).is_none() {
+                let candidate = qualify(&repo, source);
+                if names.contains(&candidate) {
+                    let suffix = &needs[source.len()..];
+                    def.needs = Some(format!("{candidate}{suffix}"));
+                }
+            }
+        }
+        if let Some(spawn) = def.spawn.clone() {
+            if split_repo(&spawn).is_none() {
+                let candidate = qualify(&repo, &spawn);
+                if names.contains(&candidate) {
+                    def.spawn = Some(candidate);
+                }
+            }
+        }
+    }
+}
+
 /// Reject a task name that would escape the tasks root or is otherwise unusable
 /// as a relative task path. Used by `catalog.get` / `catalog.add` and
 /// [`write_task_md`] (defense in depth: the RPC handlers are remotely reachable).
 pub fn validate_task_path(name: &str) -> anyhow::Result<()> {
     if name.is_empty() {
         anyhow::bail!("task name must not be empty");
+    }
+    if name.starts_with(REPO_PREFIX) {
+        anyhow::bail!("task name must not start with the reserved '{REPO_PREFIX}' prefix");
     }
     if name.contains('\\') {
         anyhow::bail!("task name must use '/' separators");
@@ -897,8 +989,121 @@ mod tests {
         assert!(validate_task_path("a\\b").is_err());
         assert!(validate_task_path("").is_err());
         assert!(validate_task_path(".").is_err());
+        // The repo prefix is reserved for repo-qualified identities.
+        assert!(validate_task_path("repo:favetto/triage").is_err());
+        assert!(validate_task_path("repo:anything").is_err());
         assert!(validate_task_path("pipelines/plan").is_ok());
         assert!(validate_task_path("plan").is_ok());
+    }
+
+    #[test]
+    fn split_repo_and_qualify_round_trip() {
+        assert_eq!(
+            split_repo("repo:favetto/triage"),
+            Some(("favetto", "triage"))
+        );
+        assert_eq!(
+            split_repo("repo:web/pipelines/plan"),
+            Some(("web", "pipelines/plan"))
+        );
+        // Bare names, malformed prefixes, and empty halves are not repo-qualified.
+        assert_eq!(split_repo("triage"), None);
+        assert_eq!(split_repo("pipelines/plan"), None);
+        assert_eq!(split_repo("repo:"), None);
+        assert_eq!(split_repo("repo:noslash"), None);
+        assert_eq!(split_repo("repo:/rel"), None);
+        assert_eq!(split_repo("repo:name/"), None);
+
+        assert_eq!(qualify("favetto", "triage"), "repo:favetto/triage");
+        for (repo, rel) in [("favetto", "triage"), ("web", "pipelines/plan")] {
+            let qualified = qualify(repo, rel);
+            assert_eq!(split_repo(&qualified), Some((repo, rel)));
+        }
+    }
+
+    #[test]
+    fn load_repo_catalog_qualifies_names_and_defaults_cwd() {
+        let root = temp_dir("repo-catalog");
+        write_nested(&root.join(".favetto/tasks"), "triage", "root task");
+        write_nested(&root.join(".favetto/tasks"), "pipelines/plan", "nested");
+
+        let defs = load_repo_catalog("favetto", &root, &[]);
+        let names: Vec<_> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["repo:favetto/pipelines/plan", "repo:favetto/triage"]
+        );
+        // Every repo-local task defaults to the repo root as its cwd.
+        for def in &defs {
+            assert_eq!(def.cwd.as_deref(), Some(root.to_str().unwrap()));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_repo_catalog_keeps_explicit_cwd() {
+        let root = temp_dir("repo-cwd");
+        let dir = root.join(".favetto/tasks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.md"),
+            "agent = \"x\"\ncwd = \"/explicit\"\n---\nbody\n",
+        )
+        .unwrap();
+        let defs = load_repo_catalog("favetto", &root, &[]);
+        assert_eq!(defs[0].cwd.as_deref(), Some("/explicit"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_repo_catalog_merges_prior_on_error() {
+        let root = temp_dir("repo-prior");
+        let dir = root.join(".favetto/tasks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.md"), "agent = \"x\"\n---\noriginal\n").unwrap();
+        let prior = load_repo_catalog("favetto", &root, &[]);
+
+        // A broken file must not drop the qualified task from the repo catalog.
+        std::fs::write(dir.join("a.md"), "agent = \n---\nbroken\n").unwrap();
+        let reloaded = load_repo_catalog("favetto", &root, &prior);
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded[0].name, "repo:favetto/a");
+        assert_eq!(reloaded[0].prompt, "original");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_repo_refs_qualifies_same_repo_only() {
+        let mut defs = vec![
+            parse_task_md("repo:favetto/a", "agent = \"x\"\n---\na\n").unwrap(),
+            parse_task_md(
+                "repo:favetto/b",
+                "agent = \"x\"\nneeds = \"a:finished\"\nspawn = \"a\"\n---\nb\n",
+            )
+            .unwrap(),
+            parse_task_md(
+                "repo:favetto/c",
+                "agent = \"x\"\nneeds = \"missing\"\n---\nc\n",
+            )
+            .unwrap(),
+            // A global task referencing `a` must stay global.
+            parse_task_md("g", "agent = \"x\"\nneeds = \"a\"\n---\ng\n").unwrap(),
+            // A fully-qualified cross-repo reference is left untouched.
+            parse_task_md(
+                "repo:web/d",
+                "agent = \"x\"\nneeds = \"repo:favetto/a:finished\"\n---\nd\n",
+            )
+            .unwrap(),
+        ];
+        resolve_repo_refs(&mut defs);
+        assert_eq!(defs[1].needs.as_deref(), Some("repo:favetto/a:finished"));
+        assert_eq!(defs[1].spawn.as_deref(), Some("repo:favetto/a"));
+        // A repo task whose reference is not defined in the repo keeps the name.
+        assert_eq!(defs[2].needs.as_deref(), Some("missing"));
+        // A global task is never rewritten.
+        assert_eq!(defs[3].needs.as_deref(), Some("a"));
+        // An already-qualified reference is preserved verbatim.
+        assert_eq!(defs[4].needs.as_deref(), Some("repo:favetto/a:finished"));
     }
 
     #[test]

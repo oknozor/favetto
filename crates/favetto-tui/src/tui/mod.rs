@@ -34,7 +34,8 @@ use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 
 use favetto_core::model::{
-    AgentCatalogEntry, AgentSessionInfo, Event, NotificationRecord, Schedule, Task, UsageStats,
+    AgentCatalogEntry, AgentSessionInfo, Event, NotificationRecord, RepoInfo, Schedule, Task,
+    UsageStats,
 };
 use favetto_core::rpc::method;
 use favetto_core::workflow::WorkflowInspect;
@@ -342,6 +343,7 @@ async fn sync_initial(client: &Client, app: &mut App) {
     .await;
 
     fetch_catalog(client, app).await;
+    fetch_repos(client, app).await;
     fetch_agent_sessions(client, app).await;
 }
 
@@ -352,6 +354,40 @@ async fn fetch_catalog(client: &Client, app: &mut App) {
     {
         app.set_catalog(catalog);
     }
+}
+
+/// Fetch the known-repos registry and the daemon-wide active repo (`repos.list`).
+async fn fetch_repos(client: &Client, app: &mut App) {
+    if let Some(v) =
+        fetch_rpc::<serde_json::Value>(client, method::REPOS_LIST, serde_json::json!({})).await
+    {
+        let active = v.get("active").and_then(|a| a.as_str()).map(str::to_string);
+        let repos = v
+            .get("repos")
+            .cloned()
+            .and_then(|r| serde_json::from_value::<Vec<RepoInfo>>(r).ok())
+            .unwrap_or_default();
+        app.set_repos(repos, active);
+    }
+}
+
+/// Set the daemon-wide active repo (`repos.activate`) and refresh the client
+/// lists so the status badge and catalog grouping update.
+async fn activate_repo(client: &Client, app: &mut App, name: Option<String>) {
+    let label = name.as_deref().unwrap_or("global");
+    match client
+        .request(method::REPOS_ACTIVATE, serde_json::json!({ "name": name }))
+        .await
+    {
+        Ok(resp) => match resp.result {
+            Some(_) => app.logs.push_back(format!("active repo: {label}")),
+            None => app
+                .logs
+                .push_back(format!("repos.activate error: {:?}", resp.error)),
+        },
+        Err(e) => app.logs.push_back(format!("repos.activate failed: {e}")),
+    }
+    refresh_lists(client, app).await;
 }
 
 /// Fetch the catalog workflow graph (DOT) for the workflow overlay.
@@ -557,6 +593,7 @@ async fn refresh_lists(client: &Client, app: &mut App) {
         }
     }
     fetch_catalog(client, app).await;
+    fetch_repos(client, app).await;
     fetch_agent_sessions(client, app).await;
 }
 
@@ -782,6 +819,12 @@ async fn run_session(
                             UiAction::OpenSessions => {
                                 fetch_sessions(client, app).await;
                             }
+                            UiAction::OpenRepoPicker => {
+                                fetch_repos(client, app).await;
+                            }
+                            UiAction::ActivateRepo(name) => {
+                                activate_repo(client, app, name).await;
+                            }
                             UiAction::AttachSession(session_id) => {
                                 attach_session(client, app, session_id).await;
                             }
@@ -899,6 +942,12 @@ async fn run_session(
             if matches!(app.popup, Popup::Workflow { .. }) {
                 fetch_workflow(client, app).await;
             }
+        }
+        // A repo add/remove/activate also publishes `catalog.updated`; keep the
+        // picker and status badge in sync.
+        if app.repos_dirty {
+            app.repos_dirty = false;
+            fetch_repos(client, app).await;
         }
         // A `task.updated`/`event` push while the runtime inspector is open
         // re-fetches `workflow.inspect` to keep its table live.

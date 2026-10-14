@@ -3404,3 +3404,206 @@ async fn events_handler_rejects_missing_or_bad_token() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Dispatch a request and unwrap the `result` value.
+async fn call_ok(state: &Arc<State>, method: &str, params: serde_json::Value) -> serde_json::Value {
+    let req = Request {
+        id: 1,
+        method: method.to_string(),
+        params,
+    };
+    let resp = dispatch(state, req).await;
+    assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+    resp.result.expect("result")
+}
+
+/// Create a repo with a `.favetto/tasks` catalog and return its path.
+fn make_repo(root: &Path, name: &str) -> std::path::PathBuf {
+    let repo = root.join(name);
+    std::fs::create_dir_all(repo.join(".favetto/tasks")).unwrap();
+    std::fs::write(
+        repo.join(".favetto/tasks/triage.md"),
+        "agent = \"x\"\n---\nrepo prompt\n",
+    )
+    .unwrap();
+    repo
+}
+
+#[tokio::test]
+async fn repos_dispatch_add_list_activate_remove() {
+    let dir = temp_dir("repos-dispatch");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let repo = make_repo(&dir, "favetto");
+    let state = test_state(&dir, &tasks_dir).await;
+
+    // Add.
+    let added = call_ok(
+        &state,
+        method::REPOS_ADD,
+        serde_json::json!({ "path": repo.to_string_lossy() }),
+    )
+    .await;
+    assert_eq!(added["name"], "favetto");
+    assert_eq!(added["available"], true);
+    assert_eq!(added["active"], false);
+
+    // List includes the repo and a null active repo.
+    let list = call_ok(&state, method::REPOS_LIST, serde_json::json!({})).await;
+    assert_eq!(list["repos"].as_array().unwrap().len(), 1);
+    assert_eq!(list["repos"][0]["name"], "favetto");
+    assert!(list["active"].is_null());
+
+    // catalog.list exposes the repo field and the retargeted catalog.
+    let catalog = call_ok(&state, method::CATALOG_LIST, serde_json::json!({})).await;
+    let entry = catalog
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "repo:favetto/triage")
+        .expect("repo task in catalog");
+    assert_eq!(entry["repo"], "favetto");
+    assert_eq!(entry["cwd"], repo.to_string_lossy().as_ref());
+
+    // catalog.get reads the repo file.
+    let got = call_ok(
+        &state,
+        method::CATALOG_GET,
+        serde_json::json!({ "name": "repo:favetto/triage" }),
+    )
+    .await;
+    assert!(got["markdown"].as_str().unwrap().contains("repo prompt"));
+
+    // Activate.
+    let activated = call_ok(
+        &state,
+        method::REPOS_ACTIVATE,
+        serde_json::json!({ "name": "favetto" }),
+    )
+    .await;
+    assert_eq!(activated["active"], "favetto");
+    assert_eq!(activated["repos"][0]["active"], true);
+
+    // Remove clears the active repo.
+    let removed = call_ok(
+        &state,
+        method::REPOS_REMOVE,
+        serde_json::json!({ "name": "favetto" }),
+    )
+    .await;
+    assert_eq!(removed["removed"], true);
+    let list = call_ok(&state, method::REPOS_LIST, serde_json::json!({})).await;
+    assert!(list["repos"].as_array().unwrap().is_empty());
+    assert!(list["active"].is_null());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn catalog_add_and_update_with_a_repo_qualified_name() {
+    let dir = temp_dir("repos-catalog-add");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let repo = make_repo(&dir, "favetto");
+    let state = test_state(&dir, &tasks_dir).await;
+    call_ok(
+        &state,
+        method::REPOS_ADD,
+        serde_json::json!({ "path": repo.to_string_lossy() }),
+    )
+    .await;
+
+    // Add a task into the active repo by its qualified name.
+    let added = call_ok(
+        &state,
+        method::CATALOG_ADD,
+        serde_json::json!({
+            "name": "repo:favetto/new-task",
+            "agent": "x",
+            "prompt": "hello",
+        }),
+    )
+    .await;
+    assert_eq!(added["name"], "repo:favetto/new-task");
+    assert!(repo.join(".favetto/tasks/new-task.md").exists());
+    assert!(!tasks_dir.join("repo:favetto/new-task.md").exists());
+
+    // Updating it writes back to the same repo file.
+    call_ok(
+        &state,
+        method::CATALOG_UPDATE,
+        serde_json::json!({
+            "name": "repo:favetto/new-task",
+            "markdown": "agent = \"x\"\n---\nupdated\n",
+        }),
+    )
+    .await;
+    let contents = std::fs::read_to_string(repo.join(".favetto/tasks/new-task.md")).unwrap();
+    assert!(contents.contains("updated"));
+
+    // An unknown repo is rejected.
+    let req = Request {
+        id: 2,
+        method: method::CATALOG_ADD.to_string(),
+        params: serde_json::json!({ "name": "repo:missing/x", "agent": "x", "prompt": "p" }),
+    };
+    let resp = dispatch(&state, req).await;
+    assert!(resp.error.is_some());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn repos_reject_malformed_params() {
+    let dir = temp_dir("repos-malformed");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+
+    // `repos.add` needs a path.
+    let req = Request {
+        id: 1,
+        method: method::REPOS_ADD.to_string(),
+        params: serde_json::json!({}),
+    };
+    let resp = dispatch(&state, req).await;
+    let error = resp.error.expect("error");
+    assert_eq!(error.code, favetto_core::rpc::error_code::INVALID_PARAMS);
+
+    // `repos.remove` needs a name.
+    let req = Request {
+        id: 2,
+        method: method::REPOS_REMOVE.to_string(),
+        params: serde_json::json!({}),
+    };
+    let resp = dispatch(&state, req).await;
+    let error = resp.error.expect("error");
+    assert_eq!(error.code, favetto_core::rpc::error_code::INVALID_PARAMS);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn tasks_start_accepts_a_repo_qualified_name() {
+    let dir = temp_dir("repos-start");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let repo = make_repo(&dir, "favetto");
+    let state = test_state(&dir, &tasks_dir).await;
+    call_ok(
+        &state,
+        method::REPOS_ADD,
+        serde_json::json!({ "path": repo.to_string_lossy() }),
+    )
+    .await;
+
+    let started = call_ok(
+        &state,
+        method::TASKS_START,
+        serde_json::json!({ "name": "repo:favetto/triage" }),
+    )
+    .await;
+    assert_eq!(started["name"], "repo:favetto/triage");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -687,6 +687,25 @@ pub struct Schedule {
     pub last_run: Option<DateTime<Utc>>,
 }
 
+/// A repository known to the daemon, as returned by `repos.list`.
+///
+/// `name` is the namespace key that qualifies the repo's tasks
+/// (`repo:<name>/<path>`); `path` is the absolute daemon-host directory. A repo
+/// is `available` when its `.favetto/tasks/` directory exists, so a moved or
+/// unmounted checkout stays listed but contributes no tasks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RepoInfo {
+    pub name: String,
+    pub path: String,
+    /// Whether the repo currently has a `.favetto/tasks/` catalog directory.
+    #[serde(default = "default_available")]
+    pub available: bool,
+    /// Whether this is the daemon-wide active repo.
+    #[serde(default)]
+    pub active: bool,
+}
+
 /// A persisted notification record (sent history).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

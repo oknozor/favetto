@@ -55,6 +55,7 @@ fn catalog_entry(name: &str) -> CatalogEntry {
         needs: None,
         vars: Vec::new(),
         prompt: String::new(),
+        repo: None,
     }
 }
 
@@ -1114,6 +1115,7 @@ fn catalog_preview_scrolls_with_keys_and_wheel() {
             needs: None,
             vars: Vec::new(),
             prompt: String::new(),
+            repo: None,
         },
         CatalogEntry {
             name: "b".to_string(),
@@ -1124,6 +1126,7 @@ fn catalog_preview_scrolls_with_keys_and_wheel() {
             needs: None,
             vars: Vec::new(),
             prompt: String::new(),
+            repo: None,
         },
     ];
     app.catalog_preview_max_scroll = 100;
@@ -1313,6 +1316,7 @@ fn set_catalog_clamps_selection_and_refreshes_preview() {
         needs: None,
         vars: Vec::new(),
         prompt: String::new(),
+        repo: None,
     }]);
 
     assert_eq!(app.catalog_selected, 0);
@@ -2203,6 +2207,7 @@ fn vars_entry(name: &str) -> CatalogEntry {
             },
         ],
         prompt: String::new(),
+        repo: None,
     }
 }
 
@@ -2904,4 +2909,151 @@ fn usage_tab_focus_and_task_push_mark_it_dirty() {
         params: serde_json::to_value(&task).unwrap(),
     });
     assert!(app.usage_dirty);
+}
+
+fn repo(name: &str, path: &str, available: bool, active: bool) -> RepoInfo {
+    RepoInfo {
+        name: name.to_string(),
+        path: path.to_string(),
+        available,
+        active,
+    }
+}
+
+#[test]
+fn repo_picker_filters_by_name_and_activates() {
+    let mut app = App::new();
+    app.set_repos(
+        vec![
+            repo("favetto", "/code/favetto", true, true),
+            repo("web", "/srv/web", false, false),
+        ],
+        Some("favetto".to_string()),
+    );
+    app.open_repo_picker();
+
+    // The global row is always present; both repos show before filtering.
+    assert_eq!(app.repo_picker_entries().len(), 3);
+
+    for c in "web".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::empty()));
+    }
+    let entries = app.repo_picker_entries();
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    assert_eq!(entries[0].0, None);
+    assert_eq!(entries[1].0.as_deref(), Some("web"));
+
+    // Down selects the repo row; Enter activates it.
+    app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+    match app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())) {
+        UiAction::ActivateRepo(name) => assert_eq!(name.as_deref(), Some("web")),
+        _ => panic!("expected ActivateRepo"),
+    }
+    assert!(matches!(app.popup, Popup::None));
+}
+
+#[test]
+fn repo_picker_backspace_widens_and_global_row_clears() {
+    let mut app = App::new();
+    app.set_repos(
+        vec![
+            repo("favetto", "/code/favetto", true, true),
+            repo("web", "/srv/web", true, false),
+        ],
+        Some("favetto".to_string()),
+    );
+    app.open_repo_picker();
+
+    // Typing then backspacing restores the full list.
+    for c in "zz".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::empty()));
+    }
+    assert_eq!(app.repo_picker_entries().len(), 1); // just `global`
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::empty()));
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::empty()));
+    assert_eq!(app.repo_picker_entries().len(), 3);
+
+    // The `global` row (index 0) clears the active repo.
+    match app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())) {
+        UiAction::ActivateRepo(name) => assert_eq!(name, None),
+        _ => panic!("expected ActivateRepo(None)"),
+    }
+}
+
+#[test]
+fn menu_switch_repo_and_add_repo_open_their_surfaces() {
+    let mut app = App::new();
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    assert!(matches!(app.popup, Popup::Menu { selected: 0 }));
+    for _ in 0..4 {
+        app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+    }
+    let action = app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
+    assert!(matches!(action, UiAction::OpenRepoPicker));
+    assert!(matches!(app.popup, Popup::RepoPicker { .. }));
+
+    app.popup = Popup::None;
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    for _ in 0..5 {
+        app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+    }
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
+    assert!(
+        matches!(app.popup, Popup::Form(ref f) if f.kind == FormKind::AddRepo),
+        "expected the Add repo form"
+    );
+}
+
+#[test]
+fn add_task_form_prefixes_the_active_repo() {
+    let mut app = App::new();
+    app.set_repos(
+        vec![repo("favetto", "/code/favetto", true, true)],
+        Some("favetto".to_string()),
+    );
+    let mut form = Form {
+        kind: FormKind::AddTask,
+        title: "Add task to catalog",
+        fields: vec!["Task name"],
+        current: 0,
+        values: Vec::new(),
+        input: TextBuffer::new("new-task"),
+    };
+    form.values
+        .push(std::mem::take(&mut form.input).into_string());
+    match app.build_submit(form.kind, form.values) {
+        UiAction::Submit { params, .. } => {
+            assert_eq!(params["name"], "repo:favetto/new-task");
+        }
+        _ => panic!("expected Submit"),
+    }
+
+    // An already-qualified name is left untouched.
+    match app.build_submit(FormKind::AddTask, vec!["repo:web/x".to_string()]) {
+        UiAction::Submit { params, .. } => assert_eq!(params["name"], "repo:web/x"),
+        _ => panic!("expected Submit"),
+    }
+}
+
+#[test]
+fn catalog_groups_repo_tasks_under_a_repo_folder() {
+    let mut app = App::new();
+    let mut entry = catalog_entry("repo:favetto/triage");
+    entry.repo = Some("favetto".to_string());
+    app.set_catalog(vec![entry]);
+
+    let rows = app.catalog_rows();
+    assert!(rows.iter().any(|r| matches!(
+        r,
+        CatalogRow::Folder { path, .. } if path == "repo:favetto"
+    )));
+    assert!(rows.iter().any(|r| matches!(r, CatalogRow::Task { .. })));
+}
+
+#[test]
+fn active_repo_label_defaults_to_global() {
+    let mut app = App::new();
+    assert_eq!(app.active_repo_label(), "repo: global");
+    app.set_repos(Vec::new(), Some("favetto".to_string()));
+    assert_eq!(app.active_repo_label(), "repo: favetto");
 }

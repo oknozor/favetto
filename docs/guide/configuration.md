@@ -27,6 +27,10 @@ session_id_json_key = "sessionID"               # captured from run JSON output
 listen = "127.0.0.1:7878"
 socket = "/tmp/favetto.sock"
 tasks_dir = "tasks"
+
+[repos]                        # repo-local task catalogs (see Catalog)
+# active = "favetto"
+# known = [{ path = "~/code/favetto" }]
 ```
 
 Where to read next:
@@ -37,6 +41,7 @@ Where to read next:
 - [Parallel execution and worktrees](./parallel-worktrees) — `[executor]`.
 - [Git and commit signing](./git-signing) — `[git]`.
 - [Webhooks and hooks](./webhooks) — `[webhook.github]`.
+- [Catalog](./catalog) — repo-local task catalogs (`[repos]`).
 - [TUI](./tui) — `[tui.sound]`.
 - [Environment variables](../reference/environment) — the overrides and secrets.
 
