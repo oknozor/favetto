@@ -525,6 +525,8 @@ body {
 }
 
 .catalog-item {
+  display: flex;
+  align-items: center;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   margin-bottom: var(--space-2);
@@ -533,6 +535,8 @@ body {
 }
 
 .catalog-link {
+  flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
@@ -540,6 +544,11 @@ body {
   color: inherit;
   padding: var(--space-3) var(--space-4);
   border-radius: var(--radius-lg);
+}
+
+.catalog-run {
+  flex: 0 0 auto;
+  margin-right: 0.75rem;
 }
 
 .catalog-link:hover,
@@ -832,14 +841,108 @@ body {
   color: var(--danger-fg);
 }
 
-/* Catalog graph ---------------------------------------------------------- */
+/* Workflow dependency graph ---------------------------------------------- */
 
-.catalog-graph {
+.workflow-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  max-width: 28rem;
+}
+
+.workflow-picker-label {
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.workflow-picker select {
+  min-height: 44px;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
+  border-radius: 0.4rem;
+  background: var(--surface-2);
+  color: inherit;
+  font: inherit;
+}
+
+.workflow-graph-wrap {
+  overflow-x: auto;
+  border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+  border-radius: 0.5rem;
+  padding: 0.5rem;
+}
+
+.workflow-graph {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 70vh;
+}
+
+.workflow-graph-node rect {
+  fill: color-mix(in srgb, currentColor 8%, var(--surface-2));
+  stroke: color-mix(in srgb, currentColor 35%, transparent);
+  stroke-width: 1.5;
+}
+
+.workflow-graph-node text {
+  fill: currentColor;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.workflow-graph-node[role="link"] {
+  cursor: pointer;
+}
+
+.workflow-graph-node[role="link"]:hover rect,
+.workflow-graph-node[role="link"]:focus-visible rect {
+  stroke: var(--primary);
+  stroke-width: 2.5;
+}
+
+.workflow-graph-node[role="link"]:focus-visible {
+  outline: none;
+}
+
+.workflow-graph-node.external rect {
+  stroke-dasharray: 4 4;
+  opacity: 0.85;
+}
+
+.workflow-graph-node.scheduled rect {
+  stroke-width: 3;
+}
+
+.workflow-edge {
+  fill: none;
+  stroke: color-mix(in srgb, currentColor 55%, transparent);
+  stroke-width: 1.5;
+}
+
+.workflow-edge-back,
+.workflow-edge-needs,
+.workflow-edge-needs-succeeded,
+.workflow-edge-needs-failed {
+  stroke-dasharray: 5 4;
+}
+
+.workflow-edge-join {
+  stroke-width: 2.5;
+}
+
+.workflow-edge-label {
+  fill: currentColor;
+  font-size: 10px;
+  opacity: 0.75;
+}
+
+.workflow-dot {
   border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
   border-radius: var(--radius-lg);
 }
 
-.catalog-graph > summary {
+.workflow-dot > summary {
   min-height: 44px;
   padding: var(--space-2) var(--space-3);
   cursor: pointer;
@@ -847,33 +950,21 @@ body {
   user-select: none;
 }
 
-.catalog-graph-nodes,
-.catalog-graph-edges {
+.workflow-dot pre {
   margin: 0;
-  padding: 0 var(--space-3);
-  list-style: none;
+  padding: 0 var(--space-3) var(--space-3);
+  overflow-x: auto;
   font-size: var(--text-sm);
 }
 
-.catalog-graph-node,
-.catalog-graph-edge {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.4rem;
-  padding: 0.15rem 0;
+/* Shared form affordances for the typed `[[vars]]` start form. */
+.field-required {
+  color: var(--danger);
 }
 
-.catalog-graph-marker {
+.field-hint {
+  font-size: 0.75rem;
   opacity: 0.65;
-  font-size: 0.8rem;
-}
-
-.catalog-graph-path {
-  margin: 0;
-  padding: var(--space-2) var(--space-3);
-  font-size: 0.8rem;
-  opacity: 0.6;
-  word-break: break-all;
 }
 
 /* ---------------------------------------------------------------------------

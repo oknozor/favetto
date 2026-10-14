@@ -334,8 +334,8 @@ threads by default).
 |---|---|---|
 | **Inbox** (default on mobile) | `events` + `tasks.list` + `agents.list` | `awaiting_input` cards with `InputRequest` options; `agents.reply`; failures; recent notifications |
 | **Tasks** | `tasks.list`, `tasks.get`, `tasks.events` + `agent.event` | status filters, run history, live pretty agent feed above the post-run output, inline awaiting-input reply, `tasks.start`/`cancel`/`retry` |
-| **Workflow** | `workflow.get`, `workflow.inspect`, `workflow.spawn/cancel/retry` | runtime buckets; DAG rendering deferred |
-| **Catalog** | `catalog.list`, `catalog.get` | Markdown preview (`pulldown-cmark`) |
+| **Workflow** | `workflow.get`, `workflow.inspect`, `workflow.cancel/retry` | catalog dependency DAG (SVG) with a weakly-connected-component picker; runtime inspect tree at `/workflow/:root_id` |
+| **Catalog** | `catalog.list`, `catalog.get` | Markdown preview (`pulldown-cmark`), plus a `tasks.start` run action |
 | **Schedules** | `schedules.list/upsert/delete` | cron management |
 | **Notifications / Settings** | `notifications.list/test`, `hooks.upsert` | channel test, hook management, pairing/session info |
 
@@ -346,8 +346,8 @@ a reload or daemon restart — the ephemeral live feed does not. Agents with no
 structured summary keep the plain-text `OutputViewer`; the raw output and the
 envelope summary remain reachable from the log.
 
-Markdown rendering uses a WASM-friendly Rust parser; the DAG view (SVG emitted
-directly by Dioxus) is Phase 5.
+Markdown rendering uses a WASM-friendly Rust parser; the DAG view is emitted as
+SVG directly by Dioxus.
 
 ### 8.4 Onboarding
 
@@ -432,7 +432,8 @@ L ≈ 3–5 days.
 
 ### Phase 5 — optional
 
-- **P5.1** SVG workflow DAG · **M**
+- **P5.1** SVG workflow DAG (shipped — the Workflow view renders the catalog
+  dependency graph) · **M**
 - **P5.2** Live terminal over the ticket-authenticated WS (`agents.attach`,
   `agents.input`, `agents.resize`) + xterm-style renderer · **L**
 

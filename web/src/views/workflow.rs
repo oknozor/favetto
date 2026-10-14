@@ -1,25 +1,26 @@
-//! The Workflow view: a runtime board (`/workflow`) and a per-root inspect tree
-//! (`/workflow/:root_id`).
+//! The Workflow view: the implicit catalog dependency graph (`/workflow`) and a
+//! per-root runtime inspect tree (`/workflow/:root_id`).
 //!
-//! There is no `workflow.list` RPC: the board derives its runtime rows from
-//! `tasks.list` (seeded into the cache and kept live by SSE `task.updated`
-//! pushes) and shows `workflow.get`'s catalog graph as a separate section. The
-//! detail view calls `workflow.inspect` and joins its rows with the cached tasks
-//! for the fields the inspect payload omits (`parent_id`, timestamps).
+//! There is no explicit workflow object in favetto, so the panel renders the
+//! graph `workflow.get` derives from the catalog's `needs`/`spawn` edges. The
+//! catalog usually contains several weakly-connected components; a picker
+//! selects one. The runtime instance view stays on `/workflow/:root_id`, which
+//! calls `workflow.inspect` and joins its rows with the cached tasks for the
+//! fields the inspect payload omits (`parent_id`, timestamps).
 
 use std::collections::{HashMap, HashSet};
 
 use dioxus::prelude::*;
 use favetto_wire::model::{Task, TaskStatus};
-use favetto_wire::rpc::{
-    EmptyParams, TasksListParams, WorkflowGetResult, WorkflowInspectParams, WorkflowRetryParams,
-    WorkflowSpawnParams,
-};
-use favetto_wire::workflow::{WorkflowEdgeKind, WorkflowInspect, WorkflowState, WorkflowTaskView};
+use favetto_wire::rpc::{EmptyParams, TasksListParams, WorkflowInspectParams, WorkflowRetryParams};
+use favetto_wire::workflow::{WorkflowInspect, WorkflowState, WorkflowTaskView};
 use uuid::Uuid;
 
 use crate::app::Route;
 use crate::client::RpcClient;
+use crate::components::workflow_graph::{
+    component_label, weakly_connected_components, WorkflowGraphView,
+};
 use crate::components::workflow_node::{status_class, status_label, NodeCard, WorkflowNode};
 use crate::state::AppState;
 
@@ -32,27 +33,6 @@ pub const GROUPS: [TaskStatus; 6] = [
     TaskStatus::Succeeded,
     TaskStatus::Cancelled,
 ];
-
-/// Bucket tasks newest-first. Always returns all six groups (possibly empty),
-/// so the accordions are stable across renders.
-pub fn bucket_tasks(tasks: &[Task]) -> Vec<(TaskStatus, Vec<Task>)> {
-    GROUPS
-        .iter()
-        .map(|&status| {
-            let mut group: Vec<Task> = tasks
-                .iter()
-                .filter(|task| task.status == status)
-                .cloned()
-                .collect();
-            group.sort_by(|a, b| {
-                b.created_at
-                    .cmp(&a.created_at)
-                    .then_with(|| b.id.cmp(&a.id))
-            });
-            (status, group)
-        })
-        .collect()
-}
 
 /// Bucket already-built cards (used by the inspect tree).
 pub fn bucket_cards(cards: &[NodeCard]) -> Vec<(TaskStatus, Vec<NodeCard>)> {
@@ -113,72 +93,6 @@ pub fn task_age(task: &Task, now: i64) -> String {
         .unwrap_or(task.created_at)
         .timestamp();
     humanize_age(age_secs(reference, now))
-}
-
-/// Parse the spawn dialog's `input` textarea. Empty/whitespace means "no input";
-/// anything else must be valid JSON.
-pub fn parse_variables(raw: &str) -> Result<Option<serde_json::Value>, String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    serde_json::from_str(trimmed)
-        .map(Some)
-        .map_err(|err| format!("variables must be valid JSON: {err}"))
-}
-
-/// Parse a comma-separated list of task ids. Blank input is an empty list.
-pub fn parse_depends_on(raw: &str) -> Result<Vec<Uuid>, String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(Vec::new());
-    }
-    trimmed
-        .split(',')
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-        .map(|token| {
-            Uuid::parse_str(token).map_err(|err| format!("invalid task id '{token}': {err}"))
-        })
-        .collect()
-}
-
-/// The spawn dialog's raw text fields.
-#[derive(Clone, PartialEq, Default)]
-pub struct SpawnForm {
-    pub name: String,
-    pub variables: String,
-    pub root_id: String,
-    pub depends_on: String,
-    pub dedupe_key: String,
-}
-
-/// Validate a raw form into `workflow.spawn` params.
-pub fn build_spawn_params(form: &SpawnForm) -> Result<WorkflowSpawnParams, String> {
-    let name = form.name.trim();
-    if name.is_empty() {
-        return Err("task name is required".to_string());
-    }
-
-    let input = parse_variables(&form.variables)?;
-    let depends_on = parse_depends_on(&form.depends_on)?;
-
-    let root_id = match form.root_id.trim() {
-        "" => None,
-        raw => Some(Uuid::parse_str(raw).map_err(|err| format!("invalid root id '{raw}': {err}"))?),
-    };
-    let dedupe_key = match form.dedupe_key.trim() {
-        "" => None,
-        raw => Some(raw.to_string()),
-    };
-
-    Ok(WorkflowSpawnParams {
-        name: name.to_string(),
-        input,
-        root_id,
-        depends_on: (!depends_on.is_empty()).then_some(depends_on),
-        dedupe_key,
-    })
 }
 
 /// Depth-first order (parent before child) with indentation depth.
@@ -245,17 +159,6 @@ pub fn workflow_state_label(state: WorkflowState) -> &'static str {
     }
 }
 
-/// Human label for a catalog graph edge kind.
-pub fn edge_kind_label(kind: WorkflowEdgeKind) -> &'static str {
-    match kind {
-        WorkflowEdgeKind::Spawn => "spawn",
-        WorkflowEdgeKind::Needs => "needs",
-        WorkflowEdgeKind::NeedsSucceeded => "needs:succeeded",
-        WorkflowEdgeKind::NeedsFailed => "needs:failed",
-        WorkflowEdgeKind::Join => "join",
-    }
-}
-
 /// A bearer client built from the shared state.
 fn client(state: AppState) -> RpcClient {
     RpcClient::new((state.daemon_url)()).with_token((state.token)())
@@ -300,229 +203,90 @@ fn run_retry(
     });
 }
 
-/// The workflow board: runtime tasks grouped by status, plus the catalog graph.
+/// The catalog dependency graph: one weakly-connected component at a time.
 #[component]
 pub fn WorkflowList() -> Element {
     let state = use_context::<AppState>();
     let navigator = use_navigator();
-    let mut catalog = use_signal(|| None::<WorkflowGetResult>);
-    let mut error = use_signal(|| None::<String>);
-    let busy = use_signal(|| false);
-    let mut show_spawn = use_signal(|| false);
+    let mut selected = use_signal(|| 0usize);
 
-    use_future(move || async move {
-        let client = client(state);
-        match client
-            .tasks_list(TasksListParams { limit: Some(500) })
-            .await
-        {
-            Ok(tasks) => {
-                let mut cache = state.cache;
-                cache.write().set_tasks(tasks);
-            }
-            Err(err) => error.set(Some(err.to_string())),
-        }
-        match client.workflow_get(EmptyParams {}).await {
-            Ok(result) => catalog.set(Some(result)),
-            Err(err) => error.set(Some(err.to_string())),
+    // Re-fetch whenever a `catalog.updated` push bumps the version, mirroring
+    // the Catalog view (there is no `workflow.list` RPC).
+    let resource = use_resource(move || {
+        let base = (state.daemon_url)();
+        let token = (state.token)();
+        let _ = (state.catalog_version)();
+        async move {
+            RpcClient::new(base)
+                .with_token(token)
+                .workflow_get(EmptyParams {})
+                .await
         }
     });
 
-    let all: Vec<Task> = (state.cache)().tasks.values().cloned().collect();
-    let buckets = bucket_tasks(&all);
-    let catalog_value = catalog();
-    let error_value = error();
+    let (loaded, error_value) = match &*resource.read_unchecked() {
+        Some(Ok(result)) => (Some(result.clone()), None),
+        Some(Err(err)) => (None, Some(err.to_string())),
+        None => (None, None),
+    };
+    let components = loaded
+        .as_ref()
+        .map(|result| weakly_connected_components(&result.graph))
+        .unwrap_or_default();
+    // Clamp after a catalog edit shrinks the component list.
+    let index = if components.is_empty() {
+        0
+    } else {
+        selected().min(components.len() - 1)
+    };
 
     rsx! {
         main { id: "favetto-app", class: "workflow-view",
             div { class: "workflow-header",
                 h1 { "Workflows" }
-                div { class: "workflow-actions",
-                    button {
-                        class: "btn primary",
-                        onclick: move |_| show_spawn.set(true),
-                        "Spawn workflow"
-                    }
-                }
             }
             if let Some(err) = error_value {
                 p { class: "error-banner", role: "alert", "{err}" }
             }
-            for (status, tasks) in buckets {
-                details { class: "status-group", open: true, key: "{status_class(status)}",
-                    summary { class: "status-group-summary",
-                        span { class: "status-badge status-{status_class(status)}", "{status_label(status)}" }
-                        span { class: "status-group-count", "{tasks.len()}" }
-                    }
-                    if tasks.is_empty() {
-                        p { class: "empty-hint", "No tasks." }
-                    }
-                    for task in tasks {
-                        WorkflowNode {
-                            key: "{task.id}",
-                            card: NodeCard::from_task(&task, now_epoch()),
-                            busy: busy(),
-                            on_cancel: move |root_id: Uuid| run_cancel(state, busy, error, root_id),
-                            on_retry: move |task_id: Uuid| run_retry(state, busy, error, task_id),
-                        }
-                    }
-                }
-            }
-            if let Some(catalog) = catalog_value {
-                CatalogGraph { catalog }
-            }
-            if show_spawn() {
-                SpawnDialog {
-                    on_close: move |_| show_spawn.set(false),
-                    on_spawned: move |root_id: Uuid| {
-                        show_spawn.set(false);
-                        navigator.push(Route::WorkflowDetail { root_id });
-                    },
-                }
-            }
-        }
-    }
-}
-
-/// The catalog workflow graph (`workflow.get`): definitions, not a runtime
-/// instance. DOT/SVG rendering is deferred to the Phase 5 DAG work.
-#[component]
-fn CatalogGraph(catalog: WorkflowGetResult) -> Element {
-    let nodes = catalog.graph.nodes.clone();
-    let edges = catalog.graph.edges.clone();
-    let path = catalog.path.clone();
-
-    rsx! {
-        details { class: "catalog-graph",
-            summary { "Catalog graph" }
-            if nodes.is_empty() {
-                p { class: "empty-hint", "The catalog has no workflow edges." }
-            } else {
-                ul { class: "catalog-graph-nodes",
-                    for node in nodes {
-                        li { class: "catalog-graph-node", key: "{node.name}",
-                            span { class: "catalog-graph-node-name", "{node.name}" }
-                            if node.scheduled {
-                                span { class: "catalog-graph-marker", "(scheduled)" }
+            if components.len() > 1 {
+                label { class: "workflow-picker",
+                    span { class: "workflow-picker-label", "Workflow" }
+                    select {
+                        aria_label: "Select workflow",
+                        value: "{index}",
+                        onchange: move |event| {
+                            if let Ok(next) = event.value().parse::<usize>() {
+                                selected.set(next);
                             }
-                            if node.external {
-                                span { class: "catalog-graph-marker external", "(external)" }
-                            }
-                        }
-                    }
-                }
-                ul { class: "catalog-graph-edges",
-                    for edge in edges {
-                        li { class: "catalog-graph-edge", key: "{edge.from}-{edge.to}-{edge_kind_label(edge.kind)}",
-                            "{edge.from} → {edge.to} ({edge_kind_label(edge.kind)})"
+                        },
+                        for (position, component) in components.iter().enumerate() {
+                            option { key: "{position}", value: "{position}", "{component_label(component)}" }
                         }
                     }
                 }
             }
-            if !path.is_empty() {
-                p { class: "catalog-graph-path", "source: {path}" }
+            match loaded {
+                None => rsx! {},
+                Some(_) if components.is_empty() => rsx! {
+                    p { class: "empty-hint", "The catalog has no tasks." }
+                },
+                Some(result) => rsx! {
+                    WorkflowGraphView {
+                        graph: components[index].clone(),
+                        on_select: move |name: String| {
+                            navigator.push(Route::CatalogDetail {
+                                name: name.split('/').map(str::to_string).collect(),
+                            });
+                        },
+                    }
+                    details { class: "workflow-dot",
+                        summary { "Raw DOT" }
+                        pre { "{result.dot}" }
+                    }
+                },
             }
         }
     }
-}
-
-/// The `workflow.spawn` dialog: name + variables + optional lineage.
-#[component]
-fn SpawnDialog(props: SpawnDialogProps) -> Element {
-    let state = use_context::<AppState>();
-    let on_close = props.on_close;
-    let on_spawned = props.on_spawned;
-    let mut form = use_signal(SpawnForm::default);
-    let mut error = use_signal(|| None::<String>);
-    let mut submitting = use_signal(|| false);
-
-    let submit = move |_| {
-        let params = match build_spawn_params(&form()) {
-            Ok(params) => params,
-            Err(err) => {
-                error.set(Some(err));
-                return;
-            }
-        };
-        error.set(None);
-        submitting.set(true);
-        spawn(async move {
-            match client(state).workflow_spawn(params).await {
-                Ok(task) => {
-                    submitting.set(false);
-                    on_spawned.call(task.root_or_self());
-                }
-                Err(err) => {
-                    submitting.set(false);
-                    error.set(Some(err.to_string()));
-                }
-            }
-        });
-    };
-
-    let error_value = error();
-    rsx! {
-        div { class: "spawn-overlay",
-            div { class: "spawn-dialog", role: "dialog", "aria-modal": "true",
-                h2 { "Spawn workflow" }
-                label { class: "field",
-                    span { class: "field-label", "Task name" }
-                    input {
-                        class: "input",
-                        value: "{form().name}",
-                        placeholder: "e.g. implement_issue",
-                        oninput: move |event| form.write().name = event.value(),
-                    }
-                }
-                label { class: "field",
-                    span { class: "field-label", "Variables (JSON, optional)" }
-                    textarea {
-                        class: "input",
-                        value: "{form().variables}",
-                        oninput: move |event| form.write().variables = event.value(),
-                    }
-                }
-                label { class: "field",
-                    span { class: "field-label", "Root id (optional)" }
-                    input {
-                        class: "input",
-                        value: "{form().root_id}",
-                        oninput: move |event| form.write().root_id = event.value(),
-                    }
-                }
-                label { class: "field",
-                    span { class: "field-label", "Depends on (comma-separated task ids, optional)" }
-                    input {
-                        class: "input",
-                        value: "{form().depends_on}",
-                        oninput: move |event| form.write().depends_on = event.value(),
-                    }
-                }
-                label { class: "field",
-                    span { class: "field-label", "Dedupe key (optional)" }
-                    input {
-                        class: "input",
-                        value: "{form().dedupe_key}",
-                        oninput: move |event| form.write().dedupe_key = event.value(),
-                    }
-                }
-                if let Some(err) = error_value {
-                    p { class: "spawn-error", role: "alert", "{err}" }
-                }
-                div { class: "spawn-dialog-actions",
-                    button { class: "btn", onclick: move |_| on_close.call(()), "Cancel" }
-                    button { class: "btn primary", disabled: submitting(), onclick: submit, "Spawn" }
-                }
-            }
-        }
-    }
-}
-
-/// Properties for [`SpawnDialog`].
-#[derive(Props, Clone, PartialEq)]
-pub struct SpawnDialogProps {
-    pub on_close: EventHandler<()>,
-    pub on_spawned: EventHandler<Uuid>,
 }
 
 /// The inspect tree for one workflow root (`workflow.inspect`).
@@ -691,42 +455,6 @@ mod tests {
     }
 
     #[test]
-    fn bucket_tasks_returns_all_six_groups_in_display_order() {
-        let statuses = [
-            TaskStatus::Running,
-            TaskStatus::AwaitingInput,
-            TaskStatus::Pending,
-            TaskStatus::Failed,
-            TaskStatus::Succeeded,
-            TaskStatus::Cancelled,
-        ];
-        let tasks: Vec<Task> = statuses
-            .iter()
-            .map(|&status| task(Uuid::new_v4(), status, "2026-01-01T00:00:00Z"))
-            .collect();
-        let buckets = bucket_tasks(&tasks);
-        assert_eq!(
-            buckets.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
-            GROUPS.to_vec()
-        );
-        for (status, group) in &buckets {
-            assert_eq!(group.len(), 1, "{status:?} should hold exactly one task");
-            assert_eq!(group[0].status, *status);
-        }
-
-        // Newest-first within a bucket.
-        let older = task(Uuid::new_v4(), TaskStatus::Failed, "2026-01-01T00:00:00Z");
-        let newer = task(Uuid::new_v4(), TaskStatus::Failed, "2026-06-01T00:00:00Z");
-        let buckets = bucket_tasks(&[older.clone(), newer.clone()]);
-        let failed = buckets
-            .iter()
-            .find(|(s, _)| *s == TaskStatus::Failed)
-            .unwrap();
-        assert_eq!(failed.1[0].id, newer.id);
-        assert_eq!(failed.1[1].id, older.id);
-    }
-
-    #[test]
     fn humanize_age_units_and_clamp() {
         assert_eq!(humanize_age(5), "5s");
         assert_eq!(humanize_age(90), "1m");
@@ -759,66 +487,6 @@ mod tests {
 
         let fresh = task(Uuid::new_v4(), TaskStatus::Pending, "2026-01-01T00:00:00Z");
         assert_eq!(task_age(&fresh, fresh.created_at.timestamp() + 5), "5s");
-    }
-
-    #[test]
-    fn parse_variables_accepts_empty_and_rejects_invalid() {
-        assert_eq!(parse_variables(""), Ok(None));
-        assert_eq!(parse_variables("   "), Ok(None));
-        assert_eq!(
-            parse_variables(r#"{"a":1}"#),
-            Ok(Some(serde_json::json!({ "a": 1 })))
-        );
-        assert!(parse_variables("not json").is_err());
-    }
-
-    #[test]
-    fn parse_variables_handles_null_and_arrays() {
-        assert_eq!(parse_variables("null"), Ok(Some(serde_json::Value::Null)));
-        assert_eq!(
-            parse_variables("[1,2]"),
-            Ok(Some(serde_json::json!([1, 2])))
-        );
-    }
-
-    #[test]
-    fn parse_depends_on_splits_and_validates() {
-        assert_eq!(parse_depends_on("   "), Ok(Vec::new()));
-        let a = Uuid::new_v4();
-        let b = Uuid::new_v4();
-        assert_eq!(parse_depends_on(&format!("{a}, {b}")), Ok(vec![a, b]));
-        assert!(parse_depends_on("nope").is_err());
-    }
-
-    #[test]
-    fn build_spawn_params_requires_name() {
-        let form = SpawnForm::default();
-        assert!(build_spawn_params(&form).is_err());
-
-        let a = Uuid::new_v4();
-        let form = SpawnForm {
-            name: " implement_issue ".to_string(),
-            variables: r#"{"issue":248}"#.to_string(),
-            root_id: String::new(),
-            depends_on: a.to_string(),
-            dedupe_key: " dedupe ".to_string(),
-        };
-        let params = build_spawn_params(&form).unwrap();
-        assert_eq!(params.name, "implement_issue");
-        assert_eq!(params.input, Some(serde_json::json!({ "issue": 248 })));
-        assert_eq!(params.depends_on, Some(vec![a]));
-        assert_eq!(params.root_id, None);
-        assert_eq!(params.dedupe_key.as_deref(), Some("dedupe"));
-    }
-
-    #[test]
-    fn build_spawn_params_rejects_a_bad_root_id() {
-        let form = SpawnForm {
-            name: "x".to_string(),
-            root_id: "not-a-uuid".to_string(),
-            ..SpawnForm::default()
-        };
-        assert!(build_spawn_params(&form).is_err());
     }
 
     #[test]
@@ -862,16 +530,39 @@ mod tests {
     }
 
     #[test]
-    fn edge_kind_labels_are_distinct() {
-        let labels = [
-            edge_kind_label(WorkflowEdgeKind::Spawn),
-            edge_kind_label(WorkflowEdgeKind::Needs),
-            edge_kind_label(WorkflowEdgeKind::NeedsSucceeded),
-            edge_kind_label(WorkflowEdgeKind::NeedsFailed),
-            edge_kind_label(WorkflowEdgeKind::Join),
-        ];
-        let unique: HashSet<&str> = labels.iter().copied().collect();
-        assert_eq!(unique.len(), labels.len());
+    fn bucket_cards_returns_all_six_groups_in_display_order() {
+        let cards: Vec<NodeCard> = [
+            TaskStatus::Running,
+            TaskStatus::AwaitingInput,
+            TaskStatus::Pending,
+            TaskStatus::Failed,
+            TaskStatus::Succeeded,
+            TaskStatus::Cancelled,
+        ]
+        .iter()
+        .map(|&status| NodeCard {
+            id: Uuid::new_v4(),
+            root_id: Uuid::new_v4(),
+            name: "t".to_string(),
+            status,
+            attempt: 1,
+            age: None,
+            summary: None,
+            depth: 0,
+        })
+        .collect();
+        let buckets = bucket_cards(&cards);
+        assert_eq!(
+            buckets
+                .iter()
+                .map(|(status, _)| *status)
+                .collect::<Vec<_>>(),
+            GROUPS.to_vec()
+        );
+        for (status, group) in &buckets {
+            assert_eq!(group.len(), 1);
+            assert_eq!(group[0].status, *status);
+        }
     }
 
     #[test]
