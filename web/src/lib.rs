@@ -11,3 +11,7 @@
 //! workspace) so the native gates do not need the Dioxus toolchain.
 
 pub mod app;
+pub mod client;
+pub mod config;
+pub mod sse;
+pub mod state;
