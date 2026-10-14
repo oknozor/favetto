@@ -21,9 +21,12 @@ favetto daemon
 ```
 
 Then open <http://127.0.0.1:7878> in a browser. On first visit you will see the
-pairing screen — enter the code from `favetto pair` (or open
-`http://127.0.0.1:7878/?pair=CODE`) to exchange it for a token. The token is
-stored in `localStorage` and reused on subsequent visits.
+sign-in screen. Enter the username and password of an account created with
+`favetto user add <name>` on the daemon host; the client calls
+`POST /auth/login` and receives the bearer token. A pairing code is still
+available behind the "Use a pairing code" toggle (or by opening
+`http://127.0.0.1:7878/?pair=CODE`). The token is stored in `localStorage` and
+reused on subsequent visits; a 401 clears it and returns to the sign-in screen.
 
 The web client is enabled by default (`[web].enabled = true`). To disable it:
 

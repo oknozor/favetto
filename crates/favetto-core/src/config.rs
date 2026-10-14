@@ -95,20 +95,39 @@ impl Default for WebSettings {
     }
 }
 
-/// Short-lived, single-use tickets for header-less clients (browser
-/// WebSocket/SSE auth). The ticket is minted over authenticated HTTP and then
-/// presented in a query string, where an `Authorization` header cannot go.
+/// Authentication settings: short-lived tickets for header-less clients
+/// (browser WebSocket/SSE auth) plus the username/password login policy.
+///
+/// A ticket is minted over authenticated HTTP and then presented in a query
+/// string, where an `Authorization` header cannot go. Login attempts are
+/// rate-limited per `(username, client)`; `require_tls` rejects non-loopback
+/// logins that did not arrive over HTTPS (directly or via a proxy that sets
+/// `X-Forwarded-Proto: https`).
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 pub struct AuthSettings {
     /// Ticket lifetime, in seconds.
     #[serde(default = "default_ticket_ttl_secs")]
     pub ticket_ttl_secs: u64,
+    /// Failed `POST /auth/login` attempts allowed per `(username, client)` in
+    /// `login_window_secs` before the client is locked out (0 disables the
+    /// limit).
+    #[serde(default = "default_login_rate_limit")]
+    pub login_rate_limit: u32,
+    /// Window, in seconds, over which `login_rate_limit` failures accumulate.
+    #[serde(default = "default_login_window_secs")]
+    pub login_window_secs: u64,
+    /// Reject non-loopback logins that did not arrive over HTTPS.
+    #[serde(default)]
+    pub require_tls: bool,
 }
 
 impl Default for AuthSettings {
     fn default() -> Self {
         Self {
             ticket_ttl_secs: default_ticket_ttl_secs(),
+            login_rate_limit: default_login_rate_limit(),
+            login_window_secs: default_login_window_secs(),
+            require_tls: false,
         }
     }
 }
@@ -573,6 +592,14 @@ fn default_web_heartbeat_secs() -> u64 {
 
 fn default_ticket_ttl_secs() -> u64 {
     30
+}
+
+fn default_login_rate_limit() -> u32 {
+    5
+}
+
+fn default_login_window_secs() -> u64 {
+    300
 }
 
 fn default_sound_events() -> BTreeMap<String, String> {
@@ -1286,6 +1313,27 @@ mod tests {
     }
 
     #[test]
+    fn auth_login_defaults_and_parses() {
+        let cfg: FavettoConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.auth.login_rate_limit, 5);
+        assert_eq!(cfg.auth.login_window_secs, 300);
+        assert!(!cfg.auth.require_tls);
+
+        let overridden: FavettoConfig = toml::from_str(
+            r#"
+            [auth]
+            login_rate_limit = 2
+            login_window_secs = 60
+            require_tls = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(overridden.auth.login_rate_limit, 2);
+        assert_eq!(overridden.auth.login_window_secs, 60);
+        assert!(overridden.auth.require_tls);
+    }
+
+    #[test]
     fn default_sound_events_includes_awaiting_input() {
         let cfg = SoundSettings::default();
         assert_eq!(
@@ -1312,6 +1360,9 @@ mod tests {
         assert_eq!(cfg.web.dir, PathBuf::new());
         assert_eq!(cfg.web.heartbeat_secs, 15);
         assert_eq!(cfg.auth.ticket_ttl_secs, 30);
+        assert_eq!(cfg.auth.login_rate_limit, 5);
+        assert_eq!(cfg.auth.login_window_secs, 300);
+        assert!(!cfg.auth.require_tls);
     }
 
     #[test]
@@ -1325,6 +1376,7 @@ mod tests {
 
             [auth]
             ticket_ttl_secs = 60
+            login_rate_limit = 10
             "#,
         )
         .unwrap();
@@ -1332,6 +1384,7 @@ mod tests {
         assert_eq!(cfg.web.dir, PathBuf::from("/srv/favetto/web"));
         assert_eq!(cfg.web.heartbeat_secs, 5);
         assert_eq!(cfg.auth.ticket_ttl_secs, 60);
+        assert_eq!(cfg.auth.login_rate_limit, 10);
     }
 
     #[test]

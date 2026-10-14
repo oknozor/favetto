@@ -12,6 +12,7 @@ use sqlx::SqlitePool;
 use tokio_cron_scheduler::JobScheduler;
 
 use crate::agents::{AgentManager, AgentRegistry};
+use crate::auth::LoginLimiter;
 use crate::config::FavettoConfig;
 use crate::db;
 use crate::event_bus::{EventBus, ServerPush};
@@ -45,6 +46,8 @@ pub struct State {
     pub catalog: Arc<RwLock<Vec<TaskDef>>>,
     pub scheduler: JobScheduler,
     pub pair: PairStore,
+    /// Per-`(username, client)` failed-login throttling for `POST /auth/login`.
+    pub login_limiter: LoginLimiter,
     /// Short-lived, single-use tickets for header-less WebSocket upgrades.
     pub tickets: TicketStore,
     /// Live hook list (mutable so the TUI can add notification hooks).
@@ -85,6 +88,10 @@ pub struct StateInit {
 impl State {
     pub fn new(init: StateInit) -> Self {
         let tickets = TicketStore::new(init.config.auth.ticket_ttl_secs);
+        let login_limiter = LoginLimiter::new(
+            init.config.auth.login_rate_limit,
+            init.config.auth.login_window_secs,
+        );
         let (watch_tx, watch_rx) = tokio::sync::mpsc::unbounded_channel();
         // Attach the bus to the agent manager before it is stored, so every
         // normalized event is published as an `agent.event` push.
@@ -103,6 +110,7 @@ impl State {
             catalog: init.catalog,
             scheduler: init.scheduler,
             pair: PairStore::new(),
+            login_limiter,
             tickets,
             hook_store: init.hook_store,
             providers_cache: tokio::sync::Mutex::new(HashMap::new()),

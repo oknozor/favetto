@@ -24,6 +24,15 @@ pub struct TuiArgs {
     /// Short-lived pairing code to exchange for a token (remote attach only).
     #[arg(long)]
     pub pair_code: Option<String>,
+    /// Username to log in with (remote attach only). Prompts for a password
+    /// when `--password` is not given.
+    #[arg(long)]
+    pub user: Option<String>,
+    /// Password for `--user` (remote attach only). Prefer the interactive
+    /// prompt or `--token-file` on a shared machine: argv is visible to other
+    /// processes.
+    #[arg(long)]
+    pub password: Option<String>,
     /// Path to the client-local config file (default `~/.config/favetto/config.toml`).
     #[arg(long)]
     pub config: Option<PathBuf>,

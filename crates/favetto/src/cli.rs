@@ -26,6 +26,8 @@ pub enum Command {
     Tui(TuiArgs),
     /// Print a short-lived pairing code for remote TUI attachment.
     Pair(PairArgs),
+    /// Manage username/password login accounts.
+    User(UserArgs),
     /// Rotate the bearer token.
     TokenRotate(TokenRotateArgs),
     /// Validate a task-definition file without starting a daemon.
@@ -78,6 +80,54 @@ pub struct PairArgs {
     /// Daemon HTTP base URL (e.g. http://127.0.0.1:7878).
     #[arg(long, default_value = "http://127.0.0.1:7878")]
     pub url: String,
+    /// Bearer token file to authenticate `POST /pair/generate`
+    /// (defaults to `<data_dir>/token`).
+    #[arg(long)]
+    pub token_file: Option<PathBuf>,
+}
+
+/// `favetto user`: manage the daemon's username/password accounts.
+#[derive(Args)]
+pub struct UserArgs {
+    #[command(subcommand)]
+    pub command: UserCommand,
+}
+
+#[derive(Subcommand)]
+pub enum UserCommand {
+    /// Create a user (or reset an existing user's password).
+    Add(UserAddArgs),
+    /// Change a user's password.
+    Passwd(UserAddArgs),
+    /// List configured users.
+    List(UserListArgs),
+    /// Remove a user.
+    Remove(UserRemoveArgs),
+}
+
+#[derive(Args)]
+pub struct UserAddArgs {
+    /// Username.
+    pub name: String,
+    /// Directory for the SQLite database (default `~/.local/share/favetto`).
+    #[arg(long)]
+    pub data_dir: Option<PathBuf>,
+}
+
+#[derive(Args)]
+pub struct UserListArgs {
+    /// Directory for the SQLite database (default `~/.local/share/favetto`).
+    #[arg(long)]
+    pub data_dir: Option<PathBuf>,
+}
+
+#[derive(Args)]
+pub struct UserRemoveArgs {
+    /// Username.
+    pub name: String,
+    /// Directory for the SQLite database (default `~/.local/share/favetto`).
+    #[arg(long)]
+    pub data_dir: Option<PathBuf>,
 }
 
 #[derive(Args)]

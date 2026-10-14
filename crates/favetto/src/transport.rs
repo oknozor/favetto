@@ -51,7 +51,14 @@ pub async fn serve_unix(path: &Path, state: Arc<State>) -> anyhow::Result<()> {
 pub async fn serve_http(listen: &str, app: Router) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(addr = %listen, "favetto HTTP/WebSocket API listening");
-    axum::serve(listener, app).await?;
+    // Connect info lets `/auth/login` key its rate limiter by the peer address
+    // (and decide whether a request is loopback for `require_tls`). Handlers
+    // that do not ask for it are unaffected.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 

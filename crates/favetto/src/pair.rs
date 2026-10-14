@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::State as AxumState;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -52,16 +52,21 @@ pub(crate) fn routes() -> Router<Arc<State>> {
         .route("/pair/exchange", post(exchange))
 }
 
+/// A six-digit code derived from a UUID v4, so it is unpredictable rather than
+/// clock-derived.
 fn random_code() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64)
-        .unwrap_or(0);
-    format!("{:06}", (nanos % 1_000_000))
+    let uuid = uuid::Uuid::new_v4();
+    let bytes = uuid.as_bytes();
+    let n = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    format!("{:06}", n % 1_000_000)
 }
 
-async fn generate(AxumState(state): AxumState<Arc<State>>) -> Response {
+/// `POST /pair/generate` — mint a pairing code. Requires a valid bearer token so
+/// the endpoint can no longer dispense the token to an unauthenticated caller.
+async fn generate(AxumState(state): AxumState<Arc<State>>, headers: HeaderMap) -> Response {
+    if !crate::server::bearer_authorized(&headers, &state.token) {
+        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+    }
     let code = random_code();
     state.pair.issue(code.clone()).await;
     tracing::info!(code = %code, "issued pairing code");
@@ -90,13 +95,28 @@ async fn exchange(
 
 /// `favetto pair`: request a code from the daemon and print it for the user.
 ///
+/// Reads the bearer token from `<data_dir>/token` (or `--token-file`) and sends
+/// it, because `POST /pair/generate` is bearer-guarded.
+///
 /// The two `println!` lines at the end are this command's stdout contract, not
 /// diagnostics: scripts parse the pairing code from the first line and the
 /// ready-to-run attach command from the second. Keep them on stdout; route any
 /// new status or error detail through `tracing` instead.
 pub async fn run(args: crate::cli::PairArgs) -> anyhow::Result<()> {
+    let token_path = args
+        .token_file
+        .clone()
+        .unwrap_or_else(crate::cli::default_token_path);
+    let token = std::fs::read_to_string(&token_path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to read bearer token at {}: {e}. Start the daemon (or run `favetto token-rotate`) to create it, or pass --token-file.",
+            token_path.display()
+        )
+    })?;
+
     let resp: Value = reqwest::Client::new()
         .post(format!("{}/pair/generate", args.url.trim_end_matches('/')))
+        .bearer_auth(token.trim())
         .send()
         .await?
         .error_for_status()?
@@ -115,4 +135,115 @@ pub async fn run(args: crate::cli::PairArgs) -> anyhow::Result<()> {
     println!("pairing code (valid {expires}s): {code}");
     println!("attach with: favetto tui --remote ws://HOST:7878/rpc --pair-code {code}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use axum::body::to_bytes;
+    use axum::http::header::AUTHORIZATION;
+
+    use crate::state::StateInit;
+
+    async fn test_state() -> Arc<State> {
+        let dir = std::env::temp_dir().join(format!("favetto-pair-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = crate::db::open(&dir.join("test.db")).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        Arc::new(State::new(StateInit {
+            db: pool,
+            bus: crate::event_bus::EventBus::new(8),
+            token: favetto_core::auth::Token::generate(),
+            webhooks: crate::webhooks::WebhookSecrets::from_config(
+                &crate::config::FavettoConfig::default(),
+            ),
+            agents: crate::agents::AgentManager::new(),
+            registry: crate::agents::AgentRegistry::default(),
+            config: Arc::new(crate::config::FavettoConfig::default()),
+            data_dir: dir.clone(),
+            tasks_dir: dir,
+            catalog: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            scheduler: tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
+            hook_store: Arc::new(parking_lot::RwLock::new(Vec::new())),
+        }))
+    }
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn codes_are_six_digits() {
+        for _ in 0..64 {
+            let code = random_code();
+            assert_eq!(code.len(), 6);
+            assert!(code.chars().all(|c| c.is_ascii_digit()), "{code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn generate_requires_a_bearer_token() {
+        let state = test_state().await;
+
+        let response = generate(AxumState(state.clone()), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = generate(AxumState(state.clone()), bearer("wrong"))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // No code was issued.
+        assert!(state.pair.codes.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn generate_issues_a_redeemable_code_with_a_bearer() {
+        let state = test_state().await;
+        let response = generate(AxumState(state.clone()), bearer(state.token.as_str()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let code = body["code"].as_str().unwrap();
+        assert_eq!(body["expires_in"], json!(PAIR_TTL_SECS));
+        assert!(state.pair.redeem(code).await);
+        assert!(!state.pair.redeem(code).await, "single use");
+    }
+
+    #[tokio::test]
+    async fn exchange_redeems_a_code_for_the_token() {
+        let state = test_state().await;
+        state.pair.issue("123456".to_string()).await;
+
+        let response = exchange(
+            AxumState(state.clone()),
+            Json(ExchangeBody {
+                code: "123456".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["token"], json!(state.token.as_str()));
+
+        // A consumed code is rejected.
+        let response = exchange(
+            AxumState(state),
+            Json(ExchangeBody {
+                code: "123456".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }

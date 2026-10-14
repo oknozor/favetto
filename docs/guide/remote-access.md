@@ -54,10 +54,46 @@ scheme to `https://` and strips the `/rpc` path for the one-off
 `favetto tui --remote wss://HOST:7878/rpc --pair-code 123456` talks to
 `https://HOST:7878` and then attaches over the validated WebSocket.
 
+## Username & password login
+
+Copying the token works for a trusted machine, but a phone or browser cannot run
+a command on the daemon host. Create an account there once:
+
+```bash
+favetto user add alice
+# Password for alice: ************
+# password set for user alice
+```
+
+`favetto user` reads the password from stdin (never from argv) and stores only an
+argon2id hash in the daemon's SQLite database; `favetto user passwd <name>`
+resets it, and `favetto user list` / `favetto user remove <name>` manage the
+roster. The database is opened directly, so none of these needs a running daemon.
+
+A remote client then authenticates itself:
+
+```bash
+favetto tui --remote wss://HOST:7878/rpc --user alice --password '…'
+```
+
+Omit `--password` to be prompted on stderr. Under the hood the client calls
+`POST /auth/login` with `{"username", "password"}` and receives the same bearer
+token the pairing flow returns. Failed attempts are rate-limited per
+`(username, client)` (`[auth].login_rate_limit` / `login_window_secs`).
+Set `[auth].require_tls = true` to reject non-loopback logins that did not
+arrive over HTTPS (directly or via a proxy that sets `X-Forwarded-Proto:
+https`). If no user exists yet, the daemon refuses remote logins and tells the
+client to run `favetto user add`.
+
+The web/Android client uses the same endpoint: its `/pair` screen signs in with
+username + password, with the pairing code behind a toggle.
+
 ## Pairing
 
 Copying the token is fine for a trusted machine. For a one-off session, ask the
-daemon for a short-lived code and exchange it for the token during attach:
+daemon for a short-lived code and exchange it for the token during attach.
+`POST /pair/generate` is bearer-guarded, so `favetto pair` reads
+`<data_dir>/token` on the daemon host and sends it:
 
 ```bash
 # on any machine that can reach the daemon's HTTP endpoint
@@ -71,8 +107,14 @@ favetto tui --remote ws://HOST:7878/rpc --pair-code 123456
 ```
 
 The code is valid for 60 seconds and is consumed on first use. Under the hood
-`favetto pair` calls `POST /pair/generate`; the client calls `POST /pair/exchange`
-with the code to obtain the token.
+`favetto pair` calls `POST /pair/generate` (with the daemon bearer token, read
+from `<data_dir>/token` or `--token-file`); the client calls
+`POST /pair/exchange` with the code to obtain the token. Use `--token-file` when
+the token lives somewhere other than the default.
+
+A `?pair=CODE` web deep link still works, and the whole pairing flow remains the
+local/one-off option; username + password login is the self-service path for a
+fresh device.
 
 ## Rotate the token
 
@@ -94,8 +136,12 @@ rotate a token outside the default location.
   TLS-terminating proxy) whenever the network is not fully trusted.
 - The Unix socket is local and trusted; anyone who can open it can control the
   daemon.
-- The pairing code is short-lived and single-use. Do not expose the HTTP
-  endpoint to untrusted networks.
+- The pairing code is short-lived and single-use. `POST /pair/generate` now
+  requires the bearer token, so it is no longer an unauthenticated token source;
+  treat it as a local bootstrap command.
+- Username/password login is rate-limited per `(username, client)` and hashes
+  passwords with argon2id. Enable `[auth].require_tls` and put the daemon behind
+  a TLS-terminating proxy when the network is not trusted.
 
 See the [CLI reference](../reference/cli) for every flag, and the
 [remote API reference](../reference/remote-api) for the protocol.

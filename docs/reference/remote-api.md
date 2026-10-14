@@ -1008,6 +1008,7 @@ Subscribing with `events.subscribe` and `last_event_id` replays persisted events
 The daemon also serves HTTP endpoints alongside the RPC transports:
 
 - `GET /metrics` — Prometheus metrics.
-- `POST /pair/generate` and `POST /pair/exchange` — pairing.
+- `POST /auth/login` — username/password login (returns the bearer token).
+- `POST /pair/generate` (bearer-guarded) and `POST /pair/exchange` — pairing.
 - `POST /webhooks/github` — GitHub webhook receiver (see [Webhooks & hooks](../guide/webhooks)).
 

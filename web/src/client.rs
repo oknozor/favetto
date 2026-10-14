@@ -379,6 +379,47 @@ pub async fn exchange_pair_code(base: &str, code: &str) -> Result<String, Client
     decode_pair_response(status, &bytes)
 }
 
+/// Encode the `POST /auth/login` JSON request body.
+pub fn encode_login_request(username: &str, password: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({ "username": username, "password": password }))
+        .unwrap_or_default()
+}
+
+/// Interpret a `/auth/login` response.
+///
+/// A 2xx body `{"token":"…"}` yields the token; a 401 is the daemon rejecting
+/// the credentials, surfaced as [`ClientError::Unauthorized`]. Anything else is
+/// a [`ClientError::Http`].
+pub fn decode_login_response(status: u16, bytes: &[u8]) -> Result<String, ClientError> {
+    match status {
+        200..=299 => {
+            let value: serde_json::Value =
+                serde_json::from_slice(bytes).map_err(|e| ClientError::Decode(e.to_string()))?;
+            value
+                .get("token")
+                .and_then(|token| token.as_str())
+                .filter(|token| !token.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| ClientError::Decode("login response missing token".into()))
+        }
+        401 => Err(ClientError::Unauthorized),
+        _ => Err(ClientError::Http {
+            status,
+            message: String::from_utf8_lossy(bytes).into_owned(),
+        }),
+    }
+}
+
+/// Log in with a username/password and return the daemon bearer token.
+///
+/// This is the self-service path for a remote client that cannot run
+/// `favetto pair` on the daemon host.
+pub async fn login(base: &str, username: &str, password: &str) -> Result<String, ClientError> {
+    let url = config::login_url_for(base);
+    let (status, bytes) = post_json(&url, encode_login_request(username, password)).await?;
+    decode_login_response(status, &bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,6 +579,51 @@ mod tests {
     fn pair_response_500_becomes_an_http_error() {
         assert_eq!(
             decode_pair_response(500, b"boom"),
+            Err(ClientError::Http {
+                status: 500,
+                message: "boom".into()
+            })
+        );
+    }
+
+    #[test]
+    fn login_request_encodes_the_credentials() {
+        let bytes = encode_login_request("alice", "s3cret");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "username": "alice", "password": "s3cret" })
+        );
+    }
+
+    #[test]
+    fn login_response_returns_the_token() {
+        assert_eq!(
+            decode_login_response(200, br#"{"token":"secret"}"#),
+            Ok("secret".to_string())
+        );
+    }
+
+    #[test]
+    fn login_response_without_a_token_is_a_decode_error() {
+        assert!(matches!(
+            decode_login_response(200, b"{}"),
+            Err(ClientError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn login_response_401_is_unauthorized() {
+        assert_eq!(
+            decode_login_response(401, b"invalid username or password"),
+            Err(ClientError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn login_response_500_becomes_an_http_error() {
+        assert_eq!(
+            decode_login_response(500, b"boom"),
             Err(ClientError::Http {
                 status: 500,
                 message: "boom".into()

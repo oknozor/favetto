@@ -25,10 +25,12 @@
 )]
 
 // Subcommand entry points.
+pub mod auth;
 pub mod cli;
 pub mod daemon;
 pub mod docgen;
 pub mod pair;
+pub mod user;
 pub mod validate;
 
 // Modules shared between the daemon and the TUI client live in `favetto-core`

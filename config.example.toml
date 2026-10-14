@@ -139,11 +139,16 @@ enabled = true        # serve the embedded web client (default true)
 dir = ""              # empty = embedded assets; a path = serve from disk (dev)
 heartbeat_secs = 15   # SSE keep-alive interval, in seconds
 
-# Short-lived, single-use tickets for header-less clients (browser WebSocket/SSE
-# auth). The ticket is minted over authenticated HTTP, then presented in a query
-# string where an Authorization header cannot go.
+# Authentication: short-lived, single-use tickets for header-less clients
+# (browser WebSocket/SSE auth), plus the username/password login policy.
+# The ticket is minted over authenticated HTTP, then presented in a query string
+# where an Authorization header cannot go. User accounts are managed with
+# `favetto user add|passwd|list|remove` and stored (hashed) in SQLite.
 [auth]
-ticket_ttl_secs = 30  # ticket lifetime, in seconds
+ticket_ttl_secs = 30     # ticket lifetime, in seconds
+login_rate_limit = 5     # failed logins per (username, client) before lockout (0 = unlimited)
+login_window_secs = 300  # window over which login failures accumulate
+require_tls = false      # reject non-loopback logins that did not arrive over HTTPS
 
 # Task executor concurrency + isolation.
 [executor]

@@ -1417,16 +1417,25 @@ async fn disconnected_pump<B: ratatui::backend::Backend>(
 }
 
 async fn resolve_transport(args: &TuiArgs) -> Transport {
-    // Pairing: exchange a short-lived code for the daemon's bearer token.
-    let pair_token = match (&args.remote, &args.pair_code) {
-        (Some(remote), Some(code)) => exchange_pair_code(remote, code).await.ok(),
-        _ => None,
+    // Remote credential resolution, in precedence order: an explicit pairing
+    // code, then a username/password login, then the token file.
+    let remote_token = match &args.remote {
+        Some(remote) => {
+            if let Some(code) = &args.pair_code {
+                exchange_pair_code(remote, code).await.ok()
+            } else if let Some(user) = &args.user {
+                login(remote, user, args.password.as_deref()).await.ok()
+            } else {
+                None
+            }
+        }
+        None => None,
     };
 
     if let Some(remote) = &args.remote {
         return Transport::Ws {
             url: normalize_ws_url(remote),
-            token: pair_token.or_else(|| read_token(args)),
+            token: remote_token.or_else(|| read_token(args)),
         };
     }
     if let Ok(url) = std::env::var("FAVETTO_URL") {
@@ -1463,6 +1472,48 @@ async fn exchange_pair_code(remote: &str, code: &str) -> anyhow::Result<String> 
         .and_then(|t| t.as_str())
         .map(str::to_string)
         .ok_or_else(|| anyhow::anyhow!("pair/exchange response missing token"))
+}
+
+/// Log in with a username/password and return the daemon's bearer token.
+///
+/// The login endpoint is derived from the remote WebSocket URL by
+/// [`pair_http_base`]. When `password` is `None`, the user is prompted on stderr.
+async fn login(remote: &str, user: &str, password: Option<&str>) -> anyhow::Result<String> {
+    let password = match password {
+        Some(password) => password.to_string(),
+        None => prompt_password(user)?,
+    };
+    let http_url = pair_http_base(remote);
+    let resp: serde_json::Value = reqwest::Client::new()
+        .post(format!("{http_url}/auth/login"))
+        .json(&login_body(user, &password))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    resp.get("token")
+        .and_then(|t| t.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("auth/login response missing token"))
+}
+
+/// The JSON body of `POST /auth/login` (pure, so it can be unit-tested).
+fn login_body(username: &str, password: &str) -> serde_json::Value {
+    serde_json::json!({ "username": username, "password": password })
+}
+
+/// Prompt for a password on stderr, reading one line from stdin.
+fn prompt_password(user: &str) -> anyhow::Result<String> {
+    use std::io::{BufRead, Write};
+
+    eprint!("Password for {user}: ");
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line)? == 0 {
+        anyhow::bail!("no password provided on stdin; pass --password");
+    }
+    Ok(line.trim_end_matches(['\n', '\r']).to_string())
 }
 
 fn read_token(args: &TuiArgs) -> Option<String> {
@@ -1665,5 +1716,14 @@ mod tests {
         .expect("daemon-backed input must not wait out the backoff");
 
         assert!(matches!(outcome, PumpOutcome::Reconnect));
+    }
+
+    #[test]
+    fn login_body_carries_the_credentials() {
+        let body = login_body("alice", "s3cret");
+        assert_eq!(
+            body,
+            serde_json::json!({ "username": "alice", "password": "s3cret" })
+        );
     }
 }

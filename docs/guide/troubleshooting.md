@@ -64,9 +64,11 @@ the definition it was dispatched with.
 
 - Check the daemon is listening on the address you dialed (`--listen`) and that
   it is reachable.
-- Make sure you passed a valid token (`--token-file`) or a fresh pairing code
-  (`--pair-code`). Pairing codes expire after 60 seconds and are single-use.
-- A rejected token returns the RPC error code `-32001`.
+- Make sure you passed a valid token (`--token-file`), a username/password
+  (`--user`/`--password`), or a fresh pairing code (`--pair-code`). Pairing
+  codes expire after 60 seconds and are single-use.
+- A rejected token returns the RPC error code `-32001`; a rejected login returns
+  HTTP 401 (and 429 after too many failures).
 
 See [Remote access](./remote-access).
 

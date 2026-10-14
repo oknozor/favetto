@@ -193,8 +193,27 @@
       ]
     },
     "AuthSettings": {
-      "description": "Short-lived, single-use tickets for header-less clients (browser\nWebSocket/SSE auth). The ticket is minted over authenticated HTTP and then\npresented in a query string, where an `Authorization` header cannot go.",
+      "description": "Authentication settings: short-lived tickets for header-less clients\n(browser WebSocket/SSE auth) plus the username/password login policy.\n\nA ticket is minted over authenticated HTTP and then presented in a query\nstring, where an `Authorization` header cannot go. Login attempts are\nrate-limited per `(username, client)`; `require_tls` rejects non-loopback\nlogins that did not arrive over HTTPS (directly or via a proxy that sets\n`X-Forwarded-Proto: https`).",
       "properties": {
+        "login_rate_limit": {
+          "default": 5,
+          "description": "Failed `POST /auth/login` attempts allowed per `(username, client)` in\n`login_window_secs` before the client is locked out (0 disables the\nlimit).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "login_window_secs": {
+          "default": 300,
+          "description": "Window, in seconds, over which `login_rate_limit` failures accumulate.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "require_tls": {
+          "default": false,
+          "description": "Reject non-loopback logins that did not arrive over HTTPS.",
+          "type": "boolean"
+        },
         "ticket_ttl_secs": {
           "default": 30,
           "description": "Ticket lifetime, in seconds.",
@@ -857,6 +876,9 @@
     "auth": {
       "$ref": "#/$defs/AuthSettings",
       "default": {
+        "login_rate_limit": 5,
+        "login_window_secs": 300,
+        "require_tls": false,
         "ticket_ttl_secs": 30
       },
       "description": "Short-lived authentication ticket settings."
