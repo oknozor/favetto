@@ -410,6 +410,113 @@ fn task_without_session_title_renders_blank_cell() {
 }
 
 #[test]
+fn started_formats_absolute_time_and_placeholder() {
+    use chrono::TimeZone;
+
+    assert_eq!(started(None), "—");
+    let t = Utc.with_ymd_and_hms(2026, 10, 14, 9, 15, 0).unwrap();
+    assert_eq!(started(Some(t)), "2026-10-14 09:15");
+}
+
+#[test]
+fn duration_uses_finished_then_live_elapsed_and_placeholder() {
+    use chrono::TimeZone;
+
+    let t0 = Utc.with_ymd_and_hms(2026, 10, 14, 9, 15, 0).unwrap();
+    let now = Utc.with_ymd_and_hms(2026, 10, 14, 9, 15, 45).unwrap();
+
+    // Never started: both states render the placeholder.
+    assert_eq!(duration(None, None, now), "—");
+
+    // Finished runs use `finished - started`.
+    assert_eq!(
+        duration(Some(t0), Some(t0 + chrono::Duration::seconds(12)), now),
+        "12s"
+    );
+    assert_eq!(
+        duration(Some(t0), Some(t0 + chrono::Duration::minutes(3)), now),
+        "3m"
+    );
+    assert_eq!(
+        duration(Some(t0), Some(t0 + chrono::Duration::minutes(80)), now),
+        "1h20m"
+    );
+    assert_eq!(
+        duration(Some(t0), Some(t0 + chrono::Duration::hours(51)), now),
+        "2d3h"
+    );
+
+    // Live runs (no `finished_at`) fall back to `now - started`.
+    assert_eq!(duration(Some(t0), None, now), "45s");
+}
+
+#[test]
+fn compact_duration_buckets_by_magnitude() {
+    assert_eq!(compact_duration(0), "0s");
+    assert_eq!(compact_duration(59), "59s");
+    assert_eq!(compact_duration(60), "1m");
+    assert_eq!(compact_duration(3_599), "59m");
+    assert_eq!(compact_duration(3_600), "1h");
+    assert_eq!(compact_duration(4_800), "1h20m");
+    assert_eq!(compact_duration(86_400), "1d");
+    assert_eq!(compact_duration(183_600), "2d3h");
+}
+
+#[test]
+fn tasks_table_shows_started_and_duration_headers() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    app.tasks = vec![geom_task("history")];
+
+    let text = render_text(&mut app, 200, 24);
+    assert!(text.contains("STARTED"), "started header missing: {text:?}");
+    assert!(
+        text.contains("DURATION"),
+        "duration header missing: {text:?}"
+    );
+    assert!(!text.contains("AGE"), "stale age header: {text:?}");
+}
+
+#[test]
+fn tasks_table_pending_row_shows_placeholders() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    // `geom_task` leaves started_at/finished_at as None.
+    app.tasks = vec![geom_task("pending")];
+
+    let text = render_text(&mut app, 200, 24);
+    // Activity/token/cost plus the two new cells all fall back to the placeholder.
+    assert!(
+        text.matches('—').count() >= 5,
+        "placeholder cells missing: {text:?}"
+    );
+}
+
+#[test]
+fn tasks_table_running_and_finished_rows_show_lifecycle() {
+    use chrono::Duration;
+
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+
+    let start = Utc::now() - Duration::minutes(2);
+    let mut running = geom_task("running");
+    running.status = TaskStatus::Running;
+    running.started_at = Some(start);
+    // finished_at stays None: the cell shows the live elapsed time.
+
+    let mut finished = geom_task("finished");
+    finished.status = TaskStatus::Succeeded;
+    finished.started_at = Some(start);
+    finished.finished_at = Some(start + Duration::seconds(12));
+
+    app.tasks = vec![running, finished];
+    let text = render_text(&mut app, 200, 24);
+    assert!(text.contains("2m"), "live duration missing: {text:?}");
+    assert!(text.contains("12s"), "finished duration missing: {text:?}");
+}
+
+#[test]
 fn truncate_ellipsis_shortens_with_marker() {
     assert_eq!(truncate_ellipsis("short", 28), "short");
     let long = "a".repeat(40);

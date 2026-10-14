@@ -84,7 +84,7 @@ Return to the **Tasks** tab to see the run's status and its agent session title.
 
 ![favetto TUI — Tasks tab](/screenshots/tui-tasks.png)
 
-*The Tasks tab lists recent runs with status, age, and session title.*
+*The Tasks tab lists recent runs with status, started time, duration, and session title.*
 
 Switch to the **Events** tab to see the persisted event stream. Select a row to
 pretty-print its JSON payload in the side panel.

@@ -10,7 +10,7 @@ focus and mouse handling see [Embedded agents](./agents).
 
 ![favetto TUI — Tasks tab](/screenshots/tui-tasks.png)
 
-*The Tasks tab: recent runs with status, age, and session title.*
+*The Tasks tab: recent runs with status, started time, duration, and session title.*
 
 An opencode run writes its session title a few seconds after its first turn. As
 soon as the agent reports its session id **during** the run, the daemon resolves
