@@ -1,11 +1,14 @@
 //! Catalog list and detail views (`/catalog`, `/catalog/:..name`).
 
 use dioxus::prelude::*;
+use favetto_wire::model::Task;
 use favetto_wire::rpc::{CatalogEntry, CatalogGetParams, EmptyParams};
 
 use crate::app::Route;
 use crate::client::RpcClient;
 use crate::components::markdown::{split_frontmatter, Markdown};
+use crate::components::start_task::StartTaskDialog;
+use crate::components::toast::{Toast, ToastKind};
 use crate::state::AppState;
 
 /// A one-line summary derived from the task prompt (the wire `CatalogEntry`
@@ -69,6 +72,9 @@ pub fn matches_query(entry: &CatalogEntry, query: &str) -> bool {
 pub fn Catalog() -> Element {
     let state = use_context::<AppState>();
     let mut query = use_signal(String::new);
+    // The catalog entry whose run dialog is open, plus the last start outcome.
+    let mut start_for = use_signal(|| None::<CatalogEntry>);
+    let mut toast = use_signal(|| Option::<(ToastKind, String)>::None);
 
     // Reading `catalog_version` inside the resource future makes Dioxus re-run
     // the fetch whenever a `catalog.updated` push bumps it (0.7 tracks signal
@@ -129,7 +135,34 @@ pub fn Catalog() -> Element {
                                 }
                             }
                         }
+                        button {
+                            class: "btn catalog-run",
+                            aria_label: "Run {entry.name}",
+                            onclick: {
+                                let entry = entry.clone();
+                                move |_| start_for.set(Some(entry.clone()))
+                            },
+                            "Run"
+                        }
                     }
+                }
+            }
+            if let Some(entry) = start_for() {
+                StartTaskDialog {
+                    name: entry.name.clone(),
+                    vars: entry.vars.clone(),
+                    on_close: move |_| start_for.set(None),
+                    on_started: move |_task: Task| {
+                        start_for.set(None);
+                        toast.set(Some((ToastKind::Success, "Task started.".to_string())));
+                    },
+                }
+            }
+            if let Some((kind, message)) = toast() {
+                Toast {
+                    kind,
+                    message,
+                    on_dismiss: move |_| toast.set(None),
                 }
             }
         }
@@ -235,5 +268,14 @@ mod tests {
         let e = entry();
         assert!(matches_query(&e, ""));
         assert!(matches_query(&e, "   "));
+    }
+
+    #[test]
+    fn catalog_list_mounts_with_state() {
+        let mut dom = VirtualDom::new(|| {
+            use_context_provider(AppState::new);
+            rsx! { Catalog {} }
+        });
+        dom.rebuild_in_place();
     }
 }

@@ -8,16 +8,15 @@
 
 use dioxus::prelude::*;
 use favetto_wire::model::{FailureKind, RunStatus, Task, TaskRun, TaskStatus};
-use favetto_wire::rpc::{
-    EmptyParams, TaskIdParams, TasksEventsParams, TasksListParams, TasksStartParams,
-};
+use favetto_wire::rpc::{TaskIdParams, TasksEventsParams, TasksListParams};
 use uuid::Uuid;
 
 use crate::app::Route;
 use crate::client::RpcClient;
 use crate::components::agent_feed::{summary_feed, AgentFeed, AgentLog};
-use crate::components::dialog::{ConfirmDialog, Dialog};
+use crate::components::dialog::ConfirmDialog;
 use crate::components::output_viewer::{extract_output_text, extract_run_summary, OutputViewer};
+use crate::components::start_task::StartTaskDialog;
 use crate::components::toast::{Toast, ToastKind};
 use crate::state::{repo_label, task_repo, AppState, TaskFeed};
 
@@ -170,18 +169,6 @@ pub fn is_terminal(status: TaskStatus) -> bool {
         status,
         TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled
     )
-}
-
-/// Parse the start dialog's `input` textarea. Empty/whitespace means "no input";
-/// anything else must be valid JSON.
-pub fn parse_task_input(raw: &str) -> Result<Option<serde_json::Value>, String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    serde_json::from_str(trimmed)
-        .map(Some)
-        .map_err(|err| format!("input must be valid JSON: {err}"))
 }
 
 /// A destructive task action awaiting explicit confirmation.
@@ -352,6 +339,8 @@ pub fn TasksList() -> Element {
             }
             if show_start() {
                 StartTaskDialog {
+                    name: String::new(),
+                    vars: Vec::new(),
                     on_close: move |_| show_start.set(false),
                     on_started: move |_task: Task| {
                         show_start.set(false);
@@ -364,122 +353,6 @@ pub fn TasksList() -> Element {
                     kind,
                     message,
                     on_dismiss: move |_| toast.set(None),
-                }
-            }
-        }
-    }
-}
-
-/// The `tasks.start` dialog: a catalog-name autocomplete plus optional JSON
-/// input. Submitting calls `tasks.start` and reports the new task.
-#[component]
-fn StartTaskDialog(on_close: EventHandler<()>, on_started: EventHandler<Task>) -> Element {
-    let state = use_context::<AppState>();
-    let mut name = use_signal(String::new);
-    let mut input = use_signal(String::new);
-    let mut error = use_signal(|| None::<String>);
-    let mut submitting = use_signal(|| false);
-
-    // Catalog names power the `<datalist>` autocomplete. A failure here is not
-    // fatal: the user can still type any task name. Repo-local names are
-    // returned already qualified (`repo:<name>/<path>`), so starting one runs it
-    // in the repo's cwd; the list stays unscoped so global tasks remain startable
-    // while a repo is active.
-    let catalog = use_resource(move || {
-        let base = (state.daemon_url)();
-        let token = (state.token)();
-        async move {
-            RpcClient::new(base)
-                .with_token(token)
-                .catalog_list(EmptyParams {})
-                .await
-                .map(|entries| {
-                    entries
-                        .into_iter()
-                        .map(|entry| entry.name)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
-        }
-    });
-    let names = catalog().unwrap_or_default();
-
-    let submit = move |_| {
-        let trimmed = name().trim().to_string();
-        if trimmed.is_empty() {
-            error.set(Some("task name is required".to_string()));
-            return;
-        }
-        let parsed = match parse_task_input(&input()) {
-            Ok(value) => value,
-            Err(err) => {
-                error.set(Some(err));
-                return;
-            }
-        };
-        error.set(None);
-        submitting.set(true);
-        spawn(async move {
-            let client = RpcClient::new((state.daemon_url)()).with_token((state.token)());
-            let params = TasksStartParams {
-                name: trimmed,
-                input: parsed,
-                interactive: None,
-            };
-            match client.tasks_start(params).await {
-                Ok(task) => {
-                    submitting.set(false);
-                    on_started.call(task);
-                }
-                Err(err) => {
-                    submitting.set(false);
-                    error.set(Some(err.to_string()));
-                }
-            }
-        });
-    };
-
-    rsx! {
-        Dialog { title: "Start task".to_string(), on_close,
-            label { class: "field",
-                span { class: "field-label", "Task name" }
-                input {
-                    class: "input",
-                    list: "favetto-catalog-names",
-                    value: "{name}",
-                    placeholder: "e.g. implement_issue",
-                    oninput: move |event| name.set(event.value()),
-                }
-            }
-            datalist { id: "favetto-catalog-names",
-                for task_name in names {
-                    option { key: "{task_name}", value: "{task_name}" }
-                }
-            }
-            label { class: "field",
-                span { class: "field-label", "Input (JSON, optional)" }
-                textarea {
-                    class: "input",
-                    value: "{input}",
-                    placeholder: "Optional JSON input",
-                    oninput: move |event| input.set(event.value()),
-                }
-            }
-            if let Some(err) = error() {
-                p { class: "dialog-error", role: "alert", "{err}" }
-            }
-            div { class: "dialog-actions",
-                button {
-                    class: "btn",
-                    disabled: submitting(),
-                    onclick: move |_| on_close.call(()),
-                    "Cancel"
-                }
-                button {
-                    class: "btn primary",
-                    disabled: submitting(),
-                    onclick: submit,
-                    "Start"
                 }
             }
         }
@@ -850,17 +723,6 @@ mod tests {
         assert!(!is_terminal(TaskStatus::Pending));
         assert!(!is_terminal(TaskStatus::Running));
         assert!(!is_terminal(TaskStatus::AwaitingInput));
-    }
-
-    #[test]
-    fn parse_task_input_accepts_empty_and_rejects_invalid() {
-        assert_eq!(parse_task_input(""), Ok(None));
-        assert_eq!(parse_task_input("   "), Ok(None));
-        assert_eq!(
-            parse_task_input(r#"{"issue_id":247}"#),
-            Ok(Some(serde_json::json!({ "issue_id": 247 })))
-        );
-        assert!(parse_task_input("not json").is_err());
     }
 
     #[test]
