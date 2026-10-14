@@ -1,0 +1,6 @@
+//! Route components.
+//!
+//! `Pair` owns onboarding; the authenticated views (Inbox, Tasks, Catalog,
+//! Settings) land in follow-up issues (#244, #249, …).
+
+pub mod pair;

@@ -164,6 +164,9 @@ pub enum SseStatus {
     Connected,
     /// The stream dropped; the reader will retry after `delay_ms`.
     Reconnecting { attempt: u32, delay_ms: u64 },
+    /// The daemon answered 401: the token is missing or has been rotated. The
+    /// reader stops retrying so the UI can send the user back to `/pair`.
+    Unauthorized,
 }
 
 /// Errors from a single streaming-fetch attempt.
@@ -277,10 +280,14 @@ pub async fn run<E, S>(
                     // Treat a body-less 2xx like a disconnect and retry.
                 }
             },
+            Err(SseError::Http(401)) => {
+                // A rotated or revoked token: retrying forever would spin. Stop
+                // and let the UI clear the token and return to `/pair`.
+                on_status(SseStatus::Unauthorized);
+                return;
+            }
             Err(_) => {
-                // Network/HTTP errors are transient; back off and retry. A 401
-                // will keep failing until the token is fixed, which is visible
-                // as a permanently reconnecting banner.
+                // Network/HTTP errors are transient; back off and retry.
             }
         }
 

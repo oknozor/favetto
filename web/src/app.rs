@@ -7,7 +7,9 @@
 
 use dioxus::prelude::*;
 
-use crate::state::{AppState, ConnectionState};
+use crate::config;
+use crate::state::{onboarding_step, AppState, ConnectionState, OnboardingStep};
+use crate::views::pair::Pair;
 
 /// Deep-linkable client routes.
 ///
@@ -19,21 +21,51 @@ pub enum Route {
     /// The default view; the Inbox replaces this in a follow-up issue.
     #[route("/")]
     Home {},
+    /// Onboarding: configure the daemon (Android) and exchange a pairing code.
+    #[route("/pair")]
+    Pair {},
 }
 
 /// The application root: stylesheet, layout shell, and router outlet.
 #[component]
 pub fn App() -> Element {
-    let state = use_context_provider(AppState::new);
-    // `use_future` runs exactly once, on mount. An effect would re-run whenever
-    // a signal it read changed, opening a duplicate SSE stream on every cache
-    // update, so the transport is started from a one-shot future instead.
-    use_future(move || async move { connect(state).await });
+    let mut state = use_context_provider(AppState::new);
+
+    // Capture `?pair=CODE` once, before `Home`'s guard navigates to `/pair` and
+    // drops the query string. The pairing form consumes it.
+    use_effect(move || {
+        if (state.pending_pair_code)().is_none() {
+            if let Some(code) = crate::views::pair::pair_code_from_url() {
+                state.pending_pair_code.set(Some(code));
+            }
+        }
+    });
+
+    let base = (state.daemon_url)();
+    let token = (state.token)();
+
     rsx! {
         document::Link { rel: "stylesheet", href: asset!("/assets/style.css") }
         ConnectionBanner {}
+        // No token means no transport, so nothing 401-loops before pairing.
+        // Remounting on a credential change restarts the connection.
+        if let Some(token) = token {
+            Transport { key: "{token}|{base}", base, token }
+        }
         Router::<Route> {}
     }
+}
+
+/// Starts the RPC/SSE transport. Keyed by the credentials in [`App`] so a fresh
+/// pairing (or a daemon-URL change) tears down the old stream and reconnects.
+#[component]
+fn Transport(base: String, token: String) -> Element {
+    let state = use_context::<AppState>();
+    use_future(move || {
+        let (base, token) = (base.clone(), Some(token.clone()));
+        async move { connect(state, base, token).await }
+    });
+    rsx! {}
 }
 
 /// A banner shown whenever the client is not connected, or is not paired yet.
@@ -47,36 +79,48 @@ fn ConnectionBanner() -> Element {
             }
         };
     }
-    match (state.connection)() {
-        ConnectionState::Connected => rsx! {},
-        ConnectionState::Reconnecting => rsx! {
-            div { class: "connection-banner reconnecting", role: "status",
-                "Reconnecting to the daemon…"
+    rsx! {
+        match (state.connection)() {
+            ConnectionState::Connected => rsx! {
+                div { class: "connection-banner connected", role: "status", "Connected." }
+            },
+            ConnectionState::Reconnecting => rsx! {
+                div { class: "connection-banner reconnecting", role: "status",
+                    "Reconnecting to the daemon…"
+                }
+            },
+            ConnectionState::Disconnected => rsx! {
+                div { class: "connection-banner disconnected", role: "status",
+                    "Disconnected — check the token and daemon URL."
+                }
+            },
+        }
+        div { class: "connection-actions",
+            button {
+                class: "forget-button",
+                onclick: move |_| {
+                    let mut state = state;
+                    state.forget();
+                },
+                "Forget daemon"
             }
-        },
-        ConnectionState::Disconnected => rsx! {
-            div { class: "connection-banner disconnected", role: "status",
-                "Disconnected — check the token and daemon URL."
-            }
-        },
+        }
     }
 }
 
 /// Connect the transport. A no-op on the host (there is no `fetch`), so the
 /// component can still mount in host unit tests.
 #[cfg(not(target_arch = "wasm32"))]
-async fn connect(_state: AppState) {}
+async fn connect(_state: AppState, _base: String, _token: Option<String>) {}
 
 /// On web: ping once to establish the connection, then stream `/events` forever,
 /// feeding pushes into the cache and connection state.
 #[cfg(target_arch = "wasm32")]
-async fn connect(state: AppState) {
+async fn connect(state: AppState, base: String, token: Option<String>) {
     use crate::config;
     use crate::sse::{self, SseStatus};
 
-    let base = (state.daemon_url)();
     let url = config::events_url_for(&base);
-    let token = (state.token)();
     let cursor = (state.cache)().cursor;
 
     // The ping runs alongside the stream so the banner flips to connected as
@@ -90,10 +134,17 @@ async fn connect(state: AppState) {
         move |event| apply_event(state, event),
         move |status| {
             let mut state = state;
-            state.connection.set(match status {
+            let next = match status {
                 SseStatus::Connected => ConnectionState::Connected,
                 SseStatus::Reconnecting { .. } => ConnectionState::Reconnecting,
-            });
+                SseStatus::Unauthorized => {
+                    // A rotated/revoked token: forget it; the guard sends us
+                    // back to `/pair`.
+                    state.clear_token();
+                    ConnectionState::Disconnected
+                }
+            };
+            state.connection.set(next);
         },
     )
     .await;
@@ -102,16 +153,21 @@ async fn connect(state: AppState) {
 /// One `system.ping` to set the initial connection state.
 #[cfg(target_arch = "wasm32")]
 async fn ping_once(mut state: AppState, base: String, token: Option<String>) {
-    use crate::client::RpcClient;
+    use crate::client::{ClientError, RpcClient};
     use favetto_wire::rpc::PingParams;
 
-    if token.is_none() {
+    let Some(token) = token else {
         state.connection.set(ConnectionState::Disconnected);
         return;
-    }
-    let client = RpcClient::new(base).with_token(token);
+    };
+    let client = RpcClient::new(base).with_token(Some(token));
     let connection = match client.ping(PingParams {}).await {
         Ok(_) => ConnectionState::Connected,
+        Err(ClientError::Unauthorized) => {
+            // Rotated/revoked token: drop it; the guard sends us to `/pair`.
+            state.clear_token();
+            ConnectionState::Disconnected
+        }
         Err(_) => ConnectionState::Disconnected,
     };
     state.connection.set(connection);
@@ -133,9 +189,23 @@ fn apply_event(mut state: AppState, event: crate::sse::SseEvent) {
 }
 
 /// Placeholder home view, replaced by the Inbox at phase 3.2.
+///
+/// Guards the authenticated area: until the client is [`OnboardingStep::Ready`]
+/// it redirects to `/pair` (daemon-URL step on Android, pairing step otherwise).
 #[component]
 fn Home() -> Element {
     let state = use_context::<AppState>();
+    let nav = use_navigator();
+    use_effect(move || {
+        let step = onboarding_step(
+            config::daemon_url_required(),
+            &(state.daemon_url)(),
+            (state.token)().as_deref(),
+        );
+        if step != OnboardingStep::Ready {
+            nav.replace(Route::Pair {});
+        }
+    });
     rsx! {
         main { id: "favetto-app",
             h1 { "favetto" }
@@ -169,5 +239,12 @@ mod tests {
             favetto_wire::model::TaskStatus::Running,
             favetto_wire::model::TaskStatus::Running
         );
+    }
+
+    /// `/pair` is the onboarding route both targets deep-link to.
+    #[test]
+    fn pair_route_round_trips() {
+        assert_eq!(Route::Pair {}.to_string(), "/pair");
+        assert_eq!("/pair".parse::<Route>().unwrap(), Route::Pair {});
     }
 }

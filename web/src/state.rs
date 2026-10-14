@@ -55,6 +55,39 @@ impl ConnectionState {
     }
 }
 
+/// Which onboarding surface applies to the current credentials.
+///
+/// Derived purely from `(platform, daemon_url, token)` so the routing guard is
+/// host-testable (see [`onboarding_step`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardingStep {
+    /// Android only: no daemon URL has been configured yet.
+    DaemonUrl,
+    /// A daemon URL is set (or the platform is same-origin web) but there is no
+    /// bearer token yet.
+    Pairing,
+    /// Paired: the authenticated views can load.
+    Ready,
+}
+
+/// The pure onboarding decision behind the route guards.
+///
+/// `require_daemon_url` is [`crate::config::daemon_url_required`]; it is passed
+/// in (rather than read here) to keep the function testable and platform-free.
+pub fn onboarding_step(
+    require_daemon_url: bool,
+    daemon_url: &str,
+    token: Option<&str>,
+) -> OnboardingStep {
+    if require_daemon_url && daemon_url.trim().is_empty() {
+        OnboardingStep::DaemonUrl
+    } else if token.is_none_or(|t| t.trim().is_empty()) {
+        OnboardingStep::Pairing
+    } else {
+        OnboardingStep::Ready
+    }
+}
+
 /// The task/event/catalog collections, keyed and capped so pushes stay cheap.
 #[derive(Debug, Default, Clone)]
 pub struct Cache {
@@ -130,6 +163,9 @@ pub struct AppState {
     pub token: Signal<Option<String>>,
     /// Daemon base URL, mirrored into `localStorage`.
     pub daemon_url: Signal<String>,
+    /// A `?pair=CODE` deep-link code captured before routing drops the query.
+    /// Consumed once by the pairing form, then cleared.
+    pub pending_pair_code: Signal<Option<String>>,
     /// Task/event/catalog caches plus the resume cursor.
     pub cache: Signal<Cache>,
 }
@@ -146,6 +182,7 @@ impl AppState {
             connection: Signal::new(ConnectionState::Disconnected),
             token: Signal::new(load_token()),
             daemon_url: Signal::new(load_daemon_url()),
+            pending_pair_code: Signal::new(None),
             cache: Signal::new(cache),
         }
     }
@@ -160,6 +197,28 @@ impl AppState {
     pub fn set_daemon_url(&mut self, url: &str) {
         save_daemon_url(url);
         self.daemon_url.set(url.to_string());
+    }
+
+    /// Clear the bearer token (locally and in `localStorage`).
+    pub fn clear_token(&mut self) {
+        self.set_token(None);
+    }
+
+    /// Clear the daemon URL (locally and in `localStorage`).
+    pub fn clear_daemon_url(&mut self) {
+        self.set_daemon_url("");
+    }
+
+    /// Disconnect: forget both the token and the daemon URL. The route guard
+    /// then sends the user back to `/pair`.
+    pub fn forget(&mut self) {
+        self.clear_token();
+        self.clear_daemon_url();
+    }
+
+    /// Whether a bearer token is currently held.
+    pub fn has_token(&self) -> bool {
+        (self.token)().is_some()
     }
 
     /// Record the highest durable event id and persist it for the next resume.
@@ -319,5 +378,48 @@ mod tests {
         save_token(Some(""));
         save_token(Some("secret"));
         assert_eq!(load_string(TOKEN_KEY), None);
+    }
+
+    #[test]
+    fn onboarding_step_web_never_asks_for_a_url() {
+        assert_eq!(onboarding_step(false, "", None), OnboardingStep::Pairing);
+        assert_eq!(
+            onboarding_step(false, "", Some("tok")),
+            OnboardingStep::Ready
+        );
+        // A URL is irrelevant on web.
+        assert_eq!(
+            onboarding_step(false, "http://host:7878", None),
+            OnboardingStep::Pairing
+        );
+    }
+
+    #[test]
+    fn onboarding_step_android_requires_a_url_first() {
+        assert_eq!(onboarding_step(true, "", None), OnboardingStep::DaemonUrl);
+        assert_eq!(
+            onboarding_step(true, "   ", Some("tok")),
+            OnboardingStep::DaemonUrl
+        );
+        assert_eq!(
+            onboarding_step(true, "http://host:7878", None),
+            OnboardingStep::Pairing
+        );
+        assert_eq!(
+            onboarding_step(true, "http://host:7878", Some("tok")),
+            OnboardingStep::Ready
+        );
+    }
+
+    #[test]
+    fn onboarding_step_treats_blank_tokens_as_absent() {
+        assert_eq!(
+            onboarding_step(false, "", Some("  ")),
+            OnboardingStep::Pairing
+        );
+        assert_eq!(
+            onboarding_step(false, "", Some("")),
+            OnboardingStep::Pairing
+        );
     }
 }
