@@ -110,3 +110,245 @@ body {
   color: #1b5e20;
   font-size: 0.9rem;
 }
+
+/* ------------------------------------------------------------------ */
+/* Tasks view                                                          */
+/* ------------------------------------------------------------------ */
+
+.tasks-view h1,
+.task-detail h1 {
+  font-size: 1.4rem;
+}
+
+.tasks-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0.75rem 0 1rem;
+}
+
+.filter-chip {
+  border: 1px solid #b8b8b8;
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  padding: 0.25rem 0.75rem;
+  font: inherit;
+  cursor: pointer;
+}
+
+.filter-chip.active {
+  background: #2a6df4;
+  border-color: #2a6df4;
+  color: #fff;
+}
+
+.task-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.task-row-link {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid #d4d4d4;
+  border-radius: 0.4rem;
+  color: inherit;
+  text-decoration: none;
+}
+
+.task-row-link:hover {
+  background: rgba(42, 109, 244, 0.08);
+}
+
+.task-row-main {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  min-width: 0;
+}
+
+.task-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-row-meta {
+  display: flex;
+  gap: 0.75rem;
+  color: #666;
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+.status-badge {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: lowercase;
+  background: #e3e3e3;
+  color: #333;
+}
+
+.status-badge.status-running {
+  background: #cfe3ff;
+  color: #14509e;
+}
+
+.status-badge.status-awaiting_input {
+  background: #ffe9b8;
+  color: #7a5200;
+}
+
+.status-badge.status-succeeded {
+  background: #cdeccd;
+  color: #1c5c1c;
+}
+
+.status-badge.status-failed,
+.status-badge.status-timed_out {
+  background: #f7d2ce;
+  color: #8f1d12;
+}
+
+.status-badge.status-cancelled,
+.status-badge.status-interrupted {
+  background: #e0d8ee;
+  color: #4a3a66;
+}
+
+.task-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.back-link {
+  color: #2a6df4;
+  text-decoration: none;
+  font-size: 0.9rem;
+}
+
+.task-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.75rem;
+}
+
+.task-timestamps,
+.failure-panel dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.15rem 0.75rem;
+  margin: 0.5rem 0 0;
+  font-size: 0.85rem;
+}
+
+.task-timestamps dt,
+.failure-panel dt {
+  color: #666;
+}
+
+.task-timestamps dd,
+.failure-panel dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.failure-panel {
+  border: 1px solid #e0a29a;
+  border-radius: 0.4rem;
+  padding: 0.75rem 1rem;
+  background: rgba(179, 38, 30, 0.06);
+}
+
+.failure-panel h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.run-history-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.run-history-table th,
+.run-history-table td {
+  text-align: left;
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid #ddd;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.output-viewer {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.5rem;
+}
+
+.output-pane {
+  width: 100%;
+  max-height: 24rem;
+  overflow: auto;
+  margin: 0;
+  padding: 0.75rem;
+  border: 1px solid #d4d4d4;
+  border-radius: 0.4rem;
+  background: #111418;
+  color: #e6e6e6;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.output-toggle {
+  border: 1px solid #b8b8b8;
+  border-radius: 0.3rem;
+  background: transparent;
+  color: inherit;
+  padding: 0.25rem 0.75rem;
+  font: inherit;
+  cursor: pointer;
+}
+
+.error-panel {
+  border: 1px solid #e0a29a;
+  border-radius: 0.4rem;
+  padding: 0.75rem 1rem;
+  background: rgba(179, 38, 30, 0.08);
+}
+
+.empty-state,
+.loading {
+  color: #666;
+}
+
+/* On narrow screens the detail route is a pushed, full-width page. */
+@media (max-width: 768px) {
+  .task-row-meta {
+    flex-direction: column;
+    gap: 0.1rem;
+    align-items: flex-end;
+  }
+
+  .task-detail {
+    min-height: 100vh;
+  }
+}
