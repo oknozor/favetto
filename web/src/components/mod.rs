@@ -2,3 +2,4 @@
 
 pub mod markdown;
 pub mod output_viewer;
+pub mod workflow_node;

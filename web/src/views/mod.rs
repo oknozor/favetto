@@ -6,3 +6,4 @@
 pub mod catalog;
 pub mod pair;
 pub mod tasks;
+pub mod workflow;

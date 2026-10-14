@@ -6,12 +6,14 @@
 //! plug into.
 
 use dioxus::prelude::*;
+use uuid::Uuid;
 
 use crate::config;
 use crate::state::{onboarding_step, AppState, ConnectionState, OnboardingStep};
 use crate::views::catalog::{Catalog, CatalogDetail};
 use crate::views::pair::Pair;
 use crate::views::tasks::{TaskDetail, TasksList};
+use crate::views::workflow::{WorkflowDetail, WorkflowList};
 
 /// Deep-linkable client routes.
 ///
@@ -38,6 +40,12 @@ pub enum Route {
     /// One catalog definition, rendered as Markdown.
     #[route("/catalog/:name")]
     CatalogDetail { name: String },
+    /// The runtime workflow board plus the catalog graph.
+    #[route("/workflow")]
+    WorkflowList {},
+    /// The `workflow.inspect` tree for one workflow root.
+    #[route("/workflow/:root_id")]
+    WorkflowDetail { root_id: Uuid },
 }
 
 /// The application root: stylesheet, layout shell, and router outlet.
@@ -230,7 +238,10 @@ fn Home() -> Element {
             if (state.connection)().is_connected() {
                 p { "Connection: connected." }
             }
-            Link { to: Route::TasksList {}, "Tasks" }
+            nav { class: "home-nav",
+                Link { to: Route::TasksList {}, "Tasks" }
+                Link { to: Route::WorkflowList {}, "Workflows" }
+            }
         }
     }
 }
