@@ -87,6 +87,7 @@ The published site is the manual:
 | [Event kinds](https://oknozor.github.io/favetto/reference/events) | Every event on the bus, generated from the enum. |
 | [Remote API](https://oknozor.github.io/favetto/reference/remote-api) | Methods, pushes, and error codes, generated from the RPC constants. |
 | [Architecture](https://oknozor.github.io/favetto/reference/architecture) | Design and milestones. |
+| [Web & Android client](https://oknozor.github.io/favetto/guide/web-client) | Using, developing, and packaging the Dioxus web/Android client. |
 
 The [annotated `config.example.toml`](config.example.toml) is the canonical
 starting configuration.
@@ -100,6 +101,7 @@ crates/
   favetto-tui/           dependency-light terminal client binary
   favetto-mcp/           MCP supervisor server (stdio)
   favetto/               daemon binary + doc generator
+web/                     Dioxus client (web SPA + Android app), standalone workspace
 tasks/                   task catalog: `*.md` files with TOML header + prompt
 skills/                  portable agent skills (e.g. favetto-task-authoring)
 docs/                    VitePress site (guide + generated reference)

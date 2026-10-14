@@ -10,6 +10,22 @@ title = "favetto"
 reload_html = true
 watch_path = ["src", "assets"]
 
+# `dx serve` runs the SPA on its own origin (default port 8080) and the web
+# build calls the daemon with same-origin relative URLs (`/rpc`, `/events`,
+# `/pair/exchange`). Forward those paths to the daemon so the dev server acts
+# as its origin; without this, POST /pair/exchange hits the dev server and
+# returns HTTP 405. Dioxus proxies by path prefix and does not rewrite paths,
+# so each daemon route needs its own entry. Change the host to match your
+# daemon (127.0.0.1:7878 when it runs on the same machine).
+[[web.proxy]]
+backend = "http://192.168.1.50:7878/rpc"
+
+[[web.proxy]]
+backend = "http://192.168.1.50:7878/events"
+
+[[web.proxy]]
+backend = "http://192.168.1.50:7878/pair"
+
 [bundle]
 identifier = "dev.favetto.app"
 publisher = "favetto"
