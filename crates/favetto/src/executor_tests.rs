@@ -249,7 +249,9 @@ fn failed_run_preserves_session_info() {
         Some(FailureKind::Agent)
     );
     assert!(!task.failure.as_ref().unwrap().retryable);
-    assert!(task.output.is_none());
+    // A failed run keeps its (structured) output so the web can still render
+    // the post-run agent log.
+    assert_eq!(task.output, Some(serde_json::json!({})));
 }
 
 #[test]

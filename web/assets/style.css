@@ -1680,6 +1680,32 @@ textarea.input {
   color: var(--fg);
 }
 
+/* Post-run agent log ----------------------------------------------------- */
+
+.task-output-summary {
+  margin: 0.75rem 0 0;
+  padding: 0.5rem 0.75rem;
+  border-left: 3px solid var(--border);
+  color: var(--muted);
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.task-output-raw {
+  margin-top: 0.75rem;
+}
+
+.task-output-raw > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.task-output-raw .output-viewer {
+  margin-top: 0.5rem;
+}
+
 /* Event feed ------------------------------------------------------------- */
 
 .event-feed {

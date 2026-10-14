@@ -339,6 +339,13 @@ threads by default).
 | **Schedules** | `schedules.list/upsert/delete` | cron management |
 | **Notifications / Settings** | `notifications.list/test`, `hooks.upsert` | channel test, hook management, pairing/session info |
 
+The Task detail **Output** section renders the durable `RunSummary` persisted in
+`task.output.result` as the same human-readable agent log (messages, reasoning,
+tool cards, usage, errors, run boundary) once a run has finished, so it survives
+a reload or daemon restart — the ephemeral live feed does not. Agents with no
+structured summary keep the plain-text `OutputViewer`; the raw output and the
+envelope summary remain reachable from the log.
+
 Markdown rendering uses a WASM-friendly Rust parser; the DAG view (SVG emitted
 directly by Dioxus) is Phase 5.
 

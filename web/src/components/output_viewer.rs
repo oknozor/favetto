@@ -6,6 +6,7 @@
 //! renders it in a bounded, scrollable `<pre>` pane with a "Show more" toggle.
 
 use dioxus::prelude::*;
+use favetto_wire::model::RunSummary;
 
 /// Number of lines shown before the "Show more" expander is offered.
 pub const COLLAPSED_LINES: usize = 200;
@@ -30,6 +31,35 @@ pub fn extract_output_text(value: &serde_json::Value) -> (String, bool) {
             _ => (pretty(value), false),
         },
         _ => (pretty(value), false),
+    }
+}
+
+/// Extract the structured [`RunSummary`] an agent persisted inside a task
+/// output value, when it carries renderable content.
+///
+/// The executor stores the serialized summary under `result`; a run that
+/// reported nothing stores `null`, and an oversized result is reduced to a
+/// `{ preview, truncated }` stub. Both decode to an empty summary and yield
+/// `None`, so the caller keeps the plain-text viewer.
+pub fn extract_run_summary(value: &serde_json::Value) -> Option<RunSummary> {
+    let candidate = value
+        .get("result")
+        .filter(|result| !result.is_null())
+        .unwrap_or(value);
+    let summary: RunSummary = serde_json::from_value(candidate.clone()).ok()?;
+    (!summary.is_empty()).then_some(summary)
+}
+
+/// Render a JSON value for a tool card: a string is shown verbatim (ANSI
+/// stripped), an empty/null value renders to nothing, scalars use their plain
+/// form, and only a genuinely nested object/array is pretty-printed.
+pub fn readable_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(text) => strip_ansi(text),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        _ => pretty(value),
     }
 }
 
@@ -165,6 +195,71 @@ mod tests {
 
         let (text, _) = extract_output_text(&serde_json::json!({ "status": "ok" }));
         assert!(text.contains("\"status\""), "pretty JSON: {text}");
+    }
+
+    #[test]
+    fn extracts_a_structured_run_summary_from_the_envelope() {
+        let value = serde_json::json!({
+            "agent": "opencode",
+            "output": "raw jsonl",
+            "result": {
+                "session_id": "ses_1",
+                "title": "Fix it",
+                "text": "done",
+                "reasoning": "because",
+                "tool_calls": [{ "id": "c1", "name": "read", "ok": true }],
+                "usage": { "input_tokens": 3 },
+                "outcome": "succeeded",
+            },
+        });
+        let summary = extract_run_summary(&value).expect("structured summary");
+        assert_eq!(summary.text, "done");
+        assert_eq!(summary.tool_calls.len(), 1);
+        assert_eq!(
+            summary.outcome,
+            Some(favetto_wire::model::IdleOutcome::Succeeded)
+        );
+
+        // A bare (unwrapped) summary is accepted too.
+        let bare = serde_json::json!({ "text": "hello" });
+        assert_eq!(
+            extract_run_summary(&bare).map(|s| s.text),
+            Some("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_or_stub_results_do_not_yield_a_summary() {
+        // `result: null` (an unstructured run) keeps the plain viewer.
+        assert!(extract_run_summary(&serde_json::json!({
+            "output": "raw",
+            "result": serde_json::Value::Null,
+        }))
+        .is_none());
+        // An oversized result is reduced to a stub, which decodes empty.
+        assert!(extract_run_summary(&serde_json::json!({
+            "result": { "preview": "…", "truncated": true },
+        }))
+        .is_none());
+        // A title-only summary has nothing to log.
+        assert!(extract_run_summary(&serde_json::json!({
+            "result": { "title": "Fix it" },
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn readable_value_unwraps_strings_and_pretty_prints_objects() {
+        assert_eq!(readable_value(&serde_json::json!("plain")), "plain");
+        assert_eq!(readable_value(&serde_json::json!(42)), "42");
+        assert_eq!(readable_value(&serde_json::json!(true)), "true");
+        assert_eq!(readable_value(&serde_json::Value::Null), "");
+        assert_eq!(
+            readable_value(&serde_json::json!("\u{1b}[31mred\u{1b}[0m")),
+            "red"
+        );
+        let nested = readable_value(&serde_json::json!({ "a": 1 }));
+        assert!(nested.contains("\"a\""), "nested object: {nested}");
     }
 
     #[test]

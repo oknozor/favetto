@@ -11,10 +11,12 @@
 use std::collections::{HashMap, HashSet};
 
 use dioxus::prelude::*;
-use favetto_wire::model::{AgentStateEvent, AgentUsage, IdleOutcome, InputRequest, MessageRole};
+use favetto_wire::model::{
+    AgentStateEvent, AgentUsage, IdleOutcome, InputRequest, MessageRole, RunSummary,
+};
 use favetto_wire::rpc::AgentEventPush;
 
-use crate::components::output_viewer::{pretty, strip_ansi, truncate_lines};
+use crate::components::output_viewer::{readable_value, strip_ansi, truncate_lines};
 use crate::components::toast::ToastKind;
 use crate::state::AppState;
 use crate::views::inbox::{submit_reply, AwaitingCard, ReplyIntent, SCREEN_DETECTED_REPLY};
@@ -242,6 +244,62 @@ pub fn build_feed(events: &[AgentEventPush]) -> Vec<FeedItem> {
         .collect()
 }
 
+/// Map a persisted [`RunSummary`] onto the feed view-model, so a finished run's
+/// output renders as a human-readable log after a reload (or daemon restart)
+/// when the ephemeral live feed is gone.
+///
+/// The summary folds events together, so the finer ordering is lost; this emits
+/// a canonical order — session, message, reasoning, tool cards, usage, error,
+/// boundary — matching how a coding-agent TUI reads top to bottom.
+pub fn summary_feed(summary: &RunSummary) -> Vec<FeedItem> {
+    let mut items = Vec::new();
+    if let Some(title) = summary
+        .title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+    {
+        items.push(FeedItem::Session {
+            title: Some(title.to_string()),
+        });
+    }
+    if !summary.text.trim().is_empty() {
+        items.push(FeedItem::Message {
+            role: MessageRole::Assistant,
+            text: summary.text.clone(),
+        });
+    }
+    if !summary.reasoning.trim().is_empty() {
+        items.push(FeedItem::Reasoning {
+            text: summary.reasoning.clone(),
+        });
+    }
+    for call in &summary.tool_calls {
+        items.push(FeedItem::Tool {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            input: call.input.clone(),
+            status: if call.ok {
+                ToolStatus::Ok
+            } else {
+                ToolStatus::Error
+            },
+            output: call.output.clone(),
+        });
+    }
+    if !summary.usage.is_empty() {
+        items.push(FeedItem::Usage(summary.usage.clone()));
+    }
+    if let Some(error) = &summary.error {
+        items.push(FeedItem::Error {
+            message: error.clone(),
+        });
+    }
+    if let Some(outcome) = summary.outcome {
+        items.push(FeedItem::Boundary(outcome));
+    }
+    items
+}
+
 /// The live feed section rendered above the task's output viewer.
 #[component]
 pub fn AgentFeed(
@@ -262,16 +320,50 @@ pub fn AgentFeed(
     rsx! {
         section { class: "agent-feed-section",
             h2 { "Live feed" }
-            div { class: "agent-feed",
-                for (index, item) in items.into_iter().enumerate() {
-                    FeedRow {
-                        key: "{index}",
-                        item,
-                        session_id: session_id.clone(),
-                        busy,
-                        toast,
-                        refresh,
-                    }
+            FeedList { items, session_id, busy, toast, refresh }
+        }
+    }
+}
+
+/// A persisted run rendered as a human-readable agent log.
+///
+/// Fed by [`summary_feed`], this is the post-run counterpart to [`AgentFeed`]:
+/// it renders the same rows from the durable `task.output` summary, so the log
+/// survives a reload or daemon restart. A persisted log has no live session to
+/// reply to, so [`FeedItem::InputRequest`] cannot occur.
+#[component]
+pub fn AgentLog(items: Vec<FeedItem>) -> Element {
+    if items.is_empty() {
+        return rsx! {};
+    }
+    let busy = use_signal(|| false);
+    let toast = use_signal(|| None::<(ToastKind, String)>);
+    let refresh = use_signal(|| 0u64);
+    rsx! {
+        FeedList { items, session_id: String::new(), busy, toast, refresh }
+    }
+}
+
+/// The scrollable list of feed rows shared by the live feed and the persisted
+/// post-run log.
+#[component]
+fn FeedList(
+    items: Vec<FeedItem>,
+    session_id: String,
+    busy: Signal<bool>,
+    toast: Signal<Option<(ToastKind, String)>>,
+    refresh: Signal<u64>,
+) -> Element {
+    rsx! {
+        div { class: "agent-feed",
+            for (index, item) in items.into_iter().enumerate() {
+                FeedRow {
+                    key: "{index}",
+                    item,
+                    session_id: session_id.clone(),
+                    busy,
+                    toast,
+                    refresh,
                 }
             }
         }
@@ -296,10 +388,20 @@ fn FeedRow(
                 MessageRole::Assistant => "assistant",
                 MessageRole::Tool => "tool",
             };
+            let clean = strip_ansi(&text);
+            let (preview, cut) = truncate_lines(&clean, FEED_COLLAPSED_LINES);
+            let shown = if expanded() { clean.clone() } else { preview };
             rsx! {
                 div { class: "feed-item feed-message",
                     span { class: "feed-role", "{label}" }
-                    pre { class: "feed-text", "{strip_ansi(&text)}" }
+                    pre { class: "feed-text", "{shown}" }
+                    if cut {
+                        button {
+                            class: "feed-toggle",
+                            onclick: move |_| expanded.set(!expanded()),
+                            if expanded() { "Show less" } else { "Show more" }
+                        }
+                    }
                 }
             }
         }
@@ -327,13 +429,27 @@ fn FeedRow(
             output,
             ..
         } => {
-            let (result, cut) = output
-                .as_ref()
-                .map(|value| {
-                    let text = pretty(value);
-                    truncate_lines(&text, FEED_COLLAPSED_LINES)
-                })
+            // Tool input/result render readably — a string stays a string, a
+            // nested object is pretty-printed — and both collapse to a preview.
+            let input_full = readable_value(&input);
+            let (input_preview, input_cut) = truncate_lines(&input_full, FEED_COLLAPSED_LINES);
+            let output_full = output.as_ref().map(readable_value);
+            let (output_preview, output_cut) = output_full
+                .as_deref()
+                .map(|text| truncate_lines(text, FEED_COLLAPSED_LINES))
                 .unwrap_or_else(|| (String::new(), false));
+            let cut = input_cut || output_cut;
+            let is_expanded = expanded();
+            let input_shown = if is_expanded {
+                input_full
+            } else {
+                input_preview
+            };
+            let output_shown = if is_expanded {
+                output_full.unwrap_or_default()
+            } else {
+                output_preview
+            };
             let chip = format!("tool-chip tool-{}", status.label());
             rsx! {
                 div { class: "feed-item feed-tool",
@@ -341,17 +457,17 @@ fn FeedRow(
                         span { class: "feed-tool-name", "{name}" }
                         span { class: chip, "{status.label()}" }
                     }
-                    if !input.is_null() {
-                        pre { class: "feed-tool-input", "{pretty(&input)}" }
+                    if !input_shown.is_empty() {
+                        pre { class: "feed-tool-input", "{input_shown}" }
                     }
-                    if !result.is_empty() {
-                        pre { class: "feed-tool-output", "{result}" }
-                        if cut {
-                            button {
-                                class: "feed-toggle",
-                                onclick: move |_| expanded.set(!expanded()),
-                                if expanded() { "Show less" } else { "Show more" }
-                            }
+                    if !output_shown.is_empty() {
+                        pre { class: "feed-tool-output", "{output_shown}" }
+                    }
+                    if cut {
+                        button {
+                            class: "feed-toggle",
+                            onclick: move |_| expanded.set(!expanded()),
+                            if expanded() { "Show less" } else { "Show more" }
                         }
                     }
                 }
@@ -485,7 +601,7 @@ fn InlinePrompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use favetto_wire::model::{AgentUsage, AwaitingInputKind, InputRequest};
+    use favetto_wire::model::{AgentUsage, AwaitingInputKind, InputRequest, ToolCall};
 
     fn push(seq: u64, event: AgentStateEvent) -> AgentEventPush {
         AgentEventPush {
@@ -689,6 +805,103 @@ mod tests {
                 .all(|item| !matches!(item, FeedItem::InputRequest(_))),
             "a resolved prompt must be dropped: {items:?}"
         );
+    }
+
+    #[test]
+    fn summary_feed_maps_a_run_summary_in_canonical_order() {
+        let summary = RunSummary {
+            session_id: Some("ses_1".to_string()),
+            title: Some("Fix the widget".to_string()),
+            text: "all done".to_string(),
+            reasoning: "because".to_string(),
+            tool_calls: vec![
+                ToolCall {
+                    id: "c1".to_string(),
+                    name: "read".to_string(),
+                    input: serde_json::json!({ "path": "a" }),
+                    ok: true,
+                    output: Some(serde_json::json!("contents")),
+                },
+                ToolCall {
+                    id: "c2".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!("rm -rf /"),
+                    ok: false,
+                    output: None,
+                },
+            ],
+            usage: AgentUsage {
+                input_tokens: 3,
+                ..Default::default()
+            },
+            outcome: Some(IdleOutcome::Failed),
+            error: Some("boom".to_string()),
+        };
+        let items = summary_feed(&summary);
+        assert!(matches!(
+            &items[0],
+            FeedItem::Session { title: Some(title) } if title == "Fix the widget"
+        ));
+        assert!(matches!(
+            &items[1],
+            FeedItem::Message { role: MessageRole::Assistant, text } if text == "all done"
+        ));
+        assert!(matches!(&items[2], FeedItem::Reasoning { text } if text == "because"));
+        assert!(matches!(
+            &items[3],
+            FeedItem::Tool { name, status: ToolStatus::Ok, .. } if name == "read"
+        ));
+        assert!(matches!(
+            &items[4],
+            FeedItem::Tool { name, status: ToolStatus::Error, .. } if name == "bash"
+        ));
+        assert!(matches!(&items[5], FeedItem::Usage(_)));
+        assert!(matches!(&items[6], FeedItem::Error { message } if message == "boom"));
+        assert!(matches!(&items[7], FeedItem::Boundary(IdleOutcome::Failed)));
+        assert_eq!(items.len(), 8);
+    }
+
+    #[test]
+    fn summary_feed_renders_only_the_title_when_nothing_else_reported() {
+        // `extract_run_summary` filters a title-only summary out, so this path
+        // is only reachable if a summary has content *and* a title.
+        let summary = RunSummary {
+            title: Some("Only a title".to_string()),
+            ..Default::default()
+        };
+        let items = summary_feed(&summary);
+        assert_eq!(items.len(), 1);
+        assert!(matches!(
+            &items[0],
+            FeedItem::Session { title: Some(title) } if title == "Only a title"
+        ));
+        // A fully empty summary yields nothing.
+        assert!(summary_feed(&RunSummary::default()).is_empty());
+    }
+
+    #[test]
+    fn agent_log_mounts_host_side() {
+        #[component]
+        fn Harness() -> Element {
+            let items = use_signal(|| {
+                summary_feed(&RunSummary {
+                    text: "hello".to_string(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".to_string(),
+                        name: "read".to_string(),
+                        ok: true,
+                        output: Some(serde_json::json!("contents")),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })
+            });
+            rsx! {
+                AgentLog { items: items() }
+            }
+        }
+        let mut dom = VirtualDom::new(Harness);
+        dom.rebuild_in_place();
     }
 
     #[test]
