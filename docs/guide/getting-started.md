@@ -73,6 +73,13 @@ favetto pair
 favetto tui --remote ws://127.0.0.1:7878/rpc --pair-code 123456
 ```
 
+Or log in with an account created by `favetto user add` (the password is
+prompted when `--password` is omitted):
+
+```bash
+favetto tui --remote wss://HOST:7878/rpc --user alice
+```
+
 See [Remote access](./remote-access) for the full flow.
 
 ## Appearance

@@ -158,9 +158,13 @@ pub(crate) const HTTP_ENDPOINTS_INTRO: &str =
 /// `GET /metrics` HTTP endpoint bullet.
 pub(crate) const HTTP_ENDPOINT_METRICS: &str = "- `GET /metrics` — Prometheus metrics.\n";
 
+/// Username/password login HTTP endpoint bullet.
+pub(crate) const HTTP_ENDPOINT_LOGIN: &str =
+    "- `POST /auth/login` — username/password login (returns the bearer token).\n";
+
 /// Pairing HTTP endpoint bullet.
 pub(crate) const HTTP_ENDPOINT_PAIR: &str =
-    "- `POST /pair/generate` and `POST /pair/exchange` — pairing.\n";
+    "- `POST /pair/generate` (bearer-guarded) and `POST /pair/exchange` — pairing.\n";
 
 /// GitHub webhook HTTP endpoint bullet.
 pub(crate) const HTTP_ENDPOINT_WEBHOOKS: &str =

@@ -1916,3 +1916,51 @@ async fn known_repos_and_daemon_state_migrate_and_round_trip() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn users_crud_round_trips() {
+    let (dir, pool) = scratch_pool("users").await;
+
+    // The migration creates the table; it starts empty.
+    assert_eq!(count_users(&pool).await.unwrap(), 0);
+    assert!(get_user_hash(&pool, "alice").await.unwrap().is_none());
+    assert!(list_users(&pool).await.unwrap().is_empty());
+
+    // Insert then read back the hash.
+    upsert_user(&pool, "alice", "hash-a").await.unwrap();
+    assert_eq!(count_users(&pool).await.unwrap(), 1);
+    assert_eq!(
+        get_user_hash(&pool, "alice").await.unwrap().as_deref(),
+        Some("hash-a")
+    );
+
+    // Upsert overwrites the hash and preserves `created_at`, advancing `updated_at`.
+    let created_at = list_users(&pool).await.unwrap()[0].created_at;
+    upsert_user(&pool, "alice", "hash-b").await.unwrap();
+    let alice = list_users(&pool).await.unwrap().remove(0);
+    assert_eq!(
+        get_user_hash(&pool, "alice").await.unwrap().as_deref(),
+        Some("hash-b")
+    );
+    assert_eq!(alice.created_at, created_at);
+    assert!(alice.updated_at >= alice.created_at);
+
+    // Listing is ordered by username.
+    upsert_user(&pool, "bob", "hash-c").await.unwrap();
+    upsert_user(&pool, "carol", "hash-d").await.unwrap();
+    let names: Vec<String> = list_users(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|u| u.username)
+        .collect();
+    assert_eq!(names, vec!["alice", "bob", "carol"]);
+    assert_eq!(count_users(&pool).await.unwrap(), 3);
+
+    // Removing reports whether a row was removed.
+    assert!(remove_user(&pool, "bob").await.unwrap());
+    assert!(!remove_user(&pool, "bob").await.unwrap());
+    assert_eq!(count_users(&pool).await.unwrap(), 2);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

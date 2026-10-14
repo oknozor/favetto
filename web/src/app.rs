@@ -156,7 +156,7 @@ fn ConnectionBanner() -> Element {
     if (state.token)().is_none() {
         return rsx! {
             div { class: "connection-banner disconnected", role: "status",
-                "Not paired — run `favetto pair` and enter the code to connect."
+                "Not signed in — sign in with your username and password (or a pairing code) to connect."
             }
         };
     }

@@ -19,6 +19,8 @@ use crate::state;
 pub const RPC_PATH: &str = "/rpc";
 /// The SSE push channel.
 pub const EVENTS_PATH: &str = "/events";
+/// Username/password login (returns the bearer token).
+pub const LOGIN_PATH: &str = "/auth/login";
 /// The pairing token exchange.
 pub const PAIR_EXCHANGE_PATH: &str = "/pair/exchange";
 
@@ -76,6 +78,16 @@ pub fn events_url_for(base: &str) -> String {
     url_for(base, EVENTS_PATH)
 }
 
+/// `{daemon_url}/auth/login` (or the same-origin `/auth/login`).
+pub fn login_url() -> String {
+    login_url_for(&daemon_url())
+}
+
+/// [`login_url`] for an explicit base, without reading storage.
+pub fn login_url_for(base: &str) -> String {
+    url_for(base, LOGIN_PATH)
+}
+
 /// `{daemon_url}/pair/exchange` (or the same-origin `/pair/exchange`).
 pub fn pair_exchange_url() -> String {
     pair_exchange_url_for(&daemon_url())
@@ -122,6 +134,7 @@ mod tests {
         for base in ["", "   ", "/"] {
             assert_eq!(rpc_url_for(base), "/rpc");
             assert_eq!(events_url_for(base), "/events");
+            assert_eq!(login_url_for(base), "/auth/login");
             assert_eq!(pair_exchange_url_for(base), "/pair/exchange");
         }
     }
@@ -131,6 +144,7 @@ mod tests {
         let base = "http://192.168.1.10:8080";
         assert_eq!(rpc_url_for(base), "http://192.168.1.10:8080/rpc");
         assert_eq!(events_url_for(base), "http://192.168.1.10:8080/events");
+        assert_eq!(login_url_for(base), "http://192.168.1.10:8080/auth/login");
         assert_eq!(
             pair_exchange_url_for(base),
             "http://192.168.1.10:8080/pair/exchange"

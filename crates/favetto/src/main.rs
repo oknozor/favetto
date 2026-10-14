@@ -35,6 +35,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Daemon(args) => favetto::daemon::run(args).await,
         Command::Tui(args) => favetto_tui::tui::run(args).await,
         Command::Pair(args) => favetto::pair::run(args).await,
+        Command::User(args) => favetto::user::run(args).await,
         Command::TokenRotate(args) => token_rotate(args),
         Command::Validate(args) => favetto::validate::run(&args),
         Command::Doc(args) => favetto::docgen::run(&args),

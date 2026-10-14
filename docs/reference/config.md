@@ -10,7 +10,7 @@ Every section is optional; favetto falls back to built-in defaults for anything 
 |-------|------|---------|----------|-------------|
 | `agent` | AgentSettings | `{}` | no | Default external agent used for catalog tasks and new agent sessions. |
 | `agents` | Map<String, AgentConfig> | `{}` | no | External coding agents by name (e.g. `claude`, `opencode`, `pi`, `vibe`). |
-| `auth` | AuthSettings | `{"ticket_ttl_secs":30}` | no | Short-lived authentication ticket settings. |
+| `auth` | AuthSettings | `{"login_rate_limit":5,"login_window_secs":300,"require_tls":false,"ticket_ttl_secs":30}` | no | Short-lived authentication ticket settings. |
 | `daemon` | DaemonSettings | `{"data_dir":null,"listen":null,"retention":{"days":30,"min_tasks":1000,"vacuum":true},"socket":null,"tasks_dir":null}` | no | Daemon defaults (overridable by CLI flags). |
 | `executor` | ExecutorSettings | `{"awaiting_input_quiet_ms":8000,"detect_awaiting_input":true,"keep_worktree":false,"max_concurrency":4,"max_output_bytes":262144,"parallel":false,"retry":{"backoff":"exponential","initial_ms":5000,"max_attempts":1,"max_ms":300000,"retry_on":["infrastructure","timeout"]},"stale_run":"fail","worktree":true,"worktree_retention":{"days":30,"min_worktrees":0}}` | no | Task executor concurrency / isolation. |
 | `git` | GitSettings | `{}` | no | Non-interactive git provisioning for agent processes. Defaults to `signing = "off"`, which forces `commit.gpgsign = false` so an agent commit can never block on an interactive pinentry/askpass prompt. |
@@ -80,12 +80,20 @@ string
 
 ## AuthSettings
 
-Short-lived, single-use tickets for header-less clients (browser
-WebSocket/SSE auth). The ticket is minted over authenticated HTTP and then
-presented in a query string, where an `Authorization` header cannot go.
+Authentication settings: short-lived tickets for header-less clients
+(browser WebSocket/SSE auth) plus the username/password login policy.
+
+A ticket is minted over authenticated HTTP and then presented in a query
+string, where an `Authorization` header cannot go. Login attempts are
+rate-limited per `(username, client)`; `require_tls` rejects non-loopback
+logins that did not arrive over HTTPS (directly or via a proxy that sets
+`X-Forwarded-Proto: https`).
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
+| `login_rate_limit` | integer | `5` | no | Failed `POST /auth/login` attempts allowed per `(username, client)` in `login_window_secs` before the client is locked out (0 disables the limit). |
+| `login_window_secs` | integer | `300` | no | Window, in seconds, over which `login_rate_limit` failures accumulate. |
+| `require_tls` | boolean | `false` | no | Reject non-loopback logins that did not arrive over HTTPS. |
 | `ticket_ttl_secs` | integer | `30` | no | Ticket lifetime, in seconds. |
 
 ## Backoff

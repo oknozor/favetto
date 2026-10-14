@@ -294,6 +294,7 @@ pub(crate) fn http_app(state: &Arc<State>) -> Router {
         .route("/metrics", get(crate::metrics::metrics_handler))
         .merge(crate::webhooks::routes())
         .merge(crate::agent_hooks::routes())
+        .merge(crate::auth::routes())
         .merge(crate::pair::routes())
         .merge(crate::ticket::routes());
     if state.config.web.enabled {

@@ -27,6 +27,8 @@ Attach the TUI to a running daemon (local Unix socket or remote WebSocket)
 | `--token-file` | `<TOKEN_FILE>` | — | Bearer token file for remote auth (defaults to `<data_dir>/token`) |
 | `--socket` | `<SOCKET>` | — | Unix socket path (overrides the default) |
 | `--pair-code` | `<PAIR_CODE>` | — | Short-lived pairing code to exchange for a token (remote attach only) |
+| `--user` | `<USER>` | — | Username to log in with (remote attach only). Prompts for a password when `--password` is not given |
+| `--password` | `<PASSWORD>` | — | Password for `--user` (remote attach only). Prefer the interactive prompt or `--token-file` on a shared machine: argv is visible to other processes |
 | `--config` | `<CONFIG>` | — | Path to the client-local config file (default `~/.config/favetto/config.toml`) |
 | `--sound` |  | — | Force sound on (overrides config and env) |
 | `--no-sound` |  | — | Disable sound (overrides config and env) |
@@ -40,6 +42,46 @@ Print a short-lived pairing code for remote TUI attachment
 | Flag | Value | Default | Description |
 |------|-------|---------|-------------|
 | `--url` | `<URL>` | `http://127.0.0.1:7878` | Daemon HTTP base URL (e.g. http://127.0.0.1:7878) |
+| `--token-file` | `<TOKEN_FILE>` | — | Bearer token file to authenticate `POST /pair/generate` (defaults to `<data_dir>/token`) |
+
+## `favetto user`
+
+Manage username/password login accounts
+
+## `favetto user add`
+
+Create a user (or reset an existing user's password)
+
+| Flag | Value | Default | Description |
+|------|-------|---------|-------------|
+| name | `<NAME>` | — | Username |
+| `--data-dir` | `<DATA_DIR>` | — | Directory for the SQLite database (default `~/.local/share/favetto`) |
+
+## `favetto user passwd`
+
+Change a user's password
+
+| Flag | Value | Default | Description |
+|------|-------|---------|-------------|
+| name | `<NAME>` | — | Username |
+| `--data-dir` | `<DATA_DIR>` | — | Directory for the SQLite database (default `~/.local/share/favetto`) |
+
+## `favetto user list`
+
+List configured users
+
+| Flag | Value | Default | Description |
+|------|-------|---------|-------------|
+| `--data-dir` | `<DATA_DIR>` | — | Directory for the SQLite database (default `~/.local/share/favetto`) |
+
+## `favetto user remove`
+
+Remove a user
+
+| Flag | Value | Default | Description |
+|------|-------|---------|-------------|
+| name | `<NAME>` | — | Username |
+| `--data-dir` | `<DATA_DIR>` | — | Directory for the SQLite database (default `~/.local/share/favetto`) |
 
 ## `favetto token-rotate`
 

@@ -101,6 +101,16 @@ CREATE TABLE IF NOT EXISTS daemon_state (
     value TEXT NOT NULL
 );
 
+-- Username/password accounts for remote login. `password_hash` is an argon2id
+-- value produced by `favetto_core::auth::hash_password`; plaintext passwords are
+-- never stored.
+CREATE TABLE IF NOT EXISTS users (
+    username      TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS task_runs (
     id          TEXT PRIMARY KEY,
     task_id     TEXT NOT NULL,
@@ -686,6 +696,84 @@ pub async fn set_active_repo(pool: &SqlitePool, name: Option<&str>) -> anyhow::R
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Users
+// ---------------------------------------------------------------------------
+
+/// A daemon user account. The password hash is never exposed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserRecord {
+    pub username: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Create a user, or replace the password of an existing one.
+///
+/// `created_at` is preserved on update; `updated_at` always advances.
+pub async fn upsert_user(
+    pool: &SqlitePool,
+    username: &str,
+    password_hash: &str,
+) -> anyhow::Result<()> {
+    let now = ts_ms(Utc::now());
+    sqlx::query(
+        "INSERT INTO users (username, password_hash, created_at, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(username) DO UPDATE SET
+             password_hash = excluded.password_hash,
+             updated_at = excluded.updated_at",
+    )
+    .bind(username)
+    .bind(password_hash)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The stored argon2id hash for `username`, if the account exists.
+pub async fn get_user_hash(pool: &SqlitePool, username: &str) -> anyhow::Result<Option<String>> {
+    let row = sqlx::query("SELECT password_hash FROM users WHERE username = ?")
+        .bind(username)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|r| r.get::<String, _>("password_hash")))
+}
+
+/// The number of configured users.
+pub async fn count_users(pool: &SqlitePool) -> anyhow::Result<i64> {
+    let row = sqlx::query("SELECT COUNT(*) AS n FROM users")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.get::<i64, _>("n"))
+}
+
+/// Every user, ordered by username.
+pub async fn list_users(pool: &SqlitePool) -> anyhow::Result<Vec<UserRecord>> {
+    let rows = sqlx::query("SELECT username, created_at, updated_at FROM users ORDER BY username")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|row| UserRecord {
+            username: row.get("username"),
+            created_at: from_ms(row.get("created_at")),
+            updated_at: from_ms(row.get("updated_at")),
+        })
+        .collect())
+}
+
+/// Delete `username`. Returns whether a row was removed.
+pub async fn remove_user(pool: &SqlitePool, username: &str) -> anyhow::Result<bool> {
+    let result = sqlx::query("DELETE FROM users WHERE username = ?")
+        .bind(username)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 // ---------------------------------------------------------------------------

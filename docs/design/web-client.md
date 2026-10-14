@@ -351,10 +351,13 @@ SVG directly by Dioxus.
 
 ### 8.4 Onboarding
 
-The pair screen accepts the code from `favetto pair` (or `?pair=CODE`), calls the
-existing `POST /pair/exchange`, and stores the returned token in `localStorage`.
-The token is the same bearer token the TUI uses; rotating it on the daemon
-(`favetto token-rotate`) invalidates the web session at its next connection.
+The onboarding screen signs in with a username and password against
+`POST /auth/login`, which returns the same bearer token the TUI uses. The token
+is stored in `localStorage`; rotating it on the daemon (`favetto token-rotate`)
+invalidates the web session at its next connection. Accounts are created with
+`favetto user add <name>` and hashed with argon2id. The pairing code (from
+`favetto pair`, or a `?pair=CODE` deep link) stays available behind a toggle and
+is exchanged at `POST /pair/exchange`; `POST /pair/generate` is bearer-guarded.
 
 ---
 
@@ -384,7 +387,10 @@ dir = ""              # empty = embedded assets; a path = serve from disk (dev)
 heartbeat_secs = 15   # SSE keep-alive interval
 
 [auth]
-ticket_ttl_secs = 30  # short-lived WS/SSE ticket lifetime
+ticket_ttl_secs = 30     # short-lived WS/SSE ticket lifetime
+login_rate_limit = 5     # failed logins per (username, client) before lockout
+login_window_secs = 300  # login failure window
+require_tls = false      # reject non-loopback plaintext logins
 ```
 
 New fields are defaulted so existing configs decode unchanged; `__doc` is
