@@ -16,9 +16,9 @@ use favetto_core::model::{AgentSessionInfo, FailureKind, Task, TaskStatus, Usage
 use favetto_core::workflow::{WorkflowInspect, WorkflowState};
 
 use super::app::{
-    activity_cell, cost_cell, format_activity, table_rows_area, token_cell, App, CatalogRow,
-    ClickAction, ClickRegion, ConfirmPrompt, ConnState, Form, ListGeometry, Popup, ReplyPrompt,
-    Tab, TaskVarsForm, Wizard, WizardStep, MENU_OPTIONS,
+    activity_cell, cost_cell, format_activity, repo_label, table_rows_area, task_repo, token_cell,
+    App, CatalogRow, ClickAction, ClickRegion, ConfirmPrompt, ConnState, Form, ListGeometry, Popup,
+    ReplyPrompt, Tab, TaskVarsForm, Wizard, WizardStep, MENU_OPTIONS,
 };
 use super::text_buffer::TextBuffer;
 use super::theme::Theme;
@@ -1742,6 +1742,7 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     let widths = [
         Constraint::Length(10), // ID
         Constraint::Length(20), // TASK
+        Constraint::Length(14), // REPO
         // Session titles are truncated to 22 chars, so the column matches that.
         Constraint::Length(22), // SESSION
         // Wide enough for `✓ succeeded #10`, the longest status plus an attempt.
@@ -1753,33 +1754,39 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
         Constraint::Length(9),  // DURATION — `1h20m`
     ];
     let header = Row::new(vec![
-        "ID", "TASK", "SESSION", "STATUS", "ACTIVITY", "TOKEN", "$COST", "STARTED", "DURATION",
+        "ID", "TASK", "REPO", "SESSION", "STATUS", "ACTIVITY", "TOKEN", "$COST", "STARTED",
+        "DURATION",
     ])
     .style(theme.table_header());
 
+    // Only rows in the active repo's scope are listed (all of them for `global`).
     let state = app.throbber_state.clone();
-    let rows: Vec<Row> = app
-        .tasks
-        .iter()
-        .map(|t| {
-            let (activity, usage) = app.task_activity_usage(&t.id.to_string());
-            let now = Utc::now();
-            Row::new(vec![
-                Cell::from(short_id(&t.id)),
-                Cell::from(t.name.clone()),
-                Cell::from(truncate_ellipsis(
-                    t.session_title.as_deref().unwrap_or(""),
-                    22,
-                )),
-                Cell::from(status_line(t.status, t.attempt, theme, &state)),
-                Cell::from(activity_cell(activity)),
-                Cell::from(token_cell(usage)),
-                Cell::from(cost_cell(usage)),
-                Cell::from(started(t.started_at)),
-                Cell::from(duration(t.started_at, t.finished_at, now)),
-            ])
-        })
-        .collect();
+    let (visible_len, rows): (usize, Vec<Row>) = {
+        let visible = app.visible_tasks();
+        let rows = visible
+            .iter()
+            .map(|t| {
+                let (activity, usage) = app.task_activity_usage(&t.id.to_string());
+                let now = Utc::now();
+                Row::new(vec![
+                    Cell::from(short_id(&t.id)),
+                    Cell::from(t.name.clone()),
+                    Cell::from(truncate_ellipsis(repo_label(task_repo(&t.name)), 14)),
+                    Cell::from(truncate_ellipsis(
+                        t.session_title.as_deref().unwrap_or(""),
+                        22,
+                    )),
+                    Cell::from(status_line(t.status, t.attempt, theme, &state)),
+                    Cell::from(activity_cell(activity)),
+                    Cell::from(token_cell(usage)),
+                    Cell::from(cost_cell(usage)),
+                    Cell::from(started(t.started_at)),
+                    Cell::from(duration(t.started_at, t.finished_at, now)),
+                ])
+            })
+            .collect();
+        (visible.len(), rows)
+    };
 
     let table = Table::new(rows, widths)
         .header(header)
@@ -1787,8 +1794,7 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(format!(
-                    " Tasks ({}) — Enter/click to run or answer an agent ",
-                    app.tasks.len()
+                    " Tasks ({visible_len}) — Enter/click to run or answer an agent "
                 ))
                 .border_style(theme.block(false)),
         )
@@ -1796,13 +1802,14 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
         .column_spacing(2);
 
     let mut state = TableState::default();
-    state.select(Some(app.tasks_selected));
+    if visible_len > 0 {
+        state.select(Some(app.tasks_selected.min(visible_len - 1)));
+    }
     frame.render_stateful_widget(table, area, &mut state);
-    let len = app.tasks.len();
     app.tasks_geom = ListGeometry {
         inner: table_rows_area(area),
         offset: state.offset(),
-        len,
+        len: visible_len,
     };
 }
 
@@ -2042,47 +2049,51 @@ fn draw_event_list(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     let widths = [
         Constraint::Length(8),
         Constraint::Min(18),
+        Constraint::Length(12), // REPO
         Constraint::Length(8),
     ];
-    let header = Row::new(vec!["ID", "KIND", "AGE"]).style(theme.table_header());
+    let header = Row::new(vec!["ID", "KIND", "REPO", "AGE"]).style(theme.table_header());
 
-    let rows: Vec<Row> = app
-        .events
-        .iter()
-        .rev()
-        .map(|e| {
-            Row::new(vec![
-                Cell::from(e.id.to_string()),
-                Cell::from(e.kind.as_str()),
-                Cell::from(age(e.created_at)),
-            ])
-        })
-        .collect();
+    // Only events in the active repo's scope are listed (all of them for
+    // `global`); the list stores oldest-first, so it renders reversed.
+    let (visible_len, rows): (usize, Vec<Row>) = {
+        let visible = app.visible_events();
+        let rows = visible
+            .iter()
+            .rev()
+            .map(|e| {
+                let repo = app.event_repo(e);
+                Row::new(vec![
+                    Cell::from(e.id.to_string()),
+                    Cell::from(e.kind.as_str()),
+                    Cell::from(truncate_ellipsis(repo_label(repo.as_deref()), 12)),
+                    Cell::from(age(e.created_at)),
+                ])
+            })
+            .collect();
+        (visible.len(), rows)
+    };
 
     let table = Table::new(rows, widths)
         .header(header)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(
-                    " Events ({}) — click or ↑/↓ select ",
-                    app.events.len()
-                ))
+                .title(format!(" Events ({visible_len}) — click or ↑/↓ select "))
                 .border_style(theme.block(false)),
         )
         .row_highlight_style(theme.selected())
         .column_spacing(1);
 
     let mut state = TableState::default();
-    if !app.events.is_empty() {
-        state.select(Some(app.events_selected.min(app.events.len() - 1)));
+    if visible_len > 0 {
+        state.select(Some(app.events_selected.min(visible_len - 1)));
     }
     frame.render_stateful_widget(table, area, &mut state);
-    let len = app.events.len();
     app.events_geom = ListGeometry {
         inner: table_rows_area(area),
         offset: state.offset(),
-        len,
+        len: visible_len,
     };
 }
 

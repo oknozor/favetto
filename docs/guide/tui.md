@@ -10,7 +10,7 @@ focus and mouse handling see [Embedded agents](./agents).
 
 ![favetto TUI — Tasks tab](/screenshots/tui-tasks.png)
 
-*The Tasks tab: recent runs with status, started time, duration, and session title.*
+*The Tasks tab: recent runs with their repo, status, started time, duration, and session title.*
 
 An opencode run writes its session title a few seconds after its first turn. As
 soon as the agent reports its session id **during** the run, the daemon resolves
@@ -209,11 +209,24 @@ it never fetches `output` blobs — and refreshes as the daemon pushes
 open. A directly started task is its own root; a spawned child inspects the root
 it inherited.
 
+## Repo scoping
+
+The **Tasks** and **Events** tables each carry a **REPO** column: the name of
+the repo a run or event belongs to, or `global` for a bare task name and for
+integration (webhook) events. When a specific repo is active (`Ctrl+P → Switch
+repo`), both tabs are scoped to that repo's rows only; the selected row is
+clamped into view and the mouse hit-testing follows the filtered rows. Selecting
+`global` restores the full, labelled lists. The active repo is also shown in the
+status bar (`repo: <name>` / `repo: global`); see
+[Repository-local tasks](./catalog#repository-local-tasks).
+
 ## Events panel
 
 The **Events** tab is a selectable, scrolling list (`↑`/`↓`, `PageUp`/`PageDown`)
 with a **payload side panel** that pretty-prints the selected event's JSON with
-syntax highlighting.
+syntax highlighting. Each row shows the event's **REPO** (or `global`); the
+repo is derived from the event's task name, or from its `task_id` for the
+terminal/cron events that do not carry a name.
 
 ![favetto TUI — Events tab](/screenshots/tui-events.png)
 

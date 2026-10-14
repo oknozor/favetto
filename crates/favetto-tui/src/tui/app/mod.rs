@@ -477,6 +477,20 @@ impl ListGeometry {
     }
 }
 
+/// The favetto repo namespace a task name belongs to.
+///
+/// A repo-local task is namespaced `repo:<name>/<path>`; a bare name is global.
+/// Returns `None` for the global namespace and for a malformed qualified name.
+pub fn task_repo(name: &str) -> Option<&str> {
+    favetto_core::tasks::split_repo(name).map(|(repo, _)| repo)
+}
+
+/// The display label for a repo column: the repo name, or `global` when the row
+/// is not scoped to a repo.
+pub fn repo_label(repo: Option<&str>) -> &str {
+    repo.unwrap_or("global")
+}
+
 pub struct App {
     /// The colour palette every widget paints through.
     pub theme: Theme,
@@ -773,8 +787,9 @@ impl App {
     }
 
     pub fn select_next(&mut self) {
-        if !self.tasks.is_empty() {
-            self.tasks_selected = (self.tasks_selected + 1).min(self.tasks.len() - 1);
+        let len = self.visible_tasks().len();
+        if len > 0 {
+            self.tasks_selected = (self.tasks_selected + 1).min(len - 1);
         }
     }
 
@@ -782,9 +797,16 @@ impl App {
         self.tasks_selected = self.tasks_selected.saturating_sub(1);
     }
 
-    /// The task currently selected on the Tasks tab, if any.
+    /// The task currently selected on the Tasks tab (within the visible rows),
+    /// if any.
     pub fn selected_task(&self) -> Option<&Task> {
-        self.tasks.get(self.tasks_selected)
+        let visible = self.visible_tasks();
+        if visible.is_empty() {
+            return None;
+        }
+        visible
+            .get(self.tasks_selected.min(visible.len() - 1))
+            .copied()
     }
 
     /// Open the confirmation popup to cancel the selected task (`tasks.cancel`).
@@ -868,9 +890,13 @@ impl App {
     }
 
     /// Store the fetched repo registry and active repo (`repos.list`).
+    ///
+    /// The active repo scopes the Tasks and Events tabs, so the row selection is
+    /// re-clamped to whatever remains visible.
     pub fn set_repos(&mut self, repos: Vec<RepoInfo>, active: Option<String>) {
         self.known_repos = repos;
         self.active_repo = active;
+        self.clamp_selections();
     }
 
     /// The label shown for the active repo in the status bar.
@@ -879,6 +905,63 @@ impl App {
             Some(name) => format!("repo: {name}"),
             None => "repo: global".to_string(),
         }
+    }
+
+    /// Whether a row's repo namespace is in scope. With no active repo every
+    /// row is visible; otherwise only rows belonging to the active repo are.
+    fn repo_visible(&self, repo: Option<&str>) -> bool {
+        match &self.active_repo {
+            Some(active) => repo == Some(active.as_str()),
+            None => true,
+        }
+    }
+
+    /// The Tasks rows visible under the active repo, in list order.
+    pub fn visible_tasks(&self) -> Vec<&Task> {
+        self.tasks
+            .iter()
+            .filter(|t| self.repo_visible(task_repo(&t.name)))
+            .collect()
+    }
+
+    /// The repo a persisted event belongs to, derived from its payload.
+    ///
+    /// Task-lifecycle events carry `name`; the terminal/cron ones carry only
+    /// `task_id`, resolved against the known task list. `None` means a global
+    /// row (integration events, or a task we cannot resolve).
+    pub fn event_repo(&self, ev: &Event) -> Option<String> {
+        if let Some(name) = ev.payload.get("name").and_then(|v| v.as_str()) {
+            return task_repo(name).map(str::to_string);
+        }
+        let task_id = ev.payload.get("task_id").and_then(|v| v.as_str())?;
+        let task_id = Uuid::parse_str(task_id).ok()?;
+        let task = self.tasks.iter().find(|t| t.id == task_id)?;
+        task_repo(&task.name).map(str::to_string)
+    }
+
+    /// The Events rows visible under the active repo, oldest first (the order
+    /// they are stored in; the table renders them reversed).
+    pub fn visible_events(&self) -> Vec<&Event> {
+        self.events
+            .iter()
+            .filter(|e| self.repo_visible(self.event_repo(e).as_deref()))
+            .collect()
+    }
+
+    /// Clamp both list selections to the currently visible rows.
+    fn clamp_selections(&mut self) {
+        let tasks = self.visible_tasks().len();
+        self.tasks_selected = if tasks == 0 {
+            0
+        } else {
+            self.tasks_selected.min(tasks - 1)
+        };
+        let events = self.visible_events().len();
+        self.events_selected = if events == 0 {
+            0
+        } else {
+            self.events_selected.min(events - 1)
+        };
     }
 
     /// Open the Ctrl+P "Switch repo" picker.
@@ -971,7 +1054,7 @@ impl App {
     /// Open the runtime workflow inspector for the selected Tasks-tab row's root
     /// (`root_id` when spawned, else the task's own id).
     fn open_workflow_inspect(&mut self) -> UiAction {
-        let Some(task) = self.tasks.get(self.tasks_selected) else {
+        let Some(task) = self.selected_task() else {
             return UiAction::None;
         };
         let root_id = task.root_or_self();
@@ -1826,14 +1909,15 @@ impl App {
         self.sound_muted = !self.sound_muted;
     }
 
-    /// The event at the current selection (0 = newest).
+    /// The event at the current selection (0 = newest), within the visible rows.
     pub fn selected_event(&self) -> Option<&Event> {
-        let n = self.events.len();
+        let visible = self.visible_events();
+        let n = visible.len();
         if n == 0 {
             return None;
         }
         let offset = self.events_selected.min(n - 1);
-        self.events.get(n - 1 - offset)
+        visible.get(n - 1 - offset).copied()
     }
 }
 
