@@ -7,19 +7,25 @@
 //! `agents.list` / `events.tail` and kept live by the existing SSE reader, so a
 //! `task.updated` or `event` push re-renders the page with no extra wiring.
 //!
-//! Answering a prompt (`agents.reply`) is wired in the follow-up issue #247, so
-//! the option buttons and free-text control show a "not yet implemented" toast
-//! for now; the [`AwaitingCard`] fields are kept ready for that follow-up.
+//! Answering a prompt (`agents.reply`) is wired here: the option buttons, the
+//! "Always" control, and the free-text input map to a typed
+//! [`InputReply`](favetto_wire::model::InputReply) with the same kind-aware
+//! rules as the TUI, and a successful reply re-seeds the cache so the card
+//! disappears immediately (an SSE `task.updated` push does the same once the
+//! daemon resolves the request).
 
 use dioxus::prelude::*;
-use favetto_wire::model::{AgentCatalogEntry, Event, Task, TaskStatus};
-use favetto_wire::rpc::{EmptyParams, EventsTailParams, TasksListParams};
+use favetto_wire::model::{
+    AgentCatalogEntry, AwaitingInputKind, Event, InputReply, Task, TaskStatus,
+};
+use favetto_wire::rpc::{AgentReplyParams, EmptyParams, EventsTailParams, TasksListParams};
 use uuid::Uuid;
 
 use crate::app::Route;
 use crate::client::RpcClient;
 use crate::components::common::{EmptyState, EventBadge, Spinner};
 use crate::components::task_card::TaskCard;
+use crate::components::toast::{Toast, ToastKind};
 use crate::config;
 use crate::state::{onboarding_step, AppState, OnboardingStep};
 use crate::views::tasks::{format_age, now_ms, status_label};
@@ -31,9 +37,10 @@ pub const EVENTS_LIMIT: usize = 20;
 /// Drag distance (px) that triggers a pull-to-refresh.
 pub const PULL_THRESHOLD: f64 = 70.0;
 
-/// Copy shown when a reply control is pressed; #247 replaces the stub with a
-/// real `agents.reply` call.
-pub const REPLY_NOT_IMPLEMENTED: &str = "Replying is not implemented yet (see #247).";
+/// Copy shown when a reply is attempted on a screen-detected prompt, which has
+/// no structured input channel to answer through.
+pub const SCREEN_DETECTED_REPLY: &str =
+    "This prompt was detected from the terminal; answer it from the agent's terminal.";
 
 /// Tasks in `AwaitingInput`, newest first.
 pub fn awaiting_tasks(tasks: &[Task]) -> Vec<Task> {
@@ -90,12 +97,89 @@ pub struct AwaitingCard {
     pub session_id: String,
     /// The correlating request id, absent for screen-detected prompts.
     pub request_id: Option<String>,
+    /// What kind of decision the agent is blocked on; drives the reply mapping.
+    pub kind: AwaitingInputKind,
     /// The prompt text.
     pub message: String,
     /// Selectable options; empty means free-form text.
     pub options: Vec<String>,
     /// Whether an "always" answer is offered.
     pub allow_always: bool,
+}
+
+/// A reply the user chose in the Inbox, before it is mapped to the wire type.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ReplyIntent {
+    /// The option at this index into [`AwaitingCard::options`].
+    Option(usize),
+    /// The extra "always / remember" control.
+    Always,
+    /// A free-form answer.
+    Text(String),
+}
+
+impl AwaitingCard {
+    /// Map a UI [`ReplyIntent`] to the typed [`InputReply`] the daemon expects.
+    pub fn to_reply(&self, intent: &ReplyIntent) -> InputReply {
+        match intent {
+            ReplyIntent::Always => InputReply::Always,
+            ReplyIntent::Text(text) => InputReply::Value {
+                value: text.clone(),
+            },
+            ReplyIntent::Option(index) => {
+                input_reply_for(self.kind, &self.options, self.allow_always, *index, "")
+            }
+        }
+    }
+}
+
+/// Map a selected option (or free-form value) to a typed [`InputReply`].
+///
+/// The mapping is kind-aware so a permission prompt answers with
+/// `Once`/`Always`/`Reject`, a confirmation with `Confirmed`, and everything
+/// else (choices, free-form text) with `Value`. This mirrors the TUI's
+/// `reply_for` so both clients answer a prompt identically.
+pub fn input_reply_for(
+    kind: AwaitingInputKind,
+    options: &[String],
+    allow_always: bool,
+    selected: usize,
+    value: &str,
+) -> InputReply {
+    if options.is_empty() {
+        return InputReply::Value {
+            value: value.to_string(),
+        };
+    }
+    let label = options.get(selected).cloned().unwrap_or_default();
+    let lower = label.to_ascii_lowercase();
+    match kind {
+        AwaitingInputKind::Permission => {
+            if lower.contains("always") || lower.contains("remember") {
+                InputReply::Always
+            } else if lower.contains("reject")
+                || lower.contains("deny")
+                || lower.contains("block")
+                || lower.contains("cancel")
+            {
+                InputReply::Reject
+            } else if allow_always && selected == 1 && options.len() > 2 {
+                InputReply::Always
+            } else {
+                InputReply::Once
+            }
+        }
+        AwaitingInputKind::Confirmation => {
+            let confirmed = !(lower.contains("no")
+                || lower.contains("deny")
+                || lower.contains("reject")
+                || lower.contains("cancel"));
+            InputReply::Confirmed { confirmed }
+        }
+        AwaitingInputKind::Choice | AwaitingInputKind::Pinentry | AwaitingInputKind::Other => {
+            InputReply::Value { value: label }
+        }
+    }
 }
 
 /// Find the structured awaiting reason for `task` among the live agent sessions.
@@ -115,6 +199,7 @@ pub fn awaiting_card_for(task: &Task, agents: &[AgentCatalogEntry]) -> Option<Aw
             session.awaiting_input.as_ref().map(|reason| AwaitingCard {
                 session_id: session.id.clone(),
                 request_id: reason.request_id.clone(),
+                kind: reason.kind,
                 message: reason.message.clone(),
                 options: reason.options.clone(),
                 allow_always: reason.allow_always,
@@ -152,10 +237,13 @@ pub fn Inbox() -> Element {
     });
 
     let mut agents = use_signal(Vec::<AgentCatalogEntry>::new);
-    // Bumped by the Refresh button and the pull-to-refresh gesture; the resource
-    // below subscribes to it and re-runs.
+    // Bumped by the Refresh button, the pull-to-refresh gesture, and a
+    // successful reply; the resource below subscribes to it and re-runs.
     let mut refresh = use_signal(|| 0u64);
-    let mut notice = use_signal(|| Option::<String>::None);
+    // The current toast, if any.
+    let mut toast = use_signal(|| Option::<(ToastKind, String)>::None);
+    // True while a reply is in flight, so every reply control is disabled.
+    let busy = use_signal(|| false);
     let mut pull_start = use_signal(|| Option::<f64>::None);
 
     // Seed the caches. `daemon_url`/`token` are read in the synchronous part so
@@ -245,8 +333,12 @@ pub fn Inbox() -> Element {
             if let Some(Err(err)) = load() {
                 div { class: "error-banner", role: "alert", "Failed to load the Inbox: {err}" }
             }
-            if let Some(message) = notice() {
-                div { class: "toast", role: "status", "{message}" }
+            if let Some((kind, message)) = toast() {
+                Toast {
+                    kind,
+                    message,
+                    on_dismiss: move |_| toast.set(None),
+                }
             }
             section { class: "inbox-section awaiting-section",
                 h2 { "Awaiting input" }
@@ -262,7 +354,9 @@ pub fn Inbox() -> Element {
                                 status: task.status,
                                 age: format_age(task.created_at.timestamp_millis(), now),
                                 card,
-                                on_reply: move |_| notice.set(Some(REPLY_NOT_IMPLEMENTED.to_string())),
+                                busy,
+                                toast,
+                                refresh,
                             }
                         } else {
                             TaskCard {
@@ -315,9 +409,41 @@ pub fn Inbox() -> Element {
     }
 }
 
-/// One awaiting-input card: the agent prompt plus its options (or a free-text
-/// fallback). Every reply control calls `on_reply`; until #247 that only raises
-/// the "not implemented" toast.
+/// Send one `agents.reply` and fold the outcome into the toast and refresh
+/// signals. A success re-seeds the cache so the resolved card disappears even
+/// before the matching `task.updated` push arrives.
+fn submit_reply(
+    state: AppState,
+    mut busy: Signal<bool>,
+    mut toast: Signal<Option<(ToastKind, String)>>,
+    mut refresh: Signal<u64>,
+    session_id: String,
+    request_id: String,
+    reply: InputReply,
+) {
+    busy.set(true);
+    spawn(async move {
+        let client = RpcClient::new((state.daemon_url)()).with_token((state.token)());
+        let params = AgentReplyParams {
+            session_id,
+            request_id,
+            reply,
+        };
+        match client.agents_reply(params).await {
+            Ok(_) => {
+                toast.set(Some((ToastKind::Success, "Reply sent.".to_string())));
+                refresh.set(refresh() + 1);
+            }
+            Err(err) => toast.set(Some((ToastKind::Error, err.to_string()))),
+        }
+        busy.set(false);
+    });
+}
+
+/// One awaiting-input card: the agent prompt plus its options, an "always"
+/// control, or a free-text fallback. A screen-detected prompt (no structured
+/// request id) cannot be answered through `agents.reply`, so it only links to
+/// the task and explains where to answer.
 #[component]
 fn AwaitingInputCard(
     id: Uuid,
@@ -325,14 +451,29 @@ fn AwaitingInputCard(
     status: TaskStatus,
     age: String,
     card: AwaitingCard,
-    on_reply: EventHandler<Option<String>>,
+    busy: Signal<bool>,
+    toast: Signal<Option<(ToastKind, String)>>,
+    refresh: Signal<u64>,
 ) -> Element {
+    let state = use_context::<AppState>();
     let mut draft = use_signal(String::new);
     let message = card.message.clone();
     let options = card.options.clone();
     let allow_always = card.allow_always;
     let screen_detected = card.request_id.is_none();
     let badge = format!("status-badge status-{}", status.as_str());
+
+    // Stable handle so every control can submit without cloning the card.
+    let submit = use_callback(move |intent: ReplyIntent| {
+        let Some(request_id) = card.request_id.clone() else {
+            let mut toast = toast;
+            toast.set(Some((ToastKind::Error, SCREEN_DETECTED_REPLY.to_string())));
+            return;
+        };
+        let reply = card.to_reply(&intent);
+        let session_id = card.session_id.clone();
+        submit_reply(state, busy, toast, refresh, session_id, request_id, reply);
+    });
 
     rsx! {
         div { class: "awaiting-card",
@@ -348,37 +489,40 @@ fn AwaitingInputCard(
             p { class: "awaiting-prompt", "{message}" }
             if screen_detected {
                 p { class: "awaiting-hint",
-                    "This prompt was detected from the terminal; reply with free text."
+                    "This prompt was detected from the terminal; answer it from the agent's terminal."
                 }
-            }
-            if options.is_empty() {
+            } else if options.is_empty() {
                 div { class: "awaiting-free-text",
                     input {
                         class: "awaiting-input",
                         r#type: "text",
                         placeholder: "Type a reply…",
                         value: "{draft}",
+                        disabled: busy(),
                         oninput: move |event| draft.set(event.value()),
                     }
                     button {
                         class: "btn primary option-button",
-                        onclick: move |_| on_reply.call(Some(draft())),
+                        disabled: busy(),
+                        onclick: move |_| submit.call(ReplyIntent::Text(draft())),
                         "Send"
                     }
                 }
             } else {
                 div { class: "awaiting-options",
-                    for option in options {
+                    for (index, option) in options.iter().enumerate() {
                         button {
                             class: "btn option-button",
-                            onclick: move |_| on_reply.call(Some(option.clone())),
+                            disabled: busy(),
+                            onclick: move |_| submit.call(ReplyIntent::Option(index)),
                             "{option}"
                         }
                     }
                     if allow_always {
                         button {
                             class: "btn option-button",
-                            onclick: move |_| on_reply.call(None),
+                            disabled: busy(),
+                            onclick: move |_| submit.call(ReplyIntent::Always),
                             "Always"
                         }
                     }
@@ -464,6 +608,90 @@ mod tests {
         }
     }
 
+    fn card(kind: AwaitingInputKind, options: Vec<&str>, allow_always: bool) -> AwaitingCard {
+        AwaitingCard {
+            session_id: "sess".to_string(),
+            request_id: Some("req".to_string()),
+            kind,
+            message: "?".to_string(),
+            options: options.into_iter().map(str::to_string).collect(),
+            allow_always,
+        }
+    }
+
+    #[test]
+    fn input_reply_for_maps_permission_options() {
+        let options = vec![
+            "Allow".to_string(),
+            "Allow always".to_string(),
+            "Deny".to_string(),
+        ];
+        assert_eq!(
+            input_reply_for(AwaitingInputKind::Permission, &options, false, 0, ""),
+            InputReply::Once
+        );
+        // A label mentioning "always"/"remember" wins over the index.
+        assert_eq!(
+            input_reply_for(AwaitingInputKind::Permission, &options, false, 1, ""),
+            InputReply::Always
+        );
+        assert_eq!(
+            input_reply_for(AwaitingInputKind::Permission, &options, false, 2, ""),
+            InputReply::Reject
+        );
+        // `allow_always` promotes the middle option when there are 3+.
+        let plain = vec![
+            "Allow".to_string(),
+            "Always".to_string(),
+            "Deny".to_string(),
+        ];
+        assert_eq!(
+            input_reply_for(AwaitingInputKind::Permission, &plain, true, 1, ""),
+            InputReply::Always
+        );
+    }
+
+    #[test]
+    fn input_reply_for_maps_confirmation_choice_and_free_text() {
+        let yes_no = vec!["Yes".to_string(), "No".to_string()];
+        assert_eq!(
+            input_reply_for(AwaitingInputKind::Confirmation, &yes_no, false, 0, ""),
+            InputReply::Confirmed { confirmed: true }
+        );
+        assert_eq!(
+            input_reply_for(AwaitingInputKind::Confirmation, &yes_no, false, 1, ""),
+            InputReply::Confirmed { confirmed: false }
+        );
+        let choice = vec!["Alpha".to_string(), "Beta".to_string()];
+        assert_eq!(
+            input_reply_for(AwaitingInputKind::Choice, &choice, false, 1, ""),
+            InputReply::Value {
+                value: "Beta".to_string()
+            }
+        );
+        // Empty options mean free text, regardless of kind.
+        assert_eq!(
+            input_reply_for(AwaitingInputKind::Other, &[], false, 0, "hello"),
+            InputReply::Value {
+                value: "hello".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn to_reply_maps_every_intent() {
+        let card = card(AwaitingInputKind::Permission, vec!["Allow", "Deny"], true);
+        assert_eq!(card.to_reply(&ReplyIntent::Always), InputReply::Always);
+        assert_eq!(card.to_reply(&ReplyIntent::Option(0)), InputReply::Once);
+        assert_eq!(card.to_reply(&ReplyIntent::Option(1)), InputReply::Reject);
+        assert_eq!(
+            card.to_reply(&ReplyIntent::Text("typed".to_string())),
+            InputReply::Value {
+                value: "typed".to_string()
+            }
+        );
+    }
+
     #[test]
     fn awaiting_tasks_filters_status_and_orders_newest_first() {
         let old = Uuid::new_v4();
@@ -538,6 +766,7 @@ mod tests {
         let card = awaiting_card_for(&task, &agents).expect("card");
         assert_eq!(card.session_id, "sess-1");
         assert_eq!(card.request_id.as_deref(), Some("req-1"));
+        assert_eq!(card.kind, AwaitingInputKind::Permission);
         assert_eq!(card.options, vec!["Allow".to_string(), "Deny".to_string()]);
         assert!(card.allow_always);
         assert_eq!(card.message, "Allow this command?");

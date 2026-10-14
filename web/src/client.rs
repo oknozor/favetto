@@ -438,6 +438,34 @@ mod tests {
     }
 
     #[test]
+    fn agent_reply_request_carries_the_typed_reply() {
+        use favetto_wire::model::InputReply;
+
+        let params = AgentReplyParams {
+            session_id: "sess-1".to_string(),
+            request_id: "req-1".to_string(),
+            reply: InputReply::Once,
+        };
+        let bytes = encode_request::<AgentsReplyCall>(4, &params).unwrap();
+        let frame: Frame = rmp_serde::from_slice(&bytes).unwrap();
+        match frame {
+            Frame::Request(request) => {
+                assert_eq!(request.id, 4);
+                assert_eq!(request.method, method::AGENTS_REPLY);
+                assert_eq!(request.params["session_id"], "sess-1");
+                assert_eq!(request.params["request_id"], "req-1");
+                // `InputReply` is internally tagged, so the reply nests under
+                // the same field name.
+                assert_eq!(
+                    request.params["reply"],
+                    serde_json::json!({ "reply": "once" })
+                );
+            }
+            other => panic!("expected a request frame, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn mismatched_id_is_rejected() {
         let bytes = response_bytes(1, Ok(serde_json::json!({ "pong": true, "cwd": "/" })));
         assert_eq!(

@@ -8,12 +8,14 @@
 
 use dioxus::prelude::*;
 use favetto_wire::model::{FailureKind, RunStatus, Task, TaskRun, TaskStatus};
-use favetto_wire::rpc::{TaskIdParams, TasksListParams};
+use favetto_wire::rpc::{EmptyParams, TaskIdParams, TasksListParams, TasksStartParams};
 use uuid::Uuid;
 
 use crate::app::Route;
 use crate::client::RpcClient;
+use crate::components::dialog::{ConfirmDialog, Dialog};
 use crate::components::output_viewer::{extract_output_text, OutputViewer};
+use crate::components::toast::{Toast, ToastKind};
 use crate::state::AppState;
 
 /// The status chips above the task list.
@@ -158,6 +160,105 @@ pub fn format_duration(started_ms: Option<i64>, finished_ms: Option<i64>) -> Str
     }
 }
 
+/// Whether a task is in a terminal state, so `tasks.retry` (not `cancel`)
+/// applies.
+pub fn is_terminal(status: TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled
+    )
+}
+
+/// Parse the start dialog's `input` textarea. Empty/whitespace means "no input";
+/// anything else must be valid JSON.
+pub fn parse_task_input(raw: &str) -> Result<Option<serde_json::Value>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(trimmed)
+        .map(Some)
+        .map_err(|err| format!("input must be valid JSON: {err}"))
+}
+
+/// A destructive task action awaiting explicit confirmation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ConfirmAction {
+    /// `tasks.cancel` on a non-terminal task.
+    Cancel,
+    /// `tasks.retry` on a terminal task.
+    Retry,
+}
+
+impl ConfirmAction {
+    /// The confirmation dialog title.
+    fn title(self) -> &'static str {
+        match self {
+            ConfirmAction::Cancel => "Cancel task",
+            ConfirmAction::Retry => "Retry task",
+        }
+    }
+
+    /// The confirm button label.
+    fn confirm_label(self) -> &'static str {
+        match self {
+            ConfirmAction::Cancel => "Cancel task",
+            ConfirmAction::Retry => "Retry task",
+        }
+    }
+
+    /// Whether the confirm button uses the destructive style.
+    fn danger(self) -> bool {
+        matches!(self, ConfirmAction::Cancel)
+    }
+
+    /// The consequence spelled out in the dialog body.
+    fn message(self, name: &str) -> String {
+        match self {
+            ConfirmAction::Cancel => {
+                format!("Cancel '{name}'? Any in-flight agent process is stopped.")
+            }
+            ConfirmAction::Retry => {
+                format!("Retry '{name}'? Its prior run history is preserved.")
+            }
+        }
+    }
+}
+
+/// Run a confirmed cancel/retry, feeding the outcome into the toast and
+/// re-fetching the task. The daemon also pushes `task.updated`, which the
+/// detail resource observes independently.
+fn run_task_command(
+    state: AppState,
+    mut busy: Signal<bool>,
+    mut toast: Signal<Option<(ToastKind, String)>>,
+    mut refresh: Signal<u64>,
+    id: Uuid,
+    action: ConfirmAction,
+) {
+    busy.set(true);
+    spawn(async move {
+        let client = RpcClient::new((state.daemon_url)()).with_token((state.token)());
+        let params = TaskIdParams { id };
+        let result = match action {
+            ConfirmAction::Cancel => client.tasks_cancel(params).await.map(|_| ()),
+            ConfirmAction::Retry => client.tasks_retry(params).await.map(|_| ()),
+        };
+        match result {
+            Ok(()) => {
+                let verb = match action {
+                    ConfirmAction::Cancel => "cancelled",
+                    ConfirmAction::Retry => "retried",
+                };
+                toast.set(Some((ToastKind::Success, format!("Task {verb}."))));
+                refresh.set(refresh() + 1);
+            }
+            Err(err) => toast.set(Some((ToastKind::Error, err.to_string()))),
+        }
+        busy.set(false);
+    });
+}
+
 /// A coloured status pill shared by the list, detail and run rows.
 #[component]
 fn StatusBadge(status: TaskStatus) -> Element {
@@ -172,6 +273,8 @@ fn StatusBadge(status: TaskStatus) -> Element {
 pub fn TasksList() -> Element {
     let mut state = use_context::<AppState>();
     let mut filter = use_signal(TaskFilter::default);
+    let mut show_start = use_signal(|| false);
+    let mut toast = use_signal(|| Option::<(ToastKind, String)>::None);
 
     // Seed the cache when the base URL or token changes. `daemon_url`/`token`
     // are read in the synchronous part so the resource subscribes to them.
@@ -201,7 +304,14 @@ pub fn TasksList() -> Element {
 
     rsx! {
         main { id: "favetto-app", class: "tasks-view",
-            h1 { "Tasks" }
+            div { class: "tasks-header",
+                h1 { "Tasks" }
+                button {
+                    class: "btn primary",
+                    onclick: move |_| show_start.set(true),
+                    "Start task"
+                }
+            }
             div { class: "tasks-toolbar",
                 for chip in TaskFilter::ALL {
                     button {
@@ -236,6 +346,135 @@ pub fn TasksList() -> Element {
                     }
                 }
             }
+            if show_start() {
+                StartTaskDialog {
+                    on_close: move |_| show_start.set(false),
+                    on_started: move |_task: Task| {
+                        show_start.set(false);
+                        toast.set(Some((ToastKind::Success, "Task started.".to_string())));
+                    },
+                }
+            }
+            if let Some((kind, message)) = toast() {
+                Toast {
+                    kind,
+                    message,
+                    on_dismiss: move |_| toast.set(None),
+                }
+            }
+        }
+    }
+}
+
+/// The `tasks.start` dialog: a catalog-name autocomplete plus optional JSON
+/// input. Submitting calls `tasks.start` and reports the new task.
+#[component]
+fn StartTaskDialog(on_close: EventHandler<()>, on_started: EventHandler<Task>) -> Element {
+    let state = use_context::<AppState>();
+    let mut name = use_signal(String::new);
+    let mut input = use_signal(String::new);
+    let mut error = use_signal(|| None::<String>);
+    let mut submitting = use_signal(|| false);
+
+    // Catalog names power the `<datalist>` autocomplete. A failure here is not
+    // fatal: the user can still type any task name.
+    let catalog = use_resource(move || {
+        let base = (state.daemon_url)();
+        let token = (state.token)();
+        async move {
+            RpcClient::new(base)
+                .with_token(token)
+                .catalog_list(EmptyParams {})
+                .await
+                .map(|entries| {
+                    entries
+                        .into_iter()
+                        .map(|entry| entry.name)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        }
+    });
+    let names = catalog().unwrap_or_default();
+
+    let submit = move |_| {
+        let trimmed = name().trim().to_string();
+        if trimmed.is_empty() {
+            error.set(Some("task name is required".to_string()));
+            return;
+        }
+        let parsed = match parse_task_input(&input()) {
+            Ok(value) => value,
+            Err(err) => {
+                error.set(Some(err));
+                return;
+            }
+        };
+        error.set(None);
+        submitting.set(true);
+        spawn(async move {
+            let client = RpcClient::new((state.daemon_url)()).with_token((state.token)());
+            let params = TasksStartParams {
+                name: trimmed,
+                input: parsed,
+                interactive: None,
+            };
+            match client.tasks_start(params).await {
+                Ok(task) => {
+                    submitting.set(false);
+                    on_started.call(task);
+                }
+                Err(err) => {
+                    submitting.set(false);
+                    error.set(Some(err.to_string()));
+                }
+            }
+        });
+    };
+
+    rsx! {
+        Dialog { title: "Start task".to_string(), on_close,
+            label { class: "field",
+                span { class: "field-label", "Task name" }
+                input {
+                    class: "input",
+                    list: "favetto-catalog-names",
+                    value: "{name}",
+                    placeholder: "e.g. implement_issue",
+                    oninput: move |event| name.set(event.value()),
+                }
+            }
+            datalist { id: "favetto-catalog-names",
+                for task_name in names {
+                    option { key: "{task_name}", value: "{task_name}" }
+                }
+            }
+            label { class: "field",
+                span { class: "field-label", "Input (JSON, optional)" }
+                textarea {
+                    class: "input",
+                    value: "{input}",
+                    placeholder: "Optional JSON input",
+                    oninput: move |event| input.set(event.value()),
+                }
+            }
+            if let Some(err) = error() {
+                p { class: "dialog-error", role: "alert", "{err}" }
+            }
+            div { class: "dialog-actions",
+                button {
+                    class: "btn",
+                    disabled: submitting(),
+                    onclick: move |_| on_close.call(()),
+                    "Cancel"
+                }
+                button {
+                    class: "btn primary",
+                    disabled: submitting(),
+                    onclick: submit,
+                    "Start"
+                }
+            }
         }
     }
 }
@@ -252,12 +491,19 @@ struct Detail {
 pub fn TaskDetail(id: String) -> Element {
     let state = use_context::<AppState>();
     let parsed = Uuid::parse_str(&id).ok();
+    let busy = use_signal(|| false);
+    let mut toast = use_signal(|| Option::<(ToastKind, String)>::None);
+    let mut confirm = use_signal(|| Option::<ConfirmAction>::None);
+    // Bumped after a cancel/retry so the detail re-fetches without waiting for
+    // the matching SSE push.
+    let refresh = use_signal(|| 0u64);
 
     // Subscribe to the cached task's (status, attempt) so an SSE `task.updated`
     // push re-fetches the full task + run history.
     let detail = use_resource(move || {
         let base = (state.daemon_url)();
         let token = (state.token)();
+        let _refresh = refresh();
         let _key = parsed.and_then(|uuid| {
             (state.cache)()
                 .tasks
@@ -315,6 +561,23 @@ pub fn TaskDetail(id: String) -> Element {
                         header { class: "task-header",
                             h1 { class: "task-title", "{task.name}" }
                             StatusBadge { status: task.status }
+                            div { class: "task-actions",
+                                if is_terminal(task.status) {
+                                    button {
+                                        class: "btn",
+                                        disabled: busy(),
+                                        onclick: move |_| confirm.set(Some(ConfirmAction::Retry)),
+                                        "Retry"
+                                    }
+                                } else {
+                                    button {
+                                        class: "btn danger",
+                                        disabled: busy(),
+                                        onclick: move |_| confirm.set(Some(ConfirmAction::Cancel)),
+                                        "Cancel"
+                                    }
+                                }
+                            }
                             dl { class: "task-timestamps",
                                 dt { "Created" }
                                 dd { "{task.created_at}" }
@@ -392,11 +655,32 @@ pub fn TaskDetail(id: String) -> Element {
                             h2 { "Output" }
                             OutputViewer { text: output_text, truncated: output_truncated }
                         }
+                        if let Some(action) = confirm() {
+                            ConfirmDialog {
+                                title: action.title().to_string(),
+                                message: action.message(&task.name),
+                                confirm_label: action.confirm_label().to_string(),
+                                danger: action.danger(),
+                                busy: busy(),
+                                on_close: move |_| confirm.set(None),
+                                on_confirm: move |_| {
+                                    confirm.set(None);
+                                    run_task_command(state, busy, toast, refresh, task.id, action);
+                                },
+                            }
+                        }
                     }
                 }
                 None => rsx! {
                     p { class: "loading", "Loading…" }
                 },
+            }
+            if let Some((kind, message)) = toast() {
+                Toast {
+                    kind,
+                    message,
+                    on_dismiss: move |_| toast.set(None),
+                }
             }
         }
     }
@@ -468,6 +752,37 @@ mod tests {
         assert_eq!(format_duration(Some(0), Some(1_200)), "1.2s");
         assert_eq!(format_duration(Some(0), Some(184_000)), "3m04s");
         assert_eq!(format_duration(Some(0), Some(7_200_000)), "2h00m");
+    }
+
+    #[test]
+    fn is_terminal_covers_only_finished_states() {
+        assert!(is_terminal(TaskStatus::Succeeded));
+        assert!(is_terminal(TaskStatus::Failed));
+        assert!(is_terminal(TaskStatus::Cancelled));
+        assert!(!is_terminal(TaskStatus::Pending));
+        assert!(!is_terminal(TaskStatus::Running));
+        assert!(!is_terminal(TaskStatus::AwaitingInput));
+    }
+
+    #[test]
+    fn parse_task_input_accepts_empty_and_rejects_invalid() {
+        assert_eq!(parse_task_input(""), Ok(None));
+        assert_eq!(parse_task_input("   "), Ok(None));
+        assert_eq!(
+            parse_task_input(r#"{"issue_id":247}"#),
+            Ok(Some(serde_json::json!({ "issue_id": 247 })))
+        );
+        assert!(parse_task_input("not json").is_err());
+    }
+
+    #[test]
+    fn confirm_action_labels_danger_and_messages() {
+        assert_eq!(ConfirmAction::Cancel.title(), "Cancel task");
+        assert_eq!(ConfirmAction::Retry.title(), "Retry task");
+        assert!(ConfirmAction::Cancel.danger());
+        assert!(!ConfirmAction::Retry.danger());
+        assert!(ConfirmAction::Cancel.message("build").contains("build"));
+        assert!(ConfirmAction::Retry.message("build").contains("build"));
     }
 
     fn with_state(view: fn() -> Element) -> Element {
