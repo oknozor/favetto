@@ -6,6 +6,7 @@ use favetto_wire::rpc::{CatalogEntry, CatalogGetParams, EmptyParams};
 
 use crate::app::Route;
 use crate::client::RpcClient;
+use crate::components::icon::{AppIcon, AppIconKind};
 use crate::components::markdown::{split_frontmatter, Markdown};
 use crate::components::start_task::StartTaskDialog;
 use crate::components::toast::{Toast, ToastKind};
@@ -198,7 +199,10 @@ pub fn CatalogDetail(name: Vec<String>) -> Element {
 
     rsx! {
         main { id: "favetto-app", class: "catalog-detail",
-            Link { to: Route::Catalog {}, class: "back-link", "← Catalog" }
+            Link { to: Route::Catalog {}, class: "back-link",
+                AppIcon { kind: AppIconKind::Back, class: "icon-inline" }
+                " Catalog"
+            }
             h1 { "{name}" }
             match &*resource.read_unchecked() {
                 None => rsx! { p { class: "loading", "Loading…" } },

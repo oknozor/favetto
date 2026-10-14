@@ -15,6 +15,7 @@ use crate::app::Route;
 use crate::client::RpcClient;
 use crate::components::agent_feed::{summary_feed, AgentFeed, AgentLog};
 use crate::components::dialog::ConfirmDialog;
+use crate::components::icon::{AppIcon, AppIconKind};
 use crate::components::output_viewer::{extract_output_text, extract_run_summary, OutputViewer};
 use crate::components::start_task::StartTaskDialog;
 use crate::components::toast::{Toast, ToastKind};
@@ -459,7 +460,10 @@ pub fn TaskDetail(id: String) -> Element {
     let now = now_ms();
     rsx! {
         main { id: "favetto-app", class: "task-detail",
-            Link { to: Route::TasksList {}, class: "back-link", "← Tasks" }
+            Link { to: Route::TasksList {}, class: "back-link",
+                AppIcon { kind: AppIconKind::Back, class: "icon-inline" }
+                " Tasks"
+            }
             match detail() {
                 Some(Err(e)) => rsx! {
                     div { class: "error-panel", "Failed to load task: {e}" }
@@ -651,7 +655,10 @@ pub fn TaskDetail(id: String) -> Element {
 fn not_found_panel(id: &str) -> Element {
     rsx! {
         main { id: "favetto-app", class: "task-detail",
-            Link { to: Route::TasksList {}, class: "back-link", "← Tasks" }
+            Link { to: Route::TasksList {}, class: "back-link",
+                AppIcon { kind: AppIconKind::Back, class: "icon-inline" }
+                " Tasks"
+            }
             div { class: "error-panel", "Task not found: {id}" }
         }
     }

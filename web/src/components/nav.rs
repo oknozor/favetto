@@ -12,6 +12,7 @@
 use dioxus::prelude::*;
 
 use crate::app::Route;
+use crate::components::icon::{AppIcon, AppIconKind};
 use crate::components::repo_switcher::RepoSwitcher;
 
 /// One top-level destination in the primary navigation.
@@ -54,15 +55,15 @@ impl NavSection {
         }
     }
 
-    /// A decorative glyph shown next to the label (hidden from assistive tech).
-    pub fn icon(self) -> &'static str {
+    /// A decorative icon shown next to the label (hidden from assistive tech).
+    pub fn icon(self) -> AppIconKind {
         match self {
-            NavSection::Inbox => "📥",
-            NavSection::Tasks => "✅",
-            NavSection::Catalog => "📚",
-            NavSection::Workflow => "🔀",
-            NavSection::Schedules => "⏰",
-            NavSection::Settings => "⚙️",
+            NavSection::Inbox => AppIconKind::Inbox,
+            NavSection::Tasks => AppIconKind::Tasks,
+            NavSection::Catalog => AppIconKind::Catalog,
+            NavSection::Workflow => AppIconKind::Workflow,
+            NavSection::Schedules => AppIconKind::Schedules,
+            NavSection::Settings => AppIconKind::Settings,
         }
     }
 
@@ -113,7 +114,7 @@ pub fn AppNav() -> Element {
                         "app-nav-item"
                     },
                     aria_current: if current == Some(section) { "page" } else { "false" },
-                    span { class: "app-nav-icon", aria_hidden: "true", "{section.icon()}" }
+                    AppIcon { kind: section.icon(), class: "app-nav-icon" }
                     span { class: "app-nav-label", "{section.label()}" }
                 }
             }
@@ -179,16 +180,17 @@ mod tests {
         unique_labels.sort_unstable();
         unique_labels.dedup();
         assert_eq!(unique_labels.len(), NavSection::ALL.len());
-        let mut unique_icons = icons.clone();
-        unique_icons.sort_unstable();
-        unique_icons.dedup();
-        assert_eq!(unique_icons.len(), NavSection::ALL.len());
+        // Each section has its own icon; no two share one.
+        for (i, icon) in icons.iter().enumerate() {
+            for other in &icons[i + 1..] {
+                assert_ne!(icon, other, "duplicate nav icon");
+            }
+        }
         // Each section links to a route that maps back to itself, so the
         // highlighted section matches the route it points at.
         for section in NavSection::ALL {
             assert_eq!(section_for(&section.route()), Some(section));
             assert!(!section.label().is_empty());
-            assert!(!section.icon().is_empty());
         }
     }
 }

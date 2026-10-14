@@ -122,7 +122,9 @@ Two browser constraints drive the design and are worth stating up front:
 **Drop**
 
 - JSON-Schema → TypeScript codegen and a Node build step: Dioxus shares the Rust
-  types, so there is nothing to regenerate.
+  types, so there is nothing to regenerate. (Tailwind CSS is compiled by `dx`
+  itself during `serve`/`build`, so adopting it adds no Node toolchain either —
+  see §8.5.)
 - Full terminal parity in v1 (deliberate; see §11 Phase 5).
 - Any new `TaskStatus`, config-driven scheduling policy, or in-daemon supervisor.
 
@@ -349,6 +351,24 @@ envelope summary remain reachable from the log.
 Markdown rendering uses a WASM-friendly Rust parser; the DAG view is emitted as
 SVG directly by Dioxus.
 
+### 8.5 Styling and icons
+
+Styling is **Tailwind CSS v4**, driven by one `web/tailwind.css` entry that
+defines the favetto palette as theme tokens, the light/dark palettes (a single
+`prefers-color-scheme` block bound to the `<meta name="color-scheme">` value),
+and a small component layer for the idioms that are not worth inlining. `dx`
+autodetects the file and runs the bundled Tailwind CLI (v4.1.5) to build
+`web/assets/tailwind.css` before the Rust compile for both `dx serve` and
+`dx build`; the generated file is committed and guarded in CI. No Node or npm is
+involved.
+
+Icons are **Phosphor**, rendered through one `AppIcon` wrapper
+(`web/src/components/icon.rs`) and an `AppIconKind` enum that every navigation,
+status, event and action site maps onto. Decorative icons render
+`aria-hidden="true"` and inherit `currentColor`; icon-only controls keep an
+explicit accessible name. The old emoji/unicode glyphs and the hand-written
+`web/assets/style.css` are gone.
+
 ### 8.4 Onboarding
 
 The onboarding screen signs in with a username and password against
@@ -518,3 +538,8 @@ field becomes required.
    a closed app, and `ntfy` already exists with zero new daemon code.
 5. **v1 is triage + monitor.** Live terminal and the visual DAG are deferred to
    Phase 5.
+6. **Tailwind CSS v4 + Phosphor icons.** The hand-written `style.css` and the
+   platform-dependent emoji glyphs are replaced by a Tailwind theme compiled by
+   `dx` and a shared Phosphor `AppIcon` wrapper. This reverses the #278 "no CSS
+   framework" non-goal while keeping the no-Node property: `dx` runs the Tailwind
+   CLI itself, and the generated `assets/tailwind.css` is committed and guarded.

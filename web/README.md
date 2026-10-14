@@ -44,6 +44,27 @@ dx build --locked --release --platform android --features mobile --target aarch6
 dx bundle --locked --platform android --package-types apk --features mobile --target aarch64-linux-android
 ```
 
+## Styling and icons
+
+Styling is **Tailwind CSS v4**. `dx` autodetects the root [`tailwind.css`](./tailwind.css)
+and runs its bundled Tailwind CLI (v4.1.5) to generate `assets/tailwind.css`
+before the Rust compile, for both `dx serve` and `dx build`. There is **no Node
+or npm toolchain**.
+
+The generated `assets/tailwind.css` is committed so the host `cargo test` and
+`cargo clippy` builds — which expand the `asset!("/assets/tailwind.css")` macro —
+succeed without first running `dx`. **After editing `tailwind.css`, regenerate
+it** so the committed artifact does not drift (CI enforces this):
+
+```bash
+dx build --platform web    # regenerates assets/tailwind.css as part of the build
+```
+
+The design tokens (palette, radii, shadows, fonts) live in the `@theme` block;
+light/dark are one `prefers-color-scheme` token flip. Icons are
+[Phosphor](https://phosphoricons.com/), rendered through one `AppIcon` wrapper in
+`src/components/icon.rs`; there are no emoji/unicode icon glyphs in the client.
+
 ## Checks
 
 ```bash

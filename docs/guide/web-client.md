@@ -114,6 +114,25 @@ cargo fmt --all -- --check
 cargo test --locked
 ```
 
+### Styling and icons
+
+The client is styled with **Tailwind CSS v4** and a **Phosphor** icon set.
+
+`dx` autodetects `web/tailwind.css` and runs its bundled Tailwind CLI to build
+`web/assets/tailwind.css` before the Rust compile, for both `dx serve` and
+`dx build` — no Node/npm is involved. The generated `assets/tailwind.css` is
+committed (host `cargo test`/`cargo clippy` need it, since they expand the
+`asset!` macro), so regenerate it after editing `tailwind.css`:
+
+```bash
+cd web
+dx build --platform web
+```
+
+CI runs `git diff --exit-code -- assets/tailwind.css` after the bundle to catch
+drift. Icons are rendered through the shared `AppIcon` wrapper
+(`web/src/components/icon.rs`) rather than emoji/unicode glyphs.
+
 ## Android app
 
 The Android build cross-compiles the same Dioxus codebase to a native APK.

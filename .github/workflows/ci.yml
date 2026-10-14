@@ -165,6 +165,11 @@ jobs:
       - name: Build the web bundle
         run: dx bundle --locked --release --platform web
         working-directory: web
+      - name: Check the committed Tailwind CSS is current
+        # `dx bundle` regenerates `assets/tailwind.css` from `tailwind.css`; a
+        # diff means the committed artifact drifted and must be regenerated.
+        run: git diff --exit-code -- assets/tailwind.css
+        working-directory: web
       - name: Stage the bundle for the daemon's rust-embed
         # Dioxus 0.7 emits the web bundle under `dist/public`; the daemon embeds
         # `web/dist`, so flatten it there (the committed `index.html` is only the
