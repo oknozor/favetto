@@ -10,6 +10,7 @@ use dioxus::prelude::*;
 use crate::config;
 use crate::state::{onboarding_step, AppState, ConnectionState, OnboardingStep};
 use crate::views::pair::Pair;
+use crate::views::tasks::{TaskDetail, TasksList};
 
 /// Deep-linkable client routes.
 ///
@@ -24,6 +25,12 @@ pub enum Route {
     /// Onboarding: configure the daemon (Android) and exchange a pairing code.
     #[route("/pair")]
     Pair {},
+    /// The task list, filterable by status.
+    #[route("/tasks")]
+    TasksList {},
+    /// A single task with its run history, failure detail and output.
+    #[route("/tasks/:id")]
+    TaskDetail { id: String },
 }
 
 /// The application root: stylesheet, layout shell, and router outlet.
@@ -213,6 +220,7 @@ fn Home() -> Element {
             if (state.connection)().is_connected() {
                 p { "Connection: connected." }
             }
+            Link { to: Route::TasksList {}, "Tasks" }
         }
     }
 }

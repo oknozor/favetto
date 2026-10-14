@@ -4,3 +4,4 @@
 //! Settings) land in follow-up issues (#244, #249, …).
 
 pub mod pair;
+pub mod tasks;
