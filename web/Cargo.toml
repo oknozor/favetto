@@ -44,6 +44,10 @@ web-sys = { version = "0.3", features = [
     "RequestInit",
     "Response",
     "ReadableStream",
+    "Notification",
+    "NotificationOptions",
+    "NotificationPermission",
+    "Document",
 ] }
 
 [features]

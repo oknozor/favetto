@@ -131,6 +131,7 @@ pub fn Settings() -> Element {
         main { id: "favetto-app", class: "settings-view",
             h1 { "Settings" }
             SessionSection {}
+            AppNotificationsSection {}
             NotificationsSection {}
             HooksSection {}
         }
@@ -192,6 +193,54 @@ fn SessionSection() -> Element {
                     nav.replace(Route::Pair {});
                 },
                 "Disconnect"
+            }
+        }
+    }
+}
+
+/// Browser/WebView notification permission and a test. Daemon channels (`ntfy`,
+/// webhook) are managed by [`NotificationsSection`].
+#[component]
+fn AppNotificationsSection() -> Element {
+    let mut state = use_context::<AppState>();
+    let mut busy = use_signal(|| false);
+    let permission = (state.notification_permission)();
+
+    let enable = move |_| {
+        busy.set(true);
+        spawn(async move {
+            let next = crate::notifications::request_permission().await;
+            state.notification_permission.set(next);
+            busy.set(false);
+        });
+    };
+    let test = move |_| {
+        crate::notifications::notify("favetto", "Test notification from favetto", "test");
+    };
+
+    rsx! {
+        section { class: "settings-section",
+            h2 { "App notifications" }
+            p { class: "settings-hint",
+                "Show a system notification when a task needs your input. Background paging to a closed app is handled by the daemon's ntfy channel."
+            }
+            dl { class: "settings-facts",
+                dt { "Permission" }
+                dd { span { class: "status-badge", "{permission.label()}" } }
+            }
+            div { class: "channel-actions",
+                button {
+                    class: "btn primary",
+                    disabled: busy() || permission.is_granted(),
+                    onclick: enable,
+                    "Enable notifications"
+                }
+                button {
+                    class: "btn",
+                    disabled: !permission.is_granted(),
+                    onclick: test,
+                    "Send test notification"
+                }
             }
         }
     }
@@ -528,6 +577,12 @@ mod tests {
     #[test]
     fn settings_view_mounts_with_state() {
         let mut dom = VirtualDom::new(|| with_state(|| rsx! { Settings {} }));
+        dom.rebuild_in_place();
+    }
+
+    #[test]
+    fn app_notifications_section_mounts_with_state() {
+        let mut dom = VirtualDom::new(|| with_state(|| rsx! { AppNotificationsSection {} }));
         dom.rebuild_in_place();
     }
 }
