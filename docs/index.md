@@ -73,7 +73,8 @@ step.
   [Variables & prompts](/guide/variables-and-prompts),
   [Embedded agents](/guide/agents),
   [Schedules & dependencies](/guide/schedules-and-dependencies),
-  [Webhooks](/guide/webhooks), [TUI](/guide/tui).
+  [Webhooks](/guide/webhooks), [Remote access](/guide/remote-access),
+  [Web & Android client](/guide/web-client), [TUI](/guide/tui).
 - **Reference** — [CLI](/reference/cli), [Configuration](/reference/config),
   [Task file format](/reference/tasks), [Event kinds](/reference/events),
   [Environment](/reference/environment), [Remote API](/reference/remote-api),
