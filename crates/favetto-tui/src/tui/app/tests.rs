@@ -2981,6 +2981,79 @@ fn repo_picker_backspace_widens_and_global_row_clears() {
 }
 
 #[test]
+fn menu_change_theme_opens_the_picker() {
+    let mut app = App::new();
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    for _ in 0..6 {
+        app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+    }
+    let action = app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
+    assert!(matches!(action, UiAction::None));
+    assert!(
+        matches!(app.popup, Popup::ThemePicker { .. }),
+        "expected the theme picker"
+    );
+}
+
+#[test]
+fn theme_picker_moves_and_skips_headers() {
+    let mut app = App::new();
+    app.open_theme_picker();
+    // The first choice is the first bundled theme, not the "Theme" header.
+    match &app.popup {
+        Popup::ThemePicker {
+            selected, entries, ..
+        } => {
+            assert!(entries[*selected].selectable(), "landed on a header");
+            assert_eq!(
+                entries[*selected],
+                ThemeChoice::Choice {
+                    theme: "opencode".to_string(),
+                    mode: ThemeMode::System,
+                    label: "Opencode".to_string(),
+                }
+            );
+        }
+        _ => panic!("expected the theme picker"),
+    }
+
+    // Moving down past the last theme choice skips the "Mode" header.
+    app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+    match &app.popup {
+        Popup::ThemePicker {
+            selected, entries, ..
+        } => {
+            assert!(entries[*selected].selectable());
+        }
+        _ => panic!("expected the theme picker"),
+    }
+}
+
+#[test]
+fn theme_picker_enter_commits_and_esc_restores() {
+    let mut app = App::new();
+    let original = app.theme;
+    app.open_theme_picker();
+    // Select Catppuccin (the second bundled theme) for a visible change.
+    app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
+    assert!(matches!(app.popup, Popup::None));
+    assert_eq!(app.theme_name, "catppuccin");
+    assert_eq!(app.theme, Theme::catppuccin_dark());
+
+    // Esc restores the original palette without committing.
+    app.popup = Popup::None;
+    let original_name = app.theme_name.clone();
+    app.open_theme_picker();
+    let restored = app.theme;
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::empty()));
+    assert!(matches!(app.popup, Popup::None));
+    assert_eq!(app.theme, restored);
+    assert_eq!(app.theme_name, original_name);
+    let _ = original;
+}
+
+#[test]
 fn menu_switch_repo_and_add_repo_open_their_surfaces() {
     let mut app = App::new();
     app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));

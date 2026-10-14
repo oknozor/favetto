@@ -260,9 +260,48 @@ a `task.updated` push all refresh the view.
 
 ## Theme
 
-The TUI selects a dark or light theme from the terminal background (an OSC 11
-query, then `COLORFGBG`, then dark). Set `FAVETTO_THEME=dark` or
-`FAVETTO_THEME=light` to override it. There is no theme file or picker.
+The TUI paints every surface through a semantic design-token theme (background,
+text, border, syntax and markdown groups, with raised-surface depth levels).
+Two built-in themes ship: **Opencode** (the default) and **Catppuccin**. Each
+has a dark and a light variant.
+
+- `[tui].theme` — the theme name. A built-in name, or a user theme loaded from
+  `~/.config/favetto/themes/<name>.json` (also searched in the config-local
+  `themes/` dir and the repo-local `.favetto/themes/`). Override with
+  `FAVETTO_THEME_NAME`.
+- `[tui].theme_mode` — `system` (the default; derives dark/light from the
+  terminal background via an OSC 11 query, then `COLORFGBG`, then dark), `dark`,
+  or `light`. Override with `FAVETTO_THEME=dark|light`.
+
+```toml
+# ~/.config/favetto/config.toml
+[tui]
+theme = "opencode"
+theme_mode = "system"
+```
+
+Press **Ctrl+P → Change theme** to preview and select a theme or mode for the
+session (the choice is not written back to the config). While the picker is
+open, ↑/↓ preview the highlighted entry, Enter keeps it, and Esc restores the
+previous theme. Set `NO_COLOR` (or run on a dumb terminal) to fall back to a
+colourless theme.
+
+A user theme is JSON with optional `dark`/`light` token maps; missing tokens
+inherit from the built-in default, and colours may be `#rrggbb`, `transparent`,
+or a `$hue.<hue>.<100..900>` reference:
+
+```json
+{
+  "name": "solarish",
+  "dark": {
+    "background.base": "#101418",
+    "text.action.primary": "#ffcc00"
+  }
+}
+```
+
+Set `[tui].show_header = false` to hide the tab bar and
+`[tui].show_footer = false` to hide the status line (both default true).
 
 ## Sound notifications
 

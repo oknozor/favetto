@@ -1,6 +1,7 @@
 //! TUI application state and the logic for folding server pushes into it.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -25,7 +26,7 @@ use crate::tasks::TaskVar;
 use super::sound::SoundCue;
 use super::term::TerminalView;
 use super::text_buffer::TextBuffer;
-use super::theme::Theme;
+use super::theme::{Theme, ThemeMode};
 
 mod input;
 mod task_vars;
@@ -191,6 +192,32 @@ pub enum Popup {
         selected: usize,
         filter: TextBuffer,
     },
+    /// The Ctrl+P "Change theme" picker: a list of theme/mode choices with
+    /// headers, previewing the selection live and restoring on `Esc`.
+    ThemePicker {
+        selected: usize,
+        entries: Vec<ThemeChoice>,
+        original: Theme,
+    },
+}
+
+/// One row of the theme picker: a non-selectable section header, or a choice
+/// pairing a theme name with a [`ThemeMode`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThemeChoice {
+    Header(&'static str),
+    Choice {
+        theme: String,
+        mode: ThemeMode,
+        label: String,
+    },
+}
+
+impl ThemeChoice {
+    /// Whether navigation may land on this entry.
+    pub fn selectable(&self) -> bool {
+        matches!(self, ThemeChoice::Choice { .. })
+    }
 }
 
 pub struct Form {
@@ -436,13 +463,14 @@ impl CatalogEntry {
 }
 
 /// The Ctrl+P menu entries, in order.
-pub const MENU_OPTIONS: [&str; 6] = [
+pub const MENU_OPTIONS: [&str; 7] = [
     "New one-shot task",
     "Add task to catalog",
     "Create schedule",
     "Create notification hook",
     "Switch repo",
     "Add repo",
+    "Change theme",
 ];
 
 /// A clickable screen region (absolute coordinates), populated during draw.
@@ -494,6 +522,20 @@ pub fn repo_label(repo: Option<&str>) -> &str {
 pub struct App {
     /// The colour palette every widget paints through.
     pub theme: Theme,
+    /// The selected built-in/user theme name.
+    pub theme_name: String,
+    /// The selected mode (`system`/`dark`/`light`).
+    pub theme_mode: ThemeMode,
+    /// The mode `system` resolved to at startup (used for live previews).
+    pub system_mode: ThemeMode,
+    /// Directories scanned for user `*.json` themes.
+    pub theme_dirs: Vec<PathBuf>,
+    /// User theme file stems discovered at startup.
+    pub user_themes: Vec<String>,
+    /// Whether the tab bar is shown.
+    pub show_header: bool,
+    /// Whether the status line is shown.
+    pub show_footer: bool,
     pub tab: Tab,
     pub conn: ConnState,
     pub conn_detail: String,
@@ -637,7 +679,8 @@ pub struct App {
 }
 
 impl App {
-    /// The default test/initial palette. Production resolves [`Theme::detect`].
+    /// The default test/initial palette. Production resolves the configured
+    /// theme with [`super::theme::Theme::resolve`].
     #[cfg(test)]
     pub fn new() -> Self {
         Self::with_theme(Theme::dark())
@@ -646,6 +689,13 @@ impl App {
     pub fn with_theme(theme: Theme) -> Self {
         Self {
             theme,
+            theme_name: "opencode".to_string(),
+            theme_mode: ThemeMode::System,
+            system_mode: ThemeMode::Dark,
+            theme_dirs: Vec::new(),
+            user_themes: Vec::new(),
+            show_header: true,
+            show_footer: true,
             tab: Tab::Tasks,
             conn: ConnState::Connecting,
             conn_detail: String::new(),
@@ -1460,6 +1510,11 @@ impl App {
             self.open_repo_picker();
             return UiAction::OpenRepoPicker;
         }
+        // The "Change theme" entry opens the theme picker.
+        if selected == 6 {
+            self.open_theme_picker();
+            return UiAction::None;
+        }
         let kind = match selected {
             1 => FormKind::AddTask,
             2 => FormKind::CreateSchedule,
@@ -1502,6 +1557,114 @@ impl App {
             input: TextBuffer::default(),
         });
         UiAction::None
+    }
+
+    /// Open the Ctrl+P "Change theme" picker, previewing the highlighted choice.
+    pub fn open_theme_picker(&mut self) {
+        let entries = self.theme_entries();
+        let selected = entries
+            .iter()
+            .position(ThemeChoice::selectable)
+            .unwrap_or(0);
+        let original = self.theme;
+        self.popup = Popup::ThemePicker {
+            selected,
+            entries,
+            original,
+        };
+    }
+
+    /// The rows of the theme picker: bundled themes, user themes, then modes.
+    pub fn theme_entries(&self) -> Vec<ThemeChoice> {
+        let mut entries = vec![ThemeChoice::Header("Theme")];
+        for name in super::theme::ThemeName::ALL {
+            entries.push(ThemeChoice::Choice {
+                theme: name.key().to_string(),
+                mode: self.theme_mode,
+                label: name.label().to_string(),
+            });
+        }
+        for user in &self.user_themes {
+            entries.push(ThemeChoice::Choice {
+                theme: user.clone(),
+                mode: self.theme_mode,
+                label: format!("{user} (user)"),
+            });
+        }
+        entries.push(ThemeChoice::Header("Mode"));
+        for mode in ThemeMode::ALL {
+            entries.push(ThemeChoice::Choice {
+                theme: self.theme_name.clone(),
+                mode,
+                label: mode.label().to_string(),
+            });
+        }
+        entries
+    }
+
+    /// Move the picker selection by `delta`, skipping section headers, and
+    /// apply the new choice as a live preview.
+    pub fn move_theme_selection(&mut self, delta: isize) {
+        let len = match &self.popup {
+            Popup::ThemePicker { entries, .. } => entries.len(),
+            _ => return,
+        };
+        let current = match &self.popup {
+            Popup::ThemePicker { selected, .. } => *selected,
+            _ => return,
+        };
+        let mut next = current as isize;
+        loop {
+            next += delta;
+            if next < 0 || next as usize >= len {
+                return;
+            }
+            let selectable = match &self.popup {
+                Popup::ThemePicker { entries, .. } => {
+                    entries.get(next as usize).map(ThemeChoice::selectable)
+                }
+                _ => None,
+            };
+            if selectable == Some(true) {
+                break;
+            }
+        }
+        if let Popup::ThemePicker { selected, .. } = &mut self.popup {
+            *selected = next as usize;
+        }
+        self.preview_selected_theme();
+    }
+
+    /// Resolve the highlighted choice and store it as the live preview palette.
+    pub fn preview_selected_theme(&mut self) {
+        let (theme, mode) = match &self.popup {
+            Popup::ThemePicker {
+                selected, entries, ..
+            } => match entries.get(*selected) {
+                Some(ThemeChoice::Choice { theme, mode, .. }) => (theme.clone(), *mode),
+                _ => return,
+            },
+            _ => return,
+        };
+        self.theme = Theme::resolve(&theme, mode, &self.theme_dirs, self.system_mode);
+    }
+
+    /// Commit the highlighted choice (the preview palette is already applied).
+    pub fn commit_theme_selection(&mut self) {
+        let choice = match &self.popup {
+            Popup::ThemePicker {
+                selected, entries, ..
+            } => match entries.get(*selected) {
+                Some(ThemeChoice::Choice { theme, mode, .. }) => Some((theme.clone(), *mode)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((theme, mode)) = choice {
+            self.theme_name = theme;
+            self.theme_mode = mode;
+        }
+        self.popup = Popup::None;
     }
 
     /// Open the one-shot wizard with the configured agents.

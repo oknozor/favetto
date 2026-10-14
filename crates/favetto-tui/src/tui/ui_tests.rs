@@ -19,9 +19,20 @@ fn session(id: &str, agent: &str, headless: bool, running: bool) -> AgentSession
     }
 }
 
+/// Every built-in palette, so render tests exercise all colour paths.
+fn all_themes() -> Vec<Theme> {
+    vec![
+        Theme::opencode_dark(),
+        Theme::opencode_light(),
+        Theme::catppuccin_dark(),
+        Theme::catppuccin_light(),
+        Theme::monochrome(),
+    ]
+}
+
 #[test]
 fn tab_regions_cover_every_tab() {
-    let regions = tab_click_regions(0, 0);
+    let regions = tab_layout(&Tab::ALL, 0, 0);
     assert_eq!(regions.len(), Tab::ALL.len());
     for (i, (tab, start, end)) in regions.iter().enumerate() {
         assert_eq!(*tab, Tab::ALL[i]);
@@ -32,7 +43,7 @@ fn tab_regions_cover_every_tab() {
 
 #[test]
 fn all_tabs_render_without_panic() {
-    for theme in [Theme::dark(), Theme::light()] {
+    for theme in all_themes() {
         for tab in Tab::ALL {
             let mut app = App::with_theme(theme);
             app.tab = tab;
@@ -45,7 +56,7 @@ fn all_tabs_render_without_panic() {
 
 #[test]
 fn all_popups_render_without_panic() {
-    for theme in [Theme::dark(), Theme::light()] {
+    for theme in all_themes() {
         for popup in [
             Popup::Menu { selected: 0 },
             Popup::Form(Form {
@@ -139,6 +150,24 @@ fn all_popups_render_without_panic() {
                 selected: 0,
                 filter: TextBuffer::new("fav"),
             },
+            Popup::ThemePicker {
+                selected: 0,
+                entries: vec![
+                    ThemeChoice::Header("Theme"),
+                    ThemeChoice::Choice {
+                        theme: "opencode".to_string(),
+                        mode: super::super::theme::ThemeMode::Dark,
+                        label: "Opencode".to_string(),
+                    },
+                    ThemeChoice::Header("Mode"),
+                    ThemeChoice::Choice {
+                        theme: "opencode".to_string(),
+                        mode: super::super::theme::ThemeMode::Light,
+                        label: "Light".to_string(),
+                    },
+                ],
+                original: Theme::dark(),
+            },
         ] {
             let mut app = App::with_theme(theme);
             app.popup = popup;
@@ -193,9 +222,79 @@ fn base_surface_paints_theme_background() {
     let buffer = terminal.backend().buffer();
     // A cell inside an otherwise-empty notifications table row.
     let cell = buffer.cell((3, 2)).unwrap();
-    assert_eq!(cell.bg, theme.bg);
+    assert_eq!(cell.bg, theme.bg());
     // Guard against a regression to `Color::Reset` on the base paint.
-    assert_ne!(theme.bg, Color::Reset);
+    assert_ne!(theme.bg(), Color::Reset);
+}
+
+#[test]
+fn dialog_scrim_covers_the_frame() {
+    let theme = Theme::dark();
+    let mut app = App::with_theme(theme);
+    app.popup = Popup::Help { scroll: 0 };
+    let backend = TestBackend::new(100, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+    // A corner cell lies outside the centred dialog: the scrim covers it.
+    let scrim = theme.scrim().bg.expect("scrim has a background");
+    assert_eq!(terminal.backend().buffer().cell((0, 0)).unwrap().bg, scrim);
+    assert_ne!(scrim, theme.bg());
+}
+
+#[test]
+fn active_tab_uses_raised_surface_and_focus_underline() {
+    let theme = Theme::dark();
+    let mut app = App::with_theme(theme);
+    app.tab = Tab::Tasks;
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+    let regions = tab_layout(&Tab::ALL, 0, 0);
+    let (_, start, end) = regions[0];
+    let buffer = terminal.backend().buffer();
+    assert_eq!(
+        buffer.cell((start, 0)).unwrap().bg,
+        theme.background.raised.high
+    );
+    // The active tab's underline spans its columns on the second chrome row.
+    assert_eq!(
+        buffer.cell((start, 1)).unwrap().bg,
+        theme.border.active,
+        "underline missing at {start}"
+    );
+    // An inactive tab stays on the base surface.
+    let (_, next_start, _) = regions[1];
+    assert_eq!(buffer.cell((next_start, 0)).unwrap().bg, theme.bg());
+    let _ = end;
+}
+
+#[test]
+fn status_bar_degrades_at_eighty_columns() {
+    let mut app = App::new();
+    // The contextual hint is the lowest-priority right-hand segment.
+    let wide = render_text(&mut app, 200, 24);
+    assert!(
+        wide.contains("cancel root"),
+        "hint missing when wide: {wide:?}"
+    );
+    let narrow = render_text(&mut app, 80, 24);
+    assert!(
+        !narrow.contains("cancel root"),
+        "hint should be dropped at 80 columns: {narrow:?}"
+    );
+    assert!(narrow.contains("connected") || narrow.contains("connecting"));
+}
+
+#[test]
+fn theme_picker_renders_bundled_themes_and_modes() {
+    let mut app = App::with_theme(Theme::dark());
+    app.open_theme_picker();
+    let text = render_text(&mut app, 100, 40);
+    assert!(text.contains("Opencode"), "theme missing: {text:?}");
+    assert!(text.contains("Mode"), "mode header missing: {text:?}");
+    assert!(text.contains("System"), "mode choice missing: {text:?}");
 }
 
 #[test]
@@ -532,8 +631,8 @@ fn agent_default_colors_adopt_theme() {
     parser.process(b"plain");
     let cell = parser.screen().cell(0, 0).unwrap();
     let style = cell_style(cell, theme);
-    assert_eq!(style.fg, Some(theme.fg));
-    assert_eq!(style.bg, Some(theme.bg));
+    assert_eq!(style.fg, Some(theme.fg()));
+    assert_eq!(style.bg, Some(theme.bg()));
 
     // Explicit colours are preserved, not replaced by the theme default.
     let mut parser = vt100::Parser::new(4, 20, 0);

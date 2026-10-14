@@ -140,7 +140,19 @@ pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
     enable_raw_mode().context("enable raw mode")?;
     // Resolve the palette now, before the input-reader thread exists: the OSC 11
     // query needs to read the terminal's reply from stdin itself.
-    let theme = theme::Theme::detect();
+    let system_mode = theme::Theme::detect_mode();
+    let theme_name = match std::env::var("FAVETTO_THEME_NAME") {
+        Ok(name) if !name.trim().is_empty() => name.trim().to_string(),
+        _ => config.tui.theme.clone(),
+    };
+    let theme_mode = std::env::var("FAVETTO_THEME")
+        .ok()
+        .and_then(|value| theme::ThemeMode::from_key(&value))
+        .or_else(|| theme::ThemeMode::from_key(&config.tui.theme_mode))
+        .unwrap_or(theme::ThemeMode::System);
+    let theme_dirs = theme_directories(&config_path);
+    let user_themes = theme::Theme::discover_user_themes(&theme_dirs);
+    let theme = theme::Theme::resolve(&theme_name, theme_mode, &theme_dirs, system_mode);
     let mut stdout = io::stdout();
     execute!(
         stdout,
@@ -173,6 +185,13 @@ pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
     });
 
     let mut app = App::with_theme(theme);
+    app.theme_name = theme_name;
+    app.theme_mode = theme_mode;
+    app.system_mode = system_mode;
+    app.theme_dirs = theme_dirs;
+    app.user_themes = user_themes;
+    app.show_header = config.tui.show_header;
+    app.show_footer = config.tui.show_footer;
     app.sound_enabled = sound_cfg.enabled;
     let mut backoff = INITIAL_BACKOFF;
     let result = loop {
@@ -1436,6 +1455,30 @@ fn transport_desc(t: &Transport) -> String {
         Transport::Unix(p) => format!("unix://{}", p.display()),
         Transport::Ws { url, .. } => url.clone(),
     }
+}
+
+/// Directories searched for user theme files, in order: the config-local
+/// `themes/`, the XDG/`FAVETTO_THEME_DIR` themes dir, then the repo-local
+/// `.favetto/themes/`.
+fn theme_directories(config_path: &std::path::Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(parent) = config_path.parent() {
+        let local = parent.join("themes");
+        if !dirs.contains(&local) {
+            dirs.push(local);
+        }
+    }
+    let default = favetto_core::paths::default_themes_dir();
+    if !dirs.contains(&default) {
+        dirs.push(default);
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let repo = cwd.join(".favetto").join("themes");
+        if !dirs.contains(&repo) {
+            dirs.push(repo);
+        }
+    }
+    dirs
 }
 
 #[cfg(test)]

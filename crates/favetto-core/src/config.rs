@@ -114,7 +114,7 @@ impl Default for AuthSettings {
 }
 
 /// TUI-only settings. The daemon parses but ignores this section.
-#[derive(Debug, Clone, Default, JsonSchema, Serialize, Deserialize)]
+#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 pub struct TuiSettings {
     #[serde(default)]
     pub sound: SoundSettings,
@@ -122,6 +122,34 @@ pub struct TuiSettings {
     /// `$EDITOR`, then `vi`. May include arguments (e.g. `code --wait`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor: Option<String>,
+    /// Built-in (`opencode`, `catppuccin`) or user theme name. A user theme is
+    /// loaded from `themes/<name>.json` in the config or `.favetto/themes`
+    /// directory. Overridable with `FAVETTO_THEME_NAME`.
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    /// Theme mode: `system` (derive from the terminal), `dark`, or `light`.
+    /// Overridable with `FAVETTO_THEME`.
+    #[serde(default = "default_theme_mode")]
+    pub theme_mode: String,
+    /// Show the tab bar. Default true.
+    #[serde(default = "default_true")]
+    pub show_header: bool,
+    /// Show the status line. Default true.
+    #[serde(default = "default_true")]
+    pub show_footer: bool,
+}
+
+impl Default for TuiSettings {
+    fn default() -> Self {
+        Self {
+            sound: SoundSettings::default(),
+            editor: None,
+            theme: default_theme(),
+            theme_mode: default_theme_mode(),
+            show_header: true,
+            show_footer: true,
+        }
+    }
 }
 
 /// Client-side sound notifications for the TUI.
@@ -523,6 +551,14 @@ fn default_true() -> bool {
     true
 }
 
+fn default_theme() -> String {
+    "opencode".to_string()
+}
+
+fn default_theme_mode() -> String {
+    "system".to_string()
+}
+
 fn default_sound_player() -> String {
     "auto".to_string()
 }
@@ -850,6 +886,33 @@ mod tests {
         // Unset stays `None` so resolution can fall back to `$VISUAL`/`$EDITOR`.
         let default: FavettoConfig = toml::from_str("").unwrap();
         assert!(default.tui.editor.is_none());
+    }
+
+    #[test]
+    fn tui_theme_defaults() {
+        let cfg: FavettoConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.tui.theme, "opencode");
+        assert_eq!(cfg.tui.theme_mode, "system");
+        assert!(cfg.tui.show_header);
+        assert!(cfg.tui.show_footer);
+    }
+
+    #[test]
+    fn parses_tui_theme_keys() {
+        let cfg: FavettoConfig = toml::from_str(
+            r#"
+            [tui]
+            theme = "catppuccin"
+            theme_mode = "light"
+            show_header = false
+            show_footer = false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.tui.theme, "catppuccin");
+        assert_eq!(cfg.tui.theme_mode, "light");
+        assert!(!cfg.tui.show_header);
+        assert!(!cfg.tui.show_footer);
     }
 
     #[test]
