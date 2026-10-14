@@ -142,7 +142,9 @@ mod tests {
         );
         assert_eq!(section_for(&Route::Catalog {}), Some(NavSection::Catalog));
         assert_eq!(
-            section_for(&Route::CatalogDetail { name: "foo".into() }),
+            section_for(&Route::CatalogDetail {
+                name: vec!["foo".into()]
+            }),
             Some(NavSection::Catalog)
         );
         assert_eq!(

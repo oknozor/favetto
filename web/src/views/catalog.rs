@@ -1,4 +1,4 @@
-//! Catalog list and detail views (`/catalog`, `/catalog/:name`).
+//! Catalog list and detail views (`/catalog`, `/catalog/:..name`).
 
 use dioxus::prelude::*;
 use favetto_wire::rpc::{CatalogEntry, CatalogGetParams, EmptyParams};
@@ -111,7 +111,7 @@ pub fn Catalog() -> Element {
             ul { class: "catalog-list",
                 for entry in visible.iter() {
                     li { key: "{entry.name}", class: "catalog-item",
-                        Link { to: Route::CatalogDetail { name: entry.name.clone() }, class: "catalog-link",
+                        Link { to: Route::CatalogDetail { name: entry.name.split('/').map(str::to_string).collect() }, class: "catalog-link",
                             span { class: "catalog-name", "{entry.name}" }
                             if !description(entry).is_empty() {
                                 span { class: "catalog-description", "{description(entry)}" }
@@ -129,10 +129,14 @@ pub fn Catalog() -> Element {
     }
 }
 
-/// `/catalog/:name` — one definition with its Markdown body.
+/// `/catalog/:..name` — one definition with its Markdown body.
+///
+/// The name arrives as route segments (repo-qualified identities contain a `/`)
+/// and is rejoined before it reaches `catalog.get`.
 #[component]
-pub fn CatalogDetail(name: String) -> Element {
+pub fn CatalogDetail(name: Vec<String>) -> Element {
     let state = use_context::<AppState>();
+    let name = name.join("/");
     let fetch_name = name.clone();
     let resource = use_resource(move || {
         let fetch_name = fetch_name.clone();

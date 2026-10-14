@@ -52,8 +52,13 @@ pub enum Route {
     #[route("/catalog")]
     Catalog {},
     /// One catalog definition, rendered as Markdown.
-    #[route("/catalog/:name")]
-    CatalogDetail { name: String },
+    ///
+    /// The name is a catch-all (`:..name`) because repo-qualified task
+    /// identities carry a `/` (`repo:<repo>/<task>`): the link splits the name
+    /// into segments and the view rejoins them. A single `String` segment would
+    /// leave the tail as a trailing segment the router cannot match.
+    #[route("/catalog/:..name")]
+    CatalogDetail { name: Vec<String> },
     /// The runtime workflow board plus the catalog graph.
     #[route("/workflow")]
     WorkflowList {},
@@ -333,9 +338,23 @@ mod tests {
     fn catalog_routes_serialize() {
         assert_eq!(Route::Catalog {}.to_string(), "/catalog");
         assert_eq!(
-            Route::CatalogDetail { name: "foo".into() }.to_string(),
+            Route::CatalogDetail {
+                name: vec!["foo".into()]
+            }
+            .to_string(),
             "/catalog/foo"
         );
+    }
+
+    /// Repo-qualified task names contain a `/`, so the detail route is a
+    /// catch-all: the split segments must round-trip to the original name.
+    #[test]
+    fn catalog_detail_route_round_trips_repo_qualified_names() {
+        let route = Route::CatalogDetail {
+            name: vec!["repo:Favetto".into(), "open_github_issue".into()],
+        };
+        assert_eq!(route.to_string(), "/catalog/repo:Favetto/open_github_issue");
+        assert_eq!(route.to_string().parse::<Route>().unwrap(), route);
     }
 
     #[test]
