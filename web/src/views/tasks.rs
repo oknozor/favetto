@@ -16,7 +16,7 @@ use crate::client::RpcClient;
 use crate::components::dialog::{ConfirmDialog, Dialog};
 use crate::components::output_viewer::{extract_output_text, OutputViewer};
 use crate::components::toast::{Toast, ToastKind};
-use crate::state::AppState;
+use crate::state::{repo_label, task_repo, AppState};
 
 /// The status chips above the task list.
 ///
@@ -296,7 +296,7 @@ pub fn TasksList() -> Element {
     let now = now_ms();
     let rows: Vec<Task> = {
         let cache = (state.cache)();
-        let mut rows: Vec<Task> = cache.tasks.values().cloned().collect();
+        let mut rows: Vec<Task> = cache.visible_tasks().into_iter().cloned().collect();
         rows.sort_by_key(|t| std::cmp::Reverse(t.created_at));
         rows.retain(|t| filter().matches(t.status));
         rows
@@ -338,6 +338,7 @@ pub fn TasksList() -> Element {
                                     StatusBadge { status: task.status }
                                 }
                                 div { class: "task-row-meta",
+                                    span { class: "task-repo", "{repo_label(task_repo(&task.name))}" }
                                     span { class: "task-age", "{format_age(task.created_at.timestamp_millis(), now)}" }
                                     span { class: "task-attempts", "{task.attempt} runs" }
                                 }
@@ -377,7 +378,10 @@ fn StartTaskDialog(on_close: EventHandler<()>, on_started: EventHandler<Task>) -
     let mut submitting = use_signal(|| false);
 
     // Catalog names power the `<datalist>` autocomplete. A failure here is not
-    // fatal: the user can still type any task name.
+    // fatal: the user can still type any task name. Repo-local names are
+    // returned already qualified (`repo:<name>/<path>`), so starting one runs it
+    // in the repo's cwd; the list stays unscoped so global tasks remain startable
+    // while a repo is active.
     let catalog = use_resource(move || {
         let base = (state.daemon_url)();
         let token = (state.token)();

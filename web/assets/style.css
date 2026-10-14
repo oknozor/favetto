@@ -1030,6 +1030,120 @@ body {
   }
 }
 
+/* Active-repo switcher: a persistent nav control plus its picker. ---------- */
+
+.repo-switcher {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  min-height: 44px;
+  margin-top: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 0.85rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.repo-switcher:hover {
+  background: color-mix(in srgb, currentColor 10%, transparent);
+}
+
+.repo-switcher-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.repo-picker-search {
+  width: 100%;
+}
+
+.repo-picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+
+.repo-option {
+  display: block;
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid transparent;
+  border-radius: 0.4rem;
+  background: rgba(127, 127, 127, 0.08);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.repo-option:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--primary) 15%, transparent);
+}
+
+.repo-option:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.repo-option-global {
+  font-style: italic;
+}
+
+/* The repo chip on task rows and cards. */
+.task-repo,
+.task-card-repo {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 0.75rem;
+  background: rgba(127, 127, 127, 0.16);
+}
+
+/* Banner above the catalog list naming the active repo. */
+.catalog-scope {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+/* Desktop (≥ 768px): pin the switcher to the bottom of the sidebar. */
+@media (min-width: 768px) {
+  .repo-switcher {
+    margin-top: auto;
+  }
+}
+
+/* Mobile (< 768px): a seventh tab in the bottom bar. */
+@media (max-width: 767px) {
+  .repo-switcher {
+    flex: 1 1 0;
+    flex-direction: column;
+    gap: 0.1rem;
+    width: auto;
+    min-width: 0;
+    margin-top: 0;
+    padding: 0.35rem 0.25rem;
+    border: none;
+    font-size: 0.7rem;
+  }
+
+  .repo-switcher-label {
+    max-width: 100%;
+  }
+}
+
 /* ---------------------------------------------------------------------------
    Settings & Schedules views
    --------------------------------------------------------------------------- */

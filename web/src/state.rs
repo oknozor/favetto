@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 
 use dioxus::prelude::*;
-use favetto_wire::model::{Event, Task};
+use favetto_wire::model::{Event, RepoInfo, Task};
 use favetto_wire::rpc::{push, CatalogEntry};
 use uuid::Uuid;
 
@@ -99,6 +99,10 @@ pub struct Cache {
     pub events: Vec<Event>,
     /// The catalog, sorted by name as `catalog.list` returns it.
     pub catalog: Vec<CatalogEntry>,
+    /// The known-repos registry, as `repos.list` returns it.
+    pub repos: Vec<RepoInfo>,
+    /// The daemon-wide active repo name; `None` means the global view.
+    pub active_repo: Option<String>,
     /// Highest durable event id seen; also the SSE resume cursor.
     pub cursor: Option<i64>,
 }
@@ -154,6 +158,84 @@ impl Cache {
             _ => false,
         }
     }
+
+    /// Store the fetched repo registry and active repo (`repos.list`).
+    pub fn set_repos(&mut self, repos: Vec<RepoInfo>, active: Option<String>) {
+        self.repos = repos;
+        self.active_repo = active;
+    }
+
+    /// Whether a row's repo namespace is in scope. With no active repo every
+    /// row is visible; otherwise only rows belonging to the active repo are.
+    ///
+    /// Mirrors `favetto_tui`'s `App::repo_visible`.
+    pub fn repo_visible(&self, repo: Option<&str>) -> bool {
+        match &self.active_repo {
+            Some(active) => repo == Some(active.as_str()),
+            None => true,
+        }
+    }
+
+    /// The repo a persisted event belongs to, derived from its payload.
+    ///
+    /// Task-lifecycle events carry `name`; the terminal/cron ones carry only
+    /// `task_id`, resolved against the known task list. `None` means a global
+    /// row (integration events, or a task we cannot resolve).
+    pub fn event_repo(&self, event: &Event) -> Option<String> {
+        if let Some(name) = event.payload.get("name").and_then(|v| v.as_str()) {
+            return task_repo(name).map(str::to_string);
+        }
+        let task_id = event.payload.get("task_id").and_then(|v| v.as_str())?;
+        let task_id = Uuid::parse_str(task_id).ok()?;
+        let task = self.tasks.values().find(|t| t.id == task_id)?;
+        task_repo(&task.name).map(str::to_string)
+    }
+
+    /// The task rows visible under the active repo.
+    pub fn visible_tasks(&self) -> Vec<&Task> {
+        self.tasks
+            .values()
+            .filter(|t| self.repo_visible(task_repo(&t.name)))
+            .collect()
+    }
+
+    /// The event rows visible under the active repo, ascending by id.
+    pub fn visible_events(&self) -> Vec<&Event> {
+        self.events
+            .iter()
+            .filter(|e| self.repo_visible(self.event_repo(e).as_deref()))
+            .collect()
+    }
+}
+
+/// Reserved prefix for repo-qualified task identities (`repo:<name>/<path>`).
+///
+/// Mirrors `favetto_core::tasks::REPO_PREFIX`. The web client links only
+/// `favetto-wire`, so [`task_repo`] re-derives the split here.
+pub const REPO_PREFIX: &str = "repo:";
+
+/// The repo namespace of a repo-qualified task name.
+///
+/// Returns `None` for a bare (global) name, or anything that does not start
+/// with [`REPO_PREFIX`] followed by non-empty `repo/relative-path` halves.
+pub fn task_repo(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix(REPO_PREFIX)?;
+    let (repo, rel) = rest.split_once('/')?;
+    if repo.is_empty() || rel.is_empty() {
+        None
+    } else {
+        Some(repo)
+    }
+}
+
+/// The display label for a repo: its name, or `global` for an unscoped row.
+pub fn repo_label(repo: Option<&str>) -> &str {
+    repo.unwrap_or("global")
+}
+
+/// The status-bar label for the active repo.
+pub fn active_repo_label(active: Option<&str>) -> String {
+    format!("repo: {}", repo_label(active))
 }
 
 /// Shared client handles, provided once at the app root.
@@ -447,5 +529,188 @@ mod tests {
             onboarding_step(false, "", Some("")),
             OnboardingStep::Pairing
         );
+    }
+
+    fn repo(name: &str, path: &str, available: bool, active: bool) -> RepoInfo {
+        RepoInfo {
+            name: name.to_string(),
+            path: path.to_string(),
+            available,
+            active,
+        }
+    }
+
+    fn make_task(name: &str) -> Task {
+        serde_json::from_value(serde_json::json!({
+            "id": Uuid::new_v4(),
+            "name": name,
+            "status": "pending",
+            "attempt": 0,
+            "input": {},
+            "output": null,
+            "dedupe_key": null,
+            "created_at": "2026-01-01T00:00:00Z",
+            "started_at": null,
+            "finished_at": null,
+            "error": null,
+            "failure": null,
+            "session_id": null,
+            "session_title": null,
+            "parent_id": null,
+            "root_id": null,
+            "interactive": false,
+        }))
+        .unwrap()
+    }
+
+    fn event_with(id: i64, kind: &str, payload: serde_json::Value) -> Event {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "kind": kind,
+            "payload": payload,
+            "created_at": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn task_repo_splits_only_well_formed_qualified_names() {
+        assert_eq!(task_repo("repo:favetto/triage"), Some("favetto"));
+        assert_eq!(task_repo("repo:web/pipelines/plan"), Some("web"));
+        assert_eq!(task_repo("triage"), None);
+        assert_eq!(task_repo("pipelines/plan"), None);
+        assert_eq!(task_repo("repo:"), None);
+        assert_eq!(task_repo("repo:noslash"), None);
+        assert_eq!(task_repo("repo:/rel"), None);
+        assert_eq!(task_repo("repo:name/"), None);
+    }
+
+    #[test]
+    fn active_repo_label_defaults_to_global() {
+        assert_eq!(active_repo_label(None), "repo: global");
+        assert_eq!(active_repo_label(Some("favetto")), "repo: favetto");
+        assert_eq!(repo_label(None), "global");
+        assert_eq!(repo_label(Some("favetto")), "favetto");
+    }
+
+    #[test]
+    fn repo_visible_scopes_rows_to_the_active_repo() {
+        let mut cache = Cache::default();
+        assert!(cache.repo_visible(None));
+        assert!(cache.repo_visible(Some("a")));
+
+        cache.set_repos(
+            vec![repo("a", "/code/a", true, true)],
+            Some("a".to_string()),
+        );
+        assert!(cache.repo_visible(Some("a")));
+        assert!(!cache.repo_visible(Some("b")));
+        assert!(!cache.repo_visible(None));
+    }
+
+    #[test]
+    fn visible_tasks_filters_by_active_repo() {
+        let mut cache = Cache::default();
+        cache.set_tasks(vec![
+            make_task("global_task"),
+            make_task("repo:a/one"),
+            make_task("repo:b/two"),
+        ]);
+        // The global view lists everything.
+        assert_eq!(cache.visible_tasks().len(), 3);
+
+        cache.active_repo = Some("a".to_string());
+        let visible = cache.visible_tasks();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].name, "repo:a/one");
+        assert_eq!(task_repo(&visible[0].name), Some("a"));
+        assert_eq!(repo_label(task_repo(&visible[0].name)), "a");
+    }
+
+    #[test]
+    fn event_repo_derives_from_name_and_task_id() {
+        let mut cache = Cache::default();
+        let local = make_task("repo:a/build");
+        let local_id = local.id.to_string();
+        cache.set_tasks(vec![local]);
+
+        // Lifecycle events carry `name` directly.
+        let named = event_with(
+            1,
+            "task_started",
+            serde_json::json!({ "name": "repo:a/build" }),
+        );
+        assert_eq!(cache.event_repo(&named).as_deref(), Some("a"));
+
+        // A bare name is global.
+        let global_named = event_with(2, "task_started", serde_json::json!({ "name": "build" }));
+        assert_eq!(cache.event_repo(&global_named), None);
+
+        // Terminal/cron events carry only `task_id`, resolved against the list.
+        let by_id = event_with(
+            3,
+            "task_completed",
+            serde_json::json!({ "task_id": local_id }),
+        );
+        assert_eq!(cache.event_repo(&by_id).as_deref(), Some("a"));
+
+        // An unresolved task id and an integration event both fall back to global.
+        let unknown = event_with(
+            4,
+            "task_failed",
+            serde_json::json!({ "task_id": Uuid::new_v4().to_string() }),
+        );
+        assert_eq!(cache.event_repo(&unknown), None);
+        let integration = event_with(
+            5,
+            "issue_created",
+            serde_json::json!({ "repo": "owner/name" }),
+        );
+        assert_eq!(cache.event_repo(&integration), None);
+    }
+
+    #[test]
+    fn visible_events_filters_by_active_repo() {
+        let mut cache = Cache::default();
+        let local = make_task("repo:a/build");
+        let local_id = local.id.to_string();
+        cache.set_tasks(vec![local]);
+        cache.push_event(event_with(
+            1,
+            "task_started",
+            serde_json::json!({ "name": "repo:a/build" }),
+        ));
+        cache.push_event(event_with(
+            2,
+            "task_started",
+            serde_json::json!({ "name": "global_task" }),
+        ));
+        cache.push_event(event_with(
+            3,
+            "task_completed",
+            serde_json::json!({ "task_id": local_id }),
+        ));
+
+        assert_eq!(cache.visible_events().len(), 3);
+        cache.active_repo = Some("a".to_string());
+        let ids: Vec<i64> = cache.visible_events().iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![1, 3]);
+    }
+
+    #[test]
+    fn set_repos_replaces_registry_and_active_repo() {
+        let mut cache = Cache::default();
+        cache.set_repos(
+            vec![
+                repo("a", "/code/a", true, true),
+                repo("b", "/code/b", false, false),
+            ],
+            Some("a".to_string()),
+        );
+        assert_eq!(cache.repos.len(), 2);
+        assert_eq!(cache.active_repo.as_deref(), Some("a"));
+        cache.set_repos(Vec::new(), None);
+        assert!(cache.repos.is_empty());
+        assert_eq!(cache.active_repo, None);
     }
 }
