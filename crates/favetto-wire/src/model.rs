@@ -472,6 +472,7 @@ impl Event {
 
 /// Role of a [`ChatMessage`] in an agent conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {
     System,

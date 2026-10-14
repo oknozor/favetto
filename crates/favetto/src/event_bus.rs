@@ -1,15 +1,17 @@
 //! In-process pub/sub hub plus the push types carried on it.
 //!
-//! The hub is intentionally simple: a `tokio::sync::broadcast` channel. Emitters
-//! persist to SQLite *before* publishing, so the bus only ever carries durable
-//! records. Slow clients that fall behind get a `Lagged` error; they can catch up
-//! via `events.subscribe { last_event_id }` because the event log is append-only.
+//! The hub is intentionally simple: a `tokio::sync::broadcast` channel. Event and
+//! task emitters persist to SQLite *before* publishing, so those pushes are
+//! durable. `agent.event` is the one non-durable push (it carries no event id and
+//! is backfilled via `tasks.events`). Slow clients that fall behind get a `Lagged`
+//! error; durable pushes can be caught up via `events.subscribe { last_event_id }`
+//! because the event log is append-only.
 
 use sqlx::SqlitePool;
 use tokio::sync::{broadcast, mpsc};
 
 use favetto_core::model::{Event, Task};
-use favetto_core::rpc::{push, Notification};
+use favetto_core::rpc::{push, AgentEventPush, Notification};
 
 /// Server → client push. Clients receive these as `Frame::Notification`.
 #[derive(Debug, Clone)]
@@ -21,6 +23,10 @@ pub enum ServerPush {
     TaskUpdated(Box<Task>),
     /// The task catalog changed on disk; clients should re-fetch it.
     CatalogUpdated,
+    /// One normalized agent-state event (non-durable). Carried on the bus so it
+    /// reaches every client, including the stateless HTTP/SSE web client; the
+    /// bounded per-session ring buffer behind `tasks.events` serves backfill.
+    AgentEvent(AgentEventPush),
 }
 
 impl ServerPush {
@@ -35,6 +41,10 @@ impl ServerPush {
             ServerPush::CatalogUpdated => Ok(Notification {
                 method: push::CATALOG_UPDATED.to_string(),
                 params: serde_json::json!({}),
+            }),
+            ServerPush::AgentEvent(ev) => Ok(Notification {
+                method: push::AGENT_EVENT.to_string(),
+                params: serde_json::to_value(ev)?,
             }),
         }
     }
@@ -155,6 +165,29 @@ mod tests {
             .into_notification()
             .expect("catalog push serialization");
         assert_eq!(n.method, push::CATALOG_UPDATED);
+    }
+
+    #[test]
+    fn agent_event_push_is_non_durable() {
+        use favetto_core::model::AgentStateEvent;
+        use favetto_core::rpc::AgentEventPush;
+
+        let push = ServerPush::AgentEvent(AgentEventPush {
+            session_id: "sess-1".to_string(),
+            task_id: Some("task-1".to_string()),
+            seq: 4,
+            event: AgentStateEvent::TurnStarted,
+        });
+        assert_eq!(push.event_id(), None);
+        let n = push.into_notification().expect("agent event serialization");
+        assert_eq!(n.method, push_method());
+        assert_eq!(n.params["session_id"], "sess-1");
+        assert_eq!(n.params["seq"], 4);
+        assert_eq!(n.params["event"]["event"], "turn_started");
+    }
+
+    fn push_method() -> &'static str {
+        favetto_core::rpc::push::AGENT_EVENT
     }
 
     #[test]

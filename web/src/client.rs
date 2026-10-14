@@ -184,6 +184,8 @@ typed_calls! {
     tasks_get => TasksGetCall,
     /// `tasks.runs`.
     tasks_runs => TasksRunsCall,
+    /// `tasks.events`.
+    tasks_events => TasksEventsCall,
     /// `tasks.cancel`.
     tasks_cancel => TasksCancelCall,
     /// `tasks.retry`.

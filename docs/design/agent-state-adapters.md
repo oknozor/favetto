@@ -336,6 +336,15 @@ client that misses a frame re-syncs on the next list.
 Add RPC `agents.reply` (`{ session_id, request_id, reply }`), documented in the
 generated remote-API reference.
 
+The same normalized stream also feeds the web Task view. Because the web client
+talks to the daemon over stateless `POST /rpc` plus one SSE stream, it never sees
+the per-connection `agent.state`/`agent.output` forwarder. Each event is instead
+buffered in a bounded per-session ring buffer and published on the event bus as a
+**non-durable** `agent.event` push (`{ session_id, task_id, seq, event }`); the
+web caches the feed and backfills it with `tasks.events { id, after, limit }`,
+keyed by `seq`. `agent.event` carries no durable id, so it never enters the event
+log or moves the resume cursor.
+
 ### 4.5 Awaiting input
 
 `attention::watch` gains a state branch:
@@ -366,6 +375,10 @@ Rules:
 `output.summary` = the `RunSummary`, plus the existing capped `raw`. This makes
 a dependent task's `prev.output` carry real text/tools/usage/outcome instead of
 a raw JSON event dump.
+
+`task.output` still carries the folded `RunSummary`, so it remains the post-run
+fallback (and the only view for agents without a structured state source); the
+web live feed augments rather than replaces it.
 
 The headless stream is a background concern: the Agent panel never renders it. A
 headless run consumes its own stdout for state/usage/session id, while the panel

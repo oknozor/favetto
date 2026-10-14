@@ -27,6 +27,7 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | `tasks.list` | List tasks (metadata only; output is omitted). |
 | `tasks.get` | Fetch a single task by id, including its stored output. |
 | `tasks.runs` | List a task's execution attempts (run history). |
+| `tasks.events` | Backfill a task's normalized agent-event feed from its session's bounded ring buffer (non-durable; `after`/`next_cursor` are per-session `seq`s). |
 | `tasks.cancel` | Cancel a task. |
 | `tasks.retry` | Retry a terminal task, preserving its prior run history. |
 | `tasks.start` | Start a catalog task by name. |
@@ -141,6 +142,26 @@ List a task's execution attempts (run history).
 **Response**
 
 TaskRun[]
+
+### `tasks.events`
+
+Backfill a task's normalized agent-event feed from its session's bounded ring buffer (non-durable; `after`/`next_cursor` are per-session `seq`s).
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `after` | integer (optional) | null | no |  |
+| `id` | string | — | yes |  |
+| `limit` | integer (optional) | null | no |  |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `events` | AgentEventPush[] | — | yes |  |
+| `next_cursor` | integer | — | yes |  |
+| `session_id` | string (optional) | — | no |  |
 
 ### `tasks.cancel`
 
@@ -855,6 +876,7 @@ Set (or clear) the daemon-wide active repository.
 | `agent.output` | Raw PTY output (base64) from a running agent session. |
 | `agent.exit` | An agent session's child process exited. |
 | `agent.state` | A session's folded live state (activity/usage) changed. |
+| `agent.event` | One normalized agent-state event, in order. Non-durable; backfill with `tasks.events`. |
 
 ## Server → client push payloads
 
@@ -940,6 +962,19 @@ A session's folded live state (activity/usage) changed.
 | `activity` | AgentActivity (optional) | — | no |  |
 | `session_id` | string | — | yes |  |
 | `usage` | AgentUsage (optional) | — | no |  |
+
+### `agent.event`
+
+One normalized agent-state event, in order. Non-durable; backfill with `tasks.events`.
+
+**Payload**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `event` | AgentStateEvent | — | yes |  |
+| `seq` | integer | — | yes |  |
+| `session_id` | string | — | yes |  |
+| `task_id` | string (optional) | — | no |  |
 
 ## Error codes
 

@@ -104,6 +104,9 @@ pub mod method {
     pub const TASKS_GET: &str = "tasks.get";
     /// List a task's execution attempts (run history), oldest-first.
     pub const TASKS_RUNS: &str = "tasks.runs";
+    /// Backfill a task's normalized agent-event feed from the live session's
+    /// bounded ring buffer (non-durable; `seq` is the per-session cursor).
+    pub const TASKS_EVENTS: &str = "tasks.events";
     pub const TASKS_CANCEL: &str = "tasks.cancel";
     /// Retry a terminal task, preserving its prior run history.
     pub const TASKS_RETRY: &str = "tasks.retry";
@@ -193,6 +196,9 @@ pub mod push {
     pub const AGENT_EXIT: &str = "agent.exit";
     /// A session's folded live state (activity/usage) changed.
     pub const AGENT_STATE: &str = "agent.state";
+    /// One normalized agent-state event, in order. Non-durable: it carries no
+    /// durable id and is backfilled via `tasks.events`, not the event log.
+    pub const AGENT_EVENT: &str = "agent.event";
 }
 
 /// Every client → server method, paired with a one-line purpose. Consumed by the
@@ -211,6 +217,11 @@ pub const CLIENT_METHODS: &[(&str, &str)] = &[
     (
         method::TASKS_RUNS,
         "List a task's execution attempts (run history).",
+    ),
+    (
+        method::TASKS_EVENTS,
+        "Backfill a task's normalized agent-event feed from its session's bounded \
+         ring buffer (non-durable; `after`/`next_cursor` are per-session `seq`s).",
     ),
     (method::TASKS_CANCEL, "Cancel a task."),
     (
@@ -351,6 +362,11 @@ pub const SERVER_PUSHES: &[(&str, &str)] = &[
         push::AGENT_STATE,
         "A session's folded live state (activity/usage) changed.",
     ),
+    (
+        push::AGENT_EVENT,
+        "One normalized agent-state event, in order. Non-durable; backfill with \
+         `tasks.events`.",
+    ),
 ];
 
 /// A client → server request.
@@ -453,6 +469,7 @@ mod tests {
             method::TASKS_LIST,
             method::TASKS_GET,
             method::TASKS_RUNS,
+            method::TASKS_EVENTS,
             method::TASKS_CANCEL,
             method::TASKS_RETRY,
             method::TASKS_START,
@@ -503,6 +520,7 @@ mod tests {
             push::AGENT_OUTPUT,
             push::AGENT_EXIT,
             push::AGENT_STATE,
+            push::AGENT_EVENT,
         ]
         .into_iter()
         .collect();

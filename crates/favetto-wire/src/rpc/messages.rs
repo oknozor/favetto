@@ -22,7 +22,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::agent_state::{AgentActivity, AgentUsage, InputReply, UsagePeriod, UsageStats};
+use crate::agent_state::{
+    AgentActivity, AgentStateEvent, AgentUsage, InputReply, UsagePeriod, UsageStats,
+};
 use crate::model::{
     AgentCatalogEntry, AgentSessionInfo, Event, NotificationRecord, RepoInfo, Schedule, Task,
     TaskRun,
@@ -96,6 +98,31 @@ pub type TasksGetResult = Task;
 
 /// `tasks.runs` result: every execution attempt for the task, oldest-first.
 pub type TasksRunsResult = Vec<TaskRun>;
+
+/// `tasks.events` params: the task id plus a per-session `seq` cursor. `after`
+/// is exclusive (return events with `seq > after`); `limit` defaults to 500 and
+/// caps at 2000.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TasksEventsParams {
+    pub id: Uuid,
+    #[serde(default, deserialize_with = "lenient")]
+    pub after: Option<u64>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub limit: Option<u64>,
+}
+
+/// `tasks.events` result: the task's structured feed, oldest-first. `session_id`
+/// is the resolved live (or most recent) session, `None` when the task has no
+/// structured state source (the web then keeps the plain output view).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TasksEventsResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub events: Vec<AgentEventPush>,
+    pub next_cursor: u64,
+}
 
 /// `tasks.cancel` result: the cancelled task, with `output` omitted.
 pub type TasksCancelResult = Task;
@@ -693,6 +720,18 @@ pub struct AgentStatePush {
     pub usage: Option<AgentUsage>,
 }
 
+/// `agent.event` push: one normalized agent-state event, in order. Non-durable;
+/// `seq` is monotonic per session and is the feed's backfill cursor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AgentEventPush {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    pub seq: u64,
+    pub event: AgentStateEvent,
+}
+
 // ---------------------------------------------------------------------------
 // typed call registry
 // ---------------------------------------------------------------------------
@@ -738,6 +777,8 @@ rpc_calls! {
     TasksGetCall => method::TASKS_GET, TaskIdParams, TasksGetResult;
     /// Typed call for `tasks.runs`.
     TasksRunsCall => method::TASKS_RUNS, TaskIdParams, TasksRunsResult;
+    /// Typed call for `tasks.events`.
+    TasksEventsCall => method::TASKS_EVENTS, TasksEventsParams, TasksEventsResult;
     /// Typed call for `tasks.cancel`.
     TasksCancelCall => method::TASKS_CANCEL, TaskIdParams, TasksCancelResult;
     /// Typed call for `tasks.retry`.
@@ -851,6 +892,11 @@ pub const CLIENT_CALLS: &[RpcCallSpec] = &[
         method: method::TASKS_RUNS,
         params_schema: schema_of::<TaskIdParams>,
         result_schema: schema_of::<TasksRunsResult>,
+    },
+    RpcCallSpec {
+        method: method::TASKS_EVENTS,
+        params_schema: schema_of::<TasksEventsParams>,
+        result_schema: schema_of::<TasksEventsResult>,
     },
     RpcCallSpec {
         method: method::TASKS_CANCEL,
@@ -1066,6 +1112,10 @@ pub const PUSH_CALLS: &[PushSpec] = &[
         method: super::push::AGENT_STATE,
         params_schema: schema_of::<AgentStatePush>,
     },
+    PushSpec {
+        method: super::push::AGENT_EVENT,
+        params_schema: schema_of::<AgentEventPush>,
+    },
 ];
 
 #[cfg(test)]
@@ -1141,6 +1191,50 @@ mod tests {
         let p: UsageStatsParams =
             serde_json::from_value(serde_json::json!({ "period": 3 })).unwrap();
         assert_eq!(p.period, None);
+    }
+
+    #[test]
+    fn agent_event_and_tasks_events_round_trip() {
+        let push = AgentEventPush {
+            session_id: "sess-1".to_string(),
+            task_id: Some("task-1".to_string()),
+            seq: 3,
+            event: AgentStateEvent::TextDelta {
+                role: crate::model::MessageRole::Assistant,
+                text: "hi".to_string(),
+            },
+        };
+        let json = serde_json::to_value(&push).unwrap();
+        assert_eq!(json["event"]["event"], "text_delta");
+        assert_eq!(json["event"]["role"], "assistant");
+        let back: AgentEventPush = serde_json::from_value(json).unwrap();
+        assert_eq!(back, push);
+
+        // `task_id` is omitted when absent.
+        let lean = serde_json::to_value(AgentEventPush {
+            task_id: None,
+            ..push.clone()
+        })
+        .unwrap();
+        assert!(lean.get("task_id").is_none());
+
+        let result = TasksEventsResult {
+            session_id: Some("sess-1".to_string()),
+            events: vec![push],
+            next_cursor: 3,
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        let back: TasksEventsResult = serde_json::from_value(json).unwrap();
+        assert_eq!(back, result);
+
+        // `after`/`limit` accept missing or ill-typed values.
+        let p: TasksEventsParams =
+            serde_json::from_value(serde_json::json!({ "id": Uuid::nil() })).unwrap();
+        assert_eq!(p.after, None);
+        assert_eq!(p.limit, None);
+        let p: TasksEventsParams =
+            serde_json::from_value(serde_json::json!({ "id": Uuid::nil(), "after": "x" })).unwrap();
+        assert_eq!(p.after, None);
     }
 
     #[test]

@@ -1501,6 +1501,142 @@ textarea.input {
   font: inherit;
 }
 
+/* Live agent feed -------------------------------------------------------- */
+
+.agent-feed-section {
+  margin-top: 1.5rem;
+}
+
+.agent-feed {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  max-height: 32rem;
+  overflow: auto;
+  padding: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--surface);
+}
+
+.feed-item {
+  padding: 0.4rem 0.6rem;
+  border-radius: 0.35rem;
+  background: var(--surface-2);
+}
+
+.feed-role {
+  display: inline-block;
+  margin-bottom: 0.2rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.feed-text,
+.feed-tool-input,
+.feed-tool-output {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.feed-reasoning {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.feed-tool {
+  border-left: 3px solid var(--border);
+}
+
+.feed-tool-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.feed-tool-name {
+  font-weight: 600;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+}
+
+.tool-chip {
+  padding: 0.05rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.tool-running {
+  background: color-mix(in srgb, var(--primary) 20%, transparent);
+  color: var(--primary);
+}
+
+.tool-ok {
+  background: color-mix(in srgb, var(--success) 20%, transparent);
+  color: var(--success);
+}
+
+.tool-error {
+  background: color-mix(in srgb, var(--danger) 20%, transparent);
+  color: var(--danger);
+}
+
+.feed-tool-input {
+  margin-top: 0.3rem;
+  color: var(--muted);
+}
+
+.feed-tool-output {
+  margin-top: 0.3rem;
+  padding-top: 0.3rem;
+  border-top: 1px solid var(--border);
+}
+
+.feed-toggle {
+  margin-top: 0.3rem;
+  border: 1px solid var(--border);
+  border-radius: 0.3rem;
+  background: transparent;
+  color: inherit;
+  padding: 0.15rem 0.6rem;
+  font: inherit;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+
+.feed-usage {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.feed-error {
+  border-left: 3px solid var(--danger);
+  color: var(--danger);
+}
+
+.feed-boundary,
+.feed-session,
+.feed-title {
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.8rem;
+  background: transparent;
+}
+
+.feed-title {
+  font-weight: 600;
+  color: var(--fg);
+}
+
 /* Event feed ------------------------------------------------------------- */
 
 .event-feed {
