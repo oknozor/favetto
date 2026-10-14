@@ -22,3 +22,20 @@ body {
   max-width: 48rem;
   padding: 1.5rem;
 }
+
+.connection-banner {
+  padding: 0.5rem 1rem;
+  text-align: center;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.connection-banner.disconnected {
+  background: #b3261e;
+  color: #fff;
+}
+
+.connection-banner.reconnecting {
+  background: #8a6d00;
+  color: #fff;
+}
