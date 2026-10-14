@@ -3286,3 +3286,107 @@ fn switching_repo_clamps_the_task_and_event_selection() {
     assert_eq!(app.visible_tasks().len(), 1);
     assert_eq!(app.visible_events().len(), 1);
 }
+
+fn drag(col: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: col,
+        row,
+        modifiers: KeyModifiers::empty(),
+    }
+}
+
+fn up(col: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: col,
+        row,
+        modifiers: KeyModifiers::empty(),
+    }
+}
+
+/// An Agent panel wired for selection: a session, a known panel rect and the
+/// supplied screen contents.
+fn agent_app(contents: &[u8]) -> App {
+    let mut app = App::new();
+    app.tab = Tab::Agent;
+    app.agent_session_id = Some("s".to_string());
+    app.agent_running = true;
+    app.agent_area = Some(Rect {
+        x: 0,
+        y: 0,
+        width: 80,
+        height: 24,
+    });
+    app.term.process(contents);
+    app
+}
+
+#[test]
+fn extract_selection_joins_rows_and_trims() {
+    let mut parser = vt100::Parser::new(24, 80, 0);
+    parser.process(b"hello\r\nworld");
+    let sel = AgentSelection {
+        anchor: (0, 0),
+        cursor: (1, 4),
+        moved: true,
+    };
+    assert_eq!(extract_selection(parser.screen(), &sel), "hello\nworld");
+}
+
+#[test]
+fn agent_drag_selects_and_copies() {
+    let mut app = agent_app(b"hello");
+    assert!(matches!(app.handle_mouse(click(0, 0)), UiAction::None));
+    assert!(matches!(app.handle_mouse(drag(4, 0)), UiAction::None));
+    let action = app.handle_mouse(up(4, 0));
+    assert!(
+        matches!(action, UiAction::CopySelection(t) if t == "hello"),
+        "expected CopySelection(\"hello\")"
+    );
+    assert!(
+        app.agent_selection.is_none(),
+        "selection is consumed on release"
+    );
+}
+
+#[test]
+fn agent_click_without_drag_copies_nothing() {
+    let mut app = agent_app(b"hello");
+    assert!(matches!(app.handle_mouse(click(0, 0)), UiAction::None));
+    assert!(matches!(app.handle_mouse(up(0, 0)), UiAction::None));
+    assert!(app.agent_selection.is_none());
+}
+
+#[test]
+fn shift_drag_is_forwarded_to_the_agent() {
+    let mut app = agent_app(b"\x1b[?1000h\x1b[?1006h");
+    let mut ev = click(0, 0);
+    ev.modifiers = KeyModifiers::SHIFT;
+    assert!(
+        matches!(app.handle_mouse(ev), UiAction::AgentInput(_)),
+        "Shift+click must be forwarded to the agent"
+    );
+    assert!(app.agent_selection.is_none());
+}
+
+#[test]
+fn agent_selection_ignored_when_structured() {
+    let mut app = agent_app(b"hello");
+    app.agent_structured = true;
+    app.agent_read_only = true;
+    assert!(matches!(app.handle_mouse(click(0, 0)), UiAction::None));
+    assert!(app.agent_selection.is_none());
+    assert!(matches!(app.handle_mouse(drag(4, 0)), UiAction::None));
+    assert!(app.agent_selection.is_none());
+}
+
+#[test]
+fn set_tab_clears_agent_selection_and_notice() {
+    let mut app = agent_app(b"hello");
+    app.agent_selection = Some(AgentSelection::new((0, 0)));
+    app.copy_notice = Some("copied 5 chars".to_string());
+    app.set_tab(Tab::Tasks);
+    assert!(app.agent_selection.is_none());
+    assert!(app.copy_notice.is_none());
+}

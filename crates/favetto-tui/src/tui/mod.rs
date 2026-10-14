@@ -2,6 +2,7 @@
 //! wire protocol whether attached locally (Unix socket) or remotely (WebSocket).
 
 mod app;
+mod clipboard;
 mod editor;
 mod json;
 mod markdown;
@@ -655,6 +656,23 @@ fn suspend_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> an
     Ok(())
 }
 
+/// Copy-on-select: always emit OSC 52 (remote/SSH/tmux fallback), then a
+/// best-effort local clipboard tool, and report the result in the status bar.
+fn copy_selection_to_clipboard(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    text: String,
+) {
+    let chars = text.chars().count();
+    let _ = clipboard::write_osc52(terminal.backend_mut(), &text);
+    let local = clipboard::write_local(&text);
+    app.copy_notice = Some(if local {
+        format!("copied {chars} chars")
+    } else {
+        format!("copied {chars} chars (OSC 52)")
+    });
+}
+
 /// Restore the TUI after the child exits and force a full repaint.
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::Result<()> {
     enable_raw_mode()?;
@@ -906,14 +924,18 @@ async fn run_session(
                             UiAction::TaskCommand { method, params } => {
                                 task_command(client, app, method, params).await;
                             }
+                            // Copy-on-select is mouse-driven; a key never yields it.
+                            UiAction::CopySelection(_) => {}
                             UiAction::None => {}
                         }
                     }
-                    Some(CEvent::Mouse(m)) => {
-                        if let UiAction::AgentInput(bytes) = app.handle_mouse(m) {
-                            send_agent_input(client, app, &bytes).await;
+                    Some(CEvent::Mouse(m)) => match app.handle_mouse(m) {
+                        UiAction::AgentInput(bytes) => send_agent_input(client, app, &bytes).await,
+                        UiAction::CopySelection(text) => {
+                            copy_selection_to_clipboard(terminal, app, text)
                         }
-                    }
+                        _ => {}
+                    },
                     Some(CEvent::FocusGained) => player.set_focused(true),
                     Some(CEvent::FocusLost) => player.set_focused(false),
                     Some(_) => {}
@@ -1328,6 +1350,9 @@ fn handle_disconnected_event(app: &mut App, event: CEvent) -> DisconnectedAction
             app.should_quit = true;
             DisconnectedAction::Quit
         }
+        // A copy is served locally; it never needs a reconnect (and the offline
+        // pump has no terminal handle to emit OSC 52 on, so it is skipped).
+        UiAction::CopySelection(_) => DisconnectedAction::Continue,
         _ => DisconnectedAction::Reconnect,
     }
 }
@@ -1485,11 +1510,22 @@ fn theme_directories(config_path: &std::path::Path) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
-    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use std::collections::BTreeMap;
 
     fn key(code: KeyCode) -> CEvent {
         CEvent::Key(KeyEvent::new(code, KeyModifiers::empty()))
+    }
+
+    fn mouse(kind: MouseEventKind, col: u16, row: u16) -> CEvent {
+        CEvent::Mouse(MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        })
     }
 
     /// A player that never touches the terminal or spawns a worker.
@@ -1551,6 +1587,34 @@ mod tests {
                 DisconnectedAction::Quit
             );
             assert!(app.should_quit, "{code:?} must request a quit");
+        }
+    }
+
+    #[test]
+    fn disconnected_mouse_drag_does_not_reconnect() {
+        let mut app = disconnected_app();
+        app.tab = app::Tab::Agent;
+        app.agent_session_id = Some("s".to_string());
+        app.agent_running = true;
+        app.agent_area = Some(ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        });
+        app.term.process(b"hello");
+
+        // Down → Drag → Up drives a full selection; the release yields
+        // `CopySelection`, which must stay local (no reconnect).
+        for ev in [
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, 0),
+            mouse(MouseEventKind::Drag(MouseButton::Left), 4, 0),
+            mouse(MouseEventKind::Up(MouseButton::Left), 4, 0),
+        ] {
+            assert_eq!(
+                handle_disconnected_event(&mut app, ev),
+                DisconnectedAction::Continue
+            );
         }
     }
 

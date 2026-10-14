@@ -254,6 +254,16 @@ impl App {
             }
         }
 
+        // Copy-on-select takes priority over forwarding a plain left drag to the
+        // agent; Shift+drag is the passthrough to the agent's own mouse UI.
+        if self.tab == Tab::Agent && !self.agent_structured && self.agent_session_id.is_some() {
+            if let Some(area) = self.agent_area {
+                if let Some(action) = self.handle_agent_selection(mouse, area) {
+                    return action;
+                }
+            }
+        }
+
         if self.tab == Tab::Agent
             && self.agent_running
             && self.agent_session_id.is_some()
@@ -266,6 +276,53 @@ impl App {
             }
         }
         UiAction::None
+    }
+
+    /// Drive the Agent-panel copy-on-select state machine. Returns `Some` when the
+    /// event was consumed, `None` when it should fall through to agent forwarding.
+    fn handle_agent_selection(&mut self, mouse: MouseEvent, area: Rect) -> Option<UiAction> {
+        if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+            return None;
+        }
+        let clamp = |col: u16, row: u16| -> (u16, u16) {
+            (
+                row.saturating_sub(area.y)
+                    .min(area.height.saturating_sub(1)),
+                col.saturating_sub(area.x).min(area.width.saturating_sub(1)),
+            )
+        };
+        let inside = mouse.column >= area.x
+            && mouse.column < area.x + area.width
+            && mouse.row >= area.y
+            && mouse.row < area.y + area.height;
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if !inside {
+                    return None;
+                }
+                self.agent_selection = Some(AgentSelection::new(clamp(mouse.column, mouse.row)));
+                Some(UiAction::None)
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let sel = self.agent_selection.as_mut()?;
+                sel.cursor = clamp(mouse.column, mouse.row);
+                sel.moved = true;
+                Some(UiAction::None)
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let sel = self.agent_selection.take()?;
+                if !sel.moved {
+                    return Some(UiAction::None); // a plain click selects nothing
+                }
+                let text = extract_selection(self.term.screen(), &sel);
+                if text.is_empty() {
+                    Some(UiAction::None)
+                } else {
+                    Some(UiAction::CopySelection(text))
+                }
+            }
+            _ => None,
+        }
     }
 
     /// The list geometry of the active tab, if that tab has a list.

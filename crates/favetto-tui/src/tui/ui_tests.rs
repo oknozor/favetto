@@ -1,3 +1,4 @@
+use super::super::app::AgentSelection;
 use super::*;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
@@ -1977,4 +1978,44 @@ fn events_list_shows_repo_column_and_filters_to_the_active_repo() {
         "foreign event must be filtered: {text:?}"
     );
     assert_eq!(app.events_geom.len, 1, "geometry tracks the visible rows");
+}
+
+#[test]
+fn agent_selection_highlights_cells() {
+    let mut app = App::new();
+    app.tab = Tab::Agent;
+    app.agent_session_id = Some("s1".into());
+    app.agent_name = Some("demo".into());
+    app.agent_running = true;
+    app.term.process(b"hello agent");
+    app.agent_selection = Some(AgentSelection {
+        anchor: (0, 1),
+        cursor: (0, 4),
+        moved: true,
+    });
+
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+    let area = app.agent_area.expect("agent area recorded during draw");
+    let buffer = terminal.backend().buffer();
+    let selected = buffer.cell((area.x + 2, area.y)).unwrap();
+    assert!(
+        selected.modifier.contains(Modifier::REVERSED),
+        "selected cell not reversed"
+    );
+    let unselected = buffer.cell((area.x, area.y)).unwrap();
+    assert!(
+        !unselected.modifier.contains(Modifier::REVERSED),
+        "unselected cell must not be reversed"
+    );
+}
+
+#[test]
+fn status_bar_shows_copy_notice() {
+    let mut app = App::new();
+    app.copy_notice = Some("copied 5 chars".to_string());
+    let text = render_text(&mut app, 200, 24);
+    assert!(text.contains("copied 5 chars"), "{text:?}");
 }
