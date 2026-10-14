@@ -3,6 +3,7 @@
 pub mod common;
 pub mod dialog;
 pub mod markdown;
+pub mod nav;
 pub mod output_viewer;
 pub mod task_card;
 pub mod toast;

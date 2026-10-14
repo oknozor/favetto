@@ -2,13 +2,14 @@
 //!
 //! The app provides the shared [`AppState`] once, renders the connection banner,
 //! and (on web) starts the RPC ping and the SSE reader. The authenticated routes
-//! share an [`AppLayout`] that renders the top navigation. The Inbox is the
-//! default landing view; Tasks, Catalog and Workflow plug into the same route
-//! enum.
+//! share an [`AppLayout`] that renders the responsive navigation. The Inbox is
+//! the default landing view; Tasks, Catalog and Workflow plug into the same
+//! route enum.
 
 use dioxus::prelude::*;
 use uuid::Uuid;
 
+use crate::components::nav::AppNav;
 use crate::state::{AppState, ConnectionState};
 use crate::views::catalog::{Catalog, CatalogDetail};
 use crate::views::inbox::Inbox;
@@ -67,27 +68,16 @@ pub enum Route {
     Settings {},
 }
 
-/// The shared shell for the authenticated routes: top navigation + outlet.
+/// The shared shell for the authenticated routes: navigation + outlet.
+///
+/// The skip link is the first focusable element so keyboard users can jump
+/// straight to the view (each view's `<main id="favetto-app">`).
 #[component]
 fn AppLayout() -> Element {
     rsx! {
+        a { class: "skip-link", href: "#favetto-app", "Skip to content" }
         AppNav {}
-        Outlet::<Route> {}
-    }
-}
-
-/// The top navigation shared by the authenticated views.
-#[component]
-fn AppNav() -> Element {
-    rsx! {
-        nav { class: "app-nav",
-            Link { to: Route::Home {}, "Home" }
-            Link { to: Route::TasksList {}, "Tasks" }
-            Link { to: Route::WorkflowList {}, "Workflows" }
-            Link { to: Route::Catalog {}, "Catalog" }
-            Link { to: Route::Schedules {}, "Schedules" }
-            Link { to: Route::Settings {}, "Settings" }
-        }
+        div { class: "app-content", Outlet::<Route> {} }
     }
 }
 
