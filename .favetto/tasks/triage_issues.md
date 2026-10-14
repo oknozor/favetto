@@ -2,7 +2,7 @@ agent = "opencode"
 provider = "deepseek"  
 model = "deepseek-flash" 
 cwd = "/code/che"
-spawn = "favetto/plan_issue"
+spawn = "repo:Favetto/plan_issue"
 spawn_file = ".favetto/triage/{{ task.id }}/manifest.json"
 ---
 
@@ -12,7 +12,7 @@ tools), which gives you authenticated access to issues, pull requests, labels,
 and repository data.
 
 Favetto is the orchestrator that is running you: this task is itself defined in
-`tasks/`, and the checkout you are working in *is* the repository you are
+`.favetto/tasks/`, and the checkout you are working in *is* the repository you are
 improving. That self-referential relationship is normal here — an issue about
 the task catalog, hooks, or scheduler is still an ordinary code issue.
 

@@ -36,7 +36,7 @@ Notes:
 
 - `.favetto/` (plans, handoffs, triage reports) is gitignored; do not commit it.
 - If the issue touches the task catalog or the spawn/needs pipeline, keep the
-  semantics documented in `README.md` intact and update `tasks/` accordingly.
+  semantics documented in `README.md` intact and update `.favetto/tasks/` accordingly.
 
 When you are done, reply with a summary: the files changed, the commands you
 ran, the test results, and anything you could not complete.
