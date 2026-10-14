@@ -15,3 +15,4 @@ pub mod client;
 pub mod config;
 pub mod sse;
 pub mod state;
+pub mod views;

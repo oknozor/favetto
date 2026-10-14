@@ -86,6 +86,33 @@ pub fn pair_exchange_url_for(base: &str) -> String {
     url_for(base, PAIR_EXCHANGE_PATH)
 }
 
+/// True on platforms where the daemon is not same-origin and the user must
+/// enter a URL before pairing (Android). Web is always same-origin, so the URL
+/// step never appears there.
+pub fn daemon_url_required() -> bool {
+    cfg!(target_os = "android")
+}
+
+/// Validate and normalize a user-entered daemon base URL.
+///
+/// Rejects empty input, a missing `http://`/`https://` scheme, and embedded
+/// whitespace. On success returns the normalized base (trailing slash trimmed)
+/// so it can be stored and joined without producing `//rpc`.
+pub fn validate_daemon_url(input: &str) -> Result<String, String> {
+    let url = normalize_base(input);
+    if url.is_empty() {
+        return Err("Enter the daemon address".into());
+    }
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .ok_or_else(|| "Address must start with http:// or https://".to_string())?;
+    if rest.is_empty() || rest.contains(char::is_whitespace) {
+        return Err("Enter a valid daemon address".into());
+    }
+    Ok(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +153,40 @@ mod tests {
     fn default_is_same_origin_on_every_platform() {
         assert_eq!(default_daemon_url(), "");
         assert_eq!(url_for(&default_daemon_url(), RPC_PATH), "/rpc");
+    }
+
+    #[test]
+    fn validate_daemon_url_accepts_http_and_https() {
+        assert_eq!(
+            validate_daemon_url("http://192.168.1.10:8080"),
+            Ok("http://192.168.1.10:8080".into())
+        );
+        assert_eq!(
+            validate_daemon_url("  https://favetto.example.com/  "),
+            Ok("https://favetto.example.com".into())
+        );
+    }
+
+    #[test]
+    fn validate_daemon_url_rejects_bad_input() {
+        for input in [
+            "",
+            "   ",
+            "192.168.1.10:8080",
+            "ftp://x",
+            "http://",
+            "http://a b",
+        ] {
+            assert!(
+                validate_daemon_url(input).is_err(),
+                "expected {input:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_url_is_not_required_on_the_host() {
+        // The host target is not Android, so the URL step stays hidden.
+        assert!(!daemon_url_required());
     }
 }

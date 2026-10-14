@@ -254,14 +254,17 @@ typed_calls! {
     repos_activate => ReposActivateCall,
 }
 
-/// `POST` a MessagePack body and return `(status, response bytes)`.
+/// `POST` a body and return `(status, response bytes)`.
 ///
-/// The browser implementation uses `fetch` with a bearer header. On the host
-/// (unit tests, docs) there is no `fetch`, so it fails cleanly instead.
+/// The browser implementation uses `fetch`. `content_type` sets both the
+/// request `Content-Type` and the `Accept` header (the RPC endpoint speaks
+/// MessagePack, the pairing endpoint JSON). On the host (unit tests, docs)
+/// there is no `fetch`, so it fails cleanly instead.
 #[cfg(target_arch = "wasm32")]
-async fn post_msgpack(
+async fn post(
     url: &str,
     token: Option<&str>,
+    content_type: &str,
     body: Vec<u8>,
 ) -> Result<(u16, Vec<u8>), ClientError> {
     use wasm_bindgen::JsCast;
@@ -274,12 +277,8 @@ async fn post_msgpack(
     let window =
         web_sys::window().ok_or_else(|| ClientError::Network("no global window".into()))?;
     let headers = web_sys::Headers::new().map_err(net)?;
-    headers
-        .set("Content-Type", "application/x-msgpack")
-        .map_err(net)?;
-    headers
-        .set("Accept", "application/x-msgpack")
-        .map_err(net)?;
+    headers.set("Content-Type", content_type).map_err(net)?;
+    headers.set("Accept", content_type).map_err(net)?;
     if let Some(token) = token {
         headers
             .set("Authorization", &format!("Bearer {token}"))
@@ -309,14 +308,71 @@ async fn post_msgpack(
 
 /// Host stub: no `fetch` outside the browser/WebView.
 #[cfg(not(target_arch = "wasm32"))]
-async fn post_msgpack(
+async fn post(
     _url: &str,
     _token: Option<&str>,
+    _content_type: &str,
     _body: Vec<u8>,
 ) -> Result<(u16, Vec<u8>), ClientError> {
     Err(ClientError::Network(
         "HTTP transport is only available on wasm32".into(),
     ))
+}
+
+/// `POST` a MessagePack RPC body.
+async fn post_msgpack(
+    url: &str,
+    token: Option<&str>,
+    body: Vec<u8>,
+) -> Result<(u16, Vec<u8>), ClientError> {
+    post(url, token, "application/x-msgpack", body).await
+}
+
+/// `POST` a JSON body (used by the unauthenticated pairing exchange).
+async fn post_json(url: &str, body: Vec<u8>) -> Result<(u16, Vec<u8>), ClientError> {
+    post(url, None, "application/json", body).await
+}
+
+/// Encode the `POST /pair/exchange` JSON request body.
+///
+/// Uses `serde_json::json!` so the crate needs no direct `serde` dependency.
+pub fn encode_pair_request(code: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({ "code": code })).unwrap_or_default()
+}
+
+/// Interpret a `/pair/exchange` response.
+///
+/// A 2xx body `{"token":"…"}` yields the token; a 401 is the daemon's
+/// "invalid or expired pairing code" (a plain-text body), surfaced as
+/// [`ClientError::Unauthorized`]. Anything else is an [`ClientError::Http`].
+pub fn decode_pair_response(status: u16, bytes: &[u8]) -> Result<String, ClientError> {
+    match status {
+        200..=299 => {
+            let value: serde_json::Value =
+                serde_json::from_slice(bytes).map_err(|e| ClientError::Decode(e.to_string()))?;
+            value
+                .get("token")
+                .and_then(|token| token.as_str())
+                .filter(|token| !token.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| ClientError::Decode("pair response missing token".into()))
+        }
+        401 => Err(ClientError::Unauthorized),
+        _ => Err(ClientError::Http {
+            status,
+            message: String::from_utf8_lossy(bytes).into_owned(),
+        }),
+    }
+}
+
+/// Exchange a pairing code for the daemon bearer token.
+///
+/// The endpoint is unauthenticated: a valid, unexpired code (from
+/// `favetto pair` or a `?pair=CODE` deep link) buys the token the TUI also uses.
+pub async fn exchange_pair_code(base: &str, code: &str) -> Result<String, ClientError> {
+    let url = config::pair_exchange_url_for(base);
+    let (status, bytes) = post_json(&url, encode_pair_request(code)).await?;
+    decode_pair_response(status, &bytes)
 }
 
 #[cfg(test)]
@@ -413,5 +469,47 @@ mod tests {
         let remote = RpcClient::new("http://192.168.1.10:8080/").with_token(Some("t".into()));
         assert_eq!(remote.base(), "http://192.168.1.10:8080");
         assert_eq!(remote.rpc_url(), "http://192.168.1.10:8080/rpc");
+    }
+
+    #[test]
+    fn pair_request_encodes_the_code() {
+        let bytes = encode_pair_request("123456");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value, serde_json::json!({ "code": "123456" }));
+    }
+
+    #[test]
+    fn pair_response_returns_the_token() {
+        assert_eq!(
+            decode_pair_response(200, br#"{"token":"secret"}"#),
+            Ok("secret".to_string())
+        );
+    }
+
+    #[test]
+    fn pair_response_without_a_token_is_a_decode_error() {
+        assert!(matches!(
+            decode_pair_response(200, b"{}"),
+            Err(ClientError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn pair_response_401_is_unauthorized() {
+        assert_eq!(
+            decode_pair_response(401, b"invalid or expired pairing code"),
+            Err(ClientError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn pair_response_500_becomes_an_http_error() {
+        assert_eq!(
+            decode_pair_response(500, b"boom"),
+            Err(ClientError::Http {
+                status: 500,
+                message: "boom".into()
+            })
+        );
     }
 }

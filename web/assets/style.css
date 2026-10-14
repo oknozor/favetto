@@ -39,3 +39,74 @@ body {
   background: #8a6d00;
   color: #fff;
 }
+
+.connection-banner.connected {
+  background: #1b5e20;
+  color: #fff;
+}
+
+.connection-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding: 0.25rem 1rem;
+}
+
+.forget-button {
+  font: inherit;
+  padding: 0.25rem 0.75rem;
+  cursor: pointer;
+}
+
+.pair-screen {
+  margin: 0 auto;
+  max-width: 32rem;
+  padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.pair-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.pair-hint {
+  color: color-mix(in srgb, currentColor 65%, transparent);
+  font-size: 0.9rem;
+}
+
+.pair-screen input {
+  font: inherit;
+  padding: 0.5rem 0.65rem;
+  border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
+  border-radius: 0.375rem;
+}
+
+.pair-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.pair-actions button {
+  font: inherit;
+  padding: 0.5rem 0.9rem;
+  cursor: pointer;
+}
+
+.pair-actions button[disabled] {
+  cursor: progress;
+  opacity: 0.6;
+}
+
+.pair-error {
+  color: #b3261e;
+  font-size: 0.9rem;
+}
+
+.pair-success {
+  color: #1b5e20;
+  font-size: 0.9rem;
+}
