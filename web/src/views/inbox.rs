@@ -497,6 +497,7 @@ fn AwaitingInputCard(
                         class: "awaiting-input",
                         r#type: "text",
                         placeholder: "Type a reply…",
+                        aria_label: "Reply to the agent prompt",
                         value: "{draft}",
                         disabled: busy(),
                         oninput: move |event| draft.set(event.value()),

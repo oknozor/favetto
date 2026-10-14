@@ -334,7 +334,7 @@ pub fn WorkflowList() -> Element {
     let error_value = error();
 
     rsx! {
-        main { class: "workflow-view",
+        main { id: "favetto-app", class: "workflow-view",
             div { class: "workflow-header",
                 h1 { "Workflows" }
                 div { class: "workflow-actions",
@@ -609,7 +609,7 @@ pub fn WorkflowDetail(root_id: Uuid) -> Element {
     let buckets = bucket_cards(&cards);
 
     rsx! {
-        main { class: "workflow-view",
+        main { id: "favetto-app", class: "workflow-view",
             div { class: "workflow-header",
                 h1 { "Workflow" }
                 if let Some((root_task, root_state, ready, running, failed, blocked)) = header {

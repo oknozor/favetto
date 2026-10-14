@@ -100,6 +100,7 @@ pub fn Catalog() -> Element {
                 class: "catalog-search",
                 r#type: "search",
                 placeholder: "Search by name or tag…",
+                aria_label: "Search the catalog",
                 value: "{query}",
                 oninput: move |event| query.set(event.value()),
             }

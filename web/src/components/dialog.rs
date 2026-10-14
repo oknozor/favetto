@@ -2,9 +2,18 @@
 //!
 //! Both render a fixed backdrop. Clicking the backdrop dismisses the dialog;
 //! the inner panel stops click propagation so a click on the panel (or its
-//! controls) does not close it.
+//! controls) does not close it. The panel is labelled by its title and takes
+//! focus when it mounts, so Escape closes it from the keyboard.
 
 use dioxus::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonic counter so every dialog gets a unique `aria-labelledby` target.
+static DIALOG_IDS: AtomicU64 = AtomicU64::new(0);
+
+fn next_dialog_id() -> u64 {
+    DIALOG_IDS.fetch_add(1, Ordering::Relaxed)
+}
 
 /// A generic modal: a titled panel over a click-to-dismiss backdrop.
 ///
@@ -12,17 +21,33 @@ use dioxus::prelude::*;
 /// confirmation below and the "start task" form.
 #[component]
 pub fn Dialog(title: String, on_close: EventHandler<()>, children: Element) -> Element {
+    let title_id = use_hook(|| format!("favetto-dialog-title-{}", next_dialog_id()));
     rsx! {
         div {
             class: "dialog-overlay",
             onclick: move |_| on_close.call(()),
+            // Escape bubbles from the focused panel to the backdrop.
+            onkeydown: move |event| {
+                if event.key() == Key::Escape {
+                    on_close.call(());
+                }
+            },
             div {
                 class: "dialog",
+                id: "{title_id}",
                 role: "dialog",
                 "aria-modal": "true",
+                "aria-labelledby": "{title_id}-heading",
+                tabindex: "-1",
+                // Move focus into the dialog so Escape and Tab work.
+                onmounted: move |event| {
+                    spawn(async move {
+                        let _ = event.set_focus(true).await;
+                    });
+                },
                 // Keep clicks inside the panel from reaching the backdrop.
                 onclick: move |event| event.stop_propagation(),
-                h2 { class: "dialog-title", "{title}" }
+                h2 { id: "{title_id}-heading", class: "dialog-title", "{title}" }
                 div { class: "dialog-body", {children} }
             }
         }
