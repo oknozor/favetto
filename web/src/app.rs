@@ -126,7 +126,7 @@ pub fn App() -> Element {
     let token = (state.token)();
 
     rsx! {
-        document::Link { rel: "stylesheet", href: asset!("/assets/style.css") }
+        document::Link { rel: "stylesheet", href: asset!("/assets/tailwind.css") }
         ConnectionBanner {}
         // No token means no transport, so nothing 401-loops before pairing.
         // Remounting on a credential change restarts the connection.

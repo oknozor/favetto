@@ -51,6 +51,7 @@ web-sys = { version = "0.3", features = [
     # The feed's scroll container is read and driven directly (`Element`).
     "Element",
 ] }
+dioxus-icons-phosphor = { version = "=0.2.1", default-features = false, features = ["regular"] }
 
 [features]
 # Web (wasm32) is the default so a plain `dx build` produces the embedded SPA.

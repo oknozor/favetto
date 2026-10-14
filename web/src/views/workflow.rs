@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use crate::app::Route;
 use crate::client::RpcClient;
+use crate::components::icon::{AppIcon, AppIconKind};
 use crate::components::workflow_graph::{
     component_label, weakly_connected_components, WorkflowGraphView,
 };
@@ -388,7 +389,10 @@ pub fn WorkflowDetail(root_id: Uuid) -> Element {
                         li { "blocked {blocked}" }
                     }
                 }
-                Link { to: Route::WorkflowList {}, class: "workflow-back", "← All workflows" }
+                Link { to: Route::WorkflowList {}, class: "workflow-back",
+                    AppIcon { kind: AppIconKind::Back, class: "icon-inline" }
+                    " All workflows"
+                }
             }
             if let Some(err) = error_value {
                 p { class: "error-banner", role: "alert", "{err}" }

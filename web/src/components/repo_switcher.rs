@@ -2,7 +2,7 @@
 //!
 //! Mirrors the TUI's Ctrl+P "Switch repo" popup: a leading `global — all repos`
 //! row clears the active repo, then the known repos (from `repos.list`) filtered
-//! case-insensitively on name or path, with an `●` active marker and a
+//! case-insensitively on name or path, with an active marker and a
 //! `(missing)` suffix for unavailable checkouts. Selecting a row calls
 //! `repos.activate` and stores the returned registry, so the UI updates without
 //! a reload.
@@ -13,6 +13,7 @@ use favetto_wire::rpc::{EmptyParams, ReposActivateParams};
 
 use crate::client::RpcClient;
 use crate::components::dialog::Dialog;
+use crate::components::icon::{AppIcon, AppIconKind};
 use crate::state::{active_repo_label, AppState};
 
 /// One row of the repo picker.
@@ -20,11 +21,13 @@ use crate::state::{active_repo_label, AppState};
 pub struct RepoOption {
     /// The repo to activate; `None` is the leading `global` row that clears it.
     pub name: Option<String>,
-    /// The rendered label, including the active marker and `(missing)` suffix.
+    /// The rendered label with a `(missing)` suffix for unavailable repos.
     pub label: String,
     /// Whether the row can be activated. Unavailable repos stay visible but
     /// inert.
     pub selectable: bool,
+    /// Whether this row is the active repo (renders a marker icon).
+    pub active: bool,
 }
 
 /// The picker rows: a leading `global` row plus the known repos matching
@@ -38,17 +41,18 @@ pub fn repo_picker_entries(repos: &[RepoInfo], filter: &str) -> Vec<RepoOption> 
         name: None,
         label: "global  —  all repos".to_string(),
         selectable: true,
+        active: false,
     }];
     for repo in repos {
         if !filter.is_empty() && !matches(&repo.name) && !matches(&repo.path) {
             continue;
         }
-        let marker = if repo.active { "● " } else { "  " };
         let availability = if repo.available { "" } else { "  (missing)" };
         entries.push(RepoOption {
             name: Some(repo.name.clone()),
-            label: format!("{marker}{}{availability}", repo.name),
+            label: format!("{}{availability}", repo.name),
             selectable: repo.available,
+            active: repo.active,
         });
     }
     entries
@@ -120,7 +124,7 @@ pub fn RepoSwitcher() -> Element {
                 error.set(None);
                 open.set(true);
             },
-            span { class: "repo-switcher-icon", aria_hidden: "true", "📦" }
+            span { class: "repo-switcher-icon", AppIcon { kind: AppIconKind::Repo, class: "app-nav-icon" } }
             span { class: "repo-switcher-label", "{label}" }
         }
         if open() {
@@ -146,7 +150,10 @@ pub fn RepoSwitcher() -> Element {
                                     let name = option.name.clone();
                                     move |_| activate_repo(state, busy, error, open, name.clone())
                                 },
-                                "{option.label}"
+                                if option.active {
+                                    AppIcon { kind: AppIconKind::ActiveRepo, class: "repo-option-marker" }
+                                }
+                                span { "{option.label}" }
                             }
                         }
                     }
@@ -182,10 +189,12 @@ mod tests {
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].name, None);
         assert!(entries[0].selectable);
+        assert!(!entries[0].active);
         assert_eq!(entries[1].name.as_deref(), Some("favetto"));
-        assert!(entries[1].label.starts_with("● "));
+        assert!(entries[1].active);
         assert_eq!(entries[2].name.as_deref(), Some("web"));
-        assert!(!entries[2].label.starts_with("● "));
+        assert!(!entries[2].active);
+        assert_eq!(entries[1].label, "favetto");
     }
 
     #[test]

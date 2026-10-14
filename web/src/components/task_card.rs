@@ -9,17 +9,18 @@ use favetto_wire::model::TaskStatus;
 use uuid::Uuid;
 
 use crate::app::Route;
+use crate::components::icon::{AppIcon, AppIconKind};
 use crate::views::tasks::status_label;
 
-/// A glyph for a task status, used as a quick visual cue on cards.
-pub fn status_icon(status: TaskStatus) -> &'static str {
+/// The icon for a task status, used as a quick visual cue on cards.
+pub fn status_icon(status: TaskStatus) -> AppIconKind {
     match status {
-        TaskStatus::Pending => "•",
-        TaskStatus::Running => "▶",
-        TaskStatus::AwaitingInput => "⏳",
-        TaskStatus::Succeeded => "✔",
-        TaskStatus::Failed => "✖",
-        TaskStatus::Cancelled => "⊘",
+        TaskStatus::Pending => AppIconKind::StatusPending,
+        TaskStatus::Running => AppIconKind::StatusRunning,
+        TaskStatus::AwaitingInput => AppIconKind::StatusAwaitingInput,
+        TaskStatus::Succeeded => AppIconKind::StatusSucceeded,
+        TaskStatus::Failed => AppIconKind::StatusFailed,
+        TaskStatus::Cancelled => AppIconKind::StatusCancelled,
     }
 }
 
@@ -43,7 +44,7 @@ pub fn TaskCard(
         Link {
             to: Route::TaskDetail { id: id.to_string() },
             class: "task-card",
-            span { class: "task-card-icon", aria_hidden: "true", "{icon}" }
+            AppIcon { kind: icon, class: "task-card-icon" }
             div { class: "task-card-main",
                 div { class: "task-card-head",
                     span { class: "task-card-name", "{name}" }
@@ -72,15 +73,19 @@ mod tests {
 
     #[test]
     fn status_icon_covers_every_status() {
-        for status in [
+        let statuses = [
             TaskStatus::Pending,
             TaskStatus::Running,
             TaskStatus::AwaitingInput,
             TaskStatus::Succeeded,
             TaskStatus::Failed,
             TaskStatus::Cancelled,
-        ] {
-            assert!(!status_icon(status).is_empty(), "{status:?}");
+        ];
+        let icons: Vec<_> = statuses.iter().map(|s| status_icon(*s)).collect();
+        for (i, icon) in icons.iter().enumerate() {
+            for other in &icons[i + 1..] {
+                assert_ne!(icon, other, "duplicate status icon");
+            }
         }
     }
 

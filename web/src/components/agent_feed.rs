@@ -17,6 +17,7 @@ use favetto_wire::model::{
 use favetto_wire::rpc::AgentEventPush;
 
 use crate::components::highlight::{highlight, pretty, readable_json, Readable};
+use crate::components::icon::{AppIcon, AppIconKind};
 use crate::components::markdown::Markdown;
 use crate::components::output_viewer::{strip_ansi, truncate_lines};
 use crate::components::toast::ToastKind;
@@ -34,46 +35,46 @@ pub fn at_bottom(scroll_top: f64, client_height: f64, scroll_height: f64) -> boo
     scroll_top + client_height >= scroll_height - FOLLOW_THRESHOLD
 }
 
-/// A compact glyph for a tool card header, keyed off the tool's name.
-pub fn tool_icon(name: &str) -> &'static str {
+/// The Phosphor icon for a tool card header, keyed off the tool's name.
+pub fn tool_icon(name: &str) -> AppIconKind {
     let name = name.to_ascii_lowercase();
     if ["bash", "shell", "exec", "command", "run", "terminal"]
         .iter()
         .any(|k| name.contains(k))
     {
-        "$"
+        AppIconKind::ToolTerminal
     } else if ["write", "edit", "patch", "create", "append"]
         .iter()
         .any(|k| name.contains(k))
     {
-        "✎"
+        AppIconKind::ToolEdit
     } else if ["read", "view", "cat", "open"]
         .iter()
         .any(|k| name.contains(k))
     {
-        "▤"
+        AppIconKind::ToolRead
     } else if ["grep", "search", "find", "glob", "query"]
         .iter()
         .any(|k| name.contains(k))
     {
-        "⌕"
+        AppIconKind::ToolSearch
     } else if ["fetch", "http", "web", "curl", "download"]
         .iter()
         .any(|k| name.contains(k))
     {
-        "⇅"
+        AppIconKind::ToolFetch
     } else if ["list", "ls", "dir", "tree"]
         .iter()
         .any(|k| name.contains(k))
     {
-        "☰"
+        AppIconKind::ToolList
     } else if ["task", "agent", "todo", "plan"]
         .iter()
         .any(|k| name.contains(k))
     {
-        "☑"
+        AppIconKind::ToolTodo
     } else {
-        "⚙"
+        AppIconKind::ToolGeneric
     }
 }
 
@@ -507,7 +508,7 @@ fn FeedList(
                         scroll_to_bottom();
                     },
                     "Jump to latest"
-                    span { class: "feed-jump-arrow", aria_hidden: "true", " ↓" }
+                    AppIcon { kind: AppIconKind::ArrowDown, class: "feed-jump-arrow" }
                 }
             }
         }
@@ -636,7 +637,7 @@ fn FeedRow(
             rsx! {
                 div { class: "{card}",
                     div { class: "feed-tool-head",
-                        span { class: "feed-tool-icon", aria_hidden: "true", "{icon}" }
+                        AppIcon { kind: icon, class: "feed-tool-icon" }
                         span { class: "feed-tool-name", "{label}" }
                         span { class: "{chip}", "{status.label()}" }
                     }
@@ -1082,10 +1083,10 @@ mod tests {
 
     #[test]
     fn tool_icon_matches_common_tools_by_name() {
-        assert_eq!(tool_icon("bash"), "$");
-        assert_eq!(tool_icon("Read"), "▤");
-        assert_eq!(tool_icon("grep"), "⌕");
-        assert_eq!(tool_icon("some_mystery_tool"), "⚙");
+        assert_eq!(tool_icon("bash"), AppIconKind::ToolTerminal);
+        assert_eq!(tool_icon("Read"), AppIconKind::ToolRead);
+        assert_eq!(tool_icon("grep"), AppIconKind::ToolSearch);
+        assert_eq!(tool_icon("some_mystery_tool"), AppIconKind::ToolGeneric);
     }
 
     #[test]

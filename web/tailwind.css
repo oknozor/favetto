@@ -1,5 +1,66 @@
-/* Minimal base styles for the favetto web client. */
+/* favetto web client — Tailwind CSS v4 entry.
+ *
+ * `dx` autodetects this file at the workspace root and runs the bundled
+ * Tailwind CLI (v4.1.5) to build `assets/tailwind.css` before the Rust
+ * compile, for both `dx serve` and `dx build`. No Node toolchain is involved.
+ *
+ * The design system lives here:
+ *   - `@source` tells Tailwind which files to scan for utility classes.
+ *   - `@theme inline` bridges the favetto palette into Tailwind so semantic
+ *     utilities (`bg-surface`, `text-muted`, `border-border`, ...) exist and
+ *     track the light/dark tokens.
+ *   - `@layer base` carries the resets and the token palettes.
+ *   - `@layer components` carries the shared component idioms.
+ */
 
+@import "tailwindcss";
+
+@source "./src/**/*.{rs,html,css}";
+
+@theme inline {
+  --font-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+
+  --color-bg: var(--bg);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-link: var(--link);
+  --color-primary: var(--primary);
+  --color-primary-fg: var(--primary-fg);
+  --color-focus: var(--focus);
+  --color-nav-bg: var(--nav-bg);
+  --color-overlay: var(--overlay);
+
+  --color-success: var(--success);
+  --color-success-soft: var(--success-soft);
+  --color-success-fg: var(--success-fg);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-danger-fg: var(--danger-fg);
+  --color-warning: var(--warning);
+  --color-warning-soft: var(--warning-soft);
+  --color-info: var(--info);
+  --color-info-soft: var(--info-soft);
+  --color-neutral: var(--neutral);
+  --color-neutral-soft: var(--neutral-soft);
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+
+  --color-code-bg: var(--code-bg);
+  --color-code-fg: var(--code-fg);
+  --color-terminal-bg: var(--terminal-bg);
+  --color-terminal-fg: var(--terminal-fg);
+
+  --radius-card: var(--radius-lg);
+  --shadow-card: var(--shadow-1);
+  --shadow-pop: var(--shadow-2);
+}
+
+@layer base {
 :root {
   color-scheme: light dark;
 
@@ -153,6 +214,9 @@ body {
   padding: var(--space-5);
 }
 
+}
+
+@layer components {
 .connection-banner {
   padding: var(--space-2) var(--space-4);
   text-align: center;
@@ -1229,7 +1293,9 @@ body {
 }
 
 .repo-option {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
   width: 100%;
   padding: var(--space-2) var(--space-3);
   border: 1px solid transparent;
@@ -2117,4 +2183,39 @@ textarea.input {
   .agent-feed {
     scroll-behavior: auto;
   }
+}
+
+/* Icon sizing ------------------------------------------------------------ */
+
+.icon-inline {
+  width: 1em;
+  height: 1em;
+  display: inline-block;
+  vertical-align: -0.125em;
+}
+
+.repo-option-marker {
+  width: 0.75rem;
+  height: 0.75rem;
+  flex: 0 0 auto;
+}
+
+.event-badge-icon {
+  width: 1em;
+  height: 1em;
+  display: inline-block;
+  vertical-align: -0.125em;
+  margin-right: 0.25rem;
+}
+
+.toast-icon {
+  width: 1.25rem;
+  height: 1.25rem;
+  flex: 0 0 auto;
+}
+
+.toast-dismiss-icon {
+  width: 1rem;
+  height: 1rem;
+}
 }

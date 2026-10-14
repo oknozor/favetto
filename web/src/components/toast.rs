@@ -6,6 +6,8 @@
 
 use dioxus::prelude::*;
 
+use crate::components::icon::{AppIcon, AppIconKind};
+
 /// The tone of a [`Toast`], which drives its colour and ARIA role.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ToastKind {
@@ -27,6 +29,15 @@ impl ToastKind {
         }
     }
 
+    /// The decorative icon for the tone.
+    pub fn icon(self) -> AppIconKind {
+        match self {
+            ToastKind::Success => AppIconKind::ToastSuccess,
+            ToastKind::Error => AppIconKind::ToastError,
+            ToastKind::Info => AppIconKind::ToastInfo,
+        }
+    }
+
     /// The ARIA role: failures are assertive, the rest polite.
     pub fn role(self) -> &'static str {
         match self {
@@ -41,12 +52,13 @@ impl ToastKind {
 pub fn Toast(kind: ToastKind, message: String, on_dismiss: EventHandler<()>) -> Element {
     rsx! {
         div { class: kind.class(), role: kind.role(),
+            AppIcon { kind: kind.icon(), class: "toast-icon" }
             span { class: "toast-message", "{message}" }
             button {
                 class: "toast-dismiss",
                 aria_label: "Dismiss",
                 onclick: move |_| on_dismiss.call(()),
-                "×"
+                AppIcon { kind: AppIconKind::Close, class: "toast-dismiss-icon" }
             }
         }
     }
@@ -57,7 +69,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn kinds_map_to_distinct_classes_and_roles() {
+    fn kinds_map_to_distinct_classes_roles_and_icons() {
         assert_eq!(ToastKind::Success.class(), "toast toast-success");
         assert_eq!(ToastKind::Error.class(), "toast toast-error");
         assert_eq!(ToastKind::Info.class(), "toast toast-info");
@@ -65,6 +77,10 @@ mod tests {
         assert_eq!(ToastKind::Error.role(), "alert");
         assert_eq!(ToastKind::Success.role(), "status");
         assert_eq!(ToastKind::Info.role(), "status");
+        // Each tone has its own icon.
+        assert_ne!(ToastKind::Success.icon(), ToastKind::Error.icon());
+        assert_ne!(ToastKind::Error.icon(), ToastKind::Info.icon());
+        assert_ne!(ToastKind::Success.icon(), ToastKind::Info.icon());
     }
 
     #[test]
