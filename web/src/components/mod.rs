@@ -1,5 +1,6 @@
 //! Reusable, view-agnostic UI building blocks.
 
+pub mod agent_feed;
 pub mod common;
 pub mod dialog;
 pub mod markdown;

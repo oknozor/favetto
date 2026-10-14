@@ -13,8 +13,11 @@
 //!
 //! Frames are broadcast on a dedicated channel rather than the event bus: they
 //! are high-volume, non-durable, and only relevant to attached connections.
+//! Normalized state events are the exception: they are also published on the
+//! event bus as non-durable `agent.event` pushes (for the web feed) and buffered
+//! per session for `tasks.events` backfill.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -28,9 +31,11 @@ use tokio::sync::{broadcast, mpsc};
 use favetto_core::model::{
     AgentActivity, AgentSessionInfo, AgentStateEvent, AwaitingInputReason, InputReply,
 };
+use favetto_core::rpc::AgentEventPush;
 
 use crate::agent_hooks::{AgentHookLaunch, HookRouteError, HookRouter, HookRuntime};
 use crate::config::{FavettoConfig, GitSettings};
+use crate::event_bus::{EventBus, ServerPush};
 
 use agent::{check_arg_sizes, extract_session_id_from_line};
 
@@ -63,6 +68,11 @@ const SCROLLBACK: usize = 2000;
 
 /// Maximum raw output bytes retained per session (for capturing task results).
 const MAX_RAW: usize = 1024 * 1024;
+
+/// How many normalized state events are kept per session for feed backfill
+/// (`tasks.events`). The live feed arrives over the bus; this is only the
+/// bounded replay window after a reload or reconnect.
+const FEED_CAP: usize = 512;
 
 /// The favetto binary itself. Agent processes are launched through
 /// `favetto __agent-exec -- <cmd>`, which sets a parent-death signal so they are
@@ -167,6 +177,11 @@ struct Session {
     responder: Option<Arc<dyn InputResponder>>,
     /// Per-session broadcast of raw normalized events, for `attention`.
     state_tx: Option<broadcast::Sender<AgentStateEvent>>,
+    /// Bounded ring buffer of the session's normalized events, keyed by the
+    /// per-session `seq`. Serves `tasks.events` backfill after a reload.
+    feed: Arc<Mutex<VecDeque<(u64, AgentStateEvent)>>>,
+    /// Monotonic per-session sequence for `feed` and `agent.event` pushes.
+    next_seq: Arc<AtomicU64>,
     /// Stops the session's detached state transport; taken on exit or close.
     state_stop: Arc<Mutex<Option<StateStop>>>,
     /// Creation order, so "the task's latest session" is well-defined.
@@ -226,6 +241,9 @@ pub struct AgentManager {
     git: GitRuntime,
     /// The daemon's per-launch HTTP hook receiver, once configured.
     hooks: Option<HookRuntime>,
+    /// The daemon event bus, attached in `State::new` so normalized events are
+    /// published as `agent.event` pushes for the web feed.
+    bus: Option<EventBus>,
 }
 
 impl Default for AgentManager {
@@ -255,7 +273,15 @@ impl AgentManager {
             next_order: AtomicU64::new(0),
             git: GitRuntime::default(),
             hooks: None,
+            bus: None,
         }
+    }
+
+    /// Attach the daemon event bus so normalized events are published as
+    /// `agent.event` pushes. Called once from `State::new`; a manager without a
+    /// bus (tests) still fills its session feed buffers.
+    pub fn set_bus(&mut self, bus: EventBus) {
+        self.bus = Some(bus);
     }
 
     /// Resolve the daemon's per-launch hook receiver from the HTTP listen
@@ -344,6 +370,44 @@ impl AgentManager {
             .filter(|s| s.task_id.as_deref() == Some(task_id))
             .max_by_key(|s| s.order)
             .map(|s| s.info())
+    }
+
+    /// The backfill feed for `task_id`'s most recent session: buffered events
+    /// with `seq > after`, oldest-first, capped at `limit`. Returns the resolved
+    /// session id (`None` when the task has no structured session) and the
+    /// highest seq emitted (or `after` when the window is empty).
+    pub fn events_for_task(
+        &self,
+        task_id: &str,
+        after: u64,
+        limit: usize,
+    ) -> (Option<String>, Vec<AgentEventPush>, u64) {
+        let sessions = self.sessions.lock();
+        let Some(session) = sessions
+            .values()
+            .filter(|s| s.task_id.as_deref() == Some(task_id))
+            .max_by_key(|s| s.order)
+        else {
+            return (None, Vec::new(), after);
+        };
+        let session_id = session.id.clone();
+        let feed = session.feed.lock();
+        let mut events: Vec<AgentEventPush> = feed
+            .iter()
+            .filter(|(seq, _)| *seq > after)
+            .map(|(seq, event)| AgentEventPush {
+                session_id: session_id.clone(),
+                task_id: session.task_id.clone(),
+                seq: *seq,
+                event: event.clone(),
+            })
+            .collect();
+        if events.len() > limit {
+            let excess = events.len() - limit;
+            events.drain(0..excess);
+        }
+        let next_cursor = events.last().map_or(after, |event| event.seq);
+        (Some(session_id), events, next_cursor)
     }
 
     /// Whether a live interactive (non-headless) session is attached to
@@ -705,11 +769,15 @@ impl AgentManager {
             live,
             responder: state_responder,
             state_tx,
+            feed: Arc::new(Mutex::new(VecDeque::new())),
+            // Seqs are 1-based so the first event is reachable with the default
+            // `after = 0` cursor (`tasks.events` filters `seq > after`).
+            next_seq: Arc::new(AtomicU64::new(1)),
             state_stop,
             order,
         });
         if let Some(events) = state_events {
-            spawn_state_task(session.clone(), tx, events);
+            spawn_state_task(session.clone(), tx, events, self.bus.clone());
         }
         let info = session.info();
         self.sessions.lock().insert(id, session);
@@ -1076,6 +1144,7 @@ fn spawn_state_task(
     session: Arc<Session>,
     tx: broadcast::Sender<AgentEvent>,
     mut events: mpsc::UnboundedReceiver<AgentStateEvent>,
+    bus: Option<EventBus>,
 ) {
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
@@ -1108,6 +1177,24 @@ fn spawn_state_task(
                     }
                 }
                 _ => {}
+            }
+            // Record the raw event for `tasks.events` backfill and publish it on
+            // the bus so the web (SSE) feed sees it live.
+            let seq = session.next_seq.fetch_add(1, Ordering::SeqCst);
+            {
+                let mut feed = session.feed.lock();
+                feed.push_back((seq, event.clone()));
+                while feed.len() > FEED_CAP {
+                    feed.pop_front();
+                }
+            }
+            if let Some(bus) = &bus {
+                bus.publish(ServerPush::AgentEvent(AgentEventPush {
+                    session_id: session.id.clone(),
+                    task_id: session.task_id.clone(),
+                    seq,
+                    event: event.clone(),
+                }));
             }
             if let Some(state_tx) = &session.state_tx {
                 let _ = state_tx.send(event);
@@ -1858,6 +1945,195 @@ mod tests {
 
         mgr.close(&info.id).unwrap();
         mgr.close(&plain.id).unwrap();
+    }
+
+    /// Poll `events_for_task` until `expected` events are buffered.
+    async fn wait_for_feed(mgr: &AgentManager, task: &str, expected: usize) {
+        for _ in 0..200 {
+            if mgr.events_for_task(task, 0, usize::MAX).1.len() >= expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let got = mgr.events_for_task(task, 0, usize::MAX).1.len();
+        panic!("feed for task {task} never reached {expected} events (got {got})");
+    }
+
+    #[tokio::test]
+    async fn events_for_task_replays_with_seq_cursor() {
+        use favetto_core::model::{AgentStateEvent, IdleOutcome, MessageRole};
+
+        let fake = crate::agents::testing::fake_state_agent("while true; do sleep 1; done");
+        let mut mgr = AgentManager::new();
+        mgr.set_bus(EventBus::new(16));
+        let task = uuid::Uuid::new_v4().to_string();
+        let info = mgr
+            .start(
+                "fake",
+                fake.agent.clone(),
+                Some(task.clone()),
+                Invocation::Interactive {
+                    prompt: None,
+                    provider: None,
+                    model: None,
+                },
+                context(None, 24, 80),
+            )
+            .unwrap();
+
+        fake.events
+            .send(AgentStateEvent::TextDelta {
+                role: MessageRole::Assistant,
+                text: "hi".to_string(),
+            })
+            .unwrap();
+        fake.events
+            .send(AgentStateEvent::ToolStarted {
+                id: "c1".to_string(),
+                name: "read".to_string(),
+                input: serde_json::json!({}),
+            })
+            .unwrap();
+        fake.events
+            .send(AgentStateEvent::Idle {
+                outcome: IdleOutcome::Succeeded,
+            })
+            .unwrap();
+        wait_for_feed(&mgr, &task, 3).await;
+
+        let (session_id, events, next_cursor) = mgr.events_for_task(&task, 0, usize::MAX);
+        assert_eq!(session_id.as_deref(), Some(info.id.as_str()));
+        let seqs: Vec<u64> = events.iter().map(|event| event.seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
+        assert_eq!(next_cursor, 3);
+        assert_eq!(events[0].task_id.as_deref(), Some(task.as_str()));
+        assert_eq!(
+            events[0].event,
+            AgentStateEvent::TextDelta {
+                role: MessageRole::Assistant,
+                text: "hi".to_string(),
+            }
+        );
+        assert_eq!(
+            events[2].event,
+            AgentStateEvent::Idle {
+                outcome: IdleOutcome::Succeeded,
+            }
+        );
+
+        // `after` is exclusive and `limit` keeps the newest window.
+        let (_, tail, cursor) = mgr.events_for_task(&task, 1, usize::MAX);
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].seq, 2);
+        assert_eq!(cursor, 3);
+        let (_, capped, cursor) = mgr.events_for_task(&task, 0, 1);
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0].seq, 3);
+        assert_eq!(cursor, 3);
+
+        // A task with no session has no feed.
+        let (session_id, events, cursor) = mgr.events_for_task("missing", 0, usize::MAX);
+        assert!(session_id.is_none());
+        assert!(events.is_empty());
+        assert_eq!(cursor, 0);
+
+        mgr.close(&info.id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn events_for_task_feed_is_capped() {
+        use favetto_core::model::{AgentStateEvent, MessageRole};
+
+        let fake = crate::agents::testing::fake_state_agent("while true; do sleep 1; done");
+        let mgr = AgentManager::new();
+        let task = uuid::Uuid::new_v4().to_string();
+        let info = mgr
+            .start(
+                "fake",
+                fake.agent.clone(),
+                Some(task.clone()),
+                Invocation::Interactive {
+                    prompt: None,
+                    provider: None,
+                    model: None,
+                },
+                context(None, 24, 80),
+            )
+            .unwrap();
+
+        let total = FEED_CAP + 5;
+        for index in 0..total {
+            fake.events
+                .send(AgentStateEvent::TextDelta {
+                    role: MessageRole::Assistant,
+                    text: index.to_string(),
+                })
+                .unwrap();
+        }
+        wait_for_feed(&mgr, &task, FEED_CAP).await;
+
+        let (_, events, cursor) = mgr.events_for_task(&task, 0, usize::MAX);
+        assert_eq!(events.len(), FEED_CAP);
+        // Seqs are 1-based, so the retained window starts at `total - FEED_CAP + 1`.
+        assert_eq!(events.first().unwrap().seq, (total - FEED_CAP + 1) as u64);
+        assert_eq!(events.last().unwrap().seq, total as u64);
+        assert_eq!(cursor, total as u64);
+
+        mgr.close(&info.id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn state_events_are_published_as_agent_event_pushes() {
+        use favetto_core::model::{AgentStateEvent, MessageRole};
+
+        let fake = crate::agents::testing::fake_state_agent("while true; do sleep 1; done");
+        let mut mgr = AgentManager::new();
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
+        mgr.set_bus(bus);
+        let task = uuid::Uuid::new_v4().to_string();
+        let info = mgr
+            .start(
+                "fake",
+                fake.agent.clone(),
+                Some(task.clone()),
+                Invocation::Interactive {
+                    prompt: None,
+                    provider: None,
+                    model: None,
+                },
+                context(None, 24, 80),
+            )
+            .unwrap();
+
+        fake.events
+            .send(AgentStateEvent::TextDelta {
+                role: MessageRole::Assistant,
+                text: "hello".to_string(),
+            })
+            .unwrap();
+
+        let push = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("agent.event push timed out")
+            .expect("a bus push");
+        match push {
+            ServerPush::AgentEvent(event) => {
+                assert_eq!(event.session_id, info.id);
+                assert_eq!(event.task_id.as_deref(), Some(task.as_str()));
+                assert_eq!(event.seq, 1);
+                assert_eq!(
+                    event.event,
+                    AgentStateEvent::TextDelta {
+                        role: MessageRole::Assistant,
+                        text: "hello".to_string(),
+                    }
+                );
+            }
+            other => panic!("expected an agent.event push, got {other:?}"),
+        }
+
+        mgr.close(&info.id).unwrap();
     }
 
     #[test]

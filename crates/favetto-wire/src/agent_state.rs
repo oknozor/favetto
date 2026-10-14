@@ -262,6 +262,7 @@ pub struct ToolCall {
 
 /// How a run or turn ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum IdleOutcome {
     Succeeded,
@@ -271,6 +272,7 @@ pub enum IdleOutcome {
 
 /// One normalized observation about a session, in order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum AgentStateEvent {
     /// The agent reported (or changed) its own session identity.

@@ -333,7 +333,7 @@ threads by default).
 | View | RPC/stream | Notes |
 |---|---|---|
 | **Inbox** (default on mobile) | `events` + `tasks.list` + `agents.list` | `awaiting_input` cards with `InputRequest` options; `agents.reply`; failures; recent notifications |
-| **Tasks** | `tasks.list`, `tasks.get` | status filters, run history, output, `tasks.start`/`cancel`/`retry` |
+| **Tasks** | `tasks.list`, `tasks.get`, `tasks.events` + `agent.event` | status filters, run history, live pretty agent feed above the post-run output, inline awaiting-input reply, `tasks.start`/`cancel`/`retry` |
 | **Workflow** | `workflow.get`, `workflow.inspect`, `workflow.spawn/cancel/retry` | runtime buckets; DAG rendering deferred |
 | **Catalog** | `catalog.list`, `catalog.get` | Markdown preview (`pulldown-cmark`) |
 | **Schedules** | `schedules.list/upsert/delete` | cron management |

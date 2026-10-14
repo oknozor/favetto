@@ -2417,6 +2417,8 @@ async fn dispatch_rejects_malformed_params() {
         (method::CATALOG_GET, serde_json::json!({})),
         (method::CATALOG_GET, serde_json::json!({ "name": 5 })),
         // Other required fields.
+        (method::TASKS_EVENTS, serde_json::json!({ "id": 5 })),
+        (method::TASKS_EVENTS, serde_json::json!({})),
         (method::TASKS_RETRY, serde_json::json!({ "id": 1 })),
         (method::SCHEDULES_DELETE, serde_json::json!({})),
         (method::NOTIFICATIONS_TEST, serde_json::json!({})),
@@ -2638,6 +2640,84 @@ async fn dispatch_agents_reply_round_trips_against_a_state_source() {
 
     let resp = dispatch(&state, reply(2, "missing")).await;
     assert_eq!(resp.error.expect("error").code, error_code::INTERNAL);
+
+    state.agents.close(&info.id).ok();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `tasks.events` backfills the structured feed from the task's latest session
+/// and reports `session_id: None` when the task has no session at all.
+#[tokio::test]
+async fn dispatch_tasks_events_backfills_the_session_feed() {
+    use favetto_core::model::AgentStateEvent;
+
+    let dir = temp_dir("tasks-events");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+
+    let task_id = Uuid::new_v4();
+    let fake = crate::agents::testing::fake_state_agent("while true; do sleep 1; done");
+    let info = state
+        .agents
+        .start(
+            "fake",
+            fake.agent.clone(),
+            Some(task_id.to_string()),
+            Invocation::Interactive {
+                prompt: None,
+                provider: None,
+                model: None,
+            },
+            AgentContext {
+                rows: 40,
+                cols: 120,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    fake.events
+        .send(AgentStateEvent::TextDelta {
+            role: favetto_core::model::MessageRole::Assistant,
+            text: "hello".to_string(),
+        })
+        .unwrap();
+
+    let events_request = || Request {
+        id: 1,
+        method: method::TASKS_EVENTS.to_string(),
+        params: serde_json::json!({ "id": task_id }),
+    };
+
+    // The state task runs asynchronously; poll until the event is buffered.
+    let mut result = serde_json::Value::Null;
+    for _ in 0..200 {
+        let resp = dispatch(&state, events_request()).await;
+        result = resp.result.expect("tasks.events result");
+        if result["events"].as_array().is_some_and(|e| !e.is_empty()) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(result["session_id"], serde_json::json!(info.id));
+    assert_eq!(result["events"].as_array().unwrap().len(), 1);
+    assert_eq!(result["events"][0]["seq"], 1);
+    assert_eq!(result["events"][0]["event"]["text"], "hello");
+    assert_eq!(result["next_cursor"], 1);
+
+    // An unknown task resolves to no session and an empty feed.
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 2,
+            method: method::TASKS_EVENTS.to_string(),
+            params: serde_json::json!({ "id": Uuid::new_v4() }),
+        },
+    )
+    .await;
+    let result = resp.result.expect("tasks.events result");
+    assert!(result["session_id"].is_null());
+    assert_eq!(result["events"].as_array().unwrap().len(), 0);
 
     state.agents.close(&info.id).ok();
     let _ = std::fs::remove_dir_all(&dir);

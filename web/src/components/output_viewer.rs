@@ -34,7 +34,7 @@ pub fn extract_output_text(value: &serde_json::Value) -> (String, bool) {
 }
 
 /// Pretty-print a JSON value, degrading to an empty string on failure.
-fn pretty(value: &serde_json::Value) -> String {
+pub fn pretty(value: &serde_json::Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_default()
 }
 

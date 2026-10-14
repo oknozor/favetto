@@ -86,12 +86,16 @@ impl State {
     pub fn new(init: StateInit) -> Self {
         let tickets = TicketStore::new(init.config.auth.ticket_ttl_secs);
         let (watch_tx, watch_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Attach the bus to the agent manager before it is stored, so every
+        // normalized event is published as an `agent.event` push.
+        let mut agents = init.agents;
+        agents.set_bus(init.bus.clone());
         Self {
             db: init.db,
             bus: init.bus,
             token: init.token,
             webhooks: init.webhooks,
-            agents: init.agents,
+            agents,
             registry: init.registry,
             config: init.config,
             data_dir: init.data_dir,

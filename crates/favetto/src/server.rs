@@ -630,6 +630,20 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
             }
         }
 
+        method::TASKS_EVENTS => {
+            let p: TasksEventsParams = parse_params(&req.method, &req.params)?;
+            let limit = p.limit.unwrap_or(500).min(2000) as usize;
+            let (session_id, events, next_cursor) =
+                state
+                    .agents
+                    .events_for_task(&p.id.to_string(), p.after.unwrap_or(0), limit);
+            to_value(TasksEventsResult {
+                session_id,
+                events,
+                next_cursor,
+            })
+        }
+
         method::AGENTS_LIST => {
             let sessions = state.agents.sessions();
             let default = state

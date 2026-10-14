@@ -416,7 +416,7 @@ pub fn Inbox() -> Element {
 /// Send one `agents.reply` and fold the outcome into the toast and refresh
 /// signals. A success re-seeds the cache so the resolved card disappears even
 /// before the matching `task.updated` push arrives.
-fn submit_reply(
+pub(crate) fn submit_reply(
     state: AppState,
     mut busy: Signal<bool>,
     mut toast: Signal<Option<(ToastKind, String)>>,

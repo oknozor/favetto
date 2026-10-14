@@ -8,15 +8,18 @@
 
 use dioxus::prelude::*;
 use favetto_wire::model::{FailureKind, RunStatus, Task, TaskRun, TaskStatus};
-use favetto_wire::rpc::{EmptyParams, TaskIdParams, TasksListParams, TasksStartParams};
+use favetto_wire::rpc::{
+    EmptyParams, TaskIdParams, TasksEventsParams, TasksListParams, TasksStartParams,
+};
 use uuid::Uuid;
 
 use crate::app::Route;
 use crate::client::RpcClient;
+use crate::components::agent_feed::AgentFeed;
 use crate::components::dialog::{ConfirmDialog, Dialog};
 use crate::components::output_viewer::{extract_output_text, OutputViewer};
 use crate::components::toast::{Toast, ToastKind};
-use crate::state::{repo_label, task_repo, AppState};
+use crate::state::{repo_label, task_repo, AppState, TaskFeed};
 
 /// The status chips above the task list.
 ///
@@ -493,7 +496,7 @@ struct Detail {
 /// The `/tasks/:id` detail route.
 #[component]
 pub fn TaskDetail(id: String) -> Element {
-    let state = use_context::<AppState>();
+    let mut state = use_context::<AppState>();
     let parsed = Uuid::parse_str(&id).ok();
     let busy = use_signal(|| false);
     let mut toast = use_signal(|| Option::<(ToastKind, String)>::None);
@@ -531,9 +534,54 @@ pub fn TaskDetail(id: String) -> Element {
         }
     });
 
+    // Backfill the live agent feed. Re-runs on a task action (`refresh`) and on
+    // an SSE reconnect (`connection`), since `agent.event` is non-durable.
+    let feed_resource = use_resource(move || {
+        let base = (state.daemon_url)();
+        let token = (state.token)();
+        let _refresh = refresh();
+        let _conn = (state.connection)();
+        async move {
+            let Some(uuid) = parsed else {
+                return Err("task not found".to_string());
+            };
+            RpcClient::new(base)
+                .with_token(token)
+                .tasks_events(TasksEventsParams {
+                    id: uuid,
+                    after: None,
+                    limit: None,
+                })
+                .await
+                .map_err(|err| err.to_string())
+        }
+    });
+    use_effect(move || {
+        if let (Some(Ok(result)), Some(uuid)) = (feed_resource(), parsed) {
+            state.cache.write().set_feed(
+                uuid,
+                TaskFeed {
+                    session_id: result.session_id.clone().unwrap_or_default(),
+                    events: result.events,
+                    last_seq: result.next_cursor,
+                },
+            );
+        }
+    });
+
     if parsed.is_none() {
         return not_found_panel(&id);
     }
+
+    let feed = parsed.and_then(|uuid| (state.cache)().feeds.get(&uuid).cloned());
+    let feed_events = feed
+        .as_ref()
+        .map(|feed| feed.events.clone())
+        .unwrap_or_default();
+    let show_feed = feed
+        .as_ref()
+        .is_some_and(|feed| !feed.session_id.is_empty())
+        || !feed_events.is_empty();
 
     let now = now_ms();
     rsx! {
@@ -653,6 +701,14 @@ pub fn TaskDetail(id: String) -> Element {
                                         }
                                     }
                                 }
+                            }
+                        }
+                        if show_feed {
+                            AgentFeed {
+                                events: feed_events.clone(),
+                                busy,
+                                toast,
+                                refresh,
                             }
                         }
                         section { class: "task-output",
@@ -804,6 +860,18 @@ mod tests {
     fn task_detail_with_an_invalid_id_mounts() {
         let mut dom =
             VirtualDom::new(|| with_state(|| rsx! { TaskDetail { id: "not-a-uuid".to_string() } }));
+        dom.rebuild_in_place();
+    }
+
+    #[test]
+    fn task_detail_with_a_valid_id_mounts_with_an_empty_cache() {
+        let mut dom = VirtualDom::new(|| {
+            with_state(|| {
+                rsx! {
+                    TaskDetail { id: "00000000-0000-0000-0000-000000000000".to_string() }
+                }
+            })
+        });
         dom.rebuild_in_place();
     }
 }

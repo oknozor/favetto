@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use dioxus::prelude::*;
 use favetto_wire::model::{Event, RepoInfo, Task};
-use favetto_wire::rpc::{push, CatalogEntry};
+use favetto_wire::rpc::{push, AgentEventPush, CatalogEntry};
 use uuid::Uuid;
 
 use crate::notifications::Permission;
@@ -29,6 +29,78 @@ pub const CURSOR_KEY: &str = "favetto.event_cursor";
 
 /// How many live events to keep in the in-memory feed.
 pub const EVENT_CAP: usize = 500;
+
+/// How many normalized agent events to keep per task feed.
+pub const FEED_CAP: usize = 500;
+
+/// One task's live agent-event feed, keyed by the resolved session.
+///
+/// Events arrive out of order relative to the backfill (`tasks.events`), so the
+/// feed dedupes by `(session_id, seq)` and resets when the session changes (a
+/// retry starts a new attempt).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct TaskFeed {
+    /// The session the buffered events belong to; empty before one is resolved.
+    pub session_id: String,
+    /// Events ascending by `seq`.
+    pub events: Vec<AgentEventPush>,
+    /// Highest per-session `seq` applied (backfill cursor and dedupe key).
+    pub last_seq: u64,
+}
+
+impl TaskFeed {
+    /// Fold one event in, returning `true` when the feed changed.
+    pub fn push(&mut self, event: AgentEventPush) -> bool {
+        if !self.session_id.is_empty() && self.session_id != event.session_id {
+            // A new session (retry/attempt boundary) replaces the old feed.
+            *self = TaskFeed {
+                session_id: event.session_id.clone(),
+                ..TaskFeed::default()
+            };
+        } else if self.session_id.is_empty() {
+            self.session_id = event.session_id.clone();
+        }
+        if event.seq <= self.last_seq {
+            return false;
+        }
+        self.last_seq = event.seq;
+        self.events.push(event);
+        if self.events.len() > FEED_CAP {
+            let excess = self.events.len() - FEED_CAP;
+            self.events.drain(0..excess);
+        }
+        true
+    }
+
+    /// Merge a backfill window into the feed without dropping a live event that
+    /// arrived while the request was in flight.
+    pub fn merge(&mut self, window: TaskFeed) {
+        if window.session_id.is_empty() {
+            // No structured source: keep whatever the live feed already holds.
+            return;
+        }
+        if self.session_id != window.session_id {
+            *self = window;
+            return;
+        }
+        for event in window.events {
+            if !self.events.iter().any(|seen| seen.seq == event.seq) {
+                self.events.push(event);
+            }
+        }
+        self.events.sort_by_key(|event| event.seq);
+        self.events.dedup_by_key(|event| event.seq);
+        if self.events.len() > FEED_CAP {
+            let excess = self.events.len() - FEED_CAP;
+            self.events.drain(0..excess);
+        }
+        self.last_seq = self
+            .events
+            .last()
+            .map_or(self.last_seq, |event| event.seq)
+            .max(self.last_seq);
+    }
+}
 
 /// Whether the client is talking to the daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +177,8 @@ pub struct Cache {
     pub active_repo: Option<String>,
     /// Highest durable event id seen; also the SSE resume cursor.
     pub cursor: Option<i64>,
+    /// Per-task normalized agent-event feeds, keyed by task id.
+    pub feeds: HashMap<Uuid, TaskFeed>,
 }
 
 impl Cache {
@@ -153,6 +227,10 @@ impl Cache {
                     self.upsert_task(task);
                     true
                 }
+                Err(_) => false,
+            },
+            push::AGENT_EVENT => match serde_json::from_value::<AgentEventPush>(params.clone()) {
+                Ok(event) => self.upsert_feed_event(event),
                 Err(_) => false,
             },
             _ => false,
@@ -205,6 +283,25 @@ impl Cache {
             .iter()
             .filter(|e| self.repo_visible(self.event_repo(e).as_deref()))
             .collect()
+    }
+
+    /// Fold one `agent.event` push into the task feed. Returns `false` for a
+    /// payload with no resolvable `task_id` (the feed is keyed by task) or a
+    /// duplicate/stale `seq`.
+    pub fn upsert_feed_event(&mut self, event: AgentEventPush) -> bool {
+        let Some(task_id) = event
+            .task_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok())
+        else {
+            return false;
+        };
+        self.feeds.entry(task_id).or_default().push(event)
+    }
+
+    /// Replace (or merge) a task's feed from the `tasks.events` backfill.
+    pub fn set_feed(&mut self, task: Uuid, feed: TaskFeed) {
+        self.feeds.entry(task).or_default().merge(feed);
     }
 }
 
@@ -469,6 +566,93 @@ mod tests {
         // Task deserialization is strict; an empty payload is ignored, not fatal.
         assert!(!cache.apply_push(push::TASK_UPDATED, &serde_json::json!({})));
         assert!(!cache.apply_push(push::CATALOG_UPDATED, &serde_json::json!({})));
+    }
+
+    fn feed_push(session: &str, task: Uuid, seq: u64) -> serde_json::Value {
+        serde_json::to_value(favetto_wire::rpc::AgentEventPush {
+            session_id: session.to_string(),
+            task_id: Some(task.to_string()),
+            seq,
+            event: favetto_wire::model::AgentStateEvent::TurnStarted,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn agent_event_push_dedupes_and_advances_the_feed() {
+        let mut cache = Cache::default();
+        let task = Uuid::new_v4();
+        assert!(cache.apply_push(push::AGENT_EVENT, &feed_push("ses_1", task, 1)));
+        assert!(cache.apply_push(push::AGENT_EVENT, &feed_push("ses_1", task, 2)));
+        // A duplicate seq is ignored.
+        assert!(!cache.apply_push(push::AGENT_EVENT, &feed_push("ses_1", task, 2)));
+        // A stale seq is ignored.
+        assert!(!cache.apply_push(push::AGENT_EVENT, &feed_push("ses_1", task, 1)));
+        let feed = cache.feeds.get(&task).expect("feed");
+        assert_eq!(feed.session_id, "ses_1");
+        assert_eq!(feed.last_seq, 2);
+        assert_eq!(feed.events.len(), 2);
+        // The durable cursor is untouched by a non-durable agent push.
+        assert_eq!(cache.cursor, None);
+    }
+
+    #[test]
+    fn agent_event_push_resets_on_a_new_session() {
+        let mut cache = Cache::default();
+        let task = Uuid::new_v4();
+        cache.apply_push(push::AGENT_EVENT, &feed_push("ses_1", task, 5));
+        cache.apply_push(push::AGENT_EVENT, &feed_push("ses_2", task, 1));
+        let feed = cache.feeds.get(&task).expect("feed");
+        assert_eq!(feed.session_id, "ses_2");
+        assert_eq!(feed.events.len(), 1);
+        assert_eq!(feed.events[0].seq, 1);
+        assert_eq!(feed.last_seq, 1);
+    }
+
+    #[test]
+    fn agent_event_feed_is_capped_and_ignores_missing_task_id() {
+        let mut cache = Cache::default();
+        let task = Uuid::new_v4();
+        for seq in 1..=(FEED_CAP as u64 + 5) {
+            cache.apply_push(push::AGENT_EVENT, &feed_push("ses_1", task, seq));
+        }
+        let feed = cache.feeds.get(&task).expect("feed");
+        assert_eq!(feed.events.len(), FEED_CAP);
+        assert_eq!(feed.events.first().unwrap().seq, 6);
+        assert_eq!(feed.last_seq, FEED_CAP as u64 + 5);
+
+        // A payload with no `task_id` cannot be keyed.
+        let orphan = serde_json::to_value(favetto_wire::rpc::AgentEventPush {
+            session_id: "ses_1".to_string(),
+            task_id: None,
+            seq: 1,
+            event: favetto_wire::model::AgentStateEvent::TurnStarted,
+        })
+        .unwrap();
+        assert!(!cache.apply_push(push::AGENT_EVENT, &orphan));
+    }
+
+    #[test]
+    fn set_feed_merges_backfill_without_dropping_live_events() {
+        let mut cache = Cache::default();
+        let task = Uuid::new_v4();
+        // A live event arrives before the backfill response.
+        cache.apply_push(push::AGENT_EVENT, &feed_push("ses_1", task, 3));
+        cache.set_feed(
+            task,
+            TaskFeed {
+                session_id: "ses_1".to_string(),
+                events: vec![
+                    serde_json::from_value(feed_push("ses_1", task, 1)).unwrap(),
+                    serde_json::from_value(feed_push("ses_1", task, 2)).unwrap(),
+                ],
+                last_seq: 2,
+            },
+        );
+        let feed = cache.feeds.get(&task).expect("feed");
+        let seqs: Vec<u64> = feed.events.iter().map(|event| event.seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
+        assert_eq!(feed.last_seq, 3);
     }
 
     #[test]
