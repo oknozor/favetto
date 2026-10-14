@@ -9,6 +9,7 @@ use dioxus::prelude::*;
 
 use crate::config;
 use crate::state::{onboarding_step, AppState, ConnectionState, OnboardingStep};
+use crate::views::catalog::{Catalog, CatalogDetail};
 use crate::views::pair::Pair;
 use crate::views::tasks::{TaskDetail, TasksList};
 
@@ -31,6 +32,12 @@ pub enum Route {
     /// A single task with its run history, failure detail and output.
     #[route("/tasks/:id")]
     TaskDetail { id: String },
+    /// The searchable list of catalog definitions.
+    #[route("/catalog")]
+    Catalog {},
+    /// One catalog definition, rendered as Markdown.
+    #[route("/catalog/:name")]
+    CatalogDetail { name: String },
 }
 
 /// The application root: stylesheet, layout shell, and router outlet.
@@ -190,6 +197,9 @@ fn apply_event(mut state: AppState, event: crate::sse::SseEvent) {
     }
     let SseEvent { event, data, .. } = event;
     let method = event.as_deref().unwrap_or(favetto_wire::rpc::push::EVENT);
+    if crate::state::is_catalog_push(method) {
+        state.bump_catalog();
+    }
     if let Ok(params) = serde_json::from_str::<serde_json::Value>(&data) {
         state.cache.write().apply_push(method, &params);
     }
@@ -254,5 +264,14 @@ mod tests {
     fn pair_route_round_trips() {
         assert_eq!(Route::Pair {}.to_string(), "/pair");
         assert_eq!("/pair".parse::<Route>().unwrap(), Route::Pair {});
+    }
+
+    #[test]
+    fn catalog_routes_serialize() {
+        assert_eq!(Route::Catalog {}.to_string(), "/catalog");
+        assert_eq!(
+            Route::CatalogDetail { name: "foo".into() }.to_string(),
+            "/catalog/foo"
+        );
     }
 }

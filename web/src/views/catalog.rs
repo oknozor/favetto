@@ -1,0 +1,227 @@
+//! Catalog list and detail views (`/catalog`, `/catalog/:name`).
+
+use dioxus::prelude::*;
+use favetto_wire::rpc::{CatalogEntry, CatalogGetParams, EmptyParams};
+
+use crate::app::Route;
+use crate::client::RpcClient;
+use crate::components::markdown::{split_frontmatter, Markdown};
+use crate::state::AppState;
+
+/// A one-line summary derived from the task prompt (the wire `CatalogEntry`
+/// carries no description field).
+pub fn description(entry: &CatalogEntry) -> String {
+    entry
+        .prompt
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.trim_start_matches('#').trim())
+        .unwrap_or("")
+        .chars()
+        .take(120)
+        .collect()
+}
+
+/// Searchable metadata chips derived from the entry (the wire type has no tags).
+pub fn tags(entry: &CatalogEntry) -> Vec<String> {
+    let mut tags = Vec::new();
+    if let Some(repo) = &entry.repo {
+        tags.push(format!("repo:{repo}"));
+    }
+    if let Some(agent) = &entry.agent {
+        tags.push(format!("agent:{agent}"));
+    }
+    if let Some(provider) = &entry.provider {
+        tags.push(format!("provider:{provider}"));
+    }
+    if let Some(model) = &entry.model {
+        tags.push(format!("model:{model}"));
+    }
+    if entry.schedule.is_some() {
+        tags.push("scheduled".into());
+    }
+    if entry.needs.is_some() {
+        tags.push("pipeline".into());
+    }
+    for var in &entry.vars {
+        tags.push(format!("var:{}", var.name));
+    }
+    tags
+}
+
+/// Whether an entry matches the search box (case-insensitive substring over the
+/// name, the derived description, and the derived tags). An empty query matches.
+pub fn matches_query(entry: &CatalogEntry, query: &str) -> bool {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return true;
+    }
+    entry.name.to_lowercase().contains(&q)
+        || description(entry).to_lowercase().contains(&q)
+        || tags(entry)
+            .iter()
+            .any(|tag| tag.to_lowercase().contains(&q))
+}
+
+/// `/catalog` — the searchable list of catalog definitions.
+#[component]
+pub fn Catalog() -> Element {
+    let state = use_context::<AppState>();
+    let mut query = use_signal(String::new);
+
+    // Reading `catalog_version` inside the resource future makes Dioxus re-run
+    // the fetch whenever a `catalog.updated` push bumps it (0.7 tracks signal
+    // reads made while polling the resource).
+    let resource = use_resource(move || async move {
+        let base = (state.daemon_url)();
+        let token = (state.token)();
+        let _ = (state.catalog_version)();
+        RpcClient::new(base)
+            .with_token(token)
+            .catalog_list(EmptyParams {})
+            .await
+    });
+
+    let entries: Vec<CatalogEntry> = match &*resource.read_unchecked() {
+        Some(Ok(list)) => list.clone(),
+        _ => Vec::new(),
+    };
+    let visible: Vec<CatalogEntry> = entries
+        .iter()
+        .filter(|entry| matches_query(entry, &query()))
+        .cloned()
+        .collect();
+
+    rsx! {
+        main { id: "favetto-app", class: "catalog",
+            h1 { "Catalog" }
+            input {
+                class: "catalog-search",
+                r#type: "search",
+                placeholder: "Search by name or tag…",
+                value: "{query}",
+                oninput: move |event| query.set(event.value()),
+            }
+            match &*resource.read_unchecked() {
+                Some(Err(err)) => rsx! { p { class: "catalog-error", "Could not load the catalog: {err}" } },
+                _ => rsx! {},
+            }
+            ul { class: "catalog-list",
+                for entry in visible.iter() {
+                    li { key: "{entry.name}", class: "catalog-item",
+                        Link { to: Route::CatalogDetail { name: entry.name.clone() }, class: "catalog-link",
+                            span { class: "catalog-name", "{entry.name}" }
+                            if !description(entry).is_empty() {
+                                span { class: "catalog-description", "{description(entry)}" }
+                            }
+                            span { class: "catalog-tags",
+                                for tag in tags(entry) {
+                                    span { class: "tag", "{tag}" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `/catalog/:name` — one definition with its Markdown body.
+#[component]
+pub fn CatalogDetail(name: String) -> Element {
+    let state = use_context::<AppState>();
+    let fetch_name = name.clone();
+    let resource = use_resource(move || {
+        let fetch_name = fetch_name.clone();
+        async move {
+            let base = (state.daemon_url)();
+            let token = (state.token)();
+            RpcClient::new(base)
+                .with_token(token)
+                .catalog_get(CatalogGetParams { name: fetch_name })
+                .await
+        }
+    });
+
+    // Own the markdown before building rsx so the read guard can drop.
+    let loaded: Option<String> = match &*resource.read_unchecked() {
+        Some(Ok(result)) => Some(result.markdown.clone()),
+        _ => None,
+    };
+
+    rsx! {
+        main { id: "favetto-app", class: "catalog-detail",
+            Link { to: Route::Catalog {}, class: "back-link", "← Catalog" }
+            h1 { "{name}" }
+            match &*resource.read_unchecked() {
+                None => rsx! { p { class: "loading", "Loading…" } },
+                Some(Err(err)) => rsx! { p { class: "catalog-error", "Could not load '{name}': {err}" } },
+                Some(Ok(_)) => {
+                    let (header, body) = split_frontmatter(loaded.as_deref().unwrap_or_default());
+                    rsx! {
+                        if let Some(header) = header {
+                            pre { class: "catalog-frontmatter", "{header}" }
+                        }
+                        Markdown { source: body.to_string() }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry() -> CatalogEntry {
+        serde_json::from_value(serde_json::json!({
+            "name": "triage_issues",
+            "agent": "claude",
+            "provider": "anthropic",
+            "model": "opus",
+            "schedule": "0 9 * * *",
+            "vars": [{ "name": "repo", "prompt": "Which repo?" }],
+            "prompt": "# Triage issues\n\nFind and label them.\n",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn description_uses_the_first_prompt_line() {
+        assert_eq!(description(&entry()), "Triage issues");
+    }
+
+    #[test]
+    fn tags_include_repo_agent_model_and_schedule() {
+        let mut e = entry();
+        e.repo = Some("favetto".into());
+        e.needs = Some("plan".into());
+        let tags = tags(&e);
+        assert!(tags.contains(&"repo:favetto".to_string()));
+        assert!(tags.contains(&"agent:claude".to_string()));
+        assert!(tags.contains(&"provider:anthropic".to_string()));
+        assert!(tags.contains(&"model:opus".to_string()));
+        assert!(tags.contains(&"scheduled".to_string()));
+        assert!(tags.contains(&"pipeline".to_string()));
+        assert!(tags.contains(&"var:repo".to_string()));
+    }
+
+    #[test]
+    fn matches_query_is_case_insensitive_over_name_and_tag() {
+        let e = entry();
+        assert!(matches_query(&e, "TRIAGE"));
+        assert!(matches_query(&e, "agent:CLAUDE"));
+        assert!(matches_query(&e, "ISSUES"));
+        assert!(!matches_query(&e, "nonexistent"));
+    }
+
+    #[test]
+    fn empty_query_matches_everything() {
+        let e = entry();
+        assert!(matches_query(&e, ""));
+        assert!(matches_query(&e, "   "));
+    }
+}
