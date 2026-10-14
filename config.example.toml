@@ -217,9 +217,19 @@ action = "opened"
 task = "favetto/plan_issue"
 filter = { labels_contains = ["bug"], base_ref = "main", author = "oknozor" }
 
+# TUI theming. `theme` is a built-in ("opencode", "catppuccin") or a user theme
+# loaded from `~/.config/favetto/themes/<name>.json` (or `.favetto/themes/`).
+# `theme_mode` is "system" (derive from the terminal), "dark", or "light".
+# Both are overridable with FAVETTO_THEME_NAME / FAVETTO_THEME. Press Ctrl+P ->
+# "Change theme" to preview and pick one for the session.
+#
 # Editor opened by `e` on a Catalog task. Unset -> $VISUAL, then $EDITOR, then vi.
 # [tui]
 # editor = "code --wait"
+# theme = "opencode"
+# theme_mode = "system"          # "system" | "dark" | "light"
+# show_header = true             # tab bar
+# show_footer = true             # status line
 
 # Client-side TUI sound notifications. Ignored by the daemon; sounds play on the
 # machine running `favetto tui`. Overridable with --sound/--no-sound/

@@ -29,6 +29,9 @@ impl App {
                 }
                 self.popup = Popup::Menu { selected: 0 };
             } else {
+                if let Popup::ThemePicker { original, .. } = &self.popup {
+                    self.theme = *original;
+                }
                 self.popup = Popup::None;
             }
             return UiAction::None;
@@ -80,6 +83,7 @@ impl App {
             Popup::Confirm(_) => return self.handle_confirm_key(key.code),
             Popup::TaskError { .. } => return self.handle_task_error_key(key.code),
             Popup::RepoPicker { .. } => return self.handle_repo_picker_key(key),
+            Popup::ThemePicker { .. } => return self.handle_theme_picker_key(key.code),
             Popup::None => {}
         }
 
@@ -668,6 +672,24 @@ impl App {
     pub(super) fn handle_task_error_key(&mut self, code: KeyCode) -> UiAction {
         match code {
             KeyCode::Esc | KeyCode::Char('x') | KeyCode::Char('X') => self.popup = Popup::None,
+            _ => {}
+        }
+        UiAction::None
+    }
+
+    /// Keys while the theme picker is open: arrows move (skipping headers) and
+    /// preview the candidate, Enter commits, Esc restores the original palette.
+    pub(super) fn handle_theme_picker_key(&mut self, code: KeyCode) -> UiAction {
+        match code {
+            KeyCode::Esc => {
+                if let Popup::ThemePicker { original, .. } = &self.popup {
+                    self.theme = *original;
+                }
+                self.popup = Popup::None;
+            }
+            KeyCode::Up => self.move_theme_selection(-1),
+            KeyCode::Down => self.move_theme_selection(1),
+            KeyCode::Enter => self.commit_theme_selection(),
             _ => {}
         }
         UiAction::None

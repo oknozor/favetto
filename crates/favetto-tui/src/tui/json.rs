@@ -30,9 +30,9 @@ fn highlight_line(line: &str, theme: &Theme) -> Line<'static> {
                 j += 1;
             }
             let color = if chars.get(j) == Some(&':') {
-                theme.syn_key
+                theme.syn_key()
             } else {
-                theme.syn_string
+                theme.syn_string()
             };
             spans.push(Span::styled(string, Style::default().fg(color)));
             i = next;
@@ -47,7 +47,10 @@ fn highlight_line(line: &str, theme: &Theme) -> Line<'static> {
                 j += 1;
             }
             let number: String = chars[i..j].iter().collect();
-            spans.push(Span::styled(number, Style::default().fg(theme.syn_number)));
+            spans.push(Span::styled(
+                number,
+                Style::default().fg(theme.syn_number()),
+            ));
             i = j;
             continue;
         }
@@ -61,7 +64,7 @@ fn highlight_line(line: &str, theme: &Theme) -> Line<'static> {
                 spans.push(Span::styled(
                     word.clone(),
                     Style::default()
-                        .fg(theme.syn_bool)
+                        .fg(theme.syn_bool())
                         .add_modifier(Modifier::BOLD),
                 ));
                 i += word.len();
@@ -99,7 +102,7 @@ fn flush(buf: &mut String, spans: &mut Vec<Span<'static>>, theme: &Theme) {
     if !buf.is_empty() {
         spans.push(Span::styled(
             std::mem::take(buf),
-            Style::default().fg(theme.syn_comment),
+            Style::default().fg(theme.syn_comment()),
         ));
     }
 }
@@ -120,9 +123,9 @@ mod tests {
         let theme = Theme::dark();
         let spans = spans(&serde_json::json!({ "name": "foo" }), &theme);
         let key = spans.iter().find(|s| s.content == "\"name\"").unwrap();
-        assert_eq!(key.style.fg, Some(theme.syn_key));
+        assert_eq!(key.style.fg, Some(theme.syn_key()));
         let value = spans.iter().find(|s| s.content == "\"foo\"").unwrap();
-        assert_eq!(value.style.fg, Some(theme.syn_string));
+        assert_eq!(value.style.fg, Some(theme.syn_string()));
     }
 
     #[test]
@@ -134,13 +137,13 @@ mod tests {
         );
         assert!(spans
             .iter()
-            .any(|s| s.content == "42" && s.style.fg == Some(theme.syn_number)));
+            .any(|s| s.content == "42" && s.style.fg == Some(theme.syn_number())));
         assert!(spans
             .iter()
-            .any(|s| s.content == "true" && s.style.fg == Some(theme.syn_bool)));
+            .any(|s| s.content == "true" && s.style.fg == Some(theme.syn_bool())));
         assert!(spans
             .iter()
-            .any(|s| s.content == "null" && s.style.fg == Some(theme.syn_bool)));
+            .any(|s| s.content == "null" && s.style.fg == Some(theme.syn_bool())));
     }
 
     #[test]
@@ -157,11 +160,11 @@ mod tests {
                 .style
                 .fg
         };
-        assert_eq!(fg(&light_spans, "\"name\""), Some(light.syn_key));
-        assert_eq!(fg(&light_spans, "\"foo\""), Some(light.syn_string));
-        assert_eq!(fg(&light_spans, "1"), Some(light.syn_number));
-        assert_ne!(light.syn_key, dark.syn_key);
-        assert_ne!(light.syn_string, dark.syn_string);
-        assert_ne!(light.syn_number, dark.syn_number);
+        assert_eq!(fg(&light_spans, "\"name\""), Some(light.syn_key()));
+        assert_eq!(fg(&light_spans, "\"foo\""), Some(light.syn_string()));
+        assert_eq!(fg(&light_spans, "1"), Some(light.syn_number()));
+        assert_ne!(light.syn_key(), dark.syn_key());
+        assert_ne!(light.syn_string(), dark.syn_string());
+        assert_ne!(light.syn_number(), dark.syn_number());
     }
 }

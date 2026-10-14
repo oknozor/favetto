@@ -743,6 +743,16 @@
             "null"
           ]
         },
+        "show_footer": {
+          "default": true,
+          "description": "Show the status line. Default true.",
+          "type": "boolean"
+        },
+        "show_header": {
+          "default": true,
+          "description": "Show the tab bar. Default true.",
+          "type": "boolean"
+        },
         "sound": {
           "$ref": "#/$defs/SoundSettings",
           "default": {
@@ -758,6 +768,16 @@
             "only_when_unfocused": false,
             "player": "auto"
           }
+        },
+        "theme": {
+          "default": "opencode",
+          "description": "Built-in (`opencode`, `catppuccin`) or user theme name. A user theme is\nloaded from `themes/<name>.json` in the config or `.favetto/themes`\ndirectory. Overridable with `FAVETTO_THEME_NAME`.",
+          "type": "string"
+        },
+        "theme_mode": {
+          "default": "system",
+          "description": "Theme mode: `system` (derive from the terminal), `dark`, or `light`.\nOverridable with `FAVETTO_THEME`.",
+          "type": "string"
         }
       },
       "type": "object"
@@ -899,6 +919,8 @@
     "tui": {
       "$ref": "#/$defs/TuiSettings",
       "default": {
+        "show_footer": true,
+        "show_header": true,
         "sound": {
           "enabled": true,
           "events": {
@@ -911,7 +933,9 @@
           "min_interval_ms": 400,
           "only_when_unfocused": false,
           "player": "auto"
-        }
+        },
+        "theme": "opencode",
+        "theme_mode": "system"
       },
       "description": "Client-side TUI settings. Ignored by the daemon, which reads the same file."
     },

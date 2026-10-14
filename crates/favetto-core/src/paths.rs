@@ -60,6 +60,19 @@ pub fn default_token_path() -> PathBuf {
     default_data_dir().join("token")
 }
 
+/// Default user-theme directory: `$FAVETTO_THEME_DIR`, else the XDG config dir
+/// (`~/.config/favetto/themes`).
+pub fn default_themes_dir() -> PathBuf {
+    std::env::var("FAVETTO_THEME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::config_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("favetto")
+                .join("themes")
+        })
+}
+
 /// The repo-local task catalog directory: `<repo_root>/.favetto/tasks`.
 pub fn repo_tasks_dir(repo_root: impl AsRef<Path>) -> PathBuf {
     repo_root.as_ref().join(".favetto").join("tasks")
@@ -89,5 +102,20 @@ mod tests {
         );
         // A `~user` form is not expanded; only a literal `~` component is.
         assert_eq!(expand_tilde("~other/dir"), PathBuf::from("~other/dir"));
+    }
+
+    #[test]
+    fn default_themes_dir_respects_override() {
+        // SAFETY: single-threaded env mutation scoped to this test.
+        let previous = std::env::var("FAVETTO_THEME_DIR").ok();
+        std::env::set_var("FAVETTO_THEME_DIR", "/tmp/favetto-themes-test");
+        assert_eq!(
+            default_themes_dir(),
+            PathBuf::from("/tmp/favetto-themes-test")
+        );
+        match previous {
+            Some(value) => std::env::set_var("FAVETTO_THEME_DIR", value),
+            None => std::env::remove_var("FAVETTO_THEME_DIR"),
+        }
     }
 }

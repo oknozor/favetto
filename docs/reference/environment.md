@@ -17,7 +17,10 @@ and integration secrets. Anything not listed here is configured in
 
 | Variable | Used by | Description |
 |----------|---------|-------------|
-| `FAVETTO_THEME` | TUI | `dark` or `light`. Overrides terminal auto-detection. |
+| `FAVETTO_THEME` | TUI | `dark` or `light`. Overrides `[tui].theme_mode` (the system/auto detection). |
+| `FAVETTO_THEME_NAME` | TUI | Overrides `[tui].theme` (a built-in or user theme name). |
+| `FAVETTO_THEME_DIR` | TUI | Overrides the user-theme directory (defaults to `~/.config/favetto/themes`). |
+| `NO_COLOR` | TUI | When set, disables colour and uses a colourless theme. |
 | `FAVETTO_PLAIN_ICONS` | TUI | Set to `1` for an ASCII fallback when the default folder/file emoji render double-width. |
 | `FAVETTO_SOUND` | TUI | `1/true/on/yes` or `0/false/off/no/none`; overrides `[tui.sound].enabled`. |
 | `FAVETTO_SOUND_DIR` | TUI | Overrides `[tui.sound].sound_dir`. |

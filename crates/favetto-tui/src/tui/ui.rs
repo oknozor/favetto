@@ -7,8 +7,8 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Bar, BarChart, Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, TableState,
-    Tabs, Wrap,
+    Bar, BarChart, Block, BorderType, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table,
+    TableState, Wrap,
 };
 use ratatui::Frame;
 
@@ -18,10 +18,10 @@ use favetto_core::workflow::{WorkflowInspect, WorkflowState};
 use super::app::{
     activity_cell, cost_cell, format_activity, repo_label, table_rows_area, task_repo, token_cell,
     App, CatalogRow, ClickAction, ClickRegion, ConfirmPrompt, ConnState, Form, ListGeometry, Popup,
-    ReplyPrompt, Tab, TaskVarsForm, Wizard, WizardStep, MENU_OPTIONS,
+    ReplyPrompt, Tab, TaskVarsForm, ThemeChoice, Wizard, WizardStep, MENU_OPTIONS,
 };
 use super::text_buffer::TextBuffer;
-use super::theme::Theme;
+use super::theme::{RaisedLevel, Theme};
 use super::{json, markdown};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -32,39 +32,29 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     frame.buffer_mut().set_style(frame_area, app.theme.base());
     let theme = app.theme;
 
+    // The tab bar and status line are optional chrome; a zero-height
+    // constraint keeps the chunk indices stable when either is hidden.
+    let header_height = if app.show_header { 2 } else { 0 };
+    let footer_height = if app.show_footer { 1 } else { 0 };
     let chunks = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(header_height),
         Constraint::Min(0),
-        Constraint::Length(1),
+        Constraint::Length(footer_height),
     ])
     .split(frame.area());
 
-    // Record tab click regions. The `Tabs` widget renders each title as
-    // `" " + title + " "` separated by the default divider `│`, i.e. a leading
-    // space then, between titles, a 3-char `" │ "` gap.
-    for (tab, col_start, col_end) in tab_click_regions(chunks[0].x, chunks[0].y) {
-        app.click_regions.push(ClickRegion {
-            row: chunks[0].y,
-            col_start,
-            col_end,
-            action: ClickAction::Tab(tab),
-        });
+    if app.show_header {
+        // Record tab click regions from the same layout the bar renders with.
+        for (tab, col_start, col_end) in tab_layout(&Tab::ALL, chunks[0].x, chunks[0].y) {
+            app.click_regions.push(ClickRegion {
+                row: chunks[0].y,
+                col_start,
+                col_end,
+                action: ClickAction::Tab(tab),
+            });
+        }
+        draw_tabs(frame, app, chunks[0]);
     }
-
-    let titles: Vec<Line> = Tab::ALL
-        .iter()
-        .map(|t| Line::from(Span::raw(t.label())))
-        .collect();
-    let tabs = Tabs::new(titles)
-        .select(Tab::ALL.iter().position(|t| *t == app.tab).unwrap_or(0))
-        .style(theme.base())
-        .block(
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .border_style(theme.block(false)),
-        )
-        .highlight_style(theme.selected().add_modifier(Modifier::BOLD));
-    frame.render_widget(tabs, chunks[0]);
 
     let tab = app.tab;
     match tab {
@@ -77,14 +67,70 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Tab::Usage => draw_usage(frame, app, chunks[1], theme),
     }
 
-    draw_status(frame, app, chunks[2], theme);
+    if app.show_footer {
+        draw_status(frame, app, chunks[2], theme);
+    }
 
     if !matches!(app.popup, Popup::None) {
         draw_popup(frame, app);
     }
 }
 
+/// Compute the `(tab, first column, end column)` triplets for the tab bar. This
+/// is the single source of truth for both rendering and click hit-testing.
+fn tab_layout(tabs: &[Tab], x0: u16, _y0: u16) -> Vec<(Tab, u16, u16)> {
+    let mut x = x0 + 1;
+    let mut out = Vec::new();
+    for tab in tabs {
+        let width = tab.label().chars().count() as u16;
+        out.push((*tab, x, x + width));
+        x += width + 2;
+    }
+    out
+}
+
+/// Draw the tab bar: spaced labels, the active tab on a raised surface with a
+/// `border.active` underline, inactive tabs muted.
+fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let active_primary = app.theme.text.action.primary;
+    let active_bg = app.theme.background.raised.high;
+    let muted = app.theme.text.muted;
+    let underline = app.theme.border.active;
+    let regions = tab_layout(&Tab::ALL, area.x, area.y);
+    let right = area.x.saturating_add(area.width);
+    let buf = frame.buffer_mut();
+    for (tab, start, end) in regions {
+        let active = tab == app.tab;
+        let style = if active {
+            Style::default()
+                .fg(active_primary)
+                .bg(active_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(muted)
+        };
+        let max = right.saturating_sub(start) as usize;
+        let label: String = tab.label().chars().take(max).collect();
+        buf.set_string(start, area.y, &label, style);
+        if active && area.height > 1 {
+            let from = start.saturating_sub(1);
+            let to = (end + 1).min(right);
+            for x in from..to {
+                if let Some(cell) = buf.cell_mut((x, area.y + 1)) {
+                    cell.set_style(Style::default().bg(underline));
+                }
+            }
+        }
+    }
+}
+
 fn draw_popup(frame: &mut Frame, app: &mut App) {
+    // Dim the whole frame behind every modal before drawing its panel.
+    paint_scrim(frame, app.theme);
+
     // The runtime workflow inspector draws straight from `app` (it needs the
     // throbber and the full view), so handle it before borrowing `popup`.
     if matches!(&app.popup, Popup::WorkflowRuntime(_)) {
@@ -156,7 +202,25 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
         Popup::TaskError { .. } => {}
         // Handled above, before `popup` is borrowed.
         Popup::RepoPicker { .. } => {}
+        Popup::ThemePicker {
+            selected, entries, ..
+        } => draw_theme_picker(frame, *selected, entries, theme),
     }
+}
+
+/// Paint the modal scrim across the whole frame.
+fn paint_scrim(frame: &mut Frame, theme: Theme) {
+    let area = frame.area();
+    frame.buffer_mut().set_style(area, theme.scrim());
+}
+
+/// Paint the scrim, clear `rect`, and fill it with the modal raised surface.
+/// Returns `rect` unchanged so callers can chain their panel render.
+fn draw_dialog_shell(frame: &mut Frame, rect: Rect, theme: Theme) -> Rect {
+    paint_scrim(frame, theme);
+    frame.render_widget(Clear, rect);
+    frame.buffer_mut().set_style(rect, theme.dialog_style());
+    rect
 }
 
 /// A horizontally-centered rectangle of the given width (percent) and fixed height.
@@ -254,13 +318,13 @@ fn draw_growing_popup(frame: &mut Frame, popup: GrowingPopup) -> Rect {
     let (rect, scroll) =
         scrolling_body_layout(area, width_pct, content_height, footer_height, focus);
 
-    frame.render_widget(Clear, rect);
-    frame.buffer_mut().set_style(rect, theme.surface_style());
+    draw_dialog_shell(frame, rect, theme);
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .title(title)
-        .style(theme.surface_style())
-        .border_style(theme.block(true));
+        .style(theme.dialog_style())
+        .border_style(theme.focused());
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
@@ -348,13 +412,13 @@ fn draw_menu(frame: &mut Frame, selected: usize, theme: Theme) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(" Ctrl+P — Actions ")
-                .style(theme.surface_style())
-                .border_style(theme.block(true)),
+                .style(theme.dialog_style())
+                .border_style(theme.focused()),
         )
         .highlight_style(Style::default().add_modifier(Modifier::BOLD));
-    frame.render_widget(Clear, rect);
-    frame.buffer_mut().set_style(rect, theme.surface_style());
+    draw_dialog_shell(frame, rect, theme);
     frame.render_widget(list, rect);
 }
 
@@ -412,13 +476,13 @@ fn draw_sessions_picker(
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(" Ctrl+O — Agent sessions ")
-                .style(theme.surface_style())
-                .border_style(theme.block(true)),
+                .style(theme.dialog_style())
+                .border_style(theme.focused()),
         )
         .highlight_style(Style::default().add_modifier(Modifier::BOLD));
-    frame.render_widget(Clear, rect);
-    frame.buffer_mut().set_style(rect, theme.surface_style());
+    draw_dialog_shell(frame, rect, theme);
     frame.render_widget(list, rect);
 }
 
@@ -434,14 +498,14 @@ fn draw_repo_picker(
     let area = frame.area();
     let height = (entries.len() as u16).saturating_add(4);
     let rect = centered_rect(area, 70, height);
-    frame.render_widget(Clear, rect);
-    frame.buffer_mut().set_style(rect, theme.surface_style());
+    draw_dialog_shell(frame, rect, theme);
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .title(" Ctrl+P — Switch repo ")
-        .style(theme.surface_style())
-        .border_style(theme.block(true));
+        .style(theme.dialog_style())
+        .border_style(theme.focused());
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
@@ -470,6 +534,45 @@ fn draw_repo_picker(
     frame.render_widget(list, chunks[1]);
 }
 
+/// Draw the Ctrl+P "Change theme" picker: a header-separated list of themes and
+/// modes. The highlighted choice is previewed live by the input handler.
+fn draw_theme_picker(frame: &mut Frame, selected: usize, entries: &[ThemeChoice], theme: Theme) {
+    let area = frame.area();
+    let rect = centered_rect(area, 50, (entries.len() as u16).saturating_add(2));
+
+    let items: Vec<ListItem> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| match entry {
+            ThemeChoice::Header(label) => ListItem::new(Line::from(Span::styled(
+                format!(" {label} "),
+                theme.muted_style().add_modifier(Modifier::BOLD),
+            ))),
+            ThemeChoice::Choice { label, .. } => {
+                let style = if i == selected {
+                    theme.selected()
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Line::from(Span::styled(format!("  {label} "), style)))
+            }
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(" Ctrl+P — Theme ")
+                .style(theme.dialog_style())
+                .border_style(theme.focused()),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+    draw_dialog_shell(frame, rect, theme);
+    frame.render_widget(list, rect);
+}
+
 /// Draw the Ctrl+R reply popup: the precise prompt from the agent's state
 /// channel, its selectable options (or a free-form input), and the send keys.
 fn draw_reply(frame: &mut Frame, prompt: &ReplyPrompt, theme: Theme) {
@@ -477,7 +580,7 @@ fn draw_reply(frame: &mut Frame, prompt: &ReplyPrompt, theme: Theme) {
     let mut content: Vec<Line<'static>> = Vec::new();
     content.push(Line::from(Span::styled(
         format!("Agent is waiting on {}", short_str(&prompt.session_id)),
-        Style::default().fg(theme.muted),
+        Style::default().fg(theme.muted()),
     )));
     content.push(Line::from(""));
     for line in prompt.request.message.lines() {
@@ -494,8 +597,12 @@ fn draw_reply(frame: &mut Frame, prompt: &ReplyPrompt, theme: Theme) {
             content.push(Line::from(Span::styled(format!("  {option} "), style)));
         }
     } else {
-        let mut spans = vec![Span::styled("> ", Style::default().fg(theme.accent))];
-        push_caret_line(&mut spans, &prompt.input, Style::default().fg(theme.accent));
+        let mut spans = vec![Span::styled("> ", Style::default().fg(theme.accent()))];
+        push_caret_line(
+            &mut spans,
+            &prompt.input,
+            Style::default().fg(theme.accent()),
+        );
         content.push(Line::from(spans));
     }
 
@@ -505,7 +612,7 @@ fn draw_reply(frame: &mut Frame, prompt: &ReplyPrompt, theme: Theme) {
         } else {
             "type answer · Enter send · Esc cancel"
         },
-        Style::default().fg(theme.muted),
+        Style::default().fg(theme.muted()),
     ))];
 
     draw_growing_popup(
@@ -534,7 +641,7 @@ fn draw_confirm(frame: &mut Frame, prompt: &ConfirmPrompt, theme: Theme) {
         .collect();
     let footer = vec![Line::from(Span::styled(
         "Enter/y confirm · Esc/n cancel",
-        Style::default().fg(theme.muted),
+        Style::default().fg(theme.muted()),
     ))];
 
     draw_growing_popup(
@@ -566,7 +673,7 @@ fn draw_task_error(frame: &mut Frame, app: &App, task_id: uuid::Uuid, theme: The
             if line.spans.is_empty() {
                 content.push(Line::from(Span::styled(
                     "(no error recorded)",
-                    Style::default().fg(theme.muted),
+                    Style::default().fg(theme.muted()),
                 )));
             } else {
                 content.push(line);
@@ -574,12 +681,12 @@ fn draw_task_error(frame: &mut Frame, app: &App, task_id: uuid::Uuid, theme: The
         }
         None => content.push(Line::from(Span::styled(
             "the task is no longer in the list",
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.muted()),
         ))),
     }
     let footer = vec![Line::from(Span::styled(
         "Esc / x close",
-        Style::default().fg(theme.muted),
+        Style::default().fg(theme.muted()),
     ))];
     draw_growing_popup(
         frame,
@@ -606,17 +713,17 @@ fn draw_form(frame: &mut Frame, form: &Form, theme: Theme) -> Rect {
         if i < form.current {
             content.push(Line::from(Span::styled(
                 format!("  ✓ {field}: {}", form.values[i]),
-                Style::default().fg(theme.success),
+                Style::default().fg(theme.success()),
             )));
         } else if i == form.current {
             focus_line = content.len();
             let mut spans = vec![Span::styled(
                 format!("> {field}: "),
                 Style::default()
-                    .fg(theme.accent)
+                    .fg(theme.accent())
                     .add_modifier(Modifier::BOLD),
             )];
-            push_caret_line(&mut spans, &form.input, Style::default().fg(theme.accent));
+            push_caret_line(&mut spans, &form.input, Style::default().fg(theme.accent()));
             content.push(Line::from(spans));
         } else {
             content.push(Line::from(format!("  {field}")));
@@ -627,7 +734,7 @@ fn draw_form(frame: &mut Frame, form: &Form, theme: Theme) -> Rect {
         Line::from(""),
         Line::from(Span::styled(
             " Enter: next · Esc: cancel ",
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.muted()),
         )),
     ];
 
@@ -665,14 +772,14 @@ fn draw_wizard(
         focus_line = content.len();
         let mut spans = vec![Span::styled(
             "> Directory: ",
-            Style::default().fg(theme.accent),
+            Style::default().fg(theme.accent()),
         )];
-        push_caret_line(&mut spans, &wizard.dir, Style::default().fg(theme.accent));
+        push_caret_line(&mut spans, &wizard.dir, Style::default().fg(theme.accent()));
         content.push(Line::from(spans));
     } else if wizard.loading {
         content.push(Line::from(vec![
             throbber_span(theme, state),
-            Span::styled("loading…", Style::default().fg(theme.muted)),
+            Span::styled("loading…", Style::default().fg(theme.muted())),
         ]));
     } else {
         let start = wizard.selected.saturating_sub(WIZARD_VISIBLE - 1);
@@ -691,7 +798,7 @@ fn draw_wizard(
                 label.clone()
             };
             let style = if unavailable {
-                Style::default().fg(theme.muted).add_modifier(Modifier::DIM)
+                theme.disabled()
             } else if idx == wizard.selected {
                 theme.selected()
             } else {
@@ -705,7 +812,7 @@ fn draw_wizard(
         if wizard.choices.is_empty() {
             content.push(Line::from(Span::styled(
                 "(nothing available)",
-                Style::default().fg(theme.muted),
+                Style::default().fg(theme.muted()),
             )));
         }
     }
@@ -713,7 +820,7 @@ fn draw_wizard(
     if let Some(err) = &wizard.error {
         content.push(Line::from(Span::styled(
             err.clone(),
-            Style::default().fg(theme.danger),
+            Style::default().fg(theme.danger()),
         )));
     }
 
@@ -721,7 +828,7 @@ fn draw_wizard(
         Line::from(""),
         Line::from(Span::styled(
             " ↑/↓ select · Enter: next · Esc: cancel ",
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.muted()),
         )),
     ];
 
@@ -755,7 +862,7 @@ fn draw_task_vars(frame: &mut Frame, form: &TaskVarsForm, theme: Theme) -> Rect 
         let label = format!("{}{}: ", if current { "> " } else { "  " }, var.prompt);
         let label_style = if current {
             Style::default()
-                .fg(theme.accent)
+                .fg(theme.accent())
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
@@ -792,11 +899,11 @@ fn draw_task_vars(frame: &mut Frame, form: &TaskVarsForm, theme: Theme) -> Rect 
                 spans.push(Span::raw("    "));
             }
             if buf.is_empty() && !current && lines.len() == 1 {
-                spans.push(Span::styled("(empty)", Style::default().fg(theme.muted)));
+                spans.push(Span::styled("(empty)", Style::default().fg(theme.muted())));
             } else {
                 spans.push(Span::raw(line.before.clone()));
                 if current && line.caret {
-                    spans.push(Span::styled("█", Style::default().fg(theme.accent)));
+                    spans.push(Span::styled("█", Style::default().fg(theme.accent())));
                 }
                 spans.push(Span::raw(line.after.clone()));
             }
@@ -807,7 +914,7 @@ fn draw_task_vars(frame: &mut Frame, form: &TaskVarsForm, theme: Theme) -> Rect 
     if let Some(err) = &form.error {
         content.push(Line::from(Span::styled(
             err.clone(),
-            Style::default().fg(theme.danger),
+            Style::default().fg(theme.danger()),
         )));
     }
 
@@ -815,7 +922,7 @@ fn draw_task_vars(frame: &mut Frame, form: &TaskVarsForm, theme: Theme) -> Rect 
         Line::from(""),
         Line::from(Span::styled(
             " Tab/↑↓ move · Enter next · Ctrl+Enter submit · Esc cancel ",
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.muted()),
         )),
     ];
 
@@ -884,6 +991,14 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("↑ / ↓", "move the selection"),
             ("Enter", "activate the repo (or global)"),
             ("Esc", "close without switching"),
+        ],
+    ),
+    (
+        "Switch theme (Ctrl+P → Change theme)",
+        &[
+            ("↑ / ↓", "preview the highlighted theme or mode"),
+            ("Enter", "keep the previewed theme for this session"),
+            ("Esc", "restore the previous theme"),
         ],
     ),
     (
@@ -973,11 +1088,13 @@ fn help_lines(theme: Theme) -> Vec<Line<'static>> {
     for (section, rows) in HELP_SECTIONS {
         lines.push(Line::from(Span::styled(
             (*section).to_string(),
-            theme.title(),
+            Style::default()
+                .fg(theme.title_color())
+                .add_modifier(Modifier::BOLD),
         )));
         for (k, v) in *rows {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {k} — "), Style::default().fg(theme.accent)),
+                Span::styled(format!("  {k} — "), Style::default().fg(theme.accent())),
                 Span::raw((*v).to_string()),
             ]));
         }
@@ -995,9 +1112,10 @@ fn draw_help(frame: &mut Frame, scroll: &mut u16, theme: Theme) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(" Help (?) — ↑/↓ scroll, Esc/? close ")
-                .style(theme.surface_style())
-                .border_style(theme.block(true)),
+                .style(theme.dialog_style())
+                .border_style(theme.focused()),
         )
         .wrap(Wrap { trim: false });
     let inner_width = rect.width.saturating_sub(2);
@@ -1006,8 +1124,7 @@ fn draw_help(frame: &mut Frame, scroll: &mut u16, theme: Theme) {
     let max_scroll = (paragraph.line_count(inner_width) as u16).saturating_sub(inner_height);
     *scroll = (*scroll).min(max_scroll);
 
-    frame.render_widget(Clear, rect);
-    frame.buffer_mut().set_style(rect, theme.surface_style());
+    draw_dialog_shell(frame, rect, theme);
     frame.render_widget(paragraph.scroll((*scroll, 0)), rect);
 }
 
@@ -1046,8 +1163,7 @@ fn draw_workflow(frame: &mut Frame, overlay: WorkflowOverlay<'_>) {
     let inner_width = rect.width.saturating_sub(2);
     let inner_height = rect.height.saturating_sub(2);
 
-    frame.render_widget(Clear, rect);
-    frame.buffer_mut().set_style(rect, theme.surface_style());
+    draw_dialog_shell(frame, rect, theme);
 
     if let Some(lines) = lines {
         // Cached render: keep the art intact (no wrapping) and scroll both axes.
@@ -1055,7 +1171,7 @@ fn draw_workflow(frame: &mut Frame, overlay: WorkflowOverlay<'_>) {
         if let Some(note) = note {
             content.push(Line::from(Span::styled(
                 note,
-                Style::default().fg(theme.muted),
+                Style::default().fg(theme.muted()),
             )));
         }
         content.extend(lines.iter().map(|line| Line::from(line.as_str())));
@@ -1069,9 +1185,10 @@ fn draw_workflow(frame: &mut Frame, overlay: WorkflowOverlay<'_>) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
                     .title(title)
-                    .style(theme.surface_style())
-                    .border_style(theme.block(true)),
+                    .style(theme.dialog_style())
+                    .border_style(theme.focused()),
             )
             .scroll((*scroll, *hscroll));
         frame.render_widget(paragraph, rect);
@@ -1083,7 +1200,7 @@ fn draw_workflow(frame: &mut Frame, overlay: WorkflowOverlay<'_>) {
     if let Some(note) = note {
         content.push(Line::from(Span::styled(
             note,
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.muted()),
         )));
     }
     content.push(Line::from(dot.unwrap_or("Loading workflow graph…")));
@@ -1091,9 +1208,10 @@ fn draw_workflow(frame: &mut Frame, overlay: WorkflowOverlay<'_>) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(title)
-                .style(theme.surface_style())
-                .border_style(theme.block(true)),
+                .style(theme.dialog_style())
+                .border_style(theme.focused()),
         )
         .wrap(Wrap { trim: false });
     let max_scroll = (paragraph.line_count(inner_width) as u16).saturating_sub(inner_height);
@@ -1114,8 +1232,7 @@ fn draw_workflow_runtime(frame: &mut Frame, app: &App) {
     let area = frame.area();
     let rect = centered_rect(area, 90, area.height.saturating_sub(2));
 
-    frame.render_widget(Clear, rect);
-    frame.buffer_mut().set_style(rect, theme.surface_style());
+    draw_dialog_shell(frame, rect, theme);
 
     let title = match &rt.view {
         Some(view) => format!(
@@ -1128,9 +1245,10 @@ fn draw_workflow_runtime(frame: &mut Frame, app: &App) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .title(title)
-        .style(theme.surface_style())
-        .border_style(theme.block(true));
+        .style(theme.dialog_style())
+        .border_style(theme.focused());
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
@@ -1144,9 +1262,9 @@ fn draw_workflow_runtime(frame: &mut Frame, app: &App) {
             .clone()
             .unwrap_or_else(|| "Loading workflow.inspect…".to_string());
         let color = if rt.error.is_some() {
-            theme.danger
+            theme.danger()
         } else {
-            theme.muted
+            theme.muted()
         };
         frame.render_widget(
             Paragraph::new(placeholder)
@@ -1166,7 +1284,7 @@ fn draw_workflow_runtime(frame: &mut Frame, app: &App) {
     if let Some(err) = &rt.error {
         header.push(Line::from(Span::styled(
             err.clone(),
-            Style::default().fg(theme.danger),
+            Style::default().fg(theme.danger()),
         )));
     }
     frame.render_widget(Paragraph::new(header), chunks[0]);
@@ -1228,11 +1346,11 @@ fn bucket_line(view: &WorkflowInspect, theme: Theme) -> Line<'static> {
         }
         spans.push(Span::styled(
             format!("{label} "),
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.muted()),
         ));
         spans.push(Span::styled(
             ids.len().to_string(),
-            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.fg()).add_modifier(Modifier::BOLD),
         ));
     }
     Line::from(spans)
@@ -1259,7 +1377,9 @@ fn draw_catalog(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
         draw_catalog_table(frame, app, area, theme);
         let rect = centered_rect(area, 80, area.height.saturating_sub(2));
         frame.render_widget(Clear, rect);
-        frame.buffer_mut().set_style(rect, theme.surface_style());
+        frame
+            .buffer_mut()
+            .set_style(rect, theme.raised_style(RaisedLevel::High));
         draw_catalog_preview(frame, app, rect, theme);
         return;
     }
@@ -1404,14 +1524,14 @@ fn draw_catalog_preview(frame: &mut Frame, app: &mut App, area: Rect, theme: The
             Some(name.as_str()),
             vec![Line::from(Span::styled(
                 "(no content)",
-                Style::default().fg(theme.muted),
+                Style::default().fg(theme.muted()),
             ))],
         ),
         None => (
             None,
             vec![Line::from(Span::styled(
                 "Select a task to preview its definition.",
-                Style::default().fg(theme.muted),
+                Style::default().fg(theme.muted()),
             ))],
         ),
     };
@@ -1612,13 +1732,13 @@ fn draw_usage(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
                 stats.buckets.len(),
                 period.bucket_unit()
             ),
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.muted()),
         )),
     ];
     if let Some(error) = &app.usage_error {
         summary.push(Line::from(Span::styled(
             error.clone(),
-            Style::default().fg(theme.danger),
+            Style::default().fg(theme.danger()),
         )));
     }
     frame.render_widget(
@@ -1649,9 +1769,9 @@ fn draw_usage(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
         )
         .bar_width(bar_width)
         .bar_gap(1)
-        .bar_style(Style::default().fg(theme.accent))
-        .value_style(Style::default().fg(theme.muted))
-        .label_style(Style::default().fg(theme.muted));
+        .bar_style(Style::default().fg(theme.accent()))
+        .value_style(Style::default().fg(theme.muted()))
+        .label_style(Style::default().fg(theme.muted()));
     frame.render_widget(token_chart, chunks[1]);
 
     let cost_bars: Vec<Bar> = stats
@@ -1674,9 +1794,9 @@ fn draw_usage(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
         )
         .bar_width(bar_width)
         .bar_gap(1)
-        .bar_style(Style::default().fg(theme.success))
-        .value_style(Style::default().fg(theme.muted))
-        .label_style(Style::default().fg(theme.muted));
+        .bar_style(Style::default().fg(theme.success()))
+        .value_style(Style::default().fg(theme.muted()))
+        .label_style(Style::default().fg(theme.muted()));
     frame.render_widget(cost_chart, chunks[2]);
 }
 
@@ -1728,9 +1848,9 @@ fn bucket_label(period: UsagePeriod, start: DateTime<Utc>) -> String {
 
 fn status_ok(s: &str, theme: Theme) -> Line<'static> {
     let (dot, txt, color) = if s == "ok" {
-        ("●", "ok", theme.success)
+        ("●", "ok", theme.success())
     } else {
-        ("○", "error", theme.danger)
+        ("○", "error", theme.danger())
     };
     Line::from(vec![
         Span::styled(format!("{dot} "), Style::default().fg(color)),
@@ -1863,7 +1983,7 @@ fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     if app.agent_session_id.is_none() || inner_area.width == 0 || inner_area.height == 0 {
         let hint = Paragraph::new(Line::from(Span::styled(
             "The embedded agent terminal appears here. Select a task and press Enter to launch the configured agent, or Ctrl+O to switch between running sessions.",
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.muted()),
         )))
         .wrap(Wrap { trim: true });
         frame.render_widget(hint, inner_area);
@@ -1943,7 +2063,7 @@ fn draw_agent_structured(frame: &mut Frame, app: &App, area: Rect, theme: Theme)
         Line::from(Span::styled(
             heading,
             Style::default()
-                .fg(theme.warning)
+                .fg(theme.warning())
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
@@ -1981,7 +2101,7 @@ fn draw_agent_structured(frame: &mut Frame, app: &App, area: Rect, theme: Theme)
     };
     lines.push(Line::from(Span::styled(
         note,
-        Style::default().fg(theme.muted),
+        Style::default().fg(theme.muted()),
     )));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
 }
@@ -1991,8 +2111,8 @@ fn draw_agent_structured(frame: &mut Frame, app: &App, area: Rect, theme: Theme)
 fn cell_style(cell: &vt100::Cell, theme: Theme) -> Style {
     let mut style = Style::default();
     let (mut fg, mut bg) = (
-        vt_color_or(cell.fgcolor(), theme.fg),
-        vt_color_or(cell.bgcolor(), theme.bg),
+        vt_color_or(cell.fgcolor(), theme.fg()),
+        vt_color_or(cell.bgcolor(), theme.bg()),
     );
 
     let mut modifier = Modifier::empty();
@@ -2023,19 +2143,6 @@ fn vt_color_or(color: vt100::Color, default: Color) -> Color {
         vt100::Color::Idx(idx) => Color::Indexed(idx),
         vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
     }
-}
-
-/// Compute the (tab, start column, end column) triplets for the tab bar, matching
-/// how the `Tabs` widget lays titles out.
-fn tab_click_regions(x0: u16, _y0: u16) -> Vec<(Tab, u16, u16)> {
-    let mut x = x0 + 1;
-    let mut out = Vec::new();
-    for tab in Tab::ALL {
-        let width = tab.label().chars().count() as u16;
-        out.push((tab, x, x + width));
-        x += width + 3;
-    }
-    out
 }
 
 fn draw_events(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
@@ -2107,7 +2214,7 @@ fn draw_event_payload(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
             " Payload ".to_string(),
             vec![Line::from(Span::styled(
                 "(no events yet)",
-                Style::default().fg(theme.muted),
+                Style::default().fg(theme.muted()),
             ))],
         ),
     };
@@ -2120,23 +2227,27 @@ fn draw_event_payload(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
                 .border_style(theme.block(false)),
         )
         .wrap(Wrap { trim: false });
+    frame.buffer_mut().set_style(area, theme.surface_style());
     frame.render_widget(paragraph, area);
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let (dot, state_txt, color) = match app.conn {
-        ConnState::Connected => ("●", "connected", theme.success),
-        ConnState::Connecting => ("◐", "connecting", theme.warning),
-        ConnState::Disconnected => ("○", "disconnected", theme.danger),
+        ConnState::Connected => ("●", "connected", theme.success()),
+        ConnState::Connecting => ("◐", "connecting", theme.warning()),
+        ConnState::Disconnected => ("○", "disconnected", theme.danger()),
     };
 
     // Keyboard focus: the embedded agent only owns the keyboard while its tab is
     // open and capture is on; otherwise favetto does.
     let agent_focused = app.tab == Tab::Agent && app.agent_capture;
     let (focus_txt, focus_color) = if agent_focused {
-        ("agent", theme.info)
+        ("agent", theme.info())
     } else {
-        ("favetto", theme.accent)
+        ("favetto", theme.accent())
     };
 
     let mut hint = if app.tab == Tab::Agent {
@@ -2156,43 +2267,47 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
 
     // Sound badge: muted wins visually; a disabled engine shows `sound off`.
     let (sound_txt, sound_color) = if !app.sound_enabled {
-        ("sound off", theme.muted)
+        ("sound off", theme.muted())
     } else if app.sound_muted {
-        ("muted", theme.warning)
+        ("muted", theme.warning())
     } else {
-        ("sound", theme.success)
+        ("sound", theme.success())
     };
 
-    let mut spans = vec![
+    let badge = |fg: Color, bg: Color| Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);
+
+    // Segments carry a priority: higher priorities are dropped first when the
+    // terminal is too narrow. The connection indicator (priority 0) never drops.
+    let mut segments: Vec<(u8, Vec<Span<'static>>)> = Vec::new();
+    let mut conn = vec![
         Span::raw(" "),
         Span::styled(format!(" {dot} "), Style::default().fg(color)),
         Span::styled(state_txt.to_string(), Style::default().fg(color)),
     ];
     if matches!(app.conn, ConnState::Connecting) {
-        spans.push(throbber_span(theme, &app.throbber_state));
+        conn.push(throbber_span(theme, &app.throbber_state));
     }
-    spans.push(Span::styled(
-        format!("· {}", app.conn_detail),
-        Style::default().fg(theme.muted),
+    segments.push((0, conn));
+    segments.push((
+        6,
+        vec![Span::styled(
+            format!("· {}", app.conn_detail),
+            Style::default().fg(theme.muted()),
+        )],
     ));
-
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(
-        format!(" {sound_txt} "),
-        Style::default()
-            .fg(theme.selected_fg)
-            .bg(sound_color)
-            .add_modifier(Modifier::BOLD),
+    segments.push((
+        4,
+        vec![Span::styled(
+            format!(" {sound_txt} "),
+            badge(theme.selected_fg(), sound_color),
+        )],
     ));
-
-    // Active-repo badge: the daemon-wide active repo (or `global`).
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(
-        format!(" {} ", app.active_repo_label()),
-        Style::default()
-            .fg(theme.selected_fg)
-            .bg(theme.info)
-            .add_modifier(Modifier::BOLD),
+    segments.push((
+        3,
+        vec![Span::styled(
+            format!(" {} ", app.active_repo_label()),
+            badge(theme.selected_fg(), theme.info()),
+        )],
     ));
 
     let awaiting = app
@@ -2201,49 +2316,89 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
         .filter(|t| t.status == TaskStatus::AwaitingInput)
         .count();
     if awaiting > 0 {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            format!("⚠ {awaiting} awaiting input · [Enter] open agent"),
-            Style::default()
-                .fg(theme.warning)
-                .add_modifier(Modifier::BOLD),
+        segments.push((
+            1,
+            vec![Span::styled(
+                format!("⚠ {awaiting} awaiting input · [Enter] open agent"),
+                Style::default()
+                    .fg(theme.warning())
+                    .add_modifier(Modifier::BOLD),
+            )],
         ));
     }
-
     if let Some(err) = &app.agent_error {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            format!("⚠ agent: {err}"),
-            Style::default()
-                .fg(theme.danger)
-                .add_modifier(Modifier::BOLD),
+        segments.push((
+            1,
+            vec![Span::styled(
+                format!("⚠ agent: {err}"),
+                Style::default()
+                    .fg(theme.danger())
+                    .add_modifier(Modifier::BOLD),
+            )],
         ));
     }
-
     if let Some(notice) = &app.notice {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            format!("⚠ {notice}"),
-            Style::default()
-                .fg(theme.danger)
-                .add_modifier(Modifier::BOLD),
+        segments.push((
+            1,
+            vec![Span::styled(
+                format!("⚠ {notice}"),
+                Style::default()
+                    .fg(theme.danger())
+                    .add_modifier(Modifier::BOLD),
+            )],
         ));
     }
-
-    let counts = format!("tasks: {}  events: {}", app.tasks.len(), app.events.len());
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(
-        format!(" {focus_txt} "),
-        Style::default()
-            .fg(theme.selected_fg)
-            .bg(focus_color)
-            .add_modifier(Modifier::BOLD),
+    segments.push((
+        2,
+        vec![Span::styled(
+            format!(" {focus_txt} "),
+            badge(theme.selected_fg(), focus_color),
+        )],
     ));
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(counts, theme.muted_style()));
-    spans.push(Span::styled(format!("  {hint}"), theme.accent_style()));
+    segments.push((
+        6,
+        vec![Span::styled(
+            format!("tasks: {}  events: {}", app.tasks.len(), app.events.len()),
+            theme.muted_style(),
+        )],
+    ));
+    segments.push((2, vec![Span::styled(hint, theme.accent_style())]));
 
+    // Drop the lowest-value (highest-numbered) segments until the bar fits.
+    while status_width(&segments) > area.width {
+        let Some((idx, _)) = segments
+            .iter()
+            .enumerate()
+            .filter(|(_, (priority, _))| *priority > 0)
+            .max_by_key(|(_, (priority, _))| *priority)
+        else {
+            break;
+        };
+        segments.remove(idx);
+    }
+
+    let mut spans: Vec<Span> = Vec::new();
+    for (i, (_, segment)) in segments.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.extend(segment);
+    }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Rendered width (in cells) of a status bar's segments, including the two-space
+/// separators between them.
+fn status_width(segments: &[(u8, Vec<Span<'static>>)]) -> u16 {
+    let mut width = 0u16;
+    for (i, (_, spans)) in segments.iter().enumerate() {
+        if i > 0 {
+            width = width.saturating_add(2);
+        }
+        let inner: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+        width = width.saturating_add(inner);
+    }
+    width
 }
 
 /// A status glyph/colour line for a task row. `Running` renders a throbber.
@@ -2300,9 +2455,9 @@ fn failure_kind_label(kind: FailureKind) -> &'static str {
 fn error_cell(task: &Task, theme: Theme) -> Line<'static> {
     if let Some(failure) = &task.failure {
         let color = if failure.retryable {
-            theme.warning
+            theme.warning()
         } else {
-            theme.danger
+            theme.danger()
         };
         let hint = if failure.retryable {
             " (retryable)"
@@ -2319,10 +2474,9 @@ fn error_cell(task: &Task, theme: Theme) -> Line<'static> {
         ]);
     }
     match task.error.as_deref() {
-        Some(err) if !err.is_empty() => Line::from(Span::styled(
-            err.to_string(),
-            Style::default().fg(theme.danger),
-        )),
+        Some(err) if !err.is_empty() => {
+            Line::from(Span::styled(err.to_string(), theme.destructive()))
+        }
         _ => Line::default(),
     }
 }
@@ -2331,7 +2485,7 @@ fn error_cell(task: &Task, theme: Theme) -> Line<'static> {
 fn throbber_span(theme: Theme, state: &throbber_widgets_tui::ThrobberState) -> Span<'static> {
     let t: throbber_widgets_tui::Throbber<'static> = throbber_widgets_tui::Throbber::default()
         .throbber_set(throbber_widgets_tui::BRAILLE_SIX)
-        .throbber_style(Style::default().fg(theme.accent))
+        .throbber_style(Style::default().fg(theme.accent()))
         .style(theme.base());
     t.to_symbol_span(state)
 }
