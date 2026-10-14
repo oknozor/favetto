@@ -376,9 +376,14 @@ Rules:
 a dependent task's `prev.output` carry real text/tools/usage/outcome instead of
 a raw JSON event dump.
 
-`task.output` still carries the folded `RunSummary`, so it remains the post-run
-fallback (and the only view for agents without a structured state source); the
-web live feed augments rather than replaces it.
+`task.output` still carries the folded `RunSummary` (under `result`), so it
+remains the post-run record for every run, successful or failed; the web live
+feed augments rather than replaces it. The daemon now persists the output
+envelope on failure too (`record_run_outcome`), so the Task detail view can
+render the run's agent log — messages, reasoning, tool cards, usage, errors and
+the run boundary — after a reload or daemon restart, when the ephemeral live
+feed is gone. Agents without a structured summary keep the plain-text output
+view; the raw output and the envelope summary stay reachable from the log.
 
 The headless stream is a background concern: the Agent panel never renders it. A
 headless run consumes its own stdout for state/usage/session id, while the panel

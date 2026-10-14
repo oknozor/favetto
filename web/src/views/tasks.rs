@@ -15,9 +15,9 @@ use uuid::Uuid;
 
 use crate::app::Route;
 use crate::client::RpcClient;
-use crate::components::agent_feed::AgentFeed;
+use crate::components::agent_feed::{summary_feed, AgentFeed, AgentLog};
 use crate::components::dialog::{ConfirmDialog, Dialog};
-use crate::components::output_viewer::{extract_output_text, OutputViewer};
+use crate::components::output_viewer::{extract_output_text, extract_run_summary, OutputViewer};
 use crate::components::toast::{Toast, ToastKind};
 use crate::state::{repo_label, task_repo, AppState, TaskFeed};
 
@@ -598,6 +598,23 @@ pub fn TaskDetail(id: String) -> Element {
                         .as_ref()
                         .map(extract_output_text)
                         .unwrap_or_else(|| ("No output recorded.".to_string(), false));
+                    // A structured run persists its `RunSummary` in the output
+                    // envelope; render it as an agent log, keeping the raw text
+                    // and the envelope summary one click away.
+                    let log_items = task
+                        .output
+                        .as_ref()
+                        .and_then(extract_run_summary)
+                        .map(|summary| summary_feed(&summary));
+                    let envelope_summary = task
+                        .output
+                        .as_ref()
+                        .and_then(|value| value.get("envelope"))
+                        .and_then(|envelope| envelope.get("summary"))
+                        .and_then(|summary| summary.as_str())
+                        .map(str::trim)
+                        .filter(|summary| !summary.is_empty())
+                        .map(str::to_string);
                     let started = task
                         .started_at
                         .map(|t| t.to_string())
@@ -713,7 +730,18 @@ pub fn TaskDetail(id: String) -> Element {
                         }
                         section { class: "task-output",
                             h2 { "Output" }
-                            OutputViewer { text: output_text, truncated: output_truncated }
+                            if let Some(items) = log_items {
+                                AgentLog { items }
+                                if let Some(summary) = envelope_summary {
+                                    p { class: "task-output-summary", "{summary}" }
+                                }
+                                details { class: "task-output-raw",
+                                    summary { "Raw output" }
+                                    OutputViewer { text: output_text, truncated: output_truncated }
+                                }
+                            } else {
+                                OutputViewer { text: output_text, truncated: output_truncated }
+                            }
                         }
                         if let Some(action) = confirm() {
                             ConfirmDialog {

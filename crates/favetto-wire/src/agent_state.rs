@@ -344,6 +344,19 @@ pub struct RunSummary {
     pub error: Option<String>,
 }
 
+impl RunSummary {
+    /// Whether the summary carries nothing worth rendering. Identity fields
+    /// (`session_id`, `title`) do not count: a title-only summary has no log.
+    pub fn is_empty(&self) -> bool {
+        self.text.trim().is_empty()
+            && self.reasoning.trim().is_empty()
+            && self.tool_calls.is_empty()
+            && self.usage.is_empty()
+            && self.outcome.is_none()
+            && self.error.is_none()
+    }
+}
+
 /// Shared `is_false` predicate for `skip_serializing_if`.
 pub(crate) fn is_false(value: &bool) -> bool {
     !*value
@@ -406,6 +419,47 @@ mod tests {
         let minimal: RunSummary = serde_json::from_str("{}").unwrap();
         assert_eq!(minimal, RunSummary::default());
         assert!(minimal.outcome.is_none());
+    }
+
+    #[test]
+    fn run_summary_is_empty_ignores_identity_fields() {
+        // A default summary and a title/session-only summary carry no log.
+        assert!(RunSummary::default().is_empty());
+        assert!(RunSummary {
+            session_id: Some("ses_1".to_string()),
+            title: Some("Fix it".to_string()),
+            ..Default::default()
+        }
+        .is_empty());
+        // Any renderable field makes it non-empty.
+        assert!(!RunSummary {
+            text: "done".to_string(),
+            ..Default::default()
+        }
+        .is_empty());
+        assert!(!RunSummary {
+            tool_calls: vec![ToolCall::default()],
+            ..Default::default()
+        }
+        .is_empty());
+        assert!(!RunSummary {
+            outcome: Some(IdleOutcome::Failed),
+            ..Default::default()
+        }
+        .is_empty());
+        assert!(!RunSummary {
+            error: Some("boom".to_string()),
+            ..Default::default()
+        }
+        .is_empty());
+        assert!(!RunSummary {
+            usage: AgentUsage {
+                input_tokens: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .is_empty());
     }
 
     #[test]
