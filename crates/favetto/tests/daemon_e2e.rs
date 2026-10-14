@@ -456,6 +456,48 @@ async fn spa_is_served_over_http() {
     assert_eq!(missing.status().as_u16(), 404);
 }
 
+/// systemd stops a service with SIGTERM. The daemon must exit cleanly
+/// (status 0) instead of being killed by the signal, so the graceful shutdown
+/// path runs.
+#[tokio::test]
+async fn sigterm_shuts_the_daemon_down_gracefully() {
+    let mut daemon = DaemonHarness::spawn();
+    wait_for_unix_socket(daemon.socket(), &daemon).await;
+
+    // SAFETY: `kill` is async-signal-safe; the pid is a live child of this test.
+    unsafe { libc::kill(daemon.child.id() as libc::pid_t, libc::SIGTERM) };
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match daemon
+            .child
+            .try_wait()
+            .expect("try_wait on the daemon child")
+        {
+            Some(status) => {
+                assert!(
+                    status.success(),
+                    "daemon exited with {status} after SIGTERM; log:\n{}",
+                    daemon.log()
+                );
+                assert!(
+                    daemon.log().contains("shutdown signal received"),
+                    "graceful shutdown path did not run; log:\n{}",
+                    daemon.log()
+                );
+                break;
+            }
+            None if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            None => panic!(
+                "daemon did not exit within 20s of SIGTERM; log:\n{}",
+                daemon.log()
+            ),
+        }
+    }
+}
+
 /// The TUI's remote attach uses the `favetto-tui` client (not the raw test
 /// client above). A base URL without `/rpc` must still reach the daemon, which
 /// only upgrades WebSockets at `/rpc`.

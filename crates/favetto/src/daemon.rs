@@ -203,11 +203,11 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let app = http_app(&state);
     let http_task = tokio::spawn(async move { transport::serve_http(&listen, app).await });
 
-    tracing::info!("daemon started (ctrl-c to stop)");
+    tracing::info!("daemon started (ctrl-c or SIGTERM to stop)");
 
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("shutdown signal received");
+        signal = shutdown_signal() => {
+            tracing::info!(signal, "shutdown signal received");
         }
         r = unix_task => {
             r??;
@@ -219,6 +219,46 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
 
     tracing::info!("daemon stopped");
     Ok(())
+}
+
+/// Wait for a process stop request: SIGINT (Ctrl+C) or, on Unix, SIGTERM
+/// (`systemctl stop`). Returns the name of the signal that fired.
+///
+/// A missing or failed signal handler must not panic (the crate denies
+/// `unwrap_used`/`expect_used` in its non-test build): fall back to Ctrl+C, or
+/// wait forever when even that cannot be installed.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    sig = ctrl_c() => sig,
+                    _ = sigterm.recv() => "SIGTERM",
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to install SIGTERM handler; waiting for Ctrl+C");
+                ctrl_c().await
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ctrl_c().await
+    }
+}
+
+/// Await Ctrl+C, tolerating a failed handler install by waiting forever.
+async fn ctrl_c() -> &'static str {
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => "SIGINT",
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to listen for Ctrl+C");
+            std::future::pending::<&'static str>().await
+        }
+    }
 }
 
 /// Assemble the daemon's HTTP/WebSocket router (API + embedded SPA).

@@ -25,6 +25,16 @@ INFO favetto::daemon: listening on unix:/tmp/favetto.sock
 INFO favetto::daemon: websocket API on 127.0.0.1:7878
 ```
 
+To keep the daemon running in the background instead, install it as a systemd
+user service — it starts at login, restarts on failure, and logs to the journal:
+
+```bash
+./scripts/install.sh
+systemctl --user status favetto
+```
+
+See [Installation → Run as a systemd user service](./installation#run-as-a-systemd-user-service).
+
 ## 2. Attach the TUI
 
 In a second terminal, attach to the daemon over the local socket:
