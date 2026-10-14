@@ -36,6 +36,10 @@ cargo install --path crates/favetto
 You also need an agent CLI (for example opencode) on your `PATH`. See the
 [installation guide](https://oknozor.github.io/favetto/guide/installation).
 
+To run the daemon as a systemd user service, `./scripts/install.sh` installs the
+binary, seeds `~/.config/favetto/config.toml`, and enables the unit (see
+[installation](https://oknozor.github.io/favetto/guide/installation#run-as-a-systemd-user-service)).
+
 ## Quickstart
 
 ```bash

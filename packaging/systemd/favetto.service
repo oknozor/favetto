@@ -1,0 +1,28 @@
+[Unit]
+Description=favetto — LLM-driven agent orchestrator daemon
+Documentation=https://oknozor.github.io/favetto/guide/installation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# `cargo install --path crates/favetto` places the binary here. The install
+# script substitutes the resolved path when it differs.
+ExecStart=%h/.cargo/bin/favetto daemon
+# The default `tasks_dir = "tasks"` is relative; anchor it at $HOME.
+WorkingDirectory=%h
+# systemd's default PATH omits the agent CLIs, and favetto resolves agents from
+# PATH. Keep the standard dirs and add the usual user install locations.
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=RUST_LOG=favetto=info
+# SIGTERM (the default stop signal) is handled by the daemon and exits 0.
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+# Modest hardening. ProtectHome/ProtectSystem=strict are intentionally omitted:
+# agents must write to repositories under $HOME and reach the network.
+NoNewPrivileges=true
+ProtectSystem=full
+
+[Install]
+WantedBy=default.target
