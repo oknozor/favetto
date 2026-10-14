@@ -1,9 +1,8 @@
 //! Root component and routing.
 //!
 //! The app provides the shared [`AppState`] once, renders the connection banner,
-//! and (on web) starts the RPC ping and the SSE reader. The Inbox, Tasks, Catalog
-//! and Settings views land in follow-up issues; the route enum is the seam they
-//! plug into.
+//! and (on web) starts the RPC ping and the SSE reader. The authenticated routes
+//! share an [`AppLayout`] that renders the top navigation.
 
 use dioxus::prelude::*;
 use uuid::Uuid;
@@ -12,6 +11,8 @@ use crate::config;
 use crate::state::{onboarding_step, AppState, ConnectionState, OnboardingStep};
 use crate::views::catalog::{Catalog, CatalogDetail};
 use crate::views::pair::Pair;
+use crate::views::schedules::Schedules;
+use crate::views::settings::Settings;
 use crate::views::tasks::{TaskDetail, TasksList};
 use crate::views::workflow::{WorkflowDetail, WorkflowList};
 
@@ -22,12 +23,15 @@ use crate::views::workflow::{WorkflowDetail, WorkflowList};
 /// Android native app share the same navigation vocabulary.
 #[derive(Routable, Clone, PartialEq, Debug)]
 pub enum Route {
+    /// Onboarding: configure the daemon (Android) and exchange a pairing code.
+    /// Unauthenticated, so it stays outside the [`AppLayout`].
+    #[route("/pair")]
+    Pair {},
+    /// The authenticated area, wrapped in the shared navigation shell.
+    #[layout(AppLayout)]
     /// The default view; the Inbox replaces this in a follow-up issue.
     #[route("/")]
     Home {},
-    /// Onboarding: configure the daemon (Android) and exchange a pairing code.
-    #[route("/pair")]
-    Pair {},
     /// The task list, filterable by status.
     #[route("/tasks")]
     TasksList {},
@@ -46,6 +50,36 @@ pub enum Route {
     /// The `workflow.inspect` tree for one workflow root.
     #[route("/workflow/:root_id")]
     WorkflowDetail { root_id: Uuid },
+    /// The cron schedule manager.
+    #[route("/schedules")]
+    Schedules {},
+    /// Notification channels, sent history, hooks and session info.
+    #[route("/settings")]
+    Settings {},
+}
+
+/// The shared shell for the authenticated routes: top navigation + outlet.
+#[component]
+fn AppLayout() -> Element {
+    rsx! {
+        AppNav {}
+        Outlet::<Route> {}
+    }
+}
+
+/// The top navigation shared by the authenticated views.
+#[component]
+fn AppNav() -> Element {
+    rsx! {
+        nav { class: "app-nav",
+            Link { to: Route::Home {}, "Home" }
+            Link { to: Route::TasksList {}, "Tasks" }
+            Link { to: Route::WorkflowList {}, "Workflows" }
+            Link { to: Route::Catalog {}, "Catalog" }
+            Link { to: Route::Schedules {}, "Schedules" }
+            Link { to: Route::Settings {}, "Settings" }
+        }
+    }
 }
 
 /// The application root: stylesheet, layout shell, and router outlet.
@@ -284,5 +318,13 @@ mod tests {
             Route::CatalogDetail { name: "foo".into() }.to_string(),
             "/catalog/foo"
         );
+    }
+
+    #[test]
+    fn schedules_and_settings_routes_serialize() {
+        assert_eq!(Route::Schedules {}.to_string(), "/schedules");
+        assert_eq!(Route::Settings {}.to_string(), "/settings");
+        assert_eq!("/schedules".parse::<Route>().unwrap(), Route::Schedules {});
+        assert_eq!("/settings".parse::<Route>().unwrap(), Route::Settings {});
     }
 }
