@@ -18,6 +18,7 @@ use crate::event_bus::{EventBus, ServerPush};
 use crate::hooks::Hook;
 use crate::metrics::Metrics;
 use crate::pair::PairStore;
+use crate::repos::KnownRepo;
 use crate::tasks::TaskDef;
 use crate::ticket::TicketStore;
 use crate::webhooks::WebhookSecrets;
@@ -52,6 +53,16 @@ pub struct State {
     pub providers_cache: tokio::sync::Mutex<HashMap<String, Vec<favetto_providers::Provider>>>,
     /// Per-daemon counters rendered on `/metrics`.
     pub metrics: Metrics,
+    /// Known repositories whose `.favetto/tasks/` catalogs are loaded.
+    pub repos: Arc<RwLock<Vec<KnownRepo>>>,
+    /// The daemon-wide active repo name; `None` means the global catalog.
+    pub active_repo: Arc<RwLock<Option<String>>>,
+    /// Control signal to the catalog watcher: sent when the set of watched roots
+    /// changes (a repo was added/removed). The watcher re-targets and reloads.
+    pub watch_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    /// Receiver half of [`Self::watch_tx`], taken exactly once by
+    /// [`crate::catalog_watch::spawn`].
+    pub(crate) watch_rx: parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<()>>>,
 }
 
 /// Arguments for [`State::new`], grouped into a struct so the constructor's
@@ -74,6 +85,7 @@ pub struct StateInit {
 impl State {
     pub fn new(init: StateInit) -> Self {
         let tickets = TicketStore::new(init.config.auth.ticket_ttl_secs);
+        let (watch_tx, watch_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             db: init.db,
             bus: init.bus,
@@ -91,6 +103,10 @@ impl State {
             hook_store: init.hook_store,
             providers_cache: tokio::sync::Mutex::new(HashMap::new()),
             metrics: Metrics::default(),
+            repos: Arc::new(RwLock::new(Vec::new())),
+            active_repo: Arc::new(RwLock::new(None)),
+            watch_tx,
+            watch_rx: parking_lot::Mutex::new(Some(watch_rx)),
         }
     }
 

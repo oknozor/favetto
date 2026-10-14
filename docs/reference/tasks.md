@@ -164,3 +164,20 @@ That identity is used consistently by `tasks.start` and `catalog.get`,
 its identity**: an
 existing `catalog:<old>` schedule is dropped and recreated, and any `needs`,
 `spawn`, or webhook rule that named the old name must be updated.
+
+### Repository-local tasks
+
+In addition to the global tasks directory, the daemon loads every registered
+repository's `<repo>/.favetto/tasks/` catalog. A repo-local task's identity is
+prefixed with `repo:<name>/`, where `<name>` is the repository's display name:
+
+```text
+<repo>/.favetto/tasks/triage.md            →  repo:<name>/triage
+<repo>/.favetto/tasks/pipelines/plan.md    →  repo:<name>/pipelines/plan
+```
+
+The `repo:` prefix is reserved, so a global task path may not start with it.
+Repo-local tasks default their `cwd` to the repository root. Bare `needs`/`spawn`
+references inside a repo-local task resolve to the same repo's task when it
+exists (preserving any `:finished`/`:all_finished` suffix); cross-repo references
+must be spelled out in full. See [Repository-local tasks](../guide/catalog#repository-local-tasks).

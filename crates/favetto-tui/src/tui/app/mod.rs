@@ -13,8 +13,8 @@ use base64::Engine as _;
 
 use favetto_core::model::{
     AgentActivity, AgentCapabilities, AgentCatalogEntry, AgentSessionInfo, AgentUsage,
-    AwaitingInputKind, Event, EventKind, InputReply, InputRequest, NotificationRecord, Schedule,
-    Task, TaskStatus, UsagePeriod, UsageStats,
+    AwaitingInputKind, Event, EventKind, InputReply, InputRequest, NotificationRecord, RepoInfo,
+    Schedule, Task, TaskStatus, UsagePeriod, UsageStats,
 };
 use favetto_core::rpc::{method, push, Notification};
 use favetto_core::workflow::WorkflowInspect;
@@ -87,6 +87,11 @@ pub enum UiAction {
     NewAgent(String),
     /// Open the Ctrl+O agent-session picker (needs an async `agents.list`).
     OpenSessions,
+    /// Open the Ctrl+P "Switch repo" picker.
+    OpenRepoPicker,
+    /// Activate a known repo by name (`None` selects the global catalog) through
+    /// `repos.activate`.
+    ActivateRepo(Option<String>),
     /// Attach the Agent panel to an existing session id (`agents.attach`).
     AttachSession(String),
     /// Forward raw keystrokes to the active agent session.
@@ -180,6 +185,12 @@ pub enum Popup {
     TaskError {
         task_id: Uuid,
     },
+    /// The Ctrl+P "Switch repo" picker: a searchable list of known repos plus a
+    /// `global` row that clears the active repo.
+    RepoPicker {
+        selected: usize,
+        filter: TextBuffer,
+    },
 }
 
 pub struct Form {
@@ -199,6 +210,7 @@ pub enum FormKind {
     AddTask,
     CreateSchedule,
     CreateNotification,
+    AddRepo,
 }
 
 /// A step in the one-shot task wizard.
@@ -384,6 +396,9 @@ pub struct CatalogEntry {
     pub vars: Vec<TaskVar>,
     #[serde(default)]
     pub prompt: String,
+    /// The repo namespace for a repo-local task (`<name>` in `repo:<name>/<path>`).
+    #[serde(default)]
+    pub repo: Option<String>,
 }
 
 /// One visible row of the Catalog tree: a folder header or a task.
@@ -421,11 +436,13 @@ impl CatalogEntry {
 }
 
 /// The Ctrl+P menu entries, in order.
-pub const MENU_OPTIONS: [&str; 4] = [
+pub const MENU_OPTIONS: [&str; 6] = [
     "New one-shot task",
     "Add task to catalog",
     "Create schedule",
     "Create notification hook",
+    "Switch repo",
+    "Add repo",
 ];
 
 /// A clickable screen region (absolute coordinates), populated during draw.
@@ -503,6 +520,14 @@ pub struct App {
     /// Set when the daemon pushes `catalog.updated`; the session loop re-fetches
     /// the catalog and clears it.
     pub catalog_dirty: bool,
+    /// The daemon's known repositories (`repos.list`), for the Switch repo picker
+    /// and the status badge.
+    pub known_repos: Vec<RepoInfo>,
+    /// The daemon-wide active repo name; `None` means the global catalog.
+    pub active_repo: Option<String>,
+    /// Set when `catalog.updated` arrives (which also fires on repo changes); the
+    /// session loop re-fetches `repos.list` and clears it.
+    pub repos_dirty: bool,
     /// Set when a `task.updated`/`event` push arrives while the runtime workflow
     /// inspector is open; the session loop re-fetches `workflow.inspect` and
     /// clears it.
@@ -627,6 +652,9 @@ impl App {
             catalog_preview_area: None,
             catalog_preview_visible: true,
             catalog_dirty: false,
+            known_repos: Vec::new(),
+            active_repo: None,
+            repos_dirty: false,
             workflow_inspect_dirty: false,
             workflow_dot: None,
             workflow_path: None,
@@ -837,6 +865,78 @@ impl App {
             self.catalog_selected.min(rows - 1)
         };
         self.catalog_preview = None;
+    }
+
+    /// Store the fetched repo registry and active repo (`repos.list`).
+    pub fn set_repos(&mut self, repos: Vec<RepoInfo>, active: Option<String>) {
+        self.known_repos = repos;
+        self.active_repo = active;
+    }
+
+    /// The label shown for the active repo in the status bar.
+    pub fn active_repo_label(&self) -> String {
+        match &self.active_repo {
+            Some(name) => format!("repo: {name}"),
+            None => "repo: global".to_string(),
+        }
+    }
+
+    /// Open the Ctrl+P "Switch repo" picker.
+    pub fn open_repo_picker(&mut self) {
+        self.popup = Popup::RepoPicker {
+            selected: 0,
+            filter: TextBuffer::default(),
+        };
+    }
+
+    /// The picker's entries as `(repo name, label)`, with a leading `global` row
+    /// (`None`) that clears the active repo. Entries are filtered by a
+    /// case-insensitive substring of the name or path.
+    pub fn repo_picker_entries(&self) -> Vec<(Option<String>, String)> {
+        let filter = match &self.popup {
+            Popup::RepoPicker { filter, .. } => filter.value().to_lowercase(),
+            _ => String::new(),
+        };
+        let matches = |haystack: &str| haystack.to_lowercase().contains(&filter);
+        let mut entries: Vec<(Option<String>, String)> =
+            vec![(None, "global  —  all repos".to_string())];
+        for repo in &self.known_repos {
+            if !filter.is_empty() && !matches(&repo.name) && !matches(&repo.path) {
+                continue;
+            }
+            let marker = if repo.active { "● " } else { "  " };
+            let availability = if repo.available { "" } else { "  (missing)" };
+            entries.push((
+                Some(repo.name.clone()),
+                format!("{marker}{}{availability}", repo.name),
+            ));
+        }
+        entries
+    }
+
+    /// Activate the repo selected in the picker (or clear it for the `global`
+    /// row). Closes the popup and emits [`UiAction::ActivateRepo`].
+    fn activate_selected_repo(&mut self) -> UiAction {
+        let entries = self.repo_picker_entries();
+        let selected = match &self.popup {
+            Popup::RepoPicker { selected, .. } => *selected,
+            _ => 0,
+        };
+        let name = entries.get(selected).and_then(|(name, _)| name.clone());
+        self.popup = Popup::None;
+        UiAction::ActivateRepo(name)
+    }
+
+    /// Re-clamp the repo picker's selection after its filter changes.
+    fn clamp_repo_picker_selection(&mut self) {
+        let len = self.repo_picker_entries().len();
+        if let Popup::RepoPicker { selected, .. } = &mut self.popup {
+            *selected = if len == 0 {
+                0
+            } else {
+                (*selected).min(len - 1)
+            };
+        }
     }
 
     /// Store the fetched workflow graph (DOT + persisted path) and, when the
@@ -1272,10 +1372,16 @@ impl App {
         if selected == 0 {
             return UiAction::OpenWizard;
         }
+        // The "Switch repo" entry opens the repo picker (fetching a fresh list).
+        if selected == 4 {
+            self.open_repo_picker();
+            return UiAction::OpenRepoPicker;
+        }
         let kind = match selected {
             1 => FormKind::AddTask,
             2 => FormKind::CreateSchedule,
-            _ => FormKind::CreateNotification,
+            3 => FormKind::CreateNotification,
+            _ => FormKind::AddRepo,
         };
         let (title, fields) = match kind {
             FormKind::AddTask => (
@@ -1298,6 +1404,10 @@ impl App {
             FormKind::CreateNotification => (
                 "Create notification hook",
                 vec!["Event kind", "Channel", "Config JSON (optional)"],
+            ),
+            FormKind::AddRepo => (
+                "Add repo",
+                vec!["Repo path (daemon host)", "Name (optional)"],
             ),
         };
         self.popup = Popup::Form(Form {
@@ -1543,19 +1653,32 @@ impl App {
         let json = |s: &str| -> Value { serde_json::from_str(s).unwrap_or(Value::Null) };
 
         match kind {
-            FormKind::AddTask => UiAction::Submit {
-                method: method::CATALOG_ADD,
-                params: serde_json::json!({
-                    "name": v(0),
-                    "agent": opt(1),
-                    "provider": opt(2),
-                    "model": opt(3),
-                    "cwd": opt(4),
-                    "schedule": opt(5),
-                    "needs": opt(6),
-                    "prompt": v(7),
-                }),
-            },
+            FormKind::AddTask => {
+                // With an active repo, new tasks default into it unless the user
+                // already typed a qualified (or global) path.
+                let name = {
+                    let typed = v(0);
+                    match &self.active_repo {
+                        Some(repo) if !typed.starts_with("repo:") && !typed.is_empty() => {
+                            format!("repo:{repo}/{typed}")
+                        }
+                        _ => typed,
+                    }
+                };
+                UiAction::Submit {
+                    method: method::CATALOG_ADD,
+                    params: serde_json::json!({
+                        "name": name,
+                        "agent": opt(1),
+                        "provider": opt(2),
+                        "model": opt(3),
+                        "cwd": opt(4),
+                        "schedule": opt(5),
+                        "needs": opt(6),
+                        "prompt": v(7),
+                    }),
+                }
+            }
             FormKind::CreateSchedule => UiAction::Submit {
                 method: method::SCHEDULES_UPSERT,
                 params: serde_json::json!({
@@ -1570,6 +1693,13 @@ impl App {
                     "event": v(0),
                     "channel": v(1),
                     "config": json(&v(2)),
+                }),
+            },
+            FormKind::AddRepo => UiAction::Submit {
+                method: method::REPOS_ADD,
+                params: serde_json::json!({
+                    "path": v(0),
+                    "name": opt(1),
                 }),
             },
         }
@@ -1608,6 +1738,9 @@ impl App {
             push::CATALOG_UPDATED => {
                 // The list is re-fetched by the session loop, which owns the client.
                 self.catalog_dirty = true;
+                // Repo add/remove/activate also publishes `catalog.updated`, so the
+                // picker and status badge refresh.
+                self.repos_dirty = true;
             }
             push::AGENT_OUTPUT => {
                 let sid = n.params.get("session_id").and_then(|v| v.as_str());

@@ -86,9 +86,9 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     );
 
     let bus = event_bus::EventBus::new(1024);
-    let catalog = Arc::new(parking_lot::RwLock::new(crate::tasks::load_catalog(
-        &tasks_dir,
-    )?));
+    // The catalog is assembled from the global tasks dir plus every known repo's
+    // `.favetto/tasks/` once the registry is loaded below.
+    let catalog = Arc::new(parking_lot::RwLock::new(Vec::new()));
     let mut agents = crate::agents::AgentManager::new();
     // Resolve every configured agent before wiring state: an unknown `type`
     // fails startup rather than the first launch.
@@ -101,10 +101,8 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     agents.configure_hooks(&listen, data_dir.clone());
     let scheduler = tokio_cron_scheduler::JobScheduler::new().await?;
 
-    // Resolve webhook secrets from config/env and validate the trigger rules before
-    // starting up, so a bad rule (unknown event/task/glob) fails fast.
+    // Resolve webhook secrets from config/env before starting up.
     let webhooks = WebhookSecrets::from_config(&config);
-    crate::webhooks::validate_rules(&config, &catalog.read())?;
 
     // Notification hooks start empty; the TUI adds them live via `hooks.upsert`.
     let hook_store = Arc::new(parking_lot::RwLock::new(Vec::new()));
@@ -123,6 +121,29 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         scheduler,
         hook_store: hook_store.clone(),
     }));
+
+    // Seed the persisted known-repos registry from `[repos].known`, load it, and
+    // resolve the active repo (config value only applies when the DB has none).
+    crate::repos::seed_from_config(&state, &state.config).await;
+    crate::repos::refresh(&state).await?;
+    let mut active = db::get_active_repo(&state.db).await?;
+    if active.is_none() {
+        if let Some(name) = &state.config.repos.active {
+            if state.repos.read().iter().any(|repo| &repo.name == name) {
+                db::set_active_repo(&state.db, Some(name)).await?;
+                active = Some(name.clone());
+            }
+        }
+    }
+    *state.active_repo.write() = active;
+
+    // Assemble the catalog (global + every repo) before validating webhook rules,
+    // which match against the live task names.
+    {
+        let defs = crate::repos::load_all(&state, &[]);
+        *state.catalog.write() = defs;
+    }
+    crate::webhooks::validate_rules(&state.config, &state.catalog.read())?;
 
     // Materialize the catalog graph once at startup so `<data_dir>/workflow.dot`
     // exists even before the first catalog change.

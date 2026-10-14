@@ -135,6 +135,10 @@ fn all_popups_render_without_panic() {
             Popup::TaskError {
                 task_id: uuid::Uuid::new_v4(),
             },
+            Popup::RepoPicker {
+                selected: 0,
+                filter: TextBuffer::new("fav"),
+            },
         ] {
             let mut app = App::with_theme(theme);
             app.popup = popup;
@@ -1022,6 +1026,7 @@ fn catalog_preview_renders_task_markdown() {
         needs: None,
         vars: Vec::new(),
         prompt: String::new(),
+        repo: None,
     }];
     app.catalog_preview = Some((
         "demo".to_string(),
@@ -1065,6 +1070,7 @@ fn catalog_preview_scrolls_to_later_content() {
         needs: None,
         vars: Vec::new(),
         prompt: String::new(),
+        repo: None,
     }];
     let mut markdown = String::new();
     for i in 0..80 {
@@ -1207,6 +1213,7 @@ fn catalog_entry(name: &str) -> super::super::app::CatalogEntry {
         needs: None,
         vars: Vec::new(),
         prompt: String::new(),
+        repo: None,
     }
 }
 
@@ -1669,4 +1676,25 @@ fn usage_formatting_helpers_are_compact_and_guarded() {
     let start = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
     assert_eq!(bucket_label(UsagePeriod::Year, start).len(), 3);
     assert_eq!(bucket_label(UsagePeriod::Day, start).len(), 2);
+}
+
+#[test]
+fn status_bar_shows_the_active_repo_badge() {
+    let mut app = App::with_theme(Theme::dark());
+    app.set_repos(
+        vec![favetto_core::model::RepoInfo {
+            name: "favetto".to_string(),
+            path: "/code/favetto".to_string(),
+            available: true,
+            active: true,
+        }],
+        Some("favetto".to_string()),
+    );
+    let text = render_text(&mut app, 120, 24);
+    assert!(text.contains("repo: favetto"), "{text:?}");
+
+    // With no active repo the badge reads `global`.
+    app.set_repos(Vec::new(), None);
+    let text = render_text(&mut app, 120, 24);
+    assert!(text.contains("repo: global"), "{text:?}");
 }

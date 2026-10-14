@@ -119,6 +119,18 @@ days = 30          # delete rows older than this many days (0 = keep forever)
 min_tasks = 1000   # always keep the newest N task rows
 vacuum = true      # reclaim disk space after a prune
 
+# Repo-local task catalogs. Each repository's `<repo>/.favetto/tasks/*.md` files
+# are loaded alongside the global `tasks_dir`, namespaced as
+# `repo:<name>/<path>` (the name defaults to the directory basename). One repo is
+# the daemon-wide *active* repo, which scopes the default target of newly added
+# catalog tasks; switch it from the TUI (Ctrl+P -> Switch repo). `known`/`active`
+# seed the registry at startup; the registry is then persisted in SQLite, so TUI
+# add/remove/activate changes survive config edits and restarts.
+[repos]
+# active = "favetto"
+# known = [{ path = "~/code/favetto" }]
+# known = [{ path = "/srv/web", name = "web" }]
+
 # Web client (embedded SPA) served by the daemon. `dir` overrides the assets
 # embedded in the binary with a directory on disk for development; leave it empty
 # in normal operation. `heartbeat_secs` is the SSE keep-alive interval.

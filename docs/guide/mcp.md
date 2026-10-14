@@ -101,6 +101,10 @@ error — so the model can read the message and correct itself.
 
 Each resource reads as `application/json`.
 
+`favetto://catalog` lists repo-local tasks too, under their qualified
+`repo:<name>/<path>` identity, and `favetto_start_task` accepts those names
+unchanged (see [Repository-local tasks](./catalog#repository-local-tasks)).
+
 ## Prompt
 
 `supervise_workflow` takes an optional `root_id` argument and returns the

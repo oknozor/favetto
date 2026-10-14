@@ -57,6 +57,10 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | `notifications.test` | Send a test notification through a channel. |
 | `hooks.upsert` | Add a notification hook reacting to an event kind. |
 | `usage.stats` | Aggregate persisted per-run token/cost usage into a per-bucket series (day/week/month/year) plus window totals. |
+| `repos.list` | List known repositories and the daemon-wide active one. |
+| `repos.add` | Register a repository (by daemon-host path) as a known repo. |
+| `repos.remove` | Remove a known repository by name. |
+| `repos.activate` | Set (or clear) the daemon-wide active repository. |
 
 ## Client → server request & response types
 
@@ -757,6 +761,74 @@ Aggregate persisted per-run token/cost usage into a per-bucket series (day/week/
 | `buckets` | UsageBucket[] | — | yes | Oldest bucket first. Empty buckets are included so the TUI chart always has a fixed number of points for the selected period. |
 | `period` | UsagePeriod | — | yes |  |
 | `totals` | UsageTotals | — | yes |  |
+
+### `repos.list`
+
+List known repositories and the daemon-wide active one.
+
+**Request**
+
+object
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `active` | string (optional) | null | no |  |
+| `repos` | RepoInfo[] | — | yes |  |
+
+### `repos.add`
+
+Register a repository (by daemon-host path) as a known repo.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `name` | string (optional) | null | no |  |
+| `path` | string | — | yes |  |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `active` | boolean | `false` | no | Whether this is the daemon-wide active repo. |
+| `available` | boolean | `true` | no | Whether the repo currently has a `.favetto/tasks/` catalog directory. |
+| `name` | string | — | yes |  |
+| `path` | string | — | yes |  |
+
+### `repos.remove`
+
+Remove a known repository by name.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `name` | string | — | yes |  |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `removed` | boolean | — | yes |  |
+
+### `repos.activate`
+
+Set (or clear) the daemon-wide active repository.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `name` | string (optional) | null | no |  |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `active` | string (optional) | null | no |  |
+| `repos` | RepoInfo[] | — | yes |  |
 
 ## Server → client pushes
 

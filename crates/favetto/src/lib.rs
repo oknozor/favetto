@@ -49,6 +49,7 @@ mod git;
 mod hooks;
 mod metrics;
 mod notify;
+mod repos;
 mod scheduler;
 mod server;
 mod state;

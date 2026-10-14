@@ -37,6 +37,55 @@ Moving `triage.md` to `pipeline/triage.md` changes its identity from `triage` to
 and any `needs`/`spawn`/webhook rule that named `triage` must be updated.
 :::
 
+## Repository-local tasks
+
+A repository can ship its own catalog in `<repo>/.favetto/tasks/`, using exactly
+the same file format and recursive discovery as the global tasks directory:
+
+```text
+my-repo/
+  .favetto/
+    tasks/
+      triage.md            →  task "repo:my-repo/triage"
+      pipelines/
+        plan.md            →  task "repo:my-repo/pipelines/plan"
+```
+
+Register the repository with the daemon by its **daemon-host path** (the machine
+running `favetto daemon`) and give it a name (defaulting to the directory
+basename):
+
+- **TUI**: `Ctrl+P → Add repo`, then `Ctrl+P → Switch repo` to pick the active
+  one. The active repo is shown in the status bar (`repo: my-repo`, or
+  `repo: global`).
+- **Config** (`~/.config/favetto/config.toml`): seed the registry with
+  [`[repos]`](./configuration#repos).
+- **RPC**: `repos.add`, `repos.remove`, `repos.activate`, `repos.list`.
+
+Repo-local tasks are namespaced as **`repo:<name>/<relative-path>`** (for
+example `repo:my-repo/triage`), so two repositories' `triage` tasks never
+collide. Global tasks keep their bare relative identity. Because the
+`repo:` prefix is reserved, a global task path may not start with it.
+
+Everything that names a task accepts the qualified identity: `tasks.start`,
+`catalog.get`/`catalog.add`/`catalog.update`, schedules, webhooks, `needs`,
+`spawn`, and <span v-pre>`{{ task.name }}`</span>. Inside a repo-local task a
+bare `needs`/`spawn` that matches another task in *the same repo* is resolved
+automatically; a cross-repo reference must be written in full.
+
+A repo-local task defaults its working directory to the repository root, so
+worktree isolation and the per-directory lock target that checkout unless the
+task sets its own `cwd`.
+
+Only the *active* repo scopes the default target of a task added through the TUI
+form; the catalog still lists every registered repo's tasks, grouped under a
+`repo:<name>` folder.
+
+The repo directory must exist on the daemon host and contain a `.favetto/tasks/`
+directory for its tasks to load. A repo whose checkout is missing stays
+registered but contributes no tasks until it reappears (the TUI marks it
+`(missing)`); the daemon watches every available repo's catalog live.
+
 ## Browse and start tasks in the TUI
 
 The **Catalog** tab renders the catalog as a collapsible tree. Each subfolder is

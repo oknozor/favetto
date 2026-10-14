@@ -60,6 +60,11 @@ pub fn default_token_path() -> PathBuf {
     default_data_dir().join("token")
 }
 
+/// The repo-local task catalog directory: `<repo_root>/.favetto/tasks`.
+pub fn repo_tasks_dir(repo_root: impl AsRef<Path>) -> PathBuf {
+    repo_root.as_ref().join(".favetto").join("tasks")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

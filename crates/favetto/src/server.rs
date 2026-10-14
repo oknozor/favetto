@@ -517,6 +517,7 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
                     needs: d.needs.clone(),
                     vars: d.vars.clone(),
                     prompt: d.prompt.clone(),
+                    repo: crate::tasks::split_repo(&d.name).map(|(repo, _)| repo.to_string()),
                 })
                 .collect();
             to_value(list)
@@ -525,18 +526,25 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
         method::CATALOG_GET => {
             let p: CatalogGetParams = parse_params(&req.method, &req.params)?;
             let name = p.name;
-            if let Err(e) = crate::tasks::validate_task_path(&name) {
+            // Repo-qualified names are validated against their bare relative path.
+            let valid = match crate::tasks::split_repo(&name) {
+                Some((_, rel)) => crate::tasks::validate_task_path(rel),
+                None => crate::tasks::validate_task_path(&name),
+            };
+            if let Err(e) = valid {
                 Err(RpcError::InvalidParams(e.to_string()))
             } else {
-                let path = state.tasks_dir.join(format!("{name}.md"));
-                let markdown = std::fs::read_to_string(&path).ok().or_else(|| {
-                    state
-                        .catalog
-                        .read()
-                        .iter()
-                        .find(|d| d.name == name)
-                        .map(crate::tasks::to_markdown)
-                });
+                let path = crate::repos::task_file_path(state, &name);
+                let markdown = path
+                    .and_then(|path| std::fs::read_to_string(&path).ok())
+                    .or_else(|| {
+                        state
+                            .catalog
+                            .read()
+                            .iter()
+                            .find(|d| d.name == name)
+                            .map(crate::tasks::to_markdown)
+                    });
                 match markdown {
                     Some(markdown) => to_value(CatalogGetResult { markdown }),
                     None => Err(RpcError::InvalidParams(format!("unknown task '{name}'"))),
@@ -753,6 +761,38 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
             match db::usage_stats(&state.db, period, Utc::now()).await {
                 Ok(stats) => to_value(stats),
                 Err(e) => Err(RpcError::Internal(e.to_string())),
+            }
+        }
+
+        method::REPOS_LIST => to_value(ReposListResult {
+            repos: crate::repos::list(state),
+            active: state.active_repo.read().clone(),
+        }),
+
+        method::REPOS_ADD => {
+            let p: ReposAddParams = parse_params(&req.method, &req.params)?;
+            match crate::repos::add(state, p).await {
+                Ok(repo) => to_value(repo),
+                Err(e) => Err(RpcError::InvalidParams(e.to_string())),
+            }
+        }
+
+        method::REPOS_REMOVE => {
+            let p: ReposRemoveParams = parse_params(&req.method, &req.params)?;
+            match crate::repos::remove(state, &p.name).await {
+                Ok(removed) => to_value(ReposRemoveResult { removed }),
+                Err(e) => Err(RpcError::Internal(e.to_string())),
+            }
+        }
+
+        method::REPOS_ACTIVATE => {
+            let p: ReposActivateParams = parse_params(&req.method, &req.params)?;
+            match crate::repos::activate(state, p.name).await {
+                Ok(()) => to_value(ReposListResult {
+                    repos: crate::repos::list(state),
+                    active: state.active_repo.read().clone(),
+                }),
+                Err(e) => Err(RpcError::InvalidParams(e.to_string())),
             }
         }
 
@@ -1693,14 +1733,14 @@ async fn add_catalog_task(
         spawn_new_root,
         prompt,
     } = params;
-    crate::tasks::validate_task_path(&name)?;
+
     if agent.is_none() {
         anyhow::bail!("a task needs an 'agent'");
     }
     let spawn_new_root = spawn_new_root.unwrap_or(false);
     let prompt = prompt.unwrap_or_default();
 
-    let def = TaskDef {
+    let mut def = TaskDef {
         name,
         agent,
         provider,
@@ -1716,7 +1756,35 @@ async fn add_catalog_task(
         vars: Vec::new(),
         prompt,
     };
-    crate::tasks::write_task_md(&state.tasks_dir, &def)?;
+    // The on-disk file keeps the user's explicit `cwd` (if any); the repo-root
+    // default is applied only in memory so a moved checkout is not pinned.
+    let file_cwd = def.cwd.clone();
+
+    // Resolve the target directory and the bare file name. A repo-qualified name
+    // writes the relative path into that repo's `.favetto/tasks/`; the qualified
+    // identity is kept in memory.
+    let (dir, rel) = match crate::tasks::split_repo(&def.name) {
+        Some((repo, rel)) => {
+            let known = crate::repos::resolve(state, repo)
+                .ok_or_else(|| anyhow::anyhow!("unknown repo '{repo}'"))?;
+            crate::tasks::validate_task_path(rel)?;
+            if def.cwd.is_none() {
+                def.cwd = Some(known.path.to_string_lossy().into_owned());
+            }
+            (known.tasks_dir(), rel.to_string())
+        }
+        None => {
+            crate::tasks::validate_task_path(&def.name)?;
+            (state.tasks_dir.clone(), def.name.clone())
+        }
+    };
+    let mut file_def = def.clone();
+    file_def.cwd = file_cwd;
+    let path = dir.join(format!("{rel}.md"));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, crate::tasks::to_markdown(&file_def))?;
 
     // Update the live catalog.
     {
@@ -1752,13 +1820,18 @@ async fn update_catalog_task(
     params: CatalogUpdateParams,
 ) -> anyhow::Result<()> {
     let CatalogUpdateParams { name, markdown } = params;
-    crate::tasks::validate_task_path(&name)?;
+    let valid = match crate::tasks::split_repo(&name) {
+        Some((_, rel)) => crate::tasks::validate_task_path(rel),
+        None => crate::tasks::validate_task_path(&name),
+    };
+    valid?;
     if !state.catalog.read().iter().any(|d| d.name == name) {
         anyhow::bail!("unknown task '{name}'");
     }
     crate::tasks::parse_task_md(&name, &markdown)
         .map_err(|e| anyhow::anyhow!("invalid task '{name}': {e}"))?;
-    let path = state.tasks_dir.join(format!("{name}.md"));
+    let path = crate::repos::task_file_path(state, &name)
+        .ok_or_else(|| anyhow::anyhow!("unknown repo for task '{name}'"))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

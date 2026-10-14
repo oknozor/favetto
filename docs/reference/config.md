@@ -14,6 +14,7 @@ Every section is optional; favetto falls back to built-in defaults for anything 
 | `daemon` | DaemonSettings | `{"data_dir":null,"listen":null,"retention":{"days":30,"min_tasks":1000,"vacuum":true},"socket":null,"tasks_dir":null}` | no | Daemon defaults (overridable by CLI flags). |
 | `executor` | ExecutorSettings | `{"awaiting_input_quiet_ms":8000,"detect_awaiting_input":true,"keep_worktree":false,"max_concurrency":4,"max_output_bytes":262144,"parallel":false,"retry":{"backoff":"exponential","initial_ms":5000,"max_attempts":1,"max_ms":300000,"retry_on":["infrastructure","timeout"]},"stale_run":"fail","worktree":true,"worktree_retention":{"days":30,"min_worktrees":0}}` | no | Task executor concurrency / isolation. |
 | `git` | GitSettings | `{}` | no | Non-interactive git provisioning for agent processes. Defaults to `signing = "off"`, which forces `commit.gpgsign = false` so an agent commit can never block on an interactive pinentry/askpass prompt. |
+| `repos` | ReposSettings | `{"known":[]}` | no | Repo-local task catalogs: the known-repos registry seed and the active repo. Ignored by clients; the daemon persists changes in SQLite. |
 | `tui` | TuiSettings | `{"sound":{"enabled":true,"events":{"attention":"none","awaiting_input":"attention","task_failed":"failure","task_finished":"success","task_started":"none"},"min_interval_ms":400,"only_when_unfocused":false,"player":"auto"}}` | no | Client-side TUI settings. Ignored by the daemon, which reads the same file. |
 | `web` | WebSettings | `{"dir":"","enabled":true,"heartbeat_secs":15}` | no | Web client (embedded SPA) settings. |
 | `webhook` | WebhookSettings | `{"github":{"enabled":false,"rules":[]}}` | no | Webhook trigger rules (currently GitHub). |
@@ -207,6 +208,28 @@ editing them.
 | `rules` | GithubRule[] | `[]` | no |  |
 | `secret` | string (optional) | — | no | Literal secret (accepted but discouraged). |
 | `secret_env` | string (optional) | — | no | Name of the env var holding the signing secret. |
+
+## RepoSeed
+
+One `[[repos.known]]` entry: a repository path and an optional display name.
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `name` | string (optional) | — | no | Display name used as the namespace key; defaults to the directory basename. |
+| `path` | string | — | yes | Absolute (or `~`-expanded) path to the repository on the daemon host. |
+
+## ReposSettings
+
+Repo-local task catalog settings (`[repos]`).
+
+`known` seeds the daemon's persisted known-repos registry at startup (the
+registry survives config edits); `active` selects the daemon-wide active repo
+by name at startup. Repo task files live in `<repo>/.favetto/tasks/`.
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `active` | string (optional) | — | no | The active repo's name at startup; unset means the global catalog. |
+| `known` | RepoSeed[] | `[]` | no | Repositories to register at startup, by daemon-host path. |
 
 ## RetentionSettings
 

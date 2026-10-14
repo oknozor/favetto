@@ -98,4 +98,5 @@ ignored. Only `main` receives version bumps (`branch_whitelist = ["main"]` in
 
 Keep changes focused on the affected crate and do not refactor unrelated code.
 `.favetto/` (plans, handoffs, triage reports) is gitignored and must not be
-committed.
+committed, with one exception: a repo's committable task catalog lives in
+`.favetto/tasks/` (see `.gitignore`).

@@ -1,5 +1,7 @@
 //! ratatui rendering: header tabs, per-tab content, and a connection status bar.
 
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -107,6 +109,15 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
     let workflow_path = app.workflow_path.clone();
     let workflow_lines = app.workflow_lines.clone();
     let workflow_note = app.workflow_note.clone();
+    // The repo picker renders from the app's repo list, so compute its rows before
+    // `popup` is borrowed mutably.
+    if let Popup::RepoPicker { selected, filter } = &app.popup {
+        let selected = *selected;
+        let filter = filter.value().to_string();
+        let entries = app.repo_picker_entries();
+        draw_repo_picker(frame, &entries, selected, &filter, theme);
+        return;
+    }
     match &mut app.popup {
         Popup::None => {}
         Popup::Menu { selected } => draw_menu(frame, *selected, theme),
@@ -143,6 +154,8 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
         Popup::WorkflowRuntime(_) => {}
         // Handled above, before `popup` is borrowed.
         Popup::TaskError { .. } => {}
+        // Handled above, before `popup` is borrowed.
+        Popup::RepoPicker { .. } => {}
     }
 }
 
@@ -335,7 +348,7 @@ fn draw_menu(frame: &mut Frame, selected: usize, theme: Theme) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Ctrl+P — New ")
+                .title(" Ctrl+P — Actions ")
                 .style(theme.surface_style())
                 .border_style(theme.block(true)),
         )
@@ -407,6 +420,54 @@ fn draw_sessions_picker(
     frame.render_widget(Clear, rect);
     frame.buffer_mut().set_style(rect, theme.surface_style());
     frame.render_widget(list, rect);
+}
+
+/// Draw the Ctrl+P "Switch repo" picker: a live search input plus the filtered
+/// repo list (with a leading `global` row).
+fn draw_repo_picker(
+    frame: &mut Frame,
+    entries: &[(Option<String>, String)],
+    selected: usize,
+    filter: &str,
+    theme: Theme,
+) {
+    let area = frame.area();
+    let height = (entries.len() as u16).saturating_add(4);
+    let rect = centered_rect(area, 70, height);
+    frame.render_widget(Clear, rect);
+    frame.buffer_mut().set_style(rect, theme.surface_style());
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Ctrl+P — Switch repo ")
+        .style(theme.surface_style())
+        .border_style(theme.block(true));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    let search = Paragraph::new(Line::from(vec![
+        Span::styled("filter: ", theme.block(true)),
+        Span::raw(filter.to_string()),
+        Span::styled("█", theme.selected()),
+    ]))
+    .style(theme.base());
+    frame.render_widget(search, chunks[0]);
+
+    let items: Vec<ListItem> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, (_, label))| {
+            let style = if i == selected {
+                theme.selected()
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(Span::styled(format!(" {label} "), style)))
+        })
+        .collect();
+    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::BOLD));
+    frame.render_widget(list, chunks[1]);
 }
 
 /// Draw the Ctrl+R reply popup: the precise prompt from the agent's state
@@ -814,6 +875,15 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Space", "fold/unfold the selected folder"),
             ("p", "show/hide the preview pane"),
             ("PageUp / PageDown / wheel", "scroll the preview pane"),
+        ],
+    ),
+    (
+        "Switch repo (Ctrl+P → Switch repo)",
+        &[
+            ("characters", "filter repos by name or path"),
+            ("↑ / ↓", "move the selection"),
+            ("Enter", "activate the repo (or global)"),
+            ("Esc", "close without switching"),
         ],
     ),
     (
@@ -1242,6 +1312,14 @@ fn draw_catalog_table(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme
     let header = Row::new(vec!["NAME", "AGENT", "MODEL", "NEEDS"]).style(theme.table_header());
     let plain = plain_icons();
 
+    // Top-level `repo:<name>` folders get a `(repo)` tag, labelled from each
+    // entry's `repo` field rather than by parsing the qualified name.
+    let repo_folders: HashSet<String> = app
+        .catalog
+        .iter()
+        .filter_map(|e| e.repo.as_ref().map(|repo| format!("repo:{repo}")))
+        .collect();
+
     let rows: Vec<Row> = app
         .catalog_rows()
         .into_iter()
@@ -1252,6 +1330,11 @@ fn draw_catalog_table(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme
                 collapsed,
             } => {
                 let label = path.rsplit('/').next().unwrap_or(path.as_str());
+                let label = if repo_folders.contains(&path) {
+                    format!("{label} (repo)")
+                } else {
+                    label.to_string()
+                };
                 let name = format!(
                     "{} {} {}",
                     "  ".repeat(depth),
@@ -2085,6 +2168,16 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
         Style::default()
             .fg(theme.selected_fg)
             .bg(sound_color)
+            .add_modifier(Modifier::BOLD),
+    ));
+
+    // Active-repo badge: the daemon-wide active repo (or `global`).
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        format!(" {} ", app.active_repo_label()),
+        Style::default()
+            .fg(theme.selected_fg)
+            .bg(theme.info)
             .add_modifier(Modifier::BOLD),
     ));
 
