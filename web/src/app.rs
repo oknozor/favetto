@@ -2,14 +2,16 @@
 //!
 //! The app provides the shared [`AppState`] once, renders the connection banner,
 //! and (on web) starts the RPC ping and the SSE reader. The authenticated routes
-//! share an [`AppLayout`] that renders the top navigation.
+//! share an [`AppLayout`] that renders the top navigation. The Inbox is the
+//! default landing view; Tasks, Catalog and Workflow plug into the same route
+//! enum.
 
 use dioxus::prelude::*;
 use uuid::Uuid;
 
-use crate::config;
-use crate::state::{onboarding_step, AppState, ConnectionState, OnboardingStep};
+use crate::state::{AppState, ConnectionState};
 use crate::views::catalog::{Catalog, CatalogDetail};
+use crate::views::inbox::Inbox;
 use crate::views::pair::Pair;
 use crate::views::schedules::Schedules;
 use crate::views::settings::Settings;
@@ -29,9 +31,13 @@ pub enum Route {
     Pair {},
     /// The authenticated area, wrapped in the shared navigation shell.
     #[layout(AppLayout)]
-    /// The default view; the Inbox replaces this in a follow-up issue.
-    #[route("/")]
+    /// The default landing view: the Inbox. The variant is still named `Home`
+    /// so `views::pair` can keep navigating to `Route::Home {}`.
+    #[route("/", Inbox)]
     Home {},
+    /// Deep-linkable alias for the Inbox (`ntfy` links use `/inbox/:task_id`).
+    #[route("/inbox")]
+    Inbox {},
     /// The task list, filterable by status.
     #[route("/tasks")]
     TasksList {},
@@ -247,39 +253,6 @@ fn apply_event(mut state: AppState, event: crate::sse::SseEvent) {
     }
 }
 
-/// Placeholder home view, replaced by the Inbox at phase 3.2.
-///
-/// Guards the authenticated area: until the client is [`OnboardingStep::Ready`]
-/// it redirects to `/pair` (daemon-URL step on Android, pairing step otherwise).
-#[component]
-fn Home() -> Element {
-    let state = use_context::<AppState>();
-    let nav = use_navigator();
-    use_effect(move || {
-        let step = onboarding_step(
-            config::daemon_url_required(),
-            &(state.daemon_url)(),
-            (state.token)().as_deref(),
-        );
-        if step != OnboardingStep::Ready {
-            nav.replace(Route::Pair {});
-        }
-    });
-    rsx! {
-        main { id: "favetto-app",
-            h1 { "favetto" }
-            p { "The web client is connected to this daemon." }
-            if (state.connection)().is_connected() {
-                p { "Connection: connected." }
-            }
-            nav { class: "home-nav",
-                Link { to: Route::TasksList {}, "Tasks" }
-                Link { to: Route::WorkflowList {}, "Workflows" }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,5 +299,15 @@ mod tests {
         assert_eq!(Route::Settings {}.to_string(), "/settings");
         assert_eq!("/schedules".parse::<Route>().unwrap(), Route::Schedules {});
         assert_eq!("/settings".parse::<Route>().unwrap(), Route::Settings {});
+    }
+
+    /// The Inbox is reachable both at the root (the `Home` variant) and at the
+    /// deep-linkable `/inbox` alias.
+    #[test]
+    fn inbox_routes_serialize() {
+        assert_eq!(Route::Home {}.to_string(), "/");
+        assert_eq!(Route::Inbox {}.to_string(), "/inbox");
+        assert_eq!("/".parse::<Route>().unwrap(), Route::Home {});
+        assert_eq!("/inbox".parse::<Route>().unwrap(), Route::Inbox {});
     }
 }
