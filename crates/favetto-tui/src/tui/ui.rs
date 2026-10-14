@@ -1746,13 +1746,14 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
         Constraint::Length(22), // SESSION
         // Wide enough for `✓ succeeded #10`, the longest status plus an attempt.
         Constraint::Length(15), // STATUS
-        Constraint::Min(14),    // ACTIVITY — absorbs the width freed by ERROR
-        Constraint::Length(14), // TOKEN
-        Constraint::Length(11), // $COST
-        Constraint::Length(8),  // AGE
+        Constraint::Min(12),    // ACTIVITY — absorbs the width freed by ERROR/AGE
+        Constraint::Length(12), // TOKEN
+        Constraint::Length(10), // $COST
+        Constraint::Length(16), // STARTED — `2026-10-14 09:15` (UTC)
+        Constraint::Length(9),  // DURATION — `1h20m`
     ];
     let header = Row::new(vec![
-        "ID", "TASK", "SESSION", "STATUS", "ACTIVITY", "TOKEN", "$COST", "AGE",
+        "ID", "TASK", "SESSION", "STATUS", "ACTIVITY", "TOKEN", "$COST", "STARTED", "DURATION",
     ])
     .style(theme.table_header());
 
@@ -1762,6 +1763,7 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
         .iter()
         .map(|t| {
             let (activity, usage) = app.task_activity_usage(&t.id.to_string());
+            let now = Utc::now();
             Row::new(vec![
                 Cell::from(short_id(&t.id)),
                 Cell::from(t.name.clone()),
@@ -1773,7 +1775,8 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
                 Cell::from(activity_cell(activity)),
                 Cell::from(token_cell(usage)),
                 Cell::from(cost_cell(usage)),
-                Cell::from(age(t.created_at)),
+                Cell::from(started(t.started_at)),
+                Cell::from(duration(t.started_at, t.finished_at, now)),
             ])
         })
         .collect();
@@ -2349,6 +2352,54 @@ fn age(ts: DateTime<Utc>) -> String {
         format!("{}m", secs / 60)
     } else {
         format!("{}h", secs / 3600)
+    }
+}
+
+/// Absolute run start in UTC, or `—` when the run never started.
+fn started(ts: Option<DateTime<Utc>>) -> String {
+    match ts {
+        Some(ts) => ts.format("%Y-%m-%d %H:%M").to_string(),
+        None => "—".to_string(),
+    }
+}
+
+/// Run duration: `finished - started`, or `now - started` while live.
+/// `—` when the run never started.
+fn duration(
+    started_at: Option<DateTime<Utc>>,
+    finished_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> String {
+    let Some(started_at) = started_at else {
+        return "—".to_string();
+    };
+    compact_duration(
+        (finished_at.unwrap_or(now) - started_at)
+            .num_seconds()
+            .max(0),
+    )
+}
+
+/// Compact seconds in the spirit of `age()`: `12s`, `3m`, `1h20m`, `2d3h`.
+fn compact_duration(secs: i64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        let (h, m) = (secs / 3600, (secs % 3600) / 60);
+        if m == 0 {
+            format!("{h}h")
+        } else {
+            format!("{h}h{m}m")
+        }
+    } else {
+        let (d, h) = (secs / 86_400, (secs % 86_400) / 3600);
+        if h == 0 {
+            format!("{d}d")
+        } else {
+            format!("{d}d{h}h")
+        }
     }
 }
 
