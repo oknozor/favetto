@@ -16,13 +16,100 @@ use favetto_wire::model::{
 };
 use favetto_wire::rpc::AgentEventPush;
 
-use crate::components::output_viewer::{readable_value, strip_ansi, truncate_lines};
+use crate::components::highlight::{highlight, pretty, readable_json, Readable};
+use crate::components::markdown::Markdown;
+use crate::components::output_viewer::{strip_ansi, truncate_lines};
 use crate::components::toast::ToastKind;
 use crate::state::AppState;
 use crate::views::inbox::{submit_reply, AwaitingCard, ReplyIntent, SCREEN_DETECTED_REPLY};
 
 /// Lines of a reasoning block (or tool result) shown before the expander.
 pub const FEED_COLLAPSED_LINES: usize = 20;
+
+/// The number of pixels from the bottom within which the feed keeps following.
+pub const FOLLOW_THRESHOLD: f64 = 24.0;
+
+/// Whether a scroll position is close enough to the bottom to keep following.
+pub fn at_bottom(scroll_top: f64, client_height: f64, scroll_height: f64) -> bool {
+    scroll_top + client_height >= scroll_height - FOLLOW_THRESHOLD
+}
+
+/// A compact glyph for a tool card header, keyed off the tool's name.
+pub fn tool_icon(name: &str) -> &'static str {
+    let name = name.to_ascii_lowercase();
+    if ["bash", "shell", "exec", "command", "run", "terminal"]
+        .iter()
+        .any(|k| name.contains(k))
+    {
+        "$"
+    } else if ["write", "edit", "patch", "create", "append"]
+        .iter()
+        .any(|k| name.contains(k))
+    {
+        "✎"
+    } else if ["read", "view", "cat", "open"]
+        .iter()
+        .any(|k| name.contains(k))
+    {
+        "▤"
+    } else if ["grep", "search", "find", "glob", "query"]
+        .iter()
+        .any(|k| name.contains(k))
+    {
+        "⌕"
+    } else if ["fetch", "http", "web", "curl", "download"]
+        .iter()
+        .any(|k| name.contains(k))
+    {
+        "⇅"
+    } else if ["list", "ls", "dir", "tree"]
+        .iter()
+        .any(|k| name.contains(k))
+    {
+        "☰"
+    } else if ["task", "agent", "todo", "plan"]
+        .iter()
+        .any(|k| name.contains(k))
+    {
+        "☑"
+    } else {
+        "⚙"
+    }
+}
+
+/// The full and collapsed forms of a readable block, plus whether it was cut.
+fn block_forms(readable: &Readable) -> (String, String, bool) {
+    let full = match readable {
+        Readable::Text(text) => text.clone(),
+        Readable::Json(value) => pretty(value),
+    };
+    let (preview, cut) = truncate_lines(&full, FEED_COLLAPSED_LINES);
+    (full, preview, cut)
+}
+
+/// Render a code block: coloured spans for JSON, plain text otherwise.
+fn readable_pre(class: &str, readable: &Readable, shown: &str) -> Element {
+    match readable {
+        Readable::Json(_) => {
+            let tokens = highlight(shown);
+            let class = format!("{class} feed-code");
+            rsx! {
+                pre { class: "{class}",
+                    for (index, token) in tokens.into_iter().enumerate() {
+                        span {
+                            key: "{index}",
+                            class: token.role.class(),
+                            "{token.text}"
+                        }
+                    }
+                }
+            }
+        }
+        Readable::Text(_) => rsx! {
+            pre { class: "{class}", "{shown}" }
+        },
+    }
+}
 
 /// The status of a tool card in the feed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,11 +403,14 @@ pub fn AgentFeed(
         .last()
         .map(|event| event.session_id.clone())
         .unwrap_or_default();
+    // The newest event's sequence bumps on every push (even a merged
+    // `ToolUpdated`), so the feed re-anchors and follows streaming output.
+    let revision = events.last().map(|event| event.seq).unwrap_or(0);
 
     rsx! {
         section { class: "agent-feed-section",
             h2 { "Live feed" }
-            FeedList { items, session_id, busy, toast, refresh }
+            FeedList { items, session_id, revision, busy, toast, refresh }
         }
     }
 }
@@ -339,31 +429,85 @@ pub fn AgentLog(items: Vec<FeedItem>) -> Element {
     let busy = use_signal(|| false);
     let toast = use_signal(|| None::<(ToastKind, String)>);
     let refresh = use_signal(|| 0u64);
+    let revision = items.len() as u64;
     rsx! {
-        FeedList { items, session_id: String::new(), busy, toast, refresh }
+        FeedList { items, session_id: String::new(), revision, busy, toast, refresh }
     }
 }
 
 /// The scrollable list of feed rows shared by the live feed and the persisted
 /// post-run log.
+///
+/// The list auto-follows: while the user is at (or near) the bottom it stays
+/// pinned to the newest row; scrolling up pauses it and reveals a jump control
+/// that resumes following.
 #[component]
 fn FeedList(
     items: Vec<FeedItem>,
     session_id: String,
+    revision: u64,
     busy: Signal<bool>,
     toast: Signal<Option<(ToastKind, String)>>,
     refresh: Signal<u64>,
 ) -> Element {
+    let mut follow = use_signal(|| true);
+    let mut element = use_signal(|| None::<web_sys::Element>);
+    let scroll_to_bottom = move || {
+        if let Some(el) = element() {
+            el.set_scroll_top(el.scroll_height());
+        }
+    };
+
     rsx! {
-        div { class: "agent-feed",
-            for (index, item) in items.into_iter().enumerate() {
-                FeedRow {
-                    key: "{index}",
-                    item,
-                    session_id: session_id.clone(),
-                    busy,
-                    toast,
-                    refresh,
+        div { class: "agent-feed-wrap",
+            div {
+                class: "agent-feed",
+                onmounted: move |evt| {
+                    element.set(evt.data().downcast::<web_sys::Element>().cloned());
+                    if follow() {
+                        scroll_to_bottom();
+                    }
+                },
+                onscroll: move |evt| {
+                    let data = evt.data();
+                    follow.set(at_bottom(
+                        data.scroll_top(),
+                        f64::from(data.client_height()),
+                        f64::from(data.scroll_height()),
+                    ));
+                },
+                for (index, item) in items.into_iter().enumerate() {
+                    FeedRow {
+                        key: "{index}",
+                        item,
+                        session_id: session_id.clone(),
+                        busy,
+                        toast,
+                        refresh,
+                    }
+                }
+                // Re-keyed whenever an event arrives, so the mount hook fires
+                // exactly when the feed should catch back up to the bottom.
+                div {
+                    key: "anchor-{revision}",
+                    class: "feed-anchor",
+                    aria_hidden: "true",
+                    onmounted: move |_| {
+                        if follow() {
+                            scroll_to_bottom();
+                        }
+                    },
+                }
+            }
+            if !follow() {
+                button {
+                    class: "feed-jump",
+                    onclick: move |_| {
+                        follow.set(true);
+                        scroll_to_bottom();
+                    },
+                    "Jump to latest"
+                    span { class: "feed-jump-arrow", aria_hidden: "true", " ↓" }
                 }
             }
         }
@@ -388,13 +532,37 @@ fn FeedRow(
                 MessageRole::Assistant => "assistant",
                 MessageRole::Tool => "tool",
             };
+            let role_class = match role {
+                MessageRole::System => "role-system",
+                MessageRole::User => "role-user",
+                MessageRole::Assistant => "role-assistant",
+                MessageRole::Tool => "role-tool",
+            };
             let clean = strip_ansi(&text);
             let (preview, cut) = truncate_lines(&clean, FEED_COLLAPSED_LINES);
             let shown = if expanded() { clean.clone() } else { preview };
+            let is_assistant = role == MessageRole::Assistant;
+            let item_class = format!("feed-item feed-message {role_class}");
+            let role_label = format!("feed-role {role_class}");
+            // Clamp by height only while collapsed over the line threshold, so
+            // a short-but-tall block is never clipped without an expander.
+            let markdown_class = if expanded() || !cut {
+                "feed-markdown"
+            } else {
+                "feed-markdown clamped"
+            };
             rsx! {
-                div { class: "feed-item feed-message",
-                    span { class: "feed-role", "{label}" }
-                    pre { class: "feed-text", "{shown}" }
+                div { class: "{item_class}",
+                    span { class: "{role_label}", "{label}" }
+                    if is_assistant {
+                        // Assistant prose is Markdown; a long block clamps by
+                        // height so fenced code and lists stay well-formed.
+                        div { class: "{markdown_class}",
+                            Markdown { source: clean.clone() }
+                        }
+                    } else {
+                        pre { class: "feed-text", "{shown}" }
+                    }
                     if cut {
                         button {
                             class: "feed-toggle",
@@ -411,6 +579,7 @@ fn FeedRow(
             let shown = if expanded() { clean.clone() } else { preview };
             rsx! {
                 div { class: "feed-item feed-reasoning",
+                    span { class: "feed-role role-reasoning", "thinking" }
                     pre { class: "feed-text", "{shown}" }
                     if cut {
                         button {
@@ -429,39 +598,59 @@ fn FeedRow(
             output,
             ..
         } => {
-            // Tool input/result render readably — a string stays a string, a
-            // nested object is pretty-printed — and both collapse to a preview.
-            let input_full = readable_value(&input);
-            let (input_preview, input_cut) = truncate_lines(&input_full, FEED_COLLAPSED_LINES);
-            let output_full = output.as_ref().map(readable_value);
-            let (output_preview, output_cut) = output_full
-                .as_deref()
-                .map(|text| truncate_lines(text, FEED_COLLAPSED_LINES))
-                .unwrap_or_else(|| (String::new(), false));
-            let cut = input_cut || output_cut;
+            // Tool input/result render readably: recognizable envelopes are
+            // unwrapped to text, structured values are pretty-printed and
+            // syntax-highlighted, and both collapse to a preview.
+            let input = readable_json(&input);
+            let output = output.as_ref().map(readable_json);
+            let input_forms = (!input.is_empty()).then(|| block_forms(&input));
+            let output_forms = output
+                .as_ref()
+                .filter(|readable| !readable.is_empty())
+                .map(block_forms);
+            let cut = input_forms.as_ref().is_some_and(|(_, _, cut)| *cut)
+                || output_forms.as_ref().is_some_and(|(_, _, cut)| *cut);
             let is_expanded = expanded();
-            let input_shown = if is_expanded {
-                input_full
+            let input_shown = input_forms.as_ref().map(|(full, preview, _)| {
+                if is_expanded {
+                    full.clone()
+                } else {
+                    preview.clone()
+                }
+            });
+            let output_shown = output_forms.as_ref().map(|(full, preview, _)| {
+                if is_expanded {
+                    full.clone()
+                } else {
+                    preview.clone()
+                }
+            });
+            let label = if name.is_empty() {
+                "tool"
             } else {
-                input_preview
+                name.as_str()
             };
-            let output_shown = if is_expanded {
-                output_full.unwrap_or_default()
-            } else {
-                output_preview
-            };
+            let icon = tool_icon(label);
+            let card = format!("feed-item feed-tool tool-{}", status.label());
             let chip = format!("tool-chip tool-{}", status.label());
             rsx! {
-                div { class: "feed-item feed-tool",
+                div { class: "{card}",
                     div { class: "feed-tool-head",
-                        span { class: "feed-tool-name", "{name}" }
-                        span { class: chip, "{status.label()}" }
+                        span { class: "feed-tool-icon", aria_hidden: "true", "{icon}" }
+                        span { class: "feed-tool-name", "{label}" }
+                        span { class: "{chip}", "{status.label()}" }
                     }
-                    if !input_shown.is_empty() {
-                        pre { class: "feed-tool-input", "{input_shown}" }
+                    if let Some(shown) = &input_shown {
+                        if !shown.trim().is_empty() {
+                            {readable_pre("feed-tool-input", &input, shown)}
+                        }
                     }
-                    if !output_shown.is_empty() {
-                        pre { class: "feed-tool-output", "{output_shown}" }
+                    if let Some(readable) = &output {
+                        if let Some(shown) = &output_shown {
+                            if !shown.trim().is_empty() {
+                                {readable_pre("feed-tool-output", readable, shown)}
+                            }
+                        }
                     }
                     if cut {
                         button {
@@ -877,6 +1066,41 @@ mod tests {
         ));
         // A fully empty summary yields nothing.
         assert!(summary_feed(&RunSummary::default()).is_empty());
+    }
+
+    #[test]
+    fn at_bottom_tracks_the_follow_threshold() {
+        // Exactly at the bottom.
+        assert!(at_bottom(0.0, 100.0, 100.0));
+        assert!(at_bottom(900.0, 100.0, 1000.0));
+        // Within the threshold, i.e. `scroll_height - FOLLOW_THRESHOLD`.
+        assert!(at_bottom(880.0, 100.0, 1000.0));
+        // Scrolled up beyond the threshold pauses following.
+        assert!(!at_bottom(870.0, 100.0, 1000.0));
+        assert!(!at_bottom(0.0, 100.0, 1000.0));
+    }
+
+    #[test]
+    fn tool_icon_matches_common_tools_by_name() {
+        assert_eq!(tool_icon("bash"), "$");
+        assert_eq!(tool_icon("Read"), "▤");
+        assert_eq!(tool_icon("grep"), "⌕");
+        assert_eq!(tool_icon("some_mystery_tool"), "⚙");
+    }
+
+    #[test]
+    fn tool_payloads_unwrap_to_readable_text_blocks() {
+        let input = readable_json(&serde_json::json!({ "command": "ls -la" }));
+        assert_eq!(
+            input,
+            Readable::Json(serde_json::json!({ "command": "ls -la" }))
+        );
+
+        let output = readable_json(&serde_json::json!({
+            "content": [{ "type": "text", "text": "done" }]
+        }));
+        assert_eq!(output, Readable::Text("done".to_string()));
+        assert!(!output.is_empty());
     }
 
     #[test]
