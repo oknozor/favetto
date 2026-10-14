@@ -2174,6 +2174,99 @@ async fn tasks_list_omits_output_and_honours_limit_and_get_returns_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `tasks.runs` returns a task's execution attempts oldest-first, and an unknown
+/// id yields an empty array rather than an error.
+#[tokio::test]
+async fn tasks_runs_returns_history_oldest_first() {
+    use favetto_core::model::{RunStatus, TaskRun};
+
+    let dir = temp_dir("tasks-runs");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+
+    let task = Task {
+        id: Uuid::new_v4(),
+        name: "hist".to_string(),
+        status: TaskStatus::Failed,
+        attempt: 3,
+        input: serde_json::json!({}),
+        output: None,
+        dedupe_key: None,
+        created_at: Utc::now(),
+        started_at: Some(Utc::now()),
+        finished_at: Some(Utc::now()),
+        error: None,
+        failure: None,
+        session_id: None,
+        session_title: None,
+        parent_id: None,
+        root_id: None,
+        interactive: false,
+    };
+    db::upsert_task(&state.db, &task).await.unwrap();
+
+    let make_run = |attempt: u32, status: RunStatus| TaskRun {
+        id: Uuid::new_v4(),
+        task_id: task.id,
+        attempt,
+        status,
+        agent: Some("opencode".to_string()),
+        model: None,
+        session_id: None,
+        started_at: Some(Utc::now()),
+        finished_at: Some(Utc::now()),
+        exit_code: None,
+        error: None,
+        usage: None,
+        failure: None,
+    };
+    // Insert out of order to prove the method returns attempt order.
+    db::insert_task_run(&state.db, &make_run(2, RunStatus::Failed))
+        .await
+        .unwrap();
+    db::insert_task_run(&state.db, &make_run(1, RunStatus::Succeeded))
+        .await
+        .unwrap();
+    db::insert_task_run(&state.db, &make_run(3, RunStatus::Running))
+        .await
+        .unwrap();
+
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 1,
+            method: method::TASKS_RUNS.to_string(),
+            params: serde_json::json!({ "id": task.id }),
+        },
+    )
+    .await;
+    let result = resp.result.expect("tasks.runs result");
+    let runs: Vec<TaskRun> = serde_json::from_value(result).expect("decodes to Vec<TaskRun>");
+    assert_eq!(
+        runs.iter().map(|r| r.attempt).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "runs must come back oldest-first"
+    );
+    assert_eq!(runs[1].status, RunStatus::Failed);
+    assert_eq!(runs[0].agent.as_deref(), Some("opencode"));
+
+    // An unknown id is empty history, not an error.
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 2,
+            method: method::TASKS_RUNS.to_string(),
+            params: serde_json::json!({ "id": Uuid::new_v4() }),
+        },
+    )
+    .await;
+    assert!(resp.error.is_none());
+    assert_eq!(resp.result.unwrap().as_array().unwrap().len(), 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `tasks.retry` re-enqueues a terminal task and keeps its run history, but is
 /// rejected while a run is still live.
 #[tokio::test]

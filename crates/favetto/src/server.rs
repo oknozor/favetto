@@ -480,6 +480,14 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
             }
         }
 
+        method::TASKS_RUNS => {
+            let p: TaskIdParams = parse_params(&req.method, &req.params)?;
+            match db::list_task_runs(&state.db, p.id).await {
+                Ok(runs) => to_value(runs),
+                Err(e) => Err(RpcError::Internal(e.to_string())),
+            }
+        }
+
         method::TASKS_CANCEL => {
             let p: TaskIdParams = parse_params(&req.method, &req.params)?;
             match cancel_task(state, p.id).await {

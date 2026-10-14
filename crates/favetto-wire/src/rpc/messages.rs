@@ -25,6 +25,7 @@ use uuid::Uuid;
 use crate::agent_state::{AgentActivity, AgentUsage, InputReply, UsagePeriod, UsageStats};
 use crate::model::{
     AgentCatalogEntry, AgentSessionInfo, Event, NotificationRecord, RepoInfo, Schedule, Task,
+    TaskRun,
 };
 use crate::task_var::TaskVar;
 use crate::workflow::{WorkflowCancelResult, WorkflowCreateResult, WorkflowGraph, WorkflowInspect};
@@ -92,6 +93,9 @@ pub struct TaskIdParams {
 
 /// `tasks.get` result: the full task, including its stored output blob.
 pub type TasksGetResult = Task;
+
+/// `tasks.runs` result: every execution attempt for the task, oldest-first.
+pub type TasksRunsResult = Vec<TaskRun>;
 
 /// `tasks.cancel` result: the cancelled task, with `output` omitted.
 pub type TasksCancelResult = Task;
@@ -732,6 +736,8 @@ rpc_calls! {
     TasksListCall => method::TASKS_LIST, TasksListParams, TasksListResult;
     /// Typed call for `tasks.get`.
     TasksGetCall => method::TASKS_GET, TaskIdParams, TasksGetResult;
+    /// Typed call for `tasks.runs`.
+    TasksRunsCall => method::TASKS_RUNS, TaskIdParams, TasksRunsResult;
     /// Typed call for `tasks.cancel`.
     TasksCancelCall => method::TASKS_CANCEL, TaskIdParams, TasksCancelResult;
     /// Typed call for `tasks.retry`.
@@ -840,6 +846,11 @@ pub const CLIENT_CALLS: &[RpcCallSpec] = &[
         method: method::TASKS_GET,
         params_schema: schema_of::<TaskIdParams>,
         result_schema: schema_of::<TasksGetResult>,
+    },
+    RpcCallSpec {
+        method: method::TASKS_RUNS,
+        params_schema: schema_of::<TaskIdParams>,
+        result_schema: schema_of::<TasksRunsResult>,
     },
     RpcCallSpec {
         method: method::TASKS_CANCEL,

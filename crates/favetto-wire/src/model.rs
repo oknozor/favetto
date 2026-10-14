@@ -71,6 +71,7 @@ impl FromStr for TaskStatus {
 /// the run-only outcomes a daemon restart can produce (`interrupted`) and the
 /// deadline case (`timed_out`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     /// Created, not yet picked up by the agent runtime.
@@ -141,6 +142,7 @@ impl FromStr for RunStatus {
 /// is one attempt at it. Run rows are history/metrics/reconciliation records,
 /// not a second source of truth for the task's live state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TaskRun {
     pub id: Uuid,
     pub task_id: Uuid,

@@ -26,6 +26,7 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | `system.ping` | Liveness check. |
 | `tasks.list` | List tasks (metadata only; output is omitted). |
 | `tasks.get` | Fetch a single task by id, including its stored output. |
+| `tasks.runs` | List a task's execution attempts (run history). |
 | `tasks.cancel` | Cancel a task. |
 | `tasks.retry` | Retry a terminal task, preserving its prior run history. |
 | `tasks.start` | Start a catalog task by name. |
@@ -126,6 +127,20 @@ Fetch a single task by id, including its stored output.
 | `session_title` | string (optional) | — | no | The agent's human-readable session title (e.g. opencode's generated title), resolved once at run completion from the agent's session store. Absent until a run finishes or when the agent reports no title. |
 | `started_at` | string (optional) | — | no |  |
 | `status` | TaskStatus | — | yes |  |
+
+### `tasks.runs`
+
+List a task's execution attempts (run history).
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `id` | string | — | yes |  |
+
+**Response**
+
+TaskRun[]
 
 ### `tasks.cancel`
 

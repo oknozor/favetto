@@ -102,6 +102,8 @@ pub mod method {
     pub const TASKS_LIST: &str = "tasks.list";
     /// Fetch a single task by id, including its stored output blob.
     pub const TASKS_GET: &str = "tasks.get";
+    /// List a task's execution attempts (run history), oldest-first.
+    pub const TASKS_RUNS: &str = "tasks.runs";
     pub const TASKS_CANCEL: &str = "tasks.cancel";
     /// Retry a terminal task, preserving its prior run history.
     pub const TASKS_RETRY: &str = "tasks.retry";
@@ -205,6 +207,10 @@ pub const CLIENT_METHODS: &[(&str, &str)] = &[
     (
         method::TASKS_GET,
         "Fetch a single task by id, including its stored output.",
+    ),
+    (
+        method::TASKS_RUNS,
+        "List a task's execution attempts (run history).",
     ),
     (method::TASKS_CANCEL, "Cancel a task."),
     (
@@ -446,6 +452,7 @@ mod tests {
             method::PING,
             method::TASKS_LIST,
             method::TASKS_GET,
+            method::TASKS_RUNS,
             method::TASKS_CANCEL,
             method::TASKS_RETRY,
             method::TASKS_START,
