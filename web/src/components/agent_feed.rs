@@ -25,7 +25,7 @@ use crate::components::toast::ToastKind;
 use crate::state::AppState;
 use crate::views::inbox::{submit_reply, AwaitingCard, ReplyIntent, SCREEN_DETECTED_REPLY};
 
-/// Lines of a reasoning block (or tool result) shown before the expander.
+/// Lines of a message block shown before the expander.
 pub const FEED_COLLAPSED_LINES: usize = 20;
 
 /// The number of pixels from the bottom within which the feed keeps following.
@@ -79,14 +79,57 @@ pub fn tool_icon(name: &str) -> AppIconKind {
     }
 }
 
-/// The full and collapsed forms of a readable block, plus whether it was cut.
-fn block_forms(readable: &Readable) -> (String, String, bool) {
-    let full = match readable {
+/// The full text of a readable block (plain text, or pretty-printed JSON).
+fn readable_text(readable: &Readable) -> String {
+    match readable {
         Readable::Text(text) => text.clone(),
         Readable::Json(value) => pretty(value),
-    };
-    let (preview, cut) = truncate_lines(&full, FEED_COLLAPSED_LINES);
-    (full, preview, cut)
+    }
+}
+
+/// The reasoning body to render for the current fold state.
+///
+/// Reasoning rows fold unconditionally, so a collapsed row renders no body at
+/// all (not even a preview) and expanding reveals the whole cleaned text.
+fn reasoning_body(text: &str, expanded: bool) -> Option<String> {
+    expanded.then(|| strip_ansi(text))
+}
+
+/// A tool row's readable bodies and whether it has anything to fold.
+struct ToolView {
+    /// The readable input (highlighted when JSON).
+    input: Readable,
+    /// The readable output, if any.
+    output: Option<Readable>,
+    /// Whether either body has content, so the row earns a disclosure control.
+    foldable: bool,
+}
+
+impl ToolView {
+    /// The input body to render, or `None` while collapsed or empty.
+    fn input_shown(&self, expanded: bool) -> Option<String> {
+        (expanded && !self.input.is_empty()).then(|| readable_text(&self.input))
+    }
+
+    /// The output body to render, or `None` while collapsed or empty.
+    fn output_shown(&self, expanded: bool) -> Option<String> {
+        self.output
+            .as_ref()
+            .and_then(|output| (expanded && !output.is_empty()).then(|| readable_text(output)))
+    }
+}
+
+/// Compute a tool row's readable bodies (raw JSON → readable form).
+fn tool_view(input: &serde_json::Value, output: Option<&serde_json::Value>) -> ToolView {
+    let input = readable_json(input);
+    let output = output.map(readable_json);
+    let foldable =
+        !input.is_empty() || output.as_ref().is_some_and(|readable| !readable.is_empty());
+    ToolView {
+        input,
+        output,
+        foldable,
+    }
 }
 
 /// Render a code block: coloured spans for JSON, plain text otherwise.
@@ -533,19 +576,18 @@ fn FeedRow(
             }
         }
         FeedItem::Reasoning { text } => {
-            let clean = strip_ansi(&text);
-            let (preview, cut) = truncate_lines(&clean, FEED_COLLAPSED_LINES);
-            let shown = if expanded() { clean.clone() } else { preview };
+            let body = reasoning_body(&text, expanded());
             rsx! {
                 div { class: "feed-item feed-reasoning",
                     span { class: "feed-role role-reasoning", "thinking" }
-                    pre { class: "feed-text", "{shown}" }
-                    if cut {
-                        button {
-                            class: "feed-toggle",
-                            onclick: move |_| expanded.set(!expanded()),
-                            if expanded() { "Show less" } else { "Show more" }
-                        }
+                    button {
+                        class: "feed-toggle",
+                        aria_expanded: if expanded() { "true" } else { "false" },
+                        onclick: move |_| expanded.set(!expanded()),
+                        if expanded() { "Show less" } else { "Show more" }
+                    }
+                    if let Some(body) = body {
+                        pre { class: "feed-text", "{body}" }
                     }
                 }
             }
@@ -559,31 +601,9 @@ fn FeedRow(
         } => {
             // Tool input/result render readably: recognizable envelopes are
             // unwrapped to text, structured values are pretty-printed and
-            // syntax-highlighted, and both collapse to a preview.
-            let input = readable_json(&input);
-            let output = output.as_ref().map(readable_json);
-            let input_forms = (!input.is_empty()).then(|| block_forms(&input));
-            let output_forms = output
-                .as_ref()
-                .filter(|readable| !readable.is_empty())
-                .map(block_forms);
-            let cut = input_forms.as_ref().is_some_and(|(_, _, cut)| *cut)
-                || output_forms.as_ref().is_some_and(|(_, _, cut)| *cut);
-            let is_expanded = expanded();
-            let input_shown = input_forms.as_ref().map(|(full, preview, _)| {
-                if is_expanded {
-                    full.clone()
-                } else {
-                    preview.clone()
-                }
-            });
-            let output_shown = output_forms.as_ref().map(|(full, preview, _)| {
-                if is_expanded {
-                    full.clone()
-                } else {
-                    preview.clone()
-                }
-            });
+            // syntax-highlighted. The row folds by default; expanding reveals
+            // the full input and output blocks.
+            let view = tool_view(&input, output.as_ref());
             let label = if name.is_empty() {
                 "tool"
             } else {
@@ -592,6 +612,9 @@ fn FeedRow(
             let icon = tool_icon(label);
             let card = format!("feed-item feed-tool tool-{}", status.label());
             let chip = format!("tool-chip tool-{}", status.label());
+            let is_expanded = expanded();
+            let input_shown = view.input_shown(is_expanded);
+            let output_shown = view.output_shown(is_expanded);
             rsx! {
                 div { class: "{card}",
                     div { class: "feed-tool-head",
@@ -599,23 +622,20 @@ fn FeedRow(
                         span { class: "feed-tool-name", "{label}" }
                         span { class: "{chip}", "{status.label()}" }
                     }
-                    if let Some(shown) = &input_shown {
-                        if !shown.trim().is_empty() {
-                            {readable_pre("feed-tool-input", &input, shown)}
-                        }
-                    }
-                    if let Some(readable) = &output {
-                        if let Some(shown) = &output_shown {
-                            if !shown.trim().is_empty() {
-                                {readable_pre("feed-tool-output", readable, shown)}
-                            }
-                        }
-                    }
-                    if cut {
+                    if view.foldable {
                         button {
                             class: "feed-toggle",
+                            aria_expanded: if is_expanded { "true" } else { "false" },
                             onclick: move |_| expanded.set(!expanded()),
-                            if expanded() { "Show less" } else { "Show more" }
+                            if is_expanded { "Show less" } else { "Show more" }
+                        }
+                    }
+                    if let Some(shown) = &input_shown {
+                        {readable_pre("feed-tool-input", &view.input, shown)}
+                    }
+                    if let Some(readable) = &view.output {
+                        if let Some(shown) = &output_shown {
+                            {readable_pre("feed-tool-output", readable, shown)}
                         }
                     }
                 }
@@ -749,6 +769,7 @@ fn InlinePrompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dioxus::core::{AttributeValue, Mutation};
     use favetto_wire::model::{AgentUsage, AwaitingInputKind, InputRequest, ToolCall};
 
     fn push(seq: u64, event: AgentStateEvent) -> AgentEventPush {
@@ -1062,6 +1083,141 @@ mod tests {
         assert!(!output.is_empty());
     }
 
+    /// Stringify the built-in [`AttributeValue`] variants for DOM assertions.
+    fn attribute_text(value: &AttributeValue) -> Option<String> {
+        match value {
+            AttributeValue::Text(text) => Some(text.clone()),
+            AttributeValue::Bool(value) => Some(value.to_string()),
+            AttributeValue::Int(value) => Some(value.to_string()),
+            AttributeValue::Float(value) => Some(value.to_string()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn reasoning_folds_by_default_and_reveals_the_full_text() {
+        // A collapsed row renders no body at all - not even a short preview.
+        assert_eq!(reasoning_body("line 1\nline 2", false), None);
+
+        // Expanding reveals the whole text, even past the message clamp.
+        let long = (0..FEED_COLLAPSED_LINES + 5)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = reasoning_body(&long, true).expect("expanded reasoning has a body");
+        assert_eq!(body, long);
+        assert_eq!(body.lines().count(), FEED_COLLAPSED_LINES + 5);
+
+        // ANSI escapes are stripped from the revealed body.
+        assert_eq!(
+            reasoning_body("\u{1b}[31mred\u{1b}[0m", true),
+            Some("red".to_string())
+        );
+    }
+
+    #[test]
+    fn tool_bodies_fold_by_default_and_reveal_the_full_blocks() {
+        let view = tool_view(
+            &serde_json::json!({ "path": "a" }),
+            Some(&serde_json::json!("done")),
+        );
+        assert!(view.foldable);
+        assert_eq!(view.input_shown(false), None);
+        assert_eq!(view.output_shown(false), None);
+        assert!(view.input_shown(true).is_some());
+        assert_eq!(view.output_shown(true), Some("done".to_string()));
+
+        // A row with no bodies earns no disclosure control.
+        let empty = tool_view(&serde_json::Value::Null, None);
+        assert!(!empty.foldable);
+        assert_eq!(empty.input_shown(true), None);
+        assert_eq!(empty.output_shown(true), None);
+    }
+
+    #[test]
+    fn feed_rows_fold_by_default_in_the_rendered_dom() {
+        #[component]
+        fn Harness() -> Element {
+            use_context_provider(AppState::new);
+            let items = use_signal(|| {
+                vec![
+                    FeedItem::Reasoning {
+                        text: "REASONING_BODY_SENTINEL".to_string(),
+                    },
+                    FeedItem::Tool {
+                        id: "c1".to_string(),
+                        name: "read".to_string(),
+                        input: serde_json::json!({ "path": "INPUT_BODY_SENTINEL" }),
+                        status: ToolStatus::Ok,
+                        output: Some(serde_json::json!("OUTPUT_BODY_SENTINEL")),
+                    },
+                ]
+            });
+            let busy = use_signal(|| false);
+            let toast = use_signal(|| None::<(ToastKind, String)>);
+            let refresh = use_signal(|| 0u64);
+            rsx! {
+                FeedList {
+                    items: items(),
+                    session_id: "ses_1".to_string(),
+                    revision: 2,
+                    busy,
+                    toast,
+                    refresh,
+                }
+            }
+        }
+
+        let mut dom = VirtualDom::new(Harness);
+        let mutations = dom.rebuild_to_vec();
+
+        let mut text = String::new();
+        let mut collapsed_toggles = 0usize;
+        for edit in &mutations.edits {
+            match edit {
+                Mutation::CreateTextNode { value, .. } | Mutation::SetText { value, .. } => {
+                    text.push_str(value);
+                    text.push('\n');
+                }
+                Mutation::SetAttribute { name, value, .. }
+                    if *name == "aria-expanded"
+                        && attribute_text(value).as_deref() == Some("false") =>
+                {
+                    collapsed_toggles += 1;
+                }
+                _ => {}
+            }
+        }
+
+        // The header stays visible while folded: tool name and status chip.
+        assert!(
+            text.contains("read"),
+            "tool name missing from folded row: {text}"
+        );
+        assert!(
+            text.contains("ok"),
+            "status chip missing from folded row: {text}"
+        );
+        // ...but no body is rendered.
+        assert!(
+            !text.contains("REASONING_BODY_SENTINEL"),
+            "reasoning body leaked while folded: {text}"
+        );
+        assert!(
+            !text.contains("INPUT_BODY_SENTINEL"),
+            "tool input leaked while folded: {text}"
+        );
+        assert!(
+            !text.contains("OUTPUT_BODY_SENTINEL"),
+            "tool output leaked while folded: {text}"
+        );
+        // One disclosure control per foldable row, both collapsed by default.
+        assert_eq!(
+            collapsed_toggles, 2,
+            "expected two collapsed toggles: {text}"
+        );
+    }
+
     #[test]
     fn feed_list_mounts_host_side() {
         #[component]
@@ -1072,6 +1228,9 @@ mod tests {
                     FeedItem::Message {
                         role: MessageRole::Assistant,
                         text: "hello".to_string(),
+                    },
+                    FeedItem::Reasoning {
+                        text: "considering".to_string(),
                     },
                     FeedItem::Tool {
                         id: "c1".to_string(),
