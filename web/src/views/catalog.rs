@@ -3,6 +3,8 @@
 use dioxus::prelude::*;
 use favetto_wire::model::Task;
 use favetto_wire::rpc::{CatalogEntry, CatalogGetParams, EmptyParams};
+use fuzzy_matcher::skim::SkimMatcherV2;
+use fuzzy_matcher::FuzzyMatcher;
 
 use crate::app::Route;
 use crate::client::RpcClient;
@@ -10,7 +12,7 @@ use crate::components::icon::{AppIcon, AppIconKind};
 use crate::components::markdown::{split_frontmatter, Markdown};
 use crate::components::start_task::StartTaskDialog;
 use crate::components::toast::{Toast, ToastKind};
-use crate::state::AppState;
+use crate::state::{AppState, Cache};
 
 /// A one-line summary derived from the task prompt (the wire `CatalogEntry`
 /// carries no description field).
@@ -62,18 +64,94 @@ pub fn task_tags(entry: &CatalogEntry) -> Vec<String> {
     tags
 }
 
-/// Whether an entry matches the search box (case-insensitive substring over the
-/// name, the derived description, and the derived tags). An empty query matches.
-pub fn matches_query(entry: &CatalogEntry, query: &str) -> bool {
-    let q = query.trim().to_lowercase();
-    if q.is_empty() {
-        return true;
+/// Field weights used to rank a match. A hit in the task name outranks one in a
+/// metadata field, which in turn outranks an incidental hit in the (long) prompt
+/// body, so named tasks surface above body-only matches.
+const NAME_WEIGHT: i64 = 32;
+const VAR_NAME_WEIGHT: i64 = 16;
+const META_WEIGHT: i64 = 4;
+const PROMPT_WEIGHT: i64 = 1;
+
+/// Every searchable `(field text, weight)` pair for an entry: the task name,
+/// the metadata fields (`agent`, `provider`, `model`, `cwd`, `schedule`,
+/// `needs`, `repo`), the derived tag chips, each variable's name and prompt, and
+/// finally the full prompt body.
+fn searchable_fields(entry: &CatalogEntry) -> Vec<(String, i64)> {
+    let mut fields = vec![(entry.name.clone(), NAME_WEIGHT)];
+    for value in [
+        &entry.agent,
+        &entry.provider,
+        &entry.model,
+        &entry.cwd,
+        &entry.schedule,
+        &entry.needs,
+        &entry.repo,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        fields.push((value.clone(), META_WEIGHT));
     }
-    entry.name.to_lowercase().contains(&q)
-        || description(entry).to_lowercase().contains(&q)
-        || tags(entry)
-            .iter()
-            .any(|tag| tag.to_lowercase().contains(&q))
+    for var in &entry.vars {
+        fields.push((var.name.clone(), VAR_NAME_WEIGHT));
+        fields.push((var.prompt.clone(), META_WEIGHT));
+    }
+    for tag in tags(entry) {
+        fields.push((tag, META_WEIGHT));
+    }
+    fields.push((entry.prompt.clone(), PROMPT_WEIGHT));
+    fields
+}
+
+/// The total weighted score for an entry against already-tokenized query terms,
+/// or `None` when a term matches no field (every term must match somewhere).
+fn score_entry(matcher: &SkimMatcherV2, entry: &CatalogEntry, tokens: &[&str]) -> Option<i64> {
+    let fields = searchable_fields(entry);
+    let mut total = 0i64;
+    for token in tokens {
+        let mut best: Option<i64> = None;
+        for (text, weight) in &fields {
+            if let Some(score) = matcher.fuzzy_match(text, token) {
+                let weighted = score.saturating_mul(*weight);
+                best = Some(best.map_or(weighted, |b| b.max(weighted)));
+            }
+        }
+        total = total.saturating_add(best?);
+    }
+    Some(total)
+}
+
+/// Full-text, fuzzy, ranked search of `entries` against `query`.
+///
+/// Matching is case-insensitive and token-wise: every whitespace-separated term
+/// must match some field (fuzzy subsequence, so typos and abbreviations work),
+/// and an entry's score is the sum of its best weighted field hits. Results are
+/// ordered by descending score; ties keep the incoming catalog order. An empty
+/// or whitespace-only query returns `entries` unchanged.
+pub fn search(entries: &[CatalogEntry], query: &str) -> Vec<CatalogEntry> {
+    let tokens: Vec<&str> = query.split_whitespace().collect();
+    if tokens.is_empty() {
+        return entries.to_vec();
+    }
+    let matcher = SkimMatcherV2::default().ignore_case();
+    let mut scored: Vec<(i64, CatalogEntry)> = entries
+        .iter()
+        .filter_map(|entry| score_entry(&matcher, entry, &tokens).map(|s| (s, entry.clone())))
+        .collect();
+    // `sort_by_key` is stable, so equal scores preserve the incoming order.
+    scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+    scored.into_iter().map(|(_, entry)| entry).collect()
+}
+
+/// Repo-scope `entries` for the active repository (via [`Cache::repo_visible`])
+/// and rank the survivors against `query` with [`search`].
+pub fn search_visible(cache: &Cache, entries: &[CatalogEntry], query: &str) -> Vec<CatalogEntry> {
+    let scoped: Vec<CatalogEntry> = entries
+        .iter()
+        .filter(|entry| cache.repo_visible(entry.repo.as_deref()))
+        .cloned()
+        .collect();
+    search(&scoped, query)
 }
 
 /// `/catalog` — the searchable list of catalog definitions.
@@ -102,15 +180,16 @@ pub fn Catalog() -> Element {
         Some(Ok(list)) => list.clone(),
         _ => Vec::new(),
     };
-    // Scope to the active repo, then the search box. A repo-local entry carries
-    // its namespace in `repo`; global entries are unscoped.
+    // Scope to the active repo, then run the full-text search. A repo-local
+    // entry carries its namespace in `repo`; global entries are unscoped.
     let cache = (state.cache)();
-    let visible: Vec<CatalogEntry> = entries
-        .iter()
-        .filter(|entry| cache.repo_visible(entry.repo.as_deref()))
-        .filter(|entry| matches_query(entry, &query()))
-        .cloned()
-        .collect();
+    let query_value = query();
+    let visible = search_visible(&cache, &entries, &query_value);
+    let count_label = if query_value.trim().is_empty() {
+        format!("{} entries", visible.len())
+    } else {
+        format!("{} matches", visible.len())
+    };
 
     rsx! {
         main { id: "favetto-app", class: "catalog",
@@ -121,11 +200,12 @@ pub fn Catalog() -> Element {
             input {
                 class: "catalog-search",
                 r#type: "search",
-                placeholder: "Search by name or tag…",
+                placeholder: "Search tasks, prompts, agents, models…",
                 aria_label: "Search the catalog",
                 value: "{query}",
                 oninput: move |event| query.set(event.value()),
             }
+            p { class: "catalog-count", "{count_label}" }
             match &*resource.read_unchecked() {
                 Some(Err(err)) => rsx! { p { class: "catalog-error", "Could not load the catalog: {err}" } },
                 _ => rsx! {},
@@ -281,20 +361,132 @@ mod tests {
         assert!(tags.contains(&"var:repo".to_string()));
     }
 
-    #[test]
-    fn matches_query_is_case_insensitive_over_name_and_tag() {
-        let e = entry();
-        assert!(matches_query(&e, "TRIAGE"));
-        assert!(matches_query(&e, "agent:CLAUDE"));
-        assert!(matches_query(&e, "ISSUES"));
-        assert!(!matches_query(&e, "nonexistent"));
+    fn custom(name: &str, prompt: &str) -> CatalogEntry {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "vars": [],
+            "prompt": prompt,
+        }))
+        .unwrap()
+    }
+
+    fn names(entries: &[CatalogEntry]) -> Vec<String> {
+        entries.iter().map(|e| e.name.clone()).collect()
     }
 
     #[test]
-    fn empty_query_matches_everything() {
+    fn search_is_case_insensitive_and_fuzzy_over_the_name() {
         let e = entry();
-        assert!(matches_query(&e, ""));
-        assert!(matches_query(&e, "   "));
+        for query in ["TRIAGE", "trie", "trige", "agent:CLAUDE", "AGENT:claude"] {
+            assert_eq!(
+                names(&search(std::slice::from_ref(&e), query)),
+                vec!["triage_issues"],
+                "{query}"
+            );
+        }
+        assert!(search(&[e], "nonexistent").is_empty());
+    }
+
+    #[test]
+    fn search_matches_the_full_prompt_body() {
+        let e = entry();
+        // "label" only appears past the first prompt line, which the old
+        // substring filter never reached.
+        assert_eq!(
+            names(&search(std::slice::from_ref(&e), "label")),
+            vec!["triage_issues"]
+        );
+        assert_eq!(
+            names(&search(std::slice::from_ref(&e), "Find and label")),
+            vec!["triage_issues"]
+        );
+        assert!(search(&[e], "unrelated").is_empty());
+    }
+
+    #[test]
+    fn search_covers_every_catalog_entry_field() {
+        let mut e = entry();
+        e.cwd = Some("/srv/work".into());
+        e.needs = Some("plan".into());
+        e.repo = Some("favetto".into());
+        for query in [
+            "triage_issues", // name
+            "claude",        // agent
+            "anthropic",     // provider
+            "opus",          // model
+            "/srv",          // cwd
+            "0 9",           // schedule
+            "plan",          // needs
+            "repo",          // var name
+            "Which repo",    // var prompt
+            "favetto",       // repo
+            "scheduled",     // derived tag
+            "pipeline",      // derived tag
+            "label",         // prompt body
+        ] {
+            assert_eq!(
+                names(&search(&[e.clone()], query)),
+                vec!["triage_issues"],
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_matches_multi_token_queries() {
+        let mut e = entry();
+        e.repo = Some("favetto".into());
+        assert_eq!(
+            names(&search(&[e.clone()], "claude opus")),
+            vec!["triage_issues"]
+        );
+        assert_eq!(
+            names(&search(&[e], "triage favetto")),
+            vec!["triage_issues"]
+        );
+    }
+
+    #[test]
+    fn search_ranks_name_matches_above_body_matches() {
+        let name_hit = custom("triage_issues", "Do the work.\n");
+        let body_hit = custom("run_report", "Triage the inbox then summarize.\n");
+        // Input order is worst-first; the name match must sort ahead.
+        let results = search(&[body_hit, name_hit], "triage");
+        assert_eq!(names(&results), vec!["triage_issues", "run_report"]);
+    }
+
+    #[test]
+    fn empty_query_preserves_catalog_order() {
+        let first = custom("run_report", "Triage the inbox.\n");
+        let second = custom("triage_issues", "Find and label them.\n");
+        for query in ["", "   "] {
+            assert_eq!(
+                names(&search(&[first.clone(), second.clone()], query)),
+                vec!["run_report", "triage_issues"],
+                "{query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_respects_repo_scoping() {
+        let global = custom("global_task", "Global.\n");
+        let mut local = custom("local_task", "Local.\n");
+        local.repo = Some("favetto".into());
+        let mut other = custom("other_task", "Other.\n");
+        other.repo = Some("other".into());
+
+        let mut cache = Cache {
+            active_repo: Some("favetto".into()),
+            ..Default::default()
+        };
+        let scoped = search_visible(&cache, &[global.clone(), local, other.clone()], "");
+        assert_eq!(names(&scoped), vec!["local_task"]);
+
+        // With no active repo the global view returns everything, in order.
+        cache.active_repo = None;
+        let all = search_visible(&cache, &[global, other], "");
+        assert_eq!(names(&all), vec!["global_task", "other_task"]);
     }
 
     #[test]
