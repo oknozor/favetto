@@ -457,8 +457,13 @@ struct WavCache {
 
 impl WavCache {
     fn new() -> Self {
+        // A directory per cache instance: a process-wide path shared by several
+        // caches (e.g. parallel tests) would let one `Drop` delete another
+        // cache's WAVs mid-write.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
         Self {
-            dir: std::env::temp_dir().join(format!("favetto-sounds-{}", std::process::id())),
+            dir: std::env::temp_dir().join(format!("favetto-sounds-{}-{id}", std::process::id())),
         }
     }
 

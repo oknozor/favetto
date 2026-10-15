@@ -39,9 +39,42 @@ struct DaemonHarness {
 }
 
 impl DaemonHarness {
+    /// Spawn a daemon, retrying if the ephemeral port is stolen before the
+    /// daemon binds it (the child then exits and its scratch dir is removed).
+    fn spawn() -> Self {
+        for _ in 0..8 {
+            let mut daemon = Self::try_spawn();
+            if daemon.wait_bound() {
+                return daemon;
+            }
+            // `daemon` is dropped: kills the child and removes its scratch dir.
+        }
+        panic!("daemon HTTP listener never bound after 8 attempts");
+    }
+
+    /// Synchronously wait (up to `STARTUP_TIMEOUT`) for the TCP listener to
+    /// accept; returns false if the child exited first (e.g. its port was
+    /// stolen).
+    fn wait_bound(&mut self) -> bool {
+        let addr: std::net::SocketAddr = self.listen.parse().expect("listen is host:port");
+        let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
+        loop {
+            if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+                return true;
+            }
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return false;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     /// Create a scratch workspace with a fake echo agent and a one-task catalog,
     /// then spawn `favetto daemon` against it.
-    fn spawn() -> Self {
+    fn try_spawn() -> Self {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

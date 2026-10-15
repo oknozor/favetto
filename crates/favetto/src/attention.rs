@@ -1010,12 +1010,22 @@ mod tests {
         }
         assert!(marked, "task never became AwaitingInput");
 
+        // The status write and the event emit are separate steps, so the
+        // event may land a moment after the status flips. Poll for it.
+        let mut event = None;
+        for _ in 0..100 {
+            let events = db::tail_events(&state.db, 50).await.unwrap();
+            if let Some(found) = events
+                .into_iter()
+                .find(|e| e.kind == EventKind::TaskAwaitingInput)
+            {
+                event = Some(found);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         // The persisted event carries the structured request for hooks.
-        let events = db::tail_events(&state.db, 50).await.unwrap();
-        let event = events
-            .iter()
-            .find(|e| e.kind == EventKind::TaskAwaitingInput)
-            .expect("task_awaiting_input event");
+        let event = event.expect("task_awaiting_input event");
         assert_eq!(event.payload["reason"]["request_id"], "perm_1");
         assert_eq!(event.payload["session_id"], info.id);
 

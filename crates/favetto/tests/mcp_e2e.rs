@@ -81,7 +81,7 @@ impl Daemon {
         .unwrap();
 
         let socket = root.join("favetto.sock");
-        let listen = format!("127.0.0.1:{}", free_port());
+        let listen = "127.0.0.1:0".to_string();
         let log_path = root.join("daemon.log");
         let log = std::fs::File::create(&log_path).unwrap();
 
@@ -128,13 +128,6 @@ impl Drop for Daemon {
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.root);
     }
-}
-
-/// A free loopback port. The listener is dropped immediately, so a small race
-/// remains; acceptable for a test.
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
 }
 
 /// Block until the Unix socket accepts connections, or panic with the log.
