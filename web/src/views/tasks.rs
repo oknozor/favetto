@@ -3,8 +3,9 @@
 //! The list seeds the shared [`AppState`] task cache from `tasks.list`; the
 //! live SSE `task.updated` pushes already update that cache in `app.rs`, so the
 //! list re-renders with no extra wiring. The detail route fetches the full task
-//! and its run history (`tasks.runs`), re-running when a push changes the
-//! task's status or attempt.
+//! and its run history (`tasks.runs`), re-running only when a push changes the
+//! task's status or attempt, or bumps the catalog version (see
+//! [`use_detail_refresh_key`]).
 
 use dioxus::prelude::*;
 use favetto_wire::model::{FailureKind, RunStatus, Task, TaskRun, TaskStatus};
@@ -19,7 +20,7 @@ use crate::components::icon::{AppIcon, AppIconKind};
 use crate::components::output_viewer::{extract_output_text, extract_run_summary, OutputViewer};
 use crate::components::start_task::StartTaskDialog;
 use crate::components::toast::{Toast, ToastKind};
-use crate::state::{task_display_name, task_repo, AppState, TaskFeed};
+use crate::state::{task_display_name, task_repo, AppState, Cache, TaskFeed};
 use crate::views::catalog::task_tags;
 
 /// The status chips above the task list.
@@ -414,6 +415,29 @@ struct Detail {
     runs: Vec<TaskRun>,
 }
 
+/// The inputs that must change for the detail route to re-fetch: the cached
+/// task's `(status, attempt)` — pushed by `task.updated` — plus the catalog
+/// version — bumped by `catalog.updated`, since the header chips read the
+/// catalog.
+///
+/// Folding these reads into a [`Memo`] narrows the subscription to exactly what
+/// the fetch depends on. Reading the raw `cache` signal instead made the
+/// resource re-run on *every* cache write — including its own `set_catalog` —
+/// which fed back on itself and hammered `tasks.get`/`tasks.runs`/`catalog.list`
+/// (the driver behind the gateway's throttling).
+fn use_detail_refresh_key(
+    cache: Signal<Cache>,
+    catalog_version: Signal<u64>,
+    uuid: Option<Uuid>,
+) -> Memo<(Option<(TaskStatus, u32)>, u64)> {
+    use_memo(move || {
+        (
+            uuid.and_then(|uuid| cache().tasks.get(&uuid).map(|t| (t.status, t.attempt))),
+            (catalog_version)(),
+        )
+    })
+}
+
 /// The `/tasks/:id` detail route.
 #[component]
 pub fn TaskDetail(id: String) -> Element {
@@ -426,18 +450,15 @@ pub fn TaskDetail(id: String) -> Element {
     // the matching SSE push.
     let refresh = use_signal(|| 0u64);
 
-    // Subscribe to the cached task's (status, attempt) so an SSE `task.updated`
-    // push re-fetches the full task + run history.
+    // Re-fetch when the cached task's (status, attempt) changes (an SSE
+    // `task.updated` push) or the catalog version changes (`catalog.updated`),
+    // but not on every unrelated cache write — see `use_detail_refresh_key`.
+    let detail_key = use_detail_refresh_key(state.cache, state.catalog_version, parsed);
     let detail = use_resource(move || {
         let base = (state.daemon_url)();
         let token = (state.token)();
         let _refresh = refresh();
-        let _key = parsed.and_then(|uuid| {
-            (state.cache)()
-                .tasks
-                .get(&uuid)
-                .map(|t| (t.status, t.attempt))
-        });
+        let _key = detail_key();
         async move {
             let Some(uuid) = parsed else {
                 return Err("task not found".to_string());
@@ -885,5 +906,123 @@ mod tests {
             })
         });
         dom.rebuild_in_place();
+    }
+
+    /// Builds a `Task` carrying just the fields the detail refresh key reads.
+    fn detail_task(uuid: Uuid, status: TaskStatus, attempt: u32) -> Task {
+        serde_json::from_value(serde_json::json!({
+            "id": uuid,
+            "name": "triage",
+            "status": status.as_str(),
+            "attempt": attempt,
+            "input": {},
+            "output": null,
+            "dedupe_key": null,
+            "created_at": "2026-01-01T00:00:00Z",
+            "started_at": null,
+            "finished_at": null,
+            "error": null,
+            "failure": null,
+            "session_id": null,
+            "session_title": null,
+            "parent_id": null,
+            "root_id": null,
+            "interactive": false,
+        }))
+        .unwrap()
+    }
+
+    fn detail_catalog() -> Vec<favetto_wire::rpc::CatalogEntry> {
+        serde_json::from_value(serde_json::json!([{
+            "name": "triage",
+            "agent": null,
+            "provider": null,
+            "model": null,
+            "cwd": null,
+            "schedule": null,
+            "needs": null,
+            "vars": [],
+            "prompt": "",
+            "repo": null,
+        }]))
+        .unwrap()
+    }
+
+    /// Regression for the detail route re-fetching on *every* cache write.
+    ///
+    /// The resource used to read the raw `cache` signal and write it back
+    /// (`set_catalog`), so one cache write restarted the fetch, which wrote
+    /// again — an unbounded loop of `tasks.get`/`tasks.runs`/`catalog.list`.
+    /// [`use_detail_refresh_key`] replaces that with a `Memo` keyed on
+    /// `(status, attempt)` + catalog version; this asserts the fetch re-runs
+    /// once per meaningful change and not on unrelated writes.
+    #[test]
+    fn detail_refresh_key_gates_the_fetch_to_meaningful_changes() {
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        // `VirtualDom::new` takes a bare `fn() -> Element`, so the probe's
+        // handles travel through thread-local state instead of a closure.
+        thread_local! {
+            static RUNS: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+            static HANDLES: RefCell<Option<(Signal<Cache>, Signal<u64>, Uuid)>> =
+                RefCell::new(None);
+        }
+
+        fn probe() -> Element {
+            let cache = use_signal(Cache::default);
+            let catalog_version = use_signal(|| 0u64);
+            let uuid = use_hook(Uuid::new_v4);
+            HANDLES.with(|h| *h.borrow_mut() = Some((cache, catalog_version, uuid)));
+
+            // Mirror `TaskDetail`: the fetch reads only the memoized key.
+            let key = use_detail_refresh_key(cache, catalog_version, Some(uuid));
+            let _resource = use_resource(move || {
+                let _key = key();
+                async move {
+                    RUNS.with(|runs| runs.set(runs.get() + 1));
+                }
+            });
+            rsx! { div {} }
+        }
+
+        fn settle(dom: &mut VirtualDom) {
+            for _ in 0..3 {
+                let _ = dom.render_immediate_to_vec();
+            }
+        }
+
+        RUNS.with(|runs| runs.set(0));
+        let mut dom = VirtualDom::new(probe);
+        dom.rebuild_in_place();
+        settle(&mut dom);
+
+        let (mut cache, catalog_version, uuid) =
+            HANDLES.with(|h| *h.borrow()).expect("probe mounted");
+        let runs = RUNS.with(|runs| runs.clone());
+        assert_eq!(runs.get(), 1, "the initial fetch runs once");
+
+        // The view's own `set_catalog` (any catalog-only write) must not refetch.
+        cache.write().set_catalog(detail_catalog());
+        settle(&mut dom);
+        assert_eq!(runs.get(), 1, "a catalog-only write must not re-fetch");
+
+        // A `task.updated` status/attempt change must refetch.
+        cache
+            .write()
+            .set_tasks([detail_task(uuid, TaskStatus::Succeeded, 1)]);
+        settle(&mut dom);
+        assert_eq!(runs.get(), 2, "a status/attempt change re-fetches");
+
+        // A `catalog.updated` push bumps the version and must refetch.
+        let mut version = catalog_version;
+        version.set(version() + 1);
+        settle(&mut dom);
+        assert_eq!(runs.get(), 3, "a catalog.updated push re-fetches");
+
+        // The SSE effect's feed write must not refetch.
+        cache.write().set_feed(uuid, TaskFeed::default());
+        settle(&mut dom);
+        assert_eq!(runs.get(), 3, "an unrelated cache write must not re-fetch");
     }
 }
