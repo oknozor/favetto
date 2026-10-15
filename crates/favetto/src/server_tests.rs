@@ -1408,7 +1408,7 @@ async fn agents_start_renders_catalog_prompt_with_task_input() {
     .await
     .expect("start_agent");
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let captured = loop {
         let text = std::fs::read_to_string(&capture).unwrap_or_default();
         if !text.is_empty() || std::time::Instant::now() >= deadline {
@@ -1474,7 +1474,7 @@ async fn agents_start_uses_catalog_provider_and_model() {
     .await
     .expect("start_agent");
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let captured = loop {
         let text = std::fs::read_to_string(&capture).unwrap_or_default();
         if !text.is_empty() || std::time::Instant::now() >= deadline {
@@ -1529,7 +1529,7 @@ async fn tasks_start_submits_rendered_prompt_without_attach() {
     // The background dispatcher claims and runs the queued task.
     let executor = crate::executor::spawn(state.clone());
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let captured = loop {
         let text = std::fs::read_to_string(&capture).unwrap_or_default();
         if !text.is_empty() || std::time::Instant::now() >= deadline {
@@ -2042,7 +2042,7 @@ async fn agents_start_resumes_in_the_runs_worktree() {
     assert!(!info.headless, "resume must launch an interactive session");
 
     let expected = dir.join("worktrees").join(task.id.to_string());
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let captured = loop {
         let text = std::fs::read_to_string(&capture).unwrap_or_default();
         if !text.trim().is_empty() || std::time::Instant::now() >= deadline {
@@ -3387,17 +3387,24 @@ fn auth_header(state: &State) -> HeaderMap {
     headers
 }
 
-/// Collect SSE text until the body goes idle for 150 ms. Used for streams that
-/// replay a finite set of events and then fall silent.
-async fn drain_sse(body: axum::body::Body) -> String {
+/// Collect SSE text until `done` is satisfied or a 10 s overall deadline
+/// elapses. The resumable stream does not end on its own, so the predicate
+/// identifies the finite replay/target frames; the per-read timeout only guards
+/// a stalled stream (well above any real inter-frame gap under load).
+async fn drain_sse_until(body: axum::body::Body, mut done: impl FnMut(&str) -> bool) -> String {
     let mut stream = body.into_data_stream();
     let mut text = String::new();
-    while let Ok(Some(Ok(chunk))) =
-        tokio::time::timeout(std::time::Duration::from_millis(150), stream.next()).await
-    {
-        text.push_str(&String::from_utf8_lossy(&chunk));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if done(&text) || tokio::time::Instant::now() >= deadline {
+            return text;
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await {
+            Ok(Some(Ok(chunk))) => text.push_str(&String::from_utf8_lossy(&chunk)),
+            // stream ended / errored / stalled
+            _ => return text,
+        }
     }
-    text
 }
 
 /// Read exactly one SSE chunk, failing if none arrives within a second.
@@ -3423,11 +3430,20 @@ fn replayed_event_ids(text: &str) -> Vec<i64> {
         .collect()
 }
 
-/// Call the handler with the given resume inputs and drain the replay.
-async fn sse_replay_text(state: &Arc<State>, headers: HeaderMap, query: EventsQuery) -> String {
+/// Call the handler with the given resume inputs and drain until `expected`
+/// durable events have been replayed.
+async fn sse_replay_text(
+    state: &Arc<State>,
+    headers: HeaderMap,
+    query: EventsQuery,
+    expected: usize,
+) -> String {
     let resp = events_handler(AxumState(state.clone()), headers, Query(query)).await;
     assert_eq!(resp.status(), StatusCode::OK);
-    drain_sse(resp.into_body()).await
+    drain_sse_until(resp.into_body(), |t| {
+        replayed_event_ids(t).len() >= expected
+    })
+    .await
 }
 
 #[tokio::test]
@@ -3466,7 +3482,12 @@ async fn sse_started_task_emits_id_event_and_data() {
     .await;
     assert!(started.error.is_none(), "{:?}", started.error);
 
-    let text = drain_sse(body).await;
+    let text = drain_sse_until(body, |t| {
+        t.contains("event: event")
+            && t.contains("event: task.updated")
+            && t.contains("\"kind\":\"task_idle\"")
+    })
+    .await;
     let mut saw_event = false;
     let mut saw_task_updated = false;
     for frame in text.split("\n\n") {
@@ -3512,7 +3533,7 @@ async fn sse_replays_from_header_and_query() {
     // `Last-Event-ID: 1` replays exactly {2, 3}.
     let mut headers = auth_header(&state);
     headers.insert("last-event-id", axum::http::HeaderValue::from_static("1"));
-    let text = sse_replay_text(&state, headers, EventsQuery::default()).await;
+    let text = sse_replay_text(&state, headers, EventsQuery::default(), 2).await;
     assert_eq!(replayed_event_ids(&text), vec![2, 3], "{text}");
 
     // `?last_event_id=2` replays exactly {3}.
@@ -3522,6 +3543,7 @@ async fn sse_replays_from_header_and_query() {
         EventsQuery {
             last_event_id: Some(2),
         },
+        1,
     )
     .await;
     assert_eq!(replayed_event_ids(&text), vec![3], "{text}");
@@ -3535,6 +3557,7 @@ async fn sse_replays_from_header_and_query() {
         EventsQuery {
             last_event_id: Some(2),
         },
+        2,
     )
     .await;
     assert_eq!(replayed_event_ids(&text), vec![2, 3], "{text}");

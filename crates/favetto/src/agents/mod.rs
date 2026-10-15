@@ -160,7 +160,9 @@ struct Session {
     running: Arc<AtomicBool>,
     /// Raw output, retained so an unattended run's result can be captured.
     raw: Arc<Mutex<Vec<u8>>>,
-    /// Child exit code (`-1` until it exits).
+    /// Child exit code (`-1` means "not exited yet, or killed"). Written before
+    /// `running` is cleared, so a waiter that sees `running == false` reads the
+    /// real code (see the reader thread and [`AgentManager::wait`]).
     exit_code: Arc<std::sync::atomic::AtomicI32>,
     /// The agent's own session id, captured from line-delimited JSON output.
     external_session_id: Arc<Mutex<Option<String>>>,
@@ -716,13 +718,17 @@ impl AgentManager {
                         Err(_) => break,
                     }
                 }
-                running.store(false, Ordering::SeqCst);
+                // Publish the exit code before clearing `running`: a waiter that
+                // observes `running == false` must always read the real code,
+                // never the `-1` sentinel. Both are `SeqCst`, so the store order
+                // is a happens-before edge for `wait`.
                 let code = child
                     .wait()
                     .ok()
                     .map(|status| status.exit_code() as i32)
                     .unwrap_or(-1);
                 exit_code.store(code, Ordering::SeqCst);
+                running.store(false, Ordering::SeqCst);
                 if let Some(parser) = state_stdout.as_mut() {
                     parser.finish(Some(code));
                 }
@@ -792,7 +798,9 @@ impl AgentManager {
     }
 
     /// Wait for a session's process to exit; returns its exit code, or `None` if
-    /// the session is unknown.
+    /// the session is unknown. Relies on the reader thread publishing
+    /// `exit_code` before it clears `running`, so a completed session never
+    /// reports the `-1` sentinel here.
     pub async fn wait(&self, session_id: &str) -> Option<i32> {
         loop {
             let (running, code) = match self.get(session_id) {
