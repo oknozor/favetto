@@ -17,6 +17,11 @@ WorkingDirectory=%h
 # PATH. Keep the standard dirs and add the usual user install locations.
 Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=RUST_LOG=favetto=info
+# Secrets for scheduled/action tasks (for example the GITHUB_TOKEN a poll gate
+# interpolates) are loaded from this private, mode-600 env file instead of
+# living in the unit. The leading `-` keeps the unit startable when the file has
+# not been created yet.
+EnvironmentFile=-%h/.config/favetto/env
 # SIGTERM (the default stop signal) is handled by the daemon and exits 0.
 Restart=on-failure
 RestartSec=5

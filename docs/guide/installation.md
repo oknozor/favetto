@@ -58,11 +58,31 @@ The script:
 
 1. installs the `favetto` binary with `cargo install --path crates/favetto --locked`,
 2. seeds `~/.config/favetto/config.toml` from `config.example.toml` when missing,
-3. installs `packaging/systemd/favetto.service` to
-   `~/.config/systemd/user/favetto.service`, and
-4. runs `systemctl --user enable --now favetto.service`.
+3. creates the private `~/.config/favetto/env` secrets file (mode 600) and, when
+   `gh` is authenticated, seeds `GITHUB_TOKEN` from `gh auth token`
+   (pass `--no-github-token` to skip; an existing value is never overwritten),
+4. installs `packaging/systemd/favetto.service` to
+   `~/.config/systemd/user/favetto.service`,
+5. enables the unit, reloads the user manager, and **restarts** the service so
+   it runs with the freshly installed binary and environment.
 
 It never uses `sudo`. Pass `--no-start` to install without enabling the unit.
+
+::: tip Secrets live in an env file, not the unit
+Scheduled and action tasks can interpolate secrets from the daemon's
+environment (for example a `poll_issues` gate that sends
+`Authorization = "Bearer $GITHUB_TOKEN"`). The shipped unit loads
+`~/.config/favetto/env` through `EnvironmentFile=`, so the token stays out of
+both the unit and the config. That file is read **only when the unit starts**;
+after editing it, apply the change with:
+
+```bash
+systemctl --user restart favetto
+```
+
+The unit marks the file optional (`EnvironmentFile=-…`), so the daemon still
+starts when it has not been created.
+:::
 
 ::: warning Agent CLIs must be on the unit's PATH
 systemd's default `PATH` does not include `~/.cargo/bin` or `~/.local/bin`, and

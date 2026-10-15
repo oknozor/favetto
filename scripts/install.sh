@@ -7,6 +7,12 @@
 # CLIs, so it is installed as a `systemctl --user` unit. This script never uses
 # `sudo`.
 #
+# Secrets for scheduled/action tasks (e.g. the `GITHUB_TOKEN` a poll gate
+# interpolates) are read from a private `~/.config/favetto/env` file that the
+# unit loads via `EnvironmentFile=`. The script creates it (mode 600) when
+# missing and seeds `GITHUB_TOKEN` from an authenticated `gh` unless
+# `--no-github-token` is passed; it never overwrites an existing value.
+#
 # Usage:
 #   scripts/install.sh                 # build the web UI, install + enable + start
 #   scripts/install.sh --no-web        # skip building the embedded web client
@@ -37,6 +43,7 @@ unit_src="$repo_root/packaging/systemd/favetto.service"
 unit_dst="$unit_dir/$SERVICE_NAME"
 cfg_dir="$config_home/favetto"
 cfg_file="$cfg_dir/config.toml"
+env_file="$cfg_dir/env"
 data_dir="$data_home/favetto"
 
 usage() {
@@ -51,12 +58,17 @@ Options:
   --no-start    Install the unit but do not run `systemctl --user enable --now`.
   --no-web      Skip building the Dioxus web client; the daemon then embeds a
                 placeholder page instead of the real UI.
+  --no-github-token
+                Do not seed GITHUB_TOKEN in ~/.config/favetto/env from `gh`.
   -h, --help    Show this help and exit.
 
 The script builds the Dioxus web client into web/dist (so the daemon embeds it),
 builds and installs the `favetto` binary with cargo, seeds
-~/.config/favetto/config.toml from config.example.toml when missing, installs
-the unit from packaging/systemd/favetto.service, and reloads the user manager.
+~/.config/favetto/config.toml from config.example.toml when missing, creates the
+private ~/.config/favetto/env secrets file (mode 600, loaded by the unit via
+EnvironmentFile=), installs the unit from packaging/systemd/favetto.service,
+reloads the user manager and restarts the service so it runs with that
+environment.
 EOF
 }
 
@@ -71,6 +83,7 @@ uninstall=0
 purge=0
 no_start=0
 no_web=0
+seed_github_token=1
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -78,6 +91,7 @@ while [ "$#" -gt 0 ]; do
         --purge) purge=1 ;;
         --no-start) no_start=1 ;;
         --no-web) no_web=1 ;;
+        --no-github-token) seed_github_token=0 ;;
         -h | --help)
             usage
             exit 0
@@ -97,6 +111,18 @@ fi
 # True when `systemctl --user` is usable (a user manager is running).
 user_manager_available() {
     systemctl --user daemon-reload >/dev/null 2>&1
+}
+
+# True once the unit reports `active`. `restart` returns before systemd has
+# finished flipping the state, so retry briefly.
+service_active() {
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if systemctl --user is-active --quiet "$SERVICE_NAME"; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    return 1
 }
 
 # The resolved path of the installed binary; prefer the cargo home, then PATH,
@@ -191,6 +217,41 @@ build_web_client() {
     log "web client built into $web_dir/dist"
 }
 
+# Create the daemon's private env file (mode 600) if it does not exist. The unit
+# loads it with `EnvironmentFile=`, so scheduled/action tasks can interpolate
+# secrets such as `GITHUB_TOKEN` without them living in the unit or the config.
+#
+# When `gh` is installed and authenticated and `GITHUB_TOKEN` is not already set
+# in the file, seed it from `gh auth token` (unless --no-github-token was passed).
+# An existing value is never overwritten.
+ensure_env_file() {
+    if [ -f "$env_file" ]; then
+        log "keeping existing $env_file"
+    else
+        mkdir -p "$cfg_dir"
+        {
+            printf '# favetto daemon secrets, loaded by the systemd unit via\n'
+            printf '# EnvironmentFile (see packaging/systemd/favetto.service).\n'
+            printf '# One KEY=value per line; keep this file at mode 600.\n'
+            printf '#\n'
+            printf '# GITHUB_TOKEN=ghp_...\n'
+            printf '# GITHUB_WEBHOOK_SECRET=...\n'
+        } >"$env_file"
+        chmod 600 "$env_file"
+        log "created $env_file (mode 600)"
+    fi
+
+    if [ "$seed_github_token" -eq 1 ] &&
+        ! grep -qE '^[[:space:]]*GITHUB_TOKEN=' "$env_file" &&
+        command -v gh >/dev/null 2>&1; then
+        if gh_token="$(gh auth token 2>/dev/null)" && [ -n "$gh_token" ]; then
+            printf 'GITHUB_TOKEN=%s\n' "$gh_token" >>"$env_file"
+            chmod 600 "$env_file"
+            log "seeded GITHUB_TOKEN in $env_file from 'gh auth token'"
+        fi
+    fi
+}
+
 install_service() {
     [ -f "$unit_src" ] || die "unit template not found: $unit_src"
 
@@ -219,6 +280,10 @@ install_service() {
         log "keeping existing $cfg_file"
     fi
 
+    # The unit loads this file with EnvironmentFile=, so it must exist (and be
+    # populated) before the service is (re)started below.
+    ensure_env_file
+
     mkdir -p "$unit_dir"
     # Substitute the resolved binary path into the checked-in unit's ExecStart.
     sed "s|%h/.cargo/bin/favetto|$bin_path|" "$unit_src" >"$unit_dst"
@@ -237,12 +302,22 @@ install_service() {
         log "unit installed (--no-start); enable it with: systemctl --user enable --now $SERVICE_NAME"
     else
         systemctl --user enable "$SERVICE_NAME"
+        # Reload first so `restart` picks up the freshly written unit, including
+        # its EnvironmentFile= line. `restart` alone reuses the unit the manager
+        # already has cached and would keep the previous environment.
+        systemctl --user daemon-reload
         # `restart` (not `enable --now`) so an already-running daemon is moved
-        # onto the freshly installed binary — `enable --now` is a no-op for an
-        # active unit, so it would keep serving the previous build (e.g. the
-        # placeholder page when the web UI was just embedded).
+        # onto the freshly installed binary and re-reads its environment —
+        # `enable --now` is a no-op for an active unit, so it would keep serving
+        # the previous build and the previous environment.
         systemctl --user restart "$SERVICE_NAME"
-        log "enabled and restarted $SERVICE_NAME"
+
+        if service_active; then
+            log "enabled and restarted $SERVICE_NAME; daemon runs with $env_file"
+        else
+            warn "$SERVICE_NAME did not stay active; check:"
+            warn "  journalctl --user -u $SERVICE_NAME -e"
+        fi
     fi
 
     cat <<EOF
@@ -260,6 +335,10 @@ The daemon serves the embedded web client at its listen address (the
 
 Agent CLIs must be reachable from the unit's PATH; edit the Environment=PATH
 line in $unit_dst if they live elsewhere.
+
+Task secrets live in $env_file (mode 600) and are loaded by the unit through
+EnvironmentFile. Add or edit KEY=value lines there (for example GITHUB_TOKEN),
+then run 'systemctl --user restart $SERVICE_NAME' to reload the environment.
 EOF
 }
 

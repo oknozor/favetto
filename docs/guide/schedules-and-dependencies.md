@@ -143,8 +143,11 @@ just like an empty `[]` manifest — so a fan-in on `triage_issues` (for example
 `needs = "triage_issues:all_finished"`) still resolves. When items are present,
 the child is enqueued with the gate run's lineage. Header values may interpolate
 `$GITHUB_TOKEN` from the daemon's environment, so the token never lives in the
-task file. See [Action tasks](../reference/tasks#action-tasks-kind-action) for
-the full `http.request` parameter list and the predicate operators.
+task file. With the systemd user service, put it in `~/.config/favetto/env`
+(loaded via `EnvironmentFile=`) and `systemctl --user restart favetto` — see
+[Installation](./installation#run-as-a-systemd-user-service). See
+[Action tasks](../reference/tasks#action-tasks-kind-action) for the full
+`http.request` parameter list and the predicate operators.
 
 ## Wait for every instance (fan-in)
 
