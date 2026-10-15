@@ -7,11 +7,12 @@ page is about *organising and finding* tasks — for the file syntax see the
 
 ## Organise tasks into folders
 
-Put task files anywhere under the tasks directory (default `tasks/`, set with
-`--tasks-dir` or `[daemon].tasks_dir`). The daemon loads them **recursively**:
+Put task files anywhere under the tasks directory (default
+`~/.config/favetto/tasks`, set with `--tasks-dir` or `[daemon].tasks_dir`). The
+daemon loads them **recursively**:
 
 ```text
-tasks/
+~/.config/favetto/tasks/
   triage.md              →  task "triage"
   release/
     changelog.md         →  task "release/changelog"
@@ -153,7 +154,7 @@ the preview.
 # in another terminal, while the daemon runs
 echo 'agent = "opencode"
 ---
-Summarise the open issues.' > tasks/summarise.md
+Summarise the open issues.' > ~/.config/favetto/tasks/summarise.md
 # → the new task appears in the Catalog tab immediately
 ```
 
@@ -172,7 +173,8 @@ task picks up the freshly loaded definition when it starts.
 
 The Ctrl+P menu's **Add task to catalog** writes a new `.md` file (it does not
 run it). The name may contain `/` to place the file in a subfolder — for example
-`release/notes` creates `tasks/release/notes.md`. Files written this way appear
-in the catalog through the same live reload described above.
+`release/notes` creates `release/notes.md` under the tasks root (by default
+`~/.config/favetto/tasks/release/notes.md`). Files written this way appear in the
+catalog through the same live reload described above.
 
 Next: [Variables and prompts](./variables-and-prompts).

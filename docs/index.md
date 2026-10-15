@@ -59,7 +59,7 @@ favetto tui
 favetto tui --remote ws://127.0.0.1:7878/rpc \
     --token-file ~/.local/share/favetto/token
 
-# then write tasks/hello.md and start it from the Catalog tab
+# then write ~/.config/favetto/tasks/hello.md and start it from the Catalog tab
 ```
 
 New here? Follow [Your first task](/guide/first-task) — it creates a task, runs

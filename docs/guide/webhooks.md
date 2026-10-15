@@ -31,8 +31,8 @@ filter = { labels_contains = ["bug"], base_ref = "main", author = "oknozor" }
 ```
 
 `task` is the [catalog identity](./catalog) — the path relative to the tasks
-root, without `.md`. Here the rules point at the tasks that ship in
-`tasks/favetto/`: `triage_issues` becomes `favetto/triage_issues`.
+root, without `.md`. Here the rules point at tasks under a `favetto/` subfolder
+of the catalog: `triage_issues` becomes `favetto/triage_issues`.
 
 A rule naming an unsupported event, an unknown catalog task, or an invalid glob
 is a **startup error**, so a typo fails the daemon rather than silently never

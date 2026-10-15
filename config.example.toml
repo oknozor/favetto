@@ -104,7 +104,7 @@ default = "opencode"
 [daemon]
 listen = "127.0.0.1:7878"
 socket = "/tmp/favetto.sock"
-tasks_dir = "tasks"
+# tasks_dir = "~/.config/favetto/tasks"
 # data_dir = "~/.local/share/favetto"
 
 # Bounded database growth. This is the one setting that deletes data: at daemon

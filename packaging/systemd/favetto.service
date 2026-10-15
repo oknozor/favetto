@@ -9,7 +9,9 @@ Type=simple
 # `cargo install --path crates/favetto` places the binary here. The install
 # script substitutes the resolved path when it differs.
 ExecStart=%h/.cargo/bin/favetto daemon
-# The default `tasks_dir = "tasks"` is relative; anchor it at $HOME.
+# The daemon's working directory is the default `cwd` for tasks that don't set
+# their own; anchor it at $HOME. (The task catalog itself defaults to
+# `~/.config/favetto/tasks`, independent of this.)
 WorkingDirectory=%h
 # systemd's default PATH omits the agent CLIs, and favetto resolves agents from
 # PATH. Keep the standard dirs and add the usual user install locations.

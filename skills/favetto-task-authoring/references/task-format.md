@@ -63,12 +63,13 @@ value becomes `input.<name>`.
 ## Identity and discovery
 
 The daemon loads `*.md` files **recursively** from the tasks root (default
-`tasks/`, set with `--tasks-dir` or `[daemon].tasks_dir`). A task's identity is
-its path relative to that root, without `.md`, with `/` separators:
+`~/.config/favetto/tasks`, set with `--tasks-dir` or `[daemon].tasks_dir`). A
+task's identity is its path relative to that root, without `.md`, with `/`
+separators:
 
 ```text
-tasks/triage.md              →  triage
-tasks/release/changelog.md   →  release/changelog
+triage.md              →  triage
+release/changelog.md   →  release/changelog
 ```
 
 The same identity is used by `tasks.start`, `catalog.get`, `needs`/`spawn`,

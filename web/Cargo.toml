@@ -53,6 +53,20 @@ web-sys = { version = "0.3", features = [
 ] }
 dioxus-icons-phosphor = { version = "=0.2.1", default-features = false, features = ["regular"] }
 
+# Native targets (Android, plus the host test harness) have no browser `fetch`,
+# so the transport goes through reqwest. rustls with bundled webpki roots keeps
+# Android self-contained (no system OpenSSL); `stream` powers the SSE reader.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+tokio = { version = "1", features = ["time"] }
+dirs = "7"
+
+# On Android the persistent state lives in the app's private files directory,
+# resolved through the JNI context the runtime installs.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"
+
 [features]
 # Web (wasm32) is the default so a plain `dx build` produces the embedded SPA.
 default = ["web"]

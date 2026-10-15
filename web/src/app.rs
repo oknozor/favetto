@@ -186,14 +186,9 @@ fn ConnectionBanner() -> Element {
     }
 }
 
-/// Connect the transport. A no-op on the host (there is no `fetch`), so the
-/// component can still mount in host unit tests.
-#[cfg(not(target_arch = "wasm32"))]
-async fn connect(_state: AppState, _base: String, _token: Option<String>) {}
-
-/// On web: ping once to establish the connection, then stream `/events` forever,
-/// feeding pushes into the cache and connection state.
-#[cfg(target_arch = "wasm32")]
+/// Ping once to establish the connection, then stream `/events` forever, feeding
+/// pushes into the cache and connection state. Runs on every target: the browser
+/// uses `fetch`, native builds use `reqwest` (see `crate::http`).
 async fn connect(state: AppState, base: String, token: Option<String>) {
     use crate::config;
     use crate::sse::{self, SseStatus};
@@ -229,7 +224,6 @@ async fn connect(state: AppState, base: String, token: Option<String>) {
 }
 
 /// One `system.ping` to set the initial connection state.
-#[cfg(target_arch = "wasm32")]
 async fn ping_once(mut state: AppState, base: String, token: Option<String>) {
     use crate::client::{ClientError, RpcClient};
     use favetto_wire::rpc::PingParams;
@@ -252,7 +246,6 @@ async fn ping_once(mut state: AppState, base: String, token: Option<String>) {
 }
 
 /// Feed one dispatched SSE frame into the cursor and the caches.
-#[cfg(target_arch = "wasm32")]
 fn apply_event(mut state: AppState, event: crate::sse::SseEvent) {
     use crate::sse::SseEvent;
 
@@ -279,7 +272,6 @@ fn apply_event(mut state: AppState, event: crate::sse::SseEvent) {
 ///
 /// The first awaiting event asks for permission (fire-and-forget); every later
 /// event notifies when permission is granted and the app is visible.
-#[cfg(target_arch = "wasm32")]
 fn handle_awaiting(mut state: AppState, event: &favetto_wire::model::Event) {
     use crate::notifications;
 

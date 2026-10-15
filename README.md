@@ -54,7 +54,7 @@ binary, seeds `~/.config/favetto/config.toml`, and enables the unit (see
     --token-file ~/.local/share/favetto/token
 ```
 
-Write a task in `tasks/hello.md` (a TOML header, then a Markdown prompt):
+Write a task in `~/.config/favetto/tasks/hello.md` (a TOML header, then a Markdown prompt):
 
 ```md
 agent = "opencode"
@@ -70,7 +70,7 @@ A task file is a TOML header followed by the prompt. Check one without starting 
 daemon:
 
 ```sh
-favetto validate tasks/hello.md
+favetto validate ~/.config/favetto/tasks/hello.md
 ```
 
 ## Documentation

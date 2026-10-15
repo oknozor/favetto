@@ -42,7 +42,7 @@ crates/
   favetto-providers/     provider/model catalog (opencode auth + models.dev)
   favetto-tui/           dependency-light terminal client binary
   favetto/               daemon binary + doc generator
-tasks/                        task catalog: `*.md` files with TOML header + prompt
+tasks/examples/                example tasks: `*.md` files with TOML header + prompt
 docs/                         VitePress site: guide + generated reference
 ```
 

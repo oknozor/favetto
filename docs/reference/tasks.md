@@ -1,7 +1,8 @@
 # Task file format
 
-A catalog task is a Markdown file under the tasks directory (default `tasks/`)
-whose first section is a TOML header and whose body is the prompt. Everything
+A catalog task is a Markdown file under the tasks directory (default
+`~/.config/favetto/tasks`) whose first section is a TOML header and whose body is
+the prompt. Everything
 before the first `---` line is parsed as TOML; everything after it is the prompt:
 
 ```md
@@ -153,10 +154,10 @@ empty. Double braces leave single braces in prompt code blocks alone.
 ## Identity and discovery
 
 The daemon loads the catalog **recursively** from `--tasks-dir` (default
-`tasks/`). A task's identity is its path relative to that root, without the `.md`
-extension, with `/` separators: `tasks/pipelines/plan.md` is the task
-`pipelines/plan`, while a root-level `tasks/triage.md` keeps the bare stem
-`triage`. Two files with the same stem in different folders are distinct tasks.
+`~/.config/favetto/tasks`). A task's identity is its path relative to that root,
+without the `.md` extension, with `/` separators: `pipelines/plan.md` is the task
+`pipelines/plan`, while a root-level `triage.md` keeps the bare stem `triage`.
+Two files with the same stem in different folders are distinct tasks.
 
 That identity is used consistently by `tasks.start` and `catalog.get`,
 `needs`/`spawn`, webhook `rule.task`, `catalog:<name>` schedule ids, and

@@ -17,7 +17,7 @@
 //! [daemon]
 //! listen = "127.0.0.1:7878"
 //! socket = "/tmp/favetto.sock"
-//! tasks_dir = "tasks"
+//! tasks_dir = "~/.config/favetto/tasks"
 //! ```
 
 use std::collections::BTreeMap;

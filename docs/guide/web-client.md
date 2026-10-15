@@ -144,6 +144,13 @@ At runtime the app prompts for the daemon's base URL (e.g.
 `https://favetto.example.com`), tests the connection, then shows the pairing
 screen — same flow as the web client, plus the URL step.
 
+Native builds have no browser `fetch`, so the transport uses `reqwest` (rustls
+with bundled webpki roots, no system OpenSSL). Point it at an `https://` URL with
+a publicly-trusted certificate (for example a Let's Encrypt cert behind a
+TLS-terminating reverse proxy); a self-signed certificate is rejected. The bearer
+token and daemon URL persist in the app's private files directory, so sign-in
+survives a restart.
+
 ### Prerequisites
 
 - **JDK 17** (Temurin or equivalent).

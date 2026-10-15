@@ -7,7 +7,9 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
-pub use favetto_core::paths::{default_config_path, default_data_dir, default_token_path};
+pub use favetto_core::paths::{
+    default_config_path, default_data_dir, default_tasks_dir, default_token_path,
+};
 pub use favetto_tui::TuiArgs;
 
 /// favetto — LLM-driven agent orchestrator (daemon + remote TUI).
@@ -58,7 +60,8 @@ pub struct DaemonArgs {
     /// Directory for SQLite + token (default `~/.local/share/favetto`).
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
-    /// Directory of task-definition `.md` files (the task catalog).
+    /// Directory of task-definition `.md` files (the task catalog)
+    /// (default `~/.config/favetto/tasks`).
     #[arg(long)]
     pub tasks_dir: Option<PathBuf>,
     /// Serve the web client from this directory instead of the embedded assets.

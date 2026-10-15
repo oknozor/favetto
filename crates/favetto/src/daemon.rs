@@ -57,9 +57,12 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         args.tasks_dir
             .clone()
             .or_else(|| config.daemon.tasks_dir.clone())
-            .unwrap_or_else(|| PathBuf::from("tasks"))
+            .unwrap_or_else(crate::cli::default_tasks_dir)
     });
     tokio::fs::create_dir_all(&data_dir).await?;
+    // Create the catalog root so the watcher targets it directly (otherwise it
+    // would watch the nearest existing ancestor — e.g. all of `~/.config`).
+    tokio::fs::create_dir_all(&tasks_dir).await?;
 
     let db_path = data_dir.join("favetto.db");
     let token_path = data_dir.join("token");

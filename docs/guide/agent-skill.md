@@ -64,12 +64,13 @@ by hand:
 [`references/task-format.md`](https://github.com/oknozor/favetto/blob/main/skills/favetto-task-authoring/references/task-format.md)
 is a compact restatement of the [task file format](../reference/tasks), and
 [`assets/task-template.md`](https://github.com/oknozor/favetto/blob/main/skills/favetto-task-authoring/assets/task-template.md)
-is a commented starting point you can copy into `tasks/`.
+is a commented starting point you can copy into your tasks directory
+(`~/.config/favetto/tasks` by default).
 
 Validate any task you write or edit:
 
 ```sh
-favetto validate tasks/release/notes.md
+favetto validate ~/.config/favetto/tasks/release/notes.md
 ```
 
 It prints `ok: <name>` and exits 0 for a valid file, or prints the parse error

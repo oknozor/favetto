@@ -301,6 +301,97 @@ pub async fn run<E, S>(
     }
 }
 
+/// Native transport (`reqwest`): open one streaming request and return the live
+/// response. Mirrors the wasm `start_stream`, including the `Last-Event-ID`
+/// header and `?last_event_id=` resume hint.
+#[cfg(not(target_arch = "wasm32"))]
+async fn start_stream(
+    url: &str,
+    token: Option<&str>,
+    last_event_id: Option<i64>,
+) -> Result<reqwest::Response, SseError> {
+    let url = match last_event_id {
+        Some(id) if url.contains('?') => format!("{url}&last_event_id={id}"),
+        Some(id) => format!("{url}?last_event_id={id}"),
+        None => url.to_string(),
+    };
+
+    let mut request = crate::http::client()
+        .get(&url)
+        .header("Accept", "text/event-stream");
+    if let Some(token) = token {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    if let Some(id) = last_event_id {
+        request = request.header("Last-Event-ID", id.to_string());
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|err| SseError::Network(err.to_string()))?;
+    let status = response.status().as_u16();
+    if !(200..=299).contains(&status) {
+        return Err(SseError::Http(status));
+    }
+    Ok(response)
+}
+
+/// Native equivalent of [`run`](run): stream `{base}/events` with `reqwest`,
+/// reconnecting with backoff. The parser, cursor and backoff are shared with the
+/// wasm path.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn run<E, S>(
+    url: String,
+    token: Option<String>,
+    initial_cursor: Option<i64>,
+    mut on_event: E,
+    mut on_status: S,
+) where
+    E: FnMut(SseEvent) + 'static,
+    S: FnMut(SseStatus) + 'static,
+{
+    use futures_util::StreamExt;
+
+    let backoff = Backoff::default();
+    let mut attempt: u32 = 0;
+    let mut cursor = initial_cursor;
+
+    loop {
+        match start_stream(&url, token.as_deref(), cursor).await {
+            Ok(response) => {
+                on_status(SseStatus::Connected);
+                attempt = 0;
+                let mut stream = response.bytes_stream();
+                let mut parser = SseParser::new();
+                while let Some(chunk) = stream.next().await {
+                    let Ok(bytes) = chunk else { break };
+                    for event in parser.push_bytes(&bytes) {
+                        cursor = advance_cursor(cursor, &event);
+                        on_event(event);
+                    }
+                }
+            }
+            Err(SseError::Http(401)) => {
+                // A rotated or revoked token: stop and let the UI clear it.
+                on_status(SseStatus::Unauthorized);
+                return;
+            }
+            Err(_) => {
+                // Network/HTTP errors are transient; back off and retry.
+            }
+        }
+
+        let delay = backoff.delay_ms(attempt);
+        attempt = attempt.saturating_add(1);
+        on_status(SseStatus::Reconnecting {
+            attempt,
+            delay_ms: delay,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

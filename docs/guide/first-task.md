@@ -7,7 +7,7 @@ and have an agent CLI (for example opencode) on your `PATH`.
 ## 1. Write a task
 
 A task is a Markdown file with a TOML header and a prompt body. Create
-`tasks/hello.md` in the directory you will run the daemon from:
+`~/.config/favetto/tasks/hello.md` in the daemon's default catalog directory:
 
 ```md
 agent = "opencode"
@@ -23,15 +23,15 @@ agent is invoked.
 
 ## 2. Start the daemon
 
-The daemon watches `tasks/` for changes, so it can be running before or after you
-write the file:
+The daemon watches the tasks directory (`~/.config/favetto/tasks` by default), so
+it can be running before or after you write the file:
 
 ```bash
 favetto daemon
 ```
 
 ```text
-INFO favetto::catalog_watch: loaded 1 task(s) from "tasks"
+INFO favetto::catalog_watch: watching task catalogs for changes tasks_dir=/home/you/.config/favetto/tasks
 ```
 
 ## 3. Attach the TUI
@@ -102,8 +102,8 @@ You should see the three lifecycle events for `hello`:
 | `task_finished` | The run ended (check `success` in the payload for failure). |
 
 ::: tip It really ran
-The agent ran in the task's working directory. `tasks/hello.md` requested a file
-in the daemon's current directory, so `hello.txt` should now exist there.
+The `hello` task sets no `cwd`, so the agent ran in the daemon's working
+directory and `hello.txt` should now exist there.
 :::
 
 ## Next steps

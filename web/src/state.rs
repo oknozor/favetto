@@ -433,7 +433,7 @@ impl Default for AppState {
 }
 
 // ---------------------------------------------------------------------------
-// localStorage
+// Persisted state (localStorage on web, files on native)
 // ---------------------------------------------------------------------------
 
 /// Read a string from `localStorage`; `None` when unset, on host, or on error
@@ -444,10 +444,10 @@ pub fn load_string(key: &str) -> Option<String> {
     LocalStorage::get::<String>(key).ok()
 }
 
-/// Host stub: there is no `localStorage` outside the browser/WebView.
+/// Native build: read from the platform state directory (`crate::storage`).
 #[cfg(not(target_arch = "wasm32"))]
-pub fn load_string(_key: &str) -> Option<String> {
-    None
+pub fn load_string(key: &str) -> Option<String> {
+    crate::storage::load_string(key)
 }
 
 /// Write a string to `localStorage`, ignoring quota/privacy failures.
@@ -457,9 +457,11 @@ pub fn save_string(key: &str, value: &str) {
     let _ = LocalStorage::set(key, value);
 }
 
-/// Host stub.
+/// Native build: write to the platform state directory.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn save_string(_key: &str, _value: &str) {}
+pub fn save_string(key: &str, value: &str) {
+    crate::storage::save_string(key, value);
+}
 
 /// Remove a key from `localStorage`.
 #[cfg(target_arch = "wasm32")]
@@ -468,9 +470,11 @@ pub fn remove_key(key: &str) {
     LocalStorage::delete(key);
 }
 
-/// Host stub.
+/// Native build: remove the key from the platform state directory.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn remove_key(_key: &str) {}
+pub fn remove_key(key: &str) {
+    crate::storage::remove_key(key);
+}
 
 /// The stored bearer token.
 pub fn load_token() -> Option<String> {

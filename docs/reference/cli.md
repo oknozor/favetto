@@ -14,7 +14,7 @@ Run the favetto daemon (event bus, API server, scheduler, executor)
 | `--socket` | `<SOCKET>` | — | Path to the Unix domain socket for local TUI attach |
 | `--listen` | `<LISTEN>` | — | TCP listen address for the WebSocket API (loopback by default) |
 | `--data-dir` | `<DATA_DIR>` | — | Directory for SQLite + token (default `~/.local/share/favetto`) |
-| `--tasks-dir` | `<TASKS_DIR>` | — | Directory of task-definition `.md` files (the task catalog) |
+| `--tasks-dir` | `<TASKS_DIR>` | — | Directory of task-definition `.md` files (the task catalog) (default `~/.config/favetto/tasks`) |
 | `--web-dir` | `<WEB_DIR>` | — | Serve the web client from this directory instead of the embedded assets |
 
 ## `favetto tui`

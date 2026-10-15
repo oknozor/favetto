@@ -260,10 +260,9 @@ typed_calls! {
 
 /// `POST` a body and return `(status, response bytes)`.
 ///
-/// The browser implementation uses `fetch`. `content_type` sets both the
-/// request `Content-Type` and the `Accept` header (the RPC endpoint speaks
-/// MessagePack, the pairing endpoint JSON). On the host (unit tests, docs)
-/// there is no `fetch`, so it fails cleanly instead.
+/// The browser implementation uses `fetch`; native builds use `reqwest`.
+/// `content_type` sets both the request `Content-Type` and the `Accept` header
+/// (the RPC endpoint speaks MessagePack, the pairing endpoint JSON).
 #[cfg(target_arch = "wasm32")]
 async fn post(
     url: &str,
@@ -310,17 +309,35 @@ async fn post(
     Ok((status, bytes))
 }
 
-/// Host stub: no `fetch` outside the browser/WebView.
+/// Native transport (`reqwest`): used on Android and the host test harness,
+/// where there is no browser `fetch`.
 #[cfg(not(target_arch = "wasm32"))]
 async fn post(
-    _url: &str,
-    _token: Option<&str>,
-    _content_type: &str,
-    _body: Vec<u8>,
+    url: &str,
+    token: Option<&str>,
+    content_type: &str,
+    body: Vec<u8>,
 ) -> Result<(u16, Vec<u8>), ClientError> {
-    Err(ClientError::Network(
-        "HTTP transport is only available on wasm32".into(),
-    ))
+    let mut request = crate::http::client()
+        .post(url)
+        .header("Content-Type", content_type)
+        .header("Accept", content_type)
+        .body(body);
+    if let Some(token) = token {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|err| ClientError::Network(err.to_string()))?;
+    let status = response.status().as_u16();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|err| ClientError::Network(err.to_string()))?
+        .to_vec();
+    Ok((status, bytes))
 }
 
 /// `POST` a MessagePack RPC body.

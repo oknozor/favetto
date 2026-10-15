@@ -73,6 +73,19 @@ pub fn default_themes_dir() -> PathBuf {
         })
 }
 
+/// Default task-catalog directory: `$FAVETTO_TASKS_DIR`, else the XDG config dir
+/// (`~/.config/favetto/tasks`).
+pub fn default_tasks_dir() -> PathBuf {
+    std::env::var("FAVETTO_TASKS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::config_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("favetto")
+                .join("tasks")
+        })
+}
+
 /// The repo-local task catalog directory: `<repo_root>/.favetto/tasks`.
 pub fn repo_tasks_dir(repo_root: impl AsRef<Path>) -> PathBuf {
     repo_root.as_ref().join(".favetto").join("tasks")
@@ -116,6 +129,30 @@ mod tests {
         match previous {
             Some(value) => std::env::set_var("FAVETTO_THEME_DIR", value),
             None => std::env::remove_var("FAVETTO_THEME_DIR"),
+        }
+    }
+
+    #[test]
+    fn default_tasks_dir_is_under_the_config_dir_and_respects_override() {
+        // SAFETY: single-threaded env mutation scoped to this test.
+        let previous = std::env::var("FAVETTO_TASKS_DIR").ok();
+
+        std::env::remove_var("FAVETTO_TASKS_DIR");
+        let expected = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("favetto")
+            .join("tasks");
+        assert_eq!(default_tasks_dir(), expected);
+
+        std::env::set_var("FAVETTO_TASKS_DIR", "/tmp/favetto-tasks-test");
+        assert_eq!(
+            default_tasks_dir(),
+            PathBuf::from("/tmp/favetto-tasks-test")
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("FAVETTO_TASKS_DIR", value),
+            None => std::env::remove_var("FAVETTO_TASKS_DIR"),
         }
     }
 }

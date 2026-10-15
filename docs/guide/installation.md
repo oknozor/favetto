@@ -74,8 +74,8 @@ your agent CLI lives elsewhere, edit that line in
 `opencode`, `claude`, `pi`, or `vibe`.
 :::
 
-The unit sets `WorkingDirectory=%h`, so the default relative `tasks_dir = "tasks"`
-resolves to `~/tasks`. To point the daemon at another catalog, set an absolute
+The default task catalog lives at `~/.config/favetto/tasks` (independent of the
+unit's `WorkingDirectory`). To point the daemon at another catalog, set
 `[daemon].tasks_dir` in `~/.config/favetto/config.toml`.
 
 Manage the daemon with:

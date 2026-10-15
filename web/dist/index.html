@@ -2,15 +2,17 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- `viewport-fit=cover` lets the client paint under the Android/iOS safe
+         areas; the CSS reclaims them with `env(safe-area-inset-*)`. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <meta name="color-scheme" content="light dark" />
     <title>favetto</title>
-  </head>
+  <link rel="preload" as="script" href="/./assets/favetto-web-dxhefea692b5510bd3e.js" crossorigin></head>
   <body>
-    <main id="favetto-placeholder">
-      <h1>favetto</h1>
-      <p>The Dioxus web client has not been built into this binary.</p>
-      <p>Build it into <code>web/dist</code>, pass <code>--web-dir</code>, or set
-      <code>[web].dir</code> to serve assets from disk during development.</p>
-    </main>
-  </body>
+    <div id="main"></div>
+  <script type="module" async src="/./assets/favetto-web-dxhefea692b5510bd3e.js"></script>
+            </body>
 </html>

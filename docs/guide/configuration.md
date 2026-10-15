@@ -26,7 +26,7 @@ session_id_json_key = "sessionID"               # captured from run JSON output
 [daemon]                       # defaults, overridable by CLI flags
 listen = "127.0.0.1:7878"
 socket = "/tmp/favetto.sock"
-tasks_dir = "tasks"
+# tasks_dir = "~/.config/favetto/tasks"
 
 [repos]                        # repo-local task catalogs (see Catalog)
 # active = "favetto"

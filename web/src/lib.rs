@@ -14,7 +14,11 @@ pub mod app;
 pub mod client;
 pub mod components;
 pub mod config;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod http;
 pub mod notifications;
 pub mod sse;
 pub mod state;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod storage;
 pub mod views;
