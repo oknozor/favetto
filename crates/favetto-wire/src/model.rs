@@ -690,12 +690,26 @@ pub struct Schedule {
     pub last_run: Option<DateTime<Utc>>,
 }
 
+/// How a repository entered the known-repos registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum RepoSource {
+    /// Registered explicitly: a `[[repos.known]]` seed or a `repos.add` call.
+    #[default]
+    Manual,
+    /// Discovered by scanning `[repos].base_dir` for `.favetto/` directories.
+    Scanned,
+}
+
 /// A repository known to the daemon, as returned by `repos.list`.
 ///
 /// `name` is the namespace key that qualifies the repo's tasks
 /// (`repo:<name>/<path>`); `path` is the absolute daemon-host directory. A repo
 /// is `available` when its `.favetto/tasks/` directory exists, so a moved or
-/// unmounted checkout stays listed but contributes no tasks.
+/// unmounted checkout stays listed but contributes no tasks. `source` records how
+/// the repo entered the registry: explicitly (`manual`) or via the base-directory
+/// scan (`scanned`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RepoInfo {
@@ -707,6 +721,9 @@ pub struct RepoInfo {
     /// Whether this is the daemon-wide active repo.
     #[serde(default)]
     pub active: bool,
+    /// How the repo entered the registry.
+    #[serde(default)]
+    pub source: RepoSource,
 }
 
 /// A persisted notification record (sent history).
@@ -1435,5 +1452,26 @@ mod tests {
         assert_eq!(n.method, push::EVENT);
         assert_eq!(n.params["id"], 7);
         assert_eq!(n.params["kind"], "task_updated");
+    }
+
+    #[test]
+    fn repo_info_source_round_trips_and_defaults_to_manual() {
+        let info = RepoInfo {
+            name: "favetto".to_string(),
+            path: "/code/favetto".to_string(),
+            available: true,
+            active: false,
+            source: RepoSource::Scanned,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["source"], "scanned");
+        let back: RepoInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(back.source, RepoSource::Scanned);
+
+        // Older payloads without `source` decode as `manual` (never reclaimed by
+        // a base-directory scan).
+        let legacy: RepoInfo =
+            serde_json::from_str(r#"{"name":"favetto","path":"/code/favetto"}"#).unwrap();
+        assert_eq!(legacy.source, RepoSource::Manual);
     }
 }

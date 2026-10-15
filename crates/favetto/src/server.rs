@@ -818,6 +818,14 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
             }
         }
 
+        method::REPOS_REFRESH => match crate::repos::refresh_from_scan(state).await {
+            Ok(_) => to_value(ReposListResult {
+                repos: crate::repos::list(state),
+                active: state.active_repo.read().clone(),
+            }),
+            Err(e) => Err(RpcError::Internal(e.to_string())),
+        },
+
         _ => Err(RpcError::MethodNotFound(format!(
             "unknown method: {}",
             req.method

@@ -182,6 +182,8 @@ pub mod method {
     pub const REPOS_REMOVE: &str = "repos.remove";
     /// Set (or clear) the daemon-wide active repository.
     pub const REPOS_ACTIVATE: &str = "repos.activate";
+    /// Re-scan the base directory and reconcile the repository registry.
+    pub const REPOS_REFRESH: &str = "repos.refresh";
 }
 
 /// Well-known server → client push (notification) method names.
@@ -341,6 +343,10 @@ pub const CLIENT_METHODS: &[(&str, &str)] = &[
     (
         method::REPOS_ACTIVATE,
         "Set (or clear) the daemon-wide active repository.",
+    ),
+    (
+        method::REPOS_REFRESH,
+        "Re-scan the base directory and reconcile the repository registry.",
     ),
 ];
 
@@ -505,6 +511,7 @@ mod tests {
             method::REPOS_ADD,
             method::REPOS_REMOVE,
             method::REPOS_ACTIVATE,
+            method::REPOS_REFRESH,
         ]
         .into_iter()
         .collect();

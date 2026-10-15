@@ -40,8 +40,9 @@ pub struct FavettoConfig {
     /// Daemon defaults (overridable by CLI flags).
     #[serde(default)]
     pub daemon: DaemonSettings,
-    /// Repo-local task catalogs: the known-repos registry seed and the active
-    /// repo. Ignored by clients; the daemon persists changes in SQLite.
+    /// Repo-local task catalogs: the known-repos registry seed, the active repo,
+    /// and the optional base directory scanned for repositories. Ignored by
+    /// clients; the daemon persists changes in SQLite.
     #[serde(default)]
     pub repos: ReposSettings,
     /// Task executor concurrency / isolation.
@@ -468,8 +469,10 @@ pub struct DaemonSettings {
 ///
 /// `known` seeds the daemon's persisted known-repos registry at startup (the
 /// registry survives config edits); `active` selects the daemon-wide active repo
-/// by name at startup. Repo task files live in `<repo>/.favetto/tasks/`.
-#[derive(Debug, Clone, Default, JsonSchema, Serialize, Deserialize)]
+/// by name at startup. `base_dir`, when set, is scanned for repositories so
+/// cloned checkouts register themselves without a config edit. Repo task files
+/// live in `<repo>/.favetto/tasks/`.
+#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 pub struct ReposSettings {
     /// Repositories to register at startup, by daemon-host path.
     #[serde(default)]
@@ -477,6 +480,32 @@ pub struct ReposSettings {
     /// The active repo's name at startup; unset means the global catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<String>,
+    /// Directory whose repositories are discovered automatically. `~`-expanded;
+    /// any child carrying a `.favetto/` directory is registered. Unset disables
+    /// scanning. Discovered repos are reclaimed when their directory vanishes;
+    /// `known`/`repos.add` entries are pinned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_dir: Option<PathBuf>,
+    /// How many directory levels below `base_dir` to scan. `1` (the default)
+    /// means immediate children; `2` also scans `org/repo` nesting.
+    #[serde(default = "default_scan_depth")]
+    pub depth: usize,
+}
+
+/// Default scan depth for [`ReposSettings::depth`]: immediate children only.
+fn default_scan_depth() -> usize {
+    1
+}
+
+impl Default for ReposSettings {
+    fn default() -> Self {
+        Self {
+            known: Vec::new(),
+            active: None,
+            base_dir: None,
+            depth: default_scan_depth(),
+        }
+    }
 }
 
 /// One `[[repos.known]]` entry: a repository path and an optional display name.
@@ -1393,6 +1422,8 @@ mod tests {
             r#"
             [repos]
             active = "favetto"
+            base_dir = "~/code"
+            depth = 2
 
             [[repos.known]]
             path = "~/code/favetto"
@@ -1409,10 +1440,14 @@ mod tests {
         assert!(cfg.repos.known[0].name.is_none());
         assert_eq!(cfg.repos.known[1].path, PathBuf::from("/srv/web"));
         assert_eq!(cfg.repos.known[1].name.as_deref(), Some("web"));
+        assert_eq!(cfg.repos.base_dir.as_deref(), Some(Path::new("~/code")));
+        assert_eq!(cfg.repos.depth, 2);
 
-        // Absent -> empty registry, no active repo.
+        // Absent -> empty registry, no active repo, no scan root, depth 1.
         let default: FavettoConfig = toml::from_str("").unwrap();
         assert!(default.repos.known.is_empty());
         assert!(default.repos.active.is_none());
+        assert!(default.repos.base_dir.is_none());
+        assert_eq!(default.repos.depth, 1);
     }
 }

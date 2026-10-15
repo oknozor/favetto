@@ -18,7 +18,8 @@ use uuid::Uuid;
 
 use favetto_core::agent_state::{AgentUsage, UsageBucket, UsagePeriod, UsageStats, UsageTotals};
 use favetto_core::model::{
-    Event, EventKind, Failure, NotificationRecord, RunStatus, Schedule, Task, TaskRun, TaskStatus,
+    Event, EventKind, Failure, NotificationRecord, RepoSource, RunStatus, Schedule, Task, TaskRun,
+    TaskStatus,
 };
 
 const SCHEMA: &str = r#"
@@ -87,11 +88,15 @@ CREATE TABLE IF NOT EXISTS worktrees (
 
 -- Known repositories whose `.favetto/tasks/` catalogs the daemon loads. `path`
 -- is the absolute daemon-host directory; `name` is the namespace key used in
--- `repo:<name>/<path>` task identities and is unique.
+-- `repo:<name>/<path>` task identities and is unique. `source` records how the
+-- repo entered the registry: `manual` (a `[[repos.known]]` seed or `repos.add`)
+-- or `scanned` (found under `[repos].base_dir`). Only scanned rows are reclaimed
+-- when their directory vanishes.
 CREATE TABLE IF NOT EXISTS known_repos (
     path     TEXT PRIMARY KEY,
     name     TEXT NOT NULL UNIQUE,
-    added_at INTEGER NOT NULL
+    added_at INTEGER NOT NULL,
+    source   TEXT NOT NULL DEFAULT 'manual'
 );
 
 -- Small key/value store for daemon-wide settings that survive restarts (the
@@ -250,6 +255,11 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(pool)
     .await;
+    // Registry origin. Legacy rows default to `manual`, so a database created
+    // before the base-directory scan existed never has its repos reclaimed.
+    let _ = sqlx::query("ALTER TABLE known_repos ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
+        .execute(pool)
+        .await;
     Ok(())
 }
 
@@ -629,14 +639,42 @@ fn row_to_schedule(row: &SqliteRow) -> Schedule {
 // Known repos + daemon state
 // ---------------------------------------------------------------------------
 
-/// List known repositories as `(name, path)`, sorted by name.
-pub async fn list_repos(pool: &SqlitePool) -> anyhow::Result<Vec<(String, String)>> {
-    let rows = sqlx::query("SELECT name, path FROM known_repos ORDER BY name")
+/// A persisted known-repo row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoRow {
+    pub name: String,
+    pub path: String,
+    pub source: RepoSource,
+}
+
+/// Parse a `known_repos.source` text column; anything but `scanned` is `manual`.
+fn parse_repo_source(raw: &str) -> RepoSource {
+    match raw {
+        "scanned" => RepoSource::Scanned,
+        _ => RepoSource::Manual,
+    }
+}
+
+/// The lowercase text form of a [`RepoSource`].
+fn repo_source_str(source: RepoSource) -> &'static str {
+    match source {
+        RepoSource::Manual => "manual",
+        RepoSource::Scanned => "scanned",
+    }
+}
+
+/// List known repositories, sorted by name.
+pub async fn list_repos(pool: &SqlitePool) -> anyhow::Result<Vec<RepoRow>> {
+    let rows = sqlx::query("SELECT name, path, source FROM known_repos ORDER BY name")
         .fetch_all(pool)
         .await?;
     Ok(rows
         .iter()
-        .map(|r| (r.get::<String, _>("name"), r.get::<String, _>("path")))
+        .map(|r| RepoRow {
+            name: r.get::<String, _>("name"),
+            path: r.get::<String, _>("path"),
+            source: parse_repo_source(&r.get::<String, _>("source")),
+        })
         .collect())
 }
 
@@ -650,11 +688,32 @@ pub async fn repo_name_for_path(pool: &SqlitePool, path: &str) -> anyhow::Result
 }
 
 /// Insert a known repo. Fails on a duplicate `name` or `path`.
-pub async fn insert_repo(pool: &SqlitePool, name: &str, path: &str) -> anyhow::Result<()> {
-    sqlx::query("INSERT INTO known_repos (name, path, added_at) VALUES (?, ?, ?)")
+pub async fn insert_repo(
+    pool: &SqlitePool,
+    name: &str,
+    path: &str,
+    source: RepoSource,
+) -> anyhow::Result<()> {
+    sqlx::query("INSERT INTO known_repos (name, path, added_at, source) VALUES (?, ?, ?, ?)")
         .bind(name)
         .bind(path)
         .bind(ts_ms(Utc::now()))
+        .bind(repo_source_str(source))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Change a repo's registry origin (e.g. promote a scanned repo to `manual`
+/// when it is explicitly added or seeded).
+pub async fn set_repo_source(
+    pool: &SqlitePool,
+    name: &str,
+    source: RepoSource,
+) -> anyhow::Result<()> {
+    sqlx::query("UPDATE known_repos SET source = ? WHERE name = ?")
+        .bind(repo_source_str(source))
+        .bind(name)
         .execute(pool)
         .await?;
     Ok(())

@@ -2917,6 +2917,7 @@ fn repo(name: &str, path: &str, available: bool, active: bool) -> RepoInfo {
         path: path.to_string(),
         available,
         active,
+        source: favetto_core::model::RepoSource::Manual,
     }
 }
 

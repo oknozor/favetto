@@ -28,22 +28,30 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
 
 /// A `State` backed by a scratch SQLite database and the given tasks dir.
 async fn test_state(dir: &Path, tasks_dir: &Path) -> Arc<State> {
+    test_state_with_config(dir, tasks_dir, crate::config::FavettoConfig::default()).await
+}
+
+/// A [`test_state`] with an explicit daemon config (e.g. a `[repos].base_dir`).
+async fn test_state_with_config(
+    dir: &Path,
+    tasks_dir: &Path,
+    config: crate::config::FavettoConfig,
+) -> Arc<State> {
     let pool = crate::db::open(&dir.join("test.db")).await.unwrap();
     crate::db::migrate(&pool).await.unwrap();
     let catalog = Arc::new(parking_lot::RwLock::new(
         crate::tasks::load_catalog(tasks_dir).unwrap(),
     ));
     let scheduler = tokio_cron_scheduler::JobScheduler::new().await.unwrap();
+    let config = Arc::new(config);
     Arc::new(State::new(StateInit {
         db: pool,
         bus: crate::event_bus::EventBus::new(64),
         token: favetto_core::auth::Token::generate(),
-        webhooks: crate::webhooks::WebhookSecrets::from_config(
-            &crate::config::FavettoConfig::default(),
-        ),
+        webhooks: crate::webhooks::WebhookSecrets::from_config(&config),
         agents: crate::agents::AgentManager::new(),
         registry: crate::agents::AgentRegistry::default(),
-        config: Arc::new(crate::config::FavettoConfig::default()),
+        config,
         data_dir: dir.to_path_buf(),
         tasks_dir: tasks_dir.to_path_buf(),
         catalog,
@@ -3620,11 +3628,13 @@ async fn repos_dispatch_add_list_activate_remove() {
     assert_eq!(added["name"], "favetto");
     assert_eq!(added["available"], true);
     assert_eq!(added["active"], false);
+    assert_eq!(added["source"], "manual");
 
     // List includes the repo and a null active repo.
     let list = call_ok(&state, method::REPOS_LIST, serde_json::json!({})).await;
     assert_eq!(list["repos"].as_array().unwrap().len(), 1);
     assert_eq!(list["repos"][0]["name"], "favetto");
+    assert_eq!(list["repos"][0]["source"], "manual");
     assert!(list["active"].is_null());
 
     // catalog.list exposes the repo field and the retargeted catalog.
@@ -3752,6 +3762,44 @@ async fn repos_reject_malformed_params() {
     let resp = dispatch(&state, req).await;
     let error = resp.error.expect("error");
     assert_eq!(error.code, favetto_core::rpc::error_code::INVALID_PARAMS);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn repos_refresh_discovers_scanned_repos() {
+    let dir = temp_dir("repos-refresh");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let base = dir.join("code");
+    make_repo(&base, "first");
+
+    let mut config = crate::config::FavettoConfig::default();
+    config.repos.base_dir = Some(base.clone());
+    let state = test_state_with_config(&dir, &tasks_dir, config).await;
+
+    // The first refresh discovers the repo as scanned.
+    let list = call_ok(&state, method::REPOS_REFRESH, serde_json::json!({})).await;
+    assert_eq!(list["repos"].as_array().unwrap().len(), 1);
+    assert_eq!(list["repos"][0]["name"], "first");
+    assert_eq!(list["repos"][0]["source"], "scanned");
+
+    // A new directory appears and a second refresh picks it up.
+    let second = make_repo(&base, "second");
+    let list = call_ok(&state, method::REPOS_REFRESH, serde_json::json!({})).await;
+    let names: Vec<&str> = list["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["first", "second"]);
+
+    // Removing the directory drops it on the next refresh.
+    std::fs::remove_dir_all(&second).unwrap();
+    let list = call_ok(&state, method::REPOS_REFRESH, serde_json::json!({})).await;
+    assert_eq!(list["repos"].as_array().unwrap().len(), 1);
+    assert_eq!(list["repos"][0]["name"], "first");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

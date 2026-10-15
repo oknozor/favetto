@@ -63,6 +63,32 @@ basename):
   [`[repos]`](./configuration#repos).
 - **RPC**: `repos.add`, `repos.remove`, `repos.activate`, `repos.list`.
 
+### Scan a base directory
+
+Instead of registering checkouts one by one, point the daemon at a directory
+that contains them:
+
+```toml
+[repos]
+base_dir = "~/code"   # ~-expanded; any child with a .favetto/ is registered
+depth = 1             # 1 = immediate children; 2 also scans org/repo nesting
+```
+
+On startup — and whenever a directory is created or removed under `base_dir` —
+the daemon scans it for children carrying a `.favetto/` directory, registers
+each one with a sanitized, de-duplicated name derived from its basename (the
+same rules as `repos.add`), and loads its catalog. A directory that disappears is
+deregistered, and if the *active* repo vanishes the daemon falls back to the
+global catalog. Hidden directories (`.foo`) and symlinked checkouts are skipped;
+use a `[[repos.known]]` seed for those.
+
+Repos discovered this way report `source = "scanned"` on `repos.list`. They can
+be pinned by adding the same path explicitly (a `[[repos.known]]` seed or
+`repos.add`), which promotes them to `source = "manual"`; only scanned repos are
+deregistered, so pinned repos survive their directory vanishing. `repos.remove`
+refuses a scanned repo (delete its directory instead), and `repos.refresh`
+forces an on-demand re-scan.
+
 Repo-local tasks are namespaced as **`repo:<name>/<relative-path>`** (for
 example `repo:my-repo/triage`), so two repositories' `triage` tasks never
 collide. Global tasks keep their bare relative identity. Because the

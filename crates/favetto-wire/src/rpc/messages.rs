@@ -686,6 +686,9 @@ pub struct ReposActivateParams {
 /// `repos.activate` result: the updated repo list.
 pub type ReposActivateResult = ReposListResult;
 
+/// `repos.refresh` result: the updated repo list after a base-directory scan.
+pub type ReposRefreshResult = ReposListResult;
+
 // ---------------------------------------------------------------------------
 // push payloads
 // ---------------------------------------------------------------------------
@@ -851,6 +854,8 @@ rpc_calls! {
     ReposRemoveCall => method::REPOS_REMOVE, ReposRemoveParams, ReposRemoveResult;
     /// Typed call for `repos.activate`.
     ReposActivateCall => method::REPOS_ACTIVATE, ReposActivateParams, ReposActivateResult;
+    /// Typed call for `repos.refresh`.
+    ReposRefreshCall => method::REPOS_REFRESH, EmptyParams, ReposRefreshResult;
 }
 
 /// The JSON Schema of a type, as a plain JSON value. Used by the doc generator.
@@ -1074,6 +1079,11 @@ pub const CLIENT_CALLS: &[RpcCallSpec] = &[
         method: method::REPOS_ACTIVATE,
         params_schema: schema_of::<ReposActivateParams>,
         result_schema: schema_of::<ReposActivateResult>,
+    },
+    RpcCallSpec {
+        method: method::REPOS_REFRESH,
+        params_schema: schema_of::<EmptyParams>,
+        result_schema: schema_of::<ReposRefreshResult>,
     },
 ];
 
