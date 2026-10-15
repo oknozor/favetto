@@ -49,6 +49,45 @@ fn docs_markdown() -> Vec<(PathBuf, String)> {
     out
 }
 
+/// Repository source paths named by a document: every `crates/…` token that
+/// ends in a Rust/TOML file or a directory separator.
+fn crate_source_paths(body: &str) -> Vec<&str> {
+    let bytes = body.as_bytes();
+    let mut paths = Vec::new();
+    let mut cursor = 0;
+    while let Some(offset) = body[cursor..].find("crates/") {
+        let start = cursor + offset;
+        let mut end = start + "crates/".len();
+        while end < bytes.len() {
+            let c = bytes[end] as char;
+            if c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.') {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        let token = &body[start..end];
+        if token.ends_with(".rs") || token.ends_with(".toml") || token.ends_with('/') {
+            paths.push(token);
+        }
+        cursor = end.max(start + 1);
+    }
+    paths
+}
+
+/// The path named in a generated page's `Generated from \`…\`` provenance line.
+fn generated_source<'a>(page: &str, body: &'a str) -> &'a str {
+    let marker = "Generated from `";
+    let start = body
+        .find(marker)
+        .unwrap_or_else(|| panic!("{page} is missing its `Generated from` provenance line"))
+        + marker.len();
+    let end = body[start..]
+        .find('`')
+        .unwrap_or_else(|| panic!("{page} has an unclosed provenance path"));
+    &body[start..start + end]
+}
+
 #[test]
 fn vitepress_site_targets_the_project_pages_base() {
     let config = read("docs/.vitepress/config.mts");
@@ -208,6 +247,47 @@ fn generated_reference_is_present() {
             body.contains("Generated from") && body.contains("Do not edit by hand"),
             "{page} does not look generated"
         );
+    }
+}
+
+#[test]
+fn generated_reference_names_existing_sources() {
+    for page in [
+        "docs/reference/cli.md",
+        "docs/reference/config.md",
+        "docs/reference/events.md",
+        "docs/reference/remote-api.md",
+    ] {
+        let body = read(page);
+        let source = generated_source(page, &body);
+        assert!(
+            repo_root().join(source).exists(),
+            "{page} claims to be generated from `{source}`, which does not exist"
+        );
+    }
+}
+
+#[test]
+fn current_docs_reference_existing_source_paths() {
+    // `docs/design/` holds historical design snapshots that deliberately keep
+    // their original (now stale) paths, so only the current manual is guarded.
+    let design = repo_root().join("docs/design");
+    let mut pages: Vec<(PathBuf, String)> = docs_markdown()
+        .into_iter()
+        .filter(|(path, _)| !path.starts_with(&design))
+        .collect();
+    for page in ["AGENT.md", "README.md"] {
+        pages.push((repo_root().join(page), read(page)));
+    }
+
+    for (path, body) in pages {
+        for source in crate_source_paths(&body) {
+            assert!(
+                repo_root().join(source).exists(),
+                "{} references `{source}`, which does not exist",
+                path.display()
+            );
+        }
     }
 }
 

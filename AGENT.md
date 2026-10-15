@@ -84,7 +84,8 @@ ignored. Only `main` receives version bumps (`branch_whitelist = ["main"]` in
 ## Workspace and toolchain
 
 - Workspace members:
-  - `crates/favetto-core` — shared wire protocol, domain types, config/tasks/workflow (no HTTP/DB/LLM).
+  - `crates/favetto-wire` — platform-free shared wire/domain types (serde/MessagePack); re-exported by `favetto-core`.
+  - `crates/favetto-core` — config/tasks/workflow; re-exports the `favetto-wire` types (no HTTP/DB/LLM).
   - `crates/favetto-providers` — provider/model catalog (opencode auth + models.dev).
   - `crates/favetto-tui` — the dependency-light terminal client binary.
   - `crates/favetto-mcp` — the stdio MCP supervisor server for the workflow plane.

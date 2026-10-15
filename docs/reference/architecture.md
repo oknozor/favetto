@@ -41,9 +41,11 @@ embedded as live terminals — the orchestrator never implements its own agent l
 
 ```
 crates/
-  favetto-core/          shared wire protocol + domain types (no HTTP/DB/LLM)
+  favetto-wire/          platform-free shared wire + domain types (serde/MessagePack)
+  favetto-core/          config/tasks/workflow; re-exports favetto-wire (no HTTP/DB/LLM)
   favetto-providers/     provider/model catalog (opencode auth + models.dev)
   favetto-tui/           dependency-light terminal client binary
+  favetto-mcp/           MCP supervisor server (stdio)
   favetto/               daemon binary + doc generator
 tasks/examples/                example tasks: `*.md` files with TOML header + prompt
 docs/                         VitePress site: guide + generated reference
