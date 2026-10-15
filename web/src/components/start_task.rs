@@ -86,6 +86,11 @@ pub fn StartTaskDialog(
 ) -> Element {
     let state = use_context::<AppState>();
     let has_vars = !vars.is_empty();
+    // The task name is rendered through the uncontrolled `initial_value`, so the
+    // original prop must survive the signal shadowing below. Typing must never
+    // re-assign the DOM `value` (that resets the caret/IME on Android), so the
+    // signal is only read on submit.
+    let initial_name = name.clone();
     let mut name = use_signal(move || name);
     let mut input = use_signal(String::new);
     let defaults: Vec<String> = vars
@@ -172,7 +177,11 @@ pub fn StartTaskDialog(
                 input {
                     class: "input",
                     list: "favetto-catalog-names",
-                    value: "{name}",
+                    // Uncontrolled: `initial_value` only seeds the field, so
+                    // typing mid-text never rewrites the DOM value (which would
+                    // reset the caret/IME on Android). `oninput` keeps the
+                    // signal current for `submit`.
+                    initial_value: "{initial_name}",
                     placeholder: "e.g. implement_issue",
                     oninput: move |event| name.set(event.value()),
                 }
@@ -208,7 +217,9 @@ pub fn StartTaskDialog(
                         } else if var.multiline {
                             textarea {
                                 class: "input",
-                                value: "{raw_vars()[position]}",
+                                // Uncontrolled: seed with the declared default;
+                                // `oninput` keeps `raw_vars` as the submit source.
+                                initial_value: "{var.default.clone().unwrap_or_default()}",
                                 oninput: move |event| {
                                     raw_vars.write()[position] = event.value();
                                 },
@@ -217,7 +228,7 @@ pub fn StartTaskDialog(
                             input {
                                 class: "input",
                                 r#type: input_type(var.var_type),
-                                value: "{raw_vars()[position]}",
+                                initial_value: "{var.default.clone().unwrap_or_default()}",
                                 placeholder: "{var.default.clone().unwrap_or_default()}",
                                 oninput: move |event| {
                                     raw_vars.write()[position] = event.value();
@@ -234,7 +245,8 @@ pub fn StartTaskDialog(
                     span { class: "field-label", "Input (JSON, optional)" }
                     textarea {
                         class: "input",
-                        value: "{input}",
+                        // Uncontrolled: no initial content, and `input` is kept
+                        // current by `oninput` for `submit`.
                         placeholder: "Optional JSON input",
                         oninput: move |event| input.set(event.value()),
                     }
@@ -368,5 +380,156 @@ mod tests {
             }
         });
         dom.rebuild_in_place();
+    }
+
+    // -- Mutation-level regression coverage for the Android caret jump -------
+    //
+    // Every text field in the dialog must be *uncontrolled*: the rendered
+    // mutations never assign the DOM `value` property after input. On
+    // Android/desktop Dioxus replays edits per animation frame, so re-assigning
+    // `value` resets the caret to the end of the field and tears down the IME
+    // composition region. These tests inspect the mutation stream directly: a
+    // regression that restores `value:` (a controlled field) reappears here as a
+    // `SetAttribute { name: "value" }` edit.
+
+    /// Install the host-side form-event converter that the native/wasm
+    /// renderers register before delivering DOM events.
+    fn install_event_converter() {
+        dioxus::html::set_event_converter(Box::new(dioxus::html::SerializedHtmlEventConverter));
+    }
+
+    /// Dispatch a synthetic `oninput` carrying `value` to `element`.
+    fn dispatch_input(dom: &mut VirtualDom, element: dioxus::core::ElementId, value: &str) {
+        let data = dioxus::html::SerializedFormData::new(value.to_string(), Vec::new());
+        let payload = dioxus::html::PlatformEventData::new(Box::new(data));
+        let event: Event<dyn std::any::Any> = Event::new(std::rc::Rc::new(payload), true);
+        // `NewEventListener`/`handle_event` use the bare event name (`input`),
+        // without the `on` attribute prefix.
+        dom.runtime().handle_event("input", event, element);
+    }
+
+    /// The elements in `mutations` that registered an `oninput` listener.
+    fn oninput_targets(mutations: &dioxus::core::Mutations) -> Vec<dioxus::core::ElementId> {
+        mutations
+            .edits
+            .iter()
+            .filter_map(|mutation| match mutation {
+                dioxus::core::Mutation::NewEventListener { name, id } if name == "input" => {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// True when any mutation assigns the controlled DOM `value` property.
+    fn writes_dom_value(mutations: &dioxus::core::Mutations) -> bool {
+        mutations.edits.iter().any(|mutation| {
+            matches!(mutation, dioxus::core::Mutation::SetAttribute { name, .. } if *name == "value")
+        })
+    }
+
+    /// True when `expected` is rendered as an uncontrolled `initial_value`.
+    fn has_initial_value(mutations: &dioxus::core::Mutations, expected: &str) -> bool {
+        mutations.edits.iter().any(|mutation| {
+            matches!(
+                mutation,
+                dioxus::core::Mutation::SetAttribute {
+                    name,
+                    value: dioxus::core::AttributeValue::Text(text),
+                    ..
+                } if *name == "initial_value" && text == expected
+            )
+        })
+    }
+
+    #[test]
+    fn start_task_fields_are_uncontrolled() {
+        use crate::state::AppState;
+
+        install_event_converter();
+        let mut dom = VirtualDom::new(|| {
+            use_context_provider(AppState::new);
+            rsx! {
+                StartTaskDialog {
+                    name: "implement_issue".to_string(),
+                    vars: Vec::new(),
+                    on_close: move |_| {},
+                    on_started: move |_| {},
+                }
+            }
+        });
+
+        let initial = dom.rebuild_to_vec();
+        assert!(
+            has_initial_value(&initial, "implement_issue"),
+            "the prefilled task name must render as initial_value: {:?}",
+            initial.edits
+        );
+        assert!(
+            !writes_dom_value(&initial),
+            "mounting must not assign the controlled value property: {:?}",
+            initial.edits
+        );
+
+        let targets = oninput_targets(&initial);
+        assert!(!targets.is_empty(), "the dialog has oninput fields");
+        for element in targets {
+            dispatch_input(&mut dom, element, "implement_issue_mid");
+            let edits = dom.render_immediate_to_vec();
+            assert!(
+                !writes_dom_value(&edits),
+                "typing must not reassign the DOM value (caret jump): {:?}",
+                edits.edits
+            );
+        }
+    }
+
+    fn vars_with_defaults() -> Vec<TaskVar> {
+        let mut branch = var("branch", VarType::String, false);
+        branch.default = Some("main".to_string());
+        let mut body = var("body", VarType::String, false);
+        body.multiline = true;
+        vec![branch, body]
+    }
+
+    #[test]
+    fn start_task_typed_var_fields_are_uncontrolled() {
+        use crate::state::AppState;
+
+        install_event_converter();
+        let mut dom = VirtualDom::new(|| {
+            use_context_provider(AppState::new);
+            rsx! {
+                StartTaskDialog {
+                    name: "implement_issue".to_string(),
+                    vars: vars_with_defaults(),
+                    on_close: move |_| {},
+                    on_started: move |_| {},
+                }
+            }
+        });
+
+        let initial = dom.rebuild_to_vec();
+        assert!(
+            has_initial_value(&initial, "main"),
+            "a var default must render as initial_value: {:?}",
+            initial.edits
+        );
+        assert!(
+            !writes_dom_value(&initial),
+            "mounting must not assign the controlled value property: {:?}",
+            initial.edits
+        );
+
+        for element in oninput_targets(&initial) {
+            dispatch_input(&mut dom, element, "typed");
+            let edits = dom.render_immediate_to_vec();
+            assert!(
+                !writes_dom_value(&edits),
+                "typing must not reassign the DOM value (caret jump): {:?}",
+                edits.edits
+            );
+        }
     }
 }
