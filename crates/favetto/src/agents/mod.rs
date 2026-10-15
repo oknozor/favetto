@@ -160,7 +160,9 @@ struct Session {
     running: Arc<AtomicBool>,
     /// Raw output, retained so an unattended run's result can be captured.
     raw: Arc<Mutex<Vec<u8>>>,
-    /// Child exit code (`-1` until it exits).
+    /// Child exit code (`-1` means "not exited yet / killed"). The PTY reader
+    /// thread publishes the real code *before* clearing `running`, so a waiter
+    /// that observes the session stopped always reads the real code.
     exit_code: Arc<std::sync::atomic::AtomicI32>,
     /// The agent's own session id, captured from line-delimited JSON output.
     external_session_id: Arc<Mutex<Option<String>>>,
@@ -716,13 +718,17 @@ impl AgentManager {
                         Err(_) => break,
                     }
                 }
-                running.store(false, Ordering::SeqCst);
+                // Publish the exit code before clearing `running`: a waiter that
+                // observes `running == false` must always read the real code, never
+                // the `-1` sentinel. Both are `SeqCst`, so the store order is a
+                // happens-before edge for `wait`.
                 let code = child
                     .wait()
                     .ok()
                     .map(|status| status.exit_code() as i32)
                     .unwrap_or(-1);
                 exit_code.store(code, Ordering::SeqCst);
+                running.store(false, Ordering::SeqCst);
                 if let Some(parser) = state_stdout.as_mut() {
                     parser.finish(Some(code));
                 }
@@ -793,6 +799,10 @@ impl AgentManager {
 
     /// Wait for a session's process to exit; returns its exit code, or `None` if
     /// the session is unknown.
+    ///
+    /// Relies on the reader thread publishing `exit_code` before clearing
+    /// `running` (both `SeqCst`), so an observed `running == false` implies the
+    /// code is already visible.
     pub async fn wait(&self, session_id: &str) -> Option<i32> {
         loop {
             let (running, code) = match self.get(session_id) {
@@ -1787,6 +1797,33 @@ mod tests {
             .detect_awaiting_input(&info.id, agent.as_ref(), std::time::Duration::ZERO)
             .is_none());
         mgr.close(&info.id).unwrap();
+    }
+
+    /// The `exit_code` publish-order invariant: a waiter that observes the
+    /// session stopped must read the real code, never the `-1` sentinel.
+    /// Repeated so a regression in the reader-thread ordering shows up under
+    /// scheduler contention.
+    #[tokio::test]
+    async fn wait_never_observes_the_exit_sentinel() {
+        let mgr = AgentManager::new();
+        let agent = template("sh", cfg("sh", &["-c", "exit 0"]));
+        for _ in 0..16 {
+            let info = mgr
+                .start(
+                    "sh",
+                    agent.clone(),
+                    None,
+                    Invocation::Interactive {
+                        prompt: None,
+                        provider: None,
+                        model: None,
+                    },
+                    context(None, 24, 80),
+                )
+                .unwrap();
+            assert_eq!(mgr.wait(&info.id).await, Some(0));
+            mgr.close(&info.id).unwrap();
+        }
     }
 
     /// A panic while holding the sessions lock must not poison it: with

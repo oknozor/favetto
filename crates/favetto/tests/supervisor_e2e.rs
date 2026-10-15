@@ -29,12 +29,13 @@ struct Daemon {
 }
 
 impl Daemon {
-    /// Create a scratch workspace with a slow fake echo agent and the two
+    /// Create a scratch workspace with a marker-gated fake echo agent and the two
     /// supervisor demo tasks, then spawn `favetto daemon` against it.
     ///
-    /// The fake agent sleeps briefly so the supervisor reliably observes the
-    /// spawned step in `running` before it finishes — that is what makes the
-    /// `wait` decision deterministic in the test.
+    /// The fake agent writes `agent-ready` then blocks until the test writes
+    /// `agent-release`, so the supervisor reliably observes the spawned step in
+    /// `running` before it finishes — that is what makes the `wait` decision
+    /// deterministic instead of depending on a wall-clock sleep.
     fn spawn() -> Self {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -52,7 +53,13 @@ impl Daemon {
         let agent = root.join("echo-agent.sh");
         std::fs::write(
             &agent,
-            "#!/bin/sh\nsleep 0.4\nprintf 'echo-agent: %s\\n' \"$1\"\nprintf 'ECHO_AGENT_DONE\\n'\n",
+            "#!/bin/sh\n\
+             dir=$(dirname \"$0\")\n\
+             : > \"$dir/agent-ready\"\n\
+             while [ ! -f \"$dir/agent-release\" ]; do sleep 0.05; done\n\
+             sleep 0.2\n\
+             printf 'echo-agent: %s\\n' \"$1\"\n\
+             printf 'ECHO_AGENT_DONE\\n'\n",
         )
         .unwrap();
         {
@@ -82,7 +89,7 @@ impl Daemon {
         .unwrap();
 
         let socket = root.join("favetto.sock");
-        let listen = format!("127.0.0.1:{}", free_port());
+        let listen = "127.0.0.1:0".to_string();
         let log_path = root.join("daemon.log");
         let log = std::fs::File::create(&log_path).unwrap();
 
@@ -117,6 +124,11 @@ impl Daemon {
         &self.socket
     }
 
+    /// The harness scratch root, where the fake agent's marker files live.
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// The captured daemon log, for assertion failure messages.
     fn log(&self) -> String {
         std::fs::read_to_string(self.root.join("daemon.log")).unwrap_or_default()
@@ -129,13 +141,6 @@ impl Drop for Daemon {
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.root);
     }
-}
-
-/// A free loopback port. The listener is dropped immediately, so a small race
-/// remains; acceptable for a test.
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
 }
 
 /// Block until the Unix socket accepts connections, or panic with the log.
@@ -153,6 +158,17 @@ async fn wait_for_socket(path: &Path, daemon: &Daemon) {
                 daemon.log()
             ),
         }
+    }
+}
+
+/// Block until `path` exists, or panic after STARTUP_TIMEOUT.
+async fn wait_for_file(path: &Path) {
+    let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+    while !path.exists() {
+        if tokio::time::Instant::now() >= deadline {
+            panic!("{} never appeared", path.display());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -174,10 +190,27 @@ async fn reference_supervisor_drives_a_two_step_workflow() {
         max_cycles: 300,
     };
 
+    // The spawned step's agent writes `agent-ready` then blocks until
+    // `agent-release` appears, so the supervisor's first `inspect` cannot miss it.
+    let ready = daemon.root().join("agent-ready");
+    let release = daemon.root().join("agent-release");
+
     // The supervisor starts the first step as its own root, then drives it.
     let root_id = supervisor::start_root(&client, &policy)
         .await
         .expect("start the root task");
+
+    // The agent is blocked on `agent-release`, so the supervisor's first
+    // inspect(s) see it running.
+    wait_for_file(&ready).await;
+    let wait = policy.wait;
+    tokio::spawn(async move {
+        // 3 x policy.wait: the loop inspects at least twice while the agent is
+        // still blocked, guaranteeing an `Action::Wait` decision.
+        tokio::time::sleep(wait * 3).await;
+        std::fs::write(&release, b"release").unwrap();
+    });
+
     let outcome = supervisor::run(&client, &policy, root_id)
         .await
         .expect("run the supervisor loop");

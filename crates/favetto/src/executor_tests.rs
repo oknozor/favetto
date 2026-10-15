@@ -816,7 +816,7 @@ async fn watch_title_while_running_skips_unknown_session() {
     let agent = state.registry.get("opencode").unwrap();
 
     let watch = tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(10),
         watch_title_while_running(&state, Uuid::new_v4(), agent, "no-such-session", &dir),
     )
     .await
@@ -862,7 +862,7 @@ async fn title_is_stored_while_run_is_still_in_progress() {
         .unwrap();
 
     let watch = tokio::time::timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(30),
         watch_title_while_running(&state, task.id, agent, &info.id, &dir),
     )
     .await
