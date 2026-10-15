@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 use ascii_dag::{BoxedNode, Graph, LabelOverflow, NodeId, RenderOptions, AUTO};
 
+use crate::tasks::display_name;
 use crate::workflow::{WorkflowEdgeKind, WorkflowGraph};
 
 /// Render `graph` as box-drawing text (one entry per output row).
@@ -25,12 +26,13 @@ pub fn render(graph: &WorkflowGraph) -> Result<String, String> {
         .nodes
         .iter()
         .map(|node| {
+            let base = display_name(&node.name);
             if node.external {
-                format!("{} (external)", node.name)
+                format!("{base} (external)")
             } else if node.scheduled {
-                format!("{} (scheduled)", node.name)
+                format!("{base} (scheduled)")
             } else {
-                node.name.clone()
+                base.to_string()
             }
         })
         .collect();
@@ -178,6 +180,24 @@ mod tests {
             edges: vec![edge("a", "a", WorkflowEdgeKind::Needs)],
         };
         assert!(render(&graph).is_ok());
+    }
+
+    #[test]
+    fn render_strips_repo_prefix_from_node_labels() {
+        let graph = WorkflowGraph {
+            nodes: vec![node("repo:my-repo/build"), node("repo:my-repo/test")],
+            edges: vec![edge(
+                "repo:my-repo/build",
+                "repo:my-repo/test",
+                WorkflowEdgeKind::Needs,
+            )],
+        };
+        let text = render(&graph).unwrap();
+        // The bare relative paths are shown and edges still resolve.
+        assert!(text.contains("build"), "{text}");
+        assert!(text.contains("test"), "{text}");
+        assert!(!text.contains("repo:my-repo/build"), "{text}");
+        assert!(!text.contains("repo:my-repo/test"), "{text}");
     }
 
     #[test]

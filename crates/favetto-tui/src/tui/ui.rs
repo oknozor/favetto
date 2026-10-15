@@ -16,9 +16,10 @@ use favetto_core::model::{AgentSessionInfo, FailureKind, Task, TaskStatus, Usage
 use favetto_core::workflow::{WorkflowInspect, WorkflowState};
 
 use super::app::{
-    activity_cell, cost_cell, format_activity, repo_label, table_rows_area, task_repo, token_cell,
-    App, CatalogRow, ClickAction, ClickRegion, ConfirmPrompt, ConnState, Form, ListGeometry, Popup,
-    ReplyPrompt, Tab, TaskVarsForm, ThemeChoice, Wizard, WizardStep, MENU_OPTIONS,
+    activity_cell, cost_cell, format_activity, repo_label, table_rows_area, task_display_name,
+    task_repo, token_cell, App, CatalogRow, ClickAction, ClickRegion, ConfirmPrompt, ConnState,
+    Form, ListGeometry, Popup, ReplyPrompt, Tab, TaskVarsForm, ThemeChoice, Wizard, WizardStep,
+    MENU_OPTIONS,
 };
 use super::text_buffer::TextBuffer;
 use super::theme::{RaisedLevel, Theme};
@@ -665,7 +666,7 @@ fn draw_task_error(frame: &mut Frame, app: &App, task_id: uuid::Uuid, theme: The
     match app.tasks.iter().find(|t| t.id == task_id) {
         Some(task) => {
             content.push(Line::from(Span::styled(
-                format!("{} · {}", short_id(&task.id), task.name),
+                format!("{} · {}", short_id(&task.id), task_display_name(&task.name)),
                 theme.title(),
             )));
             content.push(Line::from(""));
@@ -1307,7 +1308,7 @@ fn draw_workflow_runtime(frame: &mut Frame, app: &App) {
         .map(|t| {
             Row::new(vec![
                 Cell::from(status_line(t.status, t.attempt, theme, &state)),
-                Cell::from(t.name.clone()),
+                Cell::from(task_display_name(&t.name)),
                 Cell::from(t.attempt.to_string()),
                 Cell::from(t.summary.clone().unwrap_or_default()),
             ])
@@ -1436,8 +1437,9 @@ fn draw_catalog_table(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme
     let header = Row::new(vec!["NAME", "AGENT", "MODEL", "NEEDS"]).style(theme.table_header());
     let plain = plain_icons();
 
-    // Top-level `repo:<name>` folders get a `(repo)` tag, labelled from each
-    // entry's `repo` field rather than by parsing the qualified name.
+    // Top-level `repo:<name>` folders get a `(repo)` tag and show the bare repo
+    // name (the `repo:` storage prefix is stripped for display); membership is
+    // keyed off each entry's `repo` field rather than by parsing the name.
     let repo_folders: HashSet<String> = app
         .catalog
         .iter()
@@ -1453,11 +1455,14 @@ fn draw_catalog_table(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme
                 depth,
                 collapsed,
             } => {
-                let label = path.rsplit('/').next().unwrap_or(path.as_str());
                 let label = if repo_folders.contains(&path) {
-                    format!("{label} (repo)")
+                    format!(
+                        "{} (repo)",
+                        path.strip_prefix(favetto_core::tasks::REPO_PREFIX)
+                            .unwrap_or(path.as_str())
+                    )
                 } else {
-                    label.to_string()
+                    path.rsplit('/').next().unwrap_or(path.as_str()).to_string()
                 };
                 let name = format!(
                     "{} {} {}",
@@ -1918,7 +1923,7 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
                 let now = Utc::now();
                 Row::new(vec![
                     Cell::from(short_id(&t.id)),
-                    Cell::from(t.name.clone()),
+                    Cell::from(task_display_name(&t.name)),
                     Cell::from(truncate_ellipsis(repo_label(task_repo(&t.name)), 14)),
                     Cell::from(truncate_ellipsis(
                         t.session_title.as_deref().unwrap_or(""),

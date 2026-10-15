@@ -574,6 +574,21 @@ pub fn split_repo(name: &str) -> Option<(&str, &str)> {
     Some((repo, rel))
 }
 
+/// The display name for a task: strip a well-formed `repo:<name>/` prefix,
+/// leaving the bare relative path.
+///
+/// Used by the TUI (and any `favetto-core` consumer) so the storage-only repo
+/// namespace does not leak into listings. Bare/global names and malformed
+/// prefixes (`repo:`, `repo:noslash`, `repo:/rel`, `repo:name/`) are returned
+/// unchanged. The web client links only `favetto-wire` and keeps an identical
+/// mirror in `web/src/state.rs::task_display_name`.
+pub fn display_name(name: &str) -> &str {
+    match split_repo(name) {
+        Some((_, rel)) => rel,
+        None => name,
+    }
+}
+
 /// Build a repo-qualified task identity: `repo:<name>/<relative-path>`.
 pub fn qualify(repo: &str, rel: &str) -> String {
     format!("{REPO_PREFIX}{repo}/{rel}")
@@ -1346,6 +1361,18 @@ mod tests {
             let qualified = qualify(repo, rel);
             assert_eq!(split_repo(&qualified), Some((repo, rel)));
         }
+    }
+
+    #[test]
+    fn display_name_strips_only_well_formed_prefixes() {
+        assert_eq!(display_name("repo:favetto/triage"), "triage");
+        assert_eq!(display_name("repo:web/pipelines/plan"), "pipelines/plan");
+        assert_eq!(display_name("triage"), "triage");
+        assert_eq!(display_name("pipelines/plan"), "pipelines/plan");
+        assert_eq!(display_name("repo:"), "repo:");
+        assert_eq!(display_name("repo:noslash"), "repo:noslash");
+        assert_eq!(display_name("repo:/rel"), "repo:/rel");
+        assert_eq!(display_name("repo:name/"), "repo:name/");
     }
 
     #[test]

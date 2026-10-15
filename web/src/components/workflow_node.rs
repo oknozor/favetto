@@ -11,6 +11,7 @@ use favetto_wire::workflow::WorkflowTaskView;
 use uuid::Uuid;
 
 use crate::app::Route;
+use crate::state::task_display_name;
 
 /// A single renderable workflow task.
 #[derive(Clone, PartialEq)]
@@ -34,7 +35,7 @@ impl NodeCard {
         Self {
             id: task.id,
             root_id: task.root_or_self(),
-            name: task.name.clone(),
+            name: task_display_name(&task.name).to_string(),
             status: task.status,
             attempt: task.attempt,
             age: Some(crate::views::workflow::task_age(task, now_epoch)),
@@ -55,7 +56,7 @@ impl NodeCard {
         Self {
             id: view.id,
             root_id,
-            name: view.name.clone(),
+            name: task_display_name(&view.name).to_string(),
             status: view.status,
             attempt: view.attempt,
             age,
@@ -246,6 +247,16 @@ mod tests {
         let standalone = task(Uuid::new_v4(), "solo", TaskStatus::Pending, None);
         let card = NodeCard::from_task(&standalone, standalone.created_at.timestamp());
         assert_eq!(card.root_id, standalone.id);
+
+        // Repo-qualified identities are displayed as the bare relative path.
+        let qualified = task(
+            Uuid::new_v4(),
+            "repo:favetto/triage",
+            TaskStatus::Pending,
+            None,
+        );
+        let card = NodeCard::from_task(&qualified, qualified.created_at.timestamp());
+        assert_eq!(card.name, "triage");
     }
 
     #[test]
@@ -263,5 +274,16 @@ mod tests {
         assert_eq!(card.summary.as_deref(), Some("boom"));
         assert_eq!(card.depth, 3);
         assert_eq!(card.attempt, 2);
+
+        // Repo-qualified identities are displayed as the bare relative path.
+        let qualified = WorkflowTaskView {
+            id: Uuid::new_v4(),
+            name: "repo:web/pipelines/plan".to_string(),
+            status: TaskStatus::Pending,
+            attempt: 1,
+            summary: None,
+        };
+        let card = NodeCard::from_view(&qualified, root, None, 0);
+        assert_eq!(card.name, "pipelines/plan");
     }
 }

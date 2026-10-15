@@ -12,6 +12,8 @@
 
 use favetto_wire::model::{Event, EventKind};
 
+use crate::state::task_display_name;
+
 /// The browser's notification permission, mirrored into [`crate::state::AppState`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Permission {
@@ -108,7 +110,7 @@ pub fn awaiting_alert(event: &Event) -> Option<Alert> {
         .and_then(|v| v.as_str())
         .unwrap_or("needs your input");
     Some(Alert {
-        title: format!("{name} needs input"),
+        title: format!("{} needs input", task_display_name(name)),
         body: message.to_string(),
         task_id,
     })
@@ -296,6 +298,15 @@ mod tests {
         assert_eq!(alert.title, "implement_issue needs input");
         assert_eq!(alert.body, "Allow `rm -rf /`?");
         assert_eq!(alert.task_id, "task-123");
+    }
+
+    #[test]
+    fn awaiting_alert_strips_repo_prefix_from_title() {
+        let mut payload = awaiting_payload(None);
+        payload["name"] = serde_json::json!("repo:my-repo/triage");
+        let event = event("task_awaiting_input", payload);
+        let alert = awaiting_alert(&event).expect("alert");
+        assert_eq!(alert.title, "triage needs input");
     }
 
     #[test]

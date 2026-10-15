@@ -12,7 +12,7 @@ use crate::components::icon::{AppIcon, AppIconKind};
 use crate::components::markdown::{split_frontmatter, Markdown};
 use crate::components::start_task::StartTaskDialog;
 use crate::components::toast::{Toast, ToastKind};
-use crate::state::{AppState, Cache};
+use crate::state::{task_display_name, AppState, Cache};
 
 /// A one-line summary derived from the task prompt (the wire `CatalogEntry`
 /// carries no description field).
@@ -214,7 +214,7 @@ pub fn Catalog() -> Element {
                 for entry in visible.iter() {
                     li { key: "{entry.name}", class: "catalog-item",
                         Link { to: Route::CatalogDetail { name: entry.name.split('/').map(str::to_string).collect() }, class: "catalog-link",
-                            span { class: "catalog-name", "{entry.name}" }
+                            span { class: "catalog-name", "{task_display_name(&entry.name)}" }
                             if !description(entry).is_empty() {
                                 span { class: "catalog-description", "{description(entry)}" }
                             }

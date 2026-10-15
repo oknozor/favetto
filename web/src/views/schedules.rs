@@ -20,7 +20,7 @@ use favetto_wire::model::Schedule;
 use favetto_wire::rpc::{EmptyParams, ScheduleDeleteParams, ScheduleUpsertParams};
 
 use crate::client::RpcClient;
-use crate::state::AppState;
+use crate::state::{task_display_name, AppState};
 
 /// The raw text fields of the create/edit form.
 #[derive(Clone, PartialEq)]
@@ -262,7 +262,7 @@ pub fn Schedules() -> Element {
                                     tr { key: "{schedule.id}",
                                         td { span { class: "schedule-id", "{schedule.id}" } }
                                         td { code { class: "schedule-cron", "{schedule.cron}" } }
-                                        td { "{schedule.task}" }
+                                        td { "{task_display_name(&schedule.task)}" }
                                         td {
                                             span {
                                                 class: if schedule.enabled { "status-badge status-succeeded" } else { "status-badge status-cancelled" },
