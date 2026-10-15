@@ -35,12 +35,35 @@ pub fn tags(entry: &CatalogEntry) -> Vec<String> {
     if let Some(repo) = &entry.repo {
         tags.push(format!("repo:{repo}"));
     }
+    // `scheduled` is shown as a kind badge on task rows, but the catalog list
+    // keeps it as a metadata chip (the schedule is a property of the entry).
+    if entry.schedule.is_some() {
+        tags.push("scheduled".into());
+    }
     tags.extend(task_tags(entry));
     tags
 }
 
-/// The metadata chips shared with the task list, excluding the repo tag: a
-/// task row renders the repo as its own chip next to the title.
+/// The catalog-derived kind badge label shown on a task row: `action`,
+/// `scheduled`, or `agent`.
+///
+/// `scheduled` is a trigger rather than a mutually-exclusive kind, so the
+/// precedence is `action` > `scheduled` > `agent`: an action task is a distinct
+/// execution kind, while a scheduled task is usually also an agent task. The
+/// label is definition-based (derived from the catalog), not per-run.
+pub fn task_kind(entry: &CatalogEntry) -> &'static str {
+    if entry.kind == "action" {
+        "action"
+    } else if entry.schedule.is_some() {
+        "scheduled"
+    } else {
+        "agent"
+    }
+}
+
+/// The metadata chips shared with the task list, excluding the repo tag and the
+/// kind label: a task row renders the repo as its own chip and the kind as its
+/// own badge next to the title.
 pub fn task_tags(entry: &CatalogEntry) -> Vec<String> {
     let mut tags = Vec::new();
     if let Some(agent) = &entry.agent {
@@ -51,9 +74,6 @@ pub fn task_tags(entry: &CatalogEntry) -> Vec<String> {
     }
     if let Some(model) = &entry.model {
         tags.push(format!("model:{model}"));
-    }
-    if entry.schedule.is_some() {
-        tags.push("scheduled".into());
     }
     if entry.needs.is_some() {
         tags.push("pipeline".into());
@@ -73,11 +93,12 @@ const META_WEIGHT: i64 = 4;
 const PROMPT_WEIGHT: i64 = 1;
 
 /// Every searchable `(field text, weight)` pair for an entry: the task name,
-/// the metadata fields (`agent`, `provider`, `model`, `cwd`, `schedule`,
+/// the metadata fields (`kind`, `agent`, `provider`, `model`, `cwd`, `schedule`,
 /// `needs`, `repo`), the derived tag chips, each variable's name and prompt, and
 /// finally the full prompt body.
 fn searchable_fields(entry: &CatalogEntry) -> Vec<(String, i64)> {
     let mut fields = vec![(entry.name.clone(), NAME_WEIGHT)];
+    fields.push((entry.kind.clone(), META_WEIGHT));
     for value in [
         &entry.agent,
         &entry.provider,
@@ -356,9 +377,31 @@ mod tests {
         assert!(tags.contains(&"agent:claude".to_string()));
         assert!(tags.contains(&"provider:anthropic".to_string()));
         assert!(tags.contains(&"model:opus".to_string()));
-        assert!(tags.contains(&"scheduled".to_string()));
+        // `scheduled` is a kind badge on task rows, not a metadata chip.
+        assert!(!tags.contains(&"scheduled".to_string()));
         assert!(tags.contains(&"pipeline".to_string()));
         assert!(tags.contains(&"var:repo".to_string()));
+    }
+
+    #[test]
+    fn task_kind_prefers_action_then_scheduled_then_agent() {
+        // An action task is always `action`, scheduled or not.
+        let mut action = entry();
+        action.kind = "action".into();
+        assert_eq!(task_kind(&action), "action");
+        assert_eq!(task_kind(&custom("t", "")), "agent");
+    }
+
+    #[test]
+    fn task_kind_shows_scheduled_for_a_cron_agent_task() {
+        // `entry()` carries a schedule but defaults to the agent kind.
+        assert_eq!(entry().schedule.as_deref(), Some("0 9 * * *"));
+        assert_eq!(task_kind(&entry()), "scheduled");
+
+        // Dropping the schedule falls back to the default kind.
+        let mut plain = entry();
+        plain.schedule = None;
+        assert_eq!(task_kind(&plain), "agent");
     }
 
     fn custom(name: &str, prompt: &str) -> CatalogEntry {
@@ -411,6 +454,7 @@ mod tests {
         e.repo = Some("favetto".into());
         for query in [
             "triage_issues", // name
+            "agent",         // kind (default)
             "claude",        // agent
             "anthropic",     // provider
             "opus",          // model
@@ -430,6 +474,12 @@ mod tests {
                 "{query}"
             );
         }
+
+        // The `kind` value itself is searchable, independent of the agent tag.
+        let mut action = e.clone();
+        action.kind = "action".into();
+        action.agent = None;
+        assert_eq!(names(&search(&[action], "action")), vec!["triage_issues"]);
     }
 
     #[test]

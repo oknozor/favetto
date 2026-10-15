@@ -517,6 +517,7 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
                 .iter()
                 .map(|d| CatalogEntry {
                     name: d.name.clone(),
+                    kind: d.kind.as_str().to_string(),
                     agent: d.agent.clone(),
                     provider: d.provider.clone(),
                     model: d.model.clone(),

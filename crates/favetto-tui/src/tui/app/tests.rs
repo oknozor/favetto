@@ -48,15 +48,44 @@ fn task(name: &str) -> Task {
 fn catalog_entry(name: &str) -> CatalogEntry {
     CatalogEntry {
         name: name.to_string(),
+        kind: "agent".to_string(),
         agent: None,
         provider: None,
         model: None,
         cwd: None,
+        schedule: None,
         needs: None,
         vars: Vec::new(),
         prompt: String::new(),
         repo: None,
     }
+}
+
+#[test]
+fn catalog_entry_defaults_kind_to_agent_and_schedule_to_none() {
+    let entry: CatalogEntry = serde_json::from_value(serde_json::json!({
+        "name": "legacy",
+        "vars": [],
+        "prompt": "",
+    }))
+    .unwrap();
+    assert_eq!(entry.kind, "agent");
+    assert_eq!(entry.schedule, None);
+    assert_eq!(entry.kind_display(), "agent");
+}
+
+#[test]
+fn catalog_kind_display_prefers_action_then_scheduled_then_agent() {
+    let mut action = catalog_entry("a");
+    action.kind = "action".to_string();
+    action.schedule = Some("* * * * *".to_string());
+    assert_eq!(action.kind_display(), "action");
+
+    let mut scheduled = catalog_entry("b");
+    scheduled.schedule = Some("* * * * *".to_string());
+    assert_eq!(scheduled.kind_display(), "scheduled");
+
+    assert_eq!(catalog_entry("c").kind_display(), "agent");
 }
 
 fn agent_session(id: &str, headless: bool, running: bool, awaiting: bool) -> AgentSessionInfo {
@@ -1108,10 +1137,12 @@ fn catalog_preview_scrolls_with_keys_and_wheel() {
     app.catalog = vec![
         CatalogEntry {
             name: "a".to_string(),
+            kind: "agent".to_string(),
             agent: None,
             provider: None,
             model: None,
             cwd: None,
+            schedule: None,
             needs: None,
             vars: Vec::new(),
             prompt: String::new(),
@@ -1119,10 +1150,12 @@ fn catalog_preview_scrolls_with_keys_and_wheel() {
         },
         CatalogEntry {
             name: "b".to_string(),
+            kind: "agent".to_string(),
             agent: None,
             provider: None,
             model: None,
             cwd: None,
+            schedule: None,
             needs: None,
             vars: Vec::new(),
             prompt: String::new(),
@@ -1309,10 +1342,12 @@ fn set_catalog_clamps_selection_and_refreshes_preview() {
 
     app.set_catalog(vec![CatalogEntry {
         name: "a".to_string(),
+        kind: "agent".to_string(),
         agent: None,
         provider: None,
         model: None,
         cwd: None,
+        schedule: None,
         needs: None,
         vars: Vec::new(),
         prompt: String::new(),
@@ -2181,10 +2216,12 @@ fn keyboard_up_down_moves_scheduler_and_notification_selection() {
 fn vars_entry(name: &str) -> CatalogEntry {
     CatalogEntry {
         name: name.to_string(),
+        kind: "agent".to_string(),
         agent: None,
         provider: None,
         model: None,
         cwd: None,
+        schedule: None,
         needs: None,
         vars: vec![
             TaskVar {

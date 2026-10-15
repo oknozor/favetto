@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::app::Route;
 use crate::components::icon::{AppIcon, AppIconKind};
-use crate::views::tasks::status_label;
+use crate::views::tasks::{status_label, KindBadge};
 
 /// The icon for a task status, used as a quick visual cue on cards.
 pub fn status_icon(status: TaskStatus) -> AppIconKind {
@@ -40,6 +40,9 @@ pub fn TaskCard(
     /// Catalog-derived metadata chips (`agent:…`, `model:…`, …).
     #[props(default)]
     tags: Vec<String>,
+    /// Catalog-derived task kind (`agent`, `action`, `scheduled`), when known.
+    #[props(default)]
+    kind: Option<String>,
 ) -> Element {
     let badge = format!("status-badge status-{}", status.as_str());
     let icon = status_icon(status);
@@ -52,6 +55,9 @@ pub fn TaskCard(
                 div { class: "task-card-head",
                     span { class: "task-card-name", "{name}" }
                     span { class: badge, "{status_label(status)}" }
+                    if let Some(kind) = kind {
+                        KindBadge { kind }
+                    }
                     if awaiting {
                         span { class: "task-card-awaiting", "needs input" }
                     }
@@ -109,6 +115,7 @@ mod tests {
                     detail: Some("boom".to_string()),
                     repo: Some("favetto".to_string()),
                     tags: vec!["agent:claude".to_string()],
+                    kind: Some("agent".to_string()),
                 }
             }
         });

@@ -411,6 +411,9 @@ pub struct WorkflowRuntime {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct CatalogEntry {
     pub name: String,
+    /// How the task runs: `"agent"` (the default) or `"action"`.
+    #[serde(default = "default_task_kind")]
+    pub kind: String,
     #[serde(default)]
     pub agent: Option<String>,
     #[serde(default)]
@@ -419,6 +422,9 @@ pub struct CatalogEntry {
     pub model: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    /// The cron schedule, when the task is a scheduled one.
+    #[serde(default)]
+    pub schedule: Option<String>,
     #[serde(default)]
     pub needs: Option<String>,
     #[serde(default)]
@@ -428,6 +434,12 @@ pub struct CatalogEntry {
     /// The repo namespace for a repo-local task (`<name>` in `repo:<name>/<path>`).
     #[serde(default)]
     pub repo: Option<String>,
+}
+
+/// The default catalog task kind (`agent`) applied when `kind` is absent from the
+/// wire payload.
+fn default_task_kind() -> String {
+    "agent".to_string()
 }
 
 /// One visible row of the Catalog tree: a folder header or a task.
@@ -460,6 +472,22 @@ impl CatalogEntry {
             (None, Some(m)) => m.clone(),
             (Some(p), None) => p.clone(),
             (None, None) => "—".to_string(),
+        }
+    }
+
+    /// The catalog-derived kind badge shown in the Tasks table: `action`,
+    /// `scheduled`, or `agent` (the default).
+    ///
+    /// The precedence is `action` > `scheduled` > `agent`: a scheduled task is
+    /// usually *also* an agent task, so the clock only wins when no stronger kind
+    /// applies.
+    pub fn kind_display(&self) -> &'static str {
+        if self.kind == "action" {
+            "action"
+        } else if self.schedule.is_some() {
+            "scheduled"
+        } else {
+            "agent"
         }
     }
 }
@@ -1020,6 +1048,12 @@ impl App {
             self.catalog_selected.min(rows - 1)
         };
         self.catalog_preview = None;
+    }
+
+    /// The catalog entry for a task name, when the task is a catalog task. Used
+    /// to derive the Tasks table's kind badge by name.
+    pub fn catalog_entry(&self, name: &str) -> Option<&CatalogEntry> {
+        self.catalog.iter().find(|entry| entry.name == name)
     }
 
     /// Store the fetched repo registry and active repo (`repos.list`).

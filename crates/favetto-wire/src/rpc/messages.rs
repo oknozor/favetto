@@ -180,11 +180,21 @@ pub struct StartOneshotResult {
 // catalog
 // ---------------------------------------------------------------------------
 
+/// The wire spelling of a catalog task's default kind (`agent`), applied when the
+/// `kind` field is absent on the wire.
+fn default_task_kind() -> String {
+    "agent".to_string()
+}
+
 /// A catalog task as listed by `catalog.list`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CatalogEntry {
     pub name: String,
+    /// How the task runs: `"agent"` (the default) or `"action"`. Defaulted for
+    /// backward compatibility with daemons predating the field.
+    #[serde(default = "default_task_kind")]
+    pub kind: String,
     pub agent: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -1255,6 +1265,7 @@ mod tests {
         // `prompt`; keep verifying the shapes the daemon serializes.
         let entry = CatalogEntry {
             name: "t".to_string(),
+            kind: "agent".to_string(),
             agent: None,
             provider: None,
             model: None,
@@ -1269,6 +1280,17 @@ mod tests {
         assert_eq!(json["agent"], serde_json::Value::Null);
         assert_eq!(json["prompt"], "p");
         assert_eq!(json["repo"], serde_json::Value::Null);
+        assert_eq!(json["kind"], "agent");
+
+        // A payload predating `kind` deserializes with the `agent` default.
+        let legacy: CatalogEntry = serde_json::from_value(serde_json::json!({
+            "name": "t",
+            "prompt": "p",
+            "vars": [],
+        }))
+        .unwrap();
+        assert_eq!(legacy.kind, "agent");
+        assert_eq!(legacy, entry);
 
         let add = CatalogAddResult {
             name: "t".to_string(),

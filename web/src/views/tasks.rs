@@ -21,7 +21,7 @@ use crate::components::output_viewer::{extract_output_text, extract_run_summary,
 use crate::components::start_task::StartTaskDialog;
 use crate::components::toast::{Toast, ToastKind};
 use crate::state::{task_display_name, task_repo, AppState, Cache, TaskFeed};
-use crate::views::catalog::task_tags;
+use crate::views::catalog::{task_kind, task_tags};
 
 /// The status chips above the task list.
 ///
@@ -290,6 +290,18 @@ fn StatusBadge(status: TaskStatus) -> Element {
     }
 }
 
+/// A catalog-derived task-kind pill: `agent`, `action`, or `scheduled`.
+///
+/// It is definition-based: a task started manually from a scheduled catalog task
+/// still reads `scheduled`.
+#[component]
+pub fn KindBadge(kind: String) -> Element {
+    let class = format!("kind-badge kind-{kind}");
+    rsx! {
+        span { class, "{kind}" }
+    }
+}
+
 /// The `/tasks` list with status filter chips.
 #[component]
 pub fn TasksList() -> Element {
@@ -364,6 +376,9 @@ pub fn TasksList() -> Element {
                                 div { class: "task-row-main",
                                     span { class: "task-name", "{task_display_name(&task.name)}" }
                                     StatusBadge { status: task.status }
+                                    if let Some(kind) = cache.catalog_entry(&task.name).map(task_kind) {
+                                        KindBadge { kind: kind.to_string() }
+                                    }
                                 }
                                 div { class: "task-row-tags",
                                     // The repo chip only applies to a scoped
@@ -606,6 +621,9 @@ pub fn TaskDetail(id: String) -> Element {
                         header { class: "task-header",
                             h1 { class: "task-title", "{task_display_name(&task.name)}" }
                             StatusBadge { status: task.status }
+                            if let Some(kind) = cache.catalog_entry(&task.name).map(task_kind) {
+                                KindBadge { kind: kind.to_string() }
+                            }
                             div { class: "task-tags",
                                 if let Some(repo) = task_repo(&task.name) {
                                     span { class: "task-repo", "{repo}" }

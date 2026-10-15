@@ -3647,6 +3647,7 @@ async fn repos_dispatch_add_list_activate_remove() {
         .expect("repo task in catalog");
     assert_eq!(entry["repo"], "favetto");
     assert_eq!(entry["cwd"], repo.to_string_lossy().as_ref());
+    assert_eq!(entry["kind"], "agent");
 
     // catalog.get reads the repo file.
     let got = call_ok(

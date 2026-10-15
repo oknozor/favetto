@@ -10,7 +10,7 @@ focus and mouse handling see [Embedded agents](./agents).
 
 ![favetto TUI — Tasks tab](/screenshots/tui-tasks.png)
 
-*The Tasks tab: recent runs with their repo, status, started time, duration, and session title.*
+*The Tasks tab: recent runs with their repo, kind, status, started time, duration, and session title.*
 
 An opencode run writes its session title a few seconds after its first turn. As
 soon as the agent reports its session id **during** the run, the daemon resolves
@@ -228,6 +228,17 @@ it never fetches `output` blobs — and refreshes as the daemon pushes
 `task.updated`/`event` frames, so instances appear and change state while it is
 open. A directly started task is its own root; a spawned child inspects the root
 it inherited.
+
+## Task kind
+
+The **Tasks** table carries a **KIND** column derived from the task's catalog
+entry: `agent` for a normal agent run (the default), `action` for a built-in
+in-daemon step such as `http.request`, and `scheduled` for a cron-scheduled task.
+`action` wins over `scheduled`, which in turn wins over `agent`, since a
+scheduled task is usually also an agent task. The label is definition-based (it
+comes from the catalog, resolved by task name), so a task started manually from a
+scheduled catalog entry still reads `scheduled`; a row whose catalog entry is
+unknown (a one-shot or an entry that was since removed) shows `—`.
 
 ## Repo scoping
 

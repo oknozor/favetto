@@ -17,8 +17,9 @@ use favetto_core::workflow::{WorkflowInspect, WorkflowState};
 
 use super::app::{
     activity_cell, cost_cell, format_activity, repo_label, table_rows_area, task_repo, token_cell,
-    App, CatalogRow, ClickAction, ClickRegion, ConfirmPrompt, ConnState, Form, ListGeometry, Popup,
-    ReplyPrompt, Tab, TaskVarsForm, ThemeChoice, Wizard, WizardStep, MENU_OPTIONS,
+    App, CatalogEntry, CatalogRow, ClickAction, ClickRegion, ConfirmPrompt, ConnState, Form,
+    ListGeometry, Popup, ReplyPrompt, Tab, TaskVarsForm, ThemeChoice, Wizard, WizardStep,
+    MENU_OPTIONS,
 };
 use super::text_buffer::TextBuffer;
 use super::theme::{RaisedLevel, Theme};
@@ -1866,6 +1867,8 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     let widths = [
         Constraint::Length(10), // ID
         Constraint::Length(20), // TASK
+        // Wide enough for the longest kind, `scheduled`.
+        Constraint::Length(9),  // KIND
         Constraint::Length(14), // REPO
         // Session titles are truncated to 22 chars, so the column matches that.
         Constraint::Length(22), // SESSION
@@ -1878,7 +1881,7 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
         Constraint::Length(9),  // DURATION — `1h20m`
     ];
     let header = Row::new(vec![
-        "ID", "TASK", "REPO", "SESSION", "STATUS", "ACTIVITY", "TOKEN", "$COST", "STARTED",
+        "ID", "TASK", "KIND", "REPO", "SESSION", "STATUS", "ACTIVITY", "TOKEN", "$COST", "STARTED",
         "DURATION",
     ])
     .style(theme.table_header());
@@ -1892,9 +1895,14 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
             .map(|t| {
                 let (activity, usage) = app.task_activity_usage(&t.id.to_string());
                 let now = Utc::now();
+                let kind = app
+                    .catalog_entry(&t.name)
+                    .map(CatalogEntry::kind_display)
+                    .unwrap_or("—");
                 Row::new(vec![
                     Cell::from(short_id(&t.id)),
                     Cell::from(t.name.clone()),
+                    Cell::from(kind),
                     Cell::from(truncate_ellipsis(repo_label(task_repo(&t.name)), 14)),
                     Cell::from(truncate_ellipsis(
                         t.session_title.as_deref().unwrap_or(""),

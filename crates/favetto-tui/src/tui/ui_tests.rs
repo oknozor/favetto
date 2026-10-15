@@ -504,8 +504,10 @@ fn task_without_session_title_renders_blank_cell() {
     app.tab = Tab::Tasks;
     app.tasks = vec![geom_task("no_title")];
 
-    // No panic and no stray title text.
-    let text = render_text(&mut app, 100, 24);
+    // No panic and no stray title text. The narrow render is a smoke test; the
+    // header only fits once the fixed columns do.
+    let _ = render_text(&mut app, 100, 24);
+    let text = render_text(&mut app, 200, 24);
     assert!(text.contains("SESSION"), "header missing: {text:?}");
 }
 
@@ -1228,10 +1230,12 @@ fn catalog_preview_renders_task_markdown() {
     app.tab = Tab::Catalog;
     app.catalog = vec![CatalogEntry {
         name: "demo".to_string(),
+        kind: "agent".to_string(),
         agent: Some("opencode".to_string()),
         provider: None,
         model: Some("deepseek-v4-flash".to_string()),
         cwd: None,
+        schedule: None,
         needs: None,
         vars: Vec::new(),
         prompt: String::new(),
@@ -1272,10 +1276,12 @@ fn catalog_preview_scrolls_to_later_content() {
     app.tab = Tab::Catalog;
     app.catalog = vec![CatalogEntry {
         name: "demo".to_string(),
+        kind: "agent".to_string(),
         agent: None,
         provider: None,
         model: None,
         cwd: None,
+        schedule: None,
         needs: None,
         vars: Vec::new(),
         prompt: String::new(),
@@ -1415,10 +1421,12 @@ fn floating_preview_captures_wheel_over_drawn_rect() {
 fn catalog_entry(name: &str) -> super::super::app::CatalogEntry {
     super::super::app::CatalogEntry {
         name: name.to_string(),
+        kind: "agent".to_string(),
         agent: None,
         provider: None,
         model: None,
         cwd: None,
+        schedule: None,
         needs: None,
         vars: Vec::new(),
         prompt: String::new(),
@@ -1919,6 +1927,40 @@ fn tasks_table_shows_repo_column_and_labels_global() {
     assert!(text.contains("REPO"), "repo header missing: {text:?}");
     assert!(text.contains("my-repo"), "repo name missing: {text:?}");
     assert!(text.contains("global"), "global label missing: {text:?}");
+}
+
+#[test]
+fn tasks_table_shows_catalog_derived_kind_column() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    app.tasks = vec![
+        geom_task("plain"),
+        geom_task("http"),
+        geom_task("cron"),
+        geom_task("missing"),
+    ];
+
+    // Names deliberately avoid the kind words so the assertions below can only
+    // match the KIND column.
+    let plain = catalog_entry("plain");
+    let mut http = catalog_entry("http");
+    http.kind = "action".to_string();
+    let mut cron = catalog_entry("cron");
+    cron.schedule = Some("0 9 * * *".to_string());
+    app.set_catalog(vec![plain, http, cron]);
+
+    let text = render_text(&mut app, 220, 24);
+    assert!(text.contains("KIND"), "kind header missing: {text:?}");
+    assert!(text.contains("action"), "action kind missing: {text:?}");
+    assert!(
+        text.contains("scheduled"),
+        "scheduled kind missing: {text:?}"
+    );
+    assert!(text.contains("agent"), "agent kind missing: {text:?}");
+    assert!(
+        text.contains('—'),
+        "unknown-kind placeholder missing: {text:?}"
+    );
 }
 
 #[test]

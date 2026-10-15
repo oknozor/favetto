@@ -35,6 +35,17 @@ The web client is enabled by default (`[web].enabled = true`). To disable it:
 enabled = false
 ```
 
+### Task kind badges
+
+The **Tasks** list, the Inbox cards, and the task detail header show a kind badge
+next to the status, derived from the task's catalog entry: `agent` (the default),
+`action` for a built-in in-daemon step such as `http.request`, and `scheduled`
+for a cron-scheduled task. The precedence is `action` > `scheduled` > `agent`,
+since a scheduled task is usually also an agent task. The badge is
+definition-based — a task started manually from a scheduled catalog entry still
+reads `scheduled` — and it is omitted when the catalog entry is unknown, so
+one-shot and legacy rows degrade gracefully.
+
 ### Remote access
 
 The web client works over the same remote setup as the TUI — see
