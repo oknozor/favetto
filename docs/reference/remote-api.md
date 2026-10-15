@@ -52,7 +52,7 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | `agents.close` | Terminate a session. |
 | `agents.reply` | Answer a structured input request on a session's state channel. |
 | `providers.list` | List configured providers and their available models. |
-| `schedules.list` | List cron schedules. |
+| `schedules.list` | List cron schedules, with the next occurrence (`next_run`, UTC) computed for enabled entries. |
 | `schedules.upsert` | Create or update a cron schedule. |
 | `schedules.delete` | Delete a cron schedule. |
 | `notifications.list` | List recent notifications. |
@@ -679,7 +679,7 @@ List configured providers and their available models.
 
 ### `schedules.list`
 
-List cron schedules.
+List cron schedules, with the next occurrence (`next_run`, UTC) computed for enabled entries.
 
 **Request**
 
@@ -712,6 +712,7 @@ Create or update a cron schedule.
 | `id` | string | — | yes |  |
 | `input` | any | — | yes |  |
 | `last_run` | string (optional) | — | no |  |
+| `next_run` | string (optional) | null | no | The next occurrence of `cron` in UTC, computed by the daemon for enabled schedules. `None` when the schedule is disabled, its expression does not parse, or no future occurrence exists. Never persisted; older payloads omit it. |
 | `task` | string | — | yes | The catalog task name to enqueue on each fire. |
 
 ### `schedules.delete`

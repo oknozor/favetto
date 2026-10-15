@@ -1036,6 +1036,7 @@ dependencies = [
  "chrono",
  "clap",
  "config",
+ "croner",
  "dirs",
  "favetto-core",
  "favetto-mcp",

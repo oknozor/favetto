@@ -1571,17 +1571,40 @@ fn draw_catalog_preview(frame: &mut Frame, app: &mut App, area: Rect, theme: The
     frame.render_widget(paragraph, area);
 }
 
+/// `in 3h 12m` / `in 45s` / `in 2d 4h`; `disabled` when the schedule is off,
+/// an em dash when there is no computed next run.
+fn format_next_run(enabled: bool, next_run: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
+    if !enabled {
+        return "disabled".to_string();
+    }
+    let Some(next) = next_run else {
+        return "—".to_string();
+    };
+    let secs = (next - now).num_seconds().max(0);
+    if secs < 60 {
+        format!("in {secs}s")
+    } else if secs < 3_600 {
+        format!("in {}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("in {}h {}m", secs / 3_600, (secs % 3_600) / 60)
+    } else {
+        format!("in {}d {}h", secs / 86_400, (secs % 86_400) / 3_600)
+    }
+}
+
 fn draw_schedules(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     let widths = [
         Constraint::Length(10),
         Constraint::Length(20),
         Constraint::Length(26),
         Constraint::Length(12),
+        Constraint::Length(14),
         Constraint::Min(0),
     ];
-    let header =
-        Row::new(vec!["ID", "CRON", "TASK", "ENABLED", "INPUT"]).style(theme.table_header());
+    let header = Row::new(vec!["ID", "CRON", "TASK", "ENABLED", "NEXT RUN", "INPUT"])
+        .style(theme.table_header());
 
+    let now = Utc::now();
     let rows: Vec<Row> = app
         .schedules
         .iter()
@@ -1597,6 +1620,7 @@ fn draw_schedules(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
                 Cell::from(s.cron.clone()),
                 Cell::from(s.task.clone()),
                 Cell::from(if s.enabled { "yes" } else { "no" }),
+                Cell::from(format_next_run(s.enabled, s.next_run, now)),
                 Cell::from(input),
             ])
         })

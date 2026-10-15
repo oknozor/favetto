@@ -19,6 +19,11 @@ as a `catalog:<name>` schedule on load and re-syncs it when the header changes o
 is removed. Schedules created by hand through the Ctrl+P menu or RPC are left
 alone.
 
+The daemon computes each schedule's `next_run` (UTC) for the `schedules.list`
+and `schedules.upsert` responses. The TUI Scheduler tab and the web `/schedules`
+table render it as a live countdown; disabled schedules (and expressions the
+daemon cannot parse) report no next run.
+
 `schedule` and `needs` are mutually exclusive: a task is either timer-driven or
 dependency-driven.
 

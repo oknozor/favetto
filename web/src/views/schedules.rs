@@ -3,8 +3,12 @@
 //! The wire `Schedule` has no human `name` field: its `id` is the stable key the
 //! daemon persists (and generates as a UUID when a new schedule omits one), so
 //! the form exposes it as an optional "Name / ID". The list shows the cron
-//! expression, the catalog task it enqueues, whether it is enabled and its last
-//! run; the daemon does not expose a "next run", so that column is omitted.
+//! expression, the catalog task it enqueues, whether it is enabled, its last run
+//! and a live countdown to its next run. The daemon computes `next_run` in UTC
+//! for enabled schedules; disabled schedules (and expressions the daemon cannot
+//! parse) report no next run. A one-second client-side clock drives the
+//! countdown, and the list re-fetches on each `cron_tick` so it resets after a
+//! fire.
 //!
 //! Validation is done client-side before submitting so a typo fails without a
 //! round trip: the cron is checked against the daemon's `croner` format (five to
@@ -129,6 +133,28 @@ pub fn build_schedule_params(form: &ScheduleForm) -> Result<ScheduleUpsertParams
     })
 }
 
+/// `in 3h 12m` / `in 45s` / `in 2d 4h`; `disabled` when the schedule is off,
+/// an em dash when there is no computed next run. Epoch-based so the caller does
+/// not need a `chrono` dependency.
+pub fn format_next_run(enabled: bool, next_run_epoch: Option<i64>, now_epoch: i64) -> String {
+    if !enabled {
+        return "disabled".to_string();
+    }
+    let Some(next) = next_run_epoch else {
+        return "—".to_string();
+    };
+    let secs = (next - now_epoch).max(0);
+    if secs < 60 {
+        format!("in {secs}s")
+    } else if secs < 3_600 {
+        format!("in {}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("in {}h {}m", secs / 3_600, (secs % 3_600) / 60)
+    } else {
+        format!("in {}d {}h", secs / 86_400, (secs % 86_400) / 3_600)
+    }
+}
+
 /// A bearer client built from the shared state.
 fn client(state: AppState) -> RpcClient {
     RpcClient::new((state.daemon_url)()).with_token((state.token)())
@@ -143,12 +169,36 @@ pub fn Schedules() -> Element {
     let mut notice = use_signal(|| Option::<String>::None);
     let mut editing = use_signal(|| Option::<ScheduleForm>::None);
     let mut deleting = use_signal(|| Option::<String>::None);
+    // A one-second clock drives the countdown; the list itself is only re-fetched
+    // on mutation or `cron_tick`. Host tests have no ticking runtime, so the
+    // clock is only bound mutably where a ticker exists.
+    #[cfg(any(target_arch = "wasm32", target_os = "android"))]
+    let mut now = use_signal(super::workflow::now_epoch);
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+    let now = use_signal(super::workflow::now_epoch);
 
-    // Reading `reload()` inside the future re-runs the fetch after a mutation.
+    #[cfg(target_arch = "wasm32")]
+    use_future(move || async move {
+        loop {
+            gloo_timers::future::TimeoutFuture::new(1_000).await;
+            now.set(super::workflow::now_epoch());
+        }
+    });
+    #[cfg(all(not(target_arch = "wasm32"), target_os = "android"))]
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            now.set(super::workflow::now_epoch());
+        }
+    });
+
+    // Reading `reload()` inside the future re-runs the fetch after a mutation;
+    // reading `schedules_version` re-runs it after each `cron_tick`.
     let schedules = use_resource(move || {
         let base = (state.daemon_url)();
         let token = (state.token)();
         let _ = reload();
+        let _ = (state.schedules_version)();
         async move {
             RpcClient::new(base)
                 .with_token(token)
@@ -202,6 +252,7 @@ pub fn Schedules() -> Element {
                                     th { "Cron" }
                                     th { "Task" }
                                     th { "Enabled" }
+                                    th { "Next run" }
                                     th { "Last run" }
                                     th { "Actions" }
                                 }
@@ -218,6 +269,7 @@ pub fn Schedules() -> Element {
                                                 if schedule.enabled { "enabled" } else { "disabled" }
                                             }
                                         }
+                                        td { "{format_next_run(schedule.enabled, schedule.next_run.map(|t| t.timestamp()), now())}" }
                                         td { "{schedule.last_run.as_ref().map(|t| t.to_string()).unwrap_or_else(|| \"never\".to_string())}" }
                                         td { div { class: "row-actions",
                                             button {
@@ -479,11 +531,30 @@ mod tests {
             input: serde_json::json!({ "a": 1 }),
             enabled: false,
             last_run: None,
+            next_run: None,
         };
         let form = ScheduleForm::from_schedule(&schedule);
         assert_eq!(form.id, "daily");
         assert!(!form.enabled);
         assert_eq!(form.input, r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn format_next_run_covers_disabled_unknown_and_buckets() {
+        let now = 1_000_000;
+        assert_eq!(format_next_run(false, Some(now + 30), now), "disabled");
+        assert_eq!(format_next_run(true, None, now), "—");
+        assert_eq!(format_next_run(true, Some(now + 45), now), "in 45s");
+        assert_eq!(
+            format_next_run(true, Some(now + 3_600 * 3 + 720), now),
+            "in 3h 12m"
+        );
+        assert_eq!(
+            format_next_run(true, Some(now + 86_400 * 2 + 3_600 * 4), now),
+            "in 2d 4h"
+        );
+        // A skewed clock (next run already past) degrades to `in 0s`.
+        assert_eq!(format_next_run(true, Some(now - 10), now), "in 0s");
     }
 
     fn with_state(view: fn() -> Element) -> Element {

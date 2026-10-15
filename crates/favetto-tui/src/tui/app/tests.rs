@@ -1302,6 +1302,17 @@ fn catalog_updated_push_marks_catalog_dirty() {
 }
 
 #[test]
+fn cron_tick_push_marks_schedules_dirty() {
+    let mut app = App::new();
+    assert!(!app.schedules_dirty);
+    app.handle_notification(Notification {
+        method: push::EVENT.to_string(),
+        params: serde_json::to_value(event(1, EventKind::CronTick, serde_json::json!({}))).unwrap(),
+    });
+    assert!(app.schedules_dirty);
+}
+
+#[test]
 fn set_catalog_clamps_selection_and_refreshes_preview() {
     let mut app = App::new();
     app.catalog_selected = 5;
@@ -1881,6 +1892,7 @@ fn page_keys_move_events_selection_only() {
         input: serde_json::json!({}),
         enabled: true,
         last_run: None,
+        next_run: None,
     }];
     app.notifications = vec![NotificationRecord {
         id: 1,
@@ -1925,6 +1937,7 @@ fn clicking_scheduler_and_notifications_rows_selects_only() {
         input: serde_json::json!({}),
         enabled: true,
         last_run: None,
+        next_run: None,
     }];
     app.notifications = vec![NotificationRecord {
         id: 1,
@@ -2136,6 +2149,7 @@ fn keyboard_up_down_moves_scheduler_and_notification_selection() {
             input: serde_json::json!({}),
             enabled: true,
             last_run: None,
+            next_run: None,
         },
         Schedule {
             id: "s2".to_string(),
@@ -2144,6 +2158,7 @@ fn keyboard_up_down_moves_scheduler_and_notification_selection() {
             input: serde_json::json!({}),
             enabled: false,
             last_run: None,
+            next_run: None,
         },
     ];
     app.notifications = vec![
@@ -2582,6 +2597,33 @@ fn needs_animation_tracks_activity() {
     if let Popup::Wizard(w) = &mut app.popup {
         w.loading = false;
     }
+    assert!(!app.needs_animation());
+}
+
+#[test]
+fn needs_animation_for_scheduler_tab_with_future_run() {
+    let mut app = App::new();
+    app.conn = ConnState::Connected;
+    app.tab = Tab::Scheduler;
+
+    // An enabled schedule without a computed next run stays static.
+    app.schedules = vec![Schedule {
+        id: "s".to_string(),
+        cron: "0 0 8 * * *".to_string(),
+        task: "t".to_string(),
+        input: serde_json::json!({}),
+        enabled: true,
+        last_run: None,
+        next_run: None,
+    }];
+    assert!(!app.needs_animation());
+
+    // A future next run keeps the countdown ticking.
+    app.schedules[0].next_run = Some(Utc::now() + chrono::Duration::hours(1));
+    assert!(app.needs_animation());
+
+    // Only on the Scheduler tab.
+    app.tab = Tab::Tasks;
     assert!(!app.needs_animation());
 }
 
