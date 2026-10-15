@@ -200,18 +200,32 @@ impl Cache {
     ///
     /// Replay and live delivery are at-least-once, so a duplicate id replaces
     /// the stored copy instead of appending. The cursor only ever moves forward.
+    ///
+    /// The feed is kept sorted by id. Live frames arrive ascending, so the hot
+    /// path is a plain append (no scan, no re-sort); only a replay/out-of-order
+    /// frame pays for a binary-search dedupe and an in-place insertion.
     pub fn push_event(&mut self, event: Event) {
-        if let Some(existing) = self.events.iter_mut().find(|e| e.id == event.id) {
-            *existing = event.clone();
-        } else {
-            self.events.push(event.clone());
+        let id = event.id;
+        match self.events.last() {
+            // The common case: a newer frame, so ordering is already correct.
+            Some(last) if last.id < id => self.events.push(event),
+            // A duplicate of the newest frame replaces it without moving it.
+            Some(last) if last.id == id => {
+                if let Some(last) = self.events.last_mut() {
+                    *last = event;
+                }
+            }
+            // Empty feed, or a replay behind the newest id: find the slot.
+            _ => match self.events.binary_search_by_key(&id, |e| e.id) {
+                Ok(index) => self.events[index] = event,
+                Err(index) => self.events.insert(index, event),
+            },
         }
-        self.events.sort_by_key(|e| e.id);
         if self.events.len() > EVENT_CAP {
             let excess = self.events.len() - EVENT_CAP;
             self.events.drain(0..excess);
         }
-        self.cursor = Some(self.cursor.map_or(event.id, |c| c.max(event.id)));
+        self.cursor = Some(self.cursor.map_or(id, |c| c.max(id)));
     }
 
     /// Feed a server push into the cache. Returns `true` when the cache changed.
@@ -267,10 +281,7 @@ impl Cache {
     ///
     /// Mirrors `favetto_tui`'s `App::repo_visible`.
     pub fn repo_visible(&self, repo: Option<&str>) -> bool {
-        match &self.active_repo {
-            Some(active) => repo == Some(active.as_str()),
-            None => true,
-        }
+        repo_in_scope(self.active_repo.as_deref(), repo)
     }
 
     /// The repo a persisted event belongs to, derived from its payload.
@@ -284,7 +295,8 @@ impl Cache {
         }
         let task_id = event.payload.get("task_id").and_then(|v| v.as_str())?;
         let task_id = Uuid::parse_str(task_id).ok()?;
-        let task = self.tasks.values().find(|t| t.id == task_id)?;
+        // `tasks` is keyed by id, so resolve directly instead of scanning.
+        let task = self.tasks.get(&task_id)?;
         task_repo(&task.name).map(str::to_string)
     }
 
@@ -321,6 +333,20 @@ impl Cache {
     /// Replace (or merge) a task's feed from the `tasks.events` backfill.
     pub fn set_feed(&mut self, task: Uuid, feed: TaskFeed) {
         self.feeds.entry(task).or_default().merge(feed);
+    }
+}
+
+/// Whether a row's repo namespace is in scope for `active_repo`. With no active
+/// repo every row is visible; otherwise only rows belonging to the active repo
+/// are.
+///
+/// Shared by [`Cache::repo_visible`] and the catalog's repo scoping, so a caller
+/// that only holds the active repo (not the whole [`Cache`]) can still apply the
+/// same rule.
+pub fn repo_in_scope(active_repo: Option<&str>, repo: Option<&str>) -> bool {
+    match active_repo {
+        Some(active) => repo == Some(active),
+        None => true,
     }
 }
 
@@ -371,6 +397,64 @@ pub fn active_repo_label(active: Option<&str>) -> String {
     format!("repo: {}", repo_label(active))
 }
 
+/// Minimum interval between persisted cursor writes, in milliseconds.
+///
+/// The SSE loop feeds one durable event per frame; persisting the cursor on
+/// every frame is a synchronous `localStorage`/`std::fs` write. On Android that
+/// runs on the Dioxus VirtualDom (render) thread and stalls input handling.
+/// Batching is safe because delivery is at-least-once and [`Cache::push_event`]
+/// dedupes by id, so a replayed window after a restart is harmless.
+pub const CURSOR_FLUSH_INTERVAL_MS: u64 = 1_000;
+
+/// Time-batches persistence of the resume cursor.
+///
+/// The in-memory cursor always advances; this only decides when the durable
+/// copy is rewritten. The clock is injected so the decision is pure and
+/// host-testable without real time or a Dioxus runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CursorThrottle {
+    last_flush_ms: Option<u64>,
+    flushed: Option<i64>,
+}
+
+impl CursorThrottle {
+    /// Record `cursor` and report whether the durable copy should be rewritten
+    /// now. The first cursor of a session flushes immediately, as does any
+    /// cursor seen more than [`CURSOR_FLUSH_INTERVAL_MS`] after the last write;
+    /// in-between frames only update memory.
+    pub fn should_flush(&mut self, cursor: i64, now_ms: u64) -> bool {
+        if self.flushed == Some(cursor) {
+            return false;
+        }
+        let due = match self.last_flush_ms {
+            Some(last) => now_ms.saturating_sub(last) >= CURSOR_FLUSH_INTERVAL_MS,
+            None => true,
+        };
+        if due {
+            self.last_flush_ms = Some(now_ms);
+            self.flushed = Some(cursor);
+        }
+        due
+    }
+}
+
+/// Wall-clock milliseconds for the cursor throttle (JS clock on wasm, system
+/// clock on the host/Android).
+fn now_ms() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::now() as u64
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+}
+
 /// Shared client handles, provided once at the app root.
 #[derive(Clone, Copy)]
 pub struct AppState {
@@ -385,6 +469,9 @@ pub struct AppState {
     pub pending_pair_code: Signal<Option<String>>,
     /// Task/event/catalog caches plus the resume cursor.
     pub cache: Signal<Cache>,
+    /// Batches persistence of the resume cursor so a busy event stream does not
+    /// write to disk on every frame — see [`CursorThrottle`].
+    pub cursor_throttle: Signal<CursorThrottle>,
     /// Bumped by a `catalog.updated` push so the Catalog view re-fetches.
     pub catalog_version: Signal<u64>,
     /// Bumped by a `cron_tick` push so the Schedules view re-fetches and the
@@ -415,6 +502,7 @@ impl AppState {
             daemon_url: Signal::new(load_daemon_url()),
             pending_pair_code: Signal::new(None),
             cache: Signal::new(cache),
+            cursor_throttle: Signal::new(CursorThrottle::default()),
             catalog_version: Signal::new(0),
             schedules_version: Signal::new(0),
             notification_permission: Signal::new(load_permission()),
@@ -456,10 +544,16 @@ impl AppState {
         (self.token)().is_some()
     }
 
-    /// Record the highest durable event id and persist it for the next resume.
+    /// Record the highest durable event id for the next resume.
+    ///
+    /// The in-memory cursor always advances so this session resumes correctly;
+    /// the durable copy is throttled by [`CursorThrottle`] to keep the
+    /// synchronous file/`localStorage` write off every event frame.
     pub fn set_cursor(&mut self, cursor: i64) {
-        save_cursor(cursor);
         self.cache.write().cursor = Some(cursor);
+        if self.cursor_throttle.write().should_flush(cursor, now_ms()) {
+            save_cursor(cursor);
+        }
     }
 
     /// Signal a catalog change to the Catalog view.
@@ -647,6 +741,48 @@ mod tests {
         assert_eq!(cache.events.len(), EVENT_CAP);
         assert_eq!(cache.events.first().unwrap().id, 11);
         assert_eq!(cache.cursor, Some(EVENT_CAP as i64 + 10));
+    }
+
+    #[test]
+    fn push_event_replaces_a_duplicate_in_the_middle() {
+        let mut cache = Cache::default();
+        for id in [1, 2, 3] {
+            cache.push_event(event(id));
+        }
+        // A replay of an older id replaces in place and keeps the feed sorted.
+        cache.push_event(event(2));
+        let ids: Vec<i64> = cache.events.iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+        // An out-of-order arrival inserts at its sorted position.
+        cache.push_event(event(0));
+        let ids: Vec<i64> = cache.events.iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn cursor_throttle_batches_writes_but_keeps_advancing() {
+        let mut throttle = CursorThrottle::default();
+        // The first cursor of a session flushes immediately.
+        assert!(throttle.should_flush(1, 0));
+        // The same value never re-flushes.
+        assert!(!throttle.should_flush(1, CURSOR_FLUSH_INTERVAL_MS * 10));
+        // A newer cursor inside the window only updates memory.
+        assert!(!throttle.should_flush(2, 500));
+        assert!(!throttle.should_flush(3, CURSOR_FLUSH_INTERVAL_MS - 1));
+        // Once the interval elapses the pending cursor is persisted.
+        assert!(throttle.should_flush(4, CURSOR_FLUSH_INTERVAL_MS));
+        // …and the window restarts from there.
+        assert!(!throttle.should_flush(5, CURSOR_FLUSH_INTERVAL_MS + 1));
+        assert!(throttle.should_flush(6, CURSOR_FLUSH_INTERVAL_MS * 2));
+    }
+
+    #[test]
+    fn repo_in_scope_matches_the_cache_method() {
+        assert!(repo_in_scope(None, None));
+        assert!(repo_in_scope(None, Some("a")));
+        assert!(repo_in_scope(Some("a"), Some("a")));
+        assert!(!repo_in_scope(Some("a"), Some("b")));
+        assert!(!repo_in_scope(Some("a"), None));
     }
 
     #[test]

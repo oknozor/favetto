@@ -158,15 +158,29 @@ pub fn search(entries: &[CatalogEntry], query: &str) -> Vec<CatalogEntry> {
     scored.into_iter().map(|(_, entry)| entry).collect()
 }
 
-/// Repo-scope `entries` for the active repository (via [`Cache::repo_visible`])
-/// and rank the survivors against `query` with [`search`].
-pub fn search_visible(cache: &Cache, entries: &[CatalogEntry], query: &str) -> Vec<CatalogEntry> {
+/// Repo-scope `entries` for `active_repo` and rank the survivors against
+/// `query` with [`search`].
+///
+/// Takes the active repo directly (rather than the whole [`Cache`]) so a caller
+/// can memoize the search on just that input: an unrelated cache write must not
+/// re-run the fuzzy matcher.
+pub fn search_scope(
+    active_repo: Option<&str>,
+    entries: &[CatalogEntry],
+    query: &str,
+) -> Vec<CatalogEntry> {
     let scoped: Vec<CatalogEntry> = entries
         .iter()
-        .filter(|entry| cache.repo_visible(entry.repo.as_deref()))
+        .filter(|entry| crate::state::repo_in_scope(active_repo, entry.repo.as_deref()))
         .cloned()
         .collect();
     search(&scoped, query)
+}
+
+/// Repo-scope `entries` for the active repository (via [`Cache::repo_visible`])
+/// and rank the survivors against `query` with [`search`].
+pub fn search_visible(cache: &Cache, entries: &[CatalogEntry], query: &str) -> Vec<CatalogEntry> {
+    search_scope(cache.active_repo.as_deref(), entries, query)
 }
 
 /// `/catalog` — the searchable list of catalog definitions.
@@ -191,15 +205,26 @@ pub fn Catalog() -> Element {
             .await
     });
 
-    let entries: Vec<CatalogEntry> = match &*resource.read_unchecked() {
+    // Clone the fetched list only when the fetch itself changes, not on every
+    // render (chrome changes, event pushes).
+    let entries = use_memo(move || match &*resource.read_unchecked() {
         Some(Ok(list)) => list.clone(),
         _ => Vec::new(),
-    };
+    });
+    // The search only reads the active repo from the cache, so subscribe to
+    // that field through its own memo: an unrelated cache write re-runs this
+    // cheap clone but leaves the expensive search below untouched.
+    let active_repo = use_memo(move || state.cache.read().active_repo.clone());
     // Scope to the active repo, then run the full-text search. A repo-local
-    // entry carries its namespace in `repo`; global entries are unscoped.
-    let cache = (state.cache)();
+    // entry carries its namespace in `repo`; global entries are unscoped. This
+    // recomputes only when the fetched list, the query, or the active repo
+    // changes — not on every render.
+    let visible_memo = use_memo(move || {
+        let active_repo = active_repo();
+        search_scope(active_repo.as_deref(), &entries(), &query())
+    });
+    let visible = visible_memo.read();
     let query_value = query();
-    let visible = search_visible(&cache, &entries, &query_value);
     let count_label = if query_value.trim().is_empty() {
         format!("{} entries", visible.len())
     } else {
@@ -209,7 +234,7 @@ pub fn Catalog() -> Element {
     rsx! {
         main { id: "favetto-app", class: "catalog",
             h1 { "Catalog" }
-            if let Some(repo) = &cache.active_repo {
+            if let Some(repo) = active_repo() {
                 p { class: "catalog-scope", "Showing entries in repo: {repo}" }
             }
             input {
