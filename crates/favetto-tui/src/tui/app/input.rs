@@ -82,6 +82,7 @@ impl App {
             Popup::Reply(_) => return self.handle_reply_key(key),
             Popup::Confirm(_) => return self.handle_confirm_key(key.code),
             Popup::TaskError { .. } => return self.handle_task_error_key(key.code),
+            Popup::TaskResult { .. } => return self.handle_task_result_key(key.code),
             Popup::RepoPicker { .. } => return self.handle_repo_picker_key(key),
             Popup::ThemePicker { .. } => return self.handle_theme_picker_key(key.code),
             Popup::None => {}
@@ -359,7 +360,7 @@ impl App {
                 self.tasks_selected = index;
                 if already {
                     if let Some(t) = self.selected_task() {
-                        return UiAction::OpenAgent(t.id.to_string());
+                        return self.open_task_action(t);
                     }
                 }
                 UiAction::None
@@ -717,6 +718,21 @@ impl App {
         }
     }
 
+    /// The primary action for opening a Tasks-tab row: an action task opens its
+    /// result summary (`tasks.get`), every other task opens an agent session.
+    /// The decision is definition-based; a task with no catalog entry (a legacy
+    /// or global row) keeps the agent behaviour.
+    fn open_task_action(&self, task: &Task) -> UiAction {
+        if self
+            .catalog_entry(&task.name)
+            .is_some_and(CatalogEntry::is_action)
+        {
+            UiAction::OpenTaskResult(task.id.to_string())
+        } else {
+            UiAction::OpenAgent(task.id.to_string())
+        }
+    }
+
     /// Open the `x` popup for the selected task's error.
     fn open_task_error(&mut self) -> UiAction {
         if let Some(task) = self.selected_task() {
@@ -729,6 +745,16 @@ impl App {
     pub(super) fn handle_task_error_key(&mut self, code: KeyCode) -> UiAction {
         match code {
             KeyCode::Esc | KeyCode::Char('x') | KeyCode::Char('X') => self.popup = Popup::None,
+            _ => {}
+        }
+        UiAction::None
+    }
+
+    /// Keys while the action-task result popup is open: `Esc` or `Enter` closes
+    /// it.
+    pub(super) fn handle_task_result_key(&mut self, code: KeyCode) -> UiAction {
+        match code {
+            KeyCode::Esc | KeyCode::Enter => self.popup = Popup::None,
             _ => {}
         }
         UiAction::None
@@ -871,7 +897,7 @@ impl App {
             KeyCode::Enter => {
                 if self.tab == Tab::Tasks {
                     if let Some(t) = self.selected_task() {
-                        return UiAction::OpenAgent(t.id.to_string());
+                        return self.open_task_action(t);
                     }
                 }
                 if self.tab == Tab::Catalog {

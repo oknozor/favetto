@@ -79,6 +79,83 @@ fn catalog_entry_lookup_matches_the_full_name() {
     assert!(app.catalog_entry("triage").is_none());
 }
 
+#[test]
+fn enter_on_action_task_opens_result_not_agent() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    let task = task("new_issues");
+    let id = task.id.to_string();
+    app.tasks = vec![task];
+    app.tasks_selected = 0;
+    let mut entry = catalog_entry("new_issues");
+    entry.kind = "action".to_string();
+    app.set_catalog(vec![entry]);
+
+    match app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())) {
+        UiAction::OpenTaskResult(got) => assert_eq!(got, id),
+        _ => panic!("expected OpenTaskResult for an action task"),
+    }
+}
+
+#[test]
+fn enter_on_agent_task_still_opens_agent() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    let task = task("worker");
+    let id = task.id.to_string();
+    app.tasks = vec![task];
+    app.tasks_selected = 0;
+    app.set_catalog(vec![catalog_entry("worker")]);
+
+    match app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())) {
+        UiAction::OpenAgent(got) => assert_eq!(got, id),
+        _ => panic!("expected OpenAgent for an agent task"),
+    }
+}
+
+#[test]
+fn double_click_on_action_task_opens_result_not_agent() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    let tasks = vec![task("worker"), task("new_issues")];
+    let id = tasks[1].id.to_string();
+    app.tasks = tasks;
+    app.tasks_selected = 0;
+    let mut entry = catalog_entry("new_issues");
+    entry.kind = "action".to_string();
+    app.set_catalog(vec![entry]);
+    let inner = Rect {
+        x: 0,
+        y: 2,
+        width: 20,
+        height: 5,
+    };
+    app.tasks_geom = geom(inner, 0, 2);
+
+    // First click selects the action row (no activation).
+    assert!(matches!(app.handle_mouse(click(5, 3)), UiAction::None));
+    assert_eq!(app.tasks_selected, 1);
+    // The second click opens the result popup, not an agent session.
+    match app.handle_mouse(click(5, 3)) {
+        UiAction::OpenTaskResult(got) => assert_eq!(got, id),
+        _ => panic!("expected OpenTaskResult for an action task"),
+    }
+}
+
+#[test]
+fn task_result_popup_closes_on_esc_and_enter() {
+    let mut app = App::new();
+    app.open_task_result(task("new_issues"));
+    assert!(matches!(app.popup, Popup::TaskResult { .. }));
+
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::empty()));
+    assert!(matches!(app.popup, Popup::None));
+
+    app.open_task_result(task("new_issues"));
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
+    assert!(matches!(app.popup, Popup::None));
+}
+
 fn agent_session(id: &str, headless: bool, running: bool, awaiting: bool) -> AgentSessionInfo {
     AgentSessionInfo {
         id: id.to_string(),
