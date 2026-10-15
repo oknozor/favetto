@@ -147,6 +147,9 @@ fn all_popups_render_without_panic() {
             Popup::TaskError {
                 task_id: uuid::Uuid::new_v4(),
             },
+            Popup::TaskResult {
+                task: Box::new(geom_task("new_issues")),
+            },
             Popup::RepoPicker {
                 selected: 0,
                 filter: TextBuffer::new("fav"),
@@ -460,6 +463,45 @@ fn task_error_popup_shows_missing_hint() {
     let text = render_text(&mut app, 200, 24);
     assert!(
         text.contains("(no error recorded)"),
+        "empty-state hint missing: {text:?}"
+    );
+}
+
+#[test]
+fn task_result_popup_renders_summary_and_status() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    let mut task = geom_task("repo:my-repo/new_issues");
+    task.status = TaskStatus::Succeeded;
+    task.output = Some(serde_json::json!({
+        "agent": null,
+        "envelope": { "summary": "http 200: created 2 issues", "outputs": {} }
+    }));
+    app.open_task_result(task);
+
+    let text = render_text(&mut app, 200, 24);
+    assert!(text.contains("Action result"), "title missing: {text:?}");
+    assert!(text.contains("status:"), "status label missing: {text:?}");
+    assert!(text.contains("succeeded"), "status missing: {text:?}");
+    assert!(
+        text.contains("http 200: created 2 issues"),
+        "summary missing: {text:?}"
+    );
+    assert!(
+        text.contains("new_issues") && !text.contains("repo:my-repo/new_issues"),
+        "bare name expected: {text:?}"
+    );
+}
+
+#[test]
+fn task_result_popup_shows_missing_summary_hint() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    app.open_task_result(geom_task("empty"));
+
+    let text = render_text(&mut app, 200, 24);
+    assert!(
+        text.contains("(no summary recorded)"),
         "empty-state hint missing: {text:?}"
     );
 }

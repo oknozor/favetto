@@ -201,6 +201,7 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
         Popup::WorkflowRuntime(_) => {}
         // Handled above, before `popup` is borrowed.
         Popup::TaskError { .. } => {}
+        Popup::TaskResult { task } => draw_task_result(frame, task, theme),
         // Handled above, before `popup` is borrowed.
         Popup::RepoPicker { .. } => {}
         Popup::ThemePicker {
@@ -701,6 +702,67 @@ fn draw_task_error(frame: &mut Frame, app: &App, task_id: uuid::Uuid, theme: The
             theme,
         },
     );
+}
+
+/// Draw the action-task result popup: the run's status plus the executor's
+/// durable one-line `envelope.summary`, fetched through `tasks.get`.
+fn draw_task_result(frame: &mut Frame, task: &Task, theme: Theme) {
+    let mut content: Vec<Line<'static>> = Vec::new();
+    content.push(Line::from(Span::styled(
+        format!("{} · {}", short_id(&task.id), task_display_name(&task.name)),
+        theme.title(),
+    )));
+    content.push(Line::from(vec![
+        Span::styled("status: ", theme.muted_style()),
+        Span::styled(
+            task.status.as_str().to_string(),
+            Style::default().fg(theme.semantic(task.status)),
+        ),
+    ]));
+    content.push(Line::from(""));
+    content.push(Line::from(Span::styled("Summary", theme.muted_style())));
+    match envelope_summary(task) {
+        Some(summary) => content.push(Line::from(Span::raw(summary.to_string()))),
+        None => content.push(Line::from(Span::styled(
+            "(no summary recorded)",
+            Style::default().fg(theme.muted()),
+        ))),
+    }
+    if let Some(error) = task.error.as_deref().filter(|e| !e.is_empty()) {
+        content.push(Line::from(""));
+        content.push(Line::from(Span::styled("Error", theme.muted_style())));
+        content.push(Line::from(Span::styled(
+            error.to_string(),
+            theme.destructive(),
+        )));
+    }
+    let footer = vec![Line::from(Span::styled(
+        "Esc / Enter close",
+        Style::default().fg(theme.muted()),
+    ))];
+    draw_growing_popup(
+        frame,
+        GrowingPopup {
+            area: frame.area(),
+            width_pct: 70,
+            title: " Action result ".to_string(),
+            content,
+            footer,
+            focus_line: 0,
+            theme,
+        },
+    );
+}
+
+/// The executor's one-line result summary, stored at `output.envelope.summary`
+/// for both agent and action runs. `None` when absent, blank, or not a string.
+fn envelope_summary(task: &Task) -> Option<&str> {
+    task.output
+        .as_ref()?
+        .get("envelope")?
+        .get("summary")?
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
 }
 
 fn draw_form(frame: &mut Frame, form: &Form, theme: Theme) -> Rect {

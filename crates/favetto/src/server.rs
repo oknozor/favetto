@@ -1300,6 +1300,22 @@ async fn start_agent(
     let cols = cols.unwrap_or(80) as u16;
     let force_new = force_new.unwrap_or(false);
 
+    // Resolve the catalog task (if any) up front. An action task runs a built-in
+    // step and has no agent, so there is no PTY to launch: reject it here rather
+    // than letting the missing agent fall back to `[agent].default`.
+    let resolved = match task_id.as_deref() {
+        Some(tid) => task_and_definition(state, tid).await,
+        None => None,
+    };
+    if let Some((_, def)) = &resolved {
+        if def.kind == crate::tasks::TaskKind::Action {
+            anyhow::bail!(
+                "task '{}' is an action task and cannot be opened as an agent session",
+                def.name
+            );
+        }
+    }
+
     // Resolve the agent: a request wins over the configured default.
     let name = requested
         .or_else(|| state.config.agent.default.clone())
@@ -1314,24 +1330,21 @@ async fn start_agent(
     // `provider`/`model` too, so the panel session matches the run instead of
     // silently falling back to the agent default. The request wins; the task
     // definition fills in whatever it didn't send.
-    let (prompt, task_provider, task_model) = match task_id.as_deref() {
-        Some(tid) => match task_and_definition(state, tid).await {
-            Some((task, def)) => {
-                let rendered = crate::executor::render_task_prompt(&def, &task);
-                (
-                    if rendered.is_empty() {
-                        prompt
-                    } else {
-                        Some(rendered)
-                    },
-                    def.provider,
-                    def.model,
-                )
-            }
-            // Fall back to the caller-provided prompt when the task (or its
-            // definition) can't be resolved.
-            None => (prompt, None, None),
-        },
+    let (prompt, task_provider, task_model) = match resolved {
+        Some((task, def)) => {
+            let rendered = crate::executor::render_task_prompt(&def, &task);
+            (
+                if rendered.is_empty() {
+                    prompt
+                } else {
+                    Some(rendered)
+                },
+                def.provider,
+                def.model,
+            )
+        }
+        // Fall back to the caller-provided prompt when the task (or its
+        // definition) can't be resolved.
         None => (prompt, None, None),
     };
     let provider = requested_provider.or(task_provider);

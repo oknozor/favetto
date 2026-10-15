@@ -37,6 +37,15 @@ per-run, so a task started by hand from a scheduled definition still reads
 [the catalog](./catalog) and
 [schedules and dependencies](./schedules-and-dependencies).
 
+Press **Enter** (or double-click) on a row to open the run. For an **agent**
+task this opens the Agent panel as described above. For an **action** task there
+is no agent session to open, so the client fetches the run with `tasks.get` and
+shows a small **Action result** popup with its status and the durable
+`envelope.summary` the action produced (for example the `http.request` status and
+a short description). The daemon also refuses `agents.start` for an action task,
+so no client can accidentally launch an agent against one. `Esc` or `Enter`
+closes the popup.
+
 ## Keybindings
 
 Press **?** at any time to open the same reference as a floating overlay. `?` or
@@ -53,7 +62,7 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 | Global | `M` | mute/unmute sound |
 | Global | `q` / `Esc` | quit |
 | Lists | `↑` / `↓` | move selection |
-| Tasks | `Enter` | open the selected task's agent session |
+| Tasks | `Enter` | open the selected task: its agent session, or an action task's result summary |
 | Tasks | `c` | cancel the selected non-terminal task (confirm) |
 | Tasks | `r` | retry the selected terminal task (confirm) |
 | Tasks | `C` | cancel every task in the selected task's workflow root (confirm) |
