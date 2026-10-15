@@ -1874,16 +1874,26 @@ async fn known_repos_and_daemon_state_migrate_and_round_trip() {
     assert!(list_repos(&pool).await.unwrap().is_empty());
     assert!(get_active_repo(&pool).await.unwrap().is_none());
 
-    insert_repo(&pool, "favetto", "/code/favetto")
+    insert_repo(&pool, "favetto", "/code/favetto", RepoSource::Manual)
         .await
         .unwrap();
-    insert_repo(&pool, "web", "/code/web").await.unwrap();
+    insert_repo(&pool, "web", "/code/web", RepoSource::Scanned)
+        .await
+        .unwrap();
     let repos = list_repos(&pool).await.unwrap();
     assert_eq!(
         repos,
         vec![
-            ("favetto".to_string(), "/code/favetto".to_string()),
-            ("web".to_string(), "/code/web".to_string()),
+            RepoRow {
+                name: "favetto".to_string(),
+                path: "/code/favetto".to_string(),
+                source: RepoSource::Manual,
+            },
+            RepoRow {
+                name: "web".to_string(),
+                path: "/code/web".to_string(),
+                source: RepoSource::Scanned,
+            },
         ]
     );
     assert_eq!(
@@ -1891,9 +1901,30 @@ async fn known_repos_and_daemon_state_migrate_and_round_trip() {
         Some("favetto".to_string())
     );
 
+    // Promotion flips the origin in place.
+    set_repo_source(&pool, "web", RepoSource::Manual)
+        .await
+        .unwrap();
+    assert_eq!(
+        list_repos(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.name == "web")
+            .unwrap()
+            .source,
+        RepoSource::Manual
+    );
+
     // A duplicate name or path is rejected.
-    assert!(insert_repo(&pool, "favetto", "/other").await.is_err());
-    assert!(insert_repo(&pool, "other", "/code/favetto").await.is_err());
+    assert!(insert_repo(&pool, "favetto", "/other", RepoSource::Manual)
+        .await
+        .is_err());
+    assert!(
+        insert_repo(&pool, "other", "/code/favetto", RepoSource::Manual)
+            .await
+            .is_err()
+    );
 
     // Active repo persists and can be cleared.
     set_active_repo(&pool, Some("web")).await.unwrap();
@@ -1908,6 +1939,28 @@ async fn known_repos_and_daemon_state_migrate_and_round_trip() {
     );
     set_active_repo(&pool, None).await.unwrap();
     assert!(get_active_repo(&pool).await.unwrap().is_none());
+
+    // A row written without an explicit `source` (a legacy database, or a
+    // migration that added the column) defaults to `manual` and is never
+    // reclaimed by the base-directory scan.
+    sqlx::query("INSERT INTO known_repos (name, path, added_at) VALUES (?, ?, ?)")
+        .bind("legacy")
+        .bind("/code/legacy")
+        .bind(0_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        list_repos(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.name == "legacy")
+            .unwrap()
+            .source,
+        RepoSource::Manual
+    );
+    delete_repo(&pool, "legacy").await.unwrap();
 
     // Deleting a repo reports whether a row was removed.
     assert!(delete_repo(&pool, "web").await.unwrap());

@@ -1896,6 +1896,7 @@ fn status_bar_shows_the_active_repo_badge() {
             path: "/code/favetto".to_string(),
             available: true,
             active: true,
+            source: favetto_core::model::RepoSource::Manual,
         }],
         Some("favetto".to_string()),
     );

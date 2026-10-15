@@ -129,7 +129,14 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     // resolve the active repo (config value only applies when the DB has none).
     crate::repos::seed_from_config(&state, &state.config).await;
     crate::repos::refresh(&state).await?;
-    let mut active = db::get_active_repo(&state.db).await?;
+
+    // Discover `[repos].base_dir` children before resolving the active repo, so a
+    // vanished active repo is cleared and falls back to the global catalog.
+    *state.active_repo.write() = db::get_active_repo(&state.db).await?;
+    if let Err(e) = crate::repos::rediscover(&state).await {
+        tracing::warn!(error = %e, "repo scan failed");
+    }
+    let mut active = state.active_repo.read().clone();
     if active.is_none() {
         if let Some(name) = &state.config.repos.active {
             if state.repos.read().iter().any(|repo| &repo.name == name) {

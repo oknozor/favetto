@@ -593,7 +593,7 @@
       "type": "object"
     },
     "ReposSettings": {
-      "description": "Repo-local task catalog settings (`[repos]`).\n\n`known` seeds the daemon's persisted known-repos registry at startup (the\nregistry survives config edits); `active` selects the daemon-wide active repo\nby name at startup. Repo task files live in `<repo>/.favetto/tasks/`.",
+      "description": "Repo-local task catalog settings (`[repos]`).\n\n`known` seeds the daemon's persisted known-repos registry at startup (the\nregistry survives config edits); `active` selects the daemon-wide active repo\nby name at startup. `base_dir`, when set, is scanned for repositories so\ncloned checkouts register themselves without a config edit. Repo task files\nlive in `<repo>/.favetto/tasks/`.",
       "properties": {
         "active": {
           "description": "The active repo's name at startup; unset means the global catalog.",
@@ -601,6 +601,20 @@
             "string",
             "null"
           ]
+        },
+        "base_dir": {
+          "description": "Directory whose repositories are discovered automatically. `~`-expanded;\nany child carrying a `.favetto/` directory is registered. Unset disables\nscanning. Discovered repos are reclaimed when their directory vanishes;\n`known`/`repos.add` entries are pinned.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "depth": {
+          "default": 1,
+          "description": "How many directory levels below `base_dir` to scan. `1` (the default)\nmeans immediate children; `2` also scans `org/repo` nesting.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         },
         "known": {
           "default": [],
@@ -934,9 +948,10 @@
     "repos": {
       "$ref": "#/$defs/ReposSettings",
       "default": {
+        "depth": 1,
         "known": []
       },
-      "description": "Repo-local task catalogs: the known-repos registry seed and the active\nrepo. Ignored by clients; the daemon persists changes in SQLite."
+      "description": "Repo-local task catalogs: the known-repos registry seed, the active repo,\nand the optional base directory scanned for repositories. Ignored by\nclients; the daemon persists changes in SQLite."
     },
     "tui": {
       "$ref": "#/$defs/TuiSettings",

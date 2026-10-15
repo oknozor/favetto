@@ -804,6 +804,7 @@ mod tests {
             path: path.to_string(),
             available,
             active,
+            source: favetto_wire::model::RepoSource::Manual,
         }
     }
 

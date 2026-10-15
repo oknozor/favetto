@@ -126,8 +126,15 @@ vacuum = true      # reclaim disk space after a prune
 # catalog tasks; switch it from the TUI (Ctrl+P -> Switch repo). `known`/`active`
 # seed the registry at startup; the registry is then persisted in SQLite, so TUI
 # add/remove/activate changes survive config edits and restarts.
+#
+# `base_dir` additionally discovers repositories automatically: any child within
+# `depth` levels carrying a `.favetto/` directory is registered as a `scanned`
+# repo and deregistered when its directory disappears (no restart needed). Only
+# scanned repos are reclaimed; `known`/`repos.add` entries are pinned.
 [repos]
 # active = "favetto"
+# base_dir = "~/code"   # scan this directory for `.favetto/` repos
+# depth = 1             # 1 = immediate children; 2 = also `org/repo` nesting
 # known = [{ path = "~/code/favetto" }]
 # known = [{ path = "/srv/web", name = "web" }]
 

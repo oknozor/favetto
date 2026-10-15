@@ -63,6 +63,7 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | `repos.add` | Register a repository (by daemon-host path) as a known repo. |
 | `repos.remove` | Remove a known repository by name. |
 | `repos.activate` | Set (or clear) the daemon-wide active repository. |
+| `repos.refresh` | Re-scan the base directory and reconcile the repository registry. |
 
 ## Client → server request & response types
 
@@ -832,6 +833,7 @@ Register a repository (by daemon-host path) as a known repo.
 | `available` | boolean | `true` | no | Whether the repo currently has a `.favetto/tasks/` catalog directory. |
 | `name` | string | — | yes |  |
 | `path` | string | — | yes |  |
+| `source` | RepoSource | `manual` | no | How the repo entered the registry. |
 
 ### `repos.remove`
 
@@ -858,6 +860,21 @@ Set (or clear) the daemon-wide active repository.
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
 | `name` | string (optional) | null | no |  |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `active` | string (optional) | null | no |  |
+| `repos` | RepoInfo[] | — | yes |  |
+
+### `repos.refresh`
+
+Re-scan the base directory and reconcile the repository registry.
+
+**Request**
+
+object
 
 **Response**
 
