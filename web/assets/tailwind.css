@@ -1670,7 +1670,6 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
     background: var(--surface);
-    scroll-behavior: smooth;
   }
   .feed-anchor {
     height: 0;
@@ -2042,9 +2041,6 @@
     }
     .skip-link {
       transition: none;
-    }
-    .agent-feed {
-      scroll-behavior: auto;
     }
   }
   .icon-inline {

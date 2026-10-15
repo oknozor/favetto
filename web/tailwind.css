@@ -1776,7 +1776,6 @@ textarea.input {
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--surface);
-  scroll-behavior: smooth;
 }
 
 /* Zero-height sentinel at the end of the list; it is re-keyed (and remounted)
@@ -2221,10 +2220,6 @@ textarea.input {
 
   .skip-link {
     transition: none;
-  }
-
-  .agent-feed {
-    scroll-behavior: auto;
   }
 }
 
