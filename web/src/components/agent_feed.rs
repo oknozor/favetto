@@ -3,7 +3,8 @@
 //! The daemon normalizes every structured agent into `AgentStateEvent`s and
 //! pushes them as non-durable `agent.event` notifications (`tasks.events`
 //! backfills after a reload). This module turns that raw stream into a
-//! human-readable, expandable feed rendered above the post-run `OutputViewer`.
+//! human-readable, expandable feed shown by the Task detail's single output
+//! section while the task runs (and from the persisted summary once terminal).
 //!
 //! The mapping is deliberately pure and host-testable ([`feed_item`] /
 //! [`build_feed`]); only the reply controls touch the network.
@@ -388,62 +389,19 @@ pub fn summary_feed(summary: &RunSummary) -> Vec<FeedItem> {
     items
 }
 
-/// The live feed section rendered above the task's output viewer.
-#[component]
-pub fn AgentFeed(
-    events: Vec<AgentEventPush>,
-    busy: Signal<bool>,
-    toast: Signal<Option<(ToastKind, String)>>,
-    refresh: Signal<u64>,
-) -> Element {
-    let items = build_feed(&events);
-    if items.is_empty() {
-        return rsx! {};
-    }
-    let session_id = events
-        .last()
-        .map(|event| event.session_id.clone())
-        .unwrap_or_default();
-    // The newest event's sequence bumps on every push (even a merged
-    // `ToolUpdated`), so the feed re-anchors and follows streaming output.
-    let revision = events.last().map(|event| event.seq).unwrap_or(0);
-
-    rsx! {
-        section { class: "agent-feed-section",
-            h2 { "Live feed" }
-            FeedList { items, session_id, revision, busy, toast, refresh }
-        }
-    }
-}
-
-/// A persisted run rendered as a human-readable agent log.
-///
-/// Fed by [`summary_feed`], this is the post-run counterpart to [`AgentFeed`]:
-/// it renders the same rows from the durable `task.output` summary, so the log
-/// survives a reload or daemon restart. A persisted log has no live session to
-/// reply to, so [`FeedItem::InputRequest`] cannot occur.
-#[component]
-pub fn AgentLog(items: Vec<FeedItem>) -> Element {
-    if items.is_empty() {
-        return rsx! {};
-    }
-    let busy = use_signal(|| false);
-    let toast = use_signal(|| None::<(ToastKind, String)>);
-    let refresh = use_signal(|| 0u64);
-    let revision = items.len() as u64;
-    rsx! {
-        FeedList { items, session_id: String::new(), revision, busy, toast, refresh }
-    }
-}
-
 /// The scrollable list of feed rows shared by the live feed and the persisted
 /// post-run log.
+///
+/// The Task detail's merged output section picks the source (live events while
+/// the task runs, the durable [`summary_feed`] once terminal) and renders this
+/// list; [`FeedItem::InputRequest`] rows keep the inline reply controls, which
+/// only the live feed produces.
 ///
 /// The list auto-follows: while the user is at (or near) the bottom it stays
 /// pinned to the newest row; scrolling up pauses it and reveals a jump control
 /// that resumes following.
 #[component]
-fn FeedList(
+pub(crate) fn FeedList(
     items: Vec<FeedItem>,
     session_id: String,
     revision: u64,
@@ -1105,65 +1063,38 @@ mod tests {
     }
 
     #[test]
-    fn agent_log_mounts_host_side() {
-        #[component]
-        fn Harness() -> Element {
-            let items = use_signal(|| {
-                summary_feed(&RunSummary {
-                    text: "hello".to_string(),
-                    tool_calls: vec![ToolCall {
-                        id: "c1".to_string(),
-                        name: "read".to_string(),
-                        ok: true,
-                        output: Some(serde_json::json!("contents")),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                })
-            });
-            rsx! {
-                AgentLog { items: items() }
-            }
-        }
-        let mut dom = VirtualDom::new(Harness);
-        dom.rebuild_in_place();
-    }
-
-    #[test]
-    fn agent_feed_mounts_host_side() {
+    fn feed_list_mounts_host_side() {
         #[component]
         fn Harness() -> Element {
             use_context_provider(AppState::new);
-            let events = use_signal(|| {
+            let items = use_signal(|| {
                 vec![
-                    push(
-                        1,
-                        AgentStateEvent::TextDelta {
-                            role: MessageRole::Assistant,
-                            text: "hello".to_string(),
-                        },
-                    ),
-                    push(
-                        2,
-                        AgentStateEvent::ToolStarted {
-                            id: "c1".to_string(),
-                            name: "read".to_string(),
-                            input: serde_json::json!({ "path": "a" }),
-                        },
-                    ),
-                    push(
-                        3,
-                        AgentStateEvent::Idle {
-                            outcome: IdleOutcome::Succeeded,
-                        },
-                    ),
+                    FeedItem::Message {
+                        role: MessageRole::Assistant,
+                        text: "hello".to_string(),
+                    },
+                    FeedItem::Tool {
+                        id: "c1".to_string(),
+                        name: "read".to_string(),
+                        input: serde_json::json!({ "path": "a" }),
+                        status: ToolStatus::Running,
+                        output: None,
+                    },
+                    FeedItem::Boundary(IdleOutcome::Succeeded),
                 ]
             });
             let busy = use_signal(|| false);
             let toast = use_signal(|| None::<(ToastKind, String)>);
             let refresh = use_signal(|| 0u64);
             rsx! {
-                AgentFeed { events: events(), busy, toast, refresh }
+                FeedList {
+                    items: items(),
+                    session_id: "ses_1".to_string(),
+                    revision: 3,
+                    busy,
+                    toast,
+                    refresh,
+                }
             }
         }
         let mut dom = VirtualDom::new(Harness);

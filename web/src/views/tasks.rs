@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::app::Route;
 use crate::client::RpcClient;
-use crate::components::agent_feed::{summary_feed, AgentFeed, AgentLog};
+use crate::components::agent_feed::{build_feed, summary_feed, FeedList};
 use crate::components::dialog::ConfirmDialog;
 use crate::components::icon::{AppIcon, AppIconKind};
 use crate::components::output_viewer::{extract_output_text, extract_run_summary, OutputViewer};
@@ -171,6 +171,35 @@ pub fn is_terminal(status: TaskStatus) -> bool {
         status,
         TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled
     )
+}
+
+/// Where the Task detail's merged output section gets its rows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OutputSource {
+    /// The ephemeral live `agent.event` feed, while the task is non-terminal.
+    Live,
+    /// The durable `RunSummary` decoded from `task.output`.
+    Summary,
+    /// No structured source: fall back to the plain `OutputViewer`.
+    Plain,
+}
+
+/// Pick the merged output section's source.
+///
+/// While a task is non-terminal a live feed wins; once terminal the persisted
+/// summary wins. A terminal task that still has a cached live feed but no
+/// summary yet keeps showing the feed, so the section never blanks during the
+/// transition.
+pub fn output_source(status: TaskStatus, has_live: bool, has_summary: bool) -> OutputSource {
+    if has_summary && (is_terminal(status) || !has_live) {
+        OutputSource::Summary
+    } else if has_live {
+        OutputSource::Live
+    } else if has_summary {
+        OutputSource::Summary
+    } else {
+        OutputSource::Plain
+    }
 }
 
 /// A destructive task action awaiting explicit confirmation.
@@ -475,10 +504,10 @@ pub fn TaskDetail(id: String) -> Element {
         .as_ref()
         .map(|feed| feed.events.clone())
         .unwrap_or_default();
-    let show_feed = feed
-        .as_ref()
-        .is_some_and(|feed| !feed.session_id.is_empty())
-        || !feed_events.is_empty();
+    // The live feed's rows are folded once; the merged output section picks
+    // between them and the persisted summary per render (see `output_source`).
+    let live_items = build_feed(&feed_events);
+    let has_live = !live_items.is_empty();
 
     // Read the catalog (subscribes to it) for the header metadata chips.
     let cache = (state.cache)();
@@ -503,11 +532,35 @@ pub fn TaskDetail(id: String) -> Element {
                     // A structured run persists its `RunSummary` in the output
                     // envelope; render it as an agent log, keeping the raw text
                     // and the envelope summary one click away.
-                    let log_items = task
+                    let summary_items = task
                         .output
                         .as_ref()
                         .and_then(extract_run_summary)
                         .map(|summary| summary_feed(&summary));
+                    let source = output_source(task.status, has_live, summary_items.is_some());
+                    // The live feed's session/revision drive the auto-follow
+                    // anchor; a persisted log uses its item count instead.
+                    let live_session_id = feed_events
+                        .last()
+                        .map(|event| event.session_id.clone())
+                        .unwrap_or_default();
+                    let live_revision = feed_events.last().map(|event| event.seq).unwrap_or(0);
+                    let (items, session_id, revision) = match source {
+                        OutputSource::Live => (live_items, live_session_id, live_revision),
+                        OutputSource::Summary => {
+                            let items = summary_items.unwrap_or_default();
+                            let revision = items.len() as u64;
+                            (items, String::new(), revision)
+                        }
+                        OutputSource::Plain => (Vec::new(), String::new(), 0),
+                    };
+                    // A terminal fallback to the live feed is labelled "Output",
+                    // not "Live feed".
+                    let heading = if source == OutputSource::Live && !is_terminal(task.status) {
+                        "Live feed"
+                    } else {
+                        "Output"
+                    };
                     let envelope_summary = task
                         .output
                         .as_ref()
@@ -632,18 +685,21 @@ pub fn TaskDetail(id: String) -> Element {
                                 }
                             }
                         }
-                        if show_feed {
-                            AgentFeed {
-                                events: feed_events.clone(),
-                                busy,
-                                toast,
-                                refresh,
-                            }
-                        }
                         section { class: "task-output",
-                            h2 { "Output" }
-                            if let Some(items) = log_items {
-                                AgentLog { items }
+                            h2 { "{heading}" }
+                            if items.is_empty() {
+                                // No structured source (no live feed, no
+                                // summary): the plain viewer is the section.
+                                OutputViewer { text: output_text, truncated: output_truncated }
+                            } else {
+                                FeedList {
+                                    items,
+                                    session_id,
+                                    revision,
+                                    busy,
+                                    toast,
+                                    refresh,
+                                }
                                 if let Some(summary) = envelope_summary {
                                     p { class: "task-output-summary", "{summary}" }
                                 }
@@ -651,8 +707,6 @@ pub fn TaskDetail(id: String) -> Element {
                                     summary { "Raw output" }
                                     OutputViewer { text: output_text, truncated: output_truncated }
                                 }
-                            } else {
-                                OutputViewer { text: output_text, truncated: output_truncated }
                             }
                         }
                         if let Some(action) = confirm() {
@@ -765,6 +819,32 @@ mod tests {
         assert!(!is_terminal(TaskStatus::Pending));
         assert!(!is_terminal(TaskStatus::Running));
         assert!(!is_terminal(TaskStatus::AwaitingInput));
+    }
+
+    #[test]
+    fn output_source_prefers_live_then_summary_and_never_blanks_transition() {
+        use TaskStatus::*;
+
+        // Non-terminal: a live feed wins; without one, the durable summary.
+        for status in [Pending, Running, AwaitingInput] {
+            assert_eq!(output_source(status, true, false), OutputSource::Live);
+            assert_eq!(output_source(status, true, true), OutputSource::Live);
+            assert_eq!(output_source(status, false, true), OutputSource::Summary);
+        }
+
+        // Terminal: the persisted summary wins, even with a cached live feed.
+        for status in [Succeeded, Failed, Cancelled] {
+            assert_eq!(output_source(status, true, true), OutputSource::Summary);
+            assert_eq!(output_source(status, false, true), OutputSource::Summary);
+            // Transition: the feed is still cached but the summary is not yet
+            // available, so the section keeps showing the feed rather than
+            // blanking.
+            assert_eq!(output_source(status, true, false), OutputSource::Live);
+        }
+
+        // Nothing structured: the plain viewer.
+        assert_eq!(output_source(Pending, false, false), OutputSource::Plain);
+        assert_eq!(output_source(Succeeded, false, false), OutputSource::Plain);
     }
 
     #[test]
