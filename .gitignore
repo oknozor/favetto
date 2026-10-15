@@ -30,3 +30,7 @@ fuzz/coverage/
 /web/dist/*.css
 /web/dist/*.apk
 /web/dist/*.aab
+
+# Android signing keystores (local release builds and CI). Never commit these.
+*.jks
+*.keystore
