@@ -310,9 +310,11 @@ jobs:
           key_password = "$key_pass"
           EOF
       - name: Bundle the release APK
+        # Go through the wrapper so the favetto launcher-icon Gradle init script
+        # is installed; `dx` 0.7.10 otherwise ships the stock Android icon.
         run: >-
-          dx bundle --locked --release --platform android --package-types apk
-          --features mobile --target "$ANDROID_TARGET"
+          ./android/dx.sh bundle --locked --release --platform android
+          --package-types apk --features mobile --target "$ANDROID_TARGET"
         working-directory: web
       - name: Check the APK size
         # A debug APK keeps the Rust symbols and weighs ~200 MiB; a release one
@@ -331,6 +333,26 @@ jobs:
             echo "::error::APK is $((bytes / 1024 / 1024)) MiB (> 60 MiB) — probably a debug build; check --release and [bundle.android]"
             exit 1
           fi
+      - name: Check the launcher icon came from web/android/res
+        # `dx`'s stock foreground is `drawable/ic_launcher_foreground`; the
+        # overlay moves it to `mipmap/ic_launcher_foreground`, so its presence in
+        # the packaged resource table proves the init script ran.
+        working-directory: web
+        run: |
+          set -euo pipefail
+          apk=$(find dist -name '*.apk' -print -quit)
+          sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/.android/sdk}}"
+          aapt2="$sdk/build-tools/${ANDROID_PLATFORM}.0.0/aapt2"
+          if [ ! -x "$aapt2" ]; then
+            aapt2="$(find "$sdk/build-tools" -name aapt2 -type f 2>/dev/null | sort -V | tail -n1)"
+          fi
+          if [ -z "$aapt2" ]; then
+            echo "::warning::aapt2 not found; skipping the launcher-icon resource check"
+            exit 0
+          fi
+          resources="$("$aapt2" dump resources "$apk")"
+          grep -q 'mipmap/ic_launcher_foreground' <<<"$resources"
+          echo "APK carries the favetto mipmap launcher foreground."
       - name: Upload the APK
         uses: actions/upload-artifact@v4
         with:
