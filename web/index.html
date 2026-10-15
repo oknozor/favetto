@@ -3,10 +3,13 @@
   <head>
     <meta charset="utf-8" />
     <!-- `viewport-fit=cover` lets the client paint under the Android/iOS safe
-         areas; the CSS reclaims them with `env(safe-area-inset-*)`. -->
+         areas; the CSS reclaims them with `env(safe-area-inset-*)`.
+         `interactive-widget=overlays-content` makes the soft keyboard float on
+         its own layer instead of resizing the visual viewport, so the fixed
+         bottom nav, dialogs and toasts stay put when a field is focused. -->
     <meta
       name="viewport"
-      content="width=device-width, initial-scale=1, viewport-fit=cover"
+      content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=overlays-content"
     />
     <meta name="color-scheme" content="light dark" />
     <title>{app_title}</title>
