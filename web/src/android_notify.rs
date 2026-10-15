@@ -74,8 +74,9 @@ fn sdk_int() -> i32 {
     .unwrap_or(0)
 }
 
-/// True when `POST_NOTIFICATIONS` is currently granted to the app.
-fn permission_granted() -> bool {
+/// Whether `POST_NOTIFICATIONS` is currently granted to the app, or `None` when
+/// the OS state could not be read (missing context / JNI failure).
+fn permission_granted() -> Option<bool> {
     with_activity(|env, activity| {
         let permission = env.new_string(POST_NOTIFICATIONS)?;
         let granted = env
@@ -89,7 +90,40 @@ fn permission_granted() -> bool {
         // android.content.pm.PackageManager.PERMISSION_GRANTED == 0.
         Ok(granted == 0)
     })
-    .unwrap_or(false)
+}
+
+/// Whether the OS would show the permission rationale, i.e. the user has not
+/// permanently refused. Android returns `false` for a first-ever request too, so
+/// this only distinguishes "ask again" from "don't ask again" once the app has
+/// recorded a denial.
+fn should_show_rationale() -> Option<bool> {
+    with_activity(|env, activity| {
+        let permission = env.new_string(POST_NOTIFICATIONS)?;
+        env.call_method(
+            activity,
+            "shouldShowRequestPermissionRationale",
+            "(Ljava/lang/String;)Z",
+            &[JValue::Object(&permission)],
+        )?
+        .z()
+    })
+}
+
+/// The live `POST_NOTIFICATIONS` state, or `None` when it cannot be read.
+///
+/// On Android < 13 no runtime permission exists, so the manifest declaration is
+/// enough and the state is [`Permission::Granted`].
+pub fn current_permission() -> Option<Permission> {
+    if sdk_int() < 33 {
+        return Some(Permission::Granted);
+    }
+    permission_granted().map(|granted| {
+        if granted {
+            Permission::Granted
+        } else {
+            Permission::Denied
+        }
+    })
 }
 
 /// Ask the `Activity` for `POST_NOTIFICATIONS`. Returns `false` on any failure.
@@ -118,13 +152,26 @@ pub async fn request_notification_permission() -> Permission {
     if sdk_int() < 33 {
         return Permission::Granted;
     }
+    // Already granted: nothing to ask.
+    if permission_granted() == Some(true) {
+        return Permission::Granted;
+    }
+    // A denial we recorded with the dialog permanently suppressed ("don't ask
+    // again") would leave us polling a dialog that never shows; settle
+    // immediately instead of holding the button busy for the full window.
+    if crate::state::load_permission() == Permission::Denied
+        && should_show_rationale() == Some(false)
+    {
+        return Permission::Denied;
+    }
     if !request_via_activity() {
         return Permission::Denied;
     }
-    // Check right away (in case it is already granted), then poll until the
-    // dialog is answered.
+    // Check right away (in case the dialog was auto-answered), then poll until
+    // the user answers. A JNI failure (`None`) now yields `Denied` rather than a
+    // stale grant.
     for _ in 0..POLL_ATTEMPTS {
-        if permission_granted() {
+        if permission_granted() == Some(true) {
             return Permission::Granted;
         }
         tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;

@@ -266,8 +266,18 @@ notification. On Android the WebView does not implement that API, so the client
 talks to the platform directly from Rust through JNI
 (`web/src/android_notify.rs`): it requests `POST_NOTIFICATIONS` from the
 `Activity`, posts the notification with `NotificationManager`, and reads the
-tap deep link. Background paging to a closed app still goes through the daemon's
-`ntfy` channel.
+tap deep link. Android reconciles the badge with the live OS state on mount, so
+a permission granted or revoked in the system settings is reflected (and a
+"don't ask again" denial settles the request promptly instead of polling).
+Background paging to a closed app still goes through the daemon's `ntfy`
+channel.
+
+**Settings → App notifications** lets you pick which task events raise a
+notification. Only `task_awaiting_input` (the default) and `task_finished`
+(success/failure derived from the payload, with the run summary as the body) are
+offered: `task_finished` is the single completion signal, so subscribing to it
+never double-notifies alongside `task_completed` / `task_failed`. The selection
+is persisted locally and restored on restart.
 
 ### Soft keyboard
 

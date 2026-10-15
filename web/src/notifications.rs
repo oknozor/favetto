@@ -65,6 +65,153 @@ impl Permission {
     }
 }
 
+/// A task event that can raise a system notification.
+///
+/// Mirrors the TUI's sound cues (#11): `task_finished` is the single completion
+/// signal (its payload carries `success`), so subscribing to it never doubles up
+/// with the separate `task_completed` / `task_failed` events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NotificationEvent {
+    /// A running task's agent is blocked waiting for user input.
+    AwaitingInput,
+    /// A task ended (success or failure, derived from the payload).
+    Finished,
+}
+
+impl NotificationEvent {
+    /// Every supported event, in display order.
+    pub const ALL: [NotificationEvent; 2] = [
+        NotificationEvent::AwaitingInput,
+        NotificationEvent::Finished,
+    ];
+
+    /// The stable token persisted to storage and shown as the event name.
+    pub fn key(self) -> &'static str {
+        match self {
+            NotificationEvent::AwaitingInput => "task_awaiting_input",
+            NotificationEvent::Finished => "task_finished",
+        }
+    }
+
+    /// A human label for the Settings multi-select.
+    pub fn label(self) -> &'static str {
+        match self {
+            NotificationEvent::AwaitingInput => "Task needs input",
+            NotificationEvent::Finished => "Task finished (success or failure)",
+        }
+    }
+
+    /// The durable event kind this subscription is driven by.
+    pub fn kind(self) -> EventKind {
+        match self {
+            NotificationEvent::AwaitingInput => EventKind::TaskAwaitingInput,
+            NotificationEvent::Finished => EventKind::TaskFinished,
+        }
+    }
+
+    /// The subscription a durable kind maps to, if any.
+    pub fn from_kind(kind: &EventKind) -> Option<NotificationEvent> {
+        match kind {
+            EventKind::TaskAwaitingInput => Some(NotificationEvent::AwaitingInput),
+            EventKind::TaskFinished => Some(NotificationEvent::Finished),
+            _ => None,
+        }
+    }
+
+    /// Parse a persisted token; `None` for an unknown/blank value.
+    pub fn parse(raw: &str) -> Option<NotificationEvent> {
+        NotificationEvent::ALL
+            .into_iter()
+            .find(|event| event.key() == raw)
+    }
+}
+
+/// The persisted token for "notify nothing" (storage drops empty strings).
+const NONE_TOKEN: &str = "none";
+
+/// The set of task events that raise a system notification.
+///
+/// Small and `Copy` so it can live in a Dioxus [`Signal`](dioxus::prelude::Signal)
+/// and be read cheaply from every push. The persisted form is a comma-separated
+/// list of [`NotificationEvent::key`] values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotificationEvents {
+    awaiting_input: bool,
+    finished: bool,
+}
+
+impl Default for NotificationEvents {
+    /// The pre-#327 behavior: only `task_awaiting_input` notifies.
+    fn default() -> Self {
+        Self {
+            awaiting_input: true,
+            finished: false,
+        }
+    }
+}
+
+impl NotificationEvents {
+    /// Whether nothing is subscribed (notifications effectively off).
+    pub fn is_empty(self) -> bool {
+        !self.awaiting_input && !self.finished
+    }
+
+    /// Whether `event` is subscribed.
+    pub fn contains(self, event: NotificationEvent) -> bool {
+        match event {
+            NotificationEvent::AwaitingInput => self.awaiting_input,
+            NotificationEvent::Finished => self.finished,
+        }
+    }
+
+    /// Subscribe or unsubscribe `event`.
+    pub fn set(&mut self, event: NotificationEvent, subscribed: bool) {
+        match event {
+            NotificationEvent::AwaitingInput => self.awaiting_input = subscribed,
+            NotificationEvent::Finished => self.finished = subscribed,
+        }
+    }
+
+    /// Flip `event`'s subscription.
+    pub fn toggle(&mut self, event: NotificationEvent) {
+        self.set(event, !self.contains(event));
+    }
+
+    /// Whether a durable event kind raises a notification under this set.
+    pub fn subscribes(self, kind: &EventKind) -> bool {
+        NotificationEvent::from_kind(kind).is_some_and(|event| self.contains(event))
+    }
+
+    /// The persisted token list; [`NONE_TOKEN`] for the empty set.
+    pub fn as_str(self) -> String {
+        let keys: Vec<&str> = NotificationEvent::ALL
+            .iter()
+            .filter(|event| self.contains(**event))
+            .map(|event| event.key())
+            .collect();
+        if keys.is_empty() {
+            NONE_TOKEN.to_string()
+        } else {
+            keys.join(",")
+        }
+    }
+
+    /// Parse a persisted token list; unknown tokens (including `"none"`) are
+    /// ignored, so an empty list yields the empty set.
+    pub fn parse(raw: &str) -> Self {
+        let mut events = Self {
+            awaiting_input: false,
+            finished: false,
+        };
+        for token in raw.split(',') {
+            if let Some(event) = NotificationEvent::parse(token.trim()) {
+                events.set(event, true);
+            }
+        }
+        events
+    }
+}
+
 /// Deterministic 31-bit id for `NotificationManager.notify`, derived from the
 /// task id (FNV-1a). Stable within and across runs so a re-notify replaces the
 /// previous notification for the same task.
@@ -90,13 +237,21 @@ pub struct Alert {
 
 /// Build an [`Alert`] from a durable event, or `None` for any other kind.
 ///
+/// Only the subscribed task events are handled; the finish case reads the
+/// enriched payload emitted by `crates/favetto/src/executor.rs::finished_payload`:
+/// `{name, task_id, success, status, attempt, retryable, summary}`.
+pub fn alert_for(event: &Event) -> Option<Alert> {
+    match event.kind {
+        EventKind::TaskAwaitingInput => awaiting_alert(event),
+        EventKind::TaskFinished => finished_alert(event),
+        _ => None,
+    }
+}
+
 /// `task_awaiting_input` payloads are emitted by
 /// `crates/favetto/src/attention.rs::mark_awaiting`: `{ task_id, name, session_id, reason }`
 /// with `reason.message` carrying the prompt.
-pub fn awaiting_alert(event: &Event) -> Option<Alert> {
-    if event.kind != EventKind::TaskAwaitingInput {
-        return None;
-    }
+fn awaiting_alert(event: &Event) -> Option<Alert> {
     let task_id = event.payload.get("task_id")?.as_str()?.to_string();
     let name = event
         .payload
@@ -112,6 +267,40 @@ pub fn awaiting_alert(event: &Event) -> Option<Alert> {
     Some(Alert {
         title: format!("{} needs input", task_display_name(name)),
         body: message.to_string(),
+        task_id,
+    })
+}
+
+/// The `task_finished` alert: success/failure is derived from the payload's
+/// `success` flag, and the body is the optional bounded `summary`.
+fn finished_alert(event: &Event) -> Option<Alert> {
+    let task_id = event.payload.get("task_id")?.as_str()?.to_string();
+    let name = task_display_name(
+        event
+            .payload
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("task"),
+    );
+    let failed = event.payload.get("success").and_then(|v| v.as_bool()) == Some(false);
+    let summary = event
+        .payload
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .filter(|summary| !summary.is_empty());
+    Some(Alert {
+        title: if failed {
+            format!("{name} failed")
+        } else {
+            format!("{name} finished")
+        },
+        body: summary
+            .unwrap_or(if failed {
+                "finished with an error"
+            } else {
+                "finished"
+            })
+            .to_string(),
         task_id,
     })
 }
@@ -153,11 +342,21 @@ pub fn current_permission() -> Permission {
     }
 }
 
-/// Android: the decision is persisted by [`request_permission`]; the OS state is
-/// authoritative once granted.
+/// Android: reconcile the persisted decision with the live OS state.
+///
+/// A `POST_NOTIFICATIONS` permission granted (or later revoked) in the system
+/// settings is authoritative. A not-granted result cannot distinguish "never
+/// asked" from "denied", so the persisted value is kept — `NotRequested` then
+/// lets dispatch ask on first use, and a persisted `Granted` becomes `Denied`
+/// when the OS revoked it.
 #[cfg(target_os = "android")]
 pub fn current_permission() -> Permission {
-    crate::state::load_permission()
+    let persisted = crate::state::load_permission();
+    match crate::android_notify::current_permission() {
+        Some(Permission::Granted) => Permission::Granted,
+        Some(Permission::Denied) if persisted == Permission::Granted => Permission::Denied,
+        _ => persisted,
+    }
 }
 
 /// Host stub: there is no browser here.
@@ -192,6 +391,19 @@ pub async fn request_permission() -> Permission {
 pub async fn request_permission() -> Permission {
     Permission::NotRequested
 }
+
+/// Persist a resolved permission so it survives a restart.
+///
+/// Only Android mirrors the decision into storage: a browser permission is
+/// always re-read live on mount and is never persisted.
+#[cfg(target_os = "android")]
+pub fn persist_permission(permission: Permission) {
+    crate::state::save_permission(permission);
+}
+
+/// Web/host: nothing is persisted.
+#[cfg(not(target_os = "android"))]
+pub fn persist_permission(_permission: Permission) {}
 
 /// True when the document/tab is hidden (backgrounded).
 #[cfg(target_arch = "wasm32")]
@@ -285,8 +497,23 @@ mod tests {
         payload
     }
 
+    fn finished_payload(success: bool, summary: Option<&str>) -> serde_json::Value {
+        let mut payload = serde_json::json!({
+            "name": "implement_issue",
+            "task_id": "task-123",
+            "success": success,
+            "status": if success { "succeeded" } else { "failed" },
+            "attempt": 1,
+            "retryable": false,
+        });
+        if let Some(summary) = summary {
+            payload["summary"] = serde_json::Value::String(summary.to_string());
+        }
+        payload
+    }
+
     #[test]
-    fn awaiting_alert_extracts_name_prompt_and_id() {
+    fn alert_for_extracts_the_awaiting_name_prompt_and_id() {
         let event = event(
             "task_awaiting_input",
             awaiting_payload(Some(serde_json::json!({
@@ -294,38 +521,116 @@ mod tests {
                 "message": "Allow `rm -rf /`?",
             }))),
         );
-        let alert = awaiting_alert(&event).expect("alert");
+        let alert = alert_for(&event).expect("alert");
         assert_eq!(alert.title, "implement_issue needs input");
         assert_eq!(alert.body, "Allow `rm -rf /`?");
         assert_eq!(alert.task_id, "task-123");
     }
 
     #[test]
-    fn awaiting_alert_strips_repo_prefix_from_title() {
+    fn alert_for_strips_repo_prefix_from_title() {
         let mut payload = awaiting_payload(None);
         payload["name"] = serde_json::json!("repo:my-repo/triage");
         let event = event("task_awaiting_input", payload);
-        let alert = awaiting_alert(&event).expect("alert");
+        let alert = alert_for(&event).expect("alert");
         assert_eq!(alert.title, "triage needs input");
     }
 
     #[test]
-    fn awaiting_alert_ignores_other_kinds() {
-        let event = event("task_finished", awaiting_payload(None));
-        assert!(awaiting_alert(&event).is_none());
-    }
-
-    #[test]
-    fn awaiting_alert_tolerates_a_missing_reason() {
+    fn alert_for_tolerates_a_missing_awaiting_reason() {
         let event = event("task_awaiting_input", awaiting_payload(None));
-        let alert = awaiting_alert(&event).expect("alert");
+        let alert = alert_for(&event).expect("alert");
         assert_eq!(alert.body, "needs your input");
     }
 
     #[test]
-    fn awaiting_alert_requires_a_task_id() {
-        let event = event("task_awaiting_input", serde_json::json!({ "name": "x" }));
-        assert!(awaiting_alert(&event).is_none());
+    fn alert_for_requires_a_task_id() {
+        let awaiting = event("task_awaiting_input", serde_json::json!({ "name": "x" }));
+        assert!(alert_for(&awaiting).is_none());
+        let finished = event("task_finished", serde_json::json!({ "name": "x" }));
+        assert!(alert_for(&finished).is_none());
+    }
+
+    #[test]
+    fn alert_for_ignores_unsubscribed_kinds() {
+        // `task_completed` / `task_failed` never alert; `task_finished` is the
+        // single completion signal, so a finish cannot double up.
+        for kind in ["task_completed", "task_failed", "task_started"] {
+            let event = event(kind, finished_payload(true, None));
+            assert!(alert_for(&event).is_none(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn alert_for_reports_a_successful_finish_with_its_summary() {
+        let event = event("task_finished", finished_payload(true, Some("all green")));
+        let alert = alert_for(&event).expect("alert");
+        assert_eq!(alert.title, "implement_issue finished");
+        assert_eq!(alert.body, "all green");
+        assert_eq!(alert.task_id, "task-123");
+    }
+
+    #[test]
+    fn alert_for_reports_a_failed_finish_without_a_summary() {
+        let event = event("task_finished", finished_payload(false, None));
+        let alert = alert_for(&event).expect("alert");
+        assert_eq!(alert.title, "implement_issue failed");
+        assert_eq!(alert.body, "finished with an error");
+    }
+
+    #[test]
+    fn notification_events_default_to_awaiting_input() {
+        let events = NotificationEvents::default();
+        assert!(events.contains(NotificationEvent::AwaitingInput));
+        assert!(!events.contains(NotificationEvent::Finished));
+        assert!(!events.is_empty());
+        assert_eq!(events.as_str(), "task_awaiting_input");
+    }
+
+    #[test]
+    fn notification_events_toggle_and_round_trip() {
+        let mut events = NotificationEvents::default();
+        events.toggle(NotificationEvent::Finished);
+        assert!(events.contains(NotificationEvent::Finished));
+        events.set(NotificationEvent::AwaitingInput, false);
+        assert_eq!(events.as_str(), "task_finished");
+        assert_eq!(NotificationEvents::parse(&events.as_str()), events);
+    }
+
+    #[test]
+    fn notification_events_empty_set_round_trips_through_none() {
+        let events = NotificationEvents::parse(NONE_TOKEN);
+        assert!(events.is_empty());
+        assert_eq!(events.as_str(), NONE_TOKEN);
+        assert_eq!(NotificationEvents::parse(&events.as_str()), events);
+    }
+
+    #[test]
+    fn notification_events_parse_ignores_unknown_tokens() {
+        let events = NotificationEvents::parse("task_finished, bogus, ,task_awaiting_input");
+        assert!(events.contains(NotificationEvent::Finished));
+        assert!(events.contains(NotificationEvent::AwaitingInput));
+        // Declared order is canonical regardless of the persisted order.
+        assert_eq!(events.as_str(), "task_awaiting_input,task_finished");
+        assert!(NotificationEvents::parse("bogus").is_empty());
+    }
+
+    #[test]
+    fn notification_events_subscribe_by_durable_kind() {
+        let events = NotificationEvents::default();
+        assert!(events.subscribes(&EventKind::TaskAwaitingInput));
+        assert!(!events.subscribes(&EventKind::TaskFinished));
+        // Unsupported kinds never subscribe.
+        assert!(!events.subscribes(&EventKind::TaskCompleted));
+        assert!(!events.subscribes(&EventKind::TaskFailed));
+
+        let all = NotificationEvents::parse("task_awaiting_input,task_finished");
+        assert!(all.subscribes(&EventKind::TaskFinished));
+
+        // Every enum's `kind` maps back to itself.
+        for event in NotificationEvent::ALL {
+            assert_eq!(NotificationEvent::from_kind(&event.kind()), Some(event));
+        }
     }
 
     #[test]
