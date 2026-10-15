@@ -51,11 +51,15 @@ icon = ["assets/icon.png"]
 # directory (`web/`); the keystore is git-ignored (`*.jks`). See
 # docs/guide/web-client.md for how to create it.
 #
-[bundle.android]
-jks_file = "favetto-release.jks"
-jks_password = "favetto"
-key_alias = "favetto"
-key_password = "favetto"
+# Keep this table commented. The CI Android job appends its own
+# `[bundle.android]` (pointing at the ephemeral/secret keystore) to this file; an
+# active table here would duplicate the key and make the manifest unparsable.
+#
+# [bundle.android]
+# jks_file = "favetto-release.jks"
+# jks_password = "..."
+# key_alias = "favetto"
+# key_password = "..."
 
 # Declare Android 13+ POST_NOTIFICATIONS. `dx` maps `notifications` to
 # `android.permission.POST_NOTIFICATIONS` in the generated AndroidManifest.xml.
