@@ -12,13 +12,13 @@ favetto-wire = { path = "../favetto-wire", features = ["schema"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = "1"
-argon2 = "0.5"
+argon2 = "0.6"
 config = "0.15"
 dirs = "7"
 hex = "0.4"
 rmp-serde = "1.3"
 schemars = { version = "1", features = ["derive", "chrono04", "uuid1"] }
-toml = "0.8"
+toml = "1.1"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "2"
