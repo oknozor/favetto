@@ -232,11 +232,25 @@ dx bundle --release --platform android --features mobile \
 ```
 
 `dx bundle` compiles the app itself, so no separate `dx build` step is needed.
-The APK lands in `web/dist/*.apk`. CI builds an `aarch64-linux-android` release
-APK on every push and uploads it as the `favetto-android-apk` workflow artifact;
-it uses a keystore from repository secrets when available and otherwise
-generates an ephemeral one (see the workflow's "Configure Android release
-signing" step).
+The APK lands in `web/dist/*.apk`.
+
+#### 4. Sign CI builds with your own key (optional)
+
+CI builds an `aarch64-linux-android` release APK on every push and uploads it as
+the `favetto-android-apk` workflow artifact. It generates an ephemeral keystore
+by default (fine for dev artifacts, not for Play). To sign with your release
+key, add these repository secrets (Settings → Secrets and variables → Actions):
+
+| Secret | Value |
+|--------|-------|
+| `ANDROID_KEYSTORE_BASE64` | `base64 -w0 favetto-release.jks` |
+| `ANDROID_KEYSTORE_PASSWORD` | the store password |
+| `ANDROID_KEY_ALIAS` | the key alias (`favetto`) |
+| `ANDROID_KEY_PASSWORD` | the key password |
+
+When `ANDROID_KEYSTORE_BASE64` is set, the workflow writes it to
+`web/android-release.jks` and signs the APK with it; otherwise it falls back to
+an ephemeral key so the artifact is still a release build.
 
 To produce APKs for all ABIs, run the bundle once per target
 (`aarch64-linux-android`, `armv7-linux-androideabi`, `i686-linux-android`,
