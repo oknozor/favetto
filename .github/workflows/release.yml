@@ -28,7 +28,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # Required by pre_bump_hooks: `cargo set-version` (cargo-edit) + nextest.
-      - uses: taiki-e/install-action@cargo-edit
+      # cargo-edit has no `@cargo-edit` shorthand tag, so install it via the
+      # `tool` input on the versioned action instead.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-edit
       - uses: taiki-e/install-action@nextest
 
       - uses: cocogitto/cocogitto-action@v4.2.0
