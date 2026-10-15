@@ -26,6 +26,8 @@ pub const TOKEN_KEY: &str = "favetto.token";
 pub const DAEMON_URL_KEY: &str = "favetto.daemon_url";
 /// `localStorage` key for the last-seen durable event id (the resume cursor).
 pub const CURSOR_KEY: &str = "favetto.event_cursor";
+/// Platform state key for the persisted notification permission (Android).
+pub const PERMISSION_KEY: &str = "favetto.notification_permission";
 
 /// How many live events to keep in the in-memory feed.
 pub const EVENT_CAP: usize = 500;
@@ -407,7 +409,7 @@ impl AppState {
             pending_pair_code: Signal::new(None),
             cache: Signal::new(cache),
             catalog_version: Signal::new(0),
-            notification_permission: Signal::new(Permission::default()),
+            notification_permission: Signal::new(load_permission()),
         }
     }
 
@@ -544,6 +546,23 @@ pub fn load_cursor() -> Option<i64> {
 /// Persist the resume cursor.
 pub fn save_cursor(cursor: i64) {
     save_string(CURSOR_KEY, &cursor.to_string());
+}
+
+/// The persisted notification permission (`NotRequested` when unset/unknown).
+///
+/// Only the Android path writes this key; on web `load_string` reads
+/// `localStorage`, where nothing is ever stored, so it stays `NotRequested` and
+/// the app's mount effect corrects it from the live browser value.
+pub fn load_permission() -> Permission {
+    load_string(PERMISSION_KEY)
+        .as_deref()
+        .map(Permission::parse)
+        .unwrap_or_default()
+}
+
+/// Persist the notification permission.
+pub fn save_permission(permission: Permission) {
+    save_string(PERMISSION_KEY, permission.as_str());
 }
 
 #[cfg(test)]
@@ -706,6 +725,29 @@ mod tests {
         save_token(Some(""));
         save_token(Some("secret"));
         assert_eq!(load_string(TOKEN_KEY), None);
+    }
+
+    /// The Android permission survives a restart: it is written through the same
+    /// native storage as the token and read back on the next launch.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn permission_persists_through_the_state_dir_override() {
+        // `FAVETTO_WEB_STATE_DIR` is process-global; serialize with the storage
+        // round-trip test.
+        let _guard = crate::storage::TEST_STATE_DIR_LOCK.lock().unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("favetto-web-permission-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("FAVETTO_WEB_STATE_DIR", &dir);
+
+        assert_eq!(load_permission(), Permission::NotRequested);
+        save_permission(Permission::Granted);
+        assert_eq!(load_permission(), Permission::Granted);
+        save_permission(Permission::Denied);
+        assert_eq!(load_permission(), Permission::Denied);
+
+        std::env::remove_var("FAVETTO_WEB_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

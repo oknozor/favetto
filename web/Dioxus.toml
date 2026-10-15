@@ -41,7 +41,9 @@ publisher = "favetto"
 icon = ["assets/icon.png"]
 
 # Declare Android 13+ POST_NOTIFICATIONS. `dx` maps `notifications` to
-# `android.permission.POST_NOTIFICATIONS` in the generated AndroidManifest.xml;
-# the web Notification API inside the WebView drives the runtime request.
+# `android.permission.POST_NOTIFICATIONS` in the generated AndroidManifest.xml.
+# The runtime request and the notification posting are done from Rust through
+# JNI (see `src/android_notify.rs`): the Android WebView does not implement the
+# web Notification API.
 [permissions]
 notifications = { description = "Tell you when a task needs your input" }

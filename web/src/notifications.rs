@@ -1,12 +1,14 @@
 //! Browser/WebView notifications for commands that need a human.
 //!
-//! Uses the web `Notification` API, which is available both in a desktop browser
-//! and in the Android WebView (vanilla Dioxus mobile packaging, no custom
-//! Kotlin). Background paging when the app is closed is handled by the daemon's
-//! `ntfy` channel, not here.
+//! On web (`wasm32`) this uses the browser `Notification` API. On Android the
+//! WebView does not implement that API and the platform backend has no
+//! notification permission, so the native path goes through JNI instead (see
+//! `src/android_notify.rs`): it requests `POST_NOTIFICATIONS`, posts a real
+//! system notification, and reads the tap deep link. Background paging when the
+//! app is closed is handled by the daemon's `ntfy` channel, not here.
 //!
 //! The permission enum and the event→alert extraction are pure and unit-tested
-//! on the host; only the functions below the `wasm32` gate talk to `web-sys`.
+//! on the host; only the target-gated functions below talk to the platform.
 
 use favetto_wire::model::{Event, EventKind};
 
@@ -41,6 +43,36 @@ impl Permission {
     pub fn needs_request(self) -> bool {
         matches!(self, Permission::NotRequested)
     }
+
+    /// Stable token persisted to storage.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Permission::NotRequested => "not_requested",
+            Permission::Granted => "granted",
+            Permission::Denied => "denied",
+        }
+    }
+
+    /// Parse a persisted token; unknown/absent values fall back to `NotRequested`.
+    pub fn parse(raw: &str) -> Permission {
+        match raw {
+            "granted" => Permission::Granted,
+            "denied" => Permission::Denied,
+            _ => Permission::NotRequested,
+        }
+    }
+}
+
+/// Deterministic 31-bit id for `NotificationManager.notify`, derived from the
+/// task id (FNV-1a). Stable within and across runs so a re-notify replaces the
+/// previous notification for the same task.
+pub fn notification_id(task_id: &str) -> i32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in task_id.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    (hash & 0x7fff_ffff) as i32
 }
 
 /// A pending-input alert derived from a durable event.
@@ -119,8 +151,15 @@ pub fn current_permission() -> Permission {
     }
 }
 
+/// Android: the decision is persisted by [`request_permission`]; the OS state is
+/// authoritative once granted.
+#[cfg(target_os = "android")]
+pub fn current_permission() -> Permission {
+    crate::state::load_permission()
+}
+
 /// Host stub: there is no browser here.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 pub fn current_permission() -> Permission {
     Permission::NotRequested
 }
@@ -137,8 +176,17 @@ pub async fn request_permission() -> Permission {
     current_permission()
 }
 
+/// Android: ask for `POST_NOTIFICATIONS` through the Activity, then poll the OS
+/// until the user answers, and persist the result.
+#[cfg(target_os = "android")]
+pub async fn request_permission() -> Permission {
+    let next = crate::android_notify::request_notification_permission().await;
+    crate::state::save_permission(next);
+    next
+}
+
 /// Host stub.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 pub async fn request_permission() -> Permission {
     Permission::NotRequested
 }
@@ -152,8 +200,15 @@ pub fn document_hidden() -> bool {
         .unwrap_or(false)
 }
 
+/// Android: the WebView is foreground whenever the app is; background paging is
+/// the daemon's `ntfy` channel.
+#[cfg(target_os = "android")]
+pub fn document_hidden() -> bool {
+    false
+}
+
 /// Host stub.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 pub fn document_hidden() -> bool {
     false
 }
@@ -185,8 +240,21 @@ pub fn notify(title: &str, body: &str, task_id: &str) {
     notification.set_onclick(Some(onclick.unchecked_ref::<js_sys::Function>()));
 }
 
+/// Android: post a real system notification via `NotificationManager`.
+#[cfg(target_os = "android")]
+pub fn notify(title: &str, body: &str, task_id: &str) {
+    crate::android_notify::post_notification(title, body, task_id);
+}
+
+/// Android: the task id carried by the launch/`onNewIntent` intent (if any),
+/// cleared so it is consumed once.
+#[cfg(target_os = "android")]
+pub fn take_pending_deep_link() -> Option<String> {
+    crate::android_notify::take_pending_deep_link()
+}
+
 /// Host stub.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 pub fn notify(_title: &str, _body: &str, _task_id: &str) {}
 
 #[cfg(test)]
@@ -277,5 +345,32 @@ mod tests {
         assert!(!Permission::Denied.needs_request());
 
         assert_eq!(Permission::default(), Permission::NotRequested);
+    }
+
+    #[test]
+    fn permission_str_round_trips() {
+        for permission in [
+            Permission::NotRequested,
+            Permission::Granted,
+            Permission::Denied,
+        ] {
+            assert_eq!(Permission::parse(permission.as_str()), permission);
+        }
+        assert_eq!(Permission::parse("bogus"), Permission::NotRequested);
+        assert_eq!(Permission::parse(""), Permission::NotRequested);
+    }
+
+    #[test]
+    fn notification_id_is_deterministic_and_distinct() {
+        assert_eq!(notification_id("task-123"), notification_id("task-123"));
+        assert_ne!(notification_id("task-123"), notification_id("task-456"));
+        // Android ids must be non-negative and fit a Java int.
+        assert!(notification_id("task-123") >= 0);
+        assert!(notification_id("") >= 0);
+    }
+
+    #[test]
+    fn notify_is_a_noop_on_host() {
+        notify("title", "body", "task-123");
     }
 }

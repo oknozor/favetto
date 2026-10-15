@@ -122,6 +122,22 @@ pub fn App() -> Element {
         }
     });
 
+    // On Android the OS posts notifications; a tap carries the task id as an
+    // intent extra. Poll for it and open the deep link. On web the notification
+    // click handler navigates directly, so this is Android-only.
+    #[cfg(target_os = "android")]
+    {
+        let nav = use_navigator();
+        use_future(move || async move {
+            loop {
+                if let Some(task_id) = crate::notifications::take_pending_deep_link() {
+                    nav.push(Route::InboxTask { task_id });
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        });
+    }
+
     let base = (state.daemon_url)();
     let token = (state.token)();
 
