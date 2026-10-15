@@ -719,6 +719,11 @@ mod tests {
 
     #[test]
     fn save_token_ignores_empty_values_on_host() {
+        // `FAVETTO_WEB_STATE_DIR` is process-global; another test may set it
+        // concurrently, which would make the host "no state dir" assumption
+        // false and let `save_token` persist. Serialize with the tests that
+        // mutate it (see `storage::TEST_STATE_DIR_LOCK`).
+        let _guard = crate::storage::TEST_STATE_DIR_LOCK.lock().unwrap();
         // On host the storage helpers are no-ops, so this only exercises the
         // empty/non-empty branch without panicking.
         save_token(None);
