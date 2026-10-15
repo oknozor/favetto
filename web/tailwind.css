@@ -1756,9 +1756,9 @@ textarea.input {
   font: inherit;
 }
 
-/* Live agent feed -------------------------------------------------------- */
+/* Merged task output (live feed or persisted log) ------------------------ */
 
-.agent-feed-section {
+.task-output {
   margin-top: var(--space-5);
 }
 

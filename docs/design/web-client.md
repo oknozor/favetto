@@ -335,18 +335,20 @@ threads by default).
 | View | RPC/stream | Notes |
 |---|---|---|
 | **Inbox** (default on mobile) | `events` + `tasks.list` + `agents.list` | `awaiting_input` cards with `InputRequest` options; `agents.reply`; failures; recent notifications |
-| **Tasks** | `tasks.list`, `tasks.get`, `tasks.events` + `agent.event` | status filters, run history, live pretty agent feed above the post-run output, inline awaiting-input reply, `tasks.start`/`cancel`/`retry` |
+| **Tasks** | `tasks.list`, `tasks.get`, `tasks.events` + `agent.event` | status filters, run history, one merged output section (live agent feed while running, the persisted `RunSummary` log once terminal), inline awaiting-input reply, `tasks.start`/`cancel`/`retry` |
 | **Workflow** | `workflow.get`, `workflow.inspect`, `workflow.cancel/retry` | catalog dependency DAG (SVG) with a weakly-connected-component picker; runtime inspect tree at `/workflow/:root_id` |
 | **Catalog** | `catalog.list`, `catalog.get` | Markdown preview (`pulldown-cmark`), plus a `tasks.start` run action |
 | **Schedules** | `schedules.list/upsert/delete` | cron management |
 | **Notifications / Settings** | `notifications.list/test`, `hooks.upsert` | channel test, hook management, pairing/session info |
 
-The Task detail **Output** section renders the durable `RunSummary` persisted in
-`task.output.result` as the same human-readable agent log (messages, reasoning,
-tool cards, usage, errors, run boundary) once a run has finished, so it survives
-a reload or daemon restart — the ephemeral live feed does not. Agents with no
-structured summary keep the plain-text `OutputViewer`; the raw output and the
-envelope summary remain reachable from the log.
+The Task detail **Output** section is the single output area. While the task runs
+it shows the live pretty agent feed (`agent.event` / `tasks.events` backfill);
+once the task reaches a terminal state it switches to the durable `RunSummary`
+persisted in `task.output.result`, rendered as the same human-readable agent log
+(messages, reasoning, tool cards, usage, errors, run boundary) so it survives a
+reload or daemon restart — the ephemeral live feed does not. The raw output and
+the envelope summary remain reachable from a disclosure inside that section.
+Agents with no structured feed or summary keep the plain-text `OutputViewer`.
 
 Markdown rendering uses a WASM-friendly Rust parser; the DAG view is emitted as
 SVG directly by Dioxus.

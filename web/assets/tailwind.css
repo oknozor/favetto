@@ -1657,7 +1657,7 @@
     color: inherit;
     font: inherit;
   }
-  .agent-feed-section {
+  .task-output {
     margin-top: var(--space-5);
   }
   .agent-feed-wrap {
