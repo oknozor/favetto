@@ -1325,6 +1325,11 @@
     color: var(--muted);
     font-size: var(--text-sm);
   }
+  .catalog-count {
+    margin: var(--space-2) 0 0;
+    color: var(--muted);
+    font-size: var(--text-sm);
+  }
   @media (min-width: 768px) {
     .repo-switcher {
       margin-top: auto;
