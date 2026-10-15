@@ -253,37 +253,36 @@ impl Agent for OpenCodeAgent {
         })
     }
 
-    /// Ask the managed server (when there is one) about the task's session,
-    /// rather than waiting for the TUI to exit. The server tracks a per-session
-    /// `outcome` ("succeeded"/"failed") once a turn completes.
+    /// Ask the managed server (when there is one) whether the task's session has
+    /// finished its turn, rather than waiting for the TUI to exit.
     ///
-    /// `opencode api GET /api/session` returns every session with its
-    /// `location.directory` and `time.created`; we keep the newest one created in
-    /// this task's working directory at or after `since`, so a leftover session
-    /// from an earlier run in the same directory cannot be mistaken for this one.
-    fn interactive_turn_done(&self, cwd: &Path, since: DateTime<Utc>) -> Option<bool> {
-        let mut cmd = std::process::Command::new(&self.template.config.command);
-        cmd.args(["api"]);
-        if let Some(endpoint) = server::endpoint() {
-            cmd.args(["--server", &endpoint.url]);
-            cmd.env("OPENCODE_SERVER_PASSWORD", &endpoint.password);
-        }
-        let out = cmd
-            .args(["GET", "/api/session"])
-            .current_dir(cwd)
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        // opencode resolves the directory it was launched in; canonicalize ours
-        // too so a symlinked path (e.g. `/tmp` on some hosts) compares equal.
-        let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-        interactive_turn_done_from_json(
-            &String::from_utf8_lossy(&out.stdout),
-            &cwd,
-            since.timestamp_millis(),
-        )
+    /// With a resolved `session_id` the probe targets exactly that session;
+    /// otherwise it falls back to the newest session created in `cwd` at/after
+    /// `since`. Either way the verdict comes from the session's **newest
+    /// message**: only a terminal `idle` message ends the turn, so an interim
+    /// `idle` written when opencode recovers from a provider/model error is
+    /// superseded by the messages that follow it and never finalizes the task.
+    fn interactive_turn_done(
+        &self,
+        session_id: Option<&str>,
+        cwd: &Path,
+        since: DateTime<Utc>,
+    ) -> Option<bool> {
+        let program = &self.template.config.command;
+        let session_id = match session_id {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => {
+                let raw = opencode_api(program, &["GET", "/api/session"], cwd)?;
+                // opencode resolves the directory it was launched in;
+                // canonicalize ours too so a symlinked path (e.g. `/tmp` on some
+                // hosts) compares equal.
+                let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+                newest_session_id_from_json(&raw, &cwd, since.timestamp_millis())?
+            }
+        };
+        let path = latest_message_path(&session_id);
+        let raw = opencode_api(program, &["GET", &path], cwd)?;
+        terminal_outcome_from_latest_message(&raw)
     }
 }
 
@@ -313,10 +312,26 @@ fn insert_server_args(
     }
 }
 
-/// Parse `opencode api GET /api/session` output and report the newest session in
-/// `cwd` created at or after `since_ms`: `None` while it is still running (no
-/// `outcome`), otherwise whether it succeeded.
-fn interactive_turn_done_from_json(raw: &str, cwd: &Path, since_ms: i64) -> Option<bool> {
+/// Run `opencode api <args>` (against the managed server when one is running)
+/// and return its stdout on success.
+fn opencode_api(program: &str, args: &[&str], cwd: &Path) -> Option<String> {
+    let mut cmd = std::process::Command::new(program);
+    cmd.arg("api");
+    if let Some(endpoint) = server::endpoint() {
+        cmd.args(["--server", &endpoint.url]);
+        cmd.env("OPENCODE_SERVER_PASSWORD", &endpoint.password);
+    }
+    let out = cmd.args(args).current_dir(cwd).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Pick the id of the newest session in `cwd` created at/after `since_ms` from
+/// `opencode api GET /api/session` output; a leftover session from an earlier
+/// run in the same directory is ignored.
+fn newest_session_id_from_json(raw: &str, cwd: &Path, since_ms: i64) -> Option<String> {
     let cwd = cwd.to_string_lossy();
     let response: serde_json::Value = serde_json::from_str(raw).ok()?;
     let sessions = response.get("data")?.as_array()?;
@@ -325,12 +340,41 @@ fn interactive_turn_done_from_json(raw: &str, cwd: &Path, since_ms: i64) -> Opti
             .and_then(|t| t.as_i64())
             .unwrap_or(i64::MIN)
     };
-    let session = sessions
+    sessions
         .iter()
         .filter(|s| s.pointer("/location/directory").and_then(|d| d.as_str()) == Some(cwd.as_ref()))
         .filter(|s| created_ms(s) >= since_ms)
-        .max_by_key(|s| created_ms(s))?;
-    let outcome = session.get("outcome").and_then(|o| o.as_str())?;
+        .max_by_key(|s| created_ms(s))
+        .and_then(|s| s.get("id").and_then(|v| v.as_str()))
+        .map(str::to_string)
+        .filter(|id| !id.is_empty())
+}
+
+/// The `opencode api` path that fetches a session's newest message.
+fn latest_message_path(session_id: &str) -> String {
+    format!(
+        "/api/session/{}/message?order=desc&limit=1",
+        server::encode_segment(session_id)
+    )
+}
+
+/// Decide whether a session's turn is finished from
+/// `opencode api GET /api/session/{id}/message` output. Only the newest message
+/// matters: a terminal `idle` yields `Some(success)`; anything else (an
+/// assistant/tool/switched message still streaming) means the turn is in flight
+/// and yields `None`.
+fn terminal_outcome_from_latest_message(raw: &str) -> Option<bool> {
+    let response: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let messages = response.get("data")?.as_array()?;
+    let latest = messages.iter().max_by_key(|m| {
+        m.pointer("/time/created")
+            .and_then(|t| t.as_i64())
+            .unwrap_or(i64::MIN)
+    })?;
+    if latest.get("type").and_then(|t| t.as_str()) != Some("idle") {
+        return None;
+    }
+    let outcome = latest.get("outcome").and_then(|o| o.as_str())?;
     Some(outcome == "succeeded")
 }
 
@@ -975,74 +1019,121 @@ mod tests {
         assert!(agent().awaiting_input(parser.screen()).is_none());
     }
 
-    /// A session still in flight has no `outcome` (it is not a required field):
-    /// the probe must not report it as finished, or an interactive task would
-    /// complete before doing any work.
+    /// The newest message decides the turn: anything other than a terminal
+    /// `idle` (an assistant/tool/switched message still streaming) means it is
+    /// in flight, so the probe must keep waiting.
     #[test]
-    fn interactive_turn_done_ignores_a_session_without_outcome() {
-        let raw = r#"{"data":[{"id":"ses_1",
-            "location":{"directory":"/work/a"},
-            "time":{"created":2000}}]}"#;
+    fn terminal_outcome_waits_without_a_terminal_idle() {
+        let raw = r#"{"data":[{"id":"msg_2","time":{"created":2000},
+            "type":"assistant","content":[]}]}"#;
+        assert_eq!(terminal_outcome_from_latest_message(raw), None);
+
+        // An `idle` with no outcome is not a verdict either.
+        let no_outcome = r#"{"data":[{"id":"msg_1","time":{"created":2000},"type":"idle"}]}"#;
+        assert_eq!(terminal_outcome_from_latest_message(no_outcome), None);
+
+        assert_eq!(terminal_outcome_from_latest_message("not json"), None);
+        assert_eq!(terminal_outcome_from_latest_message("{}"), None);
+    }
+
+    /// Regression for #311: opencode writes an interim `idle outcome="failed"`
+    /// when a provider/model error occurs and then recovers, so only the newest
+    /// message matters. A superseded idle must not finalize the task.
+    #[test]
+    fn terminal_outcome_ignores_a_superseded_idle() {
+        // The reported transcript: error idle, then the agent keeps working,
+        // then the real terminal idle.
+        let recovered = r#"{"data":[
+            {"id":"msg_1","time":{"created":1000},"type":"idle","outcome":"failed"},
+            {"id":"msg_2","time":{"created":1001},"type":"assistant"},
+            {"id":"msg_3","time":{"created":2000},"type":"idle","outcome":"succeeded"}
+        ]}"#;
+        assert_eq!(terminal_outcome_from_latest_message(recovered), Some(true));
+
+        // Still inside the recovered turn: the newest message is work, not idle.
+        let in_flight = r#"{"data":[
+            {"id":"msg_1","time":{"created":1000},"type":"idle","outcome":"failed"},
+            {"id":"msg_2","time":{"created":2000},"type":"assistant"}
+        ]}"#;
+        assert_eq!(terminal_outcome_from_latest_message(in_flight), None);
+
+        // The newest message ordering is by `time.created`, not array order.
+        let unsorted = r#"{"data":[
+            {"id":"msg_3","time":{"created":2000},"type":"idle","outcome":"succeeded"},
+            {"id":"msg_1","time":{"created":1000},"type":"idle","outcome":"failed"}
+        ]}"#;
+        assert_eq!(terminal_outcome_from_latest_message(unsorted), Some(true));
+    }
+
+    /// The exact-session probe fetches only that session's newest message.
+    #[test]
+    fn latest_message_path_targets_the_session() {
         assert_eq!(
-            interactive_turn_done_from_json(raw, Path::new("/work/a"), 1000),
-            None
+            latest_message_path("ses_abc"),
+            "/api/session/ses_abc/message?order=desc&limit=1"
+        );
+        // Reserved bytes in an id are percent-encoded.
+        assert_eq!(
+            latest_message_path("a/b"),
+            "/api/session/a%2Fb/message?order=desc&limit=1"
         );
     }
 
     #[test]
-    fn interactive_turn_done_reads_the_outcome() {
-        let raw = r#"{"data":[
-            {"id":"ses_old","outcome":"succeeded",
-             "location":{"directory":"/work/a"},"time":{"created":100}},
-            {"id":"ses_new","outcome":"succeeded",
-             "location":{"directory":"/work/a"},"time":{"created":2000}}
-        ]}"#;
-        assert_eq!(
-            interactive_turn_done_from_json(raw, Path::new("/work/a"), 1000),
-            Some(true)
-        );
-
-        // Any other terminal outcome (`failed`, `interrupted`) is not a success.
-        for outcome in ["failed", "interrupted"] {
-            let other = raw.replace(
-                "\"ses_new\",\"outcome\":\"succeeded\"",
-                &format!("\"ses_new\",\"outcome\":\"{outcome}\""),
+    fn terminal_outcome_reads_success_and_failure() {
+        for (outcome, expected) in [
+            ("succeeded", true),
+            ("failed", false),
+            ("interrupted", false),
+        ] {
+            let raw = format!(
+                r#"{{"data":[{{"id":"msg_1","time":{{"created":2000}},"type":"idle","outcome":"{outcome}"}}]}}"#
             );
             assert_eq!(
-                interactive_turn_done_from_json(&other, Path::new("/work/a"), 1000),
-                Some(false),
+                terminal_outcome_from_latest_message(&raw),
+                Some(expected),
                 "outcome: {outcome}"
             );
         }
     }
 
-    /// A finished session from an earlier run in the same directory must not
-    /// complete the current task: only sessions created at/after `since` count.
+    /// Only the task's own session id is targeted; `cwd`/`since` fall back to
+    /// the newest session created in the working directory.
     #[test]
-    fn interactive_turn_done_ignores_sessions_older_than_since() {
-        let raw = r#"{"data":[{"id":"ses_old","outcome":"succeeded",
-            "location":{"directory":"/work/a"},
-            "time":{"created":100}}]}"#;
+    fn newest_session_targets_the_directory_since_window() {
+        let raw = r#"{"data":[
+            {"id":"ses_old","location":{"directory":"/work/a"},"time":{"created":100}},
+            {"id":"ses_new","location":{"directory":"/work/a"},"time":{"created":2000}},
+            {"id":"ses_other","location":{"directory":"/work/b"},"time":{"created":3000}}
+        ]}"#;
         assert_eq!(
-            interactive_turn_done_from_json(raw, Path::new("/work/a"), 1000),
+            newest_session_id_from_json(raw, Path::new("/work/a"), 1000).as_deref(),
+            Some("ses_new")
+        );
+        // A session older than `since` is ignored even in the right directory.
+        assert_eq!(
+            newest_session_id_from_json(raw, Path::new("/work/a"), 2500),
             None
         );
         // A different directory is ignored even when newer.
-        let other = raw.replace("/work/a", "/work/b");
         assert_eq!(
-            interactive_turn_done_from_json(&other, Path::new("/work/a"), 1000),
+            newest_session_id_from_json(raw, Path::new("/work/c"), 1000),
             None
+        );
+        assert_eq!(
+            newest_session_id_from_json(raw, Path::new("/work/b"), 1000).as_deref(),
+            Some("ses_other")
         );
     }
 
     #[test]
-    fn interactive_turn_done_rejects_malformed_output() {
+    fn newest_session_rejects_malformed_output() {
         assert_eq!(
-            interactive_turn_done_from_json("not json", Path::new("/work/a"), 0),
+            newest_session_id_from_json("not json", Path::new("/work/a"), 0),
             None
         );
         assert_eq!(
-            interactive_turn_done_from_json("{}", Path::new("/work/a"), 0),
+            newest_session_id_from_json("{}", Path::new("/work/a"), 0),
             None
         );
     }

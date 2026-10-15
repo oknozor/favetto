@@ -2011,7 +2011,7 @@ async fn run_one_runs_user_started_tasks_interactively() {
 /// Regression: a user-started interactive task whose TUI never exits must still
 /// complete once the agent finishes the seeded turn, so its `spawn` successors
 /// are launched. The fake `opencode` stays alive for the TUI but answers the
-/// turn-completion probe with a `succeeded` session outcome.
+/// turn-completion probe with a terminal `idle` message.
 #[cfg(unix)]
 #[tokio::test]
 async fn run_one_finishes_a_live_interactive_task_and_spawns() {
@@ -2025,7 +2025,12 @@ async fn run_one_finishes_a_live_interactive_task_and_spawns() {
     let script = dir.join("fake-opencode.sh");
     let script_body = r#"#!/bin/sh
 if [ "$1" = "api" ]; then
-  printf '{"data":[{"id":"ses_fake","outcome":"succeeded","location":{"directory":"%s"},"time":{"created":%s}}]}' "$(pwd)" "$(date +%s%3N)"
+  case "$*" in
+    *message*)
+      printf '{"data":[{"id":"msg_1","type":"idle","outcome":"succeeded","time":{"created":%s}}]}' "$(date +%s%3N)" ;;
+    *)
+      printf '{"data":[{"id":"ses_fake","outcome":"succeeded","location":{"directory":"%s"},"time":{"created":%s}}]}' "$(pwd)" "$(date +%s%3N)" ;;
+  esac
   exit 0
 fi
 printf 'FAKE-OPENCODE-TUI\n'

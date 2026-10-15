@@ -153,9 +153,11 @@ How a catalog task runs depends on who started it. A task you start from the
 prompt (`prompt_args` plus `submit_prompt`, or the prompt on stdin); the Agent
 panel attaches to that single session live and writable. The task finishes as
 soon as the agent completes the seeded turn, so its `spawn`/`needs` successors
-fire without you having to quit the TUI: the daemon asks the agent's own session
-store whether that turn is done (opencode's per-session `outcome`) and keeps the
-TUI open afterwards for inspection, so you can still interact with it by hand.
+fire without you having to quit the TUI: the daemon asks the task's own agent
+session for its newest message and treats the turn as done only when that
+message is a terminal `idle` (opencode), so an interim error that the agent
+recovers from never finalizes the task; it keeps the TUI open afterwards for
+inspection, so you can still interact with it by hand.
 An agent whose interactive mode exits on its own finishes the task at exit
 instead. A task started programmatically — by a schedule, a webhook/hook,
 `needs`, or `spawn` — runs headless, using `headless_args` (or `run_args` when a
