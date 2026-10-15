@@ -185,9 +185,9 @@ dx serve --platform android --features mobile --device
 
 ### Package a release APK
 
-A release APK is roughly 15–30 MB; the default debug APK is ~200 MB because its
-Gradle `debug` build type keeps the Rust debug symbols (`jniLibs.keepDebugSymbols`)
-and disables minification.
+A release APK is roughly 15 MB (the current app builds to ~13 MiB); the default
+debug APK is ~200 MB because its Gradle `debug` build type keeps the Rust debug
+symbols (`jniLibs.keepDebugSymbols`) and disables minification.
 
 Getting a release APK takes **both** `--release` **and** an Android signing
 config, because `dx` 0.7.10 only runs Gradle `assembleRelease` when the build is
