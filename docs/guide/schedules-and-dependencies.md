@@ -108,6 +108,44 @@ triage → plan → implement pipeline fully declarative:
 2. each **plan** writes a handoff file and `spawn`s **implement**;
 3. **implement** opens the pull request.
 
+## Poll and gate with an action
+
+An agent step always runs, so "poll, then only continue when there is work" would
+burn an agent run even on an empty poll. A `kind = "action"` task does the check
+deterministically and gates its `spawn` with an `[action.when]` predicate:
+
+```md
+kind = "action"
+schedule = "0 */15 * * * *"
+worktree = false
+spawn = "triage_issues"
+spawn_file = ".favetto/gates/{{ task.id }}/handoff.json"
+
+[action]
+id = "http.request"
+
+[action.params]
+method = "GET"
+url = "https://api.github.com/repos/oknozor/favetto/issues"
+query = { state = "open" }
+headers = { Accept = "application/vnd.github+json", Authorization = "Bearer $GITHUB_TOKEN" }
+timeout_ms = 15000
+
+[action.when]
+path = "items"
+op = "not_empty"
+---
+Poll the GitHub issues API; when open issues exist, start `triage_issues`.
+```
+
+When the response has no items the task still **succeeds** but enqueues nothing,
+just like an empty `[]` manifest — so a fan-in on `triage_issues` (for example
+`needs = "triage_issues:all_finished"`) still resolves. When items are present,
+the child is enqueued with the gate run's lineage. Header values may interpolate
+`$GITHUB_TOKEN` from the daemon's environment, so the token never lives in the
+task file. See [Action tasks](../reference/tasks#action-tasks-kind-action) for
+the full `http.request` parameter list and the predicate operators.
+
 ## Wait for every instance (fan-in)
 
 A fan-out has no built-in join: `needs = "<task>:finished"` starts its successor

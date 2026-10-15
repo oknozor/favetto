@@ -2,6 +2,7 @@
 //! header.
 //!
 //! ```md
+//! kind = "agent"                         # optional — "agent" (default) or "action"
 //! agent = "opencode"                     # optional — external agent
 //! provider = "jev"                       # optional — model provider
 //! model = "1.13"                         # optional — model id (uses run_args)
@@ -14,6 +15,8 @@
 //! spawn = "child_task"                   # optional — fan out from a handoff file
 //! spawn_file = ".favetto/{{ task.id }}/manifest.json"  # array → one child per item
 //! spawn_new_root = true                  # optional — each child starts its own workflow root
+//! [action]                               # only for kind = "action"
+//! id = "http.request"                    #   a built-in in-daemon step
 //! ---
 //! You are an engineering agent…
 //! ```
@@ -40,13 +43,136 @@ use crate::config::GitSigning;
 // The pure value types moved to `favetto-wire`; keep the old paths resolving.
 pub use favetto_wire::task_var::{TaskVar, VarType};
 
+/// How a catalog task runs.
+///
+/// `agent` (the default) launches an external agent CLI through the executor;
+/// `action` runs a built-in, deterministic in-daemon step (e.g. `http.request`)
+/// and never starts an agent or a PTY session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskKind {
+    /// Run through an external agent CLI (the default).
+    #[default]
+    Agent,
+    /// Run a built-in, deterministic action inside the daemon.
+    Action,
+}
+
+impl TaskKind {
+    /// The header/wire spelling, `"agent"` or `"action"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskKind::Agent => "agent",
+            TaskKind::Action => "action",
+        }
+    }
+}
+
+/// A comparison operator for a structured `[action.when]` predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WhenOp {
+    /// The resolved value is non-null and not empty.
+    NotEmpty,
+    /// The resolved value is missing, null, or empty.
+    Empty,
+    /// The resolved value equals `value`.
+    Eq,
+    /// The resolved value differs from `value`.
+    Ne,
+    /// The resolved value is greater than `value`.
+    Gt,
+    /// The resolved value is less than `value`.
+    Lt,
+    /// A string contains `value`, an array holds `value`, or an object has the key `value`.
+    Contains,
+}
+
+impl WhenOp {
+    /// The header spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WhenOp::NotEmpty => "not_empty",
+            WhenOp::Empty => "empty",
+            WhenOp::Eq => "eq",
+            WhenOp::Ne => "ne",
+            WhenOp::Gt => "gt",
+            WhenOp::Lt => "lt",
+            WhenOp::Contains => "contains",
+        }
+    }
+
+    /// Whether the operator requires a `value` operand.
+    pub fn needs_value(self) -> bool {
+        !matches!(self, WhenOp::NotEmpty | WhenOp::Empty)
+    }
+}
+
+/// A declarative predicate over an action's result, used to gate `spawn`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct WhenPredicate {
+    /// Dot path (or `/`-prefixed JSON Pointer) into the action's `outputs`.
+    pub path: String,
+    /// Comparison applied to the resolved value.
+    pub op: WhenOp,
+    /// Comparison operand for the operators that need one.
+    #[serde(default)]
+    pub value: Option<toml::Value>,
+}
+
+/// A built-in action a `kind = "action"` task runs, from the `[action]` table.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ActionDef {
+    /// Registry id, e.g. `http.request`.
+    pub id: String,
+    /// Action parameters (`[action.params]`). Empty when the table is absent.
+    #[serde(default)]
+    pub params: toml::Table,
+    /// Optional predicate that gates `spawn` on the action's result.
+    #[serde(default)]
+    pub when: Option<WhenPredicate>,
+    /// Optional JSON value used as the single spawned child's `input`
+    /// (`[action.spawn_input]`). Defaults to `{}`.
+    #[serde(default)]
+    pub spawn_input: Option<toml::Value>,
+}
+
+/// Convert a [`toml::Value`] into the equivalent [`serde_json::Value`].
+///
+/// TOML has no `null` and its datetime is a distinct type; a datetime renders as
+/// its string form. Used to hand action parameters to the JSON-based runtime.
+pub fn toml_to_json(value: &toml::Value) -> serde_json::Value {
+    match value {
+        toml::Value::String(s) => serde_json::Value::String(s.clone()),
+        toml::Value::Integer(i) => serde_json::Value::Number((*i).into()),
+        toml::Value::Float(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        toml::Value::Boolean(b) => serde_json::Value::Bool(*b),
+        toml::Value::Datetime(dt) => serde_json::Value::String(dt.to_string()),
+        toml::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(toml_to_json).collect())
+        }
+        toml::Value::Table(table) => serde_json::Value::Object(
+            table
+                .iter()
+                .map(|(key, value)| (key.clone(), toml_to_json(value)))
+                .collect(),
+        ),
+    }
+}
+
 /// A task definition from a `*.md` file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TaskDef {
     /// Path relative to the tasks root, without the `.md` extension,
     /// `/`-separated (e.g. `pipelines/plan`). A root-level file keeps its bare
     /// stem.
     pub name: String,
+    /// How the task runs: through an agent (default) or a built-in action.
+    pub kind: TaskKind,
+    /// The built-in action to run when `kind == "action"`.
+    pub action: Option<ActionDef>,
     /// Optional external agent name from `[agents.*]`. Overrides the global default.
     pub agent: Option<String>,
     /// Optional model provider (e.g. `"jev"`), substituted as `{provider}`.
@@ -91,6 +217,10 @@ pub struct TaskDef {
 
 #[derive(Debug, Deserialize)]
 struct Header {
+    #[serde(default)]
+    kind: TaskKind,
+    #[serde(default)]
+    action: Option<ActionDef>,
     #[serde(default)]
     agent: Option<String>,
     #[serde(default)]
@@ -217,6 +347,55 @@ fn validate_needs(needs: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Validate a `kind` / `[action]` / agent header combination.
+///
+/// `kind = "action"` requires an `[action]` table with a non-empty `id` and
+/// forbids `agent` / `provider` / `model`; a predicate's `value` must be present
+/// exactly for the operators that compare against one. An `[action]` table on an
+/// agent task is rejected. Returning `Err` makes `reload_catalog` keep the
+/// previous definition.
+fn validate_action(
+    kind: TaskKind,
+    agent: Option<&str>,
+    provider: Option<&str>,
+    model: Option<&str>,
+    action: Option<&ActionDef>,
+) -> anyhow::Result<()> {
+    match kind {
+        TaskKind::Agent => {
+            if action.is_some() {
+                anyhow::bail!("an [action] table requires kind = \"action\"");
+            }
+        }
+        TaskKind::Action => {
+            let Some(action) = action else {
+                anyhow::bail!("kind = \"action\" requires an [action] table with an `id`");
+            };
+            if agent.is_some() || provider.is_some() || model.is_some() {
+                anyhow::bail!("kind = \"action\" must not set `agent`, `provider`, or `model`");
+            }
+            if action.id.trim().is_empty() {
+                anyhow::bail!("[action].id must not be empty");
+            }
+            if let Some(when) = &action.when {
+                if when.path.trim().is_empty() {
+                    anyhow::bail!("[action.when].path must not be empty");
+                }
+                if when.op.needs_value() && when.value.is_none() {
+                    anyhow::bail!(
+                        "[action.when] op \"{}\" requires a `value`",
+                        when.op.as_str()
+                    );
+                }
+                if !when.op.needs_value() && when.value.is_some() {
+                    anyhow::bail!("[action.when] op \"{}\" takes no `value`", when.op.as_str());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parse a task definition from Markdown + TOML front-matter.
 pub fn parse_task_md(name: &str, content: &str) -> anyhow::Result<TaskDef> {
     let mut header_lines: Vec<&str> = Vec::new();
@@ -238,9 +417,18 @@ pub fn parse_task_md(name: &str, content: &str) -> anyhow::Result<TaskDef> {
 
     validate_vars(&header.vars)?;
     validate_needs(header.needs.as_deref())?;
+    validate_action(
+        header.kind,
+        header.agent.as_deref(),
+        header.provider.as_deref(),
+        header.model.as_deref(),
+        header.action.as_ref(),
+    )?;
 
     Ok(TaskDef {
         name: name.to_string(),
+        kind: header.kind,
+        action: header.action,
         agent: header.agent,
         provider: header.provider,
         model: header.model,
@@ -260,6 +448,9 @@ pub fn parse_task_md(name: &str, content: &str) -> anyhow::Result<TaskDef> {
 /// Serialize a task definition back to Markdown.
 pub fn to_markdown(def: &TaskDef) -> String {
     let mut out = String::new();
+    if def.kind == TaskKind::Action {
+        out.push_str("kind = \"action\"\n");
+    }
     if let Some(a) = &def.agent {
         out.push_str(&format!("agent = {a:?}\n"));
     }
@@ -299,6 +490,30 @@ pub fn to_markdown(def: &TaskDef) -> String {
     // the global `[executor].worktree`.
     if def.worktree == Some(false) {
         out.push_str("worktree = false\n");
+    }
+    // The `[action]` table is emitted after every top-level scalar, so its
+    // header does not capture the remaining keys. `[[vars]]` is an absolute
+    // table path, so it stays top-level even when emitted afterwards.
+    if let Some(action) = &def.action {
+        out.push_str("[action]\n");
+        out.push_str(&format!("id = {:?}\n", action.id));
+        if let Some(spawn_input) = &action.spawn_input {
+            out.push_str(&format!("spawn_input = {spawn_input}\n"));
+        }
+        if !action.params.is_empty() {
+            out.push_str("\n[action.params]\n");
+            for (key, value) in &action.params {
+                out.push_str(&format!("{key} = {value}\n"));
+            }
+        }
+        if let Some(when) = &action.when {
+            out.push_str("\n[action.when]\n");
+            out.push_str(&format!("path = {:?}\n", when.path));
+            out.push_str(&format!("op = {:?}\n", when.op.as_str()));
+            if let Some(value) = &when.value {
+                out.push_str(&format!("value = {value}\n"));
+            }
+        }
     }
     // Array-of-tables must come after every scalar key, so `[[vars]]` is emitted
     // last in the header.
@@ -726,9 +941,119 @@ mod tests {
     }
 
     #[test]
+    fn parses_and_round_trips_an_action_task() {
+        let def = parse_task_md(
+            "gates/new_issues",
+            "kind = \"action\"\nschedule = \"0 */15 * * * *\"\nworktree = false\n\
+             spawn = \"triage\"\nspawn_file = \".favetto/gates/{{ task.id }}/handoff.json\"\n\
+             \n[action]\nid = \"http.request\"\n\n[action.params]\n\
+             method = \"GET\"\nurl = \"https://api.github.com/repos/o/r/issues\"\n\
+             query = { state = \"open\" }\nheaders = { Accept = \"application/vnd.github+json\" }\n\
+             timeout_ms = 15000\n\
+             [action.spawn_input]\nissue_id = 7\n\n[action.when]\npath = \"items\"\nop = \"not_empty\"\n---\nbody\n",
+        )
+        .unwrap();
+        assert_eq!(def.kind, TaskKind::Action);
+        assert_eq!(def.agent, None);
+        assert_eq!(def.spawn.as_deref(), Some("triage"));
+        let action = def.action.as_ref().expect("action table");
+        assert_eq!(action.id, "http.request");
+        assert_eq!(action.params["method"], toml::Value::String("GET".into()));
+        assert_eq!(action.params["timeout_ms"], toml::Value::Integer(15000));
+        assert_eq!(
+            action.spawn_input,
+            Some(toml::Value::Table(toml::toml! { issue_id = 7 }))
+        );
+        let when = action.when.as_ref().expect("when predicate");
+        assert_eq!(when.path, "items");
+        assert_eq!(when.op, WhenOp::NotEmpty);
+        assert!(when.value.is_none());
+
+        // The header round-trips, including the nested params and predicate.
+        let md = to_markdown(&def);
+        assert!(md.contains("kind = \"action\""), "{md}");
+        assert!(md.contains("[action]"), "{md}");
+        assert!(md.contains("[action.params]"), "{md}");
+        assert!(md.contains("[action.when]"), "{md}");
+        let reparsed = parse_task_md("gates/new_issues", &md).unwrap();
+        assert_eq!(reparsed, def);
+    }
+
+    #[test]
+    fn parses_action_when_comparison_with_a_value() {
+        let def = parse_task_md(
+            "t",
+            "kind = \"action\"\n[action]\nid = \"http.request\"\n\
+             [action.when]\npath = \"status\"\nop = \"eq\"\nvalue = 200\n---\n",
+        )
+        .unwrap();
+        let when = def.action.as_ref().unwrap().when.clone().unwrap();
+        assert_eq!(when.op, WhenOp::Eq);
+        assert_eq!(when.value, Some(toml::Value::Integer(200)));
+        assert!(to_markdown(&def).contains("value = 200"));
+    }
+
+    #[test]
+    fn rejects_invalid_action_headers() {
+        // kind = action without an [action] table.
+        assert!(parse_task_md("t", "kind = \"action\"\n---\nbody\n").is_err());
+        // kind = action with an agent.
+        assert!(parse_task_md(
+            "t",
+            "kind = \"action\"\nagent = \"x\"\n[action]\nid = \"http.request\"\n---\nbody\n"
+        )
+        .is_err());
+        // An empty action id.
+        assert!(parse_task_md("t", "kind = \"action\"\n[action]\nid = \"\"\n---\nbody\n").is_err());
+        // An [action] table on an agent task.
+        assert!(parse_task_md(
+            "t",
+            "agent = \"x\"\n[action]\nid = \"http.request\"\n---\nbody\n"
+        )
+        .is_err());
+        // A comparison op without a value.
+        assert!(parse_task_md(
+            "t",
+            "kind = \"action\"\n[action]\nid = \"http.request\"\n[action.when]\npath = \"x\"\nop = \"eq\"\n---\n"
+        )
+        .is_err());
+        // A value on an op that takes none.
+        assert!(parse_task_md(
+            "t",
+            "kind = \"action\"\n[action]\nid = \"http.request\"\n[action.when]\npath = \"x\"\nop = \"not_empty\"\nvalue = 1\n---\n"
+        )
+        .is_err());
+        // An unknown action id is a runtime concern, not a parse error.
+        assert!(parse_task_md(
+            "t",
+            "kind = \"action\"\n[action]\nid = \"mystery\"\n---\nbody\n"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn agent_task_markdown_is_unchanged_by_the_kind_field() {
+        // A legacy agent file parses with the default kind and serializes
+        // without a `kind`/`[action]` block, so old files round-trip verbatim.
+        let def = parse_task_md(
+            "t",
+            "agent = \"opencode\"\nspawn = \"child\"\nspawn_file = \"m.json\"\n---\nbody\n",
+        )
+        .unwrap();
+        assert_eq!(def.kind, TaskKind::Agent);
+        assert!(def.action.is_none());
+        let md = to_markdown(&def);
+        assert!(!md.contains("kind ="), "{md}");
+        assert!(!md.contains("[action]"), "{md}");
+        assert_eq!(parse_task_md("t", &md).unwrap(), def);
+    }
+
+    #[test]
     fn round_trips_through_markdown() {
         let def = TaskDef {
             name: "t".to_string(),
+            kind: TaskKind::Agent,
+            action: None,
             agent: Some("vibe".to_string()),
             provider: Some("jev".to_string()),
             model: Some("1.13".to_string()),
@@ -957,6 +1282,8 @@ mod tests {
         let dir = temp_dir("nested-write");
         let def = TaskDef {
             name: "pipelines/plan".to_string(),
+            kind: TaskKind::Agent,
+            action: None,
             agent: Some("x".to_string()),
             provider: None,
             model: None,
@@ -1111,6 +1438,8 @@ mod tests {
         let dir = temp_dir("write-traversal");
         let def = TaskDef {
             name: "../escape".to_string(),
+            kind: TaskKind::Agent,
+            action: None,
             agent: None,
             provider: None,
             model: None,

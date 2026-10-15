@@ -40,6 +40,7 @@ pub mod template;
 pub use favetto_core::{config, paths, tasks, workflow, ws};
 
 // Daemon internals — not part of the reusable surface.
+mod actions;
 mod agent_hooks;
 mod agents;
 mod attention;

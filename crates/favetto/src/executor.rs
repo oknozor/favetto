@@ -29,12 +29,13 @@ use favetto_core::model::{
     TaskStatus,
 };
 
+use crate::actions::{evaluate_when, ActionContext};
 use crate::agents::{resolve_session_title, Agent, TITLE_POLL_ATTEMPTS, TITLE_POLL_INTERVAL};
 use crate::config::{ExecutorSettings, RetrySettings, StaleRunPolicy};
 use crate::db;
 use crate::event_bus::ServerPush;
 use crate::state::State;
-use crate::tasks::{needs_parts, NeedsKind, TaskDef};
+use crate::tasks::{needs_parts, NeedsKind, TaskDef, TaskKind};
 
 /// The result of an agent run. `failure` is `Some` for a non-zero exit or a
 /// missing session; `session_id`/`session_title` are carried either way so a
@@ -326,20 +327,22 @@ async fn dispatch_loop(state: Arc<State>, cfg: ExecutorSettings) {
             }
 
             let base = resolve_base_dir(&def, &task);
-            let plan =
-                match make_plan(&state, &cfg, &base, &task, def.worktree.unwrap_or(true)).await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        fail_task(
-                            &state,
-                            task,
-                            FailureKind::Infrastructure,
-                            &format!("worktree setup failed: {e}"),
-                        )
-                        .await;
-                        continue;
-                    }
-                };
+            // Action tasks default to no worktree (they run a deterministic,
+            // read-only step); an explicit `worktree = true` still opts in.
+            let worktree_enabled = def.worktree.unwrap_or(def.kind == TaskKind::Agent);
+            let plan = match make_plan(&state, &cfg, &base, &task, worktree_enabled).await {
+                Ok(p) => p,
+                Err(e) => {
+                    fail_task(
+                        &state,
+                        task,
+                        FailureKind::Infrastructure,
+                        &format!("worktree setup failed: {e}"),
+                    )
+                    .await;
+                    continue;
+                }
+            };
 
             // Reserve the directory so same-dir tasks serialize.
             let guard = if plan.needs_lock {
@@ -591,20 +594,33 @@ async fn run_one(
 
     let config = state.config.as_ref().clone();
 
-    let prompt = render_task_prompt(&def, &task);
+    // Actions never launch an agent, so they have no prompt to render.
+    let prompt = match def.kind {
+        TaskKind::Agent => render_task_prompt(&def, &task),
+        TaskKind::Action => String::new(),
+    };
 
     let agent_name = def.agent.clone().or_else(|| config.agent.default.clone());
-    let outcome: Result<RunOutcome, RunError> = match agent_name.as_deref() {
-        Some(name) => run_agent_task(state, &task, name, &def, &prompt, &plan.cwd)
-            .await
-            .map_err(|e| RunError::new(FailureKind::Infrastructure, e.to_string())),
-        None => Err(RunError::new(
-            FailureKind::InvalidInput,
-            format!(
-                "task '{}' has no agent: set `agent` in the task or `[agent].default` in the config",
-                def.name
-            ),
-        )),
+    // The run is attributed to the action id for an action task, else to the
+    // resolved agent. Kept separate from `agent_name` so run history shows both.
+    let runner = match def.kind {
+        TaskKind::Action => def.action.as_ref().map(|action| action.id.clone()),
+        TaskKind::Agent => agent_name.clone(),
+    };
+    let outcome: Result<RunOutcome, RunError> = match def.kind {
+        TaskKind::Action => run_action_task(state, &task, &def, &plan.cwd).await,
+        TaskKind::Agent => match agent_name.as_deref() {
+            Some(name) => run_agent_task(state, &task, name, &def, &prompt, &plan.cwd)
+                .await
+                .map_err(|e| RunError::new(FailureKind::Infrastructure, e.to_string())),
+            None => Err(RunError::new(
+                FailureKind::InvalidInput,
+                format!(
+                    "task '{}' has no agent: set `agent` in the task or `[agent].default` in the config",
+                    def.name
+                ),
+            )),
+        },
     };
 
     // An interactive run that finished its turn keeps its TUI (and therefore its
@@ -647,10 +663,14 @@ async fn run_one(
     finished_run.exit_code = exit_code;
     finished_run.error = task.error.clone();
     finished_run.failure = task.failure.clone();
-    // Attribute the run and persist its per-attempt usage. `agent_name` was
-    // resolved above; `model` is the task's configured model, if any.
-    finished_run.agent = agent_name.clone();
-    finished_run.model = def.model.clone();
+    // Attribute the run and persist its per-attempt usage. `runner` is the
+    // resolved agent name or the action id; `model` is the task's configured
+    // model, if any (action tasks never set one).
+    finished_run.agent = runner.clone();
+    finished_run.model = match def.kind {
+        TaskKind::Agent => def.model.clone(),
+        TaskKind::Action => None,
+    };
     finished_run.usage = usage;
     let _ = db::finalize_task_run(&state.db, &finished_run).await;
 
@@ -708,8 +728,22 @@ async fn run_one(
 
             if success {
                 if let Some(spawn_task) = def.spawn.clone() {
-                    if let Err(e) = spawn_from_manifest(state, &task, &def, &plan.cwd).await {
-                        tracing::warn!(task = %task.name, error = %e, "failed to spawn tasks from handoff");
+                    // An action task gates its spawn on `[action.when]` and writes
+                    // the child manifest itself (default `[{}]`). A false predicate
+                    // enqueues nothing, exactly like an empty `[]` manifest. An
+                    // agent task always proceeds and leaves the manifest to the
+                    // agent.
+                    let gate_open = match action_spawn_ready(&task, &def, &plan.cwd) {
+                        Ok(open) => open,
+                        Err(e) => {
+                            tracing::warn!(task = %task.name, error = %e, "failed to prepare action spawn");
+                            false
+                        }
+                    };
+                    if gate_open {
+                        if let Err(e) = spawn_from_manifest(state, &task, &def, &plan.cwd).await {
+                            tracing::warn!(task = %task.name, error = %e, "failed to spawn tasks from handoff");
+                        }
                     }
                     // The parent's own `TaskFinished` was emitted above, before the
                     // manifest was read, so a fan-in on the spawned child is evaluated
@@ -1047,7 +1081,7 @@ fn bounded_prev_value(value: Option<&serde_json::Value>, cap: usize) -> serde_js
 fn build_task_output(
     raw: &str,
     parsed: &serde_json::Value,
-    agent: &str,
+    agent: Option<&str>,
     session_id: Option<String>,
     session_title: Option<String>,
     max: usize,
@@ -1163,6 +1197,132 @@ async fn spawn_from_manifest(
         }
     }
     Ok(())
+}
+
+/// Whether an action task's `spawn` should proceed, writing the child manifest
+/// when it should. An agent task always proceeds (the agent wrote the manifest).
+///
+/// For an action task the `[action.when]` predicate is evaluated against the
+/// run's stored `envelope.outputs`; when it is false the task still succeeds but
+/// enqueues nothing. When it holds (or there is no predicate) the manifest is
+/// written from `[action.spawn_input]`, defaulting to a single empty child.
+fn action_spawn_ready(task: &Task, def: &TaskDef, cwd: &Path) -> anyhow::Result<bool> {
+    if def.kind != TaskKind::Action {
+        return Ok(true);
+    }
+    if let Some(when) = def.action.as_ref().and_then(|action| action.when.as_ref()) {
+        let outputs = task
+            .output
+            .as_ref()
+            .and_then(|output| output.get("envelope"))
+            .and_then(|envelope| envelope.get("outputs"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        if !evaluate_when(when, &outputs)? {
+            tracing::info!(
+                task = %task.name,
+                "action `when` predicate is false; enqueueing nothing"
+            );
+            return Ok(false);
+        }
+    }
+    write_action_manifest(task, def, cwd)?;
+    Ok(true)
+}
+
+/// Write an action task's child manifest to its rendered `spawn_file`. The
+/// manifest is `[action.spawn_input]` when set, else a single `{}` child, so the
+/// existing `spawn_from_manifest` lineage/dedupe path is reused unchanged.
+fn write_action_manifest(task: &Task, def: &TaskDef, cwd: &Path) -> anyhow::Result<()> {
+    let spawn_file = def
+        .spawn_file
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("task '{}' sets `spawn` but no `spawn_file`", def.name))?;
+    let items = match def
+        .action
+        .as_ref()
+        .and_then(|action| action.spawn_input.as_ref())
+    {
+        Some(value) => vec![crate::tasks::toml_to_json(value)],
+        None => vec![serde_json::json!({})],
+    };
+    let rendered = crate::template::render(spawn_file, &render_context(task));
+    let path = if Path::new(&rendered).is_absolute() {
+        PathBuf::from(&rendered)
+    } else {
+        cwd.join(&rendered)
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            anyhow::anyhow!(
+                "cannot create spawn_file directory {}: {e}",
+                parent.display()
+            )
+        })?;
+    }
+    std::fs::write(&path, serde_json::to_string(&items)?)
+        .map_err(|e| anyhow::anyhow!("cannot write spawn_file {}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// Run a `kind = "action"` task through the built-in action registry. The
+/// outcome is folded into the same `task.output` envelope an agent run produces
+/// (`agent: null`), so `needs` successors and `{{ prev.* }}` keep working.
+async fn run_action_task(
+    state: &Arc<State>,
+    task: &Task,
+    def: &TaskDef,
+    cwd: &Path,
+) -> Result<RunOutcome, RunError> {
+    let action_def = def.action.as_ref().ok_or_else(|| {
+        RunError::new(
+            FailureKind::InvalidInput,
+            format!(
+                "task '{}' is kind = \"action\" but has no [action] table",
+                def.name
+            ),
+        )
+    })?;
+    let action = state.actions.get(&action_def.id).ok_or_else(|| {
+        RunError::new(
+            FailureKind::InvalidInput,
+            format!(
+                "task '{}' references unknown action '{}' (known: {})",
+                def.name,
+                action_def.id,
+                state.actions.ids().join(", ")
+            ),
+        )
+    })?;
+
+    let ctx = ActionContext {
+        params: crate::tasks::toml_to_json(&toml::Value::Table(action_def.params.clone())),
+        cwd: cwd.to_path_buf(),
+        task_id: task.id,
+        max_output_bytes: state.config.executor.max_output_bytes,
+        env: std::env::vars().collect(),
+    };
+    let outcome = action
+        .execute(&ctx)
+        .await
+        .map_err(|e| RunError::new(e.kind, e.message))?;
+
+    let raw = outcome.outputs.to_string();
+    let parsed = serde_json::json!({
+        "summary": outcome.summary,
+        "outputs": outcome.outputs,
+    });
+    let max = state.config.executor.max_output_bytes;
+    let output = build_task_output(&raw, &parsed, None, None, None, max);
+    Ok(RunOutcome {
+        output,
+        session_id: None,
+        session_title: None,
+        exit_code: Some(0),
+        usage: None,
+        failure: None,
+        alive: false,
+    })
 }
 
 /// Run a task through its configured external agent as a real PTY session bound
@@ -1327,7 +1487,7 @@ async fn run_agent_task(
     let output = build_task_output(
         &result.raw,
         &result.output,
-        agent_name,
+        Some(agent_name),
         result.session_id.clone(),
         session_title.clone(),
         max,

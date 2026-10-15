@@ -11,6 +11,7 @@ use parking_lot::RwLock;
 use sqlx::SqlitePool;
 use tokio_cron_scheduler::JobScheduler;
 
+use crate::actions::ActionRegistry;
 use crate::agents::{AgentManager, AgentRegistry};
 use crate::auth::LoginLimiter;
 use crate::config::FavettoConfig;
@@ -36,6 +37,8 @@ pub struct State {
     pub agents: AgentManager,
     /// Configured external agents, resolved once at startup.
     pub registry: AgentRegistry,
+    /// Curated built-in actions a `kind = "action"` task can run.
+    pub actions: ActionRegistry,
     /// Config resolved once at startup (external agents, executor/daemon defaults).
     pub config: Arc<FavettoConfig>,
     /// Directory for SQLite + token + worktrees.
@@ -104,6 +107,7 @@ impl State {
             webhooks: init.webhooks,
             agents,
             registry: init.registry,
+            actions: ActionRegistry::new(),
             config: init.config,
             data_dir: init.data_dir,
             tasks_dir: init.tasks_dir,
