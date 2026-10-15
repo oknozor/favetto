@@ -137,9 +137,11 @@ pub struct WatchRun<'a> {
     pub quiet: Duration,
     /// Whether to mirror awaiting-input transitions onto the task row.
     pub detect: bool,
-    /// The run's working directory; scopes the turn-completion probe.
+    /// The run's working directory; only the fallback probe when no session id
+    /// has been resolved.
     pub cwd: &'a Path,
-    /// When the run started; only sessions created at/after this count.
+    /// When the run started; the fallback probe only considers sessions created
+    /// at/after this count.
     pub since: DateTime<Utc>,
 }
 
@@ -240,10 +242,13 @@ async fn watch_inner(
         if let Some((cwd, since)) = interactive {
             if last_probe.elapsed() >= TURN_PROBE_INTERVAL {
                 last_probe = std::time::Instant::now();
+                // Correlate the probe to the task's own agent session id when the
+                // manager has resolved one, instead of guessing by cwd+time.
+                let session_id = state.agents.external_session_id(session);
                 let probe_agent = agent.clone();
                 let probe_cwd = cwd.to_path_buf();
                 let probe = tokio::task::spawn_blocking(move || {
-                    probe_agent.interactive_turn_done(&probe_cwd, since)
+                    probe_agent.interactive_turn_done(session_id.as_deref(), &probe_cwd, since)
                 });
                 if let Ok(Ok(Some(success))) = tokio::time::timeout(TURN_PROBE_TIMEOUT, probe).await
                 {
@@ -643,12 +648,17 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// Session ids recorded by [`DoneAgent`]'s probe, one per call.
+    type ProbedSessionIds = Arc<std::sync::Mutex<Vec<Option<String>>>>;
+
     /// A test agent whose command stays alive and whose turn-completion probe is
-    /// scripted, so `watch_run` can be exercised without a real CLI.
+    /// scripted, so `watch_run` can be exercised without a real CLI. It records
+    /// the session id handed to each probe.
     struct DoneAgent {
         descriptor: AgentDescriptor,
         script: String,
         done: Option<bool>,
+        probed: ProbedSessionIds,
     }
 
     impl Agent for DoneAgent {
@@ -668,13 +678,32 @@ mod tests {
             })
         }
 
-        fn interactive_turn_done(&self, _cwd: &Path, _since: DateTime<Utc>) -> Option<bool> {
+        fn interactive_turn_done(
+            &self,
+            session_id: Option<&str>,
+            _cwd: &Path,
+            _since: DateTime<Utc>,
+        ) -> Option<bool> {
+            self.probed
+                .lock()
+                .unwrap()
+                .push(session_id.map(str::to_string));
             self.done
         }
     }
 
     fn done_agent(script: &str, done: Option<bool>) -> Arc<dyn Agent> {
-        Arc::new(DoneAgent {
+        done_agent_recording(script, done).0
+    }
+
+    /// Like [`done_agent`], but also returns the handle that records the session
+    /// ids handed to each probe.
+    fn done_agent_recording(
+        script: &str,
+        done: Option<bool>,
+    ) -> (Arc<dyn Agent>, ProbedSessionIds) {
+        let probed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = Arc::new(DoneAgent {
             descriptor: AgentDescriptor {
                 id: "done".to_string(),
                 name: "Done".to_string(),
@@ -684,7 +713,9 @@ mod tests {
             },
             script: script.to_string(),
             done,
-        })
+            probed: probed.clone(),
+        });
+        (agent, probed)
     }
 
     /// Insert a `Running` task row for `watch_run` to reconcile against.
@@ -849,6 +880,63 @@ mod tests {
         .await;
 
         assert_eq!(end, WatchEnd::Exited(Some(0)));
+    }
+
+    /// The turn probe is correlated to the task's own resolved agent session id,
+    /// not guessed from the run's working directory.
+    #[tokio::test]
+    async fn watch_run_probes_the_tasks_own_session() {
+        let state = state_with_sh("exit 0").await;
+        let (agent, probed) = done_agent_recording("while true; do sleep 1; done", Some(true));
+        let task_id = running_task(&state).await;
+
+        // Headless so the manager seeds the caller's deterministic id
+        // synchronously; `watch_run`'s probe path is identical.
+        let info = state
+            .agents
+            .start(
+                "done",
+                agent.clone(),
+                Some(task_id.to_string()),
+                Invocation::Headless {
+                    prompt: "go",
+                    provider: None,
+                    model: None,
+                },
+                AgentContext {
+                    session_id: Some("ses_task".to_string()),
+                    rows: 40,
+                    cols: 120,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            state.agents.external_session_id(&info.id).as_deref(),
+            Some("ses_task")
+        );
+
+        let end = watch_run(
+            &state,
+            WatchRun {
+                session: &info.id,
+                agent,
+                task_id: Some(task_id),
+                quiet: Duration::from_millis(50),
+                detect: true,
+                cwd: Path::new("/tmp"),
+                since: chrono::Utc::now(),
+            },
+        )
+        .await;
+
+        assert_eq!(end, WatchEnd::TurnFinished { success: true });
+        assert_eq!(
+            probed.lock().unwrap().as_slice(),
+            &[Some("ses_task".to_string())],
+            "the probe must receive the task's own session id"
+        );
+        state.agents.close(&info.id).ok();
     }
 
     /// A session with a structured state source drives awaiting-input without

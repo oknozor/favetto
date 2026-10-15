@@ -264,8 +264,12 @@ pub trait Agent: Send + Sync {
     /// Some interactive CLIs (notably opencode) keep their TUI alive after the
     /// agent answers the prompt, so a task would otherwise stay `running` forever
     /// and never fire its `spawn`/`needs` successors. An implementation asks the
-    /// CLI's own session store about the most recent session created in `cwd` at
-    /// or after `since`:
+    /// CLI's own session store about the task's session.
+    ///
+    /// `session_id` is the task's own agent session id, resolved live from the
+    /// run (see [`AgentManager::external_session_id`]); when it is known the probe
+    /// must target exactly that session. `cwd`/`since` remain as a fallback for
+    /// when no id has been resolved yet.
     ///
     /// - `Some(true)` — the turn finished successfully;
     /// - `Some(false)` — the turn finished with a failure;
@@ -274,7 +278,14 @@ pub trait Agent: Send + Sync {
     /// The default returns `None`, so an agent whose interactive mode exits on
     /// its own keeps the exit-based lifecycle. This is a blocking probe: callers
     /// run it off the async runtime.
-    fn interactive_turn_done(&self, _cwd: &Path, _since: DateTime<Utc>) -> Option<bool> {
+    ///
+    /// [`AgentManager::external_session_id`]: crate::agents::AgentManager::external_session_id
+    fn interactive_turn_done(
+        &self,
+        _session_id: Option<&str>,
+        _cwd: &Path,
+        _since: DateTime<Utc>,
+    ) -> Option<bool> {
         None
     }
 }
