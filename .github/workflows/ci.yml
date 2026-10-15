@@ -301,6 +301,14 @@ jobs:
               -storepass "$store_pass" -keypass "$key_pass" \
               -dname "CN=favetto CI"
           fi
+          # Defensive: drop any active `[bundle.android]` table so re-committing
+          # the template can never collide with the table appended below.
+          awk '
+            /^\[bundle\.android\]$/ { skip = 1; next }
+            /^\[/ { skip = 0 }
+            !skip
+          ' Dioxus.toml > Dioxus.toml.ci
+          mv Dioxus.toml.ci Dioxus.toml
           cat >> Dioxus.toml <<EOF
 
           [bundle.android]
