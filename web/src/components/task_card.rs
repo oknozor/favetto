@@ -34,9 +34,12 @@ pub fn TaskCard(
     age: String,
     #[props(default = false)] awaiting: bool,
     #[props(default)] detail: Option<String>,
-    /// The repo namespace (`global` for an unscoped task), shown as a chip.
+    /// The repo namespace, shown as a chip; `None` for a global task.
     #[props(default)]
     repo: Option<String>,
+    /// Catalog-derived metadata chips (`agent:…`, `model:…`, …).
+    #[props(default)]
+    tags: Vec<String>,
 ) -> Element {
     let badge = format!("status-badge status-{}", status.as_str());
     let icon = status_icon(status);
@@ -54,6 +57,9 @@ pub fn TaskCard(
                     }
                     if let Some(repo) = repo {
                         span { class: "task-card-repo", "{repo}" }
+                    }
+                    for tag in tags {
+                        span { class: "tag", "{tag}" }
                     }
                 }
                 div { class: "task-card-meta",
@@ -101,6 +107,8 @@ mod tests {
                     age: "5m".to_string(),
                     awaiting: true,
                     detail: Some("boom".to_string()),
+                    repo: Some("favetto".to_string()),
+                    tags: vec!["agent:claude".to_string()],
                 }
             }
         });

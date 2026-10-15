@@ -243,6 +243,21 @@ impl Cache {
         self.active_repo = active;
     }
 
+    /// Replace the cached catalog (`catalog.list`).
+    ///
+    /// Task rows resolve their metadata chips from this, so the catalog is
+    /// fetched alongside `tasks.list` and degrades to no chips when absent.
+    pub fn set_catalog(&mut self, catalog: Vec<CatalogEntry>) {
+        self.catalog = catalog;
+    }
+
+    /// The cached catalog entry for a task's storage name, if the catalog has
+    /// been loaded. A task and its catalog definition share the same identity
+    /// (`repo:<name>/<path>` for a repo-local task, a bare name otherwise).
+    pub fn catalog_entry(&self, name: &str) -> Option<&CatalogEntry> {
+        self.catalog.iter().find(|entry| entry.name == name)
+    }
+
     /// Whether a row's repo namespace is in scope. With no active repo every
     /// row is visible; otherwise only rows belonging to the active repo are.
     ///
@@ -322,6 +337,23 @@ pub fn task_repo(name: &str) -> Option<&str> {
         None
     } else {
         Some(repo)
+    }
+}
+
+/// The display name for a task: the repo prefix is stripped from a
+/// repo-qualified identity, leaving the bare relative path.
+///
+/// `repo:favetto/triage` → `triage` and `repo:web/pipelines/plan` →
+/// `pipelines/plan`. Bare/global names (`triage`) and malformed repo prefixes
+/// are returned unchanged, so this never hides a name it cannot split.
+pub fn task_display_name(name: &str) -> &str {
+    match task_repo(name) {
+        Some(_) => name
+            .strip_prefix(REPO_PREFIX)
+            .and_then(|rest| rest.split_once('/'))
+            .map(|(_, rel)| rel)
+            .unwrap_or(name),
+        None => name,
     }
 }
 
@@ -771,6 +803,54 @@ mod tests {
         assert_eq!(task_repo("repo:noslash"), None);
         assert_eq!(task_repo("repo:/rel"), None);
         assert_eq!(task_repo("repo:name/"), None);
+    }
+
+    #[test]
+    fn task_display_name_strips_only_well_formed_prefixes() {
+        assert_eq!(task_display_name("repo:favetto/triage"), "triage");
+        assert_eq!(
+            task_display_name("repo:web/pipelines/plan"),
+            "pipelines/plan"
+        );
+        // Bare/global names are untouched.
+        assert_eq!(task_display_name("triage"), "triage");
+        assert_eq!(task_display_name("pipelines/plan"), "pipelines/plan");
+        // Malformed prefixes are left as-is rather than losing the name.
+        assert_eq!(task_display_name("repo:"), "repo:");
+        assert_eq!(task_display_name("repo:noslash"), "repo:noslash");
+        assert_eq!(task_display_name("repo:/rel"), "repo:/rel");
+        assert_eq!(task_display_name("repo:name/"), "repo:name/");
+    }
+
+    #[test]
+    fn set_catalog_replaces_and_looks_up_by_task_name() {
+        let mut cache = Cache::default();
+        let entry: CatalogEntry = serde_json::from_value(serde_json::json!({
+            "name": "repo:favetto/triage",
+            "agent": "claude",
+            "provider": null,
+            "model": null,
+            "cwd": null,
+            "schedule": null,
+            "needs": null,
+            "vars": [],
+            "prompt": "",
+            "repo": "favetto",
+        }))
+        .unwrap();
+        cache.set_catalog(vec![entry]);
+        assert_eq!(cache.catalog.len(), 1);
+        assert_eq!(
+            cache
+                .catalog_entry("repo:favetto/triage")
+                .map(|e| e.agent.as_deref()),
+            Some(Some("claude"))
+        );
+        assert!(cache.catalog_entry("triage").is_none());
+
+        // Replacing with an empty catalog clears the lookup.
+        cache.set_catalog(Vec::new());
+        assert!(cache.catalog_entry("repo:favetto/triage").is_none());
     }
 
     #[test]

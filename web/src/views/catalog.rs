@@ -33,6 +33,14 @@ pub fn tags(entry: &CatalogEntry) -> Vec<String> {
     if let Some(repo) = &entry.repo {
         tags.push(format!("repo:{repo}"));
     }
+    tags.extend(task_tags(entry));
+    tags
+}
+
+/// The metadata chips shared with the task list, excluding the repo tag: a
+/// task row renders the repo as its own chip next to the title.
+pub fn task_tags(entry: &CatalogEntry) -> Vec<String> {
+    let mut tags = Vec::new();
     if let Some(agent) = &entry.agent {
         tags.push(format!("agent:{agent}"));
     }
@@ -250,6 +258,21 @@ mod tests {
         e.needs = Some("plan".into());
         let tags = tags(&e);
         assert!(tags.contains(&"repo:favetto".to_string()));
+        assert!(tags.contains(&"agent:claude".to_string()));
+        assert!(tags.contains(&"provider:anthropic".to_string()));
+        assert!(tags.contains(&"model:opus".to_string()));
+        assert!(tags.contains(&"scheduled".to_string()));
+        assert!(tags.contains(&"pipeline".to_string()));
+        assert!(tags.contains(&"var:repo".to_string()));
+    }
+
+    #[test]
+    fn task_tags_keep_metadata_and_drop_the_repo() {
+        let mut e = entry();
+        e.repo = Some("favetto".into());
+        e.needs = Some("plan".into());
+        let tags = task_tags(&e);
+        assert!(!tags.iter().any(|tag| tag.starts_with("repo:")));
         assert!(tags.contains(&"agent:claude".to_string()));
         assert!(tags.contains(&"provider:anthropic".to_string()));
         assert!(tags.contains(&"model:opus".to_string()));

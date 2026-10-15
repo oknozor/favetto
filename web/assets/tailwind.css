@@ -515,6 +515,12 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .task-row-tags, .task-tags {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-1);
+  }
   .task-row-meta {
     display: flex;
     gap: var(--space-3);
@@ -732,7 +738,7 @@
     flex-wrap: wrap;
     gap: var(--space-1);
   }
-  .catalog-tags .tag {
+  .tag {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: var(--text-xs);
     padding: 0.1rem 0.4rem;
