@@ -130,6 +130,37 @@ runs. Write a short Markdown digest to `reports/daily.md` and reply with the
 highlights.
 ```
 
+## Poll and gate with an action (`kind = "action"`)
+
+A deterministic gate runs no agent: it polls the GitHub issues API and only
+spawns `triage_issues` when the response's `items` array is non-empty. The
+`GITHUB_TOKEN` is read from the daemon's environment by the header value, so the
+secret never lands in the task file.
+
+```md
+kind = "action"
+schedule = "0 */15 * * * *"
+worktree = false
+spawn = "triage_issues"
+spawn_file = ".favetto/gates/{{ task.id }}/handoff.json"
+
+[action]
+id = "http.request"
+
+[action.params]
+method = "GET"
+url = "https://api.github.com/repos/oknozor/favetto/issues"
+query = { state = "open" }
+headers = { Accept = "application/vnd.github+json", Authorization = "Bearer $GITHUB_TOKEN" }
+timeout_ms = 15000
+
+[action.when]
+path = "items"
+op = "not_empty"
+---
+Poll the GitHub issues API; when open issues exist, start `triage_issues`.
+```
+
 ## Read-only task (`worktree = false`)
 
 Planning, triage, and review tasks should not create a worktree or branch.

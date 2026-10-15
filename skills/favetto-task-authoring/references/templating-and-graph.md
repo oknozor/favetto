@@ -63,6 +63,11 @@ element as its `input`. Write `[]` to enqueue nothing.
   descendant, which lets a pipeline restart itself so the child's own
   `:all_finished` fan-in fires freshly.
 
+A `kind = "action"` task gates the same `spawn` with an `[action.when]`
+predicate instead of leaving a handoff file: a false predicate enqueues nothing,
+and a true one writes the child manifest from `[action.spawn_input]` (default
+`[{}]`). See [`task-format.md`](task-format.md#gating-spawn-with-actionwhen).
+
 ## Schedules
 
 `schedule` is a cron expression that registers the task as a recurring
