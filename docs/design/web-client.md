@@ -387,8 +387,10 @@ is exchanged at `POST /pair/exchange`; `POST /pair/generate` is bearer-guarded.
 
 SSE and `ntfy` are complementary, not alternatives:
 
-- **SSE** drives the live in-app experience — inbox badges, the browser
-  `Notification` API while the PWA is open, and instant UI updates.
+- **SSE** drives the live in-app experience — inbox badges, browser/Android
+  system notifications while the app is open (the web build uses the browser
+  `Notification` API; Android posts natively through JNI, see
+  `web/src/android_notify.rs`), and instant UI updates.
 - **SSE cannot wake a closed or backgrounded app.** There is no live connection
   when the tab is not running.
 - **`ntfy`** (already implemented in `notify.rs`, driven by `hooks.upsert` and

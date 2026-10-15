@@ -13,6 +13,12 @@
 
 use std::path::PathBuf;
 
+/// Serializes tests that mutate `FAVETTO_WEB_STATE_DIR`. It is a process-global
+/// environment variable, and the test harness runs tests in parallel threads, so
+/// two tests that set it would otherwise clobber each other's directory.
+#[cfg(test)]
+pub(crate) static TEST_STATE_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The directory state files live in, or `None` when none is available.
 fn state_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("FAVETTO_WEB_STATE_DIR") {
@@ -110,6 +116,7 @@ mod tests {
 
     #[test]
     fn round_trips_through_the_state_dir_override() {
+        let _guard = TEST_STATE_DIR_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("favetto-web-state-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("FAVETTO_WEB_STATE_DIR", &dir);

@@ -10,6 +10,8 @@
 //! The crate is a standalone cargo workspace (excluded from the root
 //! workspace) so the native gates do not need the Dioxus toolchain.
 
+#[cfg(target_os = "android")]
+mod android_notify;
 pub mod app;
 pub mod client;
 pub mod components;

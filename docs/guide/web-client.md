@@ -204,9 +204,16 @@ To produce APKs for all ABIs, run the two commands once per target
 
 ### Permissions
 
-The app declares `POST_NOTIFICATIONS` (Android 13+) so the in-app
-`Notification` API can ask at runtime. This is configured in `web/Dioxus.toml`
-under `[permissions]`; `dx` maps it into the generated `AndroidManifest.xml`.
+The app declares `POST_NOTIFICATIONS` (Android 13+) in `web/Dioxus.toml` under
+`[permissions]`; `dx` maps it into the generated `AndroidManifest.xml`.
+
+On web the browser `Notification` API asks for permission and shows the
+notification. On Android the WebView does not implement that API, so the client
+talks to the platform directly from Rust through JNI
+(`web/src/android_notify.rs`): it requests `POST_NOTIFICATIONS` from the
+`Activity`, posts the notification with `NotificationManager`, and reads the
+tap deep link. Background paging to a closed app still goes through the daemon's
+`ntfy` channel.
 
 ### Soft keyboard
 
