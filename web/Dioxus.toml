@@ -51,11 +51,11 @@ icon = ["assets/icon.png"]
 # directory (`web/`); the keystore is git-ignored (`*.jks`). See
 # docs/guide/web-client.md for how to create it.
 #
-# [bundle.android]
-# jks_file = "favetto-release.jks"
-# jks_password = "..."
-# key_alias = "favetto"
-# key_password = "..."
+[bundle.android]
+jks_file = "favetto-release.jks"
+jks_password = "favetto"
+key_alias = "favetto"
+key_password = "favetto"
 
 # Declare Android 13+ POST_NOTIFICATIONS. `dx` maps `notifications` to
 # `android.permission.POST_NOTIFICATIONS` in the generated AndroidManifest.xml.
