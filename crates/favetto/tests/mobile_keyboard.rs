@@ -79,6 +79,42 @@ fn native_activity_keeps_the_window_metrics_fixed() {
     );
 }
 
+/// `web/Dioxus.toml` must parse as TOML both on its own and after the Android CI
+/// signing step appends its own `[bundle.android]` table. A committed active
+/// table makes the append a duplicate key, and `dx bundle` fails before it
+/// builds the APK.
+#[test]
+fn dioxus_toml_has_no_duplicate_bundle_android_table() {
+    let config = read("web/Dioxus.toml");
+
+    // The committed manifest parses on its own.
+    toml::from_str::<toml::Value>(&config).expect("web/Dioxus.toml must be valid TOML");
+
+    // The CI signing step appends this block verbatim (see
+    // `.github/workflows/ci.yml`). If the committed file already declares the
+    // table, the combination is an invalid TOML duplicate.
+    let ci_signing = concat!(
+        "[bundle.android]\n",
+        "jks_file = \"android-release.jks\"\n",
+        "jks_password = \"ci-password\"\n",
+        "key_alias = \"favetto\"\n",
+        "key_password = \"ci-password\"\n",
+    );
+    let combined = format!("{config}{ci_signing}");
+    toml::from_str::<toml::Value>(&combined)
+        .expect("web/Dioxus.toml plus the Android CI signing table must be valid TOML");
+
+    // At most one active (uncommented) `[bundle.android]` header.
+    let active = config
+        .lines()
+        .filter(|line| line.trim() == "[bundle.android]")
+        .count();
+    assert!(
+        active <= 1,
+        "web/Dioxus.toml must not declare an active [bundle.android] table"
+    );
+}
+
 /// The embedded `web/dist` stays the diagnostic placeholder, never a build.
 #[test]
 fn committed_dist_is_the_no_assets_placeholder() {
