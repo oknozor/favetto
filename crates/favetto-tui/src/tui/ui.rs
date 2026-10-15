@@ -12,7 +12,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use favetto_core::model::{AgentSessionInfo, FailureKind, Task, TaskStatus, UsagePeriod};
+use favetto_core::model::{AgentSessionInfo, FailureKind, Schedule, Task, TaskStatus, UsagePeriod};
 use favetto_core::workflow::{WorkflowInspect, WorkflowState};
 
 use super::app::{
@@ -1577,11 +1577,13 @@ fn draw_schedules(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
         Constraint::Length(20),
         Constraint::Length(26),
         Constraint::Length(12),
+        Constraint::Length(14),
         Constraint::Min(0),
     ];
-    let header =
-        Row::new(vec!["ID", "CRON", "TASK", "ENABLED", "INPUT"]).style(theme.table_header());
+    let header = Row::new(vec!["ID", "CRON", "TASK", "ENABLED", "NEXT RUN", "INPUT"])
+        .style(theme.table_header());
 
+    let now = Utc::now();
     let rows: Vec<Row> = app
         .schedules
         .iter()
@@ -1597,6 +1599,7 @@ fn draw_schedules(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
                 Cell::from(s.cron.clone()),
                 Cell::from(s.task.clone()),
                 Cell::from(if s.enabled { "yes" } else { "no" }),
+                Cell::from(next_run_cell(s, now)),
                 Cell::from(input),
             ])
         })
@@ -2526,6 +2529,34 @@ fn truncate_ellipsis(s: &str, max: usize) -> String {
         "{}…",
         s.chars().take(max.saturating_sub(1)).collect::<String>()
     )
+}
+
+/// Human countdown to `next`, e.g. `in 45s`, `in 3h 12m`; `due now` once the
+/// instant has passed (the daemon may not have refreshed `next_run` yet).
+fn countdown(next: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let secs = (next - now).num_seconds();
+    if secs <= 0 {
+        return "due now".to_string();
+    }
+    if secs < 60 {
+        format!("in {secs}s")
+    } else if secs < 3_600 {
+        format!("in {}m {:02}s", secs / 60, secs % 60)
+    } else if secs < 86_400 {
+        format!("in {}h {}m", secs / 3_600, (secs % 3_600) / 60)
+    } else {
+        format!("in {}d {}h", secs / 86_400, (secs % 86_400) / 3_600)
+    }
+}
+
+/// The `NEXT RUN` cell: a live countdown for an enabled schedule with a
+/// parseable cron, `disabled` for an explicit opt-out, else `—`.
+fn next_run_cell(schedule: &Schedule, now: DateTime<Utc>) -> String {
+    match schedule.next_run {
+        Some(next) => countdown(next, now),
+        None if !schedule.enabled => "disabled".to_string(),
+        None => "—".to_string(),
+    }
 }
 
 fn age(ts: DateTime<Utc>) -> String {

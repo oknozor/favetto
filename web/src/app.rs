@@ -277,6 +277,11 @@ fn apply_event(mut state: AppState, event: crate::sse::SseEvent) {
         if method == favetto_wire::rpc::push::EVENT {
             if let Ok(event) = serde_json::from_value::<favetto_wire::model::Event>(params.clone())
             {
+                if event.kind == favetto_wire::model::EventKind::CronTick {
+                    // A schedule fired; its next run changed, so the Schedules
+                    // view should re-fetch even though it caches no schedules.
+                    state.bump_schedules();
+                }
                 handle_awaiting(state, &event);
             }
         }

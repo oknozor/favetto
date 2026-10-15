@@ -46,7 +46,7 @@ use uuid::Uuid;
 use crate::cli::TuiArgs;
 use crate::client::{normalize_ws_url, pair_http_base, Client, Transport};
 use crate::config::FavettoConfig;
-use app::{App, CatalogEntry, ConnState, Popup, UiAction};
+use app::{App, CatalogEntry, ConnState, Popup, Tab, UiAction};
 use sound::{CliSound, SoundPlayer};
 
 /// Outcome of a connected session: the user quit, or the link dropped.
@@ -339,11 +339,7 @@ async fn sync_initial(client: &Client, app: &mut App) {
         app.sound_suppressed = false;
     }
 
-    if let Some(schedules) =
-        fetch_rpc::<Vec<Schedule>>(client, method::SCHEDULES_LIST, serde_json::json!({})).await
-    {
-        app.schedules = schedules;
-    }
+    fetch_schedules(client, app).await;
 
     if let Some(notifications) = fetch_rpc::<Vec<NotificationRecord>>(
         client,
@@ -365,6 +361,16 @@ async fn sync_initial(client: &Client, app: &mut App) {
     fetch_catalog(client, app).await;
     fetch_repos(client, app).await;
     fetch_agent_sessions(client, app).await;
+}
+
+/// Fetch the schedule list. Re-run periodically while the Scheduler tab is open
+/// so the next-run countdown stays live, and after a `cron_tick` push.
+async fn fetch_schedules(client: &Client, app: &mut App) {
+    if let Some(schedules) =
+        fetch_rpc::<Vec<Schedule>>(client, method::SCHEDULES_LIST, serde_json::json!({})).await
+    {
+        app.schedules = schedules;
+    }
 }
 
 /// Fetch the task catalog.
@@ -818,6 +824,10 @@ async fn run_session(
     anim.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut agents_refresh = tokio::time::interval(Duration::from_secs(3));
     agents_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Drives the Scheduler tab's live countdown by re-fetching `schedules.list`
+    // (which recomputes `next_run` against the daemon's clock) once a second.
+    let mut schedules_refresh = tokio::time::interval(Duration::from_secs(1));
+    schedules_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         // The tick is only consumed while something on screen animates; an idle
@@ -961,6 +971,9 @@ async fn run_session(
                     fetch_agent_sessions(client, app).await;
                 }
             }
+            _ = schedules_refresh.tick(), if app.tab == Tab::Scheduler => {
+                fetch_schedules(client, app).await;
+            }
         }
 
         // Keep the worker's mute/focus state in sync, then forward any cues the
@@ -989,6 +1002,12 @@ async fn run_session(
         if app.repos_dirty {
             app.repos_dirty = false;
             fetch_repos(client, app).await;
+        }
+        // A `cron_tick` moved a schedule's next run; refresh so the countdown
+        // resets even when the Scheduler tab is in the background.
+        if app.schedules_dirty {
+            app.schedules_dirty = false;
+            fetch_schedules(client, app).await;
         }
         // A `task.updated`/`event` push while the runtime inspector is open
         // re-fetches `workflow.inspect` to keep its table live.

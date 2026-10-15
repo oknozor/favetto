@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tokio_cron_scheduler::{Job, JobScheduler};
 use uuid::Uuid;
 
@@ -14,6 +14,34 @@ use favetto_core::model::Schedule;
 use crate::db;
 use crate::executor;
 use crate::state::State;
+
+/// Compute the next UTC fire time for `cron`, using the same parser
+/// configuration the scheduler registers jobs with (`croner`, seconds required,
+/// day-of-month and day-of-week combined).
+///
+/// Returns `None` when the expression does not parse under that parser. The
+/// result is strictly after `after`, so a fire exactly at `after` is skipped.
+pub fn next_occurrence(cron: &str, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let schedule = croner::parser::CronParser::builder()
+        .seconds(croner::parser::Seconds::Required)
+        .dom_and_dow(true)
+        .build()
+        .parse(cron)
+        .ok()?;
+    schedule.find_next_occurrence(&after, false).ok()
+}
+
+/// Populate `schedule.next_run` for an enabled schedule whose cron parses.
+///
+/// Disabled schedules have no upcoming run, so their `next_run` stays `None`.
+pub fn with_next_run(mut schedule: Schedule, now: DateTime<Utc>) -> Schedule {
+    schedule.next_run = if schedule.enabled {
+        next_occurrence(&schedule.cron, now)
+    } else {
+        None
+    };
+    schedule
+}
 
 /// Register a schedule's job with the scheduler. Returns the job id.
 pub async fn register(
@@ -103,6 +131,7 @@ pub async fn reconcile_catalog_schedules(state: &Arc<State>) -> anyhow::Result<(
             input: serde_json::json!({}),
             enabled: true,
             last_run: None,
+            next_run: None,
         });
     }
 
@@ -162,4 +191,80 @@ pub async fn start(state: &Arc<State>) -> anyhow::Result<()> {
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::TimeZone as _;
+
+    use super::*;
+
+    /// A fixed reference instant: 2026-01-01T07:30:00Z.
+    fn now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 1, 1, 7, 30, 0).unwrap()
+    }
+
+    fn ts(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap()
+    }
+
+    #[test]
+    fn next_occurrence_uses_seconds_first_fields() {
+        // `0 0 8 * * *` is second=0 minute=0 hour=8: the next 08:00:00.
+        assert_eq!(
+            next_occurrence("0 0 8 * * *", now()),
+            Some(ts(2026, 1, 1, 8, 0, 0))
+        );
+        // A 30-second offset is honoured.
+        assert_eq!(
+            next_occurrence("30 0 8 * * *", now()),
+            Some(ts(2026, 1, 1, 8, 0, 30))
+        );
+        // `0 * * * * *` fires at the top of every minute.
+        assert_eq!(
+            next_occurrence("0 * * * * *", now()),
+            Some(ts(2026, 1, 1, 7, 31, 0))
+        );
+    }
+
+    #[test]
+    fn next_occurrence_rolls_over_to_the_next_day() {
+        let after = ts(2026, 1, 1, 8, 0, 0);
+        assert_eq!(
+            next_occurrence("0 0 8 * * *", after),
+            Some(ts(2026, 1, 2, 8, 0, 0))
+        );
+    }
+
+    #[test]
+    fn next_occurrence_rejects_expressions_the_scheduler_rejects() {
+        // The scheduler requires an explicit seconds field, so a five-field
+        // expression must not silently produce a next run.
+        assert_eq!(next_occurrence("0 8 * * *", now()), None);
+        assert_eq!(next_occurrence("not a cron", now()), None);
+        assert_eq!(next_occurrence("", now()), None);
+    }
+
+    #[test]
+    fn with_next_run_skips_disabled_schedules() {
+        let enabled = Schedule {
+            id: "enabled".to_string(),
+            cron: "0 0 8 * * *".to_string(),
+            task: "t".to_string(),
+            input: serde_json::json!({}),
+            enabled: true,
+            last_run: None,
+            next_run: None,
+        };
+        assert_eq!(
+            with_next_run(enabled.clone(), now()).next_run,
+            Some(ts(2026, 1, 1, 8, 0, 0))
+        );
+
+        let disabled = Schedule {
+            enabled: false,
+            ..enabled
+        };
+        assert_eq!(with_next_run(disabled, now()).next_run, None);
+    }
 }

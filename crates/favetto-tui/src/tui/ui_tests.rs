@@ -563,6 +563,71 @@ fn compact_duration_buckets_by_magnitude() {
 }
 
 #[test]
+fn countdown_buckets_and_clamps_to_due_now() {
+    use chrono::TimeZone as _;
+
+    let now = Utc.with_ymd_and_hms(2026, 10, 14, 9, 15, 0).unwrap();
+    assert_eq!(countdown(now, now), "due now");
+    assert_eq!(
+        countdown(now - chrono::Duration::seconds(5), now),
+        "due now"
+    );
+    assert_eq!(
+        countdown(now + chrono::Duration::seconds(45), now),
+        "in 45s"
+    );
+    assert_eq!(
+        countdown(now + chrono::Duration::seconds(100), now),
+        "in 1m 40s"
+    );
+    assert_eq!(
+        countdown(
+            now + chrono::Duration::hours(3) + chrono::Duration::minutes(12),
+            now
+        ),
+        "in 3h 12m"
+    );
+    assert_eq!(
+        countdown(
+            now + chrono::Duration::days(2) + chrono::Duration::hours(3),
+            now
+        ),
+        "in 2d 3h"
+    );
+}
+
+#[test]
+fn next_run_cell_marks_disabled_and_unknown() {
+    use chrono::TimeZone as _;
+    use favetto_core::model::Schedule;
+
+    let now = Utc.with_ymd_and_hms(2026, 10, 14, 9, 15, 0).unwrap();
+    let enabled = Schedule {
+        id: "s".to_string(),
+        cron: "0 0 8 * * *".to_string(),
+        task: "t".to_string(),
+        input: serde_json::json!({}),
+        enabled: true,
+        last_run: None,
+        next_run: Some(now + chrono::Duration::minutes(1)),
+    };
+    assert_eq!(next_run_cell(&enabled, now), "in 1m 00s");
+
+    let disabled = Schedule {
+        enabled: false,
+        next_run: None,
+        ..enabled.clone()
+    };
+    assert_eq!(next_run_cell(&disabled, now), "disabled");
+
+    let unparsed = Schedule {
+        next_run: None,
+        ..enabled
+    };
+    assert_eq!(next_run_cell(&unparsed, now), "—");
+}
+
+#[test]
 fn tasks_table_shows_started_and_duration_headers() {
     let mut app = App::new();
     app.tab = Tab::Tasks;
@@ -1560,6 +1625,7 @@ fn drawn_schedules_and_notifications_record_geometry() {
         input: serde_json::json!({}),
         enabled: true,
         last_run: None,
+        next_run: None,
     }];
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).unwrap();

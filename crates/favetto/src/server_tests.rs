@@ -782,6 +782,56 @@ async fn add_catalog_task_with_schedule_registers_cron() {
 }
 
 #[tokio::test]
+async fn schedules_list_computes_next_run_for_enabled_schedules_only() {
+    use favetto_core::model::Schedule;
+
+    let dir = temp_dir("schedules-list-next-run");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+
+    for (id, enabled) in [("enabled", true), ("disabled", false)] {
+        crate::scheduler::upsert(
+            &state,
+            &Schedule {
+                id: id.to_string(),
+                cron: "0 0 8 * * *".to_string(),
+                task: "t".to_string(),
+                input: serde_json::json!({}),
+                enabled,
+                last_run: None,
+                next_run: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let req = Request {
+        id: 1,
+        method: method::SCHEDULES_LIST.to_string(),
+        params: serde_json::json!({}),
+    };
+    let resp = dispatch(&state, req).await;
+    let result = resp.result.expect("schedules.list result");
+    let list: Vec<Schedule> = serde_json::from_value(result).unwrap();
+
+    let enabled = list.iter().find(|s| s.id == "enabled").unwrap();
+    assert!(
+        enabled.next_run.is_some_and(|next| next > Utc::now()),
+        "enabled schedule must expose a future next run"
+    );
+
+    let disabled = list.iter().find(|s| s.id == "disabled").unwrap();
+    assert!(
+        disabled.next_run.is_none(),
+        "disabled schedule must not expose a next run"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn update_catalog_task_rewrites_file_and_publishes() {
     let dir = temp_dir("update");
     let tasks_dir = dir.join("tasks");

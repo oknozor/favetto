@@ -731,7 +731,15 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
         }
 
         method::SCHEDULES_LIST => match db::list_schedules(&state.db).await {
-            Ok(schedules) => to_value(schedules),
+            Ok(schedules) => {
+                // Enrich each row with its next fire time (UTC) on the way out.
+                let now = Utc::now();
+                let schedules: Vec<_> = schedules
+                    .into_iter()
+                    .map(|schedule| crate::scheduler::with_next_run(schedule, now))
+                    .collect();
+                to_value(schedules)
+            }
             Err(e) => Err(RpcError::Internal(e.to_string())),
         },
 
@@ -1737,6 +1745,7 @@ async fn upsert_schedule(
         input,
         enabled,
         last_run: None,
+        next_run: None,
     };
 
     crate::scheduler::upsert(state, &schedule).await?;

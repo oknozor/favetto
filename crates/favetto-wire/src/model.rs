@@ -688,6 +688,11 @@ pub struct Schedule {
     pub input: serde_json::Value,
     pub enabled: bool,
     pub last_run: Option<DateTime<Utc>>,
+    /// Next fire time in UTC, computed by the daemon from `cron` when the
+    /// schedule is enabled. `None` for a disabled schedule (or one whose cron
+    /// expression does not parse). Not persisted.
+    #[serde(default)]
+    pub next_run: Option<DateTime<Utc>>,
 }
 
 /// How a repository entered the known-repos registry.

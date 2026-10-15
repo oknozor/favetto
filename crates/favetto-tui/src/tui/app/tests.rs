@@ -1881,6 +1881,7 @@ fn page_keys_move_events_selection_only() {
         input: serde_json::json!({}),
         enabled: true,
         last_run: None,
+        next_run: None,
     }];
     app.notifications = vec![NotificationRecord {
         id: 1,
@@ -1925,6 +1926,7 @@ fn clicking_scheduler_and_notifications_rows_selects_only() {
         input: serde_json::json!({}),
         enabled: true,
         last_run: None,
+        next_run: None,
     }];
     app.notifications = vec![NotificationRecord {
         id: 1,
@@ -2136,6 +2138,7 @@ fn keyboard_up_down_moves_scheduler_and_notification_selection() {
             input: serde_json::json!({}),
             enabled: true,
             last_run: None,
+            next_run: None,
         },
         Schedule {
             id: "s2".to_string(),
@@ -2144,6 +2147,7 @@ fn keyboard_up_down_moves_scheduler_and_notification_selection() {
             input: serde_json::json!({}),
             enabled: false,
             last_run: None,
+            next_run: None,
         },
     ];
     app.notifications = vec![

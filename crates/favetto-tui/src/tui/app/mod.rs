@@ -725,6 +725,9 @@ pub struct App {
 
     // Scheduler + notifications.
     pub schedules: Vec<Schedule>,
+    /// Set when a `cron_tick` push or a schedule upsert may have changed the
+    /// next run; the session loop re-fetches `schedules.list` and clears it.
+    pub schedules_dirty: bool,
     pub notifications: Vec<NotificationRecord>,
 
     // Last-rendered list geometry, for mouse row hit-testing.
@@ -825,6 +828,7 @@ impl App {
             click_regions: Vec::new(),
             throbber_state: throbber_widgets_tui::ThrobberState::default(),
             schedules: Vec::new(),
+            schedules_dirty: false,
             notifications: Vec::new(),
             tasks_geom: ListGeometry::default(),
             catalog_geom: ListGeometry::default(),
@@ -2126,6 +2130,10 @@ impl App {
 
     /// Add an event if it is newer than the last seen cursor, advancing the cursor.
     pub fn ingest_event(&mut self, ev: Event) {
+        if ev.kind == EventKind::CronTick {
+            // The next occurrence moved; the session loop re-fetches the list.
+            self.schedules_dirty = true;
+        }
         if ev.id > self.last_event_id {
             self.last_event_id = ev.id;
             if !self.sound_suppressed {
