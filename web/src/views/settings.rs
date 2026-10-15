@@ -18,6 +18,7 @@ use favetto_wire::rpc::{
 
 use crate::app::Route;
 use crate::client::RpcClient;
+use crate::notifications::NotificationEvent;
 use crate::state::AppState;
 
 /// The notification channels the daemon implements (`crates/favetto/src/notify.rs`).
@@ -206,6 +207,7 @@ fn AppNotificationsSection() -> Element {
     let mut state = use_context::<AppState>();
     let mut busy = use_signal(|| false);
     let permission = (state.notification_permission)();
+    let events = (state.notification_events)();
 
     let enable = move |_| {
         busy.set(true);
@@ -223,11 +225,28 @@ fn AppNotificationsSection() -> Element {
         section { class: "settings-section",
             h2 { "App notifications" }
             p { class: "settings-hint",
-                "Show a system notification when a task needs your input. Background paging to a closed app is handled by the daemon's ntfy channel."
+                "Show a system notification for the task events you pick. Background paging to a closed app is handled by the daemon's ntfy channel."
             }
             dl { class: "settings-facts",
                 dt { "Permission" }
                 dd { span { class: "status-badge", "{permission.label()}" } }
+            }
+            div { class: "settings-form",
+                span { class: "field-label", "Notify me when" }
+                for event in NotificationEvent::ALL {
+                    label { class: "field field-inline",
+                        input {
+                            r#type: "checkbox",
+                            checked: events.contains(event),
+                            onchange: move |_| {
+                                let mut next = (state.notification_events)();
+                                next.toggle(event);
+                                state.set_notification_events(next);
+                            },
+                        }
+                        span { class: "field-label", "{event.label()}" }
+                    }
+                }
             }
             div { class: "channel-actions",
                 button {

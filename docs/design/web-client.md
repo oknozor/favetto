@@ -390,7 +390,10 @@ SSE and `ntfy` are complementary, not alternatives:
 - **SSE** drives the live in-app experience — inbox badges, browser/Android
   system notifications while the app is open (the web build uses the browser
   `Notification` API; Android posts natively through JNI, see
-  `web/src/android_notify.rs`), and instant UI updates.
+  `web/src/android_notify.rs`), and instant UI updates. The notifying task
+  events are a persisted, user-selectable set (`task_awaiting_input` by
+  default, `task_finished` opt-in): `notifications::alert_for` builds the alert
+  per kind and `app::dispatch_alert` gates on the subscribed set.
 - **SSE cannot wake a closed or backgrounded app.** There is no live connection
   when the tab is not running.
 - **`ntfy`** (already implemented in `notify.rs`, driven by `hooks.upsert` and
