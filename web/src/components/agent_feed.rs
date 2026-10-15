@@ -36,6 +36,35 @@ pub fn at_bottom(scroll_top: f64, client_height: f64, scroll_height: f64) -> boo
     scroll_top + client_height >= scroll_height - FOLLOW_THRESHOLD
 }
 
+/// What moved the feed's viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollCause {
+    /// The component or the layout moved the viewport: the auto-follow scroll
+    /// itself, a reflow, content growth, or a row expansion. Never changes the
+    /// follow state.
+    Programmatic,
+    /// An explicit user gesture that moved the viewport toward the top: a wheel
+    /// or trackpad scroll up, a downward touch/pointer drag, or an upward
+    /// scroll key.
+    UserScrolledUp,
+    /// A scroll that has come to rest at the bottom.
+    ReachedBottom,
+}
+
+/// Resolve the auto-follow state after one scroll signal.
+///
+/// Following is the default and unconditional: only an explicit upward user
+/// gesture pauses it, and coming to rest at the bottom resumes it. Every other
+/// signal leaves `follow` untouched, so programmatic and layout-driven scrolls
+/// can never turn following off.
+pub fn follow_after_scroll(follow: bool, cause: ScrollCause) -> bool {
+    match cause {
+        ScrollCause::Programmatic => follow,
+        ScrollCause::UserScrolledUp => false,
+        ScrollCause::ReachedBottom => true,
+    }
+}
+
 /// The Phosphor icon for a tool card header, keyed off the tool's name.
 pub fn tool_icon(name: &str) -> AppIconKind {
     let name = name.to_ascii_lowercase();
@@ -440,9 +469,11 @@ pub fn summary_feed(summary: &RunSummary) -> Vec<FeedItem> {
 /// list; [`FeedItem::InputRequest`] rows keep the inline reply controls, which
 /// only the live feed produces.
 ///
-/// The list auto-follows: while the user is at (or near) the bottom it stays
-/// pinned to the newest row; scrolling up pauses it and reveals a jump control
-/// that resumes following.
+/// The list auto-follows unconditionally: it stays pinned to the newest row on
+/// every update, and only an explicit upward user gesture pauses it. Coming to
+/// rest at the bottom, or the jump control, resumes following; programmatic
+/// scrolls (the auto-follow animation itself), layout reflows, content growth
+/// and row expansion never change the follow state.
 #[component]
 pub(crate) fn FeedList(
     items: Vec<FeedItem>,
@@ -454,16 +485,22 @@ pub(crate) fn FeedList(
 ) -> Element {
     let mut follow = use_signal(|| true);
     let mut element = use_signal(|| None::<web_sys::Element>);
+    let mut last_touch_y = use_signal(|| None::<f64>);
+    let mut last_pointer_y = use_signal(|| None::<f64>);
     let scroll_to_bottom = move || {
         if let Some(el) = element() {
             el.set_scroll_top(el.scroll_height());
         }
+    };
+    let mut pause_on_scroll_up = move || {
+        follow.set(follow_after_scroll(follow(), ScrollCause::UserScrolledUp));
     };
 
     rsx! {
         div { class: "agent-feed-wrap",
             div {
                 class: "agent-feed",
+                tabindex: "0",
                 onmounted: move |evt| {
                     element.set(evt.data().downcast::<web_sys::Element>().cloned());
                     if follow() {
@@ -472,12 +509,62 @@ pub(crate) fn FeedList(
                 },
                 onscroll: move |evt| {
                     let data = evt.data();
-                    follow.set(at_bottom(
+                    let at_bottom = at_bottom(
                         data.scroll_top(),
                         f64::from(data.client_height()),
                         f64::from(data.scroll_height()),
-                    ));
+                    );
+                    // Only a scroll that comes to rest at the bottom changes
+                    // the state. A non-bottom scroll without a preceding
+                    // gesture is ours (smooth auto-follow animation, reflow,
+                    // row growth) and must be ignored.
+                    if at_bottom {
+                        follow.set(follow_after_scroll(follow(), ScrollCause::ReachedBottom));
+                    }
                 },
+                onwheel: move |evt| {
+                    // Negative deltaY = the viewport moves toward the top.
+                    if evt.delta().strip_units().y < 0.0 {
+                        pause_on_scroll_up();
+                    }
+                },
+                onkeydown: move |evt| {
+                    if matches!(evt.key(), Key::ArrowUp | Key::PageUp | Key::Home) {
+                        pause_on_scroll_up();
+                    }
+                },
+                ontouchstart: move |evt| {
+                    last_touch_y.set(evt.touches().first().map(|t| t.client_coordinates().y));
+                },
+                ontouchmove: move |evt| {
+                    let y = evt.touches().first().map(|t| t.client_coordinates().y);
+                    if let (Some(prev), Some(now)) = (last_touch_y(), y) {
+                        // A finger moving down drags the content up (away from
+                        // the newest row).
+                        if now > prev {
+                            pause_on_scroll_up();
+                        }
+                    }
+                    last_touch_y.set(y);
+                },
+                onpointerdown: move |evt| {
+                    last_pointer_y.set(Some(evt.data().client_coordinates().y));
+                },
+                onpointermove: move |evt| {
+                    let data = evt.data();
+                    // Only while a button is held (a scrollbar/pointer drag).
+                    if !data.held_buttons().is_empty() {
+                        let y = data.client_coordinates().y;
+                        if let Some(prev) = last_pointer_y() {
+                            if y > prev {
+                                pause_on_scroll_up();
+                            }
+                        }
+                        last_pointer_y.set(Some(y));
+                    }
+                },
+                onpointerup: move |_| last_pointer_y.set(None),
+                onpointercancel: move |_| last_pointer_y.set(None),
                 for (index, item) in items.into_iter().enumerate() {
                     FeedRow {
                         key: "{index}",
@@ -1061,6 +1148,30 @@ mod tests {
     }
 
     #[test]
+    fn follow_after_scroll_tracks_explicit_intent() {
+        // Programmatic/layout scrolls never change the follow state.
+        assert!(follow_after_scroll(true, ScrollCause::Programmatic));
+        assert!(!follow_after_scroll(false, ScrollCause::Programmatic));
+        // Only an explicit upward gesture pauses following.
+        assert!(!follow_after_scroll(true, ScrollCause::UserScrolledUp));
+        assert!(!follow_after_scroll(false, ScrollCause::UserScrolledUp));
+        // Coming to rest at the bottom resumes following.
+        assert!(follow_after_scroll(false, ScrollCause::ReachedBottom));
+        assert!(follow_after_scroll(true, ScrollCause::ReachedBottom));
+    }
+
+    #[test]
+    fn follow_after_scroll_survives_a_programmatic_scroll_burst() {
+        // `scroll-behavior: smooth` turns the auto-follow scroll into a burst
+        // of intermediate, non-bottom scroll events. None of them may clear
+        // following - this is the exact regression from the issue.
+        let follow = (0..64).fold(true, |follow, _| {
+            follow_after_scroll(follow, ScrollCause::Programmatic)
+        });
+        assert!(follow);
+    }
+
+    #[test]
     fn tool_icon_matches_common_tools_by_name() {
         assert_eq!(tool_icon("bash"), AppIconKind::ToolTerminal);
         assert_eq!(tool_icon("Read"), AppIconKind::ToolRead);
@@ -1258,5 +1369,152 @@ mod tests {
         }
         let mut dom = VirtualDom::new(Harness);
         dom.rebuild_in_place();
+    }
+
+    // -- Host-side intent regression ----------------------------------------
+    //
+    // Follow is decided by *intent*, not geometry: synthetic `scroll`/`wheel`
+    // events are dispatched to the rendered `.agent-feed` container and the
+    // presence of the "Jump to latest" control is asserted.
+
+    /// Install the host-side event converter the native/wasm renderers register
+    /// before delivering DOM events.
+    fn install_event_converter() {
+        dioxus::html::set_event_converter(Box::new(dioxus::html::SerializedHtmlEventConverter));
+    }
+
+    /// Dispatch a synthetic event carrying `data` to `element`.
+    fn dispatch_event<E: 'static>(
+        dom: &mut VirtualDom,
+        name: &str,
+        element: dioxus::core::ElementId,
+        data: E,
+    ) {
+        let payload = dioxus::html::PlatformEventData::new(Box::new(data));
+        let event: Event<dyn std::any::Any> = Event::new(std::rc::Rc::new(payload), true);
+        // `handle_event` uses the bare event name, without the `on` prefix.
+        dom.runtime().handle_event(name, event, element);
+    }
+
+    /// The element that registered a listener for the bare event `name`.
+    fn listener_target(mutations: &dioxus::core::Mutations, name: &str) -> dioxus::core::ElementId {
+        mutations
+            .edits
+            .iter()
+            .find_map(|mutation| match mutation {
+                Mutation::NewEventListener { name: n, id } if n == name => Some(*id),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no `{name}` listener registered"))
+    }
+
+    /// Whether the mutation stream renders the "Jump to latest" control.
+    ///
+    /// Dioxus bakes static text into templates, so the label itself is not a
+    /// `CreateTextNode`; the control's icon (`.feed-jump-arrow`) is rendered
+    /// dynamically and is therefore observable in the diff.
+    fn has_jump(mutations: &dioxus::core::Mutations) -> bool {
+        mutations.edits.iter().any(|mutation| match mutation {
+            Mutation::CreateTextNode { value, .. } | Mutation::SetText { value, .. } => {
+                value.contains("Jump to latest")
+            }
+            Mutation::SetAttribute { value, .. } => {
+                matches!(value, AttributeValue::Text(text) if text.contains("feed-jump"))
+            }
+            _ => false,
+        })
+    }
+
+    /// A scroll event whose viewport is `scroll_top` down a 1000px-tall list.
+    fn scroll_data(scroll_top: f64) -> dioxus::html::SerializedScrollData {
+        dioxus::html::SerializedScrollData {
+            scroll_top,
+            scroll_left: 0.0,
+            scroll_width: 0,
+            scroll_height: 1000,
+            client_width: 0,
+            client_height: 100,
+        }
+    }
+
+    /// A pixel-mode wheel event with the given vertical delta.
+    fn wheel_data(delta_y: f64) -> dioxus::html::SerializedWheelData {
+        dioxus::html::SerializedWheelData {
+            mouse: Default::default(),
+            delta_mode: 0,
+            delta_x: 0.0,
+            delta_y,
+            delta_z: 0.0,
+        }
+    }
+
+    #[test]
+    fn feed_list_follows_until_an_explicit_upward_gesture() {
+        install_event_converter();
+
+        #[component]
+        fn Harness() -> Element {
+            use_context_provider(AppState::new);
+            let items = use_signal(|| {
+                vec![
+                    FeedItem::Message {
+                        role: MessageRole::Assistant,
+                        text: "hello".to_string(),
+                    },
+                    FeedItem::Reasoning {
+                        text: "considering".to_string(),
+                    },
+                    FeedItem::Boundary(IdleOutcome::Succeeded),
+                ]
+            });
+            let busy = use_signal(|| false);
+            let toast = use_signal(|| None::<(ToastKind, String)>);
+            let refresh = use_signal(|| 0u64);
+            rsx! {
+                FeedList {
+                    items: items(),
+                    session_id: "ses_1".to_string(),
+                    revision: 1,
+                    busy,
+                    toast,
+                    refresh,
+                }
+            }
+        }
+
+        let mut dom = VirtualDom::new(Harness);
+        let initial = dom.rebuild_to_vec();
+        // Following is the default: no jump control on mount.
+        assert!(!has_jump(&initial), "the feed must follow on mount");
+
+        let scroll = listener_target(&initial, "scroll");
+        let wheel = listener_target(&initial, "wheel");
+        assert_eq!(scroll, wheel, "both gestures target the scroll container");
+
+        // A non-bottom programmatic/layout scroll must not pause following.
+        dispatch_event(&mut dom, "scroll", scroll, scroll_data(0.0));
+        let edits = dom.render_immediate_to_vec();
+        assert!(
+            !has_jump(&edits),
+            "a programmatic scroll must not pause following"
+        );
+
+        // An explicit wheel-up gesture pauses following.
+        dispatch_event(&mut dom, "wheel", wheel, wheel_data(-120.0));
+        let edits = dom.render_immediate_to_vec();
+        assert!(has_jump(&edits), "wheel up must pause following");
+
+        // Coming to rest at the bottom resumes following.
+        dispatch_event(&mut dom, "scroll", scroll, scroll_data(900.0));
+        let edits = dom.render_immediate_to_vec();
+        assert!(
+            !has_jump(&edits),
+            "reaching the bottom must resume following"
+        );
+
+        // A downward wheel does not pause.
+        dispatch_event(&mut dom, "wheel", wheel, wheel_data(120.0));
+        let edits = dom.render_immediate_to_vec();
+        assert!(!has_jump(&edits), "wheel down must not pause following");
     }
 }
