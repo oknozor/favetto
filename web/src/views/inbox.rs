@@ -27,7 +27,8 @@ use crate::components::common::{EmptyState, EventBadge, Spinner};
 use crate::components::task_card::TaskCard;
 use crate::components::toast::{Toast, ToastKind};
 use crate::config;
-use crate::state::{onboarding_step, repo_label, task_repo, AppState, OnboardingStep};
+use crate::state::{onboarding_step, task_display_name, task_repo, AppState, OnboardingStep};
+use crate::views::catalog::task_tags;
 use crate::views::tasks::{format_age, now_ms, status_label};
 
 /// How many recent failures the Inbox shows.
@@ -260,6 +261,12 @@ pub fn Inbox() -> Element {
                 .map_err(|err| err.to_string())?;
             state.cache.write().set_tasks(tasks);
 
+            // The catalog powers the task cards' metadata chips. A failing
+            // catalog is non-fatal: cards fall back to the repo chip.
+            if let Ok(catalog) = client.catalog_list(EmptyParams {}).await {
+                state.cache.write().set_catalog(catalog);
+            }
+
             let list = client
                 .agents_list(EmptyParams {})
                 .await
@@ -352,9 +359,11 @@ pub fn Inbox() -> Element {
                             AwaitingInputCard {
                                 key: "{task.id}",
                                 id: task.id,
-                                name: task.name.clone(),
+                                name: task_display_name(&task.name).to_string(),
                                 status: task.status,
                                 age: format_age(task.created_at.timestamp_millis(), now),
+                                repo: task_repo(&task.name).map(str::to_string),
+                                tags: cache.catalog_entry(&task.name).map(task_tags).unwrap_or_default(),
                                 card,
                                 busy,
                                 toast,
@@ -364,11 +373,12 @@ pub fn Inbox() -> Element {
                             TaskCard {
                                 key: "{task.id}",
                                 id: task.id,
-                                name: task.name.clone(),
+                                name: task_display_name(&task.name).to_string(),
                                 status: task.status,
                                 age: format_age(task.created_at.timestamp_millis(), now),
                                 awaiting: true,
-                                repo: Some(repo_label(task_repo(&task.name)).to_string()),
+                                repo: task_repo(&task.name).map(str::to_string),
+                                tags: cache.catalog_entry(&task.name).map(task_tags).unwrap_or_default(),
                             }
                         }
                     }
@@ -381,11 +391,12 @@ pub fn Inbox() -> Element {
                         TaskCard {
                             key: "{task.id}",
                             id: task.id,
-                            name: task.name.clone(),
+                            name: task_display_name(&task.name).to_string(),
                             status: task.status,
                             age: format_age(task.created_at.timestamp_millis(), now),
                             detail: task.error.clone(),
-                            repo: Some(repo_label(task_repo(&task.name)).to_string()),
+                            repo: task_repo(&task.name).map(str::to_string),
+                            tags: cache.catalog_entry(&task.name).map(task_tags).unwrap_or_default(),
                         }
                     }
                 }
@@ -454,6 +465,8 @@ fn AwaitingInputCard(
     name: String,
     status: TaskStatus,
     age: String,
+    #[props(default)] repo: Option<String>,
+    #[props(default)] tags: Vec<String>,
     card: AwaitingCard,
     busy: Signal<bool>,
     toast: Signal<Option<(ToastKind, String)>>,
@@ -489,6 +502,12 @@ fn AwaitingInputCard(
                 }
                 span { class: badge, "{status_label(status)}" }
                 span { class: "awaiting-age", "{age}" }
+                if let Some(repo) = repo {
+                    span { class: "task-card-repo", "{repo}" }
+                }
+                for tag in tags {
+                    span { class: "tag", "{tag}" }
+                }
             }
             p { class: "awaiting-prompt", "{message}" }
             if screen_detected {

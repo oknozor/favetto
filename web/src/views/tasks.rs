@@ -8,7 +8,7 @@
 
 use dioxus::prelude::*;
 use favetto_wire::model::{FailureKind, RunStatus, Task, TaskRun, TaskStatus};
-use favetto_wire::rpc::{TaskIdParams, TasksEventsParams, TasksListParams};
+use favetto_wire::rpc::{EmptyParams, TaskIdParams, TasksEventsParams, TasksListParams};
 use uuid::Uuid;
 
 use crate::app::Route;
@@ -19,7 +19,8 @@ use crate::components::icon::{AppIcon, AppIconKind};
 use crate::components::output_viewer::{extract_output_text, extract_run_summary, OutputViewer};
 use crate::components::start_task::StartTaskDialog;
 use crate::components::toast::{Toast, ToastKind};
-use crate::state::{repo_label, task_repo, AppState, TaskFeed};
+use crate::state::{task_display_name, task_repo, AppState, TaskFeed};
+use crate::views::catalog::task_tags;
 
 /// The status chips above the task list.
 ///
@@ -277,6 +278,11 @@ pub fn TasksList() -> Element {
             match client.tasks_list(TasksListParams { limit: None }).await {
                 Ok(tasks) => {
                     state.cache.write().set_tasks(tasks);
+                    // The catalog powers the row metadata chips. A failing
+                    // catalog is non-fatal: rows fall back to the repo chip.
+                    if let Ok(catalog) = client.catalog_list(EmptyParams {}).await {
+                        state.cache.write().set_catalog(catalog);
+                    }
                     Ok(())
                 }
                 Err(e) => Err(e.to_string()),
@@ -285,8 +291,9 @@ pub fn TasksList() -> Element {
     });
 
     let now = now_ms();
+    // Read the catalog cache (subscribes to it) for the row metadata chips.
+    let cache = (state.cache)();
     let rows: Vec<Task> = {
-        let cache = (state.cache)();
         let mut rows: Vec<Task> = cache.visible_tasks().into_iter().cloned().collect();
         rows.sort_by_key(|t| std::cmp::Reverse(t.created_at));
         rows.retain(|t| filter().matches(t.status));
@@ -325,11 +332,22 @@ pub fn TasksList() -> Element {
                                 to: Route::TaskDetail { id: task.id.to_string() },
                                 class: "task-row-link",
                                 div { class: "task-row-main",
-                                    span { class: "task-name", "{task.name}" }
+                                    span { class: "task-name", "{task_display_name(&task.name)}" }
                                     StatusBadge { status: task.status }
                                 }
+                                div { class: "task-row-tags",
+                                    // The repo chip only applies to a scoped
+                                    // task; global rows show no repo tag.
+                                    if let Some(repo) = task_repo(&task.name) {
+                                        span { class: "task-repo", "{repo}" }
+                                    }
+                                    if let Some(entry) = cache.catalog_entry(&task.name) {
+                                        for tag in task_tags(entry) {
+                                            span { class: "tag", "{tag}" }
+                                        }
+                                    }
+                                }
                                 div { class: "task-row-meta",
-                                    span { class: "task-repo", "{repo_label(task_repo(&task.name))}" }
                                     span { class: "task-age", "{format_age(task.created_at.timestamp_millis(), now)}" }
                                     span { class: "task-attempts", "{task.attempt} runs" }
                                 }
@@ -404,6 +422,11 @@ pub fn TaskDetail(id: String) -> Element {
                 .tasks_runs(TaskIdParams { id: uuid })
                 .await
                 .map_err(|e| e.to_string())?;
+            // Seed the catalog so the header can render metadata chips even on
+            // a direct deep-link; a failure here is non-fatal.
+            if let Ok(catalog) = client.catalog_list(EmptyParams {}).await {
+                state.cache.write().set_catalog(catalog);
+            }
             Ok(Detail { task, runs })
         }
     });
@@ -457,6 +480,8 @@ pub fn TaskDetail(id: String) -> Element {
         .is_some_and(|feed| !feed.session_id.is_empty())
         || !feed_events.is_empty();
 
+    // Read the catalog (subscribes to it) for the header metadata chips.
+    let cache = (state.cache)();
     let now = now_ms();
     rsx! {
         main { id: "favetto-app", class: "task-detail",
@@ -505,8 +530,18 @@ pub fn TaskDetail(id: String) -> Element {
                     let show_failure = failure.is_some() || task.status == TaskStatus::Failed;
                     rsx! {
                         header { class: "task-header",
-                            h1 { class: "task-title", "{task.name}" }
+                            h1 { class: "task-title", "{task_display_name(&task.name)}" }
                             StatusBadge { status: task.status }
+                            div { class: "task-tags",
+                                if let Some(repo) = task_repo(&task.name) {
+                                    span { class: "task-repo", "{repo}" }
+                                }
+                                if let Some(entry) = cache.catalog_entry(&task.name) {
+                                    for tag in task_tags(entry) {
+                                        span { class: "tag", "{tag}" }
+                                    }
+                                }
+                            }
                             div { class: "task-actions",
                                 if is_terminal(task.status) {
                                     button {
@@ -623,7 +658,7 @@ pub fn TaskDetail(id: String) -> Element {
                         if let Some(action) = confirm() {
                             ConfirmDialog {
                                 title: action.title().to_string(),
-                                message: action.message(&task.name),
+                                message: action.message(task_display_name(&task.name)),
                                 confirm_label: action.confirm_label().to_string(),
                                 danger: action.danger(),
                                 busy: busy(),
