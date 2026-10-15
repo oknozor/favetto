@@ -208,6 +208,19 @@ The app declares `POST_NOTIFICATIONS` (Android 13+) so the in-app
 `Notification` API can ask at runtime. This is configured in `web/Dioxus.toml`
 under `[permissions]`; `dx` maps it into the generated `AndroidManifest.xml`.
 
+### Soft keyboard
+
+The soft keyboard overlays the WebView instead of resizing it. Focusing a field
+used to shrink the viewport, which pushed the fixed bottom navigation, dialogs
+and toasts up (the WebView treats `position: fixed` as viewport-relative). Two
+pieces of wiring keep it in place:
+
+- the client's viewport meta sets
+  `interactive-widget=overlays-content` (`web/index.html`);
+- the native shell forces `SOFT_INPUT_ADJUST_NOTHING` in the custom
+  `web/android/MainActivity.kt`, which `dx` picks up through the
+  `android_main_activity` key in `web/Dioxus.toml`.
+
 ## How the daemon embeds the web bundle
 
 The `favetto` crate embeds `web/dist/` at compile time with `rust-embed`:
@@ -243,4 +256,5 @@ type is explicit (`application/wasm`), which browsers require.
 | Web client can't connect | Check the daemon is running and `[web].enabled = true`; open the browser dev console for the exact error |
 | Android app can't reach the daemon | Use `https://` (not `http://`) for remote daemons; the app validates the scheme. For a LAN daemon, allow cleartext in your reverse proxy or use a TLS tunnel |
 | `dx` version mismatch | `dx` is pinned to 0.7.10 in `web/Cargo.toml` and CI; install the same version locally |
+| Android keyboard shifts the bottom nav or dialogs | Update to a build that carries the `interactive-widget=overlays-content` viewport hint and the `web/android/MainActivity.kt` override; an old APK still resizes the WebView |
 | WASM budget exceeded | CI fails when the gzipped WASM exceeds 1 MB (warns at 500 KB); check for new heavy dependencies |

@@ -2,6 +2,11 @@
 name = "favetto"
 out_dir = "dist"
 asset_dir = "assets"
+# The custom entry point forces the soft keyboard to overlay the WebView
+# instead of resizing it (`SOFT_INPUT_ADJUST_NOTHING`). `dx` copies it into the
+# generated Gradle project in place of the default `MainActivity.kt`. The path
+# is relative to this manifest (`web/`).
+android_main_activity = "android/MainActivity.kt"
 
 [web.app]
 title = "favetto"
