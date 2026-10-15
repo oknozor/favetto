@@ -6,6 +6,7 @@
 # provider = "my-provider"        # model provider; only used with `model`
 # model = "my-model"              # model id; switches to the agent's run_args
 # cwd = "/path/to/checkout"       # working directory for the run
+# kind = "action"                 # "action" runs a built-in step; no agent/session
 # schedule = "0 0 8 * * *"        # recurring (mutually exclusive with `needs`)
 # needs = "other/task:finished"   # dependency (mutually exclusive with `schedule`)
 # spawn = "other/child"           # enqueue children from `spawn_file`
@@ -13,6 +14,18 @@
 # spawn_new_root = false          # each spawn child gets its own workflow root
 # sign = "off"                    # "off" | "ssh" | "gpg"
 # worktree = false                # read-only tasks: no worktree or branch
+
+# For kind = "action", replace the agent keys above with an [action] block and
+# keep `spawn`/`spawn_file`; `[action.when]` gates the spawn. See
+# references/task-format.md (Action tasks).
+#
+# [action]
+# id = "http.request"
+# [action.params]
+# url = "https://api.example.com/items"
+# [action.when]
+# path = "items"
+# op = "not_empty"
 
 # [[vars]]
 # name = "input_name"             # [a-zA-Z0-9_]+, unique, never `_prev`

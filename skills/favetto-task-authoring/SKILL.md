@@ -31,6 +31,8 @@ Read the references only when you need the detail.
    - recurring → `schedule = "<cron>"`;
    - follows another task → `needs = "<task>:<kind>"`;
    - enqueues children → `spawn` + `spawn_file`;
+   - deterministic check that only sometimes spawns → `kind = "action"` +
+     `[action]` (no agent);
    - needs human input → declare `[[vars]]`.
 4. **Place the file** under the tasks root. Its identity is the path relative to
    the root without `.md`, `/`-separated (for example `pipeline/plan`). Moving a
@@ -59,6 +61,11 @@ Read the references only when you need the detail.
   non-empty, and never be `_prev`; its `prompt` must be non-empty.
 - Templates use `{{ dotted.path }}` over `task.*`, `input.*`, and `prev.*`.
   Objects/arrays render as compact JSON; missing paths render empty.
+- A `kind = "action"` task runs a built-in in-daemon step (today
+  `http.request`) instead of an agent: it must declare `[action].id` and must
+  **not** set `agent`/`provider`/`model`. Its optional `[action.when]` predicate
+  gates `spawn`, so a scheduled poller only starts the next task when there is
+  something to do.
 - Set `worktree = false` on read-only tasks (triage, review, planning) so they do
   not create an isolated worktree.
 - Unknown header keys are silently ignored, but invalid *values* (bad TOML, a bad
