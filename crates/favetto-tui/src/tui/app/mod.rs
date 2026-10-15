@@ -725,6 +725,10 @@ pub struct App {
 
     // Scheduler + notifications.
     pub schedules: Vec<Schedule>,
+    /// Set when a `cron_tick` push arrives; the session loop re-fetches
+    /// `schedules.list` (refreshing each schedule's computed next run) and
+    /// clears it.
+    pub schedules_dirty: bool,
     pub notifications: Vec<NotificationRecord>,
 
     // Last-rendered list geometry, for mouse row hit-testing.
@@ -825,6 +829,7 @@ impl App {
             click_regions: Vec::new(),
             throbber_state: throbber_widgets_tui::ThrobberState::default(),
             schedules: Vec::new(),
+            schedules_dirty: false,
             notifications: Vec::new(),
             tasks_geom: ListGeometry::default(),
             catalog_geom: ListGeometry::default(),
@@ -857,6 +862,16 @@ impl App {
             .tasks
             .iter()
             .any(|t| matches!(t.status, TaskStatus::Running | TaskStatus::AwaitingInput))
+        {
+            return true;
+        }
+        // The Scheduler tab's next-run countdown ticks while a future run is on
+        // screen, so the panel must keep redrawing.
+        if self.tab == Tab::Scheduler
+            && self
+                .schedules
+                .iter()
+                .any(|s| s.enabled && s.next_run.is_some())
         {
             return true;
         }
@@ -2040,6 +2055,11 @@ impl App {
         match n.method.as_str() {
             push::EVENT => {
                 if let Ok(ev) = serde_json::from_value::<Event>(n.params) {
+                    // A fire changes the schedule's next occurrence, so the
+                    // countdown re-syncs from `schedules.list`.
+                    if ev.kind == EventKind::CronTick {
+                        self.schedules_dirty = true;
+                    }
                     self.ingest_event(ev);
                 }
                 self.mark_workflow_inspect_dirty();

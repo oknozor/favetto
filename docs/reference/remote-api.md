@@ -712,6 +712,7 @@ Create or update a cron schedule.
 | `id` | string | — | yes |  |
 | `input` | any | — | yes |  |
 | `last_run` | string (optional) | — | no |  |
+| `next_run` | string (optional) | null | no | The next UTC instant this schedule will fire. Computed on demand by `schedules.list`; `None` for a disabled schedule or one whose cron expression has no future occurrence. Not persisted. |
 | `task` | string | — | yes | The catalog task name to enqueue on each fire. |
 
 ### `schedules.delete`

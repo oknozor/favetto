@@ -1560,6 +1560,7 @@ fn drawn_schedules_and_notifications_record_geometry() {
         input: serde_json::json!({}),
         enabled: true,
         last_run: None,
+        next_run: None,
     }];
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -1586,6 +1587,42 @@ fn drawn_schedules_and_notifications_record_geometry() {
     terminal.draw(|f| draw(f, &mut app)).unwrap();
     assert_eq!(app.notifications_geom.len, 1);
     assert_eq!(app.notifications_geom.offset, 0);
+}
+
+#[test]
+fn format_countdown_buckets_days_hours_minutes_seconds() {
+    assert_eq!(format_countdown(0), "due");
+    assert_eq!(format_countdown(-5), "due");
+    assert_eq!(format_countdown(45), "in 45s");
+    assert_eq!(format_countdown(125), "in 2m 5s");
+    assert_eq!(format_countdown(3_600 + 12 * 60), "in 1h 12m");
+    assert_eq!(format_countdown(86_400 + 3 * 3_600), "in 1d 3h");
+}
+
+#[test]
+fn next_run_label_handles_enabled_disabled_and_absent() {
+    use chrono::{Duration, Utc};
+    use favetto_core::model::Schedule;
+
+    let now = Utc::now();
+    let base = Schedule {
+        id: "s".to_string(),
+        cron: "0 0 8 * * *".to_string(),
+        task: "t".to_string(),
+        input: serde_json::json!({}),
+        enabled: true,
+        last_run: None,
+        next_run: Some(now + Duration::minutes(45)),
+    };
+    assert_eq!(next_run_label(&base, now), "in 45m 0s");
+
+    let mut disabled = base.clone();
+    disabled.enabled = false;
+    assert_eq!(next_run_label(&disabled, now), "disabled");
+
+    let mut absent = base;
+    absent.next_run = None;
+    assert_eq!(next_run_label(&absent, now), "—");
 }
 
 #[test]

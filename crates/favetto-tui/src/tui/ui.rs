@@ -12,7 +12,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use favetto_core::model::{AgentSessionInfo, FailureKind, Task, TaskStatus, UsagePeriod};
+use favetto_core::model::{AgentSessionInfo, FailureKind, Schedule, Task, TaskStatus, UsagePeriod};
 use favetto_core::workflow::{WorkflowInspect, WorkflowState};
 
 use super::app::{
@@ -1571,17 +1571,48 @@ fn draw_catalog_preview(frame: &mut Frame, app: &mut App, area: Rect, theme: The
     frame.render_widget(paragraph, area);
 }
 
+/// Human countdown to a schedule's next run: `in 3h 12m`, `in 45s`, `—` when
+/// there is no upcoming run, or `disabled` when the schedule is turned off.
+fn next_run_label(schedule: &Schedule, now: DateTime<Utc>) -> String {
+    if !schedule.enabled {
+        return "disabled".to_string();
+    }
+    match schedule.next_run {
+        Some(next) => format_countdown(next.signed_duration_since(now).num_seconds()),
+        None => "—".to_string(),
+    }
+}
+
+/// Format a whole-second delta as a compact countdown. A non-positive delta
+/// means the run is due (or overdue and awaiting the next tick).
+fn format_countdown(secs: i64) -> String {
+    if secs <= 0 {
+        return "due".to_string();
+    }
+    if secs >= 86_400 {
+        format!("in {}d {}h", secs / 86_400, (secs % 86_400) / 3_600)
+    } else if secs >= 3_600 {
+        format!("in {}h {}m", secs / 3_600, (secs % 3_600) / 60)
+    } else if secs >= 60 {
+        format!("in {}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("in {secs}s")
+    }
+}
+
 fn draw_schedules(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     let widths = [
         Constraint::Length(10),
         Constraint::Length(20),
         Constraint::Length(26),
         Constraint::Length(12),
+        Constraint::Length(12),
         Constraint::Min(0),
     ];
-    let header =
-        Row::new(vec!["ID", "CRON", "TASK", "ENABLED", "INPUT"]).style(theme.table_header());
+    let header = Row::new(vec!["ID", "CRON", "TASK", "ENABLED", "NEXT RUN", "INPUT"])
+        .style(theme.table_header());
 
+    let now = Utc::now();
     let rows: Vec<Row> = app
         .schedules
         .iter()
@@ -1597,6 +1628,7 @@ fn draw_schedules(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
                 Cell::from(s.cron.clone()),
                 Cell::from(s.task.clone()),
                 Cell::from(if s.enabled { "yes" } else { "no" }),
+                Cell::from(next_run_label(s, now)),
                 Cell::from(input),
             ])
         })

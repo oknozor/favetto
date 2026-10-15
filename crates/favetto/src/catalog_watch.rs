@@ -585,6 +585,7 @@ mod tests {
                 input: serde_json::json!({}),
                 enabled: true,
                 last_run: None,
+                next_run: None,
             },
         )
         .await

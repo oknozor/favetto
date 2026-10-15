@@ -1881,6 +1881,7 @@ fn page_keys_move_events_selection_only() {
         input: serde_json::json!({}),
         enabled: true,
         last_run: None,
+        next_run: None,
     }];
     app.notifications = vec![NotificationRecord {
         id: 1,
@@ -1925,6 +1926,7 @@ fn clicking_scheduler_and_notifications_rows_selects_only() {
         input: serde_json::json!({}),
         enabled: true,
         last_run: None,
+        next_run: None,
     }];
     app.notifications = vec![NotificationRecord {
         id: 1,
@@ -2136,6 +2138,7 @@ fn keyboard_up_down_moves_scheduler_and_notification_selection() {
             input: serde_json::json!({}),
             enabled: true,
             last_run: None,
+            next_run: None,
         },
         Schedule {
             id: "s2".to_string(),
@@ -2144,6 +2147,7 @@ fn keyboard_up_down_moves_scheduler_and_notification_selection() {
             input: serde_json::json!({}),
             enabled: false,
             last_run: None,
+            next_run: None,
         },
     ];
     app.notifications = vec![
@@ -2583,6 +2587,58 @@ fn needs_animation_tracks_activity() {
         w.loading = false;
     }
     assert!(!app.needs_animation());
+}
+
+#[test]
+fn scheduler_tab_animates_while_a_next_run_is_pending() {
+    let mut app = App::new();
+    app.conn = ConnState::Connected;
+    app.tab = Tab::Scheduler;
+    app.schedules = vec![Schedule {
+        id: "s".to_string(),
+        cron: "0 0 8 * * *".to_string(),
+        task: "t".to_string(),
+        input: serde_json::json!({}),
+        enabled: true,
+        last_run: None,
+        next_run: Some(Utc::now() + chrono::Duration::minutes(5)),
+    }];
+    assert!(app.needs_animation());
+
+    // A disabled schedule has no countdown to tick.
+    app.schedules[0].enabled = false;
+    assert!(!app.needs_animation());
+
+    // Neither does an enabled schedule without a computed next run.
+    app.schedules[0].enabled = true;
+    app.schedules[0].next_run = None;
+    assert!(!app.needs_animation());
+}
+
+#[test]
+fn cron_tick_push_marks_schedules_dirty() {
+    let mut app = App::new();
+    assert!(!app.schedules_dirty);
+
+    app.handle_notification(Notification {
+        method: push::EVENT.to_string(),
+        params: serde_json::to_value(event(
+            1,
+            EventKind::CronTick,
+            serde_json::json!({ "schedule_id": "s" }),
+        ))
+        .unwrap(),
+    });
+    assert!(app.schedules_dirty, "a fire must re-sync the countdown");
+
+    // An unrelated event leaves the schedules alone.
+    app.schedules_dirty = false;
+    app.handle_notification(Notification {
+        method: push::EVENT.to_string(),
+        params: serde_json::to_value(event(2, EventKind::TaskStarted, serde_json::json!({})))
+            .unwrap(),
+    });
+    assert!(!app.schedules_dirty);
 }
 
 #[test]

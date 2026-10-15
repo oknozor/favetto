@@ -339,11 +339,7 @@ async fn sync_initial(client: &Client, app: &mut App) {
         app.sound_suppressed = false;
     }
 
-    if let Some(schedules) =
-        fetch_rpc::<Vec<Schedule>>(client, method::SCHEDULES_LIST, serde_json::json!({})).await
-    {
-        app.schedules = schedules;
-    }
+    fetch_schedules(client, app).await;
 
     if let Some(notifications) = fetch_rpc::<Vec<NotificationRecord>>(
         client,
@@ -373,6 +369,15 @@ async fn fetch_catalog(client: &Client, app: &mut App) {
         fetch_rpc::<Vec<CatalogEntry>>(client, method::CATALOG_LIST, serde_json::json!({})).await
     {
         app.set_catalog(catalog);
+    }
+}
+
+/// Fetch the cron schedules (each carries its daemon-computed `next_run`).
+async fn fetch_schedules(client: &Client, app: &mut App) {
+    if let Some(schedules) =
+        fetch_rpc::<Vec<Schedule>>(client, method::SCHEDULES_LIST, serde_json::json!({})).await
+    {
+        app.schedules = schedules;
     }
 }
 
@@ -590,16 +595,6 @@ async fn refresh_lists(client: &Client, app: &mut App) {
         }
     }
     if let Ok(resp) = client
-        .request(method::SCHEDULES_LIST, serde_json::json!({}))
-        .await
-    {
-        if let Some(v) = resp.result {
-            if let Ok(schedules) = serde_json::from_value::<Vec<Schedule>>(v) {
-                app.schedules = schedules;
-            }
-        }
-    }
-    if let Ok(resp) = client
         .request(
             method::NOTIFICATIONS_LIST,
             serde_json::json!({ "limit": 100 }),
@@ -612,6 +607,7 @@ async fn refresh_lists(client: &Client, app: &mut App) {
             }
         }
     }
+    fetch_schedules(client, app).await;
     fetch_catalog(client, app).await;
     fetch_repos(client, app).await;
     fetch_agent_sessions(client, app).await;
@@ -989,6 +985,12 @@ async fn run_session(
         if app.repos_dirty {
             app.repos_dirty = false;
             fetch_repos(client, app).await;
+        }
+        // A `cron_tick` push re-fetches the schedules so each next-run
+        // countdown resets to the following occurrence.
+        if app.schedules_dirty {
+            app.schedules_dirty = false;
+            fetch_schedules(client, app).await;
         }
         // A `task.updated`/`event` push while the runtime inspector is open
         // re-fetches `workflow.inspect` to keep its table live.

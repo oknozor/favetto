@@ -5,7 +5,8 @@
 
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use croner::parser::{CronParser, Seconds};
 use tokio_cron_scheduler::{Job, JobScheduler};
 use uuid::Uuid;
 
@@ -14,6 +15,32 @@ use favetto_core::model::Schedule;
 use crate::db;
 use crate::executor;
 use crate::state::State;
+
+/// Parse a cron expression exactly like `tokio-cron-scheduler` does (seconds
+/// required, day-of-month AND day-of-week) and return the next occurrence
+/// strictly after `now`, evaluated in UTC. `None` for a malformed expression or
+/// one with no future occurrence.
+pub fn next_occurrence(cron: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let parsed = CronParser::builder()
+        .seconds(Seconds::Required)
+        .dom_and_dow(true)
+        .build()
+        .parse(cron)
+        .ok()?;
+    parsed.find_next_occurrence(&now, false).ok()
+}
+
+/// Fill in the derived `next_run` for each schedule: enabled schedules get the
+/// next UTC occurrence, disabled schedules (and unparseable crons) get `None`.
+pub fn with_next_runs(schedules: &mut [Schedule], now: DateTime<Utc>) {
+    for schedule in schedules {
+        schedule.next_run = if schedule.enabled {
+            next_occurrence(&schedule.cron, now)
+        } else {
+            None
+        };
+    }
+}
 
 /// Register a schedule's job with the scheduler. Returns the job id.
 pub async fn register(
@@ -103,6 +130,7 @@ pub async fn reconcile_catalog_schedules(state: &Arc<State>) -> anyhow::Result<(
             input: serde_json::json!({}),
             enabled: true,
             last_run: None,
+            next_run: None,
         });
     }
 
@@ -162,4 +190,67 @@ pub async fn start(state: &Arc<State>) -> anyhow::Result<()> {
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone as _;
+
+    /// A fixed UTC instant builder for deterministic occurrence tests.
+    fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, s).single().unwrap()
+    }
+
+    fn schedule(id: &str, cron: &str, enabled: bool) -> Schedule {
+        Schedule {
+            id: id.to_string(),
+            cron: cron.to_string(),
+            task: "t".to_string(),
+            input: serde_json::Value::Null,
+            enabled,
+            last_run: None,
+            next_run: None,
+        }
+    }
+
+    #[test]
+    fn next_occurrence_evaluates_the_cron_in_utc() {
+        // 07:30 UTC: the daily 08:00 job (seconds-first) fires at 08:00 UTC.
+        let now = at(2026, 6, 15, 7, 30, 0);
+        assert_eq!(
+            next_occurrence("0 0 8 * * *", now),
+            Some(at(2026, 6, 15, 8, 0, 0))
+        );
+    }
+
+    #[test]
+    fn next_occurrence_honours_second_granularity() {
+        let now = at(2026, 6, 15, 0, 0, 10);
+        assert_eq!(
+            next_occurrence("*/30 * * * * *", now),
+            Some(at(2026, 6, 15, 0, 0, 30))
+        );
+    }
+
+    #[test]
+    fn next_occurrence_is_none_for_bad_or_secondless_cron() {
+        let now = at(2026, 6, 15, 0, 0, 0);
+        // The daemon's parser requires a seconds field, matching
+        // `tokio-cron-scheduler`; a 5-field expression never schedules.
+        assert_eq!(next_occurrence("0 8 * * *", now), None);
+        assert_eq!(next_occurrence("not a cron", now), None);
+    }
+
+    #[test]
+    fn with_next_runs_sets_enabled_and_clears_disabled() {
+        let now = at(2026, 6, 15, 7, 30, 0);
+        let mut schedules = vec![
+            schedule("on", "0 0 8 * * *", true),
+            schedule("off", "0 0 8 * * *", false),
+        ];
+        with_next_runs(&mut schedules, now);
+        assert_eq!(schedules[0].next_run, Some(at(2026, 6, 15, 8, 0, 0)));
+        assert_eq!(schedules[1].next_run, None);
+    }
 }

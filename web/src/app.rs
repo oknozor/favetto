@@ -277,6 +277,11 @@ fn apply_event(mut state: AppState, event: crate::sse::SseEvent) {
         if method == favetto_wire::rpc::push::EVENT {
             if let Ok(event) = serde_json::from_value::<favetto_wire::model::Event>(params.clone())
             {
+                // A fire changes each schedule's next occurrence; the Schedules
+                // view re-fetches on the bumped version.
+                if event.kind == favetto_wire::model::EventKind::CronTick {
+                    state.bump_schedules();
+                }
                 handle_awaiting(state, &event);
             }
         }

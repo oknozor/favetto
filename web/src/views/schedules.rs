@@ -3,8 +3,10 @@
 //! The wire `Schedule` has no human `name` field: its `id` is the stable key the
 //! daemon persists (and generates as a UUID when a new schedule omits one), so
 //! the form exposes it as an optional "Name / ID". The list shows the cron
-//! expression, the catalog task it enqueues, whether it is enabled and its last
-//! run; the daemon does not expose a "next run", so that column is omitted.
+//! expression, the catalog task it enqueues, whether it is enabled, a live
+//! countdown to the daemon-computed next run and its last run. The countdown
+//! ticks client-side and re-fetches after a `cron_tick` push so it resets on
+//! fire; a disabled schedule shows no upcoming run.
 //!
 //! Validation is done client-side before submitting so a typo fails without a
 //! round trip: the cron is checked against the daemon's `croner` format (five to
@@ -17,6 +19,7 @@ use favetto_wire::rpc::{EmptyParams, ScheduleDeleteParams, ScheduleUpsertParams}
 
 use crate::client::RpcClient;
 use crate::state::AppState;
+use crate::views::workflow::now_epoch;
 
 /// The raw text fields of the create/edit form.
 #[derive(Clone, PartialEq)]
@@ -111,6 +114,47 @@ pub fn parse_schedule_input(raw: &str) -> Result<Option<serde_json::Value>, Stri
         .map_err(|err| format!("input must be valid JSON: {err}"))
 }
 
+/// Humanize a whole-second countdown: `3h 12m`, `45s`, `2d 4h`. A non-positive
+/// value is due (or overdue and awaiting the next tick).
+pub fn humanize_countdown(secs: i64) -> String {
+    if secs <= 0 {
+        return "due".to_string();
+    }
+    if secs >= 86_400 {
+        format!("{}d {}h", secs / 86_400, (secs % 86_400) / 3_600)
+    } else if secs >= 3_600 {
+        format!("{}h {}m", secs / 3_600, (secs % 3_600) / 60)
+    } else if secs >= 60 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// The Next-run cell: `disabled` for an off schedule, `—` when the daemon
+/// resolved no future occurrence, else `in <countdown>`.
+pub fn next_run_label(enabled: bool, next_epoch: Option<i64>, now: i64) -> String {
+    if !enabled {
+        return "disabled".to_string();
+    }
+    match next_epoch {
+        Some(next) => format!("in {}", humanize_countdown(next - now)),
+        None => "—".to_string(),
+    }
+}
+
+/// Sleep roughly one second on both the browser and native targets.
+async fn tick_second() {
+    #[cfg(target_arch = "wasm32")]
+    {
+        gloo_timers::future::TimeoutFuture::new(1000).await;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    }
+}
+
 /// Validate a raw form into `schedules.upsert` params.
 pub fn build_schedule_params(form: &ScheduleForm) -> Result<ScheduleUpsertParams, String> {
     let task = form.task.trim();
@@ -143,12 +187,23 @@ pub fn Schedules() -> Element {
     let mut notice = use_signal(|| Option::<String>::None);
     let mut editing = use_signal(|| Option::<ScheduleForm>::None);
     let mut deleting = use_signal(|| Option::<String>::None);
+    // Bumped every second so the next-run countdown re-renders while the view
+    // is mounted.
+    let mut now = use_signal(now_epoch);
+    use_future(move || async move {
+        loop {
+            tick_second().await;
+            now.set(now_epoch());
+        }
+    });
 
-    // Reading `reload()` inside the future re-runs the fetch after a mutation.
+    // Reading `reload()` (after a mutation) and `schedules_version` (after a
+    // `cron_tick`) inside the future re-runs the fetch.
     let schedules = use_resource(move || {
         let base = (state.daemon_url)();
         let token = (state.token)();
         let _ = reload();
+        let _ = (state.schedules_version)();
         async move {
             RpcClient::new(base)
                 .with_token(token)
@@ -202,6 +257,7 @@ pub fn Schedules() -> Element {
                                     th { "Cron" }
                                     th { "Task" }
                                     th { "Enabled" }
+                                    th { "Next run" }
                                     th { "Last run" }
                                     th { "Actions" }
                                 }
@@ -217,6 +273,9 @@ pub fn Schedules() -> Element {
                                                 class: if schedule.enabled { "status-badge status-succeeded" } else { "status-badge status-cancelled" },
                                                 if schedule.enabled { "enabled" } else { "disabled" }
                                             }
+                                        }
+                                        td { class: "schedule-next-run",
+                                            "{next_run_label(schedule.enabled, schedule.next_run.map(|t| t.timestamp()), now())}"
                                         }
                                         td { "{schedule.last_run.as_ref().map(|t| t.to_string()).unwrap_or_else(|| \"never\".to_string())}" }
                                         td { div { class: "row-actions",
@@ -479,11 +538,29 @@ mod tests {
             input: serde_json::json!({ "a": 1 }),
             enabled: false,
             last_run: None,
+            next_run: None,
         };
         let form = ScheduleForm::from_schedule(&schedule);
         assert_eq!(form.id, "daily");
         assert!(!form.enabled);
         assert_eq!(form.input, r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn humanize_countdown_buckets_days_hours_minutes_seconds() {
+        assert_eq!(humanize_countdown(0), "due");
+        assert_eq!(humanize_countdown(-1), "due");
+        assert_eq!(humanize_countdown(45), "45s");
+        assert_eq!(humanize_countdown(125), "2m 5s");
+        assert_eq!(humanize_countdown(3_600 + 12 * 60), "1h 12m");
+        assert_eq!(humanize_countdown(86_400 + 3 * 3_600), "1d 3h");
+    }
+
+    #[test]
+    fn next_run_label_covers_enabled_disabled_and_absent() {
+        assert_eq!(next_run_label(true, Some(1_000), 940), "in 1m 0s");
+        assert_eq!(next_run_label(false, Some(1_000), 940), "disabled");
+        assert_eq!(next_run_label(true, None, 940), "—");
     }
 
     fn with_state(view: fn() -> Element) -> Element {
