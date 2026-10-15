@@ -20,7 +20,7 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust with rustfmt
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -32,7 +32,7 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust with clippy
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -45,9 +45,9 @@ jobs:
     name: msrv
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install the declared MSRV toolchain
-        uses: dtolnay/rust-toolchain@1.94.0
+        uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
       - name: Check against the declared MSRV
         run: cargo check --locked --workspace --all-targets
@@ -56,7 +56,7 @@ jobs:
     name: wasm
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust with the wasm32 target
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -69,7 +69,7 @@ jobs:
     name: nextest
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -82,7 +82,7 @@ jobs:
     name: docs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -105,7 +105,7 @@ jobs:
     name: conventional commits
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -117,7 +117,7 @@ jobs:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   # The `web/` Dioxus client is a standalone workspace (see the root `exclude`);
@@ -133,7 +133,7 @@ jobs:
       WEB_WARN_BYTES: "500000"
       WEB_FAIL_BYTES: "1000000"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust with rustfmt and the wasm32 target
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -144,7 +144,7 @@ jobs:
           workspaces: web
       - name: Cache the pinned Dioxus CLI
         id: dx-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/dx
           key: dx-${{ env.DX_VERSION }}-${{ runner.os }}-${{ runner.arch }}
@@ -152,7 +152,7 @@ jobs:
         if: steps.dx-cache.outputs.cache-hit != 'true'
         run: cargo install dioxus-cli --version "$DX_VERSION" --locked
       - name: Cache the Dioxus toolchain downloads
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.local/share/.dx
           key: dx-tools-${{ runner.os }}-${{ env.DX_VERSION }}
@@ -200,7 +200,7 @@ jobs:
           fi
         working-directory: web
       - name: Upload the staged web bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: web-dist
           path: web/dist
@@ -215,9 +215,9 @@ jobs:
       ANDROID_PLATFORM: "34"
       NDK_VERSION: 27.0.12077973
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
@@ -252,7 +252,7 @@ jobs:
           workspaces: web
       - name: Cache the pinned Dioxus CLI
         id: dx-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/dx
           key: dx-${{ env.DX_VERSION }}-${{ runner.os }}-${{ runner.arch }}
@@ -260,12 +260,12 @@ jobs:
         if: steps.dx-cache.outputs.cache-hit != 'true'
         run: cargo install dioxus-cli --version "$DX_VERSION" --locked
       - name: Cache the Dioxus toolchain downloads
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.local/share/.dx
           key: dx-tools-${{ runner.os }}-${{ env.DX_VERSION }}
       - name: Cache Gradle
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.gradle/caches
@@ -280,7 +280,7 @@ jobs:
           --features mobile --target "$ANDROID_TARGET"
         working-directory: web
       - name: Upload the APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: favetto-android-apk
           path: web/dist/*.apk
