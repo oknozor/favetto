@@ -276,16 +276,20 @@ fn apply_event(mut state: AppState, event: crate::sse::SseEvent) {
     if crate::state::is_catalog_push(method) {
         state.bump_catalog();
     }
-    if let Ok(params) = serde_json::from_str::<serde_json::Value>(&data) {
-        if method == favetto_wire::rpc::push::EVENT {
-            if let Ok(event) = serde_json::from_value::<favetto_wire::model::Event>(params.clone())
-            {
-                if matches!(event.kind, favetto_wire::model::EventKind::CronTick) {
-                    state.bump_schedules();
-                }
-                dispatch_alert(state, &event);
+    // A durable `event` frame is decoded once from its raw payload and then
+    // shared by the awaiting-input notification and the cache feed, instead of
+    // parsing to a `Value` and re-decoding it per destination.
+    if method == favetto_wire::rpc::push::EVENT {
+        if let Ok(event) = serde_json::from_str::<favetto_wire::model::Event>(&data) {
+            if matches!(event.kind, favetto_wire::model::EventKind::CronTick) {
+                state.bump_schedules();
             }
+            dispatch_alert(state, &event);
+            state.cache.write().push_event(event);
         }
+        return;
+    }
+    if let Ok(params) = serde_json::from_str::<serde_json::Value>(&data) {
         state.cache.write().apply_push(method, &params);
     }
 }
