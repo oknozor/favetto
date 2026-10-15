@@ -30,7 +30,10 @@ embedded as live terminals — the orchestrator never implements its own agent l
   wire protocol; local attach is just a special case of remote attach.
 - **Event-driven core** — everything is a task, an event, or a hook.
 - **Declarative tasks** — each task is a Markdown file with a TOML header
-  (`agent`, plus optional schedule/dependency) and a prompt body.
+  (`agent` or `kind = "action"`, plus optional schedule/dependency) and a prompt
+  body. An agent task delegates to an external CLI; an action task runs a
+  curated built-in step (e.g. `http.request`) in the daemon and may gate its
+  `spawn` on the result.
 - **Crash-resilient** — tasks and events persist across restarts; the event log is
   append-only and monotonic, doubling as the TUI's resume cursor.
 

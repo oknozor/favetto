@@ -190,11 +190,14 @@ pub fn regenerate(catalog: &[TaskDef], data_dir: &Path) -> std::io::Result<PathB
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tasks::TaskKind;
 
     /// A minimal task with no edges; tests set the fields they care about.
     fn task(name: &str) -> TaskDef {
         TaskDef {
             name: name.to_string(),
+            kind: TaskKind::Agent,
+            action: None,
             agent: Some("x".to_string()),
             provider: None,
             model: None,

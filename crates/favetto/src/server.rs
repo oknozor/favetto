@@ -1772,6 +1772,8 @@ async fn add_catalog_task(
 
     let mut def = TaskDef {
         name,
+        kind: crate::tasks::TaskKind::Agent,
+        action: None,
         agent,
         provider,
         model,

@@ -536,7 +536,7 @@ mod tests {
 
     use crate::event_bus::EventBus;
     use crate::state::StateInit;
-    use crate::tasks::TaskDef;
+    use crate::tasks::{TaskDef, TaskKind};
     use axum::http::{HeaderMap, HeaderValue};
     use favetto_core::auth::Token;
     use favetto_core::model::{EventKind, TaskStatus};
@@ -863,6 +863,8 @@ mod tests {
     fn catalog() -> Vec<TaskDef> {
         vec![TaskDef {
             name: "triage".to_string(),
+            kind: TaskKind::Agent,
+            action: None,
             agent: None,
             provider: None,
             model: None,

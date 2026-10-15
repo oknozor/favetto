@@ -20,6 +20,8 @@ fn def_with_vars() -> TaskDef {
     };
     TaskDef {
         name: "t".to_string(),
+        kind: TaskKind::Agent,
+        action: None,
         agent: None,
         provider: None,
         model: None,
@@ -901,7 +903,7 @@ fn truncate_text_keeps_head_and_tail_on_char_boundaries() {
 fn build_task_output_caps_and_dedupes() {
     let raw = "x".repeat(10_000);
     let parsed = serde_json::json!({ "text": raw });
-    let value = build_task_output(&raw, &parsed, "opencode", None, None, 1000);
+    let value = build_task_output(&raw, &parsed, Some("opencode"), None, None, 1000);
     assert_eq!(value["result"], serde_json::Value::Null);
     assert_eq!(value["truncated"], true);
     assert_eq!(value["output_bytes"], 10_000);
@@ -939,7 +941,7 @@ async fn build_task_output_bounds_every_shape() {
     ];
 
     for (i, parsed) in shapes.iter().enumerate() {
-        let value = build_task_output(&raw, parsed, "agent", None, None, max);
+        let value = build_task_output(&raw, parsed, Some("agent"), None, None, max);
         assert_eq!(
             value["output_bytes"].as_u64(),
             Some(raw.len() as u64),
@@ -964,7 +966,7 @@ async fn build_task_output_bounds_every_shape() {
     let built = build_task_output(
         &raw,
         &serde_json::json!([{ "event": huge }]),
-        "agent",
+        Some("agent"),
         None,
         None,
         max,
@@ -1007,7 +1009,14 @@ async fn build_task_output_bounds_every_shape() {
 fn build_task_output_keeps_structured_result() {
     let raw = "done";
     let parsed = serde_json::json!([{ "event": "x" }]);
-    let value = build_task_output(raw, &parsed, "opencode", Some("ses_1".into()), None, 1000);
+    let value = build_task_output(
+        raw,
+        &parsed,
+        Some("opencode"),
+        Some("ses_1".into()),
+        None,
+        1000,
+    );
     assert_eq!(value["truncated"], false);
     assert_eq!(value["output"], "done");
     assert_eq!(value["result"], parsed);
@@ -1055,7 +1064,7 @@ fn bounded_prev_value_truncates_large_shape_and_keeps_small_verbatim() {
 fn build_task_output_synthesises_summary_from_raw_tail() {
     let raw = "starting\nstep one\ndone: added the feature\n";
     let parsed = serde_json::json!({ "text": raw });
-    let value = build_task_output(raw, &parsed, "plain", None, None, 1000);
+    let value = build_task_output(raw, &parsed, Some("plain"), None, None, 1000);
     assert_eq!(value["envelope"]["summary"], "done: added the feature");
     assert_eq!(value["envelope"]["artifacts"], serde_json::json!([]));
     assert_eq!(value["envelope"]["findings"], serde_json::json!([]));
@@ -1076,7 +1085,7 @@ fn build_task_output_embeds_structured_envelope() {
         "outputs": { "tests_passed": true },
         "continuation": { "spawn": "next" },
     });
-    let value = build_task_output("raw text", &parsed, "agent", None, None, 1000);
+    let value = build_task_output("raw text", &parsed, Some("agent"), None, None, 1000);
     assert_eq!(value["envelope"], parsed);
     // The envelope is the canonical copy, so `result` is de-duped.
     assert_eq!(value["result"], serde_json::Value::Null);
@@ -1090,7 +1099,7 @@ fn build_task_output_embeds_envelope_from_result_text() {
         "text": "{\"summary\":\"from text\",\"artifacts\":[]}",
         "session_id": "ses_1",
     });
-    let value = build_task_output("whatever", &parsed, "opencode", None, None, 1000);
+    let value = build_task_output("whatever", &parsed, Some("opencode"), None, None, 1000);
     assert_eq!(value["envelope"]["summary"], "from text");
     // Missing documented keys are normalized in.
     assert_eq!(value["envelope"]["findings"], serde_json::json!([]));
@@ -1107,7 +1116,7 @@ fn build_task_output_ignores_non_envelope_result() {
         "text": "this is not JSON",
         "session_id": "ses_1",
     });
-    let value = build_task_output(raw, &parsed, "opencode", None, None, 1000);
+    let value = build_task_output(raw, &parsed, Some("opencode"), None, None, 1000);
     assert_eq!(value["envelope"]["summary"], "final answer");
     assert_eq!(value["result"], parsed);
 }
@@ -3690,4 +3699,174 @@ async fn repo_task_runs_in_and_branches_the_repo() {
 
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// A one-shot local HTTP server returning `body` as `application/json`.
+async fn serve_json_once(
+    body: &'static str,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        if let Ok((mut socket, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.flush().await;
+        }
+    });
+    (addr, handle)
+}
+
+/// A `kind = "action"` task runs its built-in action without an agent and folds
+/// the result into the agent-shaped `task.output.envelope` (with `agent: null`).
+#[tokio::test]
+async fn run_one_runs_an_action_task_without_an_agent() {
+    let dir = scratch_dir("action-envelope");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (addr, server) = serve_json_once(r#"[{"number":1},{"number":2},{"number":3}]"#).await;
+    let state = join_state(&dir, Vec::new()).await;
+
+    let def = crate::tasks::parse_task_md(
+        "gate",
+        &format!(
+            "kind = \"action\"\nworktree = false\n\
+             [action]\nid = \"http.request\"\n\
+             [action.params]\nurl = \"http://{addr}/issues\"\n\
+             [action.when]\npath = \"items\"\nop = \"not_empty\"\n---\nPoll.\n"
+        ),
+    )
+    .unwrap();
+    assert_eq!(def.agent, None);
+
+    let task = lineage_task("gate", TaskStatus::Running, None, None);
+    db::insert_task(&state.db, &task).await.unwrap();
+    let plan = Plan {
+        cwd: dir.clone(),
+        needs_lock: false,
+        worktree: None,
+    };
+    let run = running_run(task.id);
+    db::insert_task_run(&state.db, &run).await.unwrap();
+    run_one(&state, task.clone(), run, def, plan, None).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+
+    let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Succeeded, "{:?}", stored.error);
+    let output = stored.output.as_ref().unwrap();
+    assert_eq!(output["agent"], serde_json::Value::Null);
+    assert_eq!(output["envelope"]["outputs"]["status"], 200);
+    assert_eq!(
+        output["envelope"]["outputs"]["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert!(
+        output["envelope"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("-> 200"),
+        "{output}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A true `[action.when]` predicate writes the action's child manifest and
+/// enqueues the child with the gate run's lineage.
+#[tokio::test]
+async fn action_when_true_writes_the_manifest_and_spawns_a_child() {
+    let dir = scratch_dir("action-spawn-true");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (addr, server) = serve_json_once(r#"[{"number":1}]"#).await;
+    let state = join_state(&dir, Vec::new()).await;
+
+    let def = crate::tasks::parse_task_md(
+        "gate",
+        &format!(
+            "kind = \"action\"\nspawn = \"child\"\nspawn_file = \"handoff.json\"\n\
+             [action]\nid = \"http.request\"\n\
+             [action.params]\nurl = \"http://{addr}/issues\"\n\
+             [action.spawn_input]\nissue_id = 7\n\
+             [action.when]\npath = \"items\"\nop = \"not_empty\"\n---\nPoll.\n"
+        ),
+    )
+    .unwrap();
+
+    let root = Uuid::new_v4();
+    let task = lineage_task("gate", TaskStatus::Running, Some(root), None);
+    db::insert_task(&state.db, &task).await.unwrap();
+    let plan = Plan {
+        cwd: dir.clone(),
+        needs_lock: false,
+        worktree: None,
+    };
+    let run = running_run(task.id);
+    db::insert_task_run(&state.db, &run).await.unwrap();
+    run_one(&state, task.clone(), run, def, plan, None).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+
+    assert!(
+        dir.join("handoff.json").exists(),
+        "manifest was not written"
+    );
+    let children = pending_named(&state, "child").await;
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].input["issue_id"], 7);
+    assert_eq!(children[0].parent_id, Some(task.id));
+    assert_eq!(children[0].root_id, Some(root));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A false `[action.when]` predicate still succeeds but enqueues nothing and
+/// writes no manifest, matching an empty `[]` handoff.
+#[tokio::test]
+async fn action_when_false_enqueues_nothing_but_succeeds() {
+    let dir = scratch_dir("action-spawn-false");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (addr, server) = serve_json_once(r#"[{"number":1}]"#).await;
+    let state = join_state(&dir, Vec::new()).await;
+
+    let def = crate::tasks::parse_task_md(
+        "gate",
+        &format!(
+            "kind = \"action\"\nspawn = \"child\"\nspawn_file = \"handoff.json\"\n\
+             [action]\nid = \"http.request\"\n\
+             [action.params]\nurl = \"http://{addr}/issues\"\n\
+             [action.when]\npath = \"items\"\nop = \"empty\"\n---\nPoll.\n"
+        ),
+    )
+    .unwrap();
+
+    let task = lineage_task("gate", TaskStatus::Running, None, None);
+    db::insert_task(&state.db, &task).await.unwrap();
+    let plan = Plan {
+        cwd: dir.clone(),
+        needs_lock: false,
+        worktree: None,
+    };
+    let run = running_run(task.id);
+    db::insert_task_run(&state.db, &run).await.unwrap();
+    run_one(&state, task.clone(), run, def, plan, None).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+
+    let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Succeeded, "{:?}", stored.error);
+    assert!(
+        !dir.join("handoff.json").exists(),
+        "manifest must not exist"
+    );
+    assert!(pending_named(&state, "child").await.is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

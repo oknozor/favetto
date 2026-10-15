@@ -38,6 +38,37 @@ Moving `triage.md` to `pipeline/triage.md` changes its identity from `triage` to
 and any `needs`/`spawn`/webhook rule that named `triage` must be updated.
 :::
 
+## Agent tasks and action tasks
+
+Every task is either an **agent task** or an **action task**, chosen by the
+`kind` header key:
+
+- `kind = "agent"` (the default) launches an external coding-agent CLI, driven by
+  the task's `prompt`.
+- `kind = "action"` runs a deterministic built-in step in the daemon — today an
+  [HTTP request](../reference/tasks#http-request) — with no agent, session, or
+  worktree. An `[action.when]` predicate can then gate the task's `spawn`, so a
+  scheduled poller only starts the next task when there is something to do.
+
+```md
+kind = "action"
+schedule = "0 */15 * * * *"
+spawn = "triage_issues"
+spawn_file = ".favetto/gates/{{ task.id }}/handoff.json"
+
+[action]
+id = "http.request"
+[action.params]
+url = "https://api.github.com/repos/oknozor/favetto/issues"
+[action.when]
+path = "items"
+op = "not_empty"
+---
+```
+
+See [Action tasks](../reference/tasks#action-tasks-kind-action) for the full
+header and the `http.request` parameters.
+
 ## Repository-local tasks
 
 A repository can ship its own catalog in `<repo>/.favetto/tasks/`, using exactly

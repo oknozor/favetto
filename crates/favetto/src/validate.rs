@@ -54,8 +54,11 @@ fn task_name_from_path(path: &std::path::Path) -> String {
         .unwrap_or_else(|| "task".to_string())
 }
 
-/// The success line: identity plus the resolved agent, when one is set.
+/// The success line: identity plus the resolved agent or action, when set.
 fn summary(def: &TaskDef) -> String {
+    if let Some(action) = &def.action {
+        return format!("ok: {} (action={})", def.name, action.id);
+    }
     match &def.agent {
         Some(agent) => format!("ok: {} (agent={agent})", def.name),
         None => format!("ok: {}", def.name),
@@ -124,6 +127,33 @@ mod tests {
         )
         .expect_err("duplicate var name");
         assert!(duplicate.to_string().contains("duplicate"), "{duplicate}");
+    }
+
+    #[test]
+    fn action_task_reports_ok_with_action() {
+        let def = parse_task_md(
+            "gate",
+            "kind = \"action\"\n[action]\nid = \"http.request\"\n---\n",
+        )
+        .expect("valid action task");
+        assert_eq!(summary(&def), "ok: gate (action=http.request)");
+    }
+
+    #[test]
+    fn action_task_without_action_is_rejected() {
+        let err = parse_task_md("gate", "kind = \"action\"\n---\nbody")
+            .expect_err("kind = action without [action]");
+        assert!(err.to_string().contains("action"), "{err}");
+    }
+
+    #[test]
+    fn action_task_with_agent_is_rejected() {
+        let err = parse_task_md(
+            "gate",
+            "kind = \"action\"\nagent = \"opencode\"\n[action]\nid = \"http.request\"\n---\nbody",
+        )
+        .expect_err("kind = action with an agent");
+        assert!(err.to_string().contains("must not set"), "{err}");
     }
 
     #[test]
