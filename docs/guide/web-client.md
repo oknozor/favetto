@@ -35,6 +35,12 @@ The web client is enabled by default (`[web].enabled = true`). To disable it:
 enabled = false
 ```
 
+Opening a task row shows its detail page, which renders the persisted run output
+through `tasks.get`. For an **action** task this is the durable
+`output.envelope.summary` the built-in step produced; the web client never calls
+`agents.start`, so opening an action run can't launch an agent session. The
+daemon also rejects `agents.start` for an action task.
+
 ### Remote access
 
 The web client works over the same remote setup as the TUI — see

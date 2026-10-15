@@ -190,6 +190,10 @@ pub struct CatalogEntry {
     pub model: Option<String>,
     pub cwd: Option<String>,
     pub schedule: Option<String>,
+    /// How the task runs: `"agent"` (the default) or `"action"`. Defaulted for
+    /// older daemons that predate `kind`.
+    #[serde(default)]
+    pub kind: String,
     pub needs: Option<String>,
     /// Manual input variables declared with `[[vars]]`.
     pub vars: Vec<TaskVar>,
@@ -1260,6 +1264,7 @@ mod tests {
             model: None,
             cwd: None,
             schedule: None,
+            kind: "action".to_string(),
             needs: None,
             vars: Vec::new(),
             prompt: "p".to_string(),
@@ -1269,6 +1274,7 @@ mod tests {
         assert_eq!(json["agent"], serde_json::Value::Null);
         assert_eq!(json["prompt"], "p");
         assert_eq!(json["repo"], serde_json::Value::Null);
+        assert_eq!(json["kind"], "action");
 
         let add = CatalogAddResult {
             name: "t".to_string(),
@@ -1290,5 +1296,43 @@ mod tests {
         })
         .unwrap();
         assert_eq!(ping, serde_json::json!({ "pong": true, "cwd": "/tmp" }));
+    }
+
+    #[test]
+    fn catalog_entry_kind_round_trips_and_defaults_empty() {
+        let entry = CatalogEntry {
+            name: "t".to_string(),
+            agent: None,
+            provider: None,
+            model: None,
+            cwd: None,
+            schedule: None,
+            kind: "agent".to_string(),
+            needs: None,
+            vars: Vec::new(),
+            prompt: "p".to_string(),
+            repo: None,
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        let back: CatalogEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(back, entry);
+        assert_eq!(back.kind, "agent");
+
+        // A daemon that predates `kind` omits the field; it defaults to empty so
+        // clients fall back to their own `agent` default.
+        let legacy: CatalogEntry = serde_json::from_value(serde_json::json!({
+            "name": "t",
+            "agent": null,
+            "provider": null,
+            "model": null,
+            "cwd": null,
+            "schedule": null,
+            "needs": null,
+            "vars": [],
+            "prompt": "p",
+            "repo": null,
+        }))
+        .unwrap();
+        assert_eq!(legacy.kind, "");
     }
 }

@@ -84,6 +84,9 @@ pub enum UiAction {
     Quit,
     /// Start (and focus) an embedded agent session for a task id.
     OpenAgent(String),
+    /// Show an action task's result summary (`tasks.get`) instead of launching an
+    /// agent: an action task has no agent session to open.
+    OpenTaskResult(String),
     /// Start a brand-new agent session for a task, ignoring any existing one.
     NewAgent(String),
     /// Open the Ctrl+O agent-session picker (needs an async `agents.list`).
@@ -187,6 +190,12 @@ pub enum Popup {
     /// `error`) rendered in full, reusing `error_cell`'s formatting.
     TaskError {
         task_id: Uuid,
+    },
+    /// The action-task result popup, opened instead of an agent session when the
+    /// selected Tasks row is an action task. Holds the full `tasks.get` row so the
+    /// durable `output.envelope.summary` (omitted from `tasks.list`) can render.
+    TaskResult {
+        task: Box<Task>,
     },
     /// The Ctrl+P "Switch repo" picker: a searchable list of known repos plus a
     /// `global` row that clears the active repo.
@@ -419,6 +428,10 @@ pub struct CatalogEntry {
     pub model: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    /// How the task runs: `"agent"` (the default) or `"action"`. Defaulted for
+    /// older daemons that predate `kind`.
+    #[serde(default)]
+    pub kind: String,
     #[serde(default)]
     pub needs: Option<String>,
     #[serde(default)]
@@ -461,6 +474,13 @@ impl CatalogEntry {
             (Some(p), None) => p.clone(),
             (None, None) => "—".to_string(),
         }
+    }
+
+    /// Whether this definition is an action task (`kind = "action"`): it runs a
+    /// built-in step rather than an external agent, so opening its run shows a
+    /// result summary instead of an agent session.
+    pub fn is_action(&self) -> bool {
+        self.kind == "action"
     }
 }
 
@@ -686,7 +706,8 @@ pub struct App {
     /// True when the panel renders the structured state view for a headless run
     /// instead of the machine PTY's screen (which carries raw JSON events).
     pub agent_structured: bool,
-    /// The last `agents.start` / `agents.attach` error, shown in the status bar.
+    /// The last `agents.start` / `agents.attach` / `tasks.get` error, shown in the
+    /// status bar.
     pub agent_error: Option<String>,
     /// The last task-command error (`tasks.cancel` / `tasks.retry` /
     /// `workflow.cancel`), shown in the status bar. Cleared by a later success.
@@ -1020,6 +1041,13 @@ impl App {
             self.catalog_selected.min(rows - 1)
         };
         self.catalog_preview = None;
+    }
+
+    /// The catalog definition for a task, matched by its (possibly
+    /// repo-qualified) name. `None` for a task with no catalog entry (a global
+    /// one-shot or a legacy row).
+    pub fn catalog_entry(&self, name: &str) -> Option<&CatalogEntry> {
+        self.catalog.iter().find(|e| e.name == name)
     }
 
     /// Store the fetched repo registry and active repo (`repos.list`).
@@ -1455,6 +1483,18 @@ impl App {
         // unless the PTY is read-only.
         self.agent_capture = !read_only;
         self.tab = Tab::Agent;
+    }
+
+    /// Show an action task's result summary instead of opening an agent session.
+    ///
+    /// The row comes from `tasks.get` (unlike `tasks.list`, it carries the
+    /// durable `output.envelope` where the executor stores the action summary).
+    /// The Tasks tab and the Agent tab are left untouched.
+    pub fn open_task_result(&mut self, task: Task) {
+        self.agent_error = None;
+        self.popup = Popup::TaskResult {
+            task: Box::new(task),
+        };
     }
 
     /// Replace the popup with the Ctrl+O agent-session picker. An empty list is

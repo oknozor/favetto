@@ -1419,6 +1419,70 @@ async fn agents_start_uses_catalog_provider_and_model() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Entering an action task must not spawn an agent: `agents.start` rejects it
+/// server-side instead of falling back to `[agent].default`. Regression for
+/// #324.
+#[cfg(unix)]
+#[tokio::test]
+async fn agents_start_rejects_an_action_task() {
+    let dir = temp_dir("start-action-reject");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    std::fs::write(
+        tasks_dir.join("gate.md"),
+        "kind = \"action\"\nworktree = false\n\n[action]\nid = \"http.request\"\n---\nPoll.\n",
+    )
+    .unwrap();
+
+    // A fake opencode that records the argv it was launched with: the guard must
+    // trip before any PTY is spawned, so this stays empty.
+    let capture = dir.join("captured-args.txt");
+    let script = argv_capture_script(&dir, &capture);
+    let state = title_state(&dir, &tasks_dir, &script).await;
+
+    let task = Task {
+        id: Uuid::new_v4(),
+        name: "gate".to_string(),
+        status: TaskStatus::Succeeded,
+        attempt: 1,
+        input: serde_json::json!({}),
+        output: Some(serde_json::json!({
+            "envelope": { "summary": "http 200: 3 issues" }
+        })),
+        dedupe_key: None,
+        created_at: Utc::now(),
+        started_at: Some(Utc::now()),
+        finished_at: Some(Utc::now()),
+        error: None,
+        failure: None,
+        session_id: None,
+        session_title: None,
+        parent_id: None,
+        root_id: None,
+        interactive: false,
+    };
+    db::insert_task(&state.db, &task).await.unwrap();
+
+    let err = start_agent(
+        &state,
+        json_params(serde_json::json!({ "task_id": task.id.to_string() })),
+    )
+    .await
+    .expect_err("an action task must not open an agent session");
+    assert!(
+        err.to_string().contains("action task"),
+        "expected a clear action-task error, got: {err}"
+    );
+    assert!(
+        std::fs::read_to_string(&capture)
+            .unwrap_or_default()
+            .is_empty(),
+        "no PTY may be spawned for an action task"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// End-to-end regression for issue #69: starting a catalog task through
 /// `tasks.start` alone runs it headlessly and submits the rendered prompt —
 /// no `agents.start` / Agent-panel attach is needed.

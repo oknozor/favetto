@@ -850,6 +850,9 @@ async fn run_session(
                             UiAction::OpenAgent(task_id) => {
                                 open_agent(client, app, task_id, false).await;
                             }
+                            UiAction::OpenTaskResult(task_id) => {
+                                open_task_result(client, app, task_id).await;
+                            }
                             UiAction::NewAgent(task_id) => {
                                 open_agent(client, app, task_id, true).await;
                             }
@@ -1061,6 +1064,32 @@ async fn open_agent(client: &Client, app: &mut App, task_id: String, force_new: 
     }
 }
 
+/// Open an action task's result summary: fetch the durable row with
+/// `tasks.get` (its `output.envelope.summary` is dropped from `tasks.list`) and
+/// show it in the result popup. No agent session or PTY is started.
+async fn open_task_result(client: &Client, app: &mut App, task_id: String) {
+    match client
+        .request(method::TASKS_GET, serde_json::json!({ "id": task_id }))
+        .await
+    {
+        Ok(resp) => match resp.result {
+            Some(v) => match serde_json::from_value::<Task>(v) {
+                Ok(task) => app.open_task_result(task),
+                Err(e) => agent_request_failed(app, "tasks.get", &e.to_string()),
+            },
+            None => {
+                let message = resp
+                    .error
+                    .as_ref()
+                    .map(|e| e.message.clone())
+                    .unwrap_or_else(|| "task not found".to_string());
+                agent_request_failed(app, "tasks.get", &message);
+            }
+        },
+        Err(e) => agent_request_failed(app, "tasks.get", &e.to_string()),
+    }
+}
+
 /// Apply an `agents.start` / `tasks.start_oneshot` response: open the returned
 /// session (with its current frame) in the Agent panel.
 fn apply_agent_response(app: &mut App, resp: favetto_core::rpc::Response) {
@@ -1091,8 +1120,9 @@ fn apply_agent_response(app: &mut App, resp: favetto_core::rpc::Response) {
     }
 }
 
-/// Surface a failed `agents.start` / `agents.attach` (or malformed response) in
-/// the status bar, and keep a copy in the (unrendered) log ring for debugging.
+/// Surface a failed `agents.start` / `agents.attach` / `tasks.get` (or malformed
+/// response) in the status bar, and keep a copy in the (unrendered) log ring for
+/// debugging.
 fn agent_request_failed(app: &mut App, context: &str, message: &str) {
     app.agent_error = Some(message.to_string());
     app.logs.push_back(format!("{context}: {message}"));
