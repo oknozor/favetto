@@ -29,6 +29,21 @@ pub fn description(entry: &CatalogEntry) -> String {
         .collect()
 }
 
+/// The single kind badge label for an entry, with precedence `action` >
+/// `scheduled` > `agent`.
+///
+/// The label is definition-based (read from the catalog entry), not per-run: a
+/// task started by hand from a scheduled definition still reads `scheduled`.
+pub fn kind_label(entry: &CatalogEntry) -> &'static str {
+    if entry.kind == "action" {
+        "action"
+    } else if entry.schedule.is_some() {
+        "scheduled"
+    } else {
+        "agent"
+    }
+}
+
 /// Searchable metadata chips derived from the entry (the wire type has no tags).
 pub fn tags(entry: &CatalogEntry) -> Vec<String> {
     let mut tags = Vec::new();
@@ -359,6 +374,17 @@ mod tests {
         assert!(tags.contains(&"scheduled".to_string()));
         assert!(tags.contains(&"pipeline".to_string()));
         assert!(tags.contains(&"var:repo".to_string()));
+    }
+
+    #[test]
+    fn kind_label_prefers_action_then_scheduled_then_agent() {
+        let mut e = entry();
+        e.schedule = None;
+        assert_eq!(kind_label(&e), "agent");
+        e.schedule = Some("0 9 * * *".into());
+        assert_eq!(kind_label(&e), "scheduled");
+        e.kind = "action".into();
+        assert_eq!(kind_label(&e), "action", "action outranks scheduled");
     }
 
     fn custom(name: &str, prompt: &str) -> CatalogEntry {

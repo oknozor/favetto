@@ -1895,6 +1895,8 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     let widths = [
         Constraint::Length(10), // ID
         Constraint::Length(20), // TASK
+        // Wide enough for `scheduled`, the longest kind label.
+        Constraint::Length(10), // KIND
         Constraint::Length(14), // REPO
         // Session titles are truncated to 22 chars, so the column matches that.
         Constraint::Length(22), // SESSION
@@ -1907,7 +1909,7 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
         Constraint::Length(9),  // DURATION — `1h20m`
     ];
     let header = Row::new(vec![
-        "ID", "TASK", "REPO", "SESSION", "STATUS", "ACTIVITY", "TOKEN", "$COST", "STARTED",
+        "ID", "TASK", "KIND", "REPO", "SESSION", "STATUS", "ACTIVITY", "TOKEN", "$COST", "STARTED",
         "DURATION",
     ])
     .style(theme.table_header());
@@ -1924,6 +1926,13 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
                 Row::new(vec![
                     Cell::from(short_id(&t.id)),
                     Cell::from(task_display_name(&t.name)),
+                    // The kind badge is definition-based; an unknown/legacy task
+                    // falls back to an em dash rather than guessing.
+                    Cell::from(
+                        app.catalog_entry(&t.name)
+                            .map(|e| e.kind_label())
+                            .unwrap_or("—"),
+                    ),
                     Cell::from(truncate_ellipsis(repo_label(task_repo(&t.name)), 14)),
                     Cell::from(truncate_ellipsis(
                         t.session_title.as_deref().unwrap_or(""),

@@ -522,6 +522,7 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
                     model: d.model.clone(),
                     cwd: d.cwd.clone(),
                     schedule: d.schedule.clone(),
+                    kind: d.kind.as_str().to_string(),
                     needs: d.needs.clone(),
                     vars: d.vars.clone(),
                     prompt: d.prompt.clone(),

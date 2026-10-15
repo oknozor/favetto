@@ -35,6 +35,13 @@ The web client is enabled by default (`[web].enabled = true`). To disable it:
 enabled = false
 ```
 
+The **Tasks** list and the **Inbox** cards label each row with a catalog-derived
+**kind badge**: `agent` (the default), `action` (a built-in deterministic step),
+or `scheduled` (a cron trigger, which loses to `action` when both apply). The
+badge is definition-based rather than per-run, and a row whose catalog entry is
+unknown shows none. See [the catalog](./catalog) and
+[schedules and dependencies](./schedules-and-dependencies).
+
 ### Remote access
 
 The web client works over the same remote setup as the TUI — see
