@@ -74,8 +74,9 @@ fn sdk_int() -> i32 {
     .unwrap_or(0)
 }
 
-/// True when `POST_NOTIFICATIONS` is currently granted to the app.
-fn permission_granted() -> bool {
+/// Whether `POST_NOTIFICATIONS` is currently granted to the app, or `None` when
+/// the JNI context is unavailable.
+fn permission_granted() -> Option<bool> {
     with_activity(|env, activity| {
         let permission = env.new_string(POST_NOTIFICATIONS)?;
         let granted = env
@@ -88,6 +89,46 @@ fn permission_granted() -> bool {
             .i()?;
         // android.content.pm.PackageManager.PERMISSION_GRANTED == 0.
         Ok(granted == 0)
+    })
+}
+
+/// The live OS state of `POST_NOTIFICATIONS`, or `None` when the JNI context is
+/// unavailable. Below Android 13 the permission does not exist, so the manifest
+/// declaration is enough and the state is `Granted`.
+pub fn permission_state() -> Option<Permission> {
+    let sdk = sdk_int();
+    if sdk == 0 {
+        return None;
+    }
+    if sdk < 33 {
+        return Some(Permission::Granted);
+    }
+    permission_granted().map(|granted| {
+        if granted {
+            Permission::Granted
+        } else {
+            Permission::Denied
+        }
+    })
+}
+
+/// True when the user has permanently denied `POST_NOTIFICATIONS`: the OS would
+/// silently deny `requestPermissions` instead of showing the dialog
+/// (`shouldShowRequestPermissionRationale` is false after a denial). Only
+/// meaningful once the app has asked at least once; `false` on any failure so
+/// the caller still attempts the request.
+fn permanently_denied() -> bool {
+    with_activity(|env, activity| {
+        let permission = env.new_string(POST_NOTIFICATIONS)?;
+        let rationale = env
+            .call_method(
+                activity,
+                "shouldShowRequestPermissionRationale",
+                "(Ljava/lang/String;)Z",
+                &[JValue::Object(&permission)],
+            )?
+            .z()?;
+        Ok(!rationale)
     })
     .unwrap_or(false)
 }
@@ -112,19 +153,29 @@ fn request_via_activity() -> bool {
 ///
 /// Runs on the Dioxus UI thread (Dioxus executes spawned tasks on the
 /// VirtualDom's thread); `Activity.requestPermissions` must be called there.
-pub async fn request_notification_permission() -> Permission {
+///
+/// `asked_before` is whether a prior request was persisted as denied. When the
+/// permission is permanently denied, `requestPermissions` never shows a dialog,
+/// so this settles immediately instead of polling for the full timeout.
+pub async fn request_notification_permission(asked_before: bool) -> Permission {
     // The runtime permission only exists on Android 13+; on older releases the
     // manifest declaration is enough.
     if sdk_int() < 33 {
         return Permission::Granted;
     }
+    // Already granted (for example from the system settings): nothing to ask.
+    if permission_granted() == Some(true) {
+        return Permission::Granted;
+    }
+    if asked_before && permanently_denied() {
+        return Permission::Denied;
+    }
     if !request_via_activity() {
         return Permission::Denied;
     }
-    // Check right away (in case it is already granted), then poll until the
-    // dialog is answered.
+    // Poll until the dialog is answered.
     for _ in 0..POLL_ATTEMPTS {
-        if permission_granted() {
+        if permission_granted() == Some(true) {
             return Permission::Granted;
         }
         tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;

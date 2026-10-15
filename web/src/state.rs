@@ -18,7 +18,7 @@ use favetto_wire::model::{Event, RepoInfo, Task};
 use favetto_wire::rpc::{push, AgentEventPush, CatalogEntry};
 use uuid::Uuid;
 
-use crate::notifications::Permission;
+use crate::notifications::{Permission, Subscription};
 
 /// `localStorage` key for the bearer token.
 pub const TOKEN_KEY: &str = "favetto.token";
@@ -28,6 +28,8 @@ pub const DAEMON_URL_KEY: &str = "favetto.daemon_url";
 pub const CURSOR_KEY: &str = "favetto.event_cursor";
 /// Platform state key for the persisted notification permission (Android).
 pub const PERMISSION_KEY: &str = "favetto.notification_permission";
+/// Platform state key for the persisted task-event notification subscriptions.
+pub const NOTIFICATION_EVENTS_KEY: &str = "favetto.notification_events";
 
 /// How many live events to keep in the in-memory feed.
 pub const EVENT_CAP: usize = 500;
@@ -390,6 +392,8 @@ pub struct AppState {
     pub schedules_version: Signal<u64>,
     /// Browser/WebView notification permission, mirrored from `Notification.permission`.
     pub notification_permission: Signal<Permission>,
+    /// The task-event kinds that raise a system notification (persisted).
+    pub notification_events: Signal<Subscription>,
 }
 
 /// Whether a push method should make the Catalog view re-fetch.
@@ -414,6 +418,7 @@ impl AppState {
             catalog_version: Signal::new(0),
             schedules_version: Signal::new(0),
             notification_permission: Signal::new(load_permission()),
+            notification_events: Signal::new(load_notification_events()),
         }
     }
 
@@ -468,6 +473,12 @@ impl AppState {
     pub fn bump_schedules(&mut self) {
         let next = (self.schedules_version)() + 1;
         self.schedules_version.set(next);
+    }
+
+    /// Persist and apply a new task-event notification subscription set.
+    pub fn set_notification_events(&mut self, events: Subscription) {
+        save_notification_events(&events);
+        self.notification_events.set(events);
     }
 }
 
@@ -574,6 +585,19 @@ pub fn load_permission() -> Permission {
 /// Persist the notification permission.
 pub fn save_permission(permission: Permission) {
     save_string(PERMISSION_KEY, permission.as_str());
+}
+
+/// The persisted notification-event subscription set, defaulting to
+/// `task_awaiting_input` when unset or unreadable.
+pub fn load_notification_events() -> Subscription {
+    load_string(NOTIFICATION_EVENTS_KEY)
+        .map(|raw| Subscription::parse(&raw))
+        .unwrap_or_default()
+}
+
+/// Persist the notification-event subscription set.
+pub fn save_notification_events(events: &Subscription) {
+    save_string(NOTIFICATION_EVENTS_KEY, &events.as_str());
 }
 
 #[cfg(test)]
@@ -761,6 +785,41 @@ mod tests {
         assert_eq!(load_permission(), Permission::Granted);
         save_permission(Permission::Denied);
         assert_eq!(load_permission(), Permission::Denied);
+
+        std::env::remove_var("FAVETTO_WEB_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The subscribed event set survives a restart with the same native storage
+    /// as the token and permission.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn notification_events_persist_through_the_state_dir_override() {
+        use crate::notifications::Subscription;
+        use favetto_wire::model::EventKind;
+
+        // `FAVETTO_WEB_STATE_DIR` is process-global; serialize with the other
+        // state-dir tests.
+        let _guard = crate::storage::TEST_STATE_DIR_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("favetto-web-events-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("FAVETTO_WEB_STATE_DIR", &dir);
+
+        // Unset -> the default (`task_awaiting_input`).
+        assert_eq!(load_notification_events(), Subscription::default());
+
+        let mut subscription = Subscription::default();
+        subscription.set(&EventKind::TaskFinished, true);
+        save_notification_events(&subscription);
+        assert_eq!(load_notification_events(), subscription);
+        assert!(load_notification_events().contains(&EventKind::TaskFinished));
+
+        // An all-unsubscribed set persists as `none` rather than reverting to
+        // the default.
+        subscription.set(&EventKind::TaskAwaitingInput, false);
+        subscription.set(&EventKind::TaskFinished, false);
+        save_notification_events(&subscription);
+        assert!(load_notification_events().is_empty());
 
         std::env::remove_var("FAVETTO_WEB_STATE_DIR");
         let _ = std::fs::remove_dir_all(&dir);

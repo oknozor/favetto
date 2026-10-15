@@ -400,6 +400,14 @@ SSE and `ntfy` are complementary, not alternatives:
 Configuration stays file-based for channels; the web Settings view manages
 hooks (`hooks.upsert`) and can send a test (`notifications.test`).
 
+The client's own system notifications are configured in the same Settings card.
+`task_awaiting_input` and `task_finished` are the supported event kinds; the
+selection is persisted locally (`favetto.notification_events`) and drives which
+durable events raise an Android/browser notification while the app is open. Only
+`task_finished` notifies for a terminal run (success versus failure is derived
+from the payload), mirroring the TUI sound design, so a finished task does not
+notify twice.
+
 ---
 
 ## 10. Configuration

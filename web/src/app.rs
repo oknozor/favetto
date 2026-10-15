@@ -280,21 +280,25 @@ fn apply_event(mut state: AppState, event: crate::sse::SseEvent) {
                 if matches!(event.kind, favetto_wire::model::EventKind::CronTick) {
                     state.bump_schedules();
                 }
-                handle_awaiting(state, &event);
+                handle_event_notification(state, &event);
             }
         }
         state.cache.write().apply_push(method, &params);
     }
 }
 
-/// Raise a notification for a `task_awaiting_input` event.
+/// Raise a system notification for a subscribed durable event.
 ///
-/// The first awaiting event asks for permission (fire-and-forget); every later
-/// event notifies when permission is granted and the app is visible.
-fn handle_awaiting(mut state: AppState, event: &favetto_wire::model::Event) {
+/// The first notifiable event asks for permission (fire-and-forget); every later
+/// event notifies when permission is granted and the app is visible. Only the
+/// event kinds in the user's [`crate::notifications::Subscription`] are surfaced.
+fn handle_event_notification(mut state: AppState, event: &favetto_wire::model::Event) {
     use crate::notifications;
 
-    let Some(alert) = notifications::awaiting_alert(event) else {
+    if !(state.notification_events)().contains(&event.kind) {
+        return;
+    }
+    let Some(alert) = notifications::alert_for(event) else {
         return;
     };
     let permission = (state.notification_permission)();

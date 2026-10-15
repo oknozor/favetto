@@ -18,6 +18,7 @@ use favetto_wire::rpc::{
 
 use crate::app::Route;
 use crate::client::RpcClient;
+use crate::notifications::{event_label, NOTIFIABLE_KINDS};
 use crate::state::AppState;
 
 /// The notification channels the daemon implements (`crates/favetto/src/notify.rs`).
@@ -199,13 +200,15 @@ fn SessionSection() -> Element {
     }
 }
 
-/// Browser/WebView notification permission and a test. Daemon channels (`ntfy`,
-/// webhook) are managed by [`NotificationsSection`].
+/// Browser/WebView notification permission, the subscribed task events and a
+/// test. Daemon channels (`ntfy`, webhook) are managed by
+/// [`NotificationsSection`].
 #[component]
 fn AppNotificationsSection() -> Element {
     let mut state = use_context::<AppState>();
     let mut busy = use_signal(|| false);
     let permission = (state.notification_permission)();
+    let subscription = (state.notification_events)();
 
     let enable = move |_| {
         busy.set(true);
@@ -223,7 +226,7 @@ fn AppNotificationsSection() -> Element {
         section { class: "settings-section",
             h2 { "App notifications" }
             p { class: "settings-hint",
-                "Show a system notification when a task needs your input. Background paging to a closed app is handled by the daemon's ntfy channel."
+                "Show a system notification on this device for the task events you choose. Background paging to a closed app is handled by the daemon's ntfy channel."
             }
             dl { class: "settings-facts",
                 dt { "Permission" }
@@ -241,6 +244,23 @@ fn AppNotificationsSection() -> Element {
                     disabled: !permission.is_granted(),
                     onclick: test,
                     "Send test notification"
+                }
+            }
+            h3 { "Notify me when" }
+            div { class: "settings-form",
+                for kind in NOTIFIABLE_KINDS {
+                    label { class: "field field-inline",
+                        input {
+                            r#type: "checkbox",
+                            checked: subscription.contains(kind),
+                            onchange: move |event| {
+                                let mut next = (state.notification_events)();
+                                next.set(kind, event.checked());
+                                state.set_notification_events(next);
+                            },
+                        }
+                        span { class: "field-label", "{event_label(kind)}" }
+                    }
                 }
             }
         }

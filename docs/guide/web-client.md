@@ -269,6 +269,17 @@ talks to the platform directly from Rust through JNI
 tap deep link. Background paging to a closed app still goes through the daemon's
 `ntfy` channel.
 
+The **Settings → App notifications** card drives this. On Android the
+**Permission** badge reads the live OS state (`checkSelfPermission`), so a
+permission granted or revoked from the system settings is reflected; the
+**Enable notifications** button requests the runtime dialog and, when the
+permission has been permanently denied, settles as `denied` immediately instead
+of waiting on a dialog that will not appear. The subscribed task events are
+chosen in the same card, persisted under `favetto.notification_events`, and
+restored on the next launch. Both `task_awaiting_input` and `task_finished` can
+raise a notification; a `task_finished` alert derives success/failure from the
+payload's `success` flag, so `task_completed` / `task_failed` do not double up.
+
 ### Soft keyboard
 
 The soft keyboard overlays the WebView instead of resizing it. Focusing a field
