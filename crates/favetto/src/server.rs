@@ -731,7 +731,15 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
         }
 
         method::SCHEDULES_LIST => match db::list_schedules(&state.db).await {
-            Ok(schedules) => to_value(schedules),
+            Ok(mut schedules) => {
+                let now = chrono::Utc::now();
+                for schedule in &mut schedules {
+                    if schedule.enabled {
+                        schedule.next_run = crate::scheduler::next_run_after(&schedule.cron, now);
+                    }
+                }
+                to_value(schedules)
+            }
             Err(e) => Err(RpcError::Internal(e.to_string())),
         },
 
@@ -1730,16 +1738,20 @@ async fn upsert_schedule(
     let input = input.unwrap_or(serde_json::Value::Null);
     let enabled = enabled.unwrap_or(true);
 
-    let schedule = Schedule {
+    let mut schedule = Schedule {
         id,
         cron,
         task,
         input,
         enabled,
         last_run: None,
+        next_run: None,
     };
 
     crate::scheduler::upsert(state, &schedule).await?;
+    if schedule.enabled {
+        schedule.next_run = crate::scheduler::next_run_after(&schedule.cron, chrono::Utc::now());
+    }
     Ok(schedule)
 }
 

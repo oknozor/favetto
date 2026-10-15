@@ -632,6 +632,7 @@ fn row_to_schedule(row: &SqliteRow) -> Schedule {
         input: serde_json::from_str(&row.get::<String, _>("input")).unwrap_or_default(),
         enabled: row.get::<i64, _>("enabled") != 0,
         last_run: row.get::<Option<i64>, _>("last_run").map(from_ms),
+        next_run: None,
     }
 }
 

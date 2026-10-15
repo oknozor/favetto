@@ -782,6 +782,77 @@ async fn add_catalog_task_with_schedule_registers_cron() {
 }
 
 #[tokio::test]
+async fn schedules_list_reports_next_run_for_enabled_only() {
+    let dir = temp_dir("schedules-next-run");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+
+    // Seed directly in the DB: the list handler (not the scheduler) computes
+    // `next_run`, and disabled rows must stay `null`.
+    for (id, enabled) in [("enabled", true), ("disabled", false)] {
+        crate::db::upsert_schedule(
+            &state.db,
+            &favetto_core::model::Schedule {
+                id: id.to_string(),
+                cron: "0 0 8 * * *".to_string(),
+                task: "t".to_string(),
+                input: serde_json::json!({}),
+                enabled,
+                last_run: None,
+                next_run: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 1,
+            method: method::SCHEDULES_LIST.to_string(),
+            params: serde_json::json!({}),
+        },
+    )
+    .await;
+    let result = resp.result.expect("schedules.list result");
+    let list = result.as_array().expect("schedule array");
+    let find = |id: &str| list.iter().find(|s| s["id"] == id).unwrap();
+    assert!(
+        find("enabled")["next_run"].is_string(),
+        "enabled schedule should expose a next run: {list:?}"
+    );
+    assert!(
+        find("disabled")["next_run"].is_null(),
+        "disabled schedule should expose no next run: {list:?}"
+    );
+
+    // `schedules.upsert` echoes the same computed value for a new enabled row.
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 2,
+            method: method::SCHEDULES_UPSERT.to_string(),
+            params: serde_json::json!({
+                "id": "fresh",
+                "cron": "0 0 8 * * *",
+                "task": "t",
+                "enabled": true,
+            }),
+        },
+    )
+    .await;
+    let upserted = resp.result.expect("schedules.upsert result");
+    assert!(
+        upserted["next_run"].is_string(),
+        "upsert should echo a next run: {upserted:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn update_catalog_task_rewrites_file_and_publishes() {
     let dir = temp_dir("update");
     let tasks_dir = dir.join("tasks");

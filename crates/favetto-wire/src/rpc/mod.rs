@@ -311,7 +311,11 @@ pub const CLIENT_METHODS: &[(&str, &str)] = &[
         method::PROVIDERS_LIST,
         "List configured providers and their available models.",
     ),
-    (method::SCHEDULES_LIST, "List cron schedules."),
+    (
+        method::SCHEDULES_LIST,
+        "List cron schedules, with the next occurrence (`next_run`, UTC) computed for \
+         enabled entries.",
+    ),
     (
         method::SCHEDULES_UPSERT,
         "Create or update a cron schedule.",

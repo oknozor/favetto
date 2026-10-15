@@ -1560,6 +1560,7 @@ fn drawn_schedules_and_notifications_record_geometry() {
         input: serde_json::json!({}),
         enabled: true,
         last_run: None,
+        next_run: None,
     }];
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -1586,6 +1587,76 @@ fn drawn_schedules_and_notifications_record_geometry() {
     terminal.draw(|f| draw(f, &mut app)).unwrap();
     assert_eq!(app.notifications_geom.len, 1);
     assert_eq!(app.notifications_geom.offset, 0);
+}
+
+#[test]
+fn format_next_run_renders_buckets() {
+    use chrono::{Duration, Utc};
+
+    let now = Utc::now();
+    assert_eq!(format_next_run(false, Some(now), now), "disabled");
+    assert_eq!(format_next_run(true, None, now), "—");
+    assert_eq!(
+        format_next_run(true, Some(now + Duration::seconds(45)), now),
+        "in 45s"
+    );
+    assert_eq!(
+        format_next_run(
+            true,
+            Some(now + Duration::seconds(3 * 3_600 + 12 * 60)),
+            now
+        ),
+        "in 3h 12m"
+    );
+    assert_eq!(
+        format_next_run(
+            true,
+            Some(now + Duration::seconds(2 * 86_400 + 4 * 3_600)),
+            now
+        ),
+        "in 2d 4h"
+    );
+    // A skewed clock (next run already past) degrades to `in 0s`.
+    assert_eq!(
+        format_next_run(true, Some(now - Duration::seconds(5)), now),
+        "in 0s"
+    );
+}
+
+#[test]
+fn schedules_tab_renders_next_run_countdown() {
+    use chrono::{Duration, Utc};
+    use favetto_core::model::Schedule;
+
+    let mut app = App::new();
+    app.tab = Tab::Scheduler;
+    app.schedules = vec![
+        Schedule {
+            id: "soon".to_string(),
+            cron: "0 0 8 * * *".to_string(),
+            task: "t".to_string(),
+            input: serde_json::json!({}),
+            enabled: true,
+            last_run: None,
+            next_run: Some(Utc::now() + Duration::minutes(90)),
+        },
+        Schedule {
+            id: "off".to_string(),
+            cron: "0 0 8 * * *".to_string(),
+            task: "t".to_string(),
+            input: serde_json::json!({}),
+            enabled: false,
+            last_run: None,
+            next_run: None,
+        },
+    ];
+    let text = render_text(&mut app, 140, 24);
+    assert!(text.contains("NEXT RUN"), "header missing: {text:?}");
+    assert!(text.contains("in 1h"), "countdown missing: {text:?}");
+    assert!(
+        text.contains("disabled"),
+        "disabled label missing: {text:?}"
+    );
 }
 
 #[test]

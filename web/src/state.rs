@@ -385,6 +385,9 @@ pub struct AppState {
     pub cache: Signal<Cache>,
     /// Bumped by a `catalog.updated` push so the Catalog view re-fetches.
     pub catalog_version: Signal<u64>,
+    /// Bumped by a `cron_tick` push so the Schedules view re-fetches and the
+    /// countdown resets after each fire.
+    pub schedules_version: Signal<u64>,
     /// Browser/WebView notification permission, mirrored from `Notification.permission`.
     pub notification_permission: Signal<Permission>,
 }
@@ -409,6 +412,7 @@ impl AppState {
             pending_pair_code: Signal::new(None),
             cache: Signal::new(cache),
             catalog_version: Signal::new(0),
+            schedules_version: Signal::new(0),
             notification_permission: Signal::new(load_permission()),
         }
     }
@@ -457,6 +461,13 @@ impl AppState {
     pub fn bump_catalog(&mut self) {
         let next = (self.catalog_version)() + 1;
         self.catalog_version.set(next);
+    }
+
+    /// Signal a schedules change (a `cron_tick`, so the next run is recomputed)
+    /// to the Schedules view.
+    pub fn bump_schedules(&mut self) {
+        let next = (self.schedules_version)() + 1;
+        self.schedules_version.set(next);
     }
 }
 

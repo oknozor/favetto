@@ -5,7 +5,8 @@
 
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use croner::parser::{CronParser, Seconds};
 use tokio_cron_scheduler::{Job, JobScheduler};
 use uuid::Uuid;
 
@@ -14,6 +15,23 @@ use favetto_core::model::Schedule;
 use crate::db;
 use crate::executor;
 use crate::state::State;
+
+/// The next UTC occurrence of `cron` strictly after `now`, or `None` when the
+/// expression does not parse / has no future occurrence.
+///
+/// Uses the same parser configuration `tokio-cron-scheduler` applies when it
+/// registers jobs (`Seconds::Required`, `dom_and_dow(true)`, UTC), so a shown
+/// `next_run` always matches when the job would actually fire.
+pub fn next_run_after(cron: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    CronParser::builder()
+        .seconds(Seconds::Required)
+        .dom_and_dow(true)
+        .build()
+        .parse(cron)
+        .ok()?
+        .find_next_occurrence(&now, false)
+        .ok()
+}
 
 /// Register a schedule's job with the scheduler. Returns the job id.
 pub async fn register(
@@ -103,6 +121,7 @@ pub async fn reconcile_catalog_schedules(state: &Arc<State>) -> anyhow::Result<(
             input: serde_json::json!({}),
             enabled: true,
             last_run: None,
+            next_run: None,
         });
     }
 
@@ -162,4 +181,49 @@ pub async fn start(state: &Arc<State>) -> anyhow::Result<()> {
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn utc(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn next_run_after_handles_second_and_minute_forms() {
+        let now = utc("2026-01-05T00:00:00Z");
+        assert_eq!(
+            next_run_after("0 * * * * *", now),
+            Some(utc("2026-01-05T00:01:00Z"))
+        );
+        assert_eq!(
+            next_run_after("30 0 * * * *", now),
+            Some(utc("2026-01-05T00:00:30Z"))
+        );
+    }
+
+    #[test]
+    fn next_run_after_handles_daily_and_weekly_forms() {
+        let now = utc("2026-01-05T00:00:00Z");
+        assert_eq!(
+            next_run_after("0 0 8 * * *", now),
+            Some(utc("2026-01-05T08:00:00Z"))
+        );
+        // 2026-01-05 is a Monday.
+        assert_eq!(
+            next_run_after("0 30 9 * * 1", now),
+            Some(utc("2026-01-05T09:30:00Z"))
+        );
+    }
+
+    #[test]
+    fn next_run_after_rejects_unparseable_expressions() {
+        let now = utc("2026-01-05T00:00:00Z");
+        assert_eq!(next_run_after("not a cron", now), None);
+        // Five-field expressions fail the seconds-required parser, matching
+        // registration.
+        assert_eq!(next_run_after("0 8 * * *", now), None);
+    }
 }

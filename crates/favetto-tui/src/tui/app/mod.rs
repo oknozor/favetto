@@ -649,6 +649,9 @@ pub struct App {
     /// Set when the daemon pushes `catalog.updated`; the session loop re-fetches
     /// the catalog and clears it.
     pub catalog_dirty: bool,
+    /// Set when a `cron_tick` arrives; the session loop re-fetches `schedules.list`
+    /// so each countdown resets after a fire.
+    pub schedules_dirty: bool,
     /// The daemon's known repositories (`repos.list`), for the Switch repo picker
     /// and the status badge.
     pub known_repos: Vec<RepoInfo>,
@@ -793,6 +796,7 @@ impl App {
             catalog_preview_area: None,
             catalog_preview_visible: true,
             catalog_dirty: false,
+            schedules_dirty: false,
             known_repos: Vec::new(),
             active_repo: None,
             repos_dirty: false,
@@ -857,6 +861,16 @@ impl App {
             .tasks
             .iter()
             .any(|t| matches!(t.status, TaskStatus::Running | TaskStatus::AwaitingInput))
+        {
+            return true;
+        }
+        // The Scheduler tab renders a live countdown, so keep repainting while a
+        // future run is on screen.
+        if self.tab == Tab::Scheduler
+            && self
+                .schedules
+                .iter()
+                .any(|s| s.enabled && s.next_run.is_some())
         {
             return true;
         }
@@ -2040,6 +2054,11 @@ impl App {
         match n.method.as_str() {
             push::EVENT => {
                 if let Ok(ev) = serde_json::from_value::<Event>(n.params) {
+                    // A `cron_tick` recomputes the schedule's next run; the
+                    // session loop re-fetches so the countdown resets.
+                    if ev.kind == EventKind::CronTick {
+                        self.schedules_dirty = true;
+                    }
                     self.ingest_event(ev);
                 }
                 self.mark_workflow_inspect_dirty();
