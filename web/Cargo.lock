@@ -1752,6 +1752,7 @@ name = "favetto-web"
 version = "0.1.0"
 dependencies = [
  "dioxus",
+ "dioxus-html",
  "dioxus-icons-phosphor",
  "dirs 7.0.0",
  "favetto-wire",

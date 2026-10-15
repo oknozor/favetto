@@ -57,6 +57,12 @@ web-sys = { version = "0.3", features = [
 ] }
 dioxus-icons-phosphor = { version = "=0.2.1", default-features = false, features = ["regular"] }
 
+# Host-side tests synthesize DOM events through the serialized form-event
+# converter, which `dioxus` pulls in with `default-features = false`. Opting the
+# feature back in here keeps the production dependency graph untouched.
+[dev-dependencies]
+dioxus-html = { version = "=0.7.10", features = ["serialize"] }
+
 # Native targets (Android, plus the host test harness) have no browser `fetch`,
 # so the transport goes through reqwest. rustls with bundled webpki roots keeps
 # Android self-contained (no system OpenSSL); `stream` powers the SSE reader.
