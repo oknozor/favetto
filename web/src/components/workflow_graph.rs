@@ -15,6 +15,8 @@ use std::collections::{HashMap, VecDeque};
 use dioxus::prelude::*;
 use favetto_wire::workflow::{WorkflowEdge, WorkflowEdgeKind, WorkflowGraph, WorkflowNode};
 
+use crate::state::task_display_name;
+
 /// Node box width in SVG user units.
 pub const NODE_W: f32 = 156.0;
 /// Node box height in SVG user units.
@@ -338,9 +340,11 @@ fn node_element(node: &NodePos, on_select: EventHandler<String>) -> Element {
     let y = node.y;
     let center_x = x + NODE_W / 2.0;
     let center_y = y + NODE_H / 2.0;
-    let label = node.name.clone();
-    let click_label = label.clone();
-    let key_label = label.clone();
+    // Only the rendered text is stripped: `node.name` stays the qualified
+    // identity used to route the click/key selection to `CatalogDetail`.
+    let label = task_display_name(&node.name).to_string();
+    let click_label = node.name.clone();
+    let key_label = node.name.clone();
 
     rsx! {
         g {

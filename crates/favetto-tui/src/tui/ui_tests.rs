@@ -432,6 +432,23 @@ fn failed_task_without_typed_failure_falls_back_to_error() {
 }
 
 #[test]
+fn task_error_popup_strips_repo_prefix_from_header() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    let task = geom_task("repo:my-repo/triage");
+    let task_id = task.id;
+    app.tasks = vec![task];
+    app.popup = Popup::TaskError { task_id };
+
+    let text = render_text(&mut app, 200, 24);
+    assert!(text.contains("triage"), "bare name missing: {text:?}");
+    assert!(
+        !text.contains("repo:my-repo/triage"),
+        "storage identity must not leak: {text:?}"
+    );
+}
+
+#[test]
 fn task_error_popup_shows_missing_hint() {
     let mut app = App::new();
     app.tab = Tab::Tasks;
@@ -911,6 +928,38 @@ fn runtime_workflow_overlay_renders_root_state_buckets_and_instances() {
     assert!(text.contains("test"), "second instance missing: {text:?}");
     assert!(text.contains("ATTEMPT"), "attempt column missing: {text:?}");
     assert!(text.contains("agent exited 1"), "summary missing: {text:?}");
+}
+
+#[test]
+fn runtime_workflow_overlay_strips_repo_prefix_from_instance_names() {
+    use favetto_core::workflow::{WorkflowInspect, WorkflowState, WorkflowTaskView};
+
+    let mut app = App::new();
+    let root = uuid::Uuid::new_v4();
+    let running = uuid::Uuid::new_v4();
+    let view = WorkflowInspect {
+        root_id: root,
+        root_task: "repo:my-repo/root".to_string(),
+        state: WorkflowState::Running,
+        tasks: vec![WorkflowTaskView {
+            id: running,
+            name: "repo:my-repo/build".to_string(),
+            status: TaskStatus::Running,
+            attempt: 1,
+            summary: None,
+        }],
+        ready: Vec::new(),
+        running: vec![running],
+        failed: Vec::new(),
+        blocked: Vec::new(),
+    };
+    app.popup = runtime_popup(root, Some(view));
+    let text = render_text(&mut app, 120, 40);
+    assert!(text.contains("build"), "bare name missing: {text:?}");
+    assert!(
+        !text.contains("repo:my-repo/build"),
+        "storage identity must not leak: {text:?}"
+    );
 }
 
 #[test]
@@ -2000,9 +2049,14 @@ fn tasks_table_filters_to_the_active_repo() {
     app.active_repo = Some("my-repo".to_string());
 
     let text = render_text(&mut app, 220, 24);
+    assert!(text.contains("triage"), "bare task name missing: {text:?}");
     assert!(
-        text.contains("repo:my-repo/triage"),
-        "local task missing: {text:?}"
+        !text.contains("repo:my-repo/triage"),
+        "storage identity must not leak into the task column: {text:?}"
+    );
+    assert!(
+        text.contains("my-repo"),
+        "repo column must still show the namespace: {text:?}"
     );
     assert!(
         !text.contains("other_task"),

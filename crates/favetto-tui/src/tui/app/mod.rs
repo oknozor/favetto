@@ -521,6 +521,11 @@ pub fn repo_label(repo: Option<&str>) -> &str {
     repo.unwrap_or("global")
 }
 
+/// The bare display name for a task, with any repo-qualified prefix stripped.
+pub fn task_display_name(name: &str) -> &str {
+    favetto_core::tasks::display_name(name)
+}
+
 /// A favetto-side text selection in the Agent panel, in grid coordinates
 /// `(row, col)` relative to [`App::agent_area`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
