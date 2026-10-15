@@ -242,7 +242,7 @@ pub fn WorkflowList() -> Element {
     };
 
     rsx! {
-        main { id: "favetto-app", class: "workflow-view",
+        main { id: "favetto-app", class: "workflow-view workflow-graph-page",
             div { class: "workflow-header",
                 h1 { "Workflows" }
             }
@@ -271,7 +271,7 @@ pub fn WorkflowList() -> Element {
                 Some(_) if components.is_empty() => rsx! {
                     p { class: "empty-hint", "The catalog has no tasks." }
                 },
-                Some(result) => rsx! {
+                Some(_) => rsx! {
                     WorkflowGraphView {
                         graph: components[index].clone(),
                         on_select: move |name: String| {
@@ -279,10 +279,6 @@ pub fn WorkflowList() -> Element {
                                 name: name.split('/').map(str::to_string).collect(),
                             });
                         },
-                    }
-                    details { class: "workflow-dot",
-                        summary { "Raw DOT" }
-                        pre { "{result.dot}" }
                     }
                 },
             }

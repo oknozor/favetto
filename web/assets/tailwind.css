@@ -11,6 +11,7 @@
     --text-lg: 1.125rem;
     --text-xl: 1.25rem;
     --text-2xl: 1.5rem;
+    --radius-sm: 0.25rem;
     --radius-md: 0.375rem;
     --radius-lg: 0.5rem;
     --radius-xl: 0.75rem;
@@ -211,6 +212,9 @@
   .contents {
     display: contents;
   }
+  .flex {
+    display: flex;
+  }
   .grid {
     display: grid;
   }
@@ -231,11 +235,37 @@
     width: calc(var(--spacing) * 5);
     height: calc(var(--spacing) * 5);
   }
+  .flex-grow {
+    flex-grow: 1;
+  }
+  .grow {
+    flex-grow: 1;
+  }
+  .border-collapse {
+    border-collapse: collapse;
+  }
+  .transform {
+    transform: var(--tw-rotate-x,) var(--tw-rotate-y,) var(--tw-rotate-z,) var(--tw-skew-x,) var(--tw-skew-y,);
+  }
   .resize {
     resize: both;
   }
+  .flex-wrap {
+    flex-wrap: wrap;
+  }
+  .border {
+    border-style: var(--tw-border-style);
+    border-width: 1px;
+  }
   .text-primary {
     color: var(--primary);
+  }
+  .underline {
+    text-decoration-line: underline;
+  }
+  .outline {
+    outline-style: var(--tw-outline-style);
+    outline-width: 1px;
   }
   .filter {
     filter: var(--tw-blur,) var(--tw-brightness,) var(--tw-contrast,) var(--tw-grayscale,) var(--tw-hue-rotate,) var(--tw-invert,) var(--tw-saturate,) var(--tw-sepia,) var(--tw-drop-shadow,);
@@ -383,19 +413,23 @@
     background: var(--warning-soft);
     color: var(--warning);
   }
-  .connection-banner.connected {
-    background: var(--success-soft);
+  .connection-status {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-3);
+    font-size: var(--text-xs);
+    color: var(--muted);
+  }
+  .connection-status.connected {
     color: var(--success);
   }
-  .connection-actions {
-    display: flex;
-    justify-content: flex-end;
-    padding: var(--space-1) var(--space-4);
-  }
-  .forget-button {
-    font: inherit;
-    padding: var(--space-1) var(--space-3);
-    cursor: pointer;
+  .connection-dot {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: var(--radius-pill);
+    background: currentColor;
   }
   .pair-screen {
     margin: 0 auto;
@@ -763,6 +797,27 @@
   .markdown-body p, .markdown-body ul, .markdown-body ol {
     margin: var(--space-3) 0;
   }
+  .markdown-body ul, .markdown-body ol {
+    padding-left: var(--space-5);
+  }
+  .markdown-body ul {
+    list-style: disc;
+  }
+  .markdown-body ol {
+    list-style: decimal;
+  }
+  .markdown-body li {
+    margin: var(--space-1) 0;
+  }
+  .markdown-body ul ul {
+    list-style: circle;
+  }
+  .markdown-body ul ul ul {
+    list-style: square;
+  }
+  .markdown-body li:has(> input[type="checkbox"]) {
+    list-style: none;
+  }
   .markdown-body pre {
     overflow-x: auto;
     background: var(--code-bg);
@@ -969,20 +1024,26 @@
     color: inherit;
     font: inherit;
   }
+  #favetto-app.workflow-graph-page {
+    max-width: none;
+  }
   .workflow-graph-wrap {
-    overflow-x: auto;
+    display: grid;
+    place-items: center;
+    height: calc(100dvh - 13rem);
+    min-height: 20rem;
+    overflow: hidden;
     border: 1px solid currentColor;
     @supports (color: color-mix(in lab, red, red)) {
       border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
     }
-    border-radius: 0.5rem;
+    border-radius: var(--radius-lg);
     padding: 0.5rem;
   }
   .workflow-graph {
     display: block;
-    width: 100%;
-    height: auto;
-    max-height: 70vh;
+    min-width: 0;
+    min-height: 0;
   }
   .workflow-graph-node rect {
     fill: currentColor;
@@ -1035,26 +1096,6 @@
     fill: currentColor;
     font-size: 10px;
     opacity: 0.75;
-  }
-  .workflow-dot {
-    border: 1px solid currentColor;
-    @supports (color: color-mix(in lab, red, red)) {
-      border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
-    }
-    border-radius: var(--radius-lg);
-  }
-  .workflow-dot > summary {
-    min-height: 44px;
-    padding: var(--space-2) var(--space-3);
-    cursor: pointer;
-    font-weight: 600;
-    user-select: none;
-  }
-  .workflow-dot pre {
-    margin: 0;
-    padding: 0 var(--space-3) var(--space-3);
-    overflow-x: auto;
-    font-size: var(--text-sm);
   }
   .field-required {
     color: var(--danger);
@@ -2053,6 +2094,36 @@
     height: 1rem;
   }
 }
+@property --tw-rotate-x {
+  syntax: "*";
+  inherits: false;
+}
+@property --tw-rotate-y {
+  syntax: "*";
+  inherits: false;
+}
+@property --tw-rotate-z {
+  syntax: "*";
+  inherits: false;
+}
+@property --tw-skew-x {
+  syntax: "*";
+  inherits: false;
+}
+@property --tw-skew-y {
+  syntax: "*";
+  inherits: false;
+}
+@property --tw-border-style {
+  syntax: "*";
+  inherits: false;
+  initial-value: solid;
+}
+@property --tw-outline-style {
+  syntax: "*";
+  inherits: false;
+  initial-value: solid;
+}
 @property --tw-blur {
   syntax: "*";
   inherits: false;
@@ -2109,6 +2180,13 @@
 @layer properties {
   @supports ((-webkit-hyphens: none) and (not (margin-trim: inline))) or ((-moz-orient: inline) and (not (color:rgb(from red r g b)))) {
     *, ::before, ::after, ::backdrop {
+      --tw-rotate-x: initial;
+      --tw-rotate-y: initial;
+      --tw-rotate-z: initial;
+      --tw-skew-x: initial;
+      --tw-skew-y: initial;
+      --tw-border-style: solid;
+      --tw-outline-style: solid;
       --tw-blur: initial;
       --tw-brightness: initial;
       --tw-contrast: initial;

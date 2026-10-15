@@ -150,6 +150,10 @@ fn Transport(base: String, token: String) -> Element {
 }
 
 /// A banner shown whenever the client is not connected, or is not paired yet.
+///
+/// A healthy connection is deliberately quiet — a small status pill rather than
+/// a full-width bar — so it does not dominate the chrome. Disconnecting is an
+/// explicit action on the Settings page, not a button on every screen.
 #[component]
 fn ConnectionBanner() -> Element {
     let state = use_context::<AppState>();
@@ -163,7 +167,10 @@ fn ConnectionBanner() -> Element {
     rsx! {
         match (state.connection)() {
             ConnectionState::Connected => rsx! {
-                div { class: "connection-banner connected", role: "status", "Connected." }
+                div { class: "connection-status connected", role: "status",
+                    span { class: "connection-dot", aria_hidden: "true" }
+                    "Connected"
+                }
             },
             ConnectionState::Reconnecting => rsx! {
                 div { class: "connection-banner reconnecting", role: "status",
@@ -175,16 +182,6 @@ fn ConnectionBanner() -> Element {
                     "Disconnected — check the token and daemon URL."
                 }
             },
-        }
-        div { class: "connection-actions",
-            button {
-                class: "forget-button",
-                onclick: move |_| {
-                    let mut state = state;
-                    state.forget();
-                },
-                "Forget daemon"
-            }
         }
     }
 }

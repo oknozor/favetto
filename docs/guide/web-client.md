@@ -40,7 +40,8 @@ enabled = false
 The web client works over the same remote setup as the TUI — see
 [Remote access](./remote-access). Put the daemon behind a TLS-terminating
 reverse proxy and open `https://PROXY_HOST` in a browser. The proxy must
-forward the `Authorization` header and the `/rpc` / `/events` paths.
+forward the `Authorization` header and the `/rpc`, `/events`, `/auth`, and
+`/pair` paths.
 
 ## Developing the web client
 
@@ -68,7 +69,10 @@ dx serve --platform web
 
 This starts a hot-reloading dev server (default port 8080). The daemon must be
 running separately; point the dev server at it by setting the daemon URL in
-the pairing screen, or proxy `/rpc` and `/events` to the daemon.
+the pairing screen, or proxy `/rpc`, `/events`, `/auth`, and `/pair` to the
+daemon (see the `[[web.proxy]]` entries in `web/Dioxus.toml`). Skipping `/auth`
+makes username/password sign-in fail with `HTTP 405` because the login POST
+never reaches the daemon.
 
 ### Build the bundle
 

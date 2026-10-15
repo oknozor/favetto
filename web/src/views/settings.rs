@@ -6,8 +6,9 @@
 //! supported channels, sends a `notifications.test` through the selected one,
 //! shows the persisted `notifications.list` sent history, and adds a
 //! `hooks.upsert` hook that reacts to an event kind. The session card shows the
-//! daemon `cwd` from `system.ping` and a "Disconnect" action that drops the
-//! bearer token and returns to `/pair`.
+//! daemon `cwd` from `system.ping` and a "Disconnect" action that forgets the
+//! bearer token (and, when one was configured, the daemon URL) and returns to
+//! `/pair`.
 
 use dioxus::prelude::*;
 use favetto_wire::model::{EventKind, NotificationRecord};
@@ -189,7 +190,7 @@ fn SessionSection() -> Element {
                 class: "btn danger",
                 onclick: move |_| {
                     let mut state = state;
-                    state.clear_token();
+                    state.forget();
                     nav.replace(Route::Pair {});
                 },
                 "Disconnect"

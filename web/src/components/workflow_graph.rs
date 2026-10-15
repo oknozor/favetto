@@ -168,10 +168,73 @@ pub struct GraphLayout {
     pub height: f32,
 }
 
-/// Assign every node a grid position. Deterministic and cycle-safe: a Kahn
-/// topological pass orders acyclic nodes, cycle members keep `graph.nodes`
-/// order, and layer relaxation is capped at `nodes.len()` passes so a cyclic
-/// graph always terminates.
+/// Tarjan's strongly-connected components over `adjacency` (indexed by node).
+///
+/// Returns each node's component id plus the component count. Contracting each
+/// component yields a DAG (the condensation), which is what [`layout`] layers.
+fn strongly_connected_components(n: usize, adjacency: &[Vec<usize>]) -> (Vec<usize>, usize) {
+    struct Tarjan {
+        index: usize,
+        indices: Vec<Option<usize>>,
+        low: Vec<usize>,
+        on_stack: Vec<bool>,
+        stack: Vec<usize>,
+        component: Vec<usize>,
+        count: usize,
+    }
+
+    fn visit(v: usize, adjacency: &[Vec<usize>], t: &mut Tarjan) {
+        t.indices[v] = Some(t.index);
+        t.low[v] = t.index;
+        t.index += 1;
+        t.stack.push(v);
+        t.on_stack[v] = true;
+
+        for &w in &adjacency[v] {
+            if t.indices[w].is_none() {
+                visit(w, adjacency, t);
+                t.low[v] = t.low[v].min(t.low[w]);
+            } else if t.on_stack[w] {
+                // `w` is on the current DFS stack, so it has an index.
+                let w_index = t.indices[w].unwrap_or_default();
+                t.low[v] = t.low[v].min(w_index);
+            }
+        }
+
+        if t.low[v] == t.indices[v].unwrap_or_default() {
+            loop {
+                let w = t.stack.pop().expect("the component root is on the stack");
+                t.on_stack[w] = false;
+                t.component[w] = t.count;
+                if w == v {
+                    break;
+                }
+            }
+            t.count += 1;
+        }
+    }
+
+    let mut t = Tarjan {
+        index: 0,
+        indices: vec![None; n],
+        low: vec![0; n],
+        on_stack: vec![false; n],
+        stack: Vec::new(),
+        component: vec![0; n],
+        count: 0,
+    };
+    for v in 0..n {
+        if t.indices[v].is_none() {
+            visit(v, adjacency, &mut t);
+        }
+    }
+    (t.component, t.count)
+}
+
+/// Assign every node a grid position. Deterministic and cycle-safe: each
+/// strongly-connected component shares a single column, and the components are
+/// then layered by longest path over the (acyclic) condensation graph. Nodes
+/// within a column keep `graph.nodes` order.
 pub fn layout(graph: &WorkflowGraph) -> GraphLayout {
     let n = graph.nodes.len();
     if n == 0 {
@@ -189,42 +252,40 @@ pub fn layout(graph: &WorkflowGraph) -> GraphLayout {
         .map(|(i, node)| (node.name.as_str(), i))
         .collect();
 
-    let mut indegree = vec![0usize; n];
     let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); n];
-    let mut pairs: Vec<(usize, usize)> = Vec::new();
     for edge in &graph.edges {
         let (Some(&from), Some(&to)) = (index.get(edge.from.as_str()), index.get(edge.to.as_str()))
         else {
             continue;
         };
-        if from == to {
-            continue;
+        if from != to {
+            adjacency[from].push(to);
         }
-        adjacency[from].push(to);
-        indegree[to] += 1;
-        pairs.push((from, to));
     }
 
-    let mut remaining = indegree.clone();
-    let mut queue: VecDeque<usize> = (0..n).filter(|&i| remaining[i] == 0).collect();
-    while let Some(node) = queue.pop_front() {
-        for &next in &adjacency[node] {
-            remaining[next] -= 1;
-            if remaining[next] == 0 {
-                queue.push_back(next);
+    // Collapse cycles first: every strongly-connected component gets one column.
+    // Layering the *condensation* keeps a cyclic graph as compact as an acyclic
+    // one — otherwise a cycle inflates the longest path to O(nodes) columns, so
+    // the canvas grows enormous and the graph renders tiny and lopsided.
+    let (component, component_count) = strongly_connected_components(n, &adjacency);
+    let mut condensation: Vec<Vec<usize>> = vec![Vec::new(); component_count];
+    for (from, targets) in adjacency.iter().enumerate() {
+        for &to in targets {
+            if component[from] != component[to] {
+                condensation[component[from]].push(component[to]);
             }
         }
     }
-    // `queue` emptied; any node with leftover indegree sits on a cycle and is
-    // simply treated as its own root by the relaxation below.
 
-    let mut layer = vec![0usize; n];
-    for _ in 0..n {
+    let mut component_layer = vec![0usize; component_count];
+    for _ in 0..component_count {
         let mut changed = false;
-        for &(from, to) in &pairs {
-            if layer[to] < layer[from] + 1 {
-                layer[to] = layer[from] + 1;
-                changed = true;
+        for (from, targets) in condensation.iter().enumerate() {
+            for &to in targets {
+                if component_layer[to] < component_layer[from] + 1 {
+                    component_layer[to] = component_layer[from] + 1;
+                    changed = true;
+                }
             }
         }
         if !changed {
@@ -232,6 +293,7 @@ pub fn layout(graph: &WorkflowGraph) -> GraphLayout {
         }
     }
 
+    let layer: Vec<usize> = (0..n).map(|i| component_layer[component[i]]).collect();
     let layer_count = layer.iter().copied().max().map_or(1, |max| max + 1);
     let mut rows = vec![0usize; layer_count];
     let mut nodes = Vec::with_capacity(n);
@@ -391,8 +453,12 @@ pub fn WorkflowGraphView(graph: WorkflowGraph, on_select: EventHandler<String>) 
         div { class: "workflow-graph-wrap",
             svg {
                 class: "workflow-graph",
-                style: "min-width: {width}px",
+                // Fill the panel, but never grow past the graph's natural size so
+                // small graphs are not over-zoomed. `preserveAspectRatio` centers
+                // the drawing in whatever box results, so the DAG stays visible.
+                style: "width: 100%; height: 100%; max-width: {width}px; max-height: {height}px",
                 view_box: "0 0 {width} {height}",
+                preserve_aspect_ratio: "xMidYMid meet",
                 role: "img",
                 "aria-label": "Catalog task dependency graph",
                 defs {
@@ -602,6 +668,66 @@ mod tests {
         let layout = layout(&graph);
         assert_eq!(layout.nodes.len(), 1);
         assert!(layout.nodes[0].x.is_finite());
+    }
+
+    #[test]
+    fn layout_keeps_a_four_node_cycle_compact() {
+        // The `implement_issue` shape: triage -> plan -> implement -> merge ->
+        // triage. The cycle-closing edge must not inflate the layers, or the
+        // canvas grows huge and the graph renders tiny and lopsided.
+        let graph = graph(
+            &["triage", "plan", "implement", "merge"],
+            &[
+                edge("triage", "plan", WorkflowEdgeKind::Spawn),
+                edge("plan", "implement", WorkflowEdgeKind::Spawn),
+                edge("implement", "merge", WorkflowEdgeKind::Needs),
+                edge("merge", "triage", WorkflowEdgeKind::Spawn),
+            ],
+        );
+        let layout = layout(&graph);
+        // One SCC -> a single column.
+        let columns: std::collections::HashSet<i32> =
+            layout.nodes.iter().map(|node| node.x as i32).collect();
+        assert_eq!(columns.len(), 1, "the cycle should occupy one column");
+        assert!(
+            layout.width <= 2.0 * MARGIN + NODE_W + 1.0,
+            "width {} should stay near a single column",
+            layout.width
+        );
+        assert_eq!(layout.nodes.len(), 4);
+    }
+
+    #[test]
+    fn layout_places_a_cycle_after_its_dependencies() {
+        // entry -> {a <-> b}: the entry sits one column left of the cycle, and
+        // both cycle members share that column.
+        let graph = graph(
+            &["entry", "a", "b"],
+            &[
+                edge("entry", "a", WorkflowEdgeKind::Spawn),
+                edge("a", "b", WorkflowEdgeKind::Needs),
+                edge("b", "a", WorkflowEdgeKind::Needs),
+            ],
+        );
+        let layout = layout(&graph);
+        let x = |name: &str| layout.nodes.iter().find(|n| n.name == name).unwrap().x;
+        assert!(x("entry") < x("a"), "entry={} a={}", x("entry"), x("a"));
+        assert_eq!(x("a"), x("b"));
+    }
+
+    #[test]
+    fn layout_layers_a_chain_by_longest_path() {
+        let graph = graph(
+            &["a", "b", "c"],
+            &[
+                edge("a", "b", WorkflowEdgeKind::Spawn),
+                edge("b", "c", WorkflowEdgeKind::Needs),
+            ],
+        );
+        let layout = layout(&graph);
+        let x = |name: &str| layout.nodes.iter().find(|n| n.name == name).unwrap().x;
+        assert!(x("a") < x("b") && x("b") < x("c"));
+        assert_eq!(x("b") - x("a"), x("c") - x("b"));
     }
 
     fn spawn_graph() -> WorkflowGraph {
