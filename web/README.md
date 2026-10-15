@@ -39,9 +39,11 @@ dx bundle --locked --release --platform web
 # Dioxus 0.7 emits under dist/public; flatten into dist/:
 rm -rf dist/assets && cp -R dist/public/. dist/ && rm -rf dist/public
 
-# Android APK
-dx build --locked --release --platform android --features mobile --target aarch64-linux-android
-dx bundle --locked --platform android --package-types apk --features mobile --target aarch64-linux-android
+# Android release APK. Requires a [bundle.android] signing config in
+# Dioxus.toml — without it `dx` silently builds a ~200 MB debug APK. See
+# ../docs/guide/web-client.md ("Package a release APK").
+dx bundle --locked --release --platform android --features mobile \
+    --target aarch64-linux-android --package-types apk
 ```
 
 ## Styling and icons

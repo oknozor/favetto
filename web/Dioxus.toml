@@ -40,6 +40,23 @@ identifier = "dev.favetto.app"
 publisher = "favetto"
 icon = ["assets/icon.png"]
 
+# Android release signing. Uncomment and fill in to make
+# `dx bundle --release --platform android` produce a signed *release* APK
+# (Gradle `assembleRelease`: minified, native symbols stripped).
+#
+# `dx` 0.7.10 only runs `assembleRelease` when the build is `--release` AND this
+# table is present; otherwise it silently runs `assembleDebug`, whose build type
+# keeps the Rust debug symbols and yields a ~200 MB APK (see
+# `build/android.rs` in dioxus-cli). `jks_file` is relative to this crate
+# directory (`web/`); the keystore is git-ignored (`*.jks`). See
+# docs/guide/web-client.md for how to create it.
+#
+# [bundle.android]
+# jks_file = "favetto-release.jks"
+# jks_password = "..."
+# key_alias = "favetto"
+# key_password = "..."
+
 # Declare Android 13+ POST_NOTIFICATIONS. `dx` maps `notifications` to
 # `android.permission.POST_NOTIFICATIONS` in the generated AndroidManifest.xml.
 # The runtime request and the notification posting are done from Rust through

@@ -6,7 +6,7 @@ that compiles to two targets:
 | Target | Build | Served / installed |
 |--------|-------|--------------------|
 | **Web** (WASM SPA) | `dx build --platform web` | Embedded in the daemon binary, served at `/` |
-| **Android** (native) | `dx build --platform android --features mobile` | APK installed on a device or emulator |
+| **Android** (native) | `dx bundle --release --platform android --features mobile` | APK installed on a device or emulator (see [Package a release APK](#package-a-release-apk)) |
 
 Both targets speak the same MessagePack wire protocol as the TUI, over HTTP +
 SSE. The web client is same-origin with the daemon (no CORS); the Android app
@@ -183,22 +183,62 @@ cd web
 dx serve --platform android --features mobile --device
 ```
 
-### Package an APK
+### Package a release APK
+
+A release APK is roughly 15–30 MB; the default debug APK is ~200 MB because its
+Gradle `debug` build type keeps the Rust debug symbols (`jniLibs.keepDebugSymbols`)
+and disables minification.
+
+Getting a release APK takes **both** `--release` **and** an Android signing
+config, because `dx` 0.7.10 only runs Gradle `assembleRelease` when the build is
+a release build *and* `[bundle.android]` is set (`build/android.rs`); otherwise
+it silently runs `assembleDebug`.
+
+#### 1. Create a signing keystore (once)
 
 ```bash
 cd web
-# Compile the native library
-dx build --locked --release --platform android --features mobile \
-    --target aarch64-linux-android
-# Bundle the APK
-dx bundle --locked --platform android --package-types apk \
-    --features mobile --target aarch64-linux-android
+keytool -genkeypair -v -keystore favetto-release.jks \
+    -alias favetto -keyalg RSA -keysize 2048 -validity 10000 \
+    -storepass 'CHANGE_ME' -keypass 'CHANGE_ME' \
+    -dname 'CN=favetto, O=favetto'
 ```
 
-The APK lands in `web/dist/*.apk`. CI builds an `aarch64-linux-android` APK on
-every push and uploads it as the `favetto-android-apk` workflow artifact.
+Keep the keystore out of version control — `*.jks` is git-ignored.
 
-To produce APKs for all ABIs, run the two commands once per target
+#### 2. Point `web/Dioxus.toml` at it
+
+Uncomment and fill in the `[bundle.android]` table (there is a template in the
+file):
+
+```toml
+[bundle.android]
+jks_file = "favetto-release.jks"
+jks_password = "CHANGE_ME"
+key_alias = "favetto"
+key_password = "CHANGE_ME"
+```
+
+`jks_file` is relative to `web/`. Use `[bundle.android]` (not
+`[android.signing]`, which the 0.7 schema advertises but `dx` 0.7.10 does not
+read).
+
+#### 3. Bundle
+
+```bash
+cd web
+dx bundle --release --platform android --features mobile \
+    --target aarch64-linux-android --package-types apk
+```
+
+`dx bundle` compiles the app itself, so no separate `dx build` step is needed.
+The APK lands in `web/dist/*.apk`. CI builds an `aarch64-linux-android` release
+APK on every push and uploads it as the `favetto-android-apk` workflow artifact;
+it uses a keystore from repository secrets when available and otherwise
+generates an ephemeral one (see the workflow's "Configure Android release
+signing" step).
+
+To produce APKs for all ABIs, run the bundle once per target
 (`aarch64-linux-android`, `armv7-linux-androideabi`, `i686-linux-android`,
 `x86_64-linux-android`) and merge them with `bundletool`.
 
@@ -264,4 +304,5 @@ type is explicit (`application/wasm`), which browsers require.
 | Android app can't reach the daemon | Use `https://` (not `http://`) for remote daemons; the app validates the scheme. For a LAN daemon, allow cleartext in your reverse proxy or use a TLS tunnel |
 | `dx` version mismatch | `dx` is pinned to 0.7.10 in `web/Cargo.toml` and CI; install the same version locally |
 | Android keyboard shifts the bottom nav or dialogs | Update to a build that carries the `interactive-widget=overlays-content` viewport hint and the `web/android/MainActivity.kt` override; an old APK still resizes the WebView |
+| Android APK is ~200 MB | It's a debug build. Pass `--release` **and** configure `[bundle.android]` signing; `dx` silently falls back to `assembleDebug` without both (see [Package a release APK](#package-a-release-apk)) |
 | WASM budget exceeded | CI fails when the gzipped WASM exceeds 1 MB (warns at 500 KB); check for new heavy dependencies |
