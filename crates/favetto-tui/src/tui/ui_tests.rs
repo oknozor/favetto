@@ -521,8 +521,9 @@ fn task_without_session_title_renders_blank_cell() {
     app.tab = Tab::Tasks;
     app.tasks = vec![geom_task("no_title")];
 
-    // No panic and no stray title text.
-    let text = render_text(&mut app, 100, 24);
+    // No panic and no stray title text. Wide enough that every fixed column
+    // (now including KIND) fits and SESSION is not compressed.
+    let text = render_text(&mut app, 200, 24);
     assert!(text.contains("SESSION"), "header missing: {text:?}");
 }
 
@@ -1281,6 +1282,8 @@ fn catalog_preview_renders_task_markdown() {
         provider: None,
         model: Some("deepseek-v4-flash".to_string()),
         cwd: None,
+        schedule: None,
+        kind: String::new(),
         needs: None,
         vars: Vec::new(),
         prompt: String::new(),
@@ -1325,6 +1328,8 @@ fn catalog_preview_scrolls_to_later_content() {
         provider: None,
         model: None,
         cwd: None,
+        schedule: None,
+        kind: String::new(),
         needs: None,
         vars: Vec::new(),
         prompt: String::new(),
@@ -1468,6 +1473,8 @@ fn catalog_entry(name: &str) -> super::super::app::CatalogEntry {
         provider: None,
         model: None,
         cwd: None,
+        schedule: None,
+        kind: String::new(),
         needs: None,
         vars: Vec::new(),
         prompt: String::new(),
@@ -2039,6 +2046,27 @@ fn tasks_table_shows_repo_column_and_labels_global() {
     assert!(text.contains("REPO"), "repo header missing: {text:?}");
     assert!(text.contains("my-repo"), "repo name missing: {text:?}");
     assert!(text.contains("global"), "global label missing: {text:?}");
+}
+
+#[test]
+fn tasks_table_renders_the_kind_column() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    app.tasks = vec![geom_task("agent_run"), geom_task("action_run")];
+
+    let mut agent = catalog_entry("agent_run");
+    agent.schedule = Some("0 9 * * *".to_string());
+    let mut action = catalog_entry("action_run");
+    action.kind = "action".to_string();
+    app.set_catalog(vec![agent, action]);
+
+    let text = render_text(&mut app, 220, 24);
+    assert!(text.contains("KIND"), "kind header missing: {text:?}");
+    assert!(
+        text.contains("scheduled"),
+        "scheduled label missing: {text:?}"
+    );
+    assert!(text.contains("action"), "action label missing: {text:?}");
 }
 
 #[test]

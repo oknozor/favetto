@@ -28,8 +28,8 @@ use crate::components::task_card::TaskCard;
 use crate::components::toast::{Toast, ToastKind};
 use crate::config;
 use crate::state::{onboarding_step, task_display_name, task_repo, AppState, OnboardingStep};
-use crate::views::catalog::task_tags;
-use crate::views::tasks::{format_age, now_ms, status_label};
+use crate::views::catalog::{kind_label, task_tags};
+use crate::views::tasks::{format_age, now_ms, status_label, KindBadge};
 
 /// How many recent failures the Inbox shows.
 pub const FAILURES_LIMIT: usize = 5;
@@ -364,6 +364,7 @@ pub fn Inbox() -> Element {
                                 age: format_age(task.created_at.timestamp_millis(), now),
                                 repo: task_repo(&task.name).map(str::to_string),
                                 tags: cache.catalog_entry(&task.name).map(task_tags).unwrap_or_default(),
+                                kind: cache.catalog_entry(&task.name).map(kind_label).map(str::to_string),
                                 card,
                                 busy,
                                 toast,
@@ -379,6 +380,7 @@ pub fn Inbox() -> Element {
                                 awaiting: true,
                                 repo: task_repo(&task.name).map(str::to_string),
                                 tags: cache.catalog_entry(&task.name).map(task_tags).unwrap_or_default(),
+                                kind: cache.catalog_entry(&task.name).map(kind_label).map(str::to_string),
                             }
                         }
                     }
@@ -397,6 +399,7 @@ pub fn Inbox() -> Element {
                             detail: task.error.clone(),
                             repo: task_repo(&task.name).map(str::to_string),
                             tags: cache.catalog_entry(&task.name).map(task_tags).unwrap_or_default(),
+                            kind: cache.catalog_entry(&task.name).map(kind_label).map(str::to_string),
                         }
                     }
                 }
@@ -467,6 +470,9 @@ fn AwaitingInputCard(
     age: String,
     #[props(default)] repo: Option<String>,
     #[props(default)] tags: Vec<String>,
+    /// The catalog-derived kind label (`agent` / `action` / `scheduled`).
+    #[props(default)]
+    kind: Option<String>,
     card: AwaitingCard,
     busy: Signal<bool>,
     toast: Signal<Option<(ToastKind, String)>>,
@@ -501,6 +507,9 @@ fn AwaitingInputCard(
                     "{name}"
                 }
                 span { class: badge, "{status_label(status)}" }
+                if let Some(kind) = kind {
+                    KindBadge { kind }
+                }
                 span { class: "awaiting-age", "{age}" }
                 if let Some(repo) = repo {
                     span { class: "task-card-repo", "{repo}" }

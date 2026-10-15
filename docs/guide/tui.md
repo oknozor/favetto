@@ -10,7 +10,7 @@ focus and mouse handling see [Embedded agents](./agents).
 
 ![favetto TUI — Tasks tab](/screenshots/tui-tasks.png)
 
-*The Tasks tab: recent runs with their repo, status, started time, duration, and session title.*
+*The Tasks tab: recent runs with their repo, kind, status, started time, duration, and session title.*
 
 An opencode run writes its session title a few seconds after its first turn. As
 soon as the agent reports its session id **during** the run, the daemon resolves
@@ -27,6 +27,15 @@ pinentry is shown as **awaiting input** (glyph `!`, warning colour) instead of
 silently staying `running`, and the status bar counts them. Press **Enter** on
 that row to open the Agent panel and answer the prompt; the task returns to
 `running` once the agent continues.
+
+Each Tasks row also carries a **KIND** column derived from the catalog
+definition: `action` for a built-in deterministic step, `scheduled` for a
+cron-triggered task, and `agent` otherwise — with `action` outranking
+`scheduled`, which outranks `agent`. The label is definition-based rather than
+per-run, so a task started by hand from a scheduled definition still reads
+`scheduled`; an unknown or one-shot row shows `—`. See
+[the catalog](./catalog) and
+[schedules and dependencies](./schedules-and-dependencies).
 
 ## Keybindings
 

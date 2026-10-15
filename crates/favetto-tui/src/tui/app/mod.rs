@@ -419,6 +419,13 @@ pub struct CatalogEntry {
     pub model: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    /// The wire schedule (`[catalog]` cron); makes the task "scheduled".
+    #[serde(default)]
+    pub schedule: Option<String>,
+    /// How the task runs: `"agent"` (default) or `"action"`. Defaulted for older
+    /// daemons.
+    #[serde(default)]
+    pub kind: String,
     #[serde(default)]
     pub needs: Option<String>,
     #[serde(default)]
@@ -460,6 +467,19 @@ impl CatalogEntry {
             (None, Some(m)) => m.clone(),
             (Some(p), None) => p.clone(),
             (None, None) => "—".to_string(),
+        }
+    }
+
+    /// The single kind label shown in the Tasks table: `action` beats a cron
+    /// `scheduled` trigger, which beats the `agent` default. The label is
+    /// definition-based (from the catalog), not per-run.
+    pub fn kind_label(&self) -> &'static str {
+        if self.kind == "action" {
+            "action"
+        } else if self.schedule.is_some() {
+            "scheduled"
+        } else {
+            "agent"
         }
     }
 }
@@ -1039,6 +1059,13 @@ impl App {
             self.catalog_selected.min(rows - 1)
         };
         self.catalog_preview = None;
+    }
+
+    /// The catalog definition for a task, matched by its (possibly
+    /// repo-qualified) name. `None` for a task with no catalog entry (a global
+    /// one-shot or a legacy row).
+    pub fn catalog_entry(&self, name: &str) -> Option<&CatalogEntry> {
+        self.catalog.iter().find(|e| e.name == name)
     }
 
     /// Store the fetched repo registry and active repo (`repos.list`).

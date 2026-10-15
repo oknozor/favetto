@@ -52,11 +52,31 @@ fn catalog_entry(name: &str) -> CatalogEntry {
         provider: None,
         model: None,
         cwd: None,
+        schedule: None,
+        kind: String::new(),
         needs: None,
         vars: Vec::new(),
         prompt: String::new(),
         repo: None,
     }
+}
+
+#[test]
+fn catalog_entry_kind_label_prefers_action_then_scheduled() {
+    let mut e = catalog_entry("t");
+    assert_eq!(e.kind_label(), "agent", "empty kind defaults to agent");
+    e.schedule = Some("0 9 * * *".to_string());
+    assert_eq!(e.kind_label(), "scheduled");
+    e.kind = "action".to_string();
+    assert_eq!(e.kind_label(), "action", "action outranks scheduled");
+}
+
+#[test]
+fn catalog_entry_lookup_matches_the_full_name() {
+    let mut app = App::new();
+    app.set_catalog(vec![catalog_entry("repo:favetto/triage")]);
+    assert!(app.catalog_entry("repo:favetto/triage").is_some());
+    assert!(app.catalog_entry("triage").is_none());
 }
 
 fn agent_session(id: &str, headless: bool, running: bool, awaiting: bool) -> AgentSessionInfo {
@@ -1112,6 +1132,8 @@ fn catalog_preview_scrolls_with_keys_and_wheel() {
             provider: None,
             model: None,
             cwd: None,
+            schedule: None,
+            kind: String::new(),
             needs: None,
             vars: Vec::new(),
             prompt: String::new(),
@@ -1123,6 +1145,8 @@ fn catalog_preview_scrolls_with_keys_and_wheel() {
             provider: None,
             model: None,
             cwd: None,
+            schedule: None,
+            kind: String::new(),
             needs: None,
             vars: Vec::new(),
             prompt: String::new(),
@@ -1324,6 +1348,8 @@ fn set_catalog_clamps_selection_and_refreshes_preview() {
         provider: None,
         model: None,
         cwd: None,
+        schedule: None,
+        kind: String::new(),
         needs: None,
         vars: Vec::new(),
         prompt: String::new(),
@@ -2200,6 +2226,8 @@ fn vars_entry(name: &str) -> CatalogEntry {
         provider: None,
         model: None,
         cwd: None,
+        schedule: None,
+        kind: String::new(),
         needs: None,
         vars: vec![
             TaskVar {

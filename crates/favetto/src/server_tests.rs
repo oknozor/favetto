@@ -848,6 +848,37 @@ async fn schedules_list_reports_next_run_for_enabled_only() {
         upserted["next_run"].is_string(),
         "upsert should echo a next run: {upserted:?}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn catalog_list_exposes_the_task_kind() {
+    let dir = temp_dir("catalog-kind");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    std::fs::write(
+        tasks_dir.join("agent_task.md"),
+        "agent = \"x\"\n---\nbody\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tasks_dir.join("action_task.md"),
+        "kind = \"action\"\n\n[action]\nid = \"http.request\"\n---\nbody\n",
+    )
+    .unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+
+    let catalog = call_ok(&state, method::CATALOG_LIST, serde_json::json!({})).await;
+    let entries = catalog.as_array().unwrap();
+    let kind_of = |name: &str| {
+        entries
+            .iter()
+            .find(|e| e["name"] == name)
+            .and_then(|e| e["kind"].as_str())
+            .unwrap_or("<missing>")
+    };
+    assert_eq!(kind_of("agent_task"), "agent");
+    assert_eq!(kind_of("action_task"), "action");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
