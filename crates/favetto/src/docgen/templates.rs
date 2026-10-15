@@ -41,7 +41,7 @@ pub(crate) const ARGS_TABLE: &str = "| Flag | Value | Default | Description |\n\
 pub(crate) const EVENTS_INTRO: &str = "\
 # Event kinds
 
-Generated from `crates/favetto-core/src/model.rs` by the docs generator. Do not edit by hand.
+Generated from `crates/favetto-wire/src/model.rs` by the docs generator. Do not edit by hand.
 
 Every event persisted on the bus is one of the kinds below. The **Event** column is the stable `snake_case` wire and storage form; `from_name` also accepts the spec's `PascalCase` spelling.
 
@@ -55,7 +55,7 @@ pub(crate) const EVENTS_TABLE: &str = "| Event | Description |\n\
 pub(crate) const REMOTE_API_INTRO: &str = "\
 # Remote API
 
-Generated from `crates/favetto-core/src/rpc.rs` by the docs generator. Do not edit by hand.
+Generated from `crates/favetto-wire/src/rpc/` by the docs generator. Do not edit by hand.
 
 The daemon exposes one wire protocol over two transports:
 

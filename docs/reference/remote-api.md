@@ -1,6 +1,6 @@
 # Remote API
 
-Generated from `crates/favetto-core/src/rpc.rs` by the docs generator. Do not edit by hand.
+Generated from `crates/favetto-wire/src/rpc/` by the docs generator. Do not edit by hand.
 
 The daemon exposes one wire protocol over two transports:
 
