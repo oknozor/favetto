@@ -107,6 +107,28 @@ The resulting `web/dist/` is picked up the next time you build the daemon
 (`cargo build -p favetto`). The committed `web/dist/` is only a placeholder —
 CI builds the real bundle and uploads it as a workflow artifact.
 
+### Bundle size
+
+CI enforces a gzipped WASM budget (warn over **500 KB**, fail over **1 MB**;
+see the `web (wasm)` job in `.github/workflows/ci.yml`). The release build is
+sized through `[profile.wasm-release]` in `web/Cargo.toml` — `dx` derives that
+profile name from the platform and build mode (`wasm` + `release`), so
+`dx bundle --release --platform web` picks it up automatically. It sets
+`opt-level = "z"`, fat LTO, `codegen-units = 1` and `panic = "abort"`; `strip`
+is intentionally left to `dx`, which runs `wasm-opt -Oz --strip-debug` itself.
+`dioxus` is also built with `default-features = false` plus only `router`,
+`launch` and `lib`, which drops the unused `devtools` and `logger` features.
+
+As measured with the CI command (`gzip -c <wasm> | wc -c`):
+
+| Variant | Uncompressed | Gzipped | vs budget |
+|---|---|---|---|
+| `favetto-web_bg-*.wasm` | 2,017,800 B | **710,349 B (~693 KiB)** | warn (> 500 KB) |
+
+Keep new dependencies and per-call `format!`/`Debug` usage in check: without
+the profile the same bundle measured ~983 KiB gzipped, and any regression that
+pushes the artifact back over 1 MB fails CI.
+
 ### Serve from disk during development
 
 To iterate on the client without rebuilding the daemon, point the daemon at the
