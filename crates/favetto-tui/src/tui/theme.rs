@@ -9,7 +9,7 @@
 //! Themes come in built-in flavours ([`ThemeName::Opencode`],
 //! [`ThemeName::Catppuccin`]) selected by a [`ThemeMode`] (`system`/`dark`/`light`)
 //! and may be overridden by a user JSON file in the themes directory. Interactive
-//! state helpers ([`Theme::selected`], [`Theme::focused`], [`Theme::disabled`], …)
+//! state helpers ([`Theme::selected`], [`Theme::disabled`], …)
 //! and raised-surface levels ([`RaisedLevel`]) keep the widgets from hand-rolling
 //! styles.
 
@@ -125,8 +125,11 @@ pub struct Markdown {
     pub code_block: Color,
 }
 
-/// A raised-surface depth. Chrome uses [`RaisedLevel::Base`], panels
-/// [`RaisedLevel::High`], and modal dialogs [`RaisedLevel::Max`].
+/// A raised-surface depth. Chrome and every floating window use
+/// [`RaisedLevel::Base`]. The heavier rungs stay part of the raised-surface
+/// schema (and its JSON) so the ladder remains complete, but no widget paints
+/// them any more.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RaisedLevel {
     Base,
@@ -717,11 +720,6 @@ impl Theme {
         self.raised_style(RaisedLevel::Base)
     }
 
-    /// The raised-surface style for a modal dialog.
-    pub fn dialog_style(&self) -> Style {
-        self.raised_style(RaisedLevel::Max)
-    }
-
     /// A style on one rung of the raised-surface ladder.
     pub fn raised_style(&self, level: RaisedLevel) -> Style {
         Style::default().fg(self.text.base).bg(self.raised(level))
@@ -758,11 +756,6 @@ impl Theme {
         } else {
             self.border.base
         })
-    }
-
-    /// Focus outline style (an active border).
-    pub fn focused(&self) -> Style {
-        Style::default().fg(self.border.active)
     }
 
     /// Table header text.

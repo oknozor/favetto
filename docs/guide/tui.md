@@ -202,6 +202,23 @@ identity, so grouping and filtering never change what a command does.
 - **Change theme** — preview and pick a theme and mode.
 - **Open docs** — opens <https://oknozor.github.io/favetto/> in your browser.
 
+### Floating windows
+
+Every floating window shares one chrome, so the palette no longer reads as a
+different UI. Whether it is the one-shot wizard, the step-by-step form, the task
+input form, the reply/confirm prompts, a task or action result, an invalid-config
+error, the `?` Help overlay, the Workflow graph or Runtime workflow inspector, the
+Agent sessions / Switch repo / Change theme pickers, the **Ctrl+X** leader hint,
+or the narrow-terminal Catalog preview, each is:
+
+- **borderless**, painted on the theme's raised *base* surface over a dimming
+  scrim — never on a heavy border or the upper raised rungs;
+- inset by a **2×1 inner padding**;
+- headed by a **bold left title and a muted, right-aligned close hint** (`esc`,
+  `Ctrl+X · esc`, `? / esc`, …) instead of a border title;
+- for the searchable pickers, given the same inline **`search:`** row and the same
+  per-row selection style as the palette.
+
 ### Shortcut leader (Ctrl+X)
 
 Every palette command also has a mnemonic shortcut reached through the **Ctrl+X**
@@ -292,13 +309,18 @@ unavailable (an older daemon) or cannot be rendered, the overlay falls back to
 the raw DOT with a short explanation. It refreshes while open when the catalog
 changes.
 
+The overlay uses the shared floating-window chrome: a bold **Workflow** title
+(with the graph's `.dot` path when present) and a muted `w / esc` close hint
+above the scrollable body.
+
 ## Runtime workflow inspector
 
 Press **i** on the Tasks tab to inspect the **selected task's root** live through
 `workflow.inspect` — the catalog graph above shows the *declared* tasks, while
 this overlay shows the durable runtime instances of one root (whether created by
-`needs`/`spawn` or by `workflow.create`/`workflow.spawn`). The title shows the
-root task and its overall state (`running`, `succeeded`, `failed`, `cancelled`),
+`needs`/`spawn` or by `workflow.create`/`workflow.spawn`). The header shows the
+overlay name and the root's overall state (`running`, `succeeded`, `failed`,
+`cancelled`),
 followed by a line of `ready`/`running`/`failed`/`blocked` bucket counts and a
 per-instance table with each instance's **status**, **task name**, **attempt**,
 and **summary** (the bounded failure/cancellation reason).
