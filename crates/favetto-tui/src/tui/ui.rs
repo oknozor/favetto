@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -237,6 +237,18 @@ fn draw_dialog_shell(frame: &mut Frame, rect: Rect, theme: Theme) -> Rect {
     rect
 }
 
+/// Paint the scrim, clear `rect`, and fill it with the theme's raised *base*
+/// surface. The command palette uses this instead of [`draw_dialog_shell`]: the
+/// base rung reads as a lighter variant of the main background on every theme,
+/// whereas `dialog_style()`'s max rung is a heavy grey on the dark themes and is
+/// darker than the background on the light ones.
+fn draw_surface_shell(frame: &mut Frame, rect: Rect, theme: Theme) -> Rect {
+    paint_scrim(frame, theme);
+    frame.render_widget(Clear, rect);
+    frame.buffer_mut().set_style(rect, theme.surface_style());
+    rect
+}
+
 /// A horizontally-centered rectangle of the given width (percent) and fixed height.
 fn centered_rect(area: Rect, width_pct: u16, height: u16) -> Rect {
     let w = (area.width.saturating_mul(width_pct) / 100)
@@ -408,9 +420,10 @@ fn push_caret_line(spans: &mut Vec<Span<'static>>, buf: &TextBuffer, caret: Styl
 /// Draw the Ctrl+P command palette: a borderless vertical panel with a bold
 /// `Commands` title and a muted `esc` hint on the right, an inline full-text
 /// search, and the grouped command list (section headers are not selectable).
-/// The title, headers, and commands share one left column, each command carries a
-/// right-aligned `Ctrl+X` shortcut, and exactly one blank row separates
-/// consecutive sections.
+/// The panel is painted with the theme's raised base surface and inset by a
+/// 2×1 margin, the title, headers, and commands share one left column, each
+/// command carries a right-aligned `Ctrl+X` shortcut, and exactly one blank row
+/// separates consecutive sections.
 fn draw_menu(
     frame: &mut Frame,
     entries: &[MenuEntry],
@@ -426,26 +439,29 @@ fn draw_menu(
         .enumerate()
         .filter(|(i, entry)| *i > 0 && matches!(entry, MenuEntry::Header(_)))
         .count();
-    // One row each for the title and the search, then the entries and spacers.
-    let height = (entries.len() + spacers + 2) as u16;
-    let rect = centered_rect(area, 60, height);
-    draw_dialog_shell(frame, rect, theme);
+    // One row each for the title, the search, a blank gap, and the top/bottom
+    // padding rows, then the entries and spacers.
+    let height = (entries.len() + spacers + 5) as u16;
+    let rect = centered_rect(area, 30, height);
+    draw_surface_shell(frame, rect, theme);
+    let inner = rect.inner(Margin::new(2, 1));
 
     let chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(0),
+        Constraint::Length(1), // title
+        Constraint::Length(1), // search
+        Constraint::Length(1), // gap below the search
+        Constraint::Min(0),    // command list
     ])
-    .split(rect);
+    .split(inner);
 
     // The title row: bold `Commands` left, muted `esc` right.
-    let gap = (rect.width as usize).saturating_sub("Commands".len() + "esc".len() + 2);
+    let gap = (inner.width as usize).saturating_sub("Commands".len() + "esc".len() + 2);
     let title = Paragraph::new(Line::from(vec![
         Span::styled(" Commands", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" ".repeat(gap)),
         Span::styled("esc ", theme.disabled()),
     ]))
-    .style(theme.dialog_style());
+    .style(theme.surface_style());
     frame.render_widget(title, chunks[0]);
 
     // Inline full-text search, directly under the title.
@@ -454,7 +470,7 @@ fn draw_menu(
         Span::raw(filter.to_string()),
         Span::styled("█", theme.selected()),
     ]))
-    .style(theme.dialog_style());
+    .style(theme.surface_style());
     frame.render_widget(search, chunks[1]);
 
     let list = if entries.is_empty() {
@@ -476,11 +492,11 @@ fn draw_menu(
             } else {
                 Style::default()
             };
-            items.push(menu_list_item(entry, style, rect.width));
+            items.push(menu_list_item(entry, style, inner.width));
         }
         List::new(items)
     };
-    frame.render_widget(list, chunks[2]);
+    frame.render_widget(list, chunks[3]);
 }
 
 /// Build one palette row as a single line. Headers render their bold label;
