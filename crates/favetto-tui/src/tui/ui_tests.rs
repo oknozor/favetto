@@ -196,7 +196,8 @@ fn all_popups_render_without_panic() {
 fn command_palette_renders_title_search_and_groups() {
     let mut app = App::new();
     app.open_menu();
-    let text = render_text(&mut app, 100, 40);
+    // A wider frame so the halved palette still fits every label + shortcut.
+    let text = render_text(&mut app, 140, 40);
     assert!(text.contains("Commands"), "title missing: {text:?}");
     assert!(text.contains("esc"), "esc hint missing: {text:?}");
     assert!(text.contains("search:"), "search row missing: {text:?}");
@@ -227,15 +228,15 @@ fn command_palette_is_left_aligned_with_section_gaps() {
     app.open_menu();
     let lines = render_lines(&mut app, 100, 40);
 
-    // Anchor on the search row: the title sits above it, then the first section
-    // header and its first command.
+    // Anchor on the search row: the title sits above it, then a blank gap row,
+    // then the first section header and its first command.
     let search_idx = lines
         .iter()
         .position(|l| l.contains("search:"))
         .unwrap_or_else(|| panic!("search row: {lines:#?}"));
     let title = &lines[search_idx - 1];
-    let header = &lines[search_idx + 1];
-    let command = &lines[search_idx + 2];
+    let header = &lines[search_idx + 2];
+    let command = &lines[search_idx + 3];
 
     // The title, the section header, and the command all share one left column.
     let title_col = title.find("Commands").unwrap();
@@ -251,8 +252,8 @@ fn command_palette_is_left_aligned_with_section_gaps() {
     );
 
     // Exactly one blank row separates the Tasks and Catalog sections.
-    let new_idx = search_idx + 2;
-    let catalog_idx = search_idx + 4;
+    let new_idx = search_idx + 3;
+    let catalog_idx = search_idx + 5;
     assert!(
         lines[new_idx].contains("New one-shot task") && lines[catalog_idx].contains("Catalog"),
         "unexpected section layout: {lines:#?}"
@@ -284,6 +285,23 @@ fn command_palette_search_hides_non_matching_commands() {
         !text.contains("New one-shot task"),
         "non-matching command still rendered: {text:?}"
     );
+}
+
+#[test]
+fn command_palette_uses_the_surface_background() {
+    for theme in all_themes() {
+        let mut app = App::with_theme(theme);
+        app.open_menu();
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        // A cell inside the centred panel is painted with the raised base rung.
+        assert_eq!(
+            buffer.cell((50, 20)).unwrap().bg,
+            theme.raised(RaisedLevel::Base)
+        );
+    }
 }
 
 #[test]
