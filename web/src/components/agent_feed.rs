@@ -213,7 +213,13 @@ pub enum FeedItem {
     /// A text block from the assistant/user/system.
     Message { role: MessageRole, text: String },
     /// Chain-of-thought text (dimmed, collapsible).
-    Reasoning { text: String },
+    ///
+    /// Consecutive reasoning deltas are coalesced into one block by
+    /// [`build_feed`]; `streaming` stays `true` while a trailing reasoning run
+    /// is still being appended to, and flips to `false` once a non-reasoning
+    /// event follows (or for the persisted [`summary_feed`] block, which is
+    /// never streaming).
+    Reasoning { text: String, streaming: bool },
     /// A tool invocation, from `Started` to `Finished`.
     Tool {
         id: String,
@@ -251,9 +257,12 @@ pub fn feed_item(event: &AgentStateEvent) -> Option<FeedItem> {
             role: *role,
             text: text.clone(),
         }),
-        AgentStateEvent::ReasoningDelta { text } => {
-            Some(FeedItem::Reasoning { text: text.clone() })
-        }
+        AgentStateEvent::ReasoningDelta { text } => Some(FeedItem::Reasoning {
+            text: text.clone(),
+            // A lone delta is an in-progress chunk; `build_feed` coalesces the
+            // run and clears the flag on the event that closes it.
+            streaming: true,
+        }),
         AgentStateEvent::ToolStarted { id, name, input } => Some(FeedItem::Tool {
             id: id.clone(),
             name: name.clone(),
@@ -297,11 +306,20 @@ pub fn feed_item(event: &AgentStateEvent) -> Option<FeedItem> {
     }
 }
 
+/// Close the trailing reasoning run, if any, so it stops rendering a throbber.
+fn finish_trailing_reasoning(items: &mut [FeedItem]) {
+    if let Some(FeedItem::Reasoning { streaming, .. }) = items.last_mut() {
+        *streaming = false;
+    }
+}
+
 /// Fold an ordered event window into display items.
 ///
 /// Tool events reference their call by id, so they merge into the original
 /// `ToolStarted` card; a resolved/dismissed input prompt is dropped once an
-/// `InputResolved` (or a turn `Idle`) follows it.
+/// `InputResolved` (or a turn `Idle`) follows it. Consecutive reasoning deltas
+/// accumulate into a single [`FeedItem::Reasoning`] block, which stays
+/// `streaming` until a non-reasoning event closes it.
 pub fn build_feed(events: &[AgentEventPush]) -> Vec<FeedItem> {
     let mut items: Vec<FeedItem> = Vec::new();
     let mut tools: HashMap<String, usize> = HashMap::new();
@@ -309,7 +327,19 @@ pub fn build_feed(events: &[AgentEventPush]) -> Vec<FeedItem> {
     let mut resolved: HashSet<usize> = HashSet::new();
 
     for push in events {
+        // Any non-reasoning event closes an in-progress reasoning run, so the
+        // throbber only marks the trailing run while it is still growing.
+        if !matches!(&push.event, AgentStateEvent::ReasoningDelta { .. }) {
+            finish_trailing_reasoning(&mut items);
+        }
         match &push.event {
+            AgentStateEvent::ReasoningDelta { text } => match items.last_mut() {
+                Some(FeedItem::Reasoning { text: current, .. }) => current.push_str(text),
+                _ => items.push(FeedItem::Reasoning {
+                    text: text.clone(),
+                    streaming: true,
+                }),
+            },
             AgentStateEvent::ToolStarted { id, name, input } => {
                 tools.insert(id.clone(), items.len());
                 items.push(FeedItem::Tool {
@@ -430,8 +460,10 @@ pub fn summary_feed(summary: &RunSummary) -> Vec<FeedItem> {
         });
     }
     if !summary.reasoning.trim().is_empty() {
+        // The durable summary is already coalesced and never streaming.
         items.push(FeedItem::Reasoning {
             text: summary.reasoning.clone(),
+            streaming: false,
         });
     }
     for call in &summary.tool_calls {
@@ -662,11 +694,18 @@ fn FeedRow(
                 }
             }
         }
-        FeedItem::Reasoning { text } => {
+        FeedItem::Reasoning { text, streaming } => {
             let body = reasoning_body(&text, expanded());
             rsx! {
-                div { class: "feed-item feed-reasoning",
-                    span { class: "feed-role role-reasoning", "thinking" }
+                div {
+                    class: "feed-item feed-reasoning",
+                    aria_busy: if streaming { "true" } else { "false" },
+                    span { class: "feed-role role-reasoning",
+                        if streaming {
+                            span { class: "feed-throbber", aria_hidden: "true" }
+                        }
+                        "thinking"
+                    }
                     button {
                         class: "feed-toggle",
                         aria_expanded: if expanded() { "true" } else { "false" },
@@ -674,7 +713,7 @@ fn FeedRow(
                         if expanded() { "Show less" } else { "Show more" }
                     }
                     if let Some(body) = body {
-                        pre { class: "feed-text", "{body}" }
+                        pre { class: "feed-text feed-thinking-body", "{body}" }
                     }
                 }
             }
@@ -1064,6 +1103,78 @@ mod tests {
     }
 
     #[test]
+    fn build_feed_coalesces_consecutive_reasoning_deltas() {
+        let events = vec![
+            push(
+                1,
+                AgentStateEvent::ReasoningDelta {
+                    text: "step ".to_string(),
+                },
+            ),
+            push(
+                2,
+                AgentStateEvent::ReasoningDelta {
+                    text: "one ".to_string(),
+                },
+            ),
+            push(
+                3,
+                AgentStateEvent::ReasoningDelta {
+                    text: "two".to_string(),
+                },
+            ),
+        ];
+        let items = build_feed(&events);
+        assert_eq!(items.len(), 1, "deltas must fold into one block: {items:?}");
+        match &items[0] {
+            FeedItem::Reasoning { text, streaming } => {
+                assert_eq!(text, "step one two");
+                assert!(*streaming, "a trailing reasoning run is still streaming");
+            }
+            other => panic!("expected one reasoning block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_feed_closes_a_reasoning_run_on_the_next_event() {
+        let events = vec![
+            push(
+                1,
+                AgentStateEvent::ReasoningDelta {
+                    text: "think".to_string(),
+                },
+            ),
+            push(
+                2,
+                AgentStateEvent::TextDelta {
+                    role: MessageRole::Assistant,
+                    text: "answer".to_string(),
+                },
+            ),
+            push(
+                3,
+                AgentStateEvent::ReasoningDelta {
+                    text: "more".to_string(),
+                },
+            ),
+        ];
+        let items = build_feed(&events);
+        assert_eq!(items.len(), 3, "a later run starts a new block: {items:?}");
+        assert!(matches!(
+            &items[0],
+            FeedItem::Reasoning { text, streaming: false } if text == "think"
+        ));
+        assert!(matches!(
+            &items[1],
+            FeedItem::Message { text, .. } if text == "answer"
+        ));
+        assert!(matches!(
+            &items[2],
+            FeedItem::Reasoning { text, streaming: true } if text == "more"
+        ));
+    }
+
+    #[test]
     fn summary_feed_maps_a_run_summary_in_canonical_order() {
         let summary = RunSummary {
             session_id: Some("ses_1".to_string()),
@@ -1102,7 +1213,10 @@ mod tests {
             &items[1],
             FeedItem::Message { role: MessageRole::Assistant, text } if text == "all done"
         ));
-        assert!(matches!(&items[2], FeedItem::Reasoning { text } if text == "because"));
+        assert!(matches!(
+            &items[2],
+            FeedItem::Reasoning { text, streaming: false } if text == "because"
+        ));
         assert!(matches!(
             &items[3],
             FeedItem::Tool { name, status: ToolStatus::Ok, .. } if name == "read"
@@ -1205,6 +1319,29 @@ mod tests {
         }
     }
 
+    /// Concatenate every text node the mutation stream creates or updates.
+    fn rendered_text(mutations: &dioxus::core::Mutations) -> String {
+        let mut text = String::new();
+        for edit in &mutations.edits {
+            if let Mutation::CreateTextNode { value, .. } | Mutation::SetText { value, .. } = edit {
+                text.push_str(value);
+                text.push('\n');
+            }
+        }
+        text
+    }
+
+    /// Whether `mutations` set the attribute `name` to `expected`.
+    fn sets_attribute(mutations: &dioxus::core::Mutations, name: &str, expected: &str) -> bool {
+        mutations.edits.iter().any(|mutation| {
+            matches!(
+                mutation,
+                Mutation::SetAttribute { name: n, value, .. }
+                    if *n == name && attribute_text(value).as_deref() == Some(expected)
+            )
+        })
+    }
+
     #[test]
     fn reasoning_folds_by_default_and_reveals_the_full_text() {
         // A collapsed row renders no body at all - not even a short preview.
@@ -1254,6 +1391,7 @@ mod tests {
                 vec![
                     FeedItem::Reasoning {
                         text: "REASONING_BODY_SENTINEL".to_string(),
+                        streaming: false,
                     },
                     FeedItem::Tool {
                         id: "c1".to_string(),
@@ -1330,6 +1468,68 @@ mod tests {
     }
 
     #[test]
+    fn streaming_reasoning_row_is_busy_and_reveals_its_body_when_expanded() {
+        install_event_converter();
+
+        #[component]
+        fn Harness(streaming: bool) -> Element {
+            use_context_provider(AppState::new);
+            let items = use_signal(move || {
+                vec![FeedItem::Reasoning {
+                    text: "THINKING_BODY_SENTINEL".to_string(),
+                    streaming,
+                }]
+            });
+            let busy = use_signal(|| false);
+            let toast = use_signal(|| None::<(ToastKind, String)>);
+            let refresh = use_signal(|| 0u64);
+            rsx! {
+                FeedList {
+                    items: items(),
+                    session_id: "ses_1".to_string(),
+                    revision: 1,
+                    busy,
+                    toast,
+                    refresh,
+                }
+            }
+        }
+
+        // While streaming, the row is marked busy: the hook the throbber
+        // hangs off.
+        let mut dom = VirtualDom::new_with_props(Harness, HarnessProps { streaming: true });
+        let initial = dom.rebuild_to_vec();
+        assert!(
+            sets_attribute(&initial, "aria-busy", "true"),
+            "a streaming block must be marked busy"
+        );
+        // The body is folded by default...
+        assert!(!rendered_text(&initial).contains("THINKING_BODY_SENTINEL"));
+
+        // ...and expanding mid-stream reveals the accumulated text.
+        let toggle = listener_target(&initial, "click");
+        dispatch_event(
+            &mut dom,
+            "click",
+            toggle,
+            dioxus::html::SerializedMouseData::default(),
+        );
+        let expanded = dom.render_immediate_to_vec();
+        assert!(
+            rendered_text(&expanded).contains("THINKING_BODY_SENTINEL"),
+            "expanding a streaming block must show its body"
+        );
+
+        // A finished block is no longer busy.
+        let mut finished = VirtualDom::new_with_props(Harness, HarnessProps { streaming: false });
+        let edits = finished.rebuild_to_vec();
+        assert!(
+            sets_attribute(&edits, "aria-busy", "false"),
+            "a finished block must not be busy"
+        );
+    }
+
+    #[test]
     fn feed_list_mounts_host_side() {
         #[component]
         fn Harness() -> Element {
@@ -1342,6 +1542,7 @@ mod tests {
                     },
                     FeedItem::Reasoning {
                         text: "considering".to_string(),
+                        streaming: false,
                     },
                     FeedItem::Tool {
                         id: "c1".to_string(),
@@ -1463,6 +1664,7 @@ mod tests {
                     },
                     FeedItem::Reasoning {
                         text: "considering".to_string(),
+                        streaming: false,
                     },
                     FeedItem::Boundary(IdleOutcome::Succeeded),
                 ]

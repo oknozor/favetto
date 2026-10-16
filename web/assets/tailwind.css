@@ -1776,6 +1776,29 @@
     color: var(--muted);
     font-style: italic;
   }
+  .feed-thinking-body {
+    color: var(--muted);
+  }
+  .feed-throbber {
+    display: inline-block;
+    width: 0.5rem;
+    height: 0.5rem;
+    margin-right: 0.35rem;
+    border-radius: 50%;
+    background: currentColor;
+    vertical-align: middle;
+    animation: feed-throbber-pulse 1s ease-in-out infinite;
+  }
+  @keyframes feed-throbber-pulse {
+    0%, 100% {
+      opacity: 0.25;
+      transform: scale(0.75);
+    }
+    50% {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
   .feed-markdown {
     font-size: var(--text-sm);
     line-height: 1.5;
@@ -2061,6 +2084,9 @@
   }
   @media (prefers-reduced-motion: reduce) {
     .spinner {
+      animation: none;
+    }
+    .feed-throbber {
       animation: none;
     }
     .skip-link {

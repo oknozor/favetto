@@ -1909,6 +1909,37 @@ textarea.input {
   font-style: italic;
 }
 
+/* The expanding thinking body stays muted, visibly distinct from assistant
+   prose. */
+.feed-thinking-body {
+  color: var(--muted);
+}
+
+/* A lightweight pulse shown before the `thinking` label while the block is
+   still streaming. Much smaller than the full-page `.spinner`. */
+.feed-throbber {
+  display: inline-block;
+  width: 0.5rem;
+  height: 0.5rem;
+  margin-right: 0.35rem;
+  border-radius: 50%;
+  background: currentColor;
+  vertical-align: middle;
+  animation: feed-throbber-pulse 1s ease-in-out infinite;
+}
+
+@keyframes feed-throbber-pulse {
+  0%,
+  100% {
+    opacity: 0.25;
+    transform: scale(0.75);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
 .feed-markdown {
   font-size: var(--text-sm);
   line-height: 1.5;
@@ -2245,6 +2276,10 @@ textarea.input {
 /* Respect users who ask for less motion. */
 @media (prefers-reduced-motion: reduce) {
   .spinner {
+    animation: none;
+  }
+
+  .feed-throbber {
     animation: none;
   }
 
