@@ -146,7 +146,11 @@ Poll the GitHub issues API; when open issues exist, start `triage_issues`.
 When the response has no items the task still **succeeds** but enqueues nothing,
 just like an empty `[]` manifest — so a fan-in on `triage_issues` (for example
 `needs = "triage_issues:all_finished"`) still resolves. When items are present,
-the child is enqueued with the gate run's lineage. Header values may interpolate
+the child is enqueued with the gate run's lineage. A **non-2xx** response
+instead **fails** the gate (the daemon sends a default `User-Agent`), so a
+rejected request surfaces as a failed task rather than a silent `succeeded`
+no-op; use `fail_on_error = false` only when intentionally branching on
+`status`. Header values may interpolate
 `$GITHUB_TOKEN` from the daemon's environment, so the token never lives in the
 task file. With the systemd user service, put it in `~/.config/favetto/env`
 (loaded via `EnvironmentFile=`) and `systemctl --user restart favetto` — see

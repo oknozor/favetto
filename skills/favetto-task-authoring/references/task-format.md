@@ -99,11 +99,15 @@ The result is folded into the same envelope an agent run produces (with
 | `headers` | table | Request headers. Values may interpolate `$VAR` / `${VAR}` from the daemon's environment, so tokens are never stored in the task file; a referenced variable that is unset fails the action. |
 | `body` | string or value | Request body; strings are sent verbatim, other values as JSON. |
 | `timeout_ms` | integer | Whole-request timeout in milliseconds; default `30000`. |
+| `fail_on_error` | bool | Fail the action on a non-2xx response; default `true`. Set `false` to record the `status` and branch on it via `[action.when]`. |
+| `user_agent` | string | `User-Agent` header; default `favetto/<version>`. |
 
-The action's `outputs` are `status` (a non-2xx response is **not** a failure),
+The action's `outputs` are `status` (the HTTP status code; a non-2xx response
+**fails** the action by default, opt out with `fail_on_error = false`),
 `headers` (lowercased names), `body` (parsed JSON, or raw text when not JSON),
 `items` (the body when it is an array, else its `items` array, else `null`), and
 `truncated` (whether the body was capped at `[executor].max_output_bytes`).
+Every request sends a `User-Agent` (`favetto/<version>` by default).
 
 ### Gating `spawn` with `[action.when]`
 

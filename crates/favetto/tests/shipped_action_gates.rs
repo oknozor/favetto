@@ -69,5 +69,10 @@ fn shipped_new_issues_gates_are_http_request_action_tasks() {
             when.value.is_none(),
             "{relative}: not_empty takes no `value`"
         );
+        assert_ne!(
+            action.params.get("fail_on_error"),
+            Some(&toml::Value::Boolean(false)),
+            "{relative} must not opt out of failing on a non-2xx response"
+        );
     }
 }
