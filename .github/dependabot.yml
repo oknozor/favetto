@@ -9,6 +9,16 @@ updates:
       cargo:
         patterns: ["*"]
 
+  # The Dioxus client is a standalone workspace (`web/`), so it needs its own
+  # entry to keep `web/Cargo.lock` scanned and bumped.
+  - package-ecosystem: cargo
+    directory: "/web"
+    schedule:
+      interval: weekly
+    groups:
+      cargo-web:
+        patterns: ["*"]
+
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
