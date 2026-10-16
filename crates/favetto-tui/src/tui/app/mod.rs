@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
@@ -528,6 +529,18 @@ pub enum MenuAction {
 }
 
 impl MenuAction {
+    /// Every palette command, in the order shown by the Ctrl+X leader hint.
+    pub const ALL: [MenuAction; 8] = [
+        MenuAction::NewOneShot,
+        MenuAction::AddTask,
+        MenuAction::CreateSchedule,
+        MenuAction::CreateNotification,
+        MenuAction::SwitchRepo,
+        MenuAction::AddRepo,
+        MenuAction::ChangeTheme,
+        MenuAction::OpenDocs,
+    ];
+
     /// The label shown in the palette and matched by its search filter.
     pub fn label(self) -> &'static str {
         match self {
@@ -540,6 +553,33 @@ impl MenuAction {
             MenuAction::ChangeTheme => "Change theme",
             MenuAction::OpenDocs => "Open docs",
         }
+    }
+
+    /// The key pressed after the `Ctrl+X` leader that runs this command. Case is
+    /// significant: `r` switches repo while `R` registers a new one.
+    pub fn leader_key(self) -> char {
+        match self {
+            MenuAction::NewOneShot => 'n',
+            MenuAction::AddTask => 'a',
+            MenuAction::CreateSchedule => 's',
+            MenuAction::CreateNotification => 'c',
+            MenuAction::SwitchRepo => 'r',
+            MenuAction::AddRepo => 'R',
+            MenuAction::ChangeTheme => 't',
+            MenuAction::OpenDocs => 'h',
+        }
+    }
+
+    /// The right-aligned shortcut hint rendered on the command's palette row.
+    pub fn shortcut(self) -> String {
+        format!("Ctrl+X {}", self.leader_key())
+    }
+
+    /// Resolve the key pressed after the `Ctrl+X` leader to a command.
+    pub fn from_leader(c: char) -> Option<MenuAction> {
+        MenuAction::ALL
+            .into_iter()
+            .find(|action| action.leader_key() == c)
     }
 }
 
@@ -585,6 +625,10 @@ pub const MENU_ENTRIES: &[MenuEntry] = &[
 
 /// The URL the `Open docs` command launches.
 pub const DOCS_URL: &str = "https://oknozor.github.io/favetto/";
+
+/// How long the Ctrl+X leader waits for its next key before cancelling, matching
+/// opencode's default `leader_timeout`.
+pub const LEADER_TIMEOUT: Duration = Duration::from_millis(2000);
 
 /// A clickable screen region (absolute coordinates), populated during draw.
 pub struct ClickRegion {
@@ -864,6 +908,9 @@ pub struct App {
 
     // Ctrl+P popup.
     pub popup: Popup,
+    /// Deadline for the armed Ctrl+X leader (shortcut) mode; `None` when the
+    /// leader is inactive. Set by Ctrl+X and consumed by the next keypress.
+    pub leader_until: Option<Instant>,
 
     /// Queued sound cues, drained by the session loop.
     pub sound_cues: Vec<SoundCue>,
@@ -956,6 +1003,7 @@ impl App {
             notifications_geom: ListGeometry::default(),
             daemon_cwd: None,
             popup: Popup::None,
+            leader_until: None,
             sound_cues: Vec::new(),
             sound_muted: false,
             sound_suppressed: false,
@@ -1776,6 +1824,13 @@ impl App {
             selected: first_selectable(MENU_ENTRIES),
             filter: TextBuffer::default(),
         };
+    }
+
+    /// Whether the Ctrl+X leader (shortcut) mode is currently armed. A pending
+    /// leader expires after [`LEADER_TIMEOUT`], matching opencode.
+    pub fn leader_active(&self) -> bool {
+        self.leader_until
+            .is_some_and(|deadline| Instant::now() < deadline)
     }
 
     /// The palette rows after applying the current search filter. An empty filter

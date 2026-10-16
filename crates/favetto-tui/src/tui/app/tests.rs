@@ -3360,6 +3360,95 @@ fn menu_dispatches_commands_by_identity() {
 }
 
 #[test]
+fn menu_shortcuts_are_unique_and_leader_prefixed() {
+    let mut seen = std::collections::HashSet::new();
+    for action in MenuAction::ALL {
+        assert!(
+            action.shortcut().starts_with("Ctrl+X "),
+            "shortcut must be a Ctrl+X combo: {}",
+            action.shortcut()
+        );
+        assert!(
+            seen.insert(action.leader_key()),
+            "duplicate leader key for {:?}",
+            action
+        );
+        assert_eq!(MenuAction::from_leader(action.leader_key()), Some(action));
+    }
+    // Case is significant: `r` switches repo while `R` registers a new one.
+    assert_eq!(MenuAction::from_leader('r'), Some(MenuAction::SwitchRepo));
+    assert_eq!(MenuAction::from_leader('R'), Some(MenuAction::AddRepo));
+    assert_eq!(MenuAction::from_leader('z'), None);
+}
+
+#[test]
+fn ctrl_x_arms_the_leader_and_dispatches_a_command() {
+    let mut app = App::new();
+    assert!(matches!(
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+        UiAction::None
+    ));
+    assert!(app.leader_active(), "Ctrl+X must arm the leader");
+
+    // Ctrl+X h opens the docs and disarms the leader.
+    let action = app.handle_key(key(KeyCode::Char('h'), KeyModifiers::empty()));
+    assert!(matches!(action, UiAction::OpenDocs));
+    assert!(!app.leader_active(), "the leader must disarm after use");
+    assert!(matches!(app.popup, Popup::None));
+}
+
+#[test]
+fn ctrl_x_leader_opens_the_one_shot_wizard() {
+    let mut app = App::new();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::CONTROL));
+    let action = app.handle_key(key(KeyCode::Char('n'), KeyModifiers::empty()));
+    assert!(matches!(action, UiAction::OpenWizard));
+    assert!(!app.leader_active());
+}
+
+#[test]
+fn ctrl_x_leader_cancels_on_escape_or_unmapped_key() {
+    let mut app = App::new();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::CONTROL));
+    assert!(matches!(
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::empty())),
+        UiAction::None
+    ));
+    assert!(!app.leader_active());
+
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::CONTROL));
+    assert!(matches!(
+        app.handle_key(key(KeyCode::Char('z'), KeyModifiers::empty())),
+        UiAction::None
+    ));
+    assert!(!app.leader_active());
+}
+
+#[test]
+fn ctrl_x_is_forwarded_to_captured_agent() {
+    let mut app = App::new();
+    app.tab = Tab::Agent;
+    app.agent_capture = true;
+    match app.handle_key(key(KeyCode::Char('x'), KeyModifiers::CONTROL)) {
+        UiAction::AgentInput(bytes) => assert_eq!(bytes, vec![0x18]),
+        _ => panic!("expected AgentInput"),
+    }
+    assert!(
+        !app.leader_active(),
+        "the leader must not arm under agent capture"
+    );
+}
+
+#[test]
+fn leader_does_not_arm_while_a_popup_owns_the_keyboard() {
+    let mut app = App::new();
+    app.popup = Popup::Help { scroll: 0 };
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::CONTROL));
+    assert!(!app.leader_active());
+    assert!(matches!(app.popup, Popup::Help { .. }));
+}
+
+#[test]
 fn add_task_form_prefixes_the_active_repo() {
     let mut app = App::new();
     app.set_repos(

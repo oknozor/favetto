@@ -1,8 +1,8 @@
 # TUI
 
 The TUI is a client of the daemon. This page covers its tabs, keybindings, and
-client-side behaviours (theme, sound, the Ctrl+P menu). For the Agent panel's
-focus and mouse handling see [Embedded agents](./agents).
+client-side behaviours (theme, sound, the Ctrl+P palette and the Ctrl+X leader).
+For the Agent panel's focus and mouse handling see [Embedded agents](./agents).
 
 ![favetto TUI — Catalog tab](/screenshots/tui-catalog.png)
 
@@ -56,6 +56,15 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 | Global | `Tab` / `→` | next tab |
 | Global | `Shift+Tab` / `←` | previous tab |
 | Global | `Ctrl+P` | open the command palette |
+| Global | `Ctrl+X` | open the shortcut leader, then a key below |
+| Global | `Ctrl+X` `n` | new one-shot task |
+| Global | `Ctrl+X` `a` | add task to catalog |
+| Global | `Ctrl+X` `s` | create schedule |
+| Global | `Ctrl+X` `c` | create notification hook |
+| Global | `Ctrl+X` `r` | switch repo |
+| Global | `Ctrl+X` `R` | add repo |
+| Global | `Ctrl+X` `t` | change theme |
+| Global | `Ctrl+X` `h` | open docs in the browser |
 | Global | `Ctrl+O` | pick a live/retained agent session |
 | Global | `?` | open/close help |
 | Global | `w` | open/close the workflow graph |
@@ -110,13 +119,13 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 | Mouse | click a catalog folder | fold/unfold it |
 | Mouse | click a catalog/task row | select; click again starts it |
 
-`?`, `w`, `i`, `p`, `e`, `c`, `r`, and `C` are forwarded to the embedded agent
-while the Agent panel has keyboard capture, and are typed literally into
-form/wizard fields when one is open. `p` only toggles the preview and `e` only
-edits on the Catalog tab; `i` only inspects on the Tasks tab, and `c`, `r`, and
-`C` only act on the Tasks tab. A plain left-button drag on the Agent panel is
-captured for copy-on-select instead of being forwarded; hold **Shift** to pass
-the drag through to the agent's own mouse UI.
+`Ctrl+P`, `Ctrl+X`, `?`, `w`, `i`, `p`, `e`, `c`, `r`, and `C` are forwarded to
+the embedded agent while the Agent panel has keyboard capture, and are typed
+literally into form/wizard fields when one is open. `p` only toggles the preview
+and `e` only edits on the Catalog tab; `i` only inspects on the Tasks tab, and
+`c`, `r`, and `C` only act on the Tasks tab. A plain left-button drag on the Agent
+panel is captured for copy-on-select instead of being forwarded; hold **Shift** to
+pass the drag through to the agent's own mouse UI.
 
 ## Cancel and retry
 
@@ -173,8 +182,9 @@ an inline full-text search directly under the title. Type to filter the commands
 (the matching is a fuzzy, skim-style full-text match); `↑`/`↓` move the highlight,
 **Enter** runs the highlighted command, and `Esc` closes the palette. Commands are
 grouped under bold, non-selectable section titles (**Tasks**, **Catalog**,
-**Repositories**, **Appearance**, **Help**) and dispatch by identity, so grouping
-and filtering never change what a command does.
+**Repositories**, **Appearance**, **Help**), with one blank row between sections,
+and each command shows its `Ctrl+X` shortcut on the right. Commands dispatch by
+identity, so grouping and filtering never change what a command does.
 
 - **New one-shot task** — a wizard (agent → provider → model → directory) that
   starts an inline, interactive task and opens it in the Agent panel for you to
@@ -187,6 +197,29 @@ and filtering never change what a command does.
   repo; see [Repo scoping](#repo-scoping).
 - **Change theme** — preview and pick a theme and mode.
 - **Open docs** — opens <https://oknozor.github.io/favetto/> in your browser.
+
+### Shortcut leader (Ctrl+X)
+
+Every palette command also has a mnemonic shortcut reached through the **Ctrl+X**
+leader, modelled on opencode. Pressing `Ctrl+X` dims the active view and shows a
+which-key hint listing the available combinations; the next key runs its command.
+`Esc`, an unmapped key, or a two-second timeout cancels the pending leader. The
+combinations are:
+
+| Key | Command |
+|-----|---------|
+| `Ctrl+X` `n` | new one-shot task |
+| `Ctrl+X` `a` | add task to catalog |
+| `Ctrl+X` `s` | create schedule |
+| `Ctrl+X` `c` | create notification hook |
+| `Ctrl+X` `r` | switch repo |
+| `Ctrl+X` `R` | add repo |
+| `Ctrl+X` `t` | change theme |
+| `Ctrl+X` `h` | open docs in the browser |
+
+The leader works from every tab while favetto owns the keyboard. While the Agent
+panel has keyboard capture, `Ctrl+X` is forwarded to the agent like the other
+favetto keys, and the `?` overlay documents the leader under **Global**.
 
 ### One-shot wizard
 

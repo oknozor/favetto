@@ -18,8 +18,8 @@ use favetto_core::workflow::{WorkflowInspect, WorkflowState};
 use super::app::{
     activity_cell, cost_cell, format_activity, repo_label, table_rows_area, task_display_name,
     task_repo, token_cell, App, CatalogRow, ClickAction, ClickRegion, ConfirmPrompt, ConnState,
-    Form, ListGeometry, MenuEntry, Popup, ReplyPrompt, Tab, TaskVarsForm, ThemeChoice, Wizard,
-    WizardStep,
+    Form, ListGeometry, MenuAction, MenuEntry, Popup, ReplyPrompt, Tab, TaskVarsForm, ThemeChoice,
+    Wizard, WizardStep,
 };
 use super::text_buffer::TextBuffer;
 use super::theme::{RaisedLevel, Theme};
@@ -74,6 +74,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if !matches!(app.popup, Popup::None) {
         draw_popup(frame, app);
+    } else if app.leader_active() {
+        draw_leader_hint(frame, app.theme);
     }
 }
 
@@ -406,6 +408,9 @@ fn push_caret_line(spans: &mut Vec<Span<'static>>, buf: &TextBuffer, caret: Styl
 /// Draw the Ctrl+P command palette: a borderless vertical panel with a bold
 /// `Commands` title and a muted `esc` hint on the right, an inline full-text
 /// search, and the grouped command list (section headers are not selectable).
+/// The title, headers, and commands share one left column, each command carries a
+/// right-aligned `Ctrl+X` shortcut, and exactly one blank row separates
+/// consecutive sections.
 fn draw_menu(
     frame: &mut Frame,
     entries: &[MenuEntry],
@@ -414,13 +419,19 @@ fn draw_menu(
     theme: Theme,
 ) {
     let area = frame.area();
-    // One row each for the title and the search, then the commands.
-    let height = (entries.len() as u16).saturating_add(4);
+    // One blank row before every header but the first. Derived at render time so
+    // the selection index (which points into `entries`) is unaffected.
+    let spacers = entries
+        .iter()
+        .enumerate()
+        .filter(|(i, entry)| *i > 0 && matches!(entry, MenuEntry::Header(_)))
+        .count();
+    // One row each for the title and the search, then the entries and spacers.
+    let height = (entries.len() + spacers + 2) as u16;
     let rect = centered_rect(area, 60, height);
     draw_dialog_shell(frame, rect, theme);
 
     let chunks = Layout::vertical([
-        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(0),
@@ -446,15 +457,18 @@ fn draw_menu(
     .style(theme.dialog_style());
     frame.render_widget(search, chunks[1]);
 
-    let items: Vec<ListItem> = entries
-        .iter()
-        .enumerate()
-        .map(|(i, entry)| {
-            let text = if entry.selectable() {
-                format!("   {}", entry.label())
-            } else {
-                format!(" {}", entry.label())
-            };
+    let list = if entries.is_empty() {
+        List::new(vec![ListItem::new(Line::from(Span::styled(
+            " no matching commands",
+            theme.disabled(),
+        )))])
+    } else {
+        let mut items = Vec::with_capacity(entries.len() + spacers);
+        for (i, entry) in entries.iter().enumerate() {
+            // A blank row sets each section apart from the one above it.
+            if i > 0 && matches!(entry, MenuEntry::Header(_)) {
+                items.push(ListItem::new(Line::from("")));
+            }
             let style = if !entry.selectable() {
                 Style::default().add_modifier(Modifier::BOLD)
             } else if i == selected {
@@ -462,18 +476,58 @@ fn draw_menu(
             } else {
                 Style::default()
             };
-            ListItem::new(Line::from(Span::styled(text, style)))
-        })
-        .collect();
-    let list = if entries.is_empty() {
-        List::new(vec![ListItem::new(Line::from(Span::styled(
-            " no matching commands",
-            theme.disabled(),
-        )))])
-    } else {
+            items.push(menu_list_item(entry, style, rect.width));
+        }
         List::new(items)
     };
-    frame.render_widget(list, chunks[3]);
+    frame.render_widget(list, chunks[2]);
+}
+
+/// Build one palette row as a single line. Headers render their bold label;
+/// commands render the label with the `Ctrl+X` shortcut pushed to the rightmost
+/// column of `width`.
+fn menu_list_item(entry: &MenuEntry, style: Style, width: u16) -> ListItem<'static> {
+    let label = format!(" {}", entry.label());
+    match entry {
+        MenuEntry::Header(_) => ListItem::new(Line::from(Span::styled(label, style))),
+        MenuEntry::Action(action) => {
+            let shortcut = format!("{} ", action.shortcut());
+            let gap =
+                (width as usize).saturating_sub(label.chars().count() + shortcut.chars().count());
+            ListItem::new(Line::from(vec![
+                Span::styled(label, style),
+                Span::styled(" ".repeat(gap), style),
+                Span::styled(shortcut, style),
+            ]))
+        }
+    }
+}
+
+/// Dim the active view and show the which-key style Ctrl+X leader hint: every
+/// palette command with the key that runs it.
+fn draw_leader_hint(frame: &mut Frame, theme: Theme) {
+    let area = frame.area();
+    let rows: Vec<Line<'static>> = MenuAction::ALL
+        .iter()
+        .map(|action| {
+            Line::from(vec![
+                Span::styled(format!(" {:>2}  ", action.leader_key()), theme.selected()),
+                Span::raw(action.label()),
+            ])
+        })
+        .collect();
+    let height = (rows.len() as u16).saturating_add(2);
+    let rect = centered_rect(area, 50, height);
+    draw_dialog_shell(frame, rect, theme);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Shortcuts · Ctrl+X ")
+        .style(theme.dialog_style())
+        .border_style(theme.focused());
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    frame.render_widget(Paragraph::new(rows), inner);
 }
 
 /// Draw the Ctrl+O session picker: one row per live/retained agent session,
@@ -1095,6 +1149,18 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Tab / →", "next tab"),
             ("Shift+Tab / ←", "previous tab"),
             ("Ctrl+P", "open the command palette"),
+            (
+                "Ctrl+X",
+                "shortcut leader: dims the view and waits for the next key",
+            ),
+            ("Ctrl+X n", "new one-shot task"),
+            ("Ctrl+X a", "add task to catalog"),
+            ("Ctrl+X s", "create schedule"),
+            ("Ctrl+X c", "create notification hook"),
+            ("Ctrl+X r", "switch repo"),
+            ("Ctrl+X R", "add repo"),
+            ("Ctrl+X t", "change theme"),
+            ("Ctrl+X h", "open docs in the browser"),
             ("Ctrl+O", "pick a live/retained agent session"),
             ("Ctrl+R", "answer a pending agent prompt"),
             ("?", "open/close this help"),
