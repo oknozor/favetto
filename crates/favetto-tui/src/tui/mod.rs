@@ -873,6 +873,9 @@ async fn run_session(
                             UiAction::OpenRepoPicker => {
                                 fetch_repos(client, app).await;
                             }
+                            UiAction::OpenTaskPicker => {
+                                fetch_catalog(client, app).await;
+                            }
                             UiAction::OpenDocs => {
                                 open_docs(app);
                             }

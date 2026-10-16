@@ -18,8 +18,8 @@ use favetto_core::workflow::{WorkflowInspect, WorkflowState};
 use super::app::{
     activity_cell, cost_cell, format_activity, repo_label, table_rows_area, task_display_name,
     task_repo, token_cell, App, CatalogRow, ClickAction, ClickRegion, ConfirmPrompt, ConnState,
-    Form, ListGeometry, MenuAction, MenuEntry, Popup, ReplyPrompt, Tab, TaskVarsForm, ThemeChoice,
-    Wizard, WizardStep,
+    Form, ListGeometry, MenuAction, MenuEntry, Popup, ReplyPrompt, Tab, TaskPickerRow,
+    TaskVarsForm, ThemeChoice, Wizard, WizardStep,
 };
 use super::text_buffer::TextBuffer;
 use super::theme::{RaisedLevel, Theme};
@@ -176,6 +176,15 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
         draw_menu(frame, &entries, selected, &filter, theme);
         return;
     }
+    // The "Launch task" picker renders from the app's catalog, so compute its
+    // grouped rows before `popup` is borrowed mutably.
+    if let Popup::TaskPicker { selected, filter } = &app.popup {
+        let selected = *selected;
+        let filter = filter.value().to_string();
+        let entries = app.task_picker_entries();
+        draw_task_picker(frame, &entries, selected, &filter, theme);
+        return;
+    }
     match &mut app.popup {
         Popup::None => {}
         Popup::Menu { .. } => {}
@@ -216,6 +225,8 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
         Popup::ConfigError { path, errors } => draw_config_error(frame, path, errors, theme),
         // Handled above, before `popup` is borrowed.
         Popup::RepoPicker { .. } => {}
+        // Handled above, before `popup` is borrowed.
+        Popup::TaskPicker { .. } => {}
         Popup::ThemePicker {
             selected, entries, ..
         } => draw_theme_picker(frame, *selected, entries, theme),
@@ -517,6 +528,86 @@ fn menu_list_item(entry: &MenuEntry, style: Style, width: u16) -> ListItem<'stat
             ]))
         }
     }
+}
+
+/// Draw the Ctrl+P "Launch task" picker: a palette-styled panel (bold title,
+/// muted `esc` hint, inline search) listing catalog tasks grouped under `Global`
+/// and per-repo headers.
+fn draw_task_picker(
+    frame: &mut Frame,
+    rows: &[TaskPickerRow],
+    selected: usize,
+    filter: &str,
+    theme: Theme,
+) {
+    let area = frame.area();
+    // One blank row before every group header but the first, derived at render
+    // time so the selection index (which points into `rows`) is unaffected.
+    let spacers = rows
+        .iter()
+        .enumerate()
+        .filter(|(i, row)| *i > 0 && matches!(row, TaskPickerRow::Header(_)))
+        .count();
+    let height = (rows.len() + spacers + 2) as u16;
+    let rect = centered_rect(area, 60, height);
+    draw_dialog_shell(frame, rect, theme);
+
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .split(rect);
+
+    // The title row: bold `Launch task` left, muted `esc` right.
+    let heading = "Launch task";
+    let gap = (rect.width as usize).saturating_sub(heading.len() + "esc".len() + 2);
+    let title = Paragraph::new(Line::from(vec![
+        Span::styled(
+            format!(" {heading}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" ".repeat(gap)),
+        Span::styled("esc ", theme.disabled()),
+    ]))
+    .style(theme.dialog_style());
+    frame.render_widget(title, chunks[0]);
+
+    // Inline full-text search, directly under the title.
+    let search = Paragraph::new(Line::from(vec![
+        Span::styled(" search: ", theme.block(true)),
+        Span::raw(filter.to_string()),
+        Span::styled("█", theme.selected()),
+    ]))
+    .style(theme.dialog_style());
+    frame.render_widget(search, chunks[1]);
+
+    let list = if rows.is_empty() {
+        List::new(vec![ListItem::new(Line::from(Span::styled(
+            " no matching tasks",
+            theme.disabled(),
+        )))])
+    } else {
+        let mut items = Vec::with_capacity(rows.len() + spacers);
+        for (i, row) in rows.iter().enumerate() {
+            if i > 0 && matches!(row, TaskPickerRow::Header(_)) {
+                items.push(ListItem::new(Line::from("")));
+            }
+            let style = if !row.selectable() {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else if i == selected {
+                theme.selected()
+            } else {
+                Style::default()
+            };
+            items.push(ListItem::new(Line::from(Span::styled(
+                format!(" {}", row.label()),
+                style,
+            ))));
+        }
+        List::new(items)
+    };
+    frame.render_widget(list, chunks[2]);
 }
 
 /// Dim the active view and show the which-key style Ctrl+X leader hint: every
@@ -1170,6 +1261,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
                 "shortcut leader: dims the view and waits for the next key",
             ),
             ("Ctrl+X n", "new one-shot task"),
+            ("Ctrl+X l", "launch a catalog task"),
             ("Ctrl+X a", "add task to catalog"),
             ("Ctrl+X s", "create schedule"),
             ("Ctrl+X c", "create notification hook"),
@@ -1220,6 +1312,15 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("↑ / ↓", "move the selection (section headers are skipped)"),
             ("Enter", "run the highlighted command"),
             ("Esc", "close the palette"),
+        ],
+    ),
+    (
+        "Launch task (Ctrl+P → Launch task)",
+        &[
+            ("characters", "filter catalog tasks by name"),
+            ("↑ / ↓", "move the selection (group headers are skipped)"),
+            ("Enter", "launch the highlighted task"),
+            ("Esc", "close without launching"),
         ],
     ),
     (
