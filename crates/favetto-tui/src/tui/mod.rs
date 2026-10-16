@@ -6,6 +6,7 @@ mod clipboard;
 mod editor;
 mod json;
 mod markdown;
+mod opencode_theme;
 mod sound;
 mod term;
 mod text_buffer;
@@ -142,18 +143,32 @@ pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
     // Resolve the palette now, before the input-reader thread exists: the OSC 11
     // query needs to read the terminal's reply from stdin itself.
     let system_mode = theme::Theme::detect_mode();
-    let theme_name = match std::env::var("FAVETTO_THEME_NAME") {
-        Ok(name) if !name.trim().is_empty() => name.trim().to_string(),
-        _ => config.tui.theme.clone(),
-    };
-    let theme_mode = std::env::var("FAVETTO_THEME")
-        .ok()
-        .and_then(|value| theme::ThemeMode::from_key(&value))
-        .or_else(|| theme::ThemeMode::from_key(&config.tui.theme_mode))
-        .unwrap_or(theme::ThemeMode::System);
     let theme_dirs = theme_directories(&config_path);
     let user_themes = theme::Theme::discover_user_themes(&theme_dirs);
-    let theme = theme::Theme::resolve(&theme_name, theme_mode, &theme_dirs, system_mode);
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let opencode_dirs = opencode_theme::theme_directories(&cwd);
+    let opencode_names = opencode_theme::known_theme_names(&opencode_dirs);
+    let opencode_selection = opencode_theme::load_cli_config();
+
+    let env_name = std::env::var("FAVETTO_THEME_NAME")
+        .ok()
+        .filter(|name| !name.trim().is_empty());
+    let env_mode = std::env::var("FAVETTO_THEME").ok();
+    let (theme_name, theme_mode, follow_opencode) = resolve_theme_selection(
+        env_name.as_deref(),
+        &config.tui.theme,
+        env_mode.as_deref(),
+        &config.tui.theme_mode,
+        &opencode_selection,
+    );
+    let theme = resolve_theme(
+        &theme_name,
+        theme_mode,
+        system_mode,
+        &theme_dirs,
+        &opencode_dirs,
+        follow_opencode,
+    );
     let mut stdout = io::stdout();
     execute!(
         stdout,
@@ -191,6 +206,8 @@ pub async fn run(args: TuiArgs) -> anyhow::Result<()> {
     app.system_mode = system_mode;
     app.theme_dirs = theme_dirs;
     app.user_themes = user_themes;
+    app.opencode_theme_dirs = opencode_dirs;
+    app.opencode_theme_names = opencode_names;
     app.show_header = config.tui.show_header;
     app.show_footer = config.tui.show_footer;
     app.sound_enabled = sound_cfg.enabled;
@@ -1623,6 +1640,96 @@ fn theme_directories(config_path: &std::path::Path) -> Vec<PathBuf> {
     dirs
 }
 
+/// Pick the effective `(name, mode)` for startup and whether opencode's own
+/// resolution should be preferred.
+///
+/// Precedence is: `FAVETTO_THEME_NAME`/`FAVETTO_THEME`, then favetto's
+/// `[tui].theme`/`[tui].theme_mode`, then opencode's `cli.json`. The `auto`
+/// sentinel (and an empty name) means "follow opencode".
+fn resolve_theme_selection(
+    env_name: Option<&str>,
+    config_name: &str,
+    env_mode: Option<&str>,
+    config_mode: &str,
+    opencode: &opencode_theme::OpencodeThemeSelection,
+) -> (String, theme::ThemeMode, bool) {
+    let env_name = env_name.map(str::trim).filter(|name| !name.is_empty());
+    let raw_name = env_name.unwrap_or(config_name.trim());
+    let follow = raw_name.is_empty() || raw_name.eq_ignore_ascii_case("auto");
+    let name = if follow {
+        opencode
+            .name
+            .clone()
+            .unwrap_or_else(|| "opencode".to_string())
+    } else {
+        raw_name.to_string()
+    };
+    let mode = env_mode
+        .and_then(theme::ThemeMode::from_key)
+        .or_else(|| match theme::ThemeMode::from_key(config_mode) {
+            // The `system` default is not an explicit override: when following
+            // opencode, let its `theme.mode` win.
+            Some(theme::ThemeMode::System) if follow => None,
+            other => other,
+        })
+        .or_else(|| {
+            if follow {
+                opencode
+                    .mode
+                    .as_deref()
+                    .and_then(theme::ThemeMode::from_key)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(theme::ThemeMode::System);
+    (name, mode, follow)
+}
+
+/// Resolve the effective theme, preferring opencode's theme when following its
+/// configuration and falling back to the bundled palette on any miss.
+fn resolve_theme(
+    name: &str,
+    mode: theme::ThemeMode,
+    system_mode: theme::ThemeMode,
+    favetto_dirs: &[PathBuf],
+    opencode_dirs: &[PathBuf],
+    prefer_opencode: bool,
+) -> theme::Theme {
+    if theme::no_color() {
+        return theme::Theme::monochrome();
+    }
+    let resolved = match mode {
+        theme::ThemeMode::System => match system_mode {
+            theme::ThemeMode::Light => theme::ThemeMode::Light,
+            _ => theme::ThemeMode::Dark,
+        },
+        other => other,
+    };
+    if prefer_opencode {
+        if let Ok(theme) = opencode_theme::resolve(name, resolved, opencode_dirs) {
+            return theme;
+        }
+    }
+    let is_favetto = theme::ThemeName::from_key(name).is_some()
+        || theme::Theme::discover_user_themes(favetto_dirs)
+            .iter()
+            .any(|user| user == name);
+    if is_favetto {
+        return theme::Theme::resolve(name, resolved, favetto_dirs, system_mode);
+    }
+    match opencode_theme::resolve(name, resolved, opencode_dirs) {
+        Ok(theme) => theme,
+        Err(err) => {
+            tracing::warn!("{err}; using the bundled palette");
+            match resolved {
+                theme::ThemeMode::Light => theme::Theme::light(),
+                _ => theme::Theme::dark(),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1791,5 +1898,68 @@ mod tests {
             body,
             serde_json::json!({ "username": "alice", "password": "s3cret" })
         );
+    }
+
+    #[test]
+    fn theme_selection_follows_opencode_when_auto() {
+        let selection = opencode_theme::OpencodeThemeSelection {
+            name: Some("synthwave84".to_string()),
+            mode: Some("light".to_string()),
+        };
+        let (name, mode, follow) =
+            resolve_theme_selection(None, "auto", None, "system", &selection);
+        assert_eq!(name, "synthwave84");
+        assert_eq!(mode, theme::ThemeMode::Light);
+        assert!(follow);
+        // An empty name follows opencode too, defaulting to `opencode`.
+        let (name, _, follow) = resolve_theme_selection(None, "", None, "system", &selection);
+        assert_eq!(name, "synthwave84");
+        assert!(follow);
+    }
+
+    #[test]
+    fn favetto_overrides_win_over_opencode() {
+        let selection = opencode_theme::OpencodeThemeSelection {
+            name: Some("nord".to_string()),
+            mode: Some("light".to_string()),
+        };
+        let (name, mode, follow) = resolve_theme_selection(
+            Some("catppuccin"),
+            "auto",
+            Some("dark"),
+            "system",
+            &selection,
+        );
+        assert_eq!(name, "catppuccin");
+        assert_eq!(mode, theme::ThemeMode::Dark);
+        assert!(!follow);
+        // A non-`auto` config name is an explicit favetto choice.
+        let (name, _, follow) =
+            resolve_theme_selection(None, "catppuccin", None, "system", &selection);
+        assert_eq!(name, "catppuccin");
+        assert!(!follow);
+    }
+
+    #[test]
+    fn resolve_theme_prefers_opencode_when_following() {
+        let theme = resolve_theme(
+            "synthwave84",
+            theme::ThemeMode::Dark,
+            theme::ThemeMode::Dark,
+            &[],
+            &[],
+            true,
+        );
+        assert_ne!(theme, theme::Theme::dark());
+        // An unknown name falls back to the bundled palette rather than failing.
+        let theme = resolve_theme(
+            "does-not-exist",
+            theme::ThemeMode::Dark,
+            theme::ThemeMode::Dark,
+            &[],
+            &[],
+            true,
+        );
+        assert_eq!(theme, theme::Theme::dark());
     }
 }

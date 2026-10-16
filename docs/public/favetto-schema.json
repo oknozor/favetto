@@ -803,13 +803,13 @@
           }
         },
         "theme": {
-          "default": "opencode",
-          "description": "Built-in (`opencode`, `catppuccin`) or user theme name. A user theme is\nloaded from `themes/<name>.json` in the config or `.favetto/themes`\ndirectory. Overridable with `FAVETTO_THEME_NAME`.",
+          "default": "auto",
+          "description": "Built-in (`opencode`, `catppuccin`) or user theme name. A user theme is\nloaded from `themes/<name>.json` in the config or `.favetto/themes`\ndirectory. `auto` (the default) follows the theme configured in\nopencode's `cli.json`; a built-in or custom opencode theme name selects\nthat theme directly. Overridable with `FAVETTO_THEME_NAME`.",
           "type": "string"
         },
         "theme_mode": {
           "default": "system",
-          "description": "Theme mode: `system` (derive from the terminal), `dark`, or `light`.\nOverridable with `FAVETTO_THEME`.",
+          "description": "Theme mode: `system` (derive from the terminal), `dark`, or `light`.\nWith `theme = \"auto\"`, `system` also follows opencode's `theme.mode`.\nOverridable with `FAVETTO_THEME`.",
           "type": "string"
         }
       },
@@ -971,7 +971,7 @@
           "only_when_unfocused": false,
           "player": "auto"
         },
-        "theme": "opencode",
+        "theme": "auto",
         "theme_mode": "system"
       },
       "description": "Client-side TUI settings. Ignored by the daemon, which reads the same file."

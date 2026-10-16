@@ -229,16 +229,20 @@ action = "opened"
 task = "favetto/plan_issue"
 filter = { labels_contains = ["bug"], base_ref = "main", author = "oknozor" }
 
-# TUI theming. `theme` is a built-in ("opencode", "catppuccin") or a user theme
-# loaded from `~/.config/favetto/themes/<name>.json` (or `.favetto/themes/`).
-# `theme_mode` is "system" (derive from the terminal), "dark", or "light".
+# TUI theming. `theme` defaults to "auto", which follows the theme configured
+# in opencode's `~/.config/opencode/cli.json` (`theme.name` + `theme.mode`),
+# loading built-in and custom opencode themes. Set it to a built-in
+# ("opencode", "catppuccin") or a user theme loaded from
+# `~/.config/favetto/themes/<name>.json` (or `.favetto/themes/`) to override.
+# `theme_mode` is "system" (derive from the terminal), "dark", or "light"; with
+# `theme = "auto"` and `theme_mode = "system"`, opencode's mode is followed.
 # Both are overridable with FAVETTO_THEME_NAME / FAVETTO_THEME. Press Ctrl+P ->
 # "Change theme" to preview and pick one for the session.
 #
 # Editor opened by `e` on a Catalog task. Unset -> $VISUAL, then $EDITOR, then vi.
 # [tui]
 # editor = "code --wait"
-# theme = "opencode"
+# theme = "auto"
 # theme_mode = "system"          # "system" | "dark" | "light"
 # show_header = true             # tab bar
 # show_footer = true             # status line

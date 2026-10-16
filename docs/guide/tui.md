@@ -388,34 +388,51 @@ a `task.updated` push all refresh the view.
 ## Theme
 
 The TUI paints every surface through a semantic design-token theme (background,
-text, border, syntax and markdown groups, with raised-surface depth levels).
-Two built-in themes ship: **Opencode** (the default) and **Catppuccin**. Each
-has a dark and a light variant.
+text, border, scrollbar, syntax and markdown groups, with raised-surface depth
+levels).
 
-- `[tui].theme` — the theme name. A built-in name, or a user theme loaded from
+By default (`theme = "auto"`) the palette follows the theme you configured in
+[opencode](https://opencode.ai): favetto reads `theme.name` and `theme.mode`
+from opencode's CLI settings (`~/.config/opencode/cli.json`, or
+`$XDG_CONFIG_HOME/opencode/cli.json`), so picking a different opencode theme —
+a built-in such as `tokyonight`, a custom theme, or a light/dark mode — changes
+the favetto TUI too. Both opencode's v2 theme format (`base`/`light`/`dark` with
+`hue` scales and `$hue.*`/`$token` references) and the older v1 format
+(`defs`/`theme`) are understood. Custom themes are `<name>.json` under
+`~/.config/opencode/themes/` or `<project>/.opencode/themes/`. If opencode's
+config is missing or the named theme cannot be loaded, favetto falls back to its
+bundled palette and logs a warning — the TUI never fails to start.
+
+- `[tui].theme` — `auto` (the default; follow opencode), a built-in
+  (`opencode`, `catppuccin`), or a user theme loaded from
   `~/.config/favetto/themes/<name>.json` (also searched in the config-local
-  `themes/` dir and the repo-local `.favetto/themes/`). Override with
-  `FAVETTO_THEME_NAME`.
+  `themes/` dir and the repo-local `.favetto/themes/`). Any opencode theme name
+  may also be used directly here. Override with `FAVETTO_THEME_NAME`.
 - `[tui].theme_mode` — `system` (the default; derives dark/light from the
   terminal background via an OSC 11 query, then `COLORFGBG`, then dark), `dark`,
-  or `light`. Override with `FAVETTO_THEME=dark|light`.
+  or `light`. With `theme = "auto"`, `system` also follows opencode's
+  `theme.mode`. Override with `FAVETTO_THEME=dark|light`.
+
+Precedence, highest first: `FAVETTO_THEME_NAME`/`FAVETTO_THEME`, then the
+non-`auto` `[tui]` values, then opencode's `cli.json`.
 
 ```toml
 # ~/.config/favetto/config.toml
 [tui]
-theme = "opencode"
+theme = "auto"       # follow opencode
 theme_mode = "system"
 ```
 
 Press **Ctrl+P → Change theme** to preview and select a theme or mode for the
-session (the choice is not written back to the config). While the picker is
-open, ↑/↓ preview the highlighted entry, Enter keeps it, and Esc restores the
-previous theme. Set `NO_COLOR` (or run on a dumb terminal) to fall back to a
-colourless theme.
+session (the choice is not written back to the config). The picker lists
+favetto's bundled/user themes plus the themes opencode knows. While it is open,
+↑/↓ preview the highlighted entry, Enter keeps it, and Esc restores the previous
+theme. Set `NO_COLOR` (or run on a dumb terminal) to fall back to a colourless
+theme.
 
-A user theme is JSON with optional `dark`/`light` token maps; missing tokens
-inherit from the built-in default, and colours may be `#rrggbb`, `transparent`,
-or a `$hue.<hue>.<100..900>` reference:
+A favetto user theme is JSON with optional `dark`/`light` token maps; missing
+tokens inherit from the built-in default, and colours may be `#rrggbb`,
+`transparent`, or a `$hue.<hue>.<100..900>` reference:
 
 ```json
 {
@@ -426,6 +443,13 @@ or a `$hue.<hue>.<100..900>` reference:
   }
 }
 ```
+
+Two opencode features are intentionally simplified: `diff.*` tokens have no
+favetto group yet (there is no diff view), and opencode's interaction states
+(`$hovered`/`$focused`/`$pressed`/`$selected`/`$disabled`) collapse onto each
+token's base colour — favetto derives its own selected/focused/disabled states.
+The `system` *palette* (terminal ANSI colours) is not implemented; only the
+`system` *mode* is honoured.
 
 Set `[tui].show_header = false` to hide the tab bar and
 `[tui].show_footer = false` to hide the status line (both default true).

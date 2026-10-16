@@ -3233,6 +3233,28 @@ fn theme_picker_enter_commits_and_esc_restores() {
 }
 
 #[test]
+fn theme_picker_lists_opencode_themes_and_resolves_them() {
+    let mut app = App::new();
+    app.opencode_theme_names = vec!["tokyonight".to_string(), "system".to_string()];
+    let entries = app.theme_entries();
+    assert!(entries
+        .iter()
+        .any(|e| matches!(e, ThemeChoice::Header("Opencode"))));
+    assert!(entries.iter().any(|e| match e {
+        ThemeChoice::Choice { theme, .. } => theme == "tokyonight",
+        _ => false,
+    }));
+    // The opencode name resolves to a real palette (not the favetto default).
+    let theme = app.resolve_named_theme("tokyonight", ThemeMode::Dark);
+    assert_ne!(theme, Theme::dark());
+    // Unknown names fall back to the bundled palette rather than failing.
+    assert_eq!(
+        app.resolve_named_theme("nope", ThemeMode::Dark),
+        Theme::dark()
+    );
+}
+
+#[test]
 fn menu_switch_repo_and_add_repo_open_their_surfaces() {
     let mut app = App::new();
     app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));

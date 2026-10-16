@@ -1,6 +1,7 @@
 use super::super::app::AgentSelection;
 use super::super::theme::RaisedLevel;
 use super::*;
+use crate::tui::theme::ThemeMode;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 use std::collections::BTreeMap;
@@ -23,12 +24,15 @@ fn session(id: &str, agent: &str, headless: bool, running: bool) -> AgentSession
 
 /// Every built-in palette, so render tests exercise all colour paths.
 fn all_themes() -> Vec<Theme> {
+    let opencode = crate::tui::opencode_theme::resolve("tokyonight", ThemeMode::Dark, &[])
+        .expect("vendored tokyonight resolves");
     vec![
         Theme::opencode_dark(),
         Theme::opencode_light(),
         Theme::catppuccin_dark(),
         Theme::catppuccin_light(),
         Theme::monochrome(),
+        opencode,
     ]
 }
 
@@ -187,6 +191,52 @@ fn sample_popups() -> Vec<Popup> {
             ],
         },
     ]
+}
+
+/// The audit guard: every cell any widget paints must use a colour from the
+/// resolved palette (or a contrast black/white, or a reset/ANSI passthrough).
+#[test]
+fn every_painted_cell_uses_the_palette() {
+    for theme in all_themes() {
+        let palette = theme.palette_colors();
+        let mut apps: Vec<App> = Tab::ALL
+            .iter()
+            .map(|tab| {
+                let mut app = App::with_theme(theme);
+                app.tab = *tab;
+                app
+            })
+            .collect();
+        let mut picker = App::with_theme(theme);
+        picker.open_theme_picker();
+        apps.push(picker);
+
+        for mut app in apps {
+            let backend = TestBackend::new(100, 40);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let area = *buffer.area();
+            for y in 0..area.height {
+                for x in 0..area.width {
+                    let cell = buffer.cell((x, y)).unwrap();
+                    for color in [cell.fg, cell.bg] {
+                        if matches!(
+                            color,
+                            Color::Reset | Color::Black | Color::White | Color::Indexed(_)
+                        ) {
+                            continue;
+                        }
+                        assert!(
+                            palette.contains(&color),
+                            "unthemed {color:?} at ({x},{y}) on tab {:?}",
+                            app.tab
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -453,6 +503,10 @@ fn assert_palette_surface(app: &mut App, width: u16, height: u16) {
     let base = theme.raised(RaisedLevel::Base);
     let high = theme.background.raised.high;
     let max = theme.background.raised.max;
+    // Both light themes pick the same grey for `raised.high` and the focused
+    // form-field fill, so a legitimately painted form field is numerically
+    // indistinguishable from the old `high` rung. Exclude it from the sentinel.
+    let formfield = theme.background.formfield;
 
     assert_eq!(
         buffer.cell((0, 0)).unwrap().bg,
@@ -468,8 +522,8 @@ fn assert_palette_surface(app: &mut App, width: u16, height: u16) {
                 saw_base = true;
             }
             // Monochrome collapses every rung to `Reset`, so only forbid a rung
-            // when it is distinct from the base/scrim actually in use.
-            if bg != base && bg != scrim {
+            // when it is distinct from the base/scrim/formfield actually in use.
+            if bg != base && bg != scrim && bg != formfield {
                 assert_ne!(bg, high, "raised high surface painted at ({x},{y})");
                 assert_ne!(bg, max, "raised max surface painted at ({x},{y})");
             }

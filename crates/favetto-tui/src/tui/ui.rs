@@ -7,8 +7,8 @@ use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Bar, BarChart, Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, TableState,
-    Wrap,
+    Bar, BarChart, Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
 };
 use ratatui::Frame;
 
@@ -22,7 +22,7 @@ use super::app::{
     TaskVarsForm, ThemeChoice, Wizard, WizardStep,
 };
 use super::text_buffer::TextBuffer;
-use super::theme::Theme;
+use super::theme::{contrast_fg, Theme};
 use super::{json, markdown};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -105,6 +105,15 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
     let regions = tab_layout(&Tab::ALL, area.x, area.y);
     let right = area.x.saturating_add(area.width);
     let buf = frame.buffer_mut();
+    // A subtle baseline under the whole bar; the active tab overwrites its
+    // region with the accent underline below.
+    if area.height > 1 {
+        for x in area.x..right {
+            if let Some(cell) = buf.cell_mut((x, area.y + 1)) {
+                cell.set_style(Style::default().bg(app.theme.border.subtle));
+            }
+        }
+    }
     for (tab, start, end) in regions {
         let active = tab == app.tab;
         let style = if active {
@@ -778,7 +787,7 @@ fn draw_reply(frame: &mut Frame, prompt: &ReplyPrompt, theme: Theme) {
     if prompt.has_options() {
         for (i, option) in prompt.request.options.iter().enumerate() {
             let style = if i == prompt.selected {
-                theme.selected()
+                theme.action_style()
             } else {
                 Style::default()
             };
@@ -1003,13 +1012,14 @@ fn draw_form(frame: &mut Frame, form: &Form, theme: Theme) -> Rect {
             )));
         } else if i == form.current {
             focus_line = content.len();
+            let field_style = Style::default()
+                .fg(theme.text.formfield)
+                .bg(theme.background.formfield);
             let mut spans = vec![Span::styled(
                 format!("> {field}: "),
-                Style::default()
-                    .fg(theme.accent())
-                    .add_modifier(Modifier::BOLD),
+                field_style.add_modifier(Modifier::BOLD),
             )];
-            push_caret_line(&mut spans, &form.input, Style::default().fg(theme.accent()));
+            push_caret_line(&mut spans, &form.input, field_style);
             content.push(Line::from(spans));
         } else {
             content.push(Line::from(format!("  {field}")));
@@ -1150,7 +1160,8 @@ fn draw_task_vars(frame: &mut Frame, form: &TaskVarsForm, theme: Theme) -> Rect 
         let label = format!("{}{}: ", if current { "> " } else { "  " }, var.prompt);
         let label_style = if current {
             Style::default()
-                .fg(theme.accent())
+                .fg(theme.text.formfield)
+                .bg(theme.background.formfield)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
@@ -1191,7 +1202,12 @@ fn draw_task_vars(frame: &mut Frame, form: &TaskVarsForm, theme: Theme) -> Rect 
             } else {
                 spans.push(Span::raw(line.before.clone()));
                 if current && line.caret {
-                    spans.push(Span::styled("█", Style::default().fg(theme.accent())));
+                    spans.push(Span::styled(
+                        "█",
+                        Style::default()
+                            .fg(theme.text.formfield)
+                            .bg(theme.background.formfield),
+                    ));
                 }
                 spans.push(Span::raw(line.after.clone()));
             }
@@ -1442,6 +1458,14 @@ fn draw_help(frame: &mut Frame, scroll: &mut u16, theme: Theme) {
     *scroll = (*scroll).min(max_scroll);
 
     frame.render_widget(paragraph.scroll((*scroll, 0)), body);
+    draw_scrollbar(
+        frame,
+        body,
+        theme,
+        *scroll,
+        max_scroll.saturating_add(body.height),
+        body.height,
+    );
 }
 
 /// Arguments for [`draw_workflow`]: the cached structured graph (when present),
@@ -1494,6 +1518,7 @@ fn draw_workflow(frame: &mut Frame, overlay: WorkflowOverlay<'_>) {
         }
         content.extend(lines.iter().map(|line| Line::from(line.as_str())));
         let max_line = content.iter().map(Line::width).max().unwrap_or(0) as u16;
+        let content_len = content.len() as u16;
         let max_scroll = (content.len() as u16).saturating_sub(inner_height);
         let max_hscroll = max_line.saturating_sub(inner_width);
         *scroll = (*scroll).min(max_scroll);
@@ -1501,6 +1526,7 @@ fn draw_workflow(frame: &mut Frame, overlay: WorkflowOverlay<'_>) {
 
         let paragraph = Paragraph::new(content).scroll((*scroll, *hscroll));
         frame.render_widget(paragraph, body);
+        draw_scrollbar(frame, body, theme, *scroll, content_len, inner_height);
         return;
     }
 
@@ -1889,6 +1915,14 @@ fn draw_catalog_preview(
         )
         .scroll((app.catalog_preview_scroll, 0));
     frame.render_widget(paragraph, area);
+    draw_scrollbar(
+        frame,
+        area,
+        theme,
+        app.catalog_preview_scroll,
+        line_count,
+        inner_height,
+    );
 }
 
 /// `in 3h 12m` / `in 45s` / `in 2d 4h`; `disabled` when the schedule is off,
@@ -2592,6 +2626,29 @@ fn draw_event_payload(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     frame.render_widget(paragraph, area);
 }
 
+/// Paint a themed vertical scrollbar on a scrollable pane's right edge. Does
+/// nothing when the content fits the viewport, so short panes stay clean.
+fn draw_scrollbar(
+    frame: &mut Frame,
+    area: Rect,
+    theme: Theme,
+    offset: u16,
+    content_len: u16,
+    viewport: u16,
+) {
+    if content_len <= viewport {
+        return;
+    }
+    let mut state = ScrollbarState::new(content_len.saturating_sub(viewport) as usize)
+        .position(offset as usize);
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight).style(
+        Style::default()
+            .fg(theme.scrollbar.base)
+            .bg(theme.background.base),
+    );
+    frame.render_stateful_widget(scrollbar, area, &mut state);
+}
+
 fn draw_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -2605,11 +2662,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     // Keyboard focus: the embedded agent only owns the keyboard while its tab is
     // open and capture is on; otherwise favetto does.
     let agent_focused = app.tab == Tab::Agent && app.agent_capture;
-    let (focus_txt, focus_color) = if agent_focused {
-        ("agent", theme.info())
-    } else {
-        ("favetto", theme.accent())
-    };
+    let focus_txt = if agent_focused { "agent" } else { "favetto" };
 
     let mut hint = if app.tab == Tab::Agent {
         if agent_focused {
@@ -2627,15 +2680,21 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
     }
 
     // Sound badge: muted wins visually; a disabled engine shows `sound off`.
-    let (sound_txt, sound_color) = if !app.sound_enabled {
-        ("sound off", theme.muted())
+    let (sound_txt, sound_bg) = if !app.sound_enabled {
+        ("sound off", theme.background.raised.base)
     } else if app.sound_muted {
-        ("muted", theme.warning())
+        ("muted", theme.background.feedback.warning)
     } else {
-        ("sound", theme.success())
+        ("sound", theme.background.feedback.success)
     };
 
-    let badge = |fg: Color, bg: Color| Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);
+    // Badges paint the token's feedback surface with a contrast-aware label.
+    let badge = |bg: Color| {
+        Style::default()
+            .fg(contrast_fg(bg))
+            .bg(bg)
+            .add_modifier(Modifier::BOLD)
+    };
 
     // Segments carry a priority: higher priorities are dropped first when the
     // terminal is too narrow. The connection indicator (priority 0) never drops.
@@ -2653,21 +2712,18 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
         6,
         vec![Span::styled(
             format!("· {}", app.conn_detail),
-            Style::default().fg(theme.muted()),
+            Style::default().fg(theme.text.action.secondary),
         )],
     ));
     segments.push((
         4,
-        vec![Span::styled(
-            format!(" {sound_txt} "),
-            badge(theme.selected_fg(), sound_color),
-        )],
+        vec![Span::styled(format!(" {sound_txt} "), badge(sound_bg))],
     ));
     segments.push((
         3,
         vec![Span::styled(
             format!(" {} ", app.active_repo_label()),
-            badge(theme.selected_fg(), theme.info()),
+            badge(theme.background.feedback.info),
         )],
     ));
 
@@ -2724,7 +2780,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
         2,
         vec![Span::styled(
             format!(" {focus_txt} "),
-            badge(theme.selected_fg(), focus_color),
+            badge(theme.background.action),
         )],
     ));
     segments.push((
