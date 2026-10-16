@@ -2,6 +2,7 @@
 
 pub mod agent_feed;
 pub mod common;
+pub mod config_error;
 pub mod dialog;
 pub mod highlight;
 pub mod icon;

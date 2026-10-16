@@ -41,6 +41,10 @@ pub struct State {
     pub actions: ActionRegistry,
     /// Config resolved once at startup (external agents, executor/daemon defaults).
     pub config: Arc<FavettoConfig>,
+    /// Resolved path of the config file the daemon was started with; re-read by
+    /// `config.validate` (the in-memory `config` already fell back to defaults on
+    /// a parse error, so it cannot be used to report the error).
+    pub config_path: PathBuf,
     /// Directory for SQLite + token + worktrees.
     pub data_dir: PathBuf,
     /// Directory of task-definition `.md` files.
@@ -81,6 +85,7 @@ pub struct StateInit {
     pub agents: AgentManager,
     pub registry: AgentRegistry,
     pub config: Arc<FavettoConfig>,
+    pub config_path: PathBuf,
     pub data_dir: PathBuf,
     pub tasks_dir: PathBuf,
     pub catalog: Arc<RwLock<Vec<TaskDef>>>,
@@ -109,6 +114,7 @@ impl State {
             registry: init.registry,
             actions: ActionRegistry::new(),
             config: init.config,
+            config_path: init.config_path,
             data_dir: init.data_dir,
             tasks_dir: init.tasks_dir,
             catalog: init.catalog,

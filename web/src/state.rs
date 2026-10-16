@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use dioxus::prelude::*;
 use favetto_wire::model::{Event, RepoInfo, Task};
-use favetto_wire::rpc::{push, AgentEventPush, CatalogEntry};
+use favetto_wire::rpc::{push, AgentEventPush, CatalogEntry, ConfigValidateResult};
 use uuid::Uuid;
 
 use crate::notifications::{NotificationEvents, Permission};
@@ -495,6 +495,9 @@ pub struct AppState {
     pub notification_permission: Signal<Permission>,
     /// Task events that raise a system notification, mirrored to storage.
     pub notification_events: Signal<NotificationEvents>,
+    /// Set when the daemon reports an invalid config file; renders as a modal
+    /// alert until dismissed.
+    pub config_error: Signal<Option<ConfigValidateResult>>,
 }
 
 /// Whether a push method should make the Catalog view re-fetch.
@@ -521,6 +524,7 @@ impl AppState {
             schedules_version: Signal::new(0),
             notification_permission: Signal::new(load_permission()),
             notification_events: Signal::new(load_notification_events()),
+            config_error: Signal::new(None),
         }
     }
 

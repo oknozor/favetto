@@ -71,6 +71,26 @@ pub struct PingResult {
 }
 
 // ---------------------------------------------------------------------------
+// config
+// ---------------------------------------------------------------------------
+
+/// `config.validate` params: none ([`EmptyParams`]).
+///
+/// `config.validate` result: whether the daemon's on-disk config file parsed,
+/// the resolved path it was read from, and the parse/deserialization errors when
+/// it did not. A missing file is valid (defaults apply).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ConfigValidateResult {
+    /// True when the file parsed, or is absent so defaults apply.
+    pub valid: bool,
+    /// The resolved config path the daemon was started with.
+    pub path: String,
+    /// One message per parse/deserialization failure; empty when `valid`.
+    pub errors: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
 // tasks
 // ---------------------------------------------------------------------------
 
@@ -780,6 +800,8 @@ macro_rules! rpc_calls {
 rpc_calls! {
     /// Typed call for `system.ping`.
     PingCall => method::PING, PingParams, PingResult;
+    /// Typed call for `config.validate`.
+    ConfigValidateCall => method::CONFIG_VALIDATE, EmptyParams, ConfigValidateResult;
     /// Typed call for `tasks.list`.
     TasksListCall => method::TASKS_LIST, TasksListParams, TasksListResult;
     /// Typed call for `tasks.get`.
@@ -888,6 +910,11 @@ pub const CLIENT_CALLS: &[RpcCallSpec] = &[
         method: method::PING,
         params_schema: schema_of::<PingParams>,
         result_schema: schema_of::<PingResult>,
+    },
+    RpcCallSpec {
+        method: method::CONFIG_VALIDATE,
+        params_schema: schema_of::<EmptyParams>,
+        result_schema: schema_of::<ConfigValidateResult>,
     },
     RpcCallSpec {
         method: method::TASKS_LIST,
@@ -1334,5 +1361,25 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(legacy.kind, "");
+    }
+
+    #[test]
+    fn config_validate_result_round_trips() {
+        let result = ConfigValidateResult {
+            valid: false,
+            path: "/home/u/.config/favetto/config.toml".to_string(),
+            errors: vec!["invalid type: string, expected a boolean".to_string()],
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "valid": false,
+                "path": "/home/u/.config/favetto/config.toml",
+                "errors": ["invalid type: string, expected a boolean"],
+            })
+        );
+        let back: ConfigValidateResult = serde_json::from_value(json).unwrap();
+        assert_eq!(back, result);
     }
 }

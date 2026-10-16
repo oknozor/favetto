@@ -131,6 +131,7 @@ mod tests {
         let pool = crate::db::open(&dir.join("test.db")).await.unwrap();
         crate::db::migrate(&pool).await.unwrap();
         Arc::new(State::new(StateInit {
+            config_path: std::path::PathBuf::new(),
             db: pool,
             bus: crate::event_bus::EventBus::new(8),
             token: Token::generate(),

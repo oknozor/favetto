@@ -1450,4 +1450,38 @@ mod tests {
         assert!(default.repos.base_dir.is_none());
         assert_eq!(default.repos.depth, 1);
     }
+
+    /// A unique temp path that does not exist on disk.
+    fn unique_config_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "favetto-config-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn load_from_missing_path_is_valid_and_yields_defaults() {
+        let path = unique_config_path("missing").join("config.toml");
+        assert!(!path.exists());
+        let cfg = FavettoConfig::load_from(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(&cfg).unwrap(),
+            serde_json::to_value(FavettoConfig::default()).unwrap()
+        );
+    }
+
+    #[test]
+    fn load_from_malformed_file_is_an_error() {
+        let dir = unique_config_path("malformed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "not valid toml [[[").unwrap();
+        let err = FavettoConfig::load_from(&path).unwrap_err();
+        assert!(!err.to_string().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

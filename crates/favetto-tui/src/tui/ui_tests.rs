@@ -172,6 +172,13 @@ fn all_popups_render_without_panic() {
                 ],
                 original: Theme::dark(),
             },
+            Popup::ConfigError {
+                path: "/home/u/.config/favetto/config.toml".to_string(),
+                errors: vec![
+                    "invalid type: string, expected a boolean for key `executor.parallel`"
+                        .to_string(),
+                ],
+            },
         ] {
             let mut app = App::with_theme(theme);
             app.popup = popup;

@@ -467,6 +467,7 @@ mod tests {
         );
         let registry = AgentRegistry::from_config_with(&cfg, &|_| true).unwrap();
         Arc::new(State::new(StateInit {
+            config_path: std::path::PathBuf::new(),
             db: pool,
             bus: EventBus::new(64),
             token: Token::generate(),

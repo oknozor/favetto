@@ -85,6 +85,7 @@ impl App {
             Popup::TaskResult { .. } => return self.handle_task_result_key(key.code),
             Popup::RepoPicker { .. } => return self.handle_repo_picker_key(key),
             Popup::ThemePicker { .. } => return self.handle_theme_picker_key(key.code),
+            Popup::ConfigError { .. } => return self.handle_config_error_key(key.code),
             Popup::None => {}
         }
 
@@ -753,6 +754,15 @@ impl App {
     /// Keys while the action-task result popup is open: `Esc` or `Enter` closes
     /// it.
     pub(super) fn handle_task_result_key(&mut self, code: KeyCode) -> UiAction {
+        match code {
+            KeyCode::Esc | KeyCode::Enter => self.popup = Popup::None,
+            _ => {}
+        }
+        UiAction::None
+    }
+
+    /// Keys while the config-error popup is open: `Esc` or `Enter` dismisses it.
+    pub(super) fn handle_config_error_key(&mut self, code: KeyCode) -> UiAction {
         match code {
             KeyCode::Esc | KeyCode::Enter => self.popup = Popup::None,
             _ => {}

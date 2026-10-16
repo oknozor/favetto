@@ -462,6 +462,23 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
                 .unwrap_or_default(),
         }),
 
+        method::CONFIG_VALIDATE => {
+            let path = state.config_path.clone();
+            let result = match crate::config::FavettoConfig::load_from(&path) {
+                Ok(_) => ConfigValidateResult {
+                    valid: true,
+                    path: path.to_string_lossy().into_owned(),
+                    errors: Vec::new(),
+                },
+                Err(e) => ConfigValidateResult {
+                    valid: false,
+                    path: path.to_string_lossy().into_owned(),
+                    errors: e.chain().map(|cause| cause.to_string()).collect(),
+                },
+            };
+            to_value(result)
+        }
+
         method::TASKS_LIST => {
             let p: TasksListParams = parse_params(&req.method, &req.params)?;
             let limit = p.limit.unwrap_or(500).min(2000) as i64;

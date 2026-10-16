@@ -156,6 +156,29 @@ fn task_result_popup_closes_on_esc_and_enter() {
     assert!(matches!(app.popup, Popup::None));
 }
 
+#[test]
+fn config_error_popup_closes_on_esc_and_enter_only() {
+    let mut app = App::new();
+    app.popup = Popup::ConfigError {
+        path: "/home/u/.config/favetto/config.toml".to_string(),
+        errors: vec!["bad value".to_string()],
+    };
+
+    // An unrelated key leaves the popup open.
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::empty()));
+    assert!(matches!(app.popup, Popup::ConfigError { .. }));
+
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::empty()));
+    assert!(matches!(app.popup, Popup::None));
+
+    app.popup = Popup::ConfigError {
+        path: "/home/u/.config/favetto/config.toml".to_string(),
+        errors: Vec::new(),
+    };
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
+    assert!(matches!(app.popup, Popup::None));
+}
+
 fn agent_session(id: &str, headless: bool, running: bool, awaiting: bool) -> AgentSessionInfo {
     AgentSessionInfo {
         id: id.to_string(),

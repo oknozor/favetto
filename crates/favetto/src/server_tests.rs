@@ -52,12 +52,61 @@ async fn test_state_with_config(
         agents: crate::agents::AgentManager::new(),
         registry: crate::agents::AgentRegistry::default(),
         config,
+        config_path: dir.join("config.toml"),
         data_dir: dir.to_path_buf(),
         tasks_dir: tasks_dir.to_path_buf(),
         catalog,
         scheduler,
         hook_store: Arc::new(parking_lot::RwLock::new(Vec::new())),
     }))
+}
+
+#[tokio::test]
+async fn config_validate_reports_a_malformed_file() {
+    let dir = temp_dir("config-validate-invalid");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+    std::fs::write(dir.join("config.toml"), "not valid toml [[[").unwrap();
+
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 1,
+            method: method::CONFIG_VALIDATE.to_string(),
+            params: serde_json::json!({}),
+        },
+    )
+    .await;
+    let result = resp.result.expect("config.validate result");
+    assert_eq!(result["valid"], serde_json::json!(false));
+    let path = result["path"].as_str().unwrap();
+    assert!(path.ends_with("config.toml"), "{path}");
+    let errors = result["errors"].as_array().expect("errors array");
+    assert!(!errors.is_empty(), "expected at least one parse error");
+}
+
+#[tokio::test]
+async fn config_validate_accepts_a_missing_file() {
+    let dir = temp_dir("config-validate-missing");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    // No config.toml on disk: defaults apply, so validation stays silent.
+    let state = test_state(&dir, &tasks_dir).await;
+
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 1,
+            method: method::CONFIG_VALIDATE.to_string(),
+            params: serde_json::json!({}),
+        },
+    )
+    .await;
+    let result = resp.result.expect("config.validate result");
+    assert_eq!(result["valid"], serde_json::json!(true));
+    assert_eq!(result["errors"], serde_json::json!([]));
+    assert!(result["path"].as_str().unwrap().ends_with("config.toml"));
 }
 
 #[tokio::test]
@@ -1087,6 +1136,7 @@ async fn agent_state_with_config(
         agents: crate::agents::AgentManager::new(),
         registry,
         config: Arc::new(cfg),
+        config_path: dir.join("config.toml"),
         data_dir: dir.to_path_buf(),
         tasks_dir: tasks_dir.to_path_buf(),
         catalog,

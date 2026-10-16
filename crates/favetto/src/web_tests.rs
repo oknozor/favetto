@@ -38,6 +38,7 @@ async fn web_state(config: FavettoConfig) -> Arc<State> {
     ));
     let scheduler = tokio_cron_scheduler::JobScheduler::new().await.unwrap();
     Arc::new(State::new(StateInit {
+        config_path: std::path::PathBuf::new(),
         db: pool,
         bus: crate::event_bus::EventBus::new(64),
         token: favetto_core::auth::Token::generate(),
