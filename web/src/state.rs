@@ -340,12 +340,26 @@ impl Cache {
 /// repo every row is visible; otherwise only rows belonging to the active repo
 /// are.
 ///
-/// Shared by [`Cache::repo_visible`] and the catalog's repo scoping, so a caller
+/// Shared by [`Cache::repo_visible`] and the Tasks/Events scoping, so a caller
 /// that only holds the active repo (not the whole [`Cache`]) can still apply the
-/// same rule.
+/// same rule. Catalog scoping uses [`catalog_in_scope`] instead, which keeps
+/// global entries visible under an active repo.
 pub fn repo_in_scope(active_repo: Option<&str>, repo: Option<&str>) -> bool {
     match active_repo {
         Some(active) => repo == Some(active),
+        None => true,
+    }
+}
+
+/// Whether a catalog entry's repo namespace is in scope for `active_repo`.
+///
+/// The Catalog shows the active repo's local entries together with the global
+/// (unscoped) ones; with no active repo every entry is visible. Unlike
+/// [`repo_in_scope`] (Tasks/Events), globals stay visible while a repo is
+/// active.
+pub fn catalog_in_scope(active_repo: Option<&str>, repo: Option<&str>) -> bool {
+    match active_repo {
+        Some(active) => repo == Some(active) || repo.is_none(),
         None => true,
     }
 }
@@ -783,6 +797,18 @@ mod tests {
         assert!(repo_in_scope(Some("a"), Some("a")));
         assert!(!repo_in_scope(Some("a"), Some("b")));
         assert!(!repo_in_scope(Some("a"), None));
+    }
+
+    #[test]
+    fn catalog_in_scope_keeps_globals_visible_under_an_active_repo() {
+        // No active repo: everything is in scope.
+        assert!(catalog_in_scope(None, None));
+        assert!(catalog_in_scope(None, Some("a")));
+        // Active repo: its local entries plus the globals.
+        assert!(catalog_in_scope(Some("a"), Some("a")));
+        assert!(catalog_in_scope(Some("a"), None));
+        // Another repo's entries are hidden.
+        assert!(!catalog_in_scope(Some("a"), Some("b")));
     }
 
     #[test]

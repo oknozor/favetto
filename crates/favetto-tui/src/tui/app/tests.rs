@@ -3271,6 +3271,88 @@ fn catalog_groups_repo_tasks_under_a_repo_folder() {
     assert!(rows.iter().any(|r| matches!(r, CatalogRow::Task { .. })));
 }
 
+/// A catalog with one global entry and one repo-local entry per repo.
+fn scoped_catalog() -> Vec<CatalogEntry> {
+    let global = catalog_entry("triage");
+    let mut a = catalog_entry("repo:a/one");
+    a.repo = Some("a".to_string());
+    let mut b = catalog_entry("repo:b/two");
+    b.repo = Some("b".to_string());
+    vec![global, a, b]
+}
+
+#[test]
+fn catalog_scopes_to_the_active_repo_plus_globals() {
+    let mut app = App::new();
+    app.set_catalog(scoped_catalog());
+
+    // No active repo: the whole catalog is in scope.
+    assert_eq!(app.visible_catalog().len(), 3);
+
+    // Active `a`: only `a`'s local entry and the global one survive; `b` and
+    // its folder are gone.
+    app.set_repos(Vec::new(), Some("a".to_string()));
+    let names: Vec<&str> = app
+        .visible_catalog()
+        .iter()
+        .map(|e| e.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["triage", "repo:a/one"]);
+
+    let rows = app.catalog_rows();
+    assert!(rows.iter().any(|r| matches!(
+        r,
+        CatalogRow::Folder { path, .. } if path == "repo:a"
+    )));
+    assert!(!rows.iter().any(|r| matches!(
+        r,
+        CatalogRow::Folder { path, .. } if path == "repo:b"
+    )));
+    assert_eq!(
+        rows.iter()
+            .filter(|r| matches!(r, CatalogRow::Task { .. }))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn catalog_shows_only_globals_when_the_active_repo_has_no_local_tasks() {
+    let mut app = App::new();
+    app.set_catalog(scoped_catalog());
+
+    // `c` contributes no local entry: only the global task remains and no empty
+    // `repo:c` folder is rendered.
+    app.set_repos(Vec::new(), Some("c".to_string()));
+    let names: Vec<&str> = app
+        .visible_catalog()
+        .iter()
+        .map(|e| e.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["triage"]);
+    assert_eq!(
+        app.catalog_rows(),
+        vec![CatalogRow::Task { index: 0, depth: 0 }]
+    );
+}
+
+#[test]
+fn switching_repo_reclamps_the_catalog_selection_and_drops_the_preview() {
+    let mut app = App::new();
+    app.set_catalog(scoped_catalog());
+    // Rows (sorted): repo:a folder, repo:a/one, repo:b folder, repo:b/two,
+    // triage.
+    assert_eq!(app.catalog_rows().len(), 5);
+    app.catalog_selected = 4;
+    app.catalog_preview = Some(("repo:b/two".to_string(), "md".to_string()));
+
+    // Active `a` shrinks the tree to repo:a folder, repo:a/one, triage.
+    app.set_repos(Vec::new(), Some("a".to_string()));
+    assert_eq!(app.catalog_rows().len(), 3);
+    assert_eq!(app.catalog_selected, 2);
+    assert!(app.catalog_preview.is_none());
+}
+
 #[test]
 fn active_repo_label_defaults_to_global() {
     let mut app = App::new();

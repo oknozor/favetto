@@ -136,11 +136,14 @@ worktree isolation and the per-directory lock target that checkout unless the
 task sets its own `cwd`.
 
 Only the *active* repo scopes the default target of a task added through the TUI
-form; the catalog still lists every registered repo's tasks, grouped under a
-`repo:<name>` folder. The active repo also scopes the TUI **Tasks** and
-**Events** tabs, which label every row with its repo (or `global`): with a
-specific repo active, only that repo's runs and events are listed, and switching
-back to `global` restores the full lists. See
+form. The active repo also scopes the **Catalog**: with a specific repo selected,
+the TUI and web catalogs list that repo's local tasks together with the global
+(unscoped) ones, hiding every other repo. With no active repo (the global view)
+the full catalog is listed, grouped under a `repo:<name>` folder; a repo with no
+local tasks contributes only its global tasks, with no empty folder. The active
+repo also scopes the TUI **Tasks** and **Events** tabs, which label every row with
+its repo (or `global`): with a specific repo active, only that repo's runs and
+events are listed, and switching back to `global` restores the full lists. See
 [Repo scoping](./tui#repo-scoping).
 
 The repo directory must exist on the daemon host and contain a `.favetto/tasks/`
