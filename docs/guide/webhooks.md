@@ -59,7 +59,8 @@ Reach them in the prompt with <span v-pre>`{{ input.repo }}`</span>,
 - **Secret precedence**: literal `secret`, else the env var named by
   `secret_env`, else `GITHUB_WEBHOOK_SECRET`. Linear always reads
   `LINEAR_WEBHOOK_SECRET`. A configured secret without `enabled = true` leaves
-  the endpoint disabled (404).
+  the endpoint disabled (404); an enabled endpoint that cannot resolve a secret
+  answers 503.
 - **Supported events**: `issues`, `issue_comment`, `pull_request`,
   `pull_request_review`, `push`, `workflow_run`, `check_suite`, `check_run`.
   Unrecognised events are acknowledged with 200 and ignored.
@@ -91,9 +92,9 @@ curl -X POST http://127.0.0.1:7878/webhooks/github \
   -H "X-Hub-Signature-256: sha256=$SIG" -d "$BODY"
 ```
 
-If the endpoint returns 404, the webhook is not `enabled` or no secret is
-configured. If it returns 401, the signature does not match — check the secret
-and that you signed the exact body.
+A 404 means the webhook is not `enabled`; a 503 means it is enabled but no
+signing secret could be resolved. If it returns 401, the signature does not
+match — check the secret and that you signed the exact body.
 
 ## Notification hooks
 
