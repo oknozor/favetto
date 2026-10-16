@@ -3713,8 +3713,10 @@ async fn repo_task_runs_in_and_branches_the_repo() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
-/// A one-shot local HTTP server returning `body` as `application/json`.
-async fn serve_json_once(
+/// A one-shot local HTTP server returning `body` as `application/json` with a
+/// chosen status line.
+async fn serve_json_status_once(
+    status: u16,
     body: &'static str,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3726,8 +3728,12 @@ async fn serve_json_once(
         if let Ok((mut socket, _)) = listener.accept().await {
             let mut buf = vec![0u8; 4096];
             let _ = socket.read(&mut buf).await;
+            let reason = http::StatusCode::from_u16(status)
+                .ok()
+                .and_then(|s| s.canonical_reason())
+                .unwrap_or("");
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
             );
             let _ = socket.write_all(response.as_bytes()).await;
@@ -3735,6 +3741,13 @@ async fn serve_json_once(
         }
     });
     (addr, handle)
+}
+
+/// A one-shot local HTTP server returning `body` as `application/json`.
+async fn serve_json_once(
+    body: &'static str,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    serve_json_status_once(200, body).await
 }
 
 /// A `kind = "action"` task runs its built-in action without an agent and folds
@@ -3874,6 +3887,55 @@ async fn action_when_false_enqueues_nothing_but_succeeds() {
 
     let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
     assert_eq!(stored.status, TaskStatus::Succeeded, "{:?}", stored.error);
+    assert!(
+        !dir.join("handoff.json").exists(),
+        "manifest must not exist"
+    );
+    assert!(pending_named(&state, "child").await.is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A non-2xx `http.request` fails the action task and writes no child manifest,
+/// even when `[action.when]` would otherwise have gated the spawn open.
+#[tokio::test]
+async fn action_task_fails_on_a_non_2xx_response_and_writes_no_manifest() {
+    let dir = scratch_dir("action-non-2xx");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (addr, server) = serve_json_status_once(403, r#"{"message":"Forbidden"}"#).await;
+    let state = join_state(&dir, Vec::new()).await;
+
+    let def = crate::tasks::parse_task_md(
+        "gate",
+        &format!(
+            "kind = \"action\"\nspawn = \"child\"\nspawn_file = \"handoff.json\"\n\
+             [action]\nid = \"http.request\"\n\
+             [action.params]\nurl = \"http://{addr}/issues\"\n\
+             [action.when]\npath = \"items\"\nop = \"not_empty\"\n---\nPoll.\n"
+        ),
+    )
+    .unwrap();
+
+    let task = lineage_task("gate", TaskStatus::Running, None, None);
+    db::insert_task(&state.db, &task).await.unwrap();
+    let plan = Plan {
+        cwd: dir.clone(),
+        needs_lock: false,
+        worktree: None,
+    };
+    let run = running_run(task.id);
+    db::insert_task_run(&state.db, &run).await.unwrap();
+    run_one(&state, task.clone(), run, def, plan, None).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+
+    let stored = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Failed, "{:?}", stored.output);
+    let failure = stored.failure.expect("a populated failure");
+    assert_eq!(
+        failure.kind,
+        favetto_core::model::FailureKind::Infrastructure
+    );
+    assert!(stored.error.unwrap().contains("403"));
     assert!(
         !dir.join("handoff.json").exists(),
         "manifest must not exist"

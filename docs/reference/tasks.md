@@ -106,16 +106,24 @@ working and `envelope.outputs` carries the action's structured result.
 | `headers` | table | Request headers. Values may interpolate `$VAR` / `${VAR}` from the daemon's environment, so tokens are never stored in the task file; a referenced variable that is unset fails the action. |
 | `body` | string or value | Request body; strings are sent verbatim, other values as JSON. |
 | `timeout_ms` | integer | Whole-request timeout in milliseconds; default `30000`. |
+| `fail_on_error` | bool | Fail the action on a non-2xx response; default `true`. Set `false` to record the `status` and branch on it via `[action.when]`. |
+| `user_agent` | string | `User-Agent` header; default `favetto/<version>`. |
 
 The action's `outputs` are:
 
 | Field | Description |
 |-------|-------------|
-| `status` | The HTTP status code. A non-2xx response is **not** a failure — branch on `status` if it matters. |
+| `status` | The HTTP status code. A non-2xx response **fails** the action by default (message carries the status and a bounded body excerpt); set `fail_on_error = false` to branch on `status` instead. |
 | `headers` | Response headers, keyed by their lowercased names. |
 | `body` | The parsed JSON body, or the raw text when the body is not JSON. |
 | `items` | The body when it is an array, else the body's `items` array, else `null`. |
 | `truncated` | Whether the body was capped at `[executor].max_output_bytes`. |
+
+Every request sends a `User-Agent` (`favetto/<version>` unless overridden by the
+`user_agent` param or a `headers.User-Agent`), which GitHub and other
+UA-strict APIs require. A non-2xx response fails the action with an
+infrastructure failure, so a rejected request surfaces as a failed task instead
+of a silent success.
 
 ### Gating `spawn` with `[action.when]`
 

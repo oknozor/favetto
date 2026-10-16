@@ -11,10 +11,16 @@
 //! | `headers` | table | Request headers; values may interpolate `$VAR` / `${VAR}` from the environment. |
 //! | `body` | string or value | Request body; strings are sent verbatim, other values as JSON. |
 //! | `timeout_ms` | integer | Whole-request timeout, default 30 000 ms. |
+//! | `fail_on_error` | bool | Fail the action on a non-2xx response, default `true`. Set `false` to keep the status in `outputs` and branch on it with `[action.when]`. |
+//! | `user_agent` | string | `User-Agent` header, default `favetto/<version>`. |
 //!
-//! A non-2xx response is *not* a failure: the status is recorded so a
-//! `[action.when]` predicate can decide what it means. Only transport faults
-//! (DNS, connect, timeout, unreadable body) fail the action.
+//! By default a non-2xx response fails the action with
+//! [`FailureKind::Infrastructure`](favetto_core::model::FailureKind::Infrastructure):
+//! the message carries the status and a bounded body excerpt, and the task
+//! writes no child manifest. Set `fail_on_error = false` to instead record
+//! `status` and let an `[action.when]` predicate decide. Transport faults (DNS,
+//! connect, timeout, unreadable body) and non-2xx responses both fail. Every
+//! request sends a `User-Agent`, which GitHub and other UA-strict APIs require.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -27,6 +33,10 @@ use super::{Action, ActionContext, ActionError, ActionOutcome};
 
 /// Default whole-request timeout when `timeout_ms` is absent.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Cap on the response-body excerpt embedded in a non-2xx failure message, so a
+/// large error page cannot bloat the persisted `error`/`failure.message`.
+const MAX_ERROR_BODY_CHARS: usize = 512;
 
 /// The built-in action that performs an HTTP request.
 pub struct HttpRequestAction;
@@ -66,9 +76,21 @@ async fn run(ctx: &ActionContext) -> Result<ActionOutcome, ActionError> {
         .and_then(Value::as_u64)
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_TIMEOUT);
+    let fail_on_error = match params.get("fail_on_error") {
+        None => true,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(ActionError::invalid(
+                "http.request `fail_on_error` must be a boolean",
+            ))
+        }
+    };
+    let user_agent = string_param(params, "user_agent")
+        .unwrap_or_else(|| format!("favetto/{}", env!("CARGO_PKG_VERSION")));
 
     let client = reqwest::Client::builder()
         .timeout(timeout)
+        .user_agent(user_agent)
         .build()
         .map_err(|e| ActionError::infrastructure(format!("failed to build HTTP client: {e}")))?;
 
@@ -116,6 +138,19 @@ async fn run(ctx: &ActionContext) -> Result<ActionOutcome, ActionError> {
         })
         .collect();
     let (body_text, truncated) = read_bounded(response, ctx.max_output_bytes).await?;
+
+    if fail_on_error && !status.is_success() {
+        let snippet: String = body_text.chars().take(MAX_ERROR_BODY_CHARS).collect();
+        let snippet = snippet.trim();
+        let detail = if snippet.is_empty() {
+            String::new()
+        } else {
+            format!(": {snippet}")
+        };
+        return Err(ActionError::infrastructure(format!(
+            "{method} {url} -> {status}{detail}"
+        )));
+    }
 
     let body = serde_json::from_str::<Value>(&body_text).unwrap_or(Value::String(body_text));
     let items = match &body {
@@ -243,7 +278,11 @@ mod tests {
 
     /// A one-shot local HTTP server. Returns its base URL and a handle yielding
     /// the raw request bytes it received.
-    async fn serve_once(body: &'static str, content_type: &'static str) -> (String, Handle) {
+    async fn serve_status_once(
+        status: u16,
+        body: &'static str,
+        content_type: &'static str,
+    ) -> (String, Handle) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
@@ -260,8 +299,12 @@ mod tests {
                     break;
                 }
             }
+            let reason = http::StatusCode::from_u16(status)
+                .ok()
+                .and_then(|s| s.canonical_reason())
+                .unwrap_or("");
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n{body}",
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
             );
             socket.write_all(response.as_bytes()).await.unwrap();
@@ -269,6 +312,10 @@ mod tests {
             String::from_utf8_lossy(&buf).into_owned()
         });
         (format!("http://{addr}"), handle)
+    }
+
+    async fn serve_once(body: &'static str, content_type: &'static str) -> (String, Handle) {
+        serve_status_once(200, body, content_type).await
     }
 
     type Handle = tokio::task::JoinHandle<String>;
@@ -364,6 +411,59 @@ mod tests {
         let outcome = execute(&ctx).await.unwrap();
         assert_eq!(outcome.outputs["body"], json!("0123"));
         assert_eq!(outcome.outputs["truncated"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn non_2xx_is_an_infrastructure_failure_by_default() {
+        let (url, _handle) =
+            serve_status_once(403, r#"{"message":"Forbidden"}"#, "application/json").await;
+        let ctx = context(&url, json!({ "url": url }));
+        let err = execute(&ctx).await.unwrap_err();
+        assert_eq!(err.kind, favetto_core::model::FailureKind::Infrastructure);
+        assert!(err.message.contains("403"), "{}", err.message);
+        assert!(err.message.contains("Forbidden"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn fail_on_error_false_keeps_a_non_2xx_response_as_success() {
+        let (url, _handle) =
+            serve_status_once(403, r#"{"message":"Forbidden"}"#, "application/json").await;
+        let ctx = context(&url, json!({ "url": url, "fail_on_error": false }));
+        let outcome = execute(&ctx).await.unwrap();
+        assert_eq!(outcome.outputs["status"], json!(403));
+        assert_eq!(outcome.outputs["items"], json!(null));
+    }
+
+    #[tokio::test]
+    async fn request_carries_a_default_user_agent() {
+        let (url, handle) = serve_once("{}", "application/json").await;
+        let ctx = context(&url, json!({ "url": url }));
+        let _ = execute(&ctx).await.unwrap();
+        let request = handle.await.unwrap().to_lowercase();
+        assert!(
+            request.contains(&format!(
+                "user-agent: favetto/{}",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_agent_param_overrides_the_default() {
+        let (url, handle) = serve_once("{}", "application/json").await;
+        let ctx = context(&url, json!({ "url": url, "user_agent": "custom-agent/9" }));
+        let _ = execute(&ctx).await.unwrap();
+        let request = handle.await.unwrap().to_lowercase();
+        assert!(request.contains("user-agent: custom-agent/9"), "{request}");
+    }
+
+    #[tokio::test]
+    async fn invalid_fail_on_error_is_invalid() {
+        let (url, _handle) = serve_once("{}", "application/json").await;
+        let ctx = context(&url, json!({ "url": url, "fail_on_error": "yes" }));
+        let err = execute(&ctx).await.unwrap_err();
+        assert_eq!(err.kind, favetto_core::model::FailureKind::InvalidInput);
     }
 
     #[tokio::test]
