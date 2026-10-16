@@ -89,21 +89,12 @@ pub(crate) fn routes() -> Router<Arc<State>> {
     Router::new().route("/auth/ticket", post(issue_ticket))
 }
 
-/// Whether the request carries a valid `Authorization: Bearer <token>` header.
-///
-/// The same check guards the WebSocket upgrade and the ticket endpoint.
-pub(crate) fn bearer_authorized(token: &Token, headers: &HeaderMap) -> bool {
-    headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|t| token.verify(t))
-        .unwrap_or(false)
-}
-
 /// `POST /auth/ticket` — exchange a bearer token for a short-lived WS ticket.
+///
+/// Authentication reuses [`crate::server::bearer_authorized`], the single source
+/// of truth shared with the WebSocket upgrade and the SSE endpoint.
 async fn issue_ticket(AxumState(state): AxumState<Arc<State>>, headers: HeaderMap) -> Response {
-    if !bearer_authorized(&state.token, &headers) {
+    if !crate::server::bearer_authorized(&headers, &state.token) {
         return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
     }
 
