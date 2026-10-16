@@ -46,7 +46,7 @@ use uuid::Uuid;
 use crate::cli::TuiArgs;
 use crate::client::{normalize_ws_url, pair_http_base, Client, Transport};
 use crate::config::FavettoConfig;
-use app::{App, CatalogEntry, ConnState, Popup, UiAction};
+use app::{App, CatalogEntry, ConnState, Popup, UiAction, DOCS_URL};
 use sound::{CliSound, SoundPlayer};
 
 /// Outcome of a connected session: the user quit, or the link dropped.
@@ -873,6 +873,9 @@ async fn run_session(
                             UiAction::OpenRepoPicker => {
                                 fetch_repos(client, app).await;
                             }
+                            UiAction::OpenDocs => {
+                                open_docs(app);
+                            }
                             UiAction::ActivateRepo(name) => {
                                 activate_repo(client, app, name).await;
                             }
@@ -1400,7 +1403,20 @@ fn handle_disconnected_event(app: &mut App, event: CEvent) -> DisconnectedAction
         // A copy is served locally; it never needs a reconnect (and the offline
         // pump has no terminal handle to emit OSC 52 on, so it is skipped).
         UiAction::CopySelection(_) => DisconnectedAction::Continue,
+        // The docs site is opened locally, so no reconnect is needed either.
+        UiAction::OpenDocs => {
+            open_docs(app);
+            DisconnectedAction::Continue
+        }
         _ => DisconnectedAction::Reconnect,
+    }
+}
+
+/// Open the favetto documentation site in the user's browser, reporting a launch
+/// failure in the status bar. A local action: it never needs the daemon.
+fn open_docs(app: &mut App) {
+    if let Err(e) = webbrowser::open(DOCS_URL) {
+        app.notice = Some(format!("could not open docs: {e}"));
     }
 }
 

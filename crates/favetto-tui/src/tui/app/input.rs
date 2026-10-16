@@ -27,7 +27,7 @@ impl App {
                 if self.tab == Tab::Agent && self.agent_capture {
                     return self.forward_agent_key(&key);
                 }
-                self.popup = Popup::Menu { selected: 0 };
+                self.open_menu();
             } else {
                 if let Popup::ThemePicker { original, .. } = &self.popup {
                     self.theme = *original;
@@ -72,7 +72,7 @@ impl App {
         // A popup owns the keyboard while it is open.
         match &self.popup {
             Popup::Form(_) => return self.handle_form_key(key),
-            Popup::Menu { .. } => return self.handle_menu_key(key.code),
+            Popup::Menu { .. } => return self.handle_menu_key(key),
             Popup::Wizard(_) => return self.handle_wizard_key(key),
             Popup::TaskVars(_) => return self.handle_task_vars_key(key),
             Popup::Help { .. } => return self.handle_help_key(key.code),
@@ -788,31 +788,40 @@ impl App {
         UiAction::None
     }
 
-    pub(super) fn handle_menu_key(&mut self, code: KeyCode) -> UiAction {
-        match code {
+    /// Keys while the Ctrl+P command palette is open: printable characters build
+    /// the full-text search, arrows move the selection (skipping section headers),
+    /// Enter runs the highlighted command, and Esc closes.
+    pub(super) fn handle_menu_key(&mut self, key: KeyEvent) -> UiAction {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
             KeyCode::Esc => {
                 self.popup = Popup::None;
                 UiAction::None
             }
             KeyCode::Up => {
-                if let Popup::Menu { selected } = &mut self.popup {
-                    *selected = selected.saturating_sub(1);
-                }
+                self.move_menu_selection(-1);
                 UiAction::None
             }
             KeyCode::Down => {
-                if let Popup::Menu { selected } = &mut self.popup {
-                    *selected = (*selected + 1).min(MENU_OPTIONS.len() - 1);
-                }
+                self.move_menu_selection(1);
                 UiAction::None
             }
-            KeyCode::Enter => {
-                let selected = match self.popup {
-                    Popup::Menu { selected } => selected,
-                    _ => 0,
-                };
-                self.open_form(selected)
+            KeyCode::Backspace => {
+                if let Popup::Menu { filter, .. } = &mut self.popup {
+                    filter.backspace();
+                }
+                self.clamp_menu_selection();
+                UiAction::None
             }
+            KeyCode::Char(c) if !ctrl && !alt => {
+                if let Popup::Menu { filter, .. } = &mut self.popup {
+                    filter.insert_char(c);
+                }
+                self.clamp_menu_selection();
+                UiAction::None
+            }
+            KeyCode::Enter => self.activate_menu_selection(),
             _ => UiAction::None,
         }
     }

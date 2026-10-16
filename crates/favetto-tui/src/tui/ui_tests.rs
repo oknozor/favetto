@@ -59,7 +59,10 @@ fn all_tabs_render_without_panic() {
 fn all_popups_render_without_panic() {
     for theme in all_themes() {
         for popup in [
-            Popup::Menu { selected: 0 },
+            Popup::Menu {
+                selected: 0,
+                filter: TextBuffer::default(),
+            },
             Popup::Form(Form {
                 kind: super::super::app::FormKind::AddTask,
                 title: "Add task to catalog",
@@ -187,6 +190,43 @@ fn all_popups_render_without_panic() {
             terminal.draw(|f| draw(f, &mut app)).unwrap();
         }
     }
+}
+
+#[test]
+fn command_palette_renders_title_search_and_groups() {
+    let mut app = App::new();
+    app.open_menu();
+    let text = render_text(&mut app, 100, 40);
+    assert!(text.contains("Commands"), "title missing: {text:?}");
+    assert!(text.contains("esc"), "esc hint missing: {text:?}");
+    assert!(text.contains("search:"), "search row missing: {text:?}");
+    for header in ["Tasks", "Catalog", "Repositories", "Appearance", "Help"] {
+        assert!(text.contains(header), "section {header} missing: {text:?}");
+    }
+    assert!(text.contains("Open docs"), "docs command missing: {text:?}");
+    // The old bordered `Ctrl+P — Actions` title is gone.
+    assert!(
+        !text.contains("Ctrl+P — Actions"),
+        "old title still rendered: {text:?}"
+    );
+}
+
+#[test]
+fn command_palette_search_hides_non_matching_commands() {
+    let mut app = App::new();
+    app.open_menu();
+    for c in "docs".chars() {
+        app.handle_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char(c),
+            ratatui::crossterm::event::KeyModifiers::empty(),
+        ));
+    }
+    let text = render_text(&mut app, 100, 40);
+    assert!(text.contains("Open docs"), "match missing: {text:?}");
+    assert!(
+        !text.contains("New one-shot task"),
+        "non-matching command still rendered: {text:?}"
+    );
 }
 
 #[test]

@@ -2106,7 +2106,10 @@ fn click_is_ignored_while_popup_open() {
         height: 5,
     };
     app.tasks_geom = geom(inner, 0, 2);
-    app.popup = Popup::Menu { selected: 0 };
+    app.popup = Popup::Menu {
+        selected: 0,
+        filter: TextBuffer::default(),
+    };
 
     assert!(matches!(app.handle_mouse(click(5, 3)), UiAction::None));
     assert_eq!(app.tasks_selected, 0);
@@ -3228,7 +3231,7 @@ fn theme_picker_enter_commits_and_esc_restores() {
 fn menu_switch_repo_and_add_repo_open_their_surfaces() {
     let mut app = App::new();
     app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
-    assert!(matches!(app.popup, Popup::Menu { selected: 0 }));
+    assert!(matches!(app.popup, Popup::Menu { .. }));
     for _ in 0..4 {
         app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
     }
@@ -3246,6 +3249,114 @@ fn menu_switch_repo_and_add_repo_open_their_surfaces() {
         matches!(app.popup, Popup::Form(ref f) if f.kind == FormKind::AddRepo),
         "expected the Add repo form"
     );
+}
+
+#[test]
+fn menu_opens_grouped_and_lands_on_a_command() {
+    let mut app = App::new();
+    app.open_menu();
+    let rows = app.menu_entries();
+    assert_eq!(rows, MENU_ENTRIES.to_vec());
+    // The first section header is not selectable, so the initial highlight is the
+    // first command under it.
+    let selected = match &app.popup {
+        Popup::Menu { selected, .. } => *selected,
+        _ => panic!("expected the command palette"),
+    };
+    assert!(
+        rows.get(selected).is_some_and(MenuEntry::selectable),
+        "initial highlight must be a command"
+    );
+
+    // Navigation never lands on a header.
+    for _ in 0..rows.len() {
+        app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+        let selected = match &app.popup {
+            Popup::Menu { selected, .. } => *selected,
+            _ => panic!("expected the command palette"),
+        };
+        assert!(
+            rows[selected].selectable(),
+            "landed on header {}",
+            rows[selected].label()
+        );
+    }
+}
+
+#[test]
+fn menu_search_filters_to_matching_commands() {
+    let mut app = App::new();
+    app.open_menu();
+    for c in "docs".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::empty()));
+    }
+    let rows = app.menu_entries();
+    assert!(rows.contains(&MenuEntry::Header("Help")));
+    assert!(rows.contains(&MenuEntry::Action(MenuAction::OpenDocs)));
+    assert_eq!(
+        rows.iter().filter(|e| e.selectable()).count(),
+        1,
+        "expected a single match: {rows:?}"
+    );
+
+    let action = app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
+    assert!(matches!(action, UiAction::OpenDocs));
+    assert!(matches!(app.popup, Popup::None));
+}
+
+#[test]
+fn menu_backspace_clears_the_search() {
+    let mut app = App::new();
+    app.open_menu();
+    // A query no command matches leaves an empty list.
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::empty()));
+    assert!(app.menu_entries().is_empty());
+
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::empty()));
+    assert_eq!(app.menu_entries(), MENU_ENTRIES.to_vec());
+}
+
+#[test]
+fn menu_dispatches_commands_by_identity() {
+    let mut app = App::new();
+    assert!(matches!(
+        app.dispatch_menu_action(MenuAction::NewOneShot),
+        UiAction::OpenWizard
+    ));
+
+    assert!(matches!(
+        app.dispatch_menu_action(MenuAction::SwitchRepo),
+        UiAction::OpenRepoPicker
+    ));
+    assert!(matches!(app.popup, Popup::RepoPicker { .. }));
+
+    let mut action = app.dispatch_menu_action(MenuAction::AddTask);
+    assert!(matches!(action, UiAction::None));
+    assert!(matches!(app.popup, Popup::Form(ref f) if f.kind == FormKind::AddTask));
+
+    action = app.dispatch_menu_action(MenuAction::CreateSchedule);
+    assert!(matches!(action, UiAction::None));
+    assert!(matches!(app.popup, Popup::Form(ref f) if f.kind == FormKind::CreateSchedule));
+
+    action = app.dispatch_menu_action(MenuAction::CreateNotification);
+    assert!(matches!(action, UiAction::None));
+    assert!(matches!(app.popup, Popup::Form(ref f) if f.kind == FormKind::CreateNotification));
+
+    action = app.dispatch_menu_action(MenuAction::AddRepo);
+    assert!(matches!(action, UiAction::None));
+    assert!(matches!(app.popup, Popup::Form(ref f) if f.kind == FormKind::AddRepo));
+
+    assert!(matches!(
+        app.dispatch_menu_action(MenuAction::ChangeTheme),
+        UiAction::None
+    ));
+    assert!(matches!(app.popup, Popup::ThemePicker { .. }));
+
+    assert!(matches!(
+        app.dispatch_menu_action(MenuAction::OpenDocs),
+        UiAction::OpenDocs
+    ));
+    assert!(matches!(app.popup, Popup::None));
 }
 
 #[test]

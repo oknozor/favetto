@@ -18,8 +18,8 @@ use favetto_core::workflow::{WorkflowInspect, WorkflowState};
 use super::app::{
     activity_cell, cost_cell, format_activity, repo_label, table_rows_area, task_display_name,
     task_repo, token_cell, App, CatalogRow, ClickAction, ClickRegion, ConfirmPrompt, ConnState,
-    Form, ListGeometry, Popup, ReplyPrompt, Tab, TaskVarsForm, ThemeChoice, Wizard, WizardStep,
-    MENU_OPTIONS,
+    Form, ListGeometry, MenuEntry, Popup, ReplyPrompt, Tab, TaskVarsForm, ThemeChoice, Wizard,
+    WizardStep,
 };
 use super::text_buffer::TextBuffer;
 use super::theme::{RaisedLevel, Theme};
@@ -165,9 +165,18 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
         draw_repo_picker(frame, &entries, selected, &filter, theme);
         return;
     }
+    // The command palette renders from the filtered command list, so compute it
+    // before `popup` is borrowed mutably.
+    if let Popup::Menu { selected, filter } = &app.popup {
+        let selected = *selected;
+        let filter = filter.value().to_string();
+        let entries = app.menu_entries();
+        draw_menu(frame, &entries, selected, &filter, theme);
+        return;
+    }
     match &mut app.popup {
         Popup::None => {}
-        Popup::Menu { selected } => draw_menu(frame, *selected, theme),
+        Popup::Menu { .. } => {}
         Popup::Form(form) => {
             draw_form(frame, form, theme);
         }
@@ -394,35 +403,77 @@ fn push_caret_line(spans: &mut Vec<Span<'static>>, buf: &TextBuffer, caret: Styl
     }
 }
 
-fn draw_menu(frame: &mut Frame, selected: usize, theme: Theme) {
+/// Draw the Ctrl+P command palette: a borderless vertical panel with a bold
+/// `Commands` title and a muted `esc` hint on the right, an inline full-text
+/// search, and the grouped command list (section headers are not selectable).
+fn draw_menu(
+    frame: &mut Frame,
+    entries: &[MenuEntry],
+    selected: usize,
+    filter: &str,
+    theme: Theme,
+) {
     let area = frame.area();
-    let rect = centered_rect(area, 60, MENU_OPTIONS.len() as u16 + 2);
+    // One row each for the title and the search, then the commands.
+    let height = (entries.len() as u16).saturating_add(4);
+    let rect = centered_rect(area, 60, height);
+    draw_dialog_shell(frame, rect, theme);
 
-    let items: Vec<ListItem> = MENU_OPTIONS
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .split(rect);
+
+    // The title row: bold `Commands` left, muted `esc` right.
+    let gap = (rect.width as usize).saturating_sub("Commands".len() + "esc".len() + 2);
+    let title = Paragraph::new(Line::from(vec![
+        Span::styled(" Commands", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" ".repeat(gap)),
+        Span::styled("esc ", theme.disabled()),
+    ]))
+    .style(theme.dialog_style());
+    frame.render_widget(title, chunks[0]);
+
+    // Inline full-text search, directly under the title.
+    let search = Paragraph::new(Line::from(vec![
+        Span::styled(" search: ", theme.block(true)),
+        Span::raw(filter.to_string()),
+        Span::styled("█", theme.selected()),
+    ]))
+    .style(theme.dialog_style());
+    frame.render_widget(search, chunks[1]);
+
+    let items: Vec<ListItem> = entries
         .iter()
         .enumerate()
-        .map(|(i, option)| {
-            let style = if i == selected {
+        .map(|(i, entry)| {
+            let text = if entry.selectable() {
+                format!("   {}", entry.label())
+            } else {
+                format!(" {}", entry.label())
+            };
+            let style = if !entry.selectable() {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else if i == selected {
                 theme.selected()
             } else {
                 Style::default()
             };
-            ListItem::new(Line::from(Span::styled(format!(" {option} "), style)))
+            ListItem::new(Line::from(Span::styled(text, style)))
         })
         .collect();
-
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(" Ctrl+P — Actions ")
-                .style(theme.dialog_style())
-                .border_style(theme.focused()),
-        )
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
-    draw_dialog_shell(frame, rect, theme);
-    frame.render_widget(list, rect);
+    let list = if entries.is_empty() {
+        List::new(vec![ListItem::new(Line::from(Span::styled(
+            " no matching commands",
+            theme.disabled(),
+        )))])
+    } else {
+        List::new(items)
+    };
+    frame.render_widget(list, chunks[3]);
 }
 
 /// Draw the Ctrl+O session picker: one row per live/retained agent session,
@@ -1043,7 +1094,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("Tab / →", "next tab"),
             ("Shift+Tab / ←", "previous tab"),
-            ("Ctrl+P", "open the action menu"),
+            ("Ctrl+P", "open the command palette"),
             ("Ctrl+O", "pick a live/retained agent session"),
             ("Ctrl+R", "answer a pending agent prompt"),
             ("?", "open/close this help"),
@@ -1078,6 +1129,15 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Space", "fold/unfold the selected folder"),
             ("p", "show/hide the preview pane"),
             ("PageUp / PageDown / wheel", "scroll the preview pane"),
+        ],
+    ),
+    (
+        "Command palette (Ctrl+P)",
+        &[
+            ("characters", "filter commands by full-text search"),
+            ("↑ / ↓", "move the selection (section headers are skipped)"),
+            ("Enter", "run the highlighted command"),
+            ("Esc", "close the palette"),
         ],
     ),
     (
