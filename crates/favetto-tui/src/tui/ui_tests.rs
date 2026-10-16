@@ -204,10 +204,67 @@ fn command_palette_renders_title_search_and_groups() {
         assert!(text.contains(header), "section {header} missing: {text:?}");
     }
     assert!(text.contains("Open docs"), "docs command missing: {text:?}");
+    // Every command carries its right-aligned Ctrl+X shortcut.
+    for shortcut in [
+        "Ctrl+X n", "Ctrl+X a", "Ctrl+X s", "Ctrl+X c", "Ctrl+X r", "Ctrl+X R", "Ctrl+X t",
+        "Ctrl+X h",
+    ] {
+        assert!(
+            text.contains(shortcut),
+            "shortcut {shortcut} missing: {text:?}"
+        );
+    }
     // The old bordered `Ctrl+P — Actions` title is gone.
     assert!(
         !text.contains("Ctrl+P — Actions"),
         "old title still rendered: {text:?}"
+    );
+}
+
+#[test]
+fn command_palette_is_left_aligned_with_section_gaps() {
+    let mut app = App::new();
+    app.open_menu();
+    let lines = render_lines(&mut app, 100, 40);
+
+    // Anchor on the search row: the title sits above it, then the first section
+    // header and its first command.
+    let search_idx = lines
+        .iter()
+        .position(|l| l.contains("search:"))
+        .unwrap_or_else(|| panic!("search row: {lines:#?}"));
+    let title = &lines[search_idx - 1];
+    let header = &lines[search_idx + 1];
+    let command = &lines[search_idx + 2];
+
+    // The title, the section header, and the command all share one left column.
+    let title_col = title.find("Commands").unwrap();
+    let header_col = header.find("Tasks").unwrap();
+    let command_col = command.find("New one-shot task").unwrap();
+    assert_eq!(
+        title_col, header_col,
+        "header not aligned to title: {lines:#?}"
+    );
+    assert_eq!(
+        header_col, command_col,
+        "command not aligned to header: {lines:#?}"
+    );
+
+    // Exactly one blank row separates the Tasks and Catalog sections.
+    let new_idx = search_idx + 2;
+    let catalog_idx = search_idx + 4;
+    assert!(
+        lines[new_idx].contains("New one-shot task") && lines[catalog_idx].contains("Catalog"),
+        "unexpected section layout: {lines:#?}"
+    );
+    assert!(
+        lines[new_idx + 1].chars().all(|c| c == '│' || c == ' '),
+        "expected a blank row between sections: {lines:#?}"
+    );
+    // And no blank row between a header and its first command.
+    assert!(
+        lines[catalog_idx + 1].contains("Add task to catalog"),
+        "no blank row must separate a header from its entries: {lines:#?}"
     );
 }
 
@@ -227,6 +284,45 @@ fn command_palette_search_hides_non_matching_commands() {
         !text.contains("New one-shot task"),
         "non-matching command still rendered: {text:?}"
     );
+}
+
+#[test]
+fn leader_mode_paints_the_scrim() {
+    let theme = Theme::dark();
+    let mut app = App::with_theme(theme);
+    app.leader_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+    let backend = TestBackend::new(100, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+    // The active view is dimmed behind the which-key hint.
+    let scrim = theme.scrim().bg.expect("scrim has a background");
+    assert_eq!(terminal.backend().buffer().cell((0, 0)).unwrap().bg, scrim);
+}
+
+#[test]
+fn leader_mode_lists_shortcuts() {
+    let mut app = App::new();
+    app.leader_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+    let text = render_text(&mut app, 100, 40);
+    assert!(text.contains("Shortcuts"), "leader title missing: {text:?}");
+    assert!(text.contains("Ctrl+X"), "leader hint missing: {text:?}");
+    assert!(
+        text.contains("Open docs"),
+        "leader command missing: {text:?}"
+    );
+    assert!(
+        text.contains("New one-shot task"),
+        "leader command missing: {text:?}"
+    );
+}
+
+#[test]
+fn leader_mode_renders_on_small_terminal() {
+    let mut app = App::new();
+    app.leader_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+    // Must not panic when the hint is larger than the terminal.
+    let _ = render_text(&mut app, 20, 6);
 }
 
 #[test]
@@ -767,6 +863,26 @@ fn render_text(app: &mut App, width: u16, height: u16) -> String {
     text
 }
 
+/// Render and return one trailing-trimmed string per screen row, so tests can
+/// reason about layout (alignment, blank separators) rather than a flat dump.
+fn render_lines(app: &mut App, width: u16, height: u16) -> Vec<String> {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| draw(f, app)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let area = *buffer.area();
+    (0..area.height)
+        .map(|y| {
+            let mut line: String = (0..area.width)
+                .filter_map(|x| buffer.cell((x, y)).map(|c| c.symbol()))
+                .collect();
+            let trimmed = line.trim_end().len();
+            line.truncate(trimmed);
+            line
+        })
+        .collect()
+}
+
 #[test]
 fn help_overlay_renders_shortcuts() {
     let mut app = App::new();
@@ -808,6 +924,23 @@ fn help_overlay_lists_editor_key() {
         text.contains("edit the selected task"),
         "editor help row missing: {text:?}"
     );
+}
+
+#[test]
+fn help_overlay_lists_leader_shortcuts() {
+    let mut app = App::new();
+    app.popup = Popup::Help { scroll: 0 };
+    let text = render_text(&mut app, 120, 60);
+    assert!(
+        text.contains("shortcut leader"),
+        "leader help row missing: {text:?}"
+    );
+    for key in ["Ctrl+X n", "Ctrl+X h", "Ctrl+X R"] {
+        assert!(
+            help_section_has_key("Global", key),
+            "Global section must document {key}"
+        );
+    }
 }
 
 /// Look up a `?` overlay section by its title. Panics if the section is missing,

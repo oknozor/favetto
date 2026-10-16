@@ -20,6 +20,21 @@ impl App {
             return UiAction::None;
         }
 
+        // The Ctrl+X leader (shortcut) mode owns the very next key. It is armed
+        // only while favetto owns the keyboard; under agent capture the pending
+        // key is forwarded to the PTY, matching the Ctrl+P rule. An expired or
+        // unmapped key drops back to normal handling.
+        if self.leader_until.is_some() {
+            if !self.leader_active() {
+                self.leader_until = None;
+            } else if self.tab == Tab::Agent && self.agent_capture && !self.agent_read_only {
+                self.leader_until = None;
+                return self.forward_agent_key(&key);
+            } else {
+                return self.handle_leader_key(key);
+            }
+        }
+
         // Ctrl+P closes an open popup, or opens the menu under favetto focus. While
         // the agent captures keys it is forwarded to the agent instead.
         if ctrl && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P')) {
@@ -92,6 +107,14 @@ impl App {
         // Agent keyboard focus: everything else is forwarded to the PTY.
         if self.tab == Tab::Agent && self.agent_capture && !self.agent_read_only {
             return self.forward_agent_key(&key);
+        }
+
+        // Ctrl+X arms the leader (shortcut) mode: the next key runs a palette
+        // command (for example Ctrl+X h opens the docs). Under agent capture the
+        // branch above forwards it to the PTY instead, matching Ctrl+P.
+        if ctrl && matches!(key.code, KeyCode::Char('x') | KeyCode::Char('X')) {
+            self.leader_until = Some(Instant::now() + LEADER_TIMEOUT);
+            return UiAction::None;
         }
 
         // `?` opens help when no popup owns the keyboard and the embedded agent is
@@ -823,6 +846,23 @@ impl App {
             }
             KeyCode::Enter => self.activate_menu_selection(),
             _ => UiAction::None,
+        }
+    }
+
+    /// Consume the key following the `Ctrl+X` leader: dispatch the mapped palette
+    /// command, or cancel on `Esc` and on any unmapped key. The leader always
+    /// disarms, whether or not the key matched.
+    pub(super) fn handle_leader_key(&mut self, key: KeyEvent) -> UiAction {
+        self.leader_until = None;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let action = match key.code {
+            KeyCode::Esc => None,
+            KeyCode::Char(c) if !ctrl => MenuAction::from_leader(c),
+            _ => None,
+        };
+        match action {
+            Some(action) => self.dispatch_menu_action(action),
+            None => UiAction::None,
         }
     }
 
