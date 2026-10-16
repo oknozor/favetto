@@ -81,10 +81,47 @@ pub enum Route {
 #[component]
 fn AppLayout() -> Element {
     rsx! {
+        // Renders nothing; it lives here (a `Router` descendant) so its
+        // `use_navigator` finds a `RouterContext`. Rendering it from `App`,
+        // the router's parent, panicked on the first Android render.
+        DeepLinkPoller {}
         a { class: "skip-link", href: "#favetto-app", "Skip to content" }
         AppNav {}
         div { class: "app-content", Outlet::<Route> {} }
     }
+}
+
+/// Consumes an Android notification deep link and opens the task it points at.
+///
+/// [`use_navigator`] needs a `RouterContext`, which `Router::<Route>` provides
+/// only to its descendants. Calling it from [`App`] (the router's parent)
+/// panicked on the first Android render and blanked the whole app, so the poll
+/// lives here instead — [`AppLayout`] is rendered by the router through
+/// `Outlet`. The navigator is consumed on every target, not behind
+/// `#[cfg(target_os = "android")]`, so the host render test below exercises the
+/// placement; only the polling loop itself is Android-only.
+#[component]
+fn DeepLinkPoller() -> Element {
+    let nav = use_navigator();
+
+    // On Android the OS posts notifications; a tap carries the task id as an
+    // intent extra. Poll for it and open the deep link. On web the notification
+    // click handler navigates directly, so this is Android-only.
+    #[cfg(target_os = "android")]
+    {
+        use_future(move || async move {
+            loop {
+                if let Some(task_id) = crate::notifications::take_pending_deep_link() {
+                    nav.push(Route::InboxTask { task_id });
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        });
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = nav;
+
+    rsx! {}
 }
 
 /// The `/inbox/:task_id` deep link from a notification click.
@@ -127,21 +164,9 @@ pub fn App() -> Element {
     });
 
     // On Android the OS posts notifications; a tap carries the task id as an
-    // intent extra. Poll for it and open the deep link. On web the notification
-    // click handler navigates directly, so this is Android-only.
-    #[cfg(target_os = "android")]
-    {
-        let nav = use_navigator();
-        use_future(move || async move {
-            loop {
-                if let Some(task_id) = crate::notifications::take_pending_deep_link() {
-                    nav.push(Route::InboxTask { task_id });
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-        });
-    }
-
+    // intent extra. The deep-link polling that consumes it is rendered by
+    // [`AppLayout`] (inside the `Router` subtree) so `use_navigator` has a
+    // `RouterContext`; it must not be called here, from the router's parent.
     let base = (state.daemon_url)();
     let token = (state.token)();
 
@@ -350,6 +375,8 @@ fn dispatch_alert(mut state: AppState, event: &favetto_wire::model::Event) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     /// The root component mounts without panicking on a host build; this guards
     /// the router/stylesheet wiring that a `dx build` would otherwise be the
@@ -358,6 +385,51 @@ mod tests {
     fn app_renders() {
         let mut dom = VirtualDom::new(App);
         dom.rebuild_in_place();
+    }
+
+    /// The Android deep-link poll must render inside `Router::<Route>`: calling
+    /// `use_navigator` from [`App`] (the router's parent) panicked on the first
+    /// Android render and blanked the whole app. `use_navigator` is compiled on
+    /// every target now (see [`DeepLinkPoller`]), so this host render is the
+    /// regression guard for the placement.
+    ///
+    /// The poll-standalone render first proves the guard can see the panic at
+    /// all. Both renders share one test (and thus one scoped panic hook) because
+    /// the hook is process-global.
+    #[test]
+    fn deep_link_poller_only_consumes_the_navigator_inside_the_router() {
+        assert!(
+            !renders_without_navigator_panic(DeepLinkPoller),
+            "`use_navigator` unexpectedly succeeded without a `Router`"
+        );
+        assert!(
+            renders_without_navigator_panic(App),
+            "`App` rendered a `use_navigator` outside the `Router`"
+        );
+    }
+
+    /// Render `root` and report whether it avoided the `use_navigator` panic
+    /// raised when there is no `RouterContext`.
+    ///
+    /// Dioxus catches a component-render panic and turns it into an error
+    /// placeholder, so `#[should_panic]` never sees it; a scoped panic hook is
+    /// the only host-visible signal. Matching only the router panic keeps
+    /// unrelated panics from changing the result.
+    fn renders_without_navigator_panic(root: fn() -> Element) -> bool {
+        let panicked = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&panicked);
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if info.to_string().contains("descendant of a Router") {
+                flag.store(true, Ordering::SeqCst);
+            }
+        }));
+
+        let mut dom = VirtualDom::new(root);
+        dom.rebuild_in_place();
+
+        std::panic::set_hook(previous);
+        !panicked.load(Ordering::SeqCst)
     }
 
     /// The client links `favetto-wire` directly, so it speaks the daemon's
