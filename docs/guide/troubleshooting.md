@@ -37,10 +37,12 @@ answer the prompt in the live session. The task returns to `running` once the
 agent continues. Detection is configurable under `[executor]`
 (`detect_awaiting_input`, `awaiting_input_quiet_ms`).
 
-## A webhook returns 404 or 401
+## A webhook returns 404, 503, or 401
 
-- **404** — the endpoint is disabled. Set `enabled = true` and configure a
-  secret (`secret`, `secret_env`, or the `GITHUB_WEBHOOK_SECRET` fallback).
+- **404** — the endpoint is disabled. Set `enabled = true`.
+- **503** — the endpoint is enabled but no signing secret could be resolved.
+  Configure one with `secret`, `secret_env`, or the `GITHUB_WEBHOOK_SECRET`
+  fallback (Linear reads `LINEAR_WEBHOOK_SECRET`).
 - **401** — the signature did not match. Check the secret and that you signed the
   *exact* raw body (`X-Hub-Signature-256: sha256=<hex>`).
 

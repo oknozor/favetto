@@ -160,6 +160,30 @@ fn readme_drops_stale_task_references() {
 }
 
 #[test]
+fn webhook_docs_distinguish_disabled_from_unconfigured() {
+    // A missing signing secret on an enabled endpoint is a 503, not a 404; only a
+    // disabled endpoint answers 404. Guard both pages against regressing to the
+    // old "404 for either cause" wording.
+    for page in ["docs/guide/webhooks.md", "docs/guide/troubleshooting.md"] {
+        let body = read(page);
+        assert!(
+            body.contains("503"),
+            "{page} must document the 503 an enabled webhook returns without a secret"
+        );
+        assert!(
+            body.contains("404"),
+            "{page} must still document the 404 for a disabled endpoint"
+        );
+    }
+
+    let troubleshooting = read("docs/guide/troubleshooting.md");
+    assert!(
+        !troubleshooting.contains("## A webhook returns 404 or 401"),
+        "troubleshooting must not conflate a disabled endpoint (404) with a missing secret (503)"
+    );
+}
+
+#[test]
 fn pages_workflow_exists() {
     let workflow = repo_root().join(".github/workflows/deploy-docs.yml");
     assert!(
