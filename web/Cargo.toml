@@ -17,7 +17,16 @@ description = "Dioxus (Rust to WASM/Android) client for the favetto daemon."
 # wire protocol as the TUI and MCP clients.
 favetto-wire = { path = "../crates/favetto-wire" }
 # Pinned to the version validated with `dx` 0.7.10; update `dx` in lockstep.
-dioxus = { version = "=0.7.10", features = ["router"] }
+# `default-features = false` drops `devtools` and `logger`, which the client
+# never uses and which bloat the WASM bundle; only the pieces it needs are
+# opted back in (`launch` powers `dioxus::launch`, `lib` the runtime + `asset!`
+# macro, `router` the SPA routes). See `docs/guide/web-client.md` for the
+# measured gzipped size.
+dioxus = { version = "=0.7.10", default-features = false, features = [
+    "router",
+    "launch",
+    "lib",
+] }
 # CommonMark → HTML. WASM-safe; only the `html` feature (drops the
 # getopts/bincode defaults used by the crate's CLI examples).
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
@@ -84,3 +93,21 @@ web = ["dioxus/web"]
 # Android native. Cross-compiled only; a host build of this feature is not
 # supported (it requires the Android SDK/NDK and an Android target triple).
 mobile = ["dioxus/mobile"]
+
+# Size-oriented release profile for the web bundle. `dx` derives the profile
+# name from the platform + build mode (`wasm` + `release` → `wasm-release`,
+# see `Platform::profile_name` in dioxus-cli), so defining it here overrides
+# the ad-hoc `opt-level = "s"` profile `dx` would otherwise inject. Size
+# guidance: <https://rustwasm.github.io/book/reference/code-size.html>.
+#
+# `opt-level = "z"` optimizes for size, fat LTO lets the whole crate graph
+# inline/deduplicate across boundaries, `codegen-units = 1` gives the
+# optimizer the full crate, and `panic = "abort"` drops the unwinding
+# machinery. Keep `strip` unset: `dx` forces `strip = false` and strips debug
+# info itself with `wasm-opt -Oz --strip-debug`.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
