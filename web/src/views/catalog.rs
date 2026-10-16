@@ -161,9 +161,11 @@ pub fn search(entries: &[CatalogEntry], query: &str) -> Vec<CatalogEntry> {
 /// Repo-scope `entries` for `active_repo` and rank the survivors against
 /// `query` with [`search`].
 ///
-/// Takes the active repo directly (rather than the whole [`Cache`]) so a caller
-/// can memoize the search on just that input: an unrelated cache write must not
-/// re-run the fuzzy matcher.
+/// The scope is the active repo's local entries plus the global (unscoped)
+/// ones; with no active repo every entry is in scope. Takes the active repo
+/// directly (rather than the whole [`Cache`]) so a caller can memoize the search
+/// on just that input: an unrelated cache write must not re-run the fuzzy
+/// matcher.
 pub fn search_scope(
     active_repo: Option<&str>,
     entries: &[CatalogEntry],
@@ -171,13 +173,13 @@ pub fn search_scope(
 ) -> Vec<CatalogEntry> {
     let scoped: Vec<CatalogEntry> = entries
         .iter()
-        .filter(|entry| crate::state::repo_in_scope(active_repo, entry.repo.as_deref()))
+        .filter(|entry| crate::state::catalog_in_scope(active_repo, entry.repo.as_deref()))
         .cloned()
         .collect();
     search(&scoped, query)
 }
 
-/// Repo-scope `entries` for the active repository (via [`Cache::repo_visible`])
+/// Repo-scope `entries` for the active repository (via [`Cache::active_repo`])
 /// and rank the survivors against `query` with [`search`].
 pub fn search_visible(cache: &Cache, entries: &[CatalogEntry], query: &str) -> Vec<CatalogEntry> {
     search_scope(cache.active_repo.as_deref(), entries, query)
@@ -235,7 +237,7 @@ pub fn Catalog() -> Element {
         main { id: "favetto-app", class: "catalog",
             h1 { "Catalog" }
             if let Some(repo) = active_repo() {
-                p { class: "catalog-scope", "Showing entries in repo: {repo}" }
+                p { class: "catalog-scope", "Showing repo: {repo} (plus global tasks)" }
             }
             input {
                 class: "catalog-search",
@@ -531,8 +533,10 @@ mod tests {
             active_repo: Some("favetto".into()),
             ..Default::default()
         };
+        // The active repo's local entries plus the global ones; another repo's
+        // entry is hidden.
         let scoped = search_visible(&cache, &[global.clone(), local, other.clone()], "");
-        assert_eq!(names(&scoped), vec!["local_task"]);
+        assert_eq!(names(&scoped), vec!["global_task", "local_task"]);
 
         // With no active repo the global view returns everything, in order.
         cache.active_repo = None;

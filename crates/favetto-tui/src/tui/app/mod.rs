@@ -1087,12 +1087,14 @@ impl App {
 
     /// Store the fetched repo registry and active repo (`repos.list`).
     ///
-    /// The active repo scopes the Tasks and Events tabs, so the row selection is
-    /// re-clamped to whatever remains visible.
+    /// The active repo scopes the Tasks, Events and Catalog tabs, so the row
+    /// selections are re-clamped to whatever remains visible and a cached
+    /// catalog preview for a now-hidden entry is dropped.
     pub fn set_repos(&mut self, repos: Vec<RepoInfo>, active: Option<String>) {
         self.known_repos = repos;
         self.active_repo = active;
         self.clamp_selections();
+        self.catalog_preview = None;
     }
 
     /// The label shown for the active repo in the status bar.
@@ -1110,6 +1112,28 @@ impl App {
             Some(active) => repo == Some(active.as_str()),
             None => true,
         }
+    }
+
+    /// Whether a catalog entry's repo namespace is in scope for the Catalog.
+    ///
+    /// The Catalog shows the active repo's local entries together with the
+    /// global (unscoped) ones; with no active repo every entry is visible.
+    /// Unlike [`App::repo_visible`] (Tasks/Events), globals stay visible while a
+    /// repo is active.
+    fn catalog_visible(&self, repo: Option<&str>) -> bool {
+        match &self.active_repo {
+            Some(active) => repo == Some(active.as_str()) || repo.is_none(),
+            None => true,
+        }
+    }
+
+    /// The catalog entries in scope for the active repo: its local entries plus
+    /// the global (unscoped) ones, in catalog order.
+    pub fn visible_catalog(&self) -> Vec<&CatalogEntry> {
+        self.catalog
+            .iter()
+            .filter(|e| self.catalog_visible(e.repo.as_deref()))
+            .collect()
     }
 
     /// The Tasks rows visible under the active repo, in list order.
@@ -1144,7 +1168,8 @@ impl App {
             .collect()
     }
 
-    /// Clamp both list selections to the currently visible rows.
+    /// Clamp the Tasks, Events and Catalog list selections to the currently
+    /// visible rows.
     fn clamp_selections(&mut self) {
         let tasks = self.visible_tasks().len();
         self.tasks_selected = if tasks == 0 {
@@ -1157,6 +1182,12 @@ impl App {
             0
         } else {
             self.events_selected.min(events - 1)
+        };
+        let catalog = self.catalog_rows().len();
+        self.catalog_selected = if catalog == 0 {
+            0
+        } else {
+            self.catalog_selected.min(catalog - 1)
         };
     }
 
@@ -1313,15 +1344,25 @@ impl App {
     }
 
     /// The visible rows of the Catalog tree: folder headers and tasks, with every
-    /// descendant of a collapsed folder hidden. Folders sort before a same-named
-    /// task (so `a.md` and `a/` render folder-first) and `depth` is the number of
-    /// `/` segments above the row.
+    /// descendant of a collapsed folder hidden and hidden entries scoped out via
+    /// [`App::catalog_visible`]. Folders sort before a same-named task (so `a.md`
+    /// and `a/` render folder-first) and `depth` is the number of `/` segments
+    /// above the row.
     pub fn catalog_rows(&self) -> Vec<CatalogRow> {
-        // (key, is_task, catalog index) records for folders and tasks.
-        let folders: HashSet<&str> = self
+        // Build the tree from the in-scope entries only, keeping each task's
+        // index into the full `self.catalog` (the preview and start paths need
+        // it).
+        let entries: Vec<(usize, &CatalogEntry)> = self
             .catalog
             .iter()
-            .flat_map(|e| {
+            .enumerate()
+            .filter(|(_, e)| self.catalog_visible(e.repo.as_deref()))
+            .collect();
+
+        // (key, is_task, catalog index) records for folders and tasks.
+        let folders: HashSet<&str> = entries
+            .iter()
+            .flat_map(|(_, e)| {
                 let mut out = Vec::new();
                 let mut cur = e.name.as_str();
                 while let Some((prefix, _)) = cur.rsplit_once('/') {
@@ -1336,12 +1377,7 @@ impl App {
             .iter()
             .map(|f| ((*f).to_string(), false, 0))
             .collect();
-        records.extend(
-            self.catalog
-                .iter()
-                .enumerate()
-                .map(|(i, e)| (e.name.clone(), true, i)),
-        );
+        records.extend(entries.iter().map(|(i, e)| (e.name.clone(), true, *i)));
         records.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
         let mut rows = Vec::with_capacity(records.len());

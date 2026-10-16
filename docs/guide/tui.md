@@ -253,9 +253,12 @@ The **Tasks** and **Events** tables each carry a **REPO** column: the name of
 the repo a run or event belongs to, or `global` for a bare task name and for
 integration (webhook) events. When a specific repo is active (`Ctrl+P → Switch
 repo`), both tabs are scoped to that repo's rows only; the selected row is
-clamped into view and the mouse hit-testing follows the filtered rows. Selecting
-`global` restores the full, labelled lists. The active repo is also shown in the
-status bar (`repo: <name>` / `repo: global`); see
+clamped into view and the mouse hit-testing follows the filtered rows. The
+**Catalog** tab is scoped the same way but additionally keeps the global
+(unscoped) tasks visible: with a repo active it lists that repo's local tasks
+plus the globals, hiding every other repo (a repo with no local tasks shows only
+the globals). Selecting `global` restores the full, labelled lists. The active
+repo is also shown in the status bar (`repo: <name>` / `repo: global`); see
 [Repository-local tasks](./catalog#repository-local-tasks).
 
 ## Events panel

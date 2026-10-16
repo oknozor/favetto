@@ -1501,9 +1501,11 @@ fn draw_catalog_table(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme
 
     // Top-level `repo:<name>` folders get a `(repo)` tag and show the bare repo
     // name (the `repo:` storage prefix is stripped for display); membership is
-    // keyed off each entry's `repo` field rather than by parsing the name.
+    // keyed off each entry's `repo` field rather than by parsing the name. Only
+    // in-scope entries are considered, so a repo with no local tasks contributes
+    // no folder.
     let repo_folders: HashSet<String> = app
-        .catalog
+        .visible_catalog()
         .iter()
         .filter_map(|e| e.repo.as_ref().map(|repo| format!("repo:{repo}")))
         .collect();
@@ -1566,7 +1568,7 @@ fn draw_catalog_table(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme
                 .borders(Borders::ALL)
                 .title(format!(
                     " Catalog ({}) — Enter/click start · e edit · Space fold ",
-                    app.catalog.len()
+                    app.visible_catalog().len()
                 ))
                 .border_style(theme.block(false)),
         )
