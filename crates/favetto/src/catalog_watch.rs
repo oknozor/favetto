@@ -294,6 +294,7 @@ mod tests {
         let scheduler = tokio_cron_scheduler::JobScheduler::new().await.unwrap();
         let config = Arc::new(config);
         Arc::new(State::new(StateInit {
+            config_path: std::path::PathBuf::new(),
             db: pool,
             bus: EventBus::new(64),
             token: favetto_core::auth::Token::generate(),
@@ -663,6 +664,7 @@ mod repo_tests {
         let scheduler = tokio_cron_scheduler::JobScheduler::new().await.unwrap();
         let config = Arc::new(config);
         Arc::new(State::new(StateInit {
+            config_path: std::path::PathBuf::new(),
             db: pool,
             bus: EventBus::new(64),
             token: favetto_core::auth::Token::generate(),

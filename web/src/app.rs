@@ -9,6 +9,7 @@
 use dioxus::prelude::*;
 use uuid::Uuid;
 
+use crate::components::config_error::ConfigErrorDialog;
 use crate::components::nav::AppNav;
 use crate::state::{AppState, ConnectionState};
 use crate::views::catalog::{Catalog, CatalogDetail};
@@ -153,6 +154,13 @@ pub fn App() -> Element {
             Transport { key: "{token}|{base}", base, token }
         }
         Router::<Route> {}
+        if let Some(error) = (state.config_error)() {
+            ConfigErrorDialog {
+                path: error.path.clone(),
+                errors: error.errors.clone(),
+                on_close: move |_| state.config_error.set(None),
+            }
+        }
     }
 }
 
@@ -253,7 +261,22 @@ async fn ping_once(mut state: AppState, base: String, token: Option<String>) {
     };
     let client = RpcClient::new(base).with_token(Some(token));
     let connection = match client.ping(PingParams {}).await {
-        Ok(_) => ConnectionState::Connected,
+        Ok(_) => {
+            // Ask the daemon to validate its on-disk config; a malformed file is
+            // surfaced as a modal until dismissed. An older daemon without
+            // `config.validate` returns an error, which we ignore.
+            if let Ok(validation) = client
+                .config_validate(favetto_wire::rpc::EmptyParams {})
+                .await
+            {
+                state.config_error.set(if validation.valid {
+                    None
+                } else {
+                    Some(validation)
+                });
+            }
+            ConnectionState::Connected
+        }
         Err(ClientError::Unauthorized) => {
             // Rotated/revoked token: drop it; the guard sends us to `/pair`.
             state.clear_token();

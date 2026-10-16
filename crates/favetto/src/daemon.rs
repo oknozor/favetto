@@ -118,6 +118,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         agents,
         registry,
         config,
+        config_path: config_path.clone(),
         data_dir: data_dir.clone(),
         tasks_dir,
         catalog,

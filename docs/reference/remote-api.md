@@ -24,6 +24,7 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | Method | Purpose |
 |--------|---------|
 | `system.ping` | Liveness check. |
+| `config.validate` | Validate the daemon's on-disk config file. |
 | `tasks.list` | List tasks (metadata only; output is omitted). |
 | `tasks.get` | Fetch a single task by id, including its stored output. |
 | `tasks.runs` | List a task's execution attempts (run history). |
@@ -83,6 +84,22 @@ object
 |-------|------|---------|----------|-------------|
 | `cwd` | string | — | yes | The daemon process's current working directory. |
 | `pong` | boolean | — | yes | Always `true` for a live daemon. |
+
+### `config.validate`
+
+Validate the daemon's on-disk config file.
+
+**Request**
+
+object
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `errors` | string[] | — | yes | One message per parse/deserialization failure; empty when `valid`. |
+| `path` | string | — | yes | The resolved config path the daemon was started with. |
+| `valid` | boolean | — | yes | True when the file parsed, or is absent so defaults apply. |
 
 ### `tasks.list`
 

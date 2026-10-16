@@ -138,6 +138,7 @@ async fn unavailable_agent_fails_with_clear_error() {
     let registry = AgentRegistry::from_config_with(&cfg, &|_| false).unwrap();
 
     let state = Arc::new(State::new(StateInit {
+        config_path: std::path::PathBuf::new(),
         db: pool,
         bus: EventBus::new(64),
         token: Token::generate(),
@@ -622,6 +623,7 @@ async fn title_state(dir: &Path, command: &Path) -> Arc<State> {
     );
     let registry = AgentRegistry::from_config_with(&cfg, &|_| true).unwrap();
     Arc::new(State::new(StateInit {
+        config_path: std::path::PathBuf::new(),
         db: pool,
         bus: EventBus::new(64),
         token: Token::generate(),
@@ -1348,6 +1350,7 @@ async fn run_one_renders_input_vars_into_the_agent_prompt() {
     let pool = crate::db::open(&dir.join("test.db")).await.unwrap();
     crate::db::migrate(&pool).await.unwrap();
     let state = Arc::new(State::new(StateInit {
+        config_path: std::path::PathBuf::new(),
         db: pool,
         bus: EventBus::new(64),
         token: Token::generate(),
@@ -1468,6 +1471,7 @@ async fn run_one_binds_and_persists_a_deterministic_session_id() {
     let pool = crate::db::open(&dir.join("test.db")).await.unwrap();
     crate::db::migrate(&pool).await.unwrap();
     let state = Arc::new(State::new(StateInit {
+        config_path: std::path::PathBuf::new(),
         db: pool,
         bus: EventBus::new(64),
         token: Token::generate(),
@@ -2244,6 +2248,7 @@ async fn run_one_reads_spawn_file_before_reclaiming_worktree() {
     let pool = crate::db::open(&root.join("test.db")).await.unwrap();
     crate::db::migrate(&pool).await.unwrap();
     let state = Arc::new(State::new(StateInit {
+        config_path: std::path::PathBuf::new(),
         db: pool,
         bus: EventBus::new(64),
         token: Token::generate(),
@@ -2414,6 +2419,7 @@ async fn run_one_keeps_the_worktree_while_an_attach_is_live() {
     let pool = crate::db::open(&root.join("test.db")).await.unwrap();
     crate::db::migrate(&pool).await.unwrap();
     let state = Arc::new(State::new(StateInit {
+        config_path: std::path::PathBuf::new(),
         db: pool,
         bus: EventBus::new(64),
         token: Token::generate(),
@@ -2512,6 +2518,7 @@ async fn join_state_with_config(
     crate::db::migrate(&pool).await.unwrap();
     let registry = AgentRegistry::from_config_with(&cfg, &|_| true).unwrap();
     Arc::new(State::new(StateInit {
+        config_path: std::path::PathBuf::new(),
         db: pool,
         bus: EventBus::new(64),
         token: Token::generate(),

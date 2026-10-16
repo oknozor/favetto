@@ -210,6 +210,12 @@ pub enum Popup {
         entries: Vec<ThemeChoice>,
         original: Theme,
     },
+    /// The daemon's config file failed validation at startup: the config path and
+    /// the parse error(s), dismissed with Esc/Enter.
+    ConfigError {
+        path: String,
+        errors: Vec<String>,
+    },
 }
 
 /// One row of the theme picker: a non-selectable section header, or a choice

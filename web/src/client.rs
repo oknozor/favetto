@@ -178,6 +178,8 @@ macro_rules! typed_calls {
 typed_calls! {
     /// `system.ping`.
     ping => PingCall,
+    /// `config.validate`.
+    config_validate => ConfigValidateCall,
     /// `tasks.list`.
     tasks_list => TasksListCall,
     /// `tasks.get`.
@@ -465,6 +467,20 @@ mod tests {
             Frame::Request(request) => {
                 assert_eq!(request.id, 7);
                 assert_eq!(request.method, method::PING);
+                assert_eq!(request.params, serde_json::json!({}));
+            }
+            other => panic!("expected a request frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_validate_request_encodes_with_empty_params() {
+        let bytes = encode_request::<ConfigValidateCall>(11, &EmptyParams {}).unwrap();
+        let frame: Frame = rmp_serde::from_slice(&bytes).unwrap();
+        match frame {
+            Frame::Request(request) => {
+                assert_eq!(request.id, 11);
+                assert_eq!(request.method, method::CONFIG_VALIDATE);
                 assert_eq!(request.params, serde_json::json!({}));
             }
             other => panic!("expected a request frame, got {other:?}"),

@@ -99,6 +99,8 @@ impl From<RpcError> for RpcErrorObject {
 /// Well-known client → server method names.
 pub mod method {
     pub const PING: &str = "system.ping";
+    /// Validate the daemon's on-disk config file.
+    pub const CONFIG_VALIDATE: &str = "config.validate";
     pub const TASKS_LIST: &str = "tasks.list";
     /// Fetch a single task by id, including its stored output blob.
     pub const TASKS_GET: &str = "tasks.get";
@@ -208,6 +210,10 @@ pub mod push {
 /// with [`method`].
 pub const CLIENT_METHODS: &[(&str, &str)] = &[
     (method::PING, "Liveness check."),
+    (
+        method::CONFIG_VALIDATE,
+        "Validate the daemon's on-disk config file.",
+    ),
     (
         method::TASKS_LIST,
         "List tasks (metadata only; output is omitted).",
@@ -476,6 +482,7 @@ mod tests {
     fn doc_tables_match_constants() {
         let methods: HashSet<&str> = [
             method::PING,
+            method::CONFIG_VALIDATE,
             method::TASKS_LIST,
             method::TASKS_GET,
             method::TASKS_RUNS,

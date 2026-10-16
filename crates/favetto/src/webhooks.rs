@@ -580,6 +580,7 @@ mod tests {
         cfg.webhook.github.rules = rules;
 
         let state = Arc::new(State::new(StateInit {
+            config_path: std::path::PathBuf::new(),
             db: pool.clone(),
             bus: EventBus::new(64),
             token: Token::generate(),

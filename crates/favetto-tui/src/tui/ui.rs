@@ -202,6 +202,7 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
         // Handled above, before `popup` is borrowed.
         Popup::TaskError { .. } => {}
         Popup::TaskResult { task } => draw_task_result(frame, task, theme),
+        Popup::ConfigError { path, errors } => draw_config_error(frame, path, errors, theme),
         // Handled above, before `popup` is borrowed.
         Popup::RepoPicker { .. } => {}
         Popup::ThemePicker {
@@ -746,6 +747,38 @@ fn draw_task_result(frame: &mut Frame, task: &Task, theme: Theme) {
             area: frame.area(),
             width_pct: 70,
             title: " Action result ".to_string(),
+            content,
+            footer,
+            focus_line: 0,
+            theme,
+        },
+    );
+}
+
+/// Draw the startup config-validation failure: the daemon's config path and the
+/// parse error(s), reusing the growing popup shell.
+fn draw_config_error(frame: &mut Frame, path: &str, errors: &[String], theme: Theme) {
+    let mut content: Vec<Line<'static>> = vec![
+        Line::from(Span::styled(
+            "The daemon could not parse its config file:",
+            Style::default().fg(theme.muted()),
+        )),
+        Line::from(Span::raw(path.to_string())),
+        Line::from(""),
+    ];
+    for error in errors {
+        content.push(Line::from(Span::styled(error.clone(), theme.destructive())));
+    }
+    let footer = vec![Line::from(Span::styled(
+        "Esc / Enter close",
+        Style::default().fg(theme.muted()),
+    ))];
+    draw_growing_popup(
+        frame,
+        GrowingPopup {
+            area: frame.area(),
+            width_pct: 70,
+            title: " Invalid config ".to_string(),
             content,
             footer,
             focus_line: 0,

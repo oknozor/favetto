@@ -38,7 +38,7 @@ use favetto_core::model::{
     AgentCatalogEntry, AgentSessionInfo, Event, NotificationRecord, RepoInfo, Schedule, Task,
     UsageStats,
 };
-use favetto_core::rpc::method;
+use favetto_core::rpc::{method, ConfigValidateResult};
 use favetto_core::workflow::WorkflowInspect;
 use favetto_providers::Provider;
 use uuid::Uuid;
@@ -316,6 +316,20 @@ async fn sync_initial(client: &Client, app: &mut App) {
         fetch_rpc::<serde_json::Value>(client, method::PING, serde_json::json!({})).await
     {
         app.daemon_cwd = v.get("cwd").and_then(|c| c.as_str()).map(str::to_string);
+    }
+
+    // Report a malformed daemon config through a dismissible popup; a valid (or
+    // absent) file, or an older daemon without `config.validate`, stays silent.
+    if let Some(validation) =
+        fetch_rpc::<ConfigValidateResult>(client, method::CONFIG_VALIDATE, serde_json::json!({}))
+            .await
+    {
+        if !validation.valid {
+            app.popup = Popup::ConfigError {
+                path: validation.path,
+                errors: validation.errors,
+            };
+        }
     }
 
     if let Some(tasks) =
