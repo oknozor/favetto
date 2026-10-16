@@ -144,10 +144,13 @@ pub struct TuiSettings {
     pub editor: Option<String>,
     /// Built-in (`opencode`, `catppuccin`) or user theme name. A user theme is
     /// loaded from `themes/<name>.json` in the config or `.favetto/themes`
-    /// directory. Overridable with `FAVETTO_THEME_NAME`.
+    /// directory. `auto` (the default) follows the theme configured in
+    /// opencode's `cli.json`; a built-in or custom opencode theme name selects
+    /// that theme directly. Overridable with `FAVETTO_THEME_NAME`.
     #[serde(default = "default_theme")]
     pub theme: String,
     /// Theme mode: `system` (derive from the terminal), `dark`, or `light`.
+    /// With `theme = "auto"`, `system` also follows opencode's `theme.mode`.
     /// Overridable with `FAVETTO_THEME`.
     #[serde(default = "default_theme_mode")]
     pub theme_mode: String,
@@ -600,7 +603,7 @@ fn default_true() -> bool {
 }
 
 fn default_theme() -> String {
-    "opencode".to_string()
+    "auto".to_string()
 }
 
 fn default_theme_mode() -> String {
@@ -947,7 +950,7 @@ mod tests {
     #[test]
     fn tui_theme_defaults() {
         let cfg: FavettoConfig = toml::from_str("").unwrap();
-        assert_eq!(cfg.tui.theme, "opencode");
+        assert_eq!(cfg.tui.theme, "auto");
         assert_eq!(cfg.tui.theme_mode, "system");
         assert!(cfg.tui.show_header);
         assert!(cfg.tui.show_footer);

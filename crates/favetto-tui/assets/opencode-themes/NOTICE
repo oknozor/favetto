@@ -1,0 +1,16 @@
+# Vendored opencode themes
+
+The JSON files in this directory (the v1 assets directly, and the v2 assets under
+`v2/`) are copied verbatim from the opencode repository:
+
+- Upstream: https://github.com/anomalyco/opencode
+- Path: `packages/tui/src/theme/assets/` (and `assets/v2/`)
+- Commit: `00e7472faa2ef15b30db6110440117e4e7e1a72a`
+- License: MIT — Copyright (c) 2025 opencode
+
+They are embedded at compile time by `crates/favetto-tui/src/tui/opencode_theme.rs`
+so the favetto TUI can resolve the built-in opencode theme names without reading
+anything from disk. `opencode`/`opencode2` are the v2 assets; the remaining names
+are the v1 assets opencode ships.
+
+The MIT license text is reproduced in the repository root (`LICENSE-MIT`).

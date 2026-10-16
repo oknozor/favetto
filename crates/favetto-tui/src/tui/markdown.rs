@@ -138,11 +138,14 @@ fn render_markdown(lines: &[&str], theme: &Theme) -> Vec<Line<'static>> {
         let trimmed = line.trim_start();
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             in_code = !in_code;
-            out.push(plain(line, Style::default().fg(theme.syn_comment())));
+            out.push(plain(
+                line,
+                Style::default().fg(theme.markdown.horizontal_rule),
+            ));
             continue;
         }
         if in_code {
-            out.push(plain(line, Style::default().fg(theme.syn_code())));
+            out.push(plain(line, Style::default().fg(theme.markdown.code_block)));
             continue;
         }
         out.push(render_markdown_line(line, theme));
@@ -159,36 +162,43 @@ fn render_markdown_line(line: &str, theme: &Theme) -> Line<'static> {
         return plain(
             trimmed,
             Style::default()
-                .fg(theme.syn_heading())
+                .fg(theme.markdown.heading)
                 .add_modifier(Modifier::BOLD),
         );
     }
 
     // Horizontal rule.
     if matches!(trimmed, "---" | "***" | "___") {
-        return plain(line, Style::default().fg(theme.syn_comment()));
+        return plain(line, Style::default().fg(theme.markdown.horizontal_rule));
     }
 
     // Blockquote.
     if let Some(rest) = trimmed.strip_prefix("> ") {
-        let mut spans = vec![Span::styled("> ", Style::default().fg(theme.syn_comment()))];
+        let mut spans = vec![Span::styled(
+            "> ",
+            Style::default().fg(theme.markdown.block_quote),
+        )];
         spans.extend(inline(
             rest,
-            Style::default()
-                .fg(theme.fg())
-                .add_modifier(Modifier::ITALIC),
+            Style::default().fg(theme.markdown.block_quote),
             theme,
         ));
         return Line::from(spans);
     }
 
     // Bullet / numbered list.
-    if let Some((marker, content)) = strip_bullet(trimmed) {
-        let mut spans = vec![Span::styled(
-            marker,
-            Style::default().fg(theme.syn_comment()),
-        )];
-        spans.extend(inline(content, Style::default().fg(theme.fg()), theme));
+    if let Some((marker, content, ordered)) = strip_bullet(trimmed) {
+        let marker_color = if ordered {
+            theme.markdown.list_enumeration
+        } else {
+            theme.markdown.list_item
+        };
+        let mut spans = vec![Span::styled(marker, Style::default().fg(marker_color))];
+        spans.extend(inline(
+            content,
+            Style::default().fg(theme.markdown.text),
+            theme,
+        ));
         return Line::from(spans);
     }
 
@@ -197,24 +207,28 @@ fn render_markdown_line(line: &str, theme: &Theme) -> Line<'static> {
     if indent > 0 {
         spans.push(Span::raw(line[..indent].to_string()));
     }
-    spans.extend(inline(trimmed, Style::default().fg(theme.fg()), theme));
+    spans.extend(inline(
+        trimmed,
+        Style::default().fg(theme.markdown.text),
+        theme,
+    ));
     Line::from(spans)
 }
 
-fn strip_bullet(line: &str) -> Option<(String, &str)> {
+fn strip_bullet(line: &str) -> Option<(String, &str, bool)> {
     for marker in ["- ", "* ", "+ "] {
         if let Some(rest) = line.strip_prefix(marker) {
-            return Some((marker.to_string(), rest));
+            return Some((marker.to_string(), rest, false));
         }
     }
     let digits = line.chars().take_while(|c| c.is_ascii_digit()).count();
     if digits > 0 && line[digits..].starts_with(". ") {
-        return Some((line[..digits + 2].to_string(), &line[digits + 2..]));
+        return Some((line[..digits + 2].to_string(), &line[digits + 2..], true));
     }
     None
 }
 
-/// Expand inline Markdown (`code`, **bold**, *italic*, [text](url)).
+/// Expand inline Markdown (`code`, **bold**, *italic*, [text](url), ![alt](url)).
 fn inline(text: &str, base: Style, theme: &Theme) -> Vec<Span<'static>> {
     let chars: Vec<char> = text.chars().collect();
     let mut spans = Vec::new();
@@ -225,7 +239,7 @@ fn inline(text: &str, base: Style, theme: &Theme) -> Vec<Span<'static>> {
             if let Some(end) = find_char(&chars, i + 1, '`') {
                 flush(&mut buf, &mut spans, base);
                 let code: String = chars[i + 1..end].iter().collect();
-                spans.push(Span::styled(code, Style::default().fg(theme.syn_code())));
+                spans.push(Span::styled(code, Style::default().fg(theme.markdown.code)));
                 i = end + 1;
                 continue;
             }
@@ -234,7 +248,12 @@ fn inline(text: &str, base: Style, theme: &Theme) -> Vec<Span<'static>> {
             if let Some(end) = find_pair(&chars, i + 2, '*') {
                 flush(&mut buf, &mut spans, base);
                 let inner: String = chars[i + 2..end].iter().collect();
-                spans.push(Span::styled(inner, base.add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled(
+                    inner,
+                    Style::default()
+                        .fg(theme.markdown.strong)
+                        .add_modifier(Modifier::BOLD),
+                ));
                 i = end + 2;
                 continue;
             }
@@ -243,9 +262,31 @@ fn inline(text: &str, base: Style, theme: &Theme) -> Vec<Span<'static>> {
             if let Some(end) = find_char(&chars, i + 1, '*') {
                 flush(&mut buf, &mut spans, base);
                 let inner: String = chars[i + 1..end].iter().collect();
-                spans.push(Span::styled(inner, base.add_modifier(Modifier::ITALIC)));
+                spans.push(Span::styled(
+                    inner,
+                    Style::default()
+                        .fg(theme.markdown.emphasis)
+                        .add_modifier(Modifier::ITALIC),
+                ));
                 i = end + 1;
                 continue;
+            }
+        }
+        if chars[i] == '!' && chars.get(i + 1) == Some(&'[') {
+            if let Some(close) = find_char(&chars, i + 2, ']') {
+                if chars.get(close + 1) == Some(&'(') {
+                    if let Some(paren) = find_char(&chars, close + 2, ')') {
+                        flush(&mut buf, &mut spans, base);
+                        let alt: String = chars[i + 2..close].iter().collect();
+                        spans.push(Span::styled("!", Style::default().fg(theme.markdown.image)));
+                        spans.push(Span::styled(
+                            alt,
+                            Style::default().fg(theme.markdown.image_text),
+                        ));
+                        i = paren + 1;
+                        continue;
+                    }
+                }
             }
         }
         if chars[i] == '[' {
@@ -256,7 +297,9 @@ fn inline(text: &str, base: Style, theme: &Theme) -> Vec<Span<'static>> {
                         let label: String = chars[i + 1..close].iter().collect();
                         spans.push(Span::styled(
                             label,
-                            base.fg(theme.syn_link()).add_modifier(Modifier::UNDERLINED),
+                            Style::default()
+                                .fg(theme.markdown.link_text)
+                                .add_modifier(Modifier::UNDERLINED),
                         ));
                         i = paren + 1;
                         continue;
@@ -330,6 +373,7 @@ mod tests {
     fn headings_are_bold() {
         let line = render_markdown_line("## Plan", &Theme::dark());
         assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(line.spans[0].style.fg, Some(Theme::dark().markdown.heading));
     }
 
     #[test]
@@ -338,7 +382,40 @@ mod tests {
         let spans = inline("use `cargo test` now", Style::default(), &theme);
         assert!(spans
             .iter()
-            .any(|s| s.content == "cargo test" && s.style.fg == Some(theme.syn_code())));
+            .any(|s| s.content == "cargo test" && s.style.fg == Some(theme.markdown.code)));
+    }
+
+    #[test]
+    fn markdown_roles_use_their_tokens() {
+        let theme = Theme::dark();
+        let bullet = render_markdown_line("- item", &theme);
+        assert_eq!(bullet.spans[0].style.fg, Some(theme.markdown.list_item));
+        let numbered = render_markdown_line("1. item", &theme);
+        assert_eq!(
+            numbered.spans[0].style.fg,
+            Some(theme.markdown.list_enumeration)
+        );
+        let quote = render_markdown_line("> quoted", &theme);
+        assert_eq!(quote.spans[0].style.fg, Some(theme.markdown.block_quote));
+        let rule = render_markdown_line("---", &theme);
+        assert_eq!(rule.spans[0].style.fg, Some(theme.markdown.horizontal_rule));
+        let spans = inline(
+            "**bold** *em* [link](x) ![alt](y)",
+            Style::default(),
+            &theme,
+        );
+        assert!(spans
+            .iter()
+            .any(|s| s.content == "bold" && s.style.fg == Some(theme.markdown.strong)));
+        assert!(spans
+            .iter()
+            .any(|s| s.content == "em" && s.style.fg == Some(theme.markdown.emphasis)));
+        assert!(spans
+            .iter()
+            .any(|s| s.content == "link" && s.style.fg == Some(theme.markdown.link_text)));
+        assert!(spans
+            .iter()
+            .any(|s| s.content == "alt" && s.style.fg == Some(theme.markdown.image_text)));
     }
 
     #[test]
@@ -358,7 +435,7 @@ mod tests {
         let light_code = inline("use `cargo test` now", Style::default(), &light);
         assert!(light_code
             .iter()
-            .any(|s| s.content == "cargo test" && s.style.fg == Some(light.syn_code())));
-        assert_ne!(light.syn_code(), dark.syn_code());
+            .any(|s| s.content == "cargo test" && s.style.fg == Some(light.markdown.code)));
+        assert_ne!(light.markdown.code, dark.markdown.code);
     }
 }

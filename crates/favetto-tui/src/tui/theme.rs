@@ -787,6 +787,21 @@ impl Theme {
         self.text.action.primary
     }
 
+    /// A filled "primary action" style: the action background with a
+    /// contrast-aware label, falling back to the accent when the palette's
+    /// action surface is transparent.
+    pub fn action_style(&self) -> Style {
+        let bg = if self.background.action == Color::Reset {
+            self.text.action.primary
+        } else {
+            self.background.action
+        };
+        Style::default()
+            .fg(contrast_fg(bg))
+            .bg(bg)
+            .add_modifier(Modifier::BOLD)
+    }
+
     /// A contrast-aware foreground for [`Theme::selected_bg`].
     pub fn selected_fg(&self) -> Color {
         contrast_fg(self.selected_bg())
@@ -864,10 +879,6 @@ impl Theme {
         self.text.feedback.error
     }
 
-    pub fn info(&self) -> Color {
-        self.text.feedback.info
-    }
-
     pub fn syn_key(&self) -> Color {
         self.syntax.keyword
     }
@@ -892,15 +903,76 @@ impl Theme {
         self.markdown.heading
     }
 
-    pub fn syn_code(&self) -> Color {
-        self.markdown.code
+    /// Every colour this theme paints with, for the "no unthemed pixel" test.
+    #[cfg(test)]
+    pub fn palette_colors(&self) -> std::collections::HashSet<Color> {
+        use std::collections::HashSet;
+        let feedback = [
+            self.background.feedback.error,
+            self.background.feedback.warning,
+            self.background.feedback.success,
+            self.background.feedback.info,
+            self.text.feedback.error,
+            self.text.feedback.warning,
+            self.text.feedback.success,
+            self.text.feedback.info,
+        ];
+        let syntax = [
+            self.syntax.comment,
+            self.syntax.keyword,
+            self.syntax.function,
+            self.syntax.variable,
+            self.syntax.string,
+            self.syntax.number,
+            self.syntax.type_,
+            self.syntax.operator,
+            self.syntax.punctuation,
+        ];
+        let markdown = [
+            self.markdown.text,
+            self.markdown.heading,
+            self.markdown.link,
+            self.markdown.link_text,
+            self.markdown.code,
+            self.markdown.block_quote,
+            self.markdown.emphasis,
+            self.markdown.strong,
+            self.markdown.horizontal_rule,
+            self.markdown.list_item,
+            self.markdown.list_enumeration,
+            self.markdown.image,
+            self.markdown.image_text,
+            self.markdown.code_block,
+        ];
+        let mut colors = HashSet::from([
+            self.background.base,
+            self.background.raised.base,
+            self.background.raised.high,
+            self.background.raised.max,
+            self.background.action,
+            self.background.formfield,
+            self.text.base,
+            self.text.muted,
+            self.text.action.primary,
+            self.text.action.secondary,
+            self.text.action.destructive,
+            self.text.formfield,
+            self.border.base,
+            self.border.active,
+            self.border.subtle,
+            self.scrollbar.base,
+            self.selected_fg(),
+            self.scrim_color(),
+        ]);
+        colors.extend(feedback);
+        colors.extend(syntax);
+        colors.extend(markdown);
+        colors
     }
 
-    pub fn syn_link(&self) -> Color {
-        self.markdown.link
-    }
-
-    fn apply_token(&mut self, path: &str, color: Color) {
+    /// Apply one opencode/favetto token path. Unknown paths are logged and
+    /// ignored; this is the bridge the opencode theme loader writes through.
+    pub(crate) fn apply_token(&mut self, path: &str, color: Color) {
         match path {
             "background.base" => self.background.base = color,
             "background.raised.base" => self.background.raised.base = color,
@@ -914,6 +986,9 @@ impl Theme {
             "background.feedback.info" => self.background.feedback.info = color,
             "text.base" => self.text.base = color,
             "text.muted" => self.text.muted = color,
+            // opencode's `text.faint` has no separate favetto role; it shares
+            // the de-emphasised `muted` slot.
+            "text.faint" => self.text.muted = color,
             "text.action.primary" => self.text.action.primary = color,
             "text.action.secondary" => self.text.action.secondary = color,
             "text.action.destructive" => self.text.action.destructive = color,
@@ -1082,7 +1157,7 @@ pub fn contrast_fg(bg: Color) -> Color {
 }
 
 /// Whether colour output should be suppressed (`NO_COLOR` set, or dumb terminal).
-fn no_color() -> bool {
+pub(crate) fn no_color() -> bool {
     std::env::var_os("NO_COLOR").is_some()
         || std::env::var("TERM")
             .map(|t| t.eq_ignore_ascii_case("dumb"))

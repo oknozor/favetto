@@ -29,7 +29,7 @@ use crate::tasks::TaskVar;
 use super::sound::SoundCue;
 use super::term::TerminalView;
 use super::text_buffer::TextBuffer;
-use super::theme::{Theme, ThemeMode};
+use super::theme::{Theme, ThemeMode, ThemeName};
 
 mod input;
 mod task_vars;
@@ -816,6 +816,10 @@ pub struct App {
     pub theme_dirs: Vec<PathBuf>,
     /// User theme file stems discovered at startup.
     pub user_themes: Vec<String>,
+    /// Directories scanned for opencode themes (project then global).
+    pub opencode_theme_dirs: Vec<PathBuf>,
+    /// Theme names opencode knows (built-ins + custom), for the picker.
+    pub opencode_theme_names: Vec<String>,
     /// Whether the tab bar is shown.
     pub show_header: bool,
     /// Whether the status line is shown.
@@ -989,6 +993,8 @@ impl App {
             system_mode: ThemeMode::Dark,
             theme_dirs: Vec::new(),
             user_themes: Vec::new(),
+            opencode_theme_dirs: Vec::new(),
+            opencode_theme_names: Vec::new(),
             show_header: true,
             show_footer: true,
             tab: Tab::Tasks,
@@ -2164,7 +2170,8 @@ impl App {
         };
     }
 
-    /// The rows of the theme picker: bundled themes, user themes, then modes.
+    /// The rows of the theme picker: bundled themes, user themes, the themes
+    /// opencode knows, then modes.
     pub fn theme_entries(&self) -> Vec<ThemeChoice> {
         let mut entries = vec![ThemeChoice::Header("Theme")];
         for name in super::theme::ThemeName::ALL {
@@ -2181,6 +2188,20 @@ impl App {
                 label: format!("{user} (user)"),
             });
         }
+        if !self.opencode_theme_names.is_empty() {
+            entries.push(ThemeChoice::Header("Opencode"));
+            for name in &self.opencode_theme_names {
+                if ThemeName::from_key(name).is_some() {
+                    continue;
+                }
+                let marker = if name == &self.theme_name { "• " } else { "" };
+                entries.push(ThemeChoice::Choice {
+                    theme: name.clone(),
+                    mode: self.theme_mode,
+                    label: format!("{marker}{name}"),
+                });
+            }
+        }
         entries.push(ThemeChoice::Header("Mode"));
         for mode in ThemeMode::ALL {
             entries.push(ThemeChoice::Choice {
@@ -2190,6 +2211,33 @@ impl App {
             });
         }
         entries
+    }
+
+    /// Resolve a theme name to a palette, preferring favetto's bundled/user
+    /// themes and falling back to opencode's built-ins and custom files.
+    pub fn resolve_named_theme(&self, name: &str, mode: ThemeMode) -> Theme {
+        if super::theme::no_color() {
+            return Theme::monochrome();
+        }
+        let resolved = match mode {
+            ThemeMode::System => self.system_mode,
+            other => other,
+        };
+        let is_favetto =
+            ThemeName::from_key(name).is_some() || self.user_themes.iter().any(|u| u == name);
+        if is_favetto {
+            return Theme::resolve(name, resolved, &self.theme_dirs, self.system_mode);
+        }
+        match super::opencode_theme::resolve(name, resolved, &self.opencode_theme_dirs) {
+            Ok(theme) => theme,
+            Err(err) => {
+                tracing::warn!("{err}; using the bundled palette");
+                match resolved {
+                    ThemeMode::Light => Theme::light(),
+                    _ => Theme::dark(),
+                }
+            }
+        }
     }
 
     /// Move the picker selection by `delta`, skipping section headers, and
@@ -2236,7 +2284,7 @@ impl App {
             },
             _ => return,
         };
-        self.theme = Theme::resolve(&theme, mode, &self.theme_dirs, self.system_mode);
+        self.theme = self.resolve_named_theme(&theme, mode);
     }
 
     /// Commit the highlighted choice (the preview palette is already applied).

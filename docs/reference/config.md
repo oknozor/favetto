@@ -15,7 +15,7 @@ Every section is optional; favetto falls back to built-in defaults for anything 
 | `executor` | ExecutorSettings | `{"awaiting_input_quiet_ms":8000,"detect_awaiting_input":true,"keep_worktree":false,"max_concurrency":4,"max_output_bytes":262144,"parallel":false,"retry":{"backoff":"exponential","initial_ms":5000,"max_attempts":1,"max_ms":300000,"retry_on":["infrastructure","timeout"]},"stale_run":"fail","worktree":true,"worktree_retention":{"days":30,"min_worktrees":0}}` | no | Task executor concurrency / isolation. |
 | `git` | GitSettings | `{}` | no | Non-interactive git provisioning for agent processes. Defaults to `signing = "off"`, which forces `commit.gpgsign = false` so an agent commit can never block on an interactive pinentry/askpass prompt. |
 | `repos` | ReposSettings | `{"depth":1,"known":[]}` | no | Repo-local task catalogs: the known-repos registry seed, the active repo, and the optional base directory scanned for repositories. Ignored by clients; the daemon persists changes in SQLite. |
-| `tui` | TuiSettings | `{"show_footer":true,"show_header":true,"sound":{"enabled":true,"events":{"attention":"none","awaiting_input":"attention","task_failed":"failure","task_finished":"success","task_started":"none"},"min_interval_ms":400,"only_when_unfocused":false,"player":"auto"},"theme":"opencode","theme_mode":"system"}` | no | Client-side TUI settings. Ignored by the daemon, which reads the same file. |
+| `tui` | TuiSettings | `{"show_footer":true,"show_header":true,"sound":{"enabled":true,"events":{"attention":"none","awaiting_input":"attention","task_failed":"failure","task_finished":"success","task_started":"none"},"min_interval_ms":400,"only_when_unfocused":false,"player":"auto"},"theme":"auto","theme_mode":"system"}` | no | Client-side TUI settings. Ignored by the daemon, which reads the same file. |
 | `web` | WebSettings | `{"dir":"","enabled":true,"heartbeat_secs":15}` | no | Web client (embedded SPA) settings. |
 | `webhook` | WebhookSettings | `{"github":{"enabled":false,"rules":[]}}` | no | Webhook trigger rules (currently GitHub). |
 
@@ -318,8 +318,8 @@ TUI-only settings. The daemon parses but ignores this section.
 | `show_footer` | boolean | `true` | no | Show the status line. Default true. |
 | `show_header` | boolean | `true` | no | Show the tab bar. Default true. |
 | `sound` | SoundSettings | `{"enabled":true,"events":{"attention":"none","awaiting_input":"attention","task_failed":"failure","task_finished":"success","task_started":"none"},"min_interval_ms":400,"only_when_unfocused":false,"player":"auto"}` | no |  |
-| `theme` | string | `opencode` | no | Built-in (`opencode`, `catppuccin`) or user theme name. A user theme is loaded from `themes/<name>.json` in the config or `.favetto/themes` directory. Overridable with `FAVETTO_THEME_NAME`. |
-| `theme_mode` | string | `system` | no | Theme mode: `system` (derive from the terminal), `dark`, or `light`. Overridable with `FAVETTO_THEME`. |
+| `theme` | string | `auto` | no | Built-in (`opencode`, `catppuccin`) or user theme name. A user theme is loaded from `themes/<name>.json` in the config or `.favetto/themes` directory. `auto` (the default) follows the theme configured in opencode's `cli.json`; a built-in or custom opencode theme name selects that theme directly. Overridable with `FAVETTO_THEME_NAME`. |
+| `theme_mode` | string | `system` | no | Theme mode: `system` (derive from the terminal), `dark`, or `light`. With `theme = "auto"`, `system` also follows opencode's `theme.mode`. Overridable with `FAVETTO_THEME`. |
 
 ## WebSettings
 

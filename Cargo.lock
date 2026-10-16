@@ -1155,6 +1155,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "clap",
+ "dirs",
  "favetto-core",
  "favetto-providers",
  "futures-util",
