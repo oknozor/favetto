@@ -3,6 +3,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
+use fuzzy_matcher::skim::SkimMatcherV2;
+use fuzzy_matcher::FuzzyMatcher;
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -93,6 +95,8 @@ pub enum UiAction {
     OpenSessions,
     /// Open the Ctrl+P "Switch repo" picker.
     OpenRepoPicker,
+    /// Open the favetto documentation site in the user's browser.
+    OpenDocs,
     /// Activate a known repo by name (`None` selects the global catalog) through
     /// `repos.activate`.
     ActivateRepo(Option<String>),
@@ -157,6 +161,8 @@ pub enum Popup {
     None,
     Menu {
         selected: usize,
+        /// Inline full-text search filtering the visible commands.
+        filter: TextBuffer,
     },
     Form(Form),
     Wizard(Wizard),
@@ -506,16 +512,79 @@ impl CatalogEntry {
     }
 }
 
-/// The Ctrl+P menu entries, in order.
-pub const MENU_OPTIONS: [&str; 7] = [
-    "New one-shot task",
-    "Add task to catalog",
-    "Create schedule",
-    "Create notification hook",
-    "Switch repo",
-    "Add repo",
-    "Change theme",
+/// A stable identity for a Ctrl+P palette command. Dispatch keys off this rather
+/// than a row index, so grouping actions and filtering the list never misroute a
+/// command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuAction {
+    NewOneShot,
+    AddTask,
+    CreateSchedule,
+    CreateNotification,
+    SwitchRepo,
+    AddRepo,
+    ChangeTheme,
+    OpenDocs,
+}
+
+impl MenuAction {
+    /// The label shown in the palette and matched by its search filter.
+    pub fn label(self) -> &'static str {
+        match self {
+            MenuAction::NewOneShot => "New one-shot task",
+            MenuAction::AddTask => "Add task to catalog",
+            MenuAction::CreateSchedule => "Create schedule",
+            MenuAction::CreateNotification => "Create notification hook",
+            MenuAction::SwitchRepo => "Switch repo",
+            MenuAction::AddRepo => "Add repo",
+            MenuAction::ChangeTheme => "Change theme",
+            MenuAction::OpenDocs => "Open docs",
+        }
+    }
+}
+
+/// One row of the Ctrl+P palette: a bold, non-selectable section header, or a
+/// command. Mirrors [`ThemeChoice`]'s header/choice split.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuEntry {
+    Header(&'static str),
+    Action(MenuAction),
+}
+
+impl MenuEntry {
+    /// Whether navigation may land on this row.
+    pub fn selectable(&self) -> bool {
+        matches!(self, MenuEntry::Action(_))
+    }
+
+    /// The text rendered (and matched) for this row.
+    pub fn label(&self) -> &'static str {
+        match self {
+            MenuEntry::Header(label) => label,
+            MenuEntry::Action(action) => action.label(),
+        }
+    }
+}
+
+/// The Ctrl+P palette rows, in order: grouped commands under bold section titles.
+pub const MENU_ENTRIES: &[MenuEntry] = &[
+    MenuEntry::Header("Tasks"),
+    MenuEntry::Action(MenuAction::NewOneShot),
+    MenuEntry::Header("Catalog"),
+    MenuEntry::Action(MenuAction::AddTask),
+    MenuEntry::Action(MenuAction::CreateSchedule),
+    MenuEntry::Action(MenuAction::CreateNotification),
+    MenuEntry::Header("Repositories"),
+    MenuEntry::Action(MenuAction::SwitchRepo),
+    MenuEntry::Action(MenuAction::AddRepo),
+    MenuEntry::Header("Appearance"),
+    MenuEntry::Action(MenuAction::ChangeTheme),
+    MenuEntry::Header("Help"),
+    MenuEntry::Action(MenuAction::OpenDocs),
 ];
+
+/// The URL the `Open docs` command launches.
+pub const DOCS_URL: &str = "https://oknozor.github.io/favetto/";
 
 /// A clickable screen region (absolute coordinates), populated during draw.
 pub struct ClickRegion {
@@ -1700,26 +1769,135 @@ impl App {
         }
     }
 
-    fn open_form(&mut self, selected: usize) -> UiAction {
-        // The first entry opens the one-shot wizard (which needs an async fetch of
-        // the agent list first).
-        if selected == 0 {
-            return UiAction::OpenWizard;
+    /// Open the Ctrl+P command palette with an empty search and the first
+    /// selectable command highlighted.
+    pub fn open_menu(&mut self) {
+        self.popup = Popup::Menu {
+            selected: first_selectable(MENU_ENTRIES),
+            filter: TextBuffer::default(),
+        };
+    }
+
+    /// The palette rows after applying the current search filter. An empty filter
+    /// shows every group; otherwise only commands matching the query are kept,
+    /// each under its section header (a header with no match is dropped).
+    pub fn menu_entries(&self) -> Vec<MenuEntry> {
+        let filter = match &self.popup {
+            Popup::Menu { filter, .. } => filter.value().to_string(),
+            _ => return MENU_ENTRIES.to_vec(),
+        };
+        if filter.trim().is_empty() {
+            return MENU_ENTRIES.to_vec();
         }
-        // The "Switch repo" entry opens the repo picker (fetching a fresh list).
-        if selected == 4 {
-            self.open_repo_picker();
-            return UiAction::OpenRepoPicker;
+        let matcher = SkimMatcherV2::default();
+        let mut rows = Vec::new();
+        let mut header: Option<MenuEntry> = None;
+        for entry in MENU_ENTRIES {
+            match entry {
+                MenuEntry::Header(_) => header = Some(entry.clone()),
+                MenuEntry::Action(action) => {
+                    if matcher.fuzzy_match(action.label(), &filter).is_some() {
+                        if let Some(header) = header.take() {
+                            rows.push(header);
+                        }
+                        rows.push(MenuEntry::Action(*action));
+                    }
+                }
+            }
         }
-        // The "Change theme" entry opens the theme picker.
-        if selected == 6 {
-            self.open_theme_picker();
-            return UiAction::None;
+        rows
+    }
+
+    /// Move the palette selection by `delta` (negative = up), skipping section
+    /// headers and staying put at either end.
+    pub fn move_menu_selection(&mut self, delta: isize) {
+        let rows = self.menu_entries();
+        let current = match &self.popup {
+            Popup::Menu { selected, .. } => *selected,
+            _ => return,
+        };
+        let mut next = current as isize;
+        loop {
+            next += delta;
+            if next < 0 || next as usize >= rows.len() {
+                return;
+            }
+            if rows[next as usize].selectable() {
+                break;
+            }
         }
-        let kind = match selected {
-            1 => FormKind::AddTask,
-            2 => FormKind::CreateSchedule,
-            3 => FormKind::CreateNotification,
+        if let Popup::Menu { selected, .. } = &mut self.popup {
+            *selected = next as usize;
+        }
+    }
+
+    /// Re-clamp the palette selection after its filter changes: keep it when it is
+    /// still a visible command, otherwise land on the first match.
+    fn clamp_menu_selection(&mut self) {
+        let rows = self.menu_entries();
+        let first = first_selectable(&rows);
+        if let Popup::Menu { selected, .. } = &mut self.popup {
+            let valid = rows.get(*selected).is_some_and(MenuEntry::selectable);
+            if !valid {
+                *selected = first;
+            }
+        }
+    }
+
+    /// The command under the palette's current selection, if any.
+    pub fn selected_menu_action(&self) -> Option<MenuAction> {
+        let rows = self.menu_entries();
+        match &self.popup {
+            Popup::Menu { selected, .. } => match rows.get(*selected) {
+                Some(MenuEntry::Action(action)) => Some(*action),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Run the highlighted command.
+    fn activate_menu_selection(&mut self) -> UiAction {
+        match self.selected_menu_action() {
+            Some(action) => self.dispatch_menu_action(action),
+            None => UiAction::None,
+        }
+    }
+
+    /// Dispatch a palette command by identity. Forms and the repo/theme pickers
+    /// replace the popup; the wizard and the docs browser are executed by the
+    /// session loop and signalled through [`UiAction`].
+    fn dispatch_menu_action(&mut self, action: MenuAction) -> UiAction {
+        match action {
+            MenuAction::NewOneShot => UiAction::OpenWizard,
+            MenuAction::SwitchRepo => {
+                self.open_repo_picker();
+                UiAction::OpenRepoPicker
+            }
+            MenuAction::ChangeTheme => {
+                self.open_theme_picker();
+                UiAction::None
+            }
+            MenuAction::OpenDocs => {
+                self.popup = Popup::None;
+                UiAction::OpenDocs
+            }
+            MenuAction::AddTask
+            | MenuAction::CreateSchedule
+            | MenuAction::CreateNotification
+            | MenuAction::AddRepo => {
+                self.open_form(action);
+                UiAction::None
+            }
+        }
+    }
+
+    /// Build the floating form for a catalog/schedule/hook/repo command.
+    fn open_form(&mut self, action: MenuAction) {
+        let kind = match action {
+            MenuAction::AddTask => FormKind::AddTask,
+            MenuAction::CreateSchedule => FormKind::CreateSchedule,
+            MenuAction::CreateNotification => FormKind::CreateNotification,
             _ => FormKind::AddRepo,
         };
         let (title, fields) = match kind {
@@ -1757,7 +1935,6 @@ impl App {
             values: Vec::new(),
             input: TextBuffer::default(),
         });
-        UiAction::None
     }
 
     /// Open the Ctrl+P "Change theme" picker, previewing the highlighted choice.
@@ -2435,6 +2612,12 @@ fn row_index_at(inner: Rect, offset: usize, len: usize, row: u16, col: u16) -> O
     }
     let index = offset + (row - inner.y) as usize;
     (index < len).then_some(index)
+}
+
+/// Index of the first selectable palette row, or 0 for an empty list (or a list
+/// with no commands).
+fn first_selectable(entries: &[MenuEntry]) -> usize {
+    entries.iter().position(MenuEntry::selectable).unwrap_or(0)
 }
 
 /// Clamp a selection moved by `delta` (negative = up) to `0..len`.

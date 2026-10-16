@@ -55,7 +55,7 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 |---------|-----|--------|
 | Global | `Tab` / `→` | next tab |
 | Global | `Shift+Tab` / `←` | previous tab |
-| Global | `Ctrl+P` | open the action menu |
+| Global | `Ctrl+P` | open the command palette |
 | Global | `Ctrl+O` | pick a live/retained agent session |
 | Global | `?` | open/close help |
 | Global | `w` | open/close the workflow graph |
@@ -88,6 +88,9 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 | Popups | `↑` / `↓` | select |
 | Popups | `Enter` | confirm / next field |
 | Popups | `Esc` | cancel / close |
+| Command palette | characters | filter commands by full-text search |
+| Command palette | `↑` / `↓` | move the selection (headers are skipped) |
+| Command palette | `Enter` | run the highlighted command |
 | Text fields | `←` / `→` | move the caret |
 | Text fields | `Alt+←` / `Alt+→` (or `Ctrl+←`/`Ctrl+→`) | move by word |
 | Text fields | `Home` / `End` (or `Ctrl+A` / `Ctrl+E`) | start / end of line |
@@ -164,7 +167,14 @@ over the agent's own mouse handling, hold **Shift** while dragging to forward th
 drag to an agent that reports mouse events. A finished interactive agent stays
 selectable; the structured view shown for headless runs is not.
 
-Press **Ctrl+P** for guided, step-by-step forms:
+Press **Ctrl+P** to open the **command palette**: a borderless, vertically
+centred panel with a bold **Commands** title, a muted `esc` hint on the right, and
+an inline full-text search directly under the title. Type to filter the commands
+(the matching is a fuzzy, skim-style full-text match); `↑`/`↓` move the highlight,
+**Enter** runs the highlighted command, and `Esc` closes the palette. Commands are
+grouped under bold, non-selectable section titles (**Tasks**, **Catalog**,
+**Repositories**, **Appearance**, **Help**) and dispatch by identity, so grouping
+and filtering never change what a command does.
 
 - **New one-shot task** — a wizard (agent → provider → model → directory) that
   starts an inline, interactive task and opens it in the Agent panel for you to
@@ -173,6 +183,10 @@ Press **Ctrl+P** for guided, step-by-step forms:
 - **Create a schedule event** — adds a cron schedule.
 - **Create a notification (hook)** — adds a hook that reacts to an event kind and
   sends a notification through a channel.
+- **Switch repo** / **Add repo** — change the active repo scope or register a new
+  repo; see [Repo scoping](#repo-scoping).
+- **Change theme** — preview and pick a theme and mode.
+- **Open docs** — opens <https://oknozor.github.io/favetto/> in your browser.
 
 ### One-shot wizard
 
