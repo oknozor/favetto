@@ -7,8 +7,8 @@ use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Bar, BarChart, Block, BorderType, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table,
-    TableState, Wrap,
+    Bar, BarChart, Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, TableState,
+    Wrap,
 };
 use ratatui::Frame;
 
@@ -22,7 +22,7 @@ use super::app::{
     TaskVarsForm, ThemeChoice, Wizard, WizardStep,
 };
 use super::text_buffer::TextBuffer;
-use super::theme::{RaisedLevel, Theme};
+use super::theme::Theme;
 use super::{json, markdown};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -239,25 +239,58 @@ fn paint_scrim(frame: &mut Frame, theme: Theme) {
     frame.buffer_mut().set_style(area, theme.scrim());
 }
 
-/// Paint the scrim, clear `rect`, and fill it with the modal raised surface.
-/// Returns `rect` unchanged so callers can chain their panel render.
-fn draw_dialog_shell(frame: &mut Frame, rect: Rect, theme: Theme) -> Rect {
-    paint_scrim(frame, theme);
-    frame.render_widget(Clear, rect);
-    frame.buffer_mut().set_style(rect, theme.dialog_style());
-    rect
-}
+/// Horizontal inner padding of every floating window.
+const PALETTE_PAD_X: u16 = 2;
+/// Vertical inner padding of every floating window.
+const PALETTE_PAD_Y: u16 = 1;
 
-/// Paint the scrim, clear `rect`, and fill it with the theme's raised *base*
-/// surface. The command palette uses this instead of [`draw_dialog_shell`]: the
-/// base rung reads as a lighter variant of the main background on every theme,
-/// whereas `dialog_style()`'s max rung is a heavy grey on the dark themes and is
-/// darker than the background on the light ones.
-fn draw_surface_shell(frame: &mut Frame, rect: Rect, theme: Theme) -> Rect {
+/// Paint the modal scrim, clear `rect`, fill it with the theme's raised base
+/// surface, and return its 2×1-padded inner area. Every floating window uses
+/// this shell: the base rung reads as a lighter variant of the main background
+/// on every theme, whereas `RaisedLevel::Max` is a heavy grey on the dark
+/// themes and is darker than the background on the light ones.
+fn draw_palette_shell(frame: &mut Frame, rect: Rect, theme: Theme) -> Rect {
     paint_scrim(frame, theme);
     frame.render_widget(Clear, rect);
     frame.buffer_mut().set_style(rect, theme.surface_style());
-    rect
+    rect.inner(Margin::new(PALETTE_PAD_X, PALETTE_PAD_Y))
+}
+
+/// Render `area`'s first row as the shared palette header: a bold left `title`
+/// and a muted right-aligned `hint`, both on the raised surface.
+fn palette_header(frame: &mut Frame, area: Rect, title: &str, hint: &str, theme: Theme) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let gap =
+        (area.width as usize).saturating_sub(title.chars().count() + hint.chars().count() + 2);
+    let row = Rect { height: 1, ..area };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!(" {title}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(format!("{hint} "), theme.disabled()),
+        ]))
+        .style(theme.surface_style()),
+        row,
+    );
+}
+
+/// Render the shared inline ` search: ` row (query plus block cursor) on the
+/// raised surface into the single-row `area`.
+fn palette_search(frame: &mut Frame, area: Rect, filter: &str, theme: Theme) {
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" search: ", theme.block(true)),
+            Span::raw(filter.to_string()),
+            Span::styled("█", theme.selected()),
+        ]))
+        .style(theme.surface_style()),
+        area,
+    );
 }
 
 /// A horizontally-centered rectangle of the given width (percent) and fixed height.
@@ -302,14 +335,18 @@ fn scrolling_body_layout(
     width_pct: u16,
     content_height: u16,
     footer_height: u16,
+    header_height: u16,
     focus: u16,
 ) -> (Rect, u16) {
     let desired = content_height
         .saturating_add(footer_height)
-        .saturating_add(2); // top + bottom border
+        .saturating_add(header_height)
+        .saturating_add(2 * PALETTE_PAD_Y);
     let rect = centered_rect(area, width_pct, desired);
-    let inner_height = rect.height.saturating_sub(2);
-    let viewport = inner_height.saturating_sub(footer_height);
+    let inner_height = rect.height.saturating_sub(2 * PALETTE_PAD_Y);
+    let viewport = inner_height
+        .saturating_sub(header_height)
+        .saturating_sub(footer_height);
     let max_scroll = content_height.saturating_sub(viewport);
     let scroll = if viewport == 0 || focus < viewport {
         0
@@ -330,6 +367,8 @@ struct GrowingPopup {
     /// Popup width as a percentage of `area`.
     width_pct: u16,
     title: String,
+    /// Muted right-aligned close hint in the header row.
+    hint: String,
     content: Vec<Line<'static>>,
     footer: Vec<Line<'static>>,
     focus_line: usize,
@@ -343,38 +382,38 @@ fn draw_growing_popup(frame: &mut Frame, popup: GrowingPopup) -> Rect {
         area,
         width_pct,
         title,
+        hint,
         content,
         footer,
         focus_line,
         theme,
     } = popup;
-    let inner_width = centered_rect(area, width_pct, 0).width.saturating_sub(2);
+    let inner_width = centered_rect(area, width_pct, 0)
+        .width
+        .saturating_sub(2 * PALETTE_PAD_X);
     let content_height = wrapped_height(&content, inner_width);
     let footer_height = wrapped_height(&footer, inner_width); // may wrap too
     let focus = focus_row(&content, focus_line, inner_width);
     let (rect, scroll) =
-        scrolling_body_layout(area, width_pct, content_height, footer_height, focus);
+        scrolling_body_layout(area, width_pct, content_height, footer_height, 1, focus);
 
-    draw_dialog_shell(frame, rect, theme);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(title)
-        .style(theme.dialog_style())
-        .border_style(theme.focused());
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
+    let inner = draw_palette_shell(frame, rect, theme);
 
-    // Content scrolls; footer is a separate, docked row block.
-    let chunks =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(footer_height)]).split(inner);
+    // A shared header, the scrolling content, and a separate docked footer row.
+    let chunks = Layout::vertical([
+        Constraint::Length(1),             // header
+        Constraint::Min(0),                // scrolling content
+        Constraint::Length(footer_height), // docked footer
+    ])
+    .split(inner);
+    palette_header(frame, chunks[0], &title, &hint, theme);
     frame.render_widget(
         Paragraph::new(content)
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0)),
-        chunks[0],
+        chunks[1],
     );
-    frame.render_widget(Paragraph::new(footer).wrap(Wrap { trim: false }), chunks[1]);
+    frame.render_widget(Paragraph::new(footer).wrap(Wrap { trim: false }), chunks[2]);
     rect
 }
 
@@ -454,8 +493,7 @@ fn draw_menu(
     // padding rows, then the entries and spacers.
     let height = (entries.len() + spacers + 5) as u16;
     let rect = centered_rect(area, 30, height);
-    draw_surface_shell(frame, rect, theme);
-    let inner = rect.inner(Margin::new(2, 1));
+    let inner = draw_palette_shell(frame, rect, theme);
 
     let chunks = Layout::vertical([
         Constraint::Length(1), // title
@@ -465,24 +503,8 @@ fn draw_menu(
     ])
     .split(inner);
 
-    // The title row: bold `Commands` left, muted `esc` right.
-    let gap = (inner.width as usize).saturating_sub("Commands".len() + "esc".len() + 2);
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled(" Commands", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" ".repeat(gap)),
-        Span::styled("esc ", theme.disabled()),
-    ]))
-    .style(theme.surface_style());
-    frame.render_widget(title, chunks[0]);
-
-    // Inline full-text search, directly under the title.
-    let search = Paragraph::new(Line::from(vec![
-        Span::styled(" search: ", theme.block(true)),
-        Span::raw(filter.to_string()),
-        Span::styled("█", theme.selected()),
-    ]))
-    .style(theme.surface_style());
-    frame.render_widget(search, chunks[1]);
+    palette_header(frame, chunks[0], "Commands", "esc", theme);
+    palette_search(frame, chunks[1], filter, theme);
 
     let list = if entries.is_empty() {
         List::new(vec![ListItem::new(Line::from(Span::styled(
@@ -548,39 +570,19 @@ fn draw_task_picker(
         .enumerate()
         .filter(|(i, row)| *i > 0 && matches!(row, TaskPickerRow::Header(_)))
         .count();
-    let height = (rows.len() + spacers + 2) as u16;
+    let height = (rows.len() + spacers + 4) as u16;
     let rect = centered_rect(area, 60, height);
-    draw_dialog_shell(frame, rect, theme);
+    let inner = draw_palette_shell(frame, rect, theme);
 
     let chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(0),
     ])
-    .split(rect);
+    .split(inner);
 
-    // The title row: bold `Launch task` left, muted `esc` right.
-    let heading = "Launch task";
-    let gap = (rect.width as usize).saturating_sub(heading.len() + "esc".len() + 2);
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled(
-            format!(" {heading}"),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" ".repeat(gap)),
-        Span::styled("esc ", theme.disabled()),
-    ]))
-    .style(theme.dialog_style());
-    frame.render_widget(title, chunks[0]);
-
-    // Inline full-text search, directly under the title.
-    let search = Paragraph::new(Line::from(vec![
-        Span::styled(" search: ", theme.block(true)),
-        Span::raw(filter.to_string()),
-        Span::styled("█", theme.selected()),
-    ]))
-    .style(theme.dialog_style());
-    frame.render_widget(search, chunks[1]);
+    palette_header(frame, chunks[0], "Launch task", "esc", theme);
+    palette_search(frame, chunks[1], filter, theme);
 
     let list = if rows.is_empty() {
         List::new(vec![ListItem::new(Line::from(Span::styled(
@@ -623,18 +625,12 @@ fn draw_leader_hint(frame: &mut Frame, theme: Theme) {
             ])
         })
         .collect();
-    let height = (rows.len() as u16).saturating_add(2);
+    let height = (rows.len() as u16).saturating_add(3);
     let rect = centered_rect(area, 50, height);
-    draw_dialog_shell(frame, rect, theme);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(" Shortcuts · Ctrl+X ")
-        .style(theme.dialog_style())
-        .border_style(theme.focused());
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-    frame.render_widget(Paragraph::new(rows), inner);
+    let inner = draw_palette_shell(frame, rect, theme);
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    palette_header(frame, chunks[0], "Shortcuts", "Ctrl+X · esc", theme);
+    frame.render_widget(Paragraph::new(rows), chunks[1]);
 }
 
 /// Draw the Ctrl+O session picker: one row per live/retained agent session,
@@ -646,7 +642,10 @@ fn draw_sessions_picker(
     theme: Theme,
 ) {
     let area = frame.area();
-    let rect = centered_rect(area, 70, (sessions.len() as u16).saturating_add(2));
+    let rect = centered_rect(area, 70, (sessions.len() as u16).saturating_add(3));
+    let inner = draw_palette_shell(frame, rect, theme);
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    palette_header(frame, chunks[0], "Agent sessions", "esc", theme);
 
     let items: Vec<ListItem> = sessions
         .iter()
@@ -687,18 +686,8 @@ fn draw_sessions_picker(
         })
         .collect();
 
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(" Ctrl+O — Agent sessions ")
-                .style(theme.dialog_style())
-                .border_style(theme.focused()),
-        )
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
-    draw_dialog_shell(frame, rect, theme);
-    frame.render_widget(list, rect);
+    let list = List::new(items);
+    frame.render_widget(list, chunks[1]);
 }
 
 /// Draw the Ctrl+P "Switch repo" picker: a live search input plus the filtered
@@ -713,25 +702,16 @@ fn draw_repo_picker(
     let area = frame.area();
     let height = (entries.len() as u16).saturating_add(4);
     let rect = centered_rect(area, 70, height);
-    draw_dialog_shell(frame, rect, theme);
+    let inner = draw_palette_shell(frame, rect, theme);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(" Ctrl+P — Switch repo ")
-        .style(theme.dialog_style())
-        .border_style(theme.focused());
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-
-    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
-    let search = Paragraph::new(Line::from(vec![
-        Span::styled("filter: ", theme.block(true)),
-        Span::raw(filter.to_string()),
-        Span::styled("█", theme.selected()),
-    ]))
-    .style(theme.base());
-    frame.render_widget(search, chunks[0]);
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .split(inner);
+    palette_header(frame, chunks[0], "Switch repo", "esc", theme);
+    palette_search(frame, chunks[1], filter, theme);
 
     let items: Vec<ListItem> = entries
         .iter()
@@ -745,15 +725,18 @@ fn draw_repo_picker(
             ListItem::new(Line::from(Span::styled(format!(" {label} "), style)))
         })
         .collect();
-    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::BOLD));
-    frame.render_widget(list, chunks[1]);
+    let list = List::new(items);
+    frame.render_widget(list, chunks[2]);
 }
 
 /// Draw the Ctrl+P "Change theme" picker: a header-separated list of themes and
 /// modes. The highlighted choice is previewed live by the input handler.
 fn draw_theme_picker(frame: &mut Frame, selected: usize, entries: &[ThemeChoice], theme: Theme) {
     let area = frame.area();
-    let rect = centered_rect(area, 50, (entries.len() as u16).saturating_add(2));
+    let rect = centered_rect(area, 50, (entries.len() as u16).saturating_add(3));
+    let inner = draw_palette_shell(frame, rect, theme);
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    palette_header(frame, chunks[0], "Theme", "esc", theme);
 
     let items: Vec<ListItem> = entries
         .iter()
@@ -774,18 +757,8 @@ fn draw_theme_picker(frame: &mut Frame, selected: usize, entries: &[ThemeChoice]
         })
         .collect();
 
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(" Ctrl+P — Theme ")
-                .style(theme.dialog_style())
-                .border_style(theme.focused()),
-        )
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
-    draw_dialog_shell(frame, rect, theme);
-    frame.render_widget(list, rect);
+    let list = List::new(items);
+    frame.render_widget(list, chunks[1]);
 }
 
 /// Draw the Ctrl+R reply popup: the precise prompt from the agent's state
@@ -835,7 +808,8 @@ fn draw_reply(frame: &mut Frame, prompt: &ReplyPrompt, theme: Theme) {
         GrowingPopup {
             area,
             width_pct: 60,
-            title: " Ctrl+R — reply ".to_string(),
+            title: "Reply".to_string(),
+            hint: "esc".to_string(),
             content,
             footer,
             focus_line: 0,
@@ -864,7 +838,8 @@ fn draw_confirm(frame: &mut Frame, prompt: &ConfirmPrompt, theme: Theme) {
         GrowingPopup {
             area,
             width_pct: 60,
-            title: prompt.title.to_string(),
+            title: prompt.title.trim().to_string(),
+            hint: "esc".to_string(),
             content,
             footer,
             focus_line: 0,
@@ -908,7 +883,8 @@ fn draw_task_error(frame: &mut Frame, app: &App, task_id: uuid::Uuid, theme: The
         GrowingPopup {
             area: frame.area(),
             width_pct: 70,
-            title: " Task error ".to_string(),
+            title: "Task error".to_string(),
+            hint: "x / esc".to_string(),
             content,
             footer,
             focus_line: 0,
@@ -958,7 +934,8 @@ fn draw_task_result(frame: &mut Frame, task: &Task, theme: Theme) {
         GrowingPopup {
             area: frame.area(),
             width_pct: 70,
-            title: " Action result ".to_string(),
+            title: "Action result".to_string(),
+            hint: "esc".to_string(),
             content,
             footer,
             focus_line: 0,
@@ -990,7 +967,8 @@ fn draw_config_error(frame: &mut Frame, path: &str, errors: &[String], theme: Th
         GrowingPopup {
             area: frame.area(),
             width_pct: 70,
-            title: " Invalid config ".to_string(),
+            title: "Invalid config".to_string(),
+            hint: "esc".to_string(),
             content,
             footer,
             focus_line: 0,
@@ -1051,7 +1029,8 @@ fn draw_form(frame: &mut Frame, form: &Form, theme: Theme) -> Rect {
         GrowingPopup {
             area,
             width_pct: 70,
-            title: " Step-by-step form ".to_string(),
+            title: "Step-by-step form".to_string(),
+            hint: "esc".to_string(),
             content,
             footer,
             focus_line,
@@ -1145,7 +1124,8 @@ fn draw_wizard(
         GrowingPopup {
             area,
             width_pct: 70,
-            title: " New one-shot task ".to_string(),
+            title: "New one-shot task".to_string(),
+            hint: "esc".to_string(),
             content,
             footer,
             focus_line,
@@ -1239,7 +1219,8 @@ fn draw_task_vars(frame: &mut Frame, form: &TaskVarsForm, theme: Theme) -> Rect 
         GrowingPopup {
             area,
             width_pct: 70,
-            title: " Task input ".to_string(),
+            title: "Task input".to_string(),
+            hint: "esc".to_string(),
             content,
             footer,
             focus_line,
@@ -1450,25 +1431,17 @@ fn help_lines(theme: Theme) -> Vec<Line<'static>> {
 fn draw_help(frame: &mut Frame, scroll: &mut u16, theme: Theme) {
     let area = frame.area();
     let rect = centered_rect(area, 80, area.height.saturating_sub(2));
+    let inner = draw_palette_shell(frame, rect, theme);
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    palette_header(frame, chunks[0], "Help", "? / esc", theme);
 
-    let paragraph = Paragraph::new(help_lines(theme))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(" Help (?) — ↑/↓ scroll, Esc/? close ")
-                .style(theme.dialog_style())
-                .border_style(theme.focused()),
-        )
-        .wrap(Wrap { trim: false });
-    let inner_width = rect.width.saturating_sub(2);
-    let inner_height = rect.height.saturating_sub(2);
+    let body = chunks[1];
+    let paragraph = Paragraph::new(help_lines(theme)).wrap(Wrap { trim: false });
     // `line_count` returns `usize`; the preview pane uses the same conversion.
-    let max_scroll = (paragraph.line_count(inner_width) as u16).saturating_sub(inner_height);
+    let max_scroll = (paragraph.line_count(body.width) as u16).saturating_sub(body.height);
     *scroll = (*scroll).min(max_scroll);
 
-    draw_dialog_shell(frame, rect, theme);
-    frame.render_widget(paragraph.scroll((*scroll, 0)), rect);
+    frame.render_widget(paragraph.scroll((*scroll, 0)), body);
 }
 
 /// Arguments for [`draw_workflow`]: the cached structured graph (when present),
@@ -1498,15 +1471,17 @@ fn draw_workflow(frame: &mut Frame, overlay: WorkflowOverlay<'_>) {
     } = overlay;
     let area = frame.area();
     let rect = centered_rect(area, 90, area.height.saturating_sub(2));
-    let hint = " Workflow (w) — ↑/↓/←/→/PgUp/PgDn scroll, Esc/w close ";
     let title = match path {
-        Some(p) => format!("{hint}— {p} "),
-        None => hint.to_string(),
+        Some(p) => format!("Workflow · {p}"),
+        None => "Workflow".to_string(),
     };
-    let inner_width = rect.width.saturating_sub(2);
-    let inner_height = rect.height.saturating_sub(2);
 
-    draw_dialog_shell(frame, rect, theme);
+    let inner = draw_palette_shell(frame, rect, theme);
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    palette_header(frame, chunks[0], &title, "w / esc", theme);
+    let body = chunks[1];
+    let inner_width = body.width;
+    let inner_height = body.height;
 
     if let Some(lines) = lines {
         // Cached render: keep the art intact (no wrapping) and scroll both axes.
@@ -1524,17 +1499,8 @@ fn draw_workflow(frame: &mut Frame, overlay: WorkflowOverlay<'_>) {
         *scroll = (*scroll).min(max_scroll);
         *hscroll = (*hscroll).min(max_hscroll);
 
-        let paragraph = Paragraph::new(content)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .title(title)
-                    .style(theme.dialog_style())
-                    .border_style(theme.focused()),
-            )
-            .scroll((*scroll, *hscroll));
-        frame.render_widget(paragraph, rect);
+        let paragraph = Paragraph::new(content).scroll((*scroll, *hscroll));
+        frame.render_widget(paragraph, body);
         return;
     }
 
@@ -1547,20 +1513,11 @@ fn draw_workflow(frame: &mut Frame, overlay: WorkflowOverlay<'_>) {
         )));
     }
     content.push(Line::from(dot.unwrap_or("Loading workflow graph…")));
-    let paragraph = Paragraph::new(content)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(title)
-                .style(theme.dialog_style())
-                .border_style(theme.focused()),
-        )
-        .wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(content).wrap(Wrap { trim: false });
     let max_scroll = (paragraph.line_count(inner_width) as u16).saturating_sub(inner_height);
     *scroll = (*scroll).min(max_scroll);
 
-    frame.render_widget(paragraph.scroll((*scroll, 0)), rect);
+    frame.render_widget(paragraph.scroll((*scroll, 0)), body);
 }
 
 /// Draw the runtime workflow inspector (`i` on the Tasks tab): the root's state,
@@ -1575,27 +1532,17 @@ fn draw_workflow_runtime(frame: &mut Frame, app: &App) {
     let area = frame.area();
     let rect = centered_rect(area, 90, area.height.saturating_sub(2));
 
-    draw_dialog_shell(frame, rect, theme);
-
     let title = match &rt.view {
-        Some(view) => format!(
-            " Runtime workflow (i) — {} [{}] — ↑/↓ select, c cancel, r retry, Esc/i close ",
-            view.root_task,
-            state_label(view.state),
-        ),
-        None => " Runtime workflow (i) — Esc/i close ".to_string(),
+        Some(view) => format!("Runtime workflow · {}", state_label(view.state)),
+        None => "Runtime workflow".to_string(),
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(title)
-        .style(theme.dialog_style())
-        .border_style(theme.focused());
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
+    let inner = draw_palette_shell(frame, rect, theme);
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    palette_header(frame, chunks[0], &title, "i / esc", theme);
+    let body = chunks[1];
 
-    if inner.width == 0 || inner.height == 0 {
+    if body.width == 0 || body.height == 0 {
         return;
     }
 
@@ -1613,7 +1560,7 @@ fn draw_workflow_runtime(frame: &mut Frame, app: &App) {
             Paragraph::new(placeholder)
                 .wrap(Wrap { trim: false })
                 .style(Style::default().fg(color)),
-            inner,
+            body,
         );
         return;
     };
@@ -1621,7 +1568,7 @@ fn draw_workflow_runtime(frame: &mut Frame, app: &App) {
     // Header (buckets + any stale-view error), then the instance table.
     let header_height = 1u16 + u16::from(rt.error.is_some());
     let chunks =
-        Layout::vertical([Constraint::Length(header_height), Constraint::Min(0)]).split(inner);
+        Layout::vertical([Constraint::Length(header_height), Constraint::Min(0)]).split(body);
 
     let mut header = vec![bucket_line(view, theme)];
     if let Some(err) = &rt.error {
@@ -1719,11 +1666,7 @@ fn draw_catalog(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     if area.width < CATALOG_PREVIEW_DOCK_MIN_WIDTH {
         draw_catalog_table(frame, app, area, theme);
         let rect = centered_rect(area, 80, area.height.saturating_sub(2));
-        frame.render_widget(Clear, rect);
-        frame
-            .buffer_mut()
-            .set_style(rect, theme.raised_style(RaisedLevel::High));
-        draw_catalog_preview(frame, app, rect, theme);
+        draw_catalog_preview(frame, app, rect, theme, true);
         return;
     }
 
@@ -1731,7 +1674,7 @@ fn draw_catalog(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     let chunks =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
     draw_catalog_table(frame, app, chunks[0], theme);
-    draw_catalog_preview(frame, app, chunks[1], theme);
+    draw_catalog_preview(frame, app, chunks[1], theme, false);
 }
 
 /// Folder/task glyphs for the Catalog tree. Terminals that render the emoji at
@@ -1861,16 +1804,15 @@ fn draw_catalog_table(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme
     };
 }
 
-fn draw_catalog_preview(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
-    // Remember the pane's rectangle so the mouse wheel can be targeted at it.
-    app.catalog_preview_area = Some(area);
-
-    let (name, lines) = match app.catalog_preview.as_ref() {
+/// The `(name, lines)` shown by the Catalog preview, rendered from the cached
+/// Markdown. Owns its output so the caller can freely write `app` fields.
+fn catalog_preview_content(app: &App, theme: Theme) -> (Option<String>, Vec<Line<'static>>) {
+    match app.catalog_preview.as_ref() {
         Some((name, markdown)) if !markdown.trim().is_empty() => {
-            (Some(name.as_str()), markdown::render_task(markdown, &theme))
+            (Some(name.clone()), markdown::render_task(markdown, &theme))
         }
         Some((name, _)) => (
-            Some(name.as_str()),
+            Some(name.clone()),
             vec![Line::from(Span::styled(
                 "(no content)",
                 Style::default().fg(theme.muted()),
@@ -1883,10 +1825,43 @@ fn draw_catalog_preview(frame: &mut Frame, app: &mut App, area: Rect, theme: The
                 Style::default().fg(theme.muted()),
             ))],
         ),
-    };
+    }
+}
 
-    // Measure the wrapped content so the scroll offset can be clamped to it.
+fn draw_catalog_preview(
+    frame: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    theme: Theme,
+    floating: bool,
+) {
+    // Remember the pane's rectangle so the mouse wheel can be targeted at it.
+    app.catalog_preview_area = Some(area);
+
+    let (name, lines) = catalog_preview_content(app, theme);
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+
+    if floating {
+        // Floating overlays share the palette chrome: a borderless raised base
+        // surface, a 2×1 inset, and a bold title with a muted close hint.
+        let inner = draw_palette_shell(frame, area, theme);
+        let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+        let body = chunks[1];
+        let line_count = paragraph.line_count(body.width) as u16;
+        app.catalog_preview_max_scroll = line_count.saturating_sub(body.height);
+        app.catalog_preview_scroll = app
+            .catalog_preview_scroll
+            .min(app.catalog_preview_max_scroll);
+        let title = match &name {
+            Some(name) => format!("Preview · {name}"),
+            None => "Preview".to_string(),
+        };
+        palette_header(frame, chunks[0], &title, "p", theme);
+        frame.render_widget(paragraph.scroll((app.catalog_preview_scroll, 0)), body);
+        return;
+    }
+
+    // Docked 50/50 pane: a bordered panel, like the tree next to it.
     let inner_width = area.width.saturating_sub(2);
     let inner_height = area.height.saturating_sub(2);
     let line_count = paragraph.line_count(inner_width) as u16;

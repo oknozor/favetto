@@ -200,8 +200,10 @@ Press **`p`** to show or hide the preview pane. When hidden the tree takes the
 full width and no preview is fetched; showing it again loads the selected task
 lazily. On terminals narrower than 100 columns there is no room for a usable
 side-by-side split, so the tree stays full-width and the preview is drawn as a
-centered floating window instead. The window stays scrollable but does not take
-the keyboard, so you can keep navigating the tree behind it.
+centered floating window instead, using the same [palette
+chrome](tui.md#floating-windows) as the command palette (borderless on the raised
+base surface, a bold title, and the muted `p` hint). The window stays scrollable
+but does not take the keyboard, so you can keep navigating the tree behind it.
 
 ## Live reload
 

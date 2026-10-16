@@ -1,4 +1,5 @@
 use super::super::app::AgentSelection;
+use super::super::theme::RaisedLevel;
 use super::*;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
@@ -55,138 +56,143 @@ fn all_tabs_render_without_panic() {
     }
 }
 
+/// Every `Popup` variant the renderer handles, for the render-loop and chrome
+/// tests. Popups that read `App` state render their empty/fallback path.
+fn sample_popups() -> Vec<Popup> {
+    vec![
+        Popup::Menu {
+            selected: 0,
+            filter: TextBuffer::default(),
+        },
+        Popup::Form(Form {
+            kind: super::super::app::FormKind::AddTask,
+            title: "Add task to catalog",
+            fields: vec!["Task name", "Prompt"],
+            current: 0,
+            values: Vec::new(),
+            input: TextBuffer::default(),
+        }),
+        Popup::Wizard(Wizard {
+            step: WizardStep::Agent,
+            selected: 0,
+            choices: vec![("opencode".to_string(), "opencode".to_string())],
+            providers: Vec::new(),
+            capabilities: AgentCapabilities::default(),
+            agent_caps: BTreeMap::new(),
+            available: BTreeMap::new(),
+            agent: None,
+            provider: None,
+            model: None,
+            dir: TextBuffer::default(),
+            loading: false,
+            error: None,
+        }),
+        Popup::Wizard(Wizard {
+            step: WizardStep::Provider,
+            selected: 0,
+            choices: Vec::new(),
+            providers: Vec::new(),
+            capabilities: AgentCapabilities::default(),
+            agent_caps: BTreeMap::new(),
+            available: BTreeMap::new(),
+            agent: Some("opencode".to_string()),
+            provider: None,
+            model: None,
+            dir: TextBuffer::default(),
+            loading: true,
+            error: Some("boom".to_string()),
+        }),
+        Popup::TaskVars(TaskVarsForm {
+            task: "issue".to_string(),
+            vars: vec![crate::tasks::TaskVar {
+                name: "description".to_string(),
+                prompt: "Describe".to_string(),
+                default: Some("draft".to_string()),
+                required: true,
+                multiline: false,
+                var_type: crate::tasks::VarType::String,
+                choices: None,
+            }],
+            current: 0,
+            values: vec![TextBuffer::new("draft")],
+            choice_selected: vec![0],
+            error: None,
+        }),
+        Popup::Help { scroll: 0 },
+        Popup::Workflow {
+            scroll: 0,
+            hscroll: 0,
+        },
+        runtime_popup(uuid::Uuid::new_v4(), None),
+        Popup::Sessions {
+            selected: 0,
+            sessions: vec![
+                session("s1", "opencode", false, true),
+                session("s2", "pi", true, false),
+            ],
+        },
+        Popup::Reply(ReplyPrompt::new(
+            "s1".to_string(),
+            favetto_core::model::InputRequest {
+                id: "perm_1".to_string(),
+                kind: favetto_core::model::AwaitingInputKind::Permission,
+                message: "Allow bash?".to_string(),
+                options: vec!["Allow once".to_string(), "Reject".to_string()],
+                allow_always: true,
+            },
+        )),
+        Popup::Confirm(ConfirmPrompt {
+            title: " Cancel task ",
+            message: vec!["Cancel task 'stuck' (attempt 2)?".to_string()],
+            method: favetto_core::rpc::method::TASKS_CANCEL,
+            params: serde_json::json!({ "id": uuid::Uuid::nil() }),
+        }),
+        // Renders the "no longer in the list" fallback for an unknown id.
+        Popup::TaskError {
+            task_id: uuid::Uuid::new_v4(),
+        },
+        Popup::TaskResult {
+            task: Box::new(geom_task("new_issues")),
+        },
+        Popup::RepoPicker {
+            selected: 0,
+            filter: TextBuffer::new("fav"),
+        },
+        Popup::TaskPicker {
+            selected: 0,
+            filter: TextBuffer::new("tri"),
+        },
+        Popup::ThemePicker {
+            selected: 0,
+            entries: vec![
+                ThemeChoice::Header("Theme"),
+                ThemeChoice::Choice {
+                    theme: "opencode".to_string(),
+                    mode: super::super::theme::ThemeMode::Dark,
+                    label: "Opencode".to_string(),
+                },
+                ThemeChoice::Header("Mode"),
+                ThemeChoice::Choice {
+                    theme: "opencode".to_string(),
+                    mode: super::super::theme::ThemeMode::Light,
+                    label: "Light".to_string(),
+                },
+            ],
+            original: Theme::dark(),
+        },
+        Popup::ConfigError {
+            path: "/home/u/.config/favetto/config.toml".to_string(),
+            errors: vec![
+                "invalid type: string, expected a boolean for key `executor.parallel`".to_string(),
+            ],
+        },
+    ]
+}
+
 #[test]
 fn all_popups_render_without_panic() {
     for theme in all_themes() {
-        for popup in [
-            Popup::Menu {
-                selected: 0,
-                filter: TextBuffer::default(),
-            },
-            Popup::Form(Form {
-                kind: super::super::app::FormKind::AddTask,
-                title: "Add task to catalog",
-                fields: vec!["Task name", "Prompt"],
-                current: 0,
-                values: Vec::new(),
-                input: TextBuffer::default(),
-            }),
-            Popup::Wizard(Wizard {
-                step: WizardStep::Agent,
-                selected: 0,
-                choices: vec![("opencode".to_string(), "opencode".to_string())],
-                providers: Vec::new(),
-                capabilities: AgentCapabilities::default(),
-                agent_caps: BTreeMap::new(),
-                available: BTreeMap::new(),
-                agent: None,
-                provider: None,
-                model: None,
-                dir: TextBuffer::default(),
-                loading: false,
-                error: None,
-            }),
-            Popup::Wizard(Wizard {
-                step: WizardStep::Provider,
-                selected: 0,
-                choices: Vec::new(),
-                providers: Vec::new(),
-                capabilities: AgentCapabilities::default(),
-                agent_caps: BTreeMap::new(),
-                available: BTreeMap::new(),
-                agent: Some("opencode".to_string()),
-                provider: None,
-                model: None,
-                dir: TextBuffer::default(),
-                loading: true,
-                error: Some("boom".to_string()),
-            }),
-            Popup::TaskVars(TaskVarsForm {
-                task: "issue".to_string(),
-                vars: vec![crate::tasks::TaskVar {
-                    name: "description".to_string(),
-                    prompt: "Describe".to_string(),
-                    default: Some("draft".to_string()),
-                    required: true,
-                    multiline: false,
-                    var_type: crate::tasks::VarType::String,
-                    choices: None,
-                }],
-                current: 0,
-                values: vec![TextBuffer::new("draft")],
-                choice_selected: vec![0],
-                error: None,
-            }),
-            Popup::Help { scroll: 0 },
-            Popup::Workflow {
-                scroll: 0,
-                hscroll: 0,
-            },
-            runtime_popup(uuid::Uuid::new_v4(), None),
-            Popup::Sessions {
-                selected: 0,
-                sessions: vec![
-                    session("s1", "opencode", false, true),
-                    session("s2", "pi", true, false),
-                ],
-            },
-            Popup::Reply(ReplyPrompt::new(
-                "s1".to_string(),
-                favetto_core::model::InputRequest {
-                    id: "perm_1".to_string(),
-                    kind: favetto_core::model::AwaitingInputKind::Permission,
-                    message: "Allow bash?".to_string(),
-                    options: vec!["Allow once".to_string(), "Reject".to_string()],
-                    allow_always: true,
-                },
-            )),
-            Popup::Confirm(ConfirmPrompt {
-                title: " Cancel task ",
-                message: vec!["Cancel task 'stuck' (attempt 2)?".to_string()],
-                method: favetto_core::rpc::method::TASKS_CANCEL,
-                params: serde_json::json!({ "id": uuid::Uuid::nil() }),
-            }),
-            // Renders the "no longer in the list" fallback for an unknown id.
-            Popup::TaskError {
-                task_id: uuid::Uuid::new_v4(),
-            },
-            Popup::TaskResult {
-                task: Box::new(geom_task("new_issues")),
-            },
-            Popup::RepoPicker {
-                selected: 0,
-                filter: TextBuffer::new("fav"),
-            },
-            Popup::TaskPicker {
-                selected: 0,
-                filter: TextBuffer::new("tri"),
-            },
-            Popup::ThemePicker {
-                selected: 0,
-                entries: vec![
-                    ThemeChoice::Header("Theme"),
-                    ThemeChoice::Choice {
-                        theme: "opencode".to_string(),
-                        mode: super::super::theme::ThemeMode::Dark,
-                        label: "Opencode".to_string(),
-                    },
-                    ThemeChoice::Header("Mode"),
-                    ThemeChoice::Choice {
-                        theme: "opencode".to_string(),
-                        mode: super::super::theme::ThemeMode::Light,
-                        label: "Light".to_string(),
-                    },
-                ],
-                original: Theme::dark(),
-            },
-            Popup::ConfigError {
-                path: "/home/u/.config/favetto/config.toml".to_string(),
-                errors: vec![
-                    "invalid type: string, expected a boolean for key `executor.parallel`"
-                        .to_string(),
-                ],
-            },
-        ] {
+        for popup in sample_popups() {
             let mut app = App::with_theme(theme);
             app.popup = popup;
             let backend = TestBackend::new(100, 40);
@@ -430,6 +436,130 @@ fn dialog_scrim_covers_the_frame() {
     let scrim = theme.scrim().bg.expect("scrim has a background");
     assert_eq!(terminal.backend().buffer().cell((0, 0)).unwrap().bg, scrim);
     assert_ne!(scrim, theme.bg());
+}
+
+/// Assert a rendered frame carries the shared palette chrome: the scrim covers
+/// the panel's surroundings, the raised *base* surface paints the panel, and
+/// neither upper raised rung (the old dialog/dock surfaces) appears anywhere.
+fn assert_palette_surface(app: &mut App, width: u16, height: u16) {
+    let theme = app.theme;
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| draw(f, app)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let area = *buffer.area();
+
+    let scrim = theme.scrim().bg.expect("scrim has a background");
+    let base = theme.raised(RaisedLevel::Base);
+    let high = theme.background.raised.high;
+    let max = theme.background.raised.max;
+
+    assert_eq!(
+        buffer.cell((0, 0)).unwrap().bg,
+        scrim,
+        "scrim missing at the frame corner"
+    );
+
+    let mut saw_base = false;
+    for y in 0..area.height {
+        for x in 0..area.width {
+            let bg = buffer.cell((x, y)).unwrap().bg;
+            if bg == base {
+                saw_base = true;
+            }
+            // Monochrome collapses every rung to `Reset`, so only forbid a rung
+            // when it is distinct from the base/scrim actually in use.
+            if bg != base && bg != scrim {
+                assert_ne!(bg, high, "raised high surface painted at ({x},{y})");
+                assert_ne!(bg, max, "raised max surface painted at ({x},{y})");
+            }
+        }
+    }
+    assert!(
+        saw_base,
+        "panel is not painted with the raised base surface"
+    );
+}
+
+#[test]
+fn floating_windows_paint_the_palette_surface() {
+    for theme in all_themes() {
+        for popup in sample_popups() {
+            let mut app = App::with_theme(theme);
+            app.popup = popup;
+            assert_palette_surface(&mut app, 100, 40);
+        }
+
+        // The Ctrl+X leader hint is a floating window too.
+        let mut app = App::with_theme(theme);
+        app.leader_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        assert_palette_surface(&mut app, 100, 40);
+
+        // The narrow-terminal floating Catalog preview.
+        let mut app = App::with_theme(theme);
+        app.tab = Tab::Catalog;
+        app.set_catalog(vec![catalog_entry("demo")]);
+        app.catalog_preview = Some(("demo".to_string(), "# Heading\n".to_string()));
+        assert_palette_surface(&mut app, CATALOG_PREVIEW_DOCK_MIN_WIDTH - 1, 30);
+    }
+}
+
+#[test]
+fn palette_shell_pads_content_2x1() {
+    let theme = Theme::dark();
+    let rect = Rect::new(5, 3, 40, 12);
+    let backend = TestBackend::new(60, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut inner = Rect::default();
+    terminal
+        .draw(|f| {
+            inner = draw_palette_shell(f, rect, theme);
+        })
+        .unwrap();
+
+    // The returned area is inset by the shared 2×1 padding.
+    assert_eq!(inner, Rect::new(7, 4, 36, 10));
+    let buffer = terminal.backend().buffer();
+    let base = theme.surface_style().bg.expect("surface has a background");
+    assert_eq!(buffer.cell((rect.x, rect.y)).unwrap().bg, base);
+    assert_eq!(buffer.cell((inner.x, inner.y)).unwrap().bg, base);
+    let scrim = theme.scrim().bg.expect("scrim has a background");
+    assert_eq!(buffer.cell((0, 0)).unwrap().bg, scrim);
+}
+
+#[test]
+fn task_picker_header_hint_uses_inner_width() {
+    let mut repo_entry = catalog_entry("repo:favetto/triage");
+    repo_entry.repo = Some("favetto".to_string());
+    let mut app = App::new();
+    app.set_catalog(vec![catalog_entry("plan"), repo_entry]);
+    app.open_task_picker();
+
+    // Recompute the picker's centered rect so the header row is unambiguous.
+    let entries = app.task_picker_entries();
+    let spacers = entries
+        .iter()
+        .enumerate()
+        .filter(|(i, row)| *i > 0 && matches!(row, TaskPickerRow::Header(_)))
+        .count();
+    let height = (entries.len() + spacers + 4) as u16;
+
+    let (width, screen) = (100u16, 40u16);
+    let backend = TestBackend::new(width, screen);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+    let panel = centered_rect(Rect::new(0, 0, width, screen), 60, height);
+    let row = panel.y + PALETTE_PAD_Y;
+    let inner_right = panel.x + panel.width - PALETTE_PAD_X; // exclusive
+    let buffer = terminal.backend().buffer();
+    let hint: String = ((inner_right - 4)..inner_right)
+        .map(|x| buffer.cell((x, row)).unwrap().symbol())
+        .collect();
+    assert_eq!(
+        hint, "esc ",
+        "hint must sit at the padded inner edge: {hint:?}"
+    );
 }
 
 #[test]
@@ -1286,7 +1416,10 @@ fn session_picker_renders_each_session() {
         session("s2", "pi", true, false),
     ]);
     let text = render_text(&mut app, 100, 24);
-    assert!(text.contains("Ctrl+O"), "picker title missing: {text:?}");
+    assert!(
+        text.contains("Agent sessions"),
+        "picker title missing: {text:?}"
+    );
     assert!(text.contains("opencode"), "first agent missing: {text:?}");
     assert!(text.contains("pi"), "second agent missing: {text:?}");
     assert!(
@@ -1371,7 +1504,7 @@ fn reply_popup_renders_message_and_options() {
     app.popup = Popup::Reply(ReplyPrompt::new("s1".to_string(), request));
 
     let text = render_text(&mut app, 100, 30);
-    assert!(text.contains("Ctrl+R"), "title missing: {text:?}");
+    assert!(text.contains("Reply"), "title missing: {text:?}");
     assert!(
         text.contains("Allow bash to run tests?"),
         "message missing: {text:?}"
@@ -2081,7 +2214,7 @@ fn task_vars_short_value_keeps_fixed_height() {
     } else {
         panic!("expected task vars popup");
     }
-    assert_eq!(rect.height, 7, "short var height changed: {rect:?}");
+    assert_eq!(rect.height, 8, "short var height changed: {rect:?}");
 
     let text = render_text(&mut app, 100, 40);
     assert!(text.contains('█'), "cursor missing: {text:?}");
@@ -2176,9 +2309,13 @@ fn form_popup_long_prompt_keeps_cursor_visible() {
 
 #[test]
 fn scrolling_body_layout_clamps_scroll() {
-    let (rect, scroll) = scrolling_body_layout(Rect::new(0, 0, 80, 24), 70, 40, 2, 39);
+    let (rect, scroll) = scrolling_body_layout(Rect::new(0, 0, 80, 24), 70, 40, 2, 1, 39);
     assert!(rect.height <= 20, "popup exceeds frame: {rect:?}");
-    let viewport = rect.height.saturating_sub(2).saturating_sub(2);
+    let viewport = rect
+        .height
+        .saturating_sub(2 * PALETTE_PAD_Y)
+        .saturating_sub(1)
+        .saturating_sub(2);
     assert!(viewport > 0);
     assert!(scroll + viewport > 39);
     assert!(scroll <= 40 - viewport);
