@@ -99,6 +99,7 @@ impl App {
             Popup::TaskError { .. } => return self.handle_task_error_key(key.code),
             Popup::TaskResult { .. } => return self.handle_task_result_key(key.code),
             Popup::RepoPicker { .. } => return self.handle_repo_picker_key(key),
+            Popup::TaskPicker { .. } => return self.handle_task_picker_key(key),
             Popup::ThemePicker { .. } => return self.handle_theme_picker_key(key.code),
             Popup::ConfigError { .. } => return self.handle_config_error_key(key.code),
             Popup::None => {}
@@ -659,6 +660,44 @@ impl App {
                 UiAction::None
             }
             KeyCode::Enter => self.activate_selected_repo(),
+            _ => UiAction::None,
+        }
+    }
+
+    /// Keys while the Ctrl+P "Launch task" picker is open: printable characters
+    /// build the filter, arrows move the selection (skipping group headers),
+    /// Enter launches the highlighted task, Esc closes.
+    pub(super) fn handle_task_picker_key(&mut self, key: KeyEvent) -> UiAction {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Esc => {
+                self.popup = Popup::None;
+                UiAction::None
+            }
+            KeyCode::Up => {
+                self.move_task_picker_selection(-1);
+                UiAction::None
+            }
+            KeyCode::Down => {
+                self.move_task_picker_selection(1);
+                UiAction::None
+            }
+            KeyCode::Backspace => {
+                if let Popup::TaskPicker { filter, .. } = &mut self.popup {
+                    filter.backspace();
+                }
+                self.clamp_task_picker_selection();
+                UiAction::None
+            }
+            KeyCode::Char(c) if !ctrl && !alt => {
+                if let Popup::TaskPicker { filter, .. } = &mut self.popup {
+                    filter.insert_char(c);
+                }
+                self.clamp_task_picker_selection();
+                UiAction::None
+            }
+            KeyCode::Enter => self.activate_task_picker_selection(),
             _ => UiAction::None,
         }
     }

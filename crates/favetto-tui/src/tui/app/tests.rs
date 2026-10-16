@@ -884,6 +884,7 @@ fn question_mark_is_literal_inside_form() {
     let mut app = App::new();
     app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
     app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+    app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
     app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
     let Popup::Form(form) = &app.popup else {
         panic!("expected form");
@@ -1345,6 +1346,7 @@ fn catalog_preview_is_literal_inside_form() {
     let mut app = App::new();
     app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
     app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+    app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
     app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
     let Popup::Form(form) = &app.popup else {
         panic!("expected form");
@@ -1400,6 +1402,7 @@ fn catalog_edit_key_is_noop_on_folder() {
 fn catalog_edit_key_literal_inside_form() {
     let mut app = App::new();
     app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
     app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
     app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
     let Popup::Form(form) = &app.popup else {
@@ -2573,6 +2576,7 @@ fn form_caret_keymap_edits_mid_string() {
     let mut app = App::new();
     app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
     app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+    app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
     app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
     for c in "abcd".chars() {
         app.handle_key(key(KeyCode::Char(c), KeyModifiers::empty()));
@@ -3008,6 +3012,7 @@ fn cancel_and_retry_are_literal_inside_a_form() {
     let mut app = App::new();
     app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
     app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+    app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
     app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
     app.handle_key(key(KeyCode::Char('c'), KeyModifiers::empty()));
     app.handle_key(key(KeyCode::Char('r'), KeyModifiers::empty()));
@@ -3158,7 +3163,7 @@ fn repo_picker_backspace_widens_and_global_row_clears() {
 fn menu_change_theme_opens_the_picker() {
     let mut app = App::new();
     app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
-    for _ in 0..6 {
+    for _ in 0..7 {
         app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
     }
     let action = app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
@@ -3232,7 +3237,7 @@ fn menu_switch_repo_and_add_repo_open_their_surfaces() {
     let mut app = App::new();
     app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
     assert!(matches!(app.popup, Popup::Menu { .. }));
-    for _ in 0..4 {
+    for _ in 0..5 {
         app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
     }
     let action = app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
@@ -3241,7 +3246,7 @@ fn menu_switch_repo_and_add_repo_open_their_surfaces() {
 
     app.popup = Popup::None;
     app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
-    for _ in 0..5 {
+    for _ in 0..6 {
         app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
     }
     app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
@@ -3330,6 +3335,12 @@ fn menu_dispatches_commands_by_identity() {
     ));
     assert!(matches!(app.popup, Popup::RepoPicker { .. }));
 
+    assert!(matches!(
+        app.dispatch_menu_action(MenuAction::LaunchTask),
+        UiAction::OpenTaskPicker
+    ));
+    assert!(matches!(app.popup, Popup::TaskPicker { .. }));
+
     let mut action = app.dispatch_menu_action(MenuAction::AddTask);
     assert!(matches!(action, UiAction::None));
     assert!(matches!(app.popup, Popup::Form(ref f) if f.kind == FormKind::AddTask));
@@ -3378,7 +3389,147 @@ fn menu_shortcuts_are_unique_and_leader_prefixed() {
     // Case is significant: `r` switches repo while `R` registers a new one.
     assert_eq!(MenuAction::from_leader('r'), Some(MenuAction::SwitchRepo));
     assert_eq!(MenuAction::from_leader('R'), Some(MenuAction::AddRepo));
+    assert_eq!(MenuAction::from_leader('l'), Some(MenuAction::LaunchTask));
     assert_eq!(MenuAction::from_leader('z'), None);
+}
+
+#[test]
+fn menu_launch_task_opens_the_task_picker() {
+    let mut app = App::new();
+    app.set_catalog(scoped_catalog());
+    let action = app.dispatch_menu_action(MenuAction::LaunchTask);
+    assert!(matches!(action, UiAction::OpenTaskPicker));
+    let rows = app.task_picker_entries();
+    match &app.popup {
+        Popup::TaskPicker { selected, .. } => {
+            assert!(
+                rows[*selected].selectable(),
+                "initial highlight must be a task, not a header"
+            );
+        }
+        _ => panic!("expected the task picker"),
+    }
+}
+
+#[test]
+fn ctrl_x_leader_opens_the_task_picker() {
+    let mut app = App::new();
+    app.set_catalog(vec![catalog_entry("alpha")]);
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::CONTROL));
+    let action = app.handle_key(key(KeyCode::Char('l'), KeyModifiers::empty()));
+    assert!(matches!(action, UiAction::OpenTaskPicker));
+    assert!(matches!(app.popup, Popup::TaskPicker { .. }));
+    assert!(!app.leader_active());
+}
+
+#[test]
+fn task_picker_groups_global_before_repos() {
+    let mut app = App::new();
+    app.set_catalog(scoped_catalog());
+    app.open_task_picker();
+    assert_eq!(
+        app.task_picker_entries(),
+        vec![
+            TaskPickerRow::Header("Global".to_string()),
+            TaskPickerRow::Task {
+                index: 0,
+                label: "triage".to_string(),
+            },
+            TaskPickerRow::Header("a".to_string()),
+            TaskPickerRow::Task {
+                index: 1,
+                label: "one".to_string(),
+            },
+            TaskPickerRow::Header("b".to_string()),
+            TaskPickerRow::Task {
+                index: 2,
+                label: "two".to_string(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn task_picker_filters_and_hides_empty_groups() {
+    let mut app = App::new();
+    app.set_catalog(scoped_catalog());
+    app.open_task_picker();
+    for c in "two".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::empty()));
+    }
+    assert_eq!(
+        app.task_picker_entries(),
+        vec![
+            TaskPickerRow::Header("b".to_string()),
+            TaskPickerRow::Task {
+                index: 2,
+                label: "two".to_string(),
+            },
+        ]
+    );
+
+    // A query with no match leaves an empty list; Backspace widens it back.
+    for c in "zzz".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::empty()));
+    }
+    assert!(app.task_picker_entries().is_empty());
+    for _ in 0..3 {
+        app.handle_key(key(KeyCode::Backspace, KeyModifiers::empty()));
+    }
+    assert_eq!(app.task_picker_entries().len(), 2);
+}
+
+#[test]
+fn task_picker_navigation_skips_headers() {
+    let mut app = App::new();
+    app.set_catalog(scoped_catalog());
+    app.open_task_picker();
+    let rows = app.task_picker_entries();
+    for _ in 0..rows.len() {
+        app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+        match &app.popup {
+            Popup::TaskPicker { selected, .. } => {
+                assert!(
+                    rows[*selected].selectable(),
+                    "landed on header {}",
+                    rows[*selected].label()
+                );
+            }
+            _ => panic!("expected the task picker"),
+        }
+    }
+}
+
+#[test]
+fn task_picker_enter_launches_the_selected_task() {
+    let mut app = App::new();
+    app.set_catalog(vec![catalog_entry("alpha"), catalog_entry("beta")]);
+    app.open_task_picker();
+    app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+    match app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())) {
+        UiAction::StartTask(name) => assert_eq!(name, "beta"),
+        _ => panic!("expected StartTask"),
+    }
+    assert!(matches!(app.popup, Popup::None));
+}
+
+#[test]
+fn task_picker_enter_opens_the_vars_form() {
+    let mut app = App::new();
+    app.set_catalog(vec![vars_entry("with-vars")]);
+    app.open_task_picker();
+    let action = app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
+    assert!(matches!(action, UiAction::None));
+    assert!(matches!(app.popup, Popup::TaskVars(_)));
+}
+
+#[test]
+fn task_picker_esc_closes_without_launching() {
+    let mut app = App::new();
+    app.set_catalog(vec![catalog_entry("alpha")]);
+    app.open_task_picker();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::empty()));
+    assert!(matches!(app.popup, Popup::None));
 }
 
 #[test]

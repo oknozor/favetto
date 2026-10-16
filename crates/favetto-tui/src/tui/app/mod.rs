@@ -96,6 +96,8 @@ pub enum UiAction {
     OpenSessions,
     /// Open the Ctrl+P "Switch repo" picker.
     OpenRepoPicker,
+    /// Open the Ctrl+P "Launch task" picker (needs a fresh `catalog.list`).
+    OpenTaskPicker,
     /// Open the favetto documentation site in the user's browser.
     OpenDocs,
     /// Activate a known repo by name (`None` selects the global catalog) through
@@ -207,6 +209,12 @@ pub enum Popup {
     /// The Ctrl+P "Switch repo" picker: a searchable list of known repos plus a
     /// `global` row that clears the active repo.
     RepoPicker {
+        selected: usize,
+        filter: TextBuffer,
+    },
+    /// The Ctrl+P "Launch task" picker: a searchable, palette-styled list of
+    /// catalog tasks grouped under `Global` and per-repo headers.
+    TaskPicker {
         selected: usize,
         filter: TextBuffer,
     },
@@ -519,6 +527,7 @@ impl CatalogEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
     NewOneShot,
+    LaunchTask,
     AddTask,
     CreateSchedule,
     CreateNotification,
@@ -530,8 +539,9 @@ pub enum MenuAction {
 
 impl MenuAction {
     /// Every palette command, in the order shown by the Ctrl+X leader hint.
-    pub const ALL: [MenuAction; 8] = [
+    pub const ALL: [MenuAction; 9] = [
         MenuAction::NewOneShot,
+        MenuAction::LaunchTask,
         MenuAction::AddTask,
         MenuAction::CreateSchedule,
         MenuAction::CreateNotification,
@@ -545,6 +555,7 @@ impl MenuAction {
     pub fn label(self) -> &'static str {
         match self {
             MenuAction::NewOneShot => "New one-shot task",
+            MenuAction::LaunchTask => "Launch task",
             MenuAction::AddTask => "Add task to catalog",
             MenuAction::CreateSchedule => "Create schedule",
             MenuAction::CreateNotification => "Create notification hook",
@@ -560,6 +571,7 @@ impl MenuAction {
     pub fn leader_key(self) -> char {
         match self {
             MenuAction::NewOneShot => 'n',
+            MenuAction::LaunchTask => 'l',
             MenuAction::AddTask => 'a',
             MenuAction::CreateSchedule => 's',
             MenuAction::CreateNotification => 'c',
@@ -610,6 +622,7 @@ impl MenuEntry {
 pub const MENU_ENTRIES: &[MenuEntry] = &[
     MenuEntry::Header("Tasks"),
     MenuEntry::Action(MenuAction::NewOneShot),
+    MenuEntry::Action(MenuAction::LaunchTask),
     MenuEntry::Header("Catalog"),
     MenuEntry::Action(MenuAction::AddTask),
     MenuEntry::Action(MenuAction::CreateSchedule),
@@ -622,6 +635,44 @@ pub const MENU_ENTRIES: &[MenuEntry] = &[
     MenuEntry::Header("Help"),
     MenuEntry::Action(MenuAction::OpenDocs),
 ];
+
+/// One row of the Ctrl+P "Launch task" picker: a bold, non-selectable group
+/// header (`Global` or a repo name), or a catalog task. Mirrors [`MenuEntry`]'s
+/// header/choice split, but the header owns its label because repo names are
+/// dynamic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskPickerRow {
+    Header(String),
+    Task {
+        /// Index into [`App::catalog`].
+        index: usize,
+        /// The task's bare display name (repo namespace stripped).
+        label: String,
+    },
+}
+
+impl TaskPickerRow {
+    /// Whether navigation may land on this row.
+    pub fn selectable(&self) -> bool {
+        matches!(self, TaskPickerRow::Task { .. })
+    }
+
+    /// The text rendered for this row.
+    pub fn label(&self) -> &str {
+        match self {
+            TaskPickerRow::Header(label) => label,
+            TaskPickerRow::Task { label, .. } => label,
+        }
+    }
+
+    /// The catalog index for a task row, or `None` for a header.
+    pub fn catalog_index(&self) -> Option<usize> {
+        match self {
+            TaskPickerRow::Task { index, .. } => Some(*index),
+            TaskPickerRow::Header(_) => None,
+        }
+    }
+}
 
 /// The URL the `Open docs` command launches.
 pub const DOCS_URL: &str = "https://oknozor.github.io/favetto/";
@@ -1372,6 +1423,108 @@ impl App {
         }
     }
 
+    /// Open the Ctrl+P "Launch task" picker with an empty search and the first
+    /// selectable task highlighted.
+    pub fn open_task_picker(&mut self) {
+        self.popup = Popup::TaskPicker {
+            selected: 0,
+            filter: TextBuffer::default(),
+        };
+        self.clamp_task_picker_selection();
+    }
+
+    /// The task picker's rows after applying the current search filter: every
+    /// catalog entry grouped under a `Global` header (`repo == None`) or a
+    /// per-repo header, in catalog order. Groups with no surviving match are
+    /// dropped. Matching mirrors the palette's fuzzy, skim-style search and runs
+    /// against the task's full identity (`repo:<name>/<path>` or a bare path).
+    pub fn task_picker_entries(&self) -> Vec<TaskPickerRow> {
+        let filter = match &self.popup {
+            Popup::TaskPicker { filter, .. } => filter.value().to_lowercase(),
+            _ => String::new(),
+        };
+        let matcher = SkimMatcherV2::default();
+        let mut globals: Vec<usize> = Vec::new();
+        let mut repos: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (index, entry) in self.catalog.iter().enumerate() {
+            if !filter.is_empty() && matcher.fuzzy_match(&entry.name, &filter).is_none() {
+                continue;
+            }
+            match &entry.repo {
+                Some(repo) => repos.entry(repo.clone()).or_default().push(index),
+                None => globals.push(index),
+            }
+        }
+        let mut rows = Vec::new();
+        for (label, indices) in std::iter::once(("Global".to_string(), globals)).chain(repos) {
+            if indices.is_empty() {
+                continue;
+            }
+            rows.push(TaskPickerRow::Header(label));
+            for index in indices {
+                rows.push(TaskPickerRow::Task {
+                    index,
+                    label: task_display_name(&self.catalog[index].name).to_string(),
+                });
+            }
+        }
+        rows
+    }
+
+    /// Re-clamp the task picker's selection after its filter changes: keep it
+    /// when it is still a visible task, otherwise land on the first match.
+    fn clamp_task_picker_selection(&mut self) {
+        let rows = self.task_picker_entries();
+        let first = rows.iter().position(TaskPickerRow::selectable).unwrap_or(0);
+        if let Popup::TaskPicker { selected, .. } = &mut self.popup {
+            let valid = rows.get(*selected).is_some_and(TaskPickerRow::selectable);
+            if !valid {
+                *selected = first;
+            }
+        }
+    }
+
+    /// Move the task picker's selection by `delta` (negative = up), skipping
+    /// group headers and staying put at either end.
+    pub fn move_task_picker_selection(&mut self, delta: isize) {
+        let rows = self.task_picker_entries();
+        let current = match &self.popup {
+            Popup::TaskPicker { selected, .. } => *selected,
+            _ => return,
+        };
+        let mut next = current as isize;
+        loop {
+            next += delta;
+            if next < 0 || next as usize >= rows.len() {
+                return;
+            }
+            if rows[next as usize].selectable() {
+                break;
+            }
+        }
+        if let Popup::TaskPicker { selected, .. } = &mut self.popup {
+            *selected = next as usize;
+        }
+    }
+
+    /// Launch the task highlighted in the picker through [`App::begin_catalog_task`]
+    /// (a `[[vars]]` task opens its variable form; every other task starts).
+    fn activate_task_picker_selection(&mut self) -> UiAction {
+        let selected = match &self.popup {
+            Popup::TaskPicker { selected, .. } => *selected,
+            _ => return UiAction::None,
+        };
+        let index = self
+            .task_picker_entries()
+            .get(selected)
+            .and_then(TaskPickerRow::catalog_index);
+        let Some(entry) = index.and_then(|i| self.catalog.get(i)).cloned() else {
+            return UiAction::None;
+        };
+        self.popup = Popup::None;
+        self.begin_catalog_task(&entry)
+    }
+
     /// Store the fetched workflow graph (DOT + persisted path) and, when the
     /// structured `graph` field was available, its cached box-drawing render.
     pub fn set_workflow(
@@ -1928,6 +2081,10 @@ impl App {
             MenuAction::SwitchRepo => {
                 self.open_repo_picker();
                 UiAction::OpenRepoPicker
+            }
+            MenuAction::LaunchTask => {
+                self.open_task_picker();
+                UiAction::OpenTaskPicker
             }
             MenuAction::ChangeTheme => {
                 self.open_theme_picker();

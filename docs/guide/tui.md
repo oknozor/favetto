@@ -58,6 +58,7 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 | Global | `Ctrl+P` | open the command palette |
 | Global | `Ctrl+X` | open the shortcut leader, then a key below |
 | Global | `Ctrl+X` `n` | new one-shot task |
+| Global | `Ctrl+X` `l` | launch a catalog task |
 | Global | `Ctrl+X` `a` | add task to catalog |
 | Global | `Ctrl+X` `s` | create schedule |
 | Global | `Ctrl+X` `c` | create notification hook |
@@ -189,6 +190,9 @@ identity, so grouping and filtering never change what a command does.
 - **New one-shot task** — a wizard (agent → provider → model → directory) that
   starts an inline, interactive task and opens it in the Agent panel for you to
   prompt. It emits the normal task events but is **not** written to the catalog.
+- **Launch task** — opens a searchable list of catalog tasks (see
+  [Launching a task from the palette](#launching-a-task-from-the-palette)) and
+  runs the highlighted one exactly like **Enter** on the Catalog tab.
 - **Add task to catalog** — writes a task `.md` file (does not run it).
 - **Create a schedule event** — adds a cron schedule.
 - **Create a notification (hook)** — adds a hook that reacts to an event kind and
@@ -209,6 +213,7 @@ combinations are:
 | Key | Command |
 |-----|---------|
 | `Ctrl+X` `n` | new one-shot task |
+| `Ctrl+X` `l` | launch a catalog task |
 | `Ctrl+X` `a` | add task to catalog |
 | `Ctrl+X` `s` | create schedule |
 | `Ctrl+X` `c` | create notification hook |
@@ -220,6 +225,18 @@ combinations are:
 The leader works from every tab while favetto owns the keyboard. While the Agent
 panel has keyboard capture, `Ctrl+X` is forwarded to the agent like the other
 favetto keys, and the `?` overlay documents the leader under **Global**.
+
+### Launching a task from the palette
+
+**Ctrl+P → Launch task** (or `Ctrl+X` `l`) opens a searchable list of the whole
+catalog, rendered in the same palette style: a borderless panel, a bold title, a
+muted `esc` hint, and an inline `search:` row. Tasks are grouped under a
+**Global** header for unscoped entries and one header per repo for
+`repo:<name>/...` entries; typing filters the list with the same fuzzy,
+skim-style search as the palette and drops any group left with no match. `↑`/`↓`
+move the highlight (headers are skipped), **Enter** launches the highlighted task
+through the same path as **Enter** on the Catalog tab — a task with `[[vars]]`
+opens its variable form first — and **Esc** closes the picker.
 
 ### One-shot wizard
 

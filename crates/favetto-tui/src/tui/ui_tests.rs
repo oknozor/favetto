@@ -157,6 +157,10 @@ fn all_popups_render_without_panic() {
                 selected: 0,
                 filter: TextBuffer::new("fav"),
             },
+            Popup::TaskPicker {
+                selected: 0,
+                filter: TextBuffer::new("tri"),
+            },
             Popup::ThemePicker {
                 selected: 0,
                 entries: vec![
@@ -207,8 +211,8 @@ fn command_palette_renders_title_search_and_groups() {
     assert!(text.contains("Open docs"), "docs command missing: {text:?}");
     // Every command carries its right-aligned Ctrl+X shortcut.
     for shortcut in [
-        "Ctrl+X n", "Ctrl+X a", "Ctrl+X s", "Ctrl+X c", "Ctrl+X r", "Ctrl+X R", "Ctrl+X t",
-        "Ctrl+X h",
+        "Ctrl+X n", "Ctrl+X l", "Ctrl+X a", "Ctrl+X s", "Ctrl+X c", "Ctrl+X r", "Ctrl+X R",
+        "Ctrl+X t", "Ctrl+X h",
     ] {
         assert!(
             text.contains(shortcut),
@@ -220,6 +224,24 @@ fn command_palette_renders_title_search_and_groups() {
         !text.contains("Ctrl+P — Actions"),
         "old title still rendered: {text:?}"
     );
+}
+
+#[test]
+fn task_picker_renders_grouped_tasks_and_search() {
+    let mut repo_entry = catalog_entry("repo:favetto/triage");
+    repo_entry.repo = Some("favetto".to_string());
+    let mut app = App::new();
+    app.set_catalog(vec![catalog_entry("plan"), repo_entry]);
+    app.open_task_picker();
+
+    let text = render_text(&mut app, 100, 40);
+    assert!(text.contains("Launch task"), "title missing: {text:?}");
+    assert!(text.contains("esc"), "esc hint missing: {text:?}");
+    assert!(text.contains("search:"), "search row missing: {text:?}");
+    assert!(text.contains("Global"), "global header missing: {text:?}");
+    assert!(text.contains("favetto"), "repo header missing: {text:?}");
+    assert!(text.contains("plan"), "global task missing: {text:?}");
+    assert!(text.contains("triage"), "repo task missing: {text:?}");
 }
 
 #[test]
@@ -253,13 +275,16 @@ fn command_palette_is_left_aligned_with_section_gaps() {
 
     // Exactly one blank row separates the Tasks and Catalog sections.
     let new_idx = search_idx + 3;
-    let catalog_idx = search_idx + 5;
+    let launch_idx = search_idx + 4;
+    let catalog_idx = search_idx + 6;
     assert!(
-        lines[new_idx].contains("New one-shot task") && lines[catalog_idx].contains("Catalog"),
+        lines[new_idx].contains("New one-shot task")
+            && lines[launch_idx].contains("Launch task")
+            && lines[catalog_idx].contains("Catalog"),
         "unexpected section layout: {lines:#?}"
     );
     assert!(
-        lines[new_idx + 1].chars().all(|c| c == '│' || c == ' '),
+        lines[launch_idx + 1].chars().all(|c| c == '│' || c == ' '),
         "expected a blank row between sections: {lines:#?}"
     );
     // And no blank row between a header and its first command.
@@ -937,7 +962,7 @@ fn help_overlay_lists_workflow_key() {
 fn help_overlay_lists_editor_key() {
     let mut app = App::new();
     app.popup = Popup::Help { scroll: 0 };
-    let text = render_text(&mut app, 100, 40);
+    let text = render_text(&mut app, 100, 45);
     assert!(
         text.contains("edit the selected task"),
         "editor help row missing: {text:?}"
