@@ -27,7 +27,7 @@ base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 config = "0.15"
-croner = "3"
+croner = "4"
 dirs = "7"
 futures-util = "0.3"
 glob = "0.3"
@@ -54,7 +54,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-segmentation = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 throbber-widgets-tui = "0.11"
-vt100 = "0.16"
+vt100 = "0.18"
 
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rust-embed = "8"
