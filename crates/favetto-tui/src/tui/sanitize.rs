@@ -53,10 +53,19 @@ pub fn line(input: &str) -> String {
 /// Skip one ESC-introduced sequence (CSI, OSC, DCS/SOS/PM/APC, or a short
 /// designation escape) and leave the following text in place.
 fn skip_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
-    match chars.next() {
-        Some('[') => skip_csi(chars),
-        Some(']') => skip_string(chars),
-        Some('P' | 'X' | '^' | '_') => skip_string(chars),
+    match chars.peek().copied() {
+        Some('[') => {
+            chars.next();
+            skip_csi(chars);
+        }
+        Some(']') => {
+            chars.next();
+            skip_string(chars);
+        }
+        Some('P' | 'X' | '^' | '_') => {
+            chars.next();
+            skip_string(chars);
+        }
         Some(c) if ('\u{20}'..='\u{2f}').contains(&c) => {
             // ESC + intermediate byte(s) + final byte (e.g. `ESC ( B`).
             while let Some(&next) = chars.peek() {
@@ -68,7 +77,12 @@ fn skip_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
                 }
             }
         }
-        Some(_) | None => {}
+        // A malformed sequence must not consume the line break; leave it for the
+        // caller so one bad escape cannot merge two transcript lines.
+        Some('\n' | '\r') | None => {}
+        Some(_) => {
+            chars.next();
+        }
     }
 }
 
@@ -107,9 +121,9 @@ fn skip_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     }
 }
 
-/// Bidirectional overrides/isolates and invisible format characters that can
-/// reorder or hide visible text. Emoji presentation selectors and combining
-/// marks are intentionally left alone.
+/// Bidirectional overrides/isolates, invisible format characters, and Unicode
+/// tag characters that can reorder or hide visible text. Emoji presentation
+/// selectors and combining marks are intentionally left alone.
 fn is_invisible_format(c: char) -> bool {
     matches!(
         c,
@@ -122,6 +136,8 @@ fn is_invisible_format(c: char) -> bool {
             | '\u{2066}'..='\u{206f}'
             | '\u{feff}'
             | '\u{fff9}'..='\u{fffb}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}'
     )
 }
 
@@ -142,9 +158,21 @@ mod tests {
     }
 
     #[test]
+    fn terminal_hyperlinks_are_stripped_like_other_osc_sequences() {
+        let input = "a\x1b]8;;https://example.com\x1b\\b\x1b]8;;\x1b\\c";
+        assert_eq!(text(input), "abc");
+        assert_eq!(
+            text("a\x1b]8;;https://example.com\x07b\x1b]8;;\x07c"),
+            "abc"
+        );
+    }
+
+    #[test]
     fn malformed_sequences_do_not_swallow_the_next_line() {
         assert_eq!(text("bad \x1b[31\nnext"), "bad \nnext");
         assert_eq!(text("bad \x1b]0;title\nnext"), "bad \nnext");
+        assert_eq!(text("bad \x1b\nnext"), "bad \nnext");
+        assert_eq!(text("bad \x1b\r\nnext"), "bad \nnext");
     }
 
     #[test]
@@ -162,6 +190,15 @@ mod tests {
         assert!(out.contains("[U+202E]"));
         assert!(out.contains("[U+2066]"));
         assert!(out.contains("[U+200B]"));
+    }
+
+    #[test]
+    fn unicode_tag_characters_cannot_hide_path_text() {
+        let out = text("report\u{e002e}\u{e0065}\u{e0078}\u{e0065}.pdf");
+        assert!(!out.contains('\u{e002e}'));
+        assert!(!out.contains('\u{e0065}'));
+        assert!(out.contains("[U+E002E][U+E0065][U+E0078][U+E0065]"));
+        assert!(out.ends_with(".pdf"));
     }
 
     #[test]
