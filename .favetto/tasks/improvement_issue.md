@@ -9,7 +9,7 @@
 agent = "opencode"
 provider = "opencode-go"
 model = "deepseek-v4.1-flash"
-schedule = "0 0 */2 * * *"
+# schedule = "0 0 */2 * * *"
 worktree = false
 
 [[vars]]

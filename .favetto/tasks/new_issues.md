@@ -3,7 +3,7 @@
 # no worktree) and gates its `spawn` on a non-empty `items` array. See
 # docs/reference/tasks (Action tasks) and docs/guide/schedules-and-dependencies.
 kind = "action"
-schedule = "0 */15 * * * *"
+# schedule = "0 */15 * * * *"
 worktree = false
 spawn = "triage_issues"
 spawn_file = ".favetto/gates/{{ task.id }}/handoff.json"
