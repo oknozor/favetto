@@ -21,7 +21,7 @@ cargo build --release
 The binary lands at `target/release/favetto`. To put it on your `PATH`:
 
 ```bash
-cargo install --path crates/favetto
+cargo install --path crates/favetto --bin favetto
 ```
 
 ## Verify
@@ -56,7 +56,7 @@ From a checkout of the repository:
 
 The script:
 
-1. installs the `favetto` binary with `cargo install --path crates/favetto --locked`,
+1. installs the `favetto` binary with `cargo install --path crates/favetto --bin favetto --locked`,
 2. seeds `~/.config/favetto/config.toml` from `config.example.toml` when missing,
 3. creates the private `~/.config/favetto/env` secrets file (mode 600) and, when
    `gh` is authenticated, seeds `GITHUB_TOKEN` from `gh auth token`

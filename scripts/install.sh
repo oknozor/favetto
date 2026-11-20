@@ -266,7 +266,7 @@ install_service() {
     fi
 
     log "installing the favetto binary (cargo install --locked)"
-    cargo install --path "$repo_root/crates/favetto" --locked --force
+    cargo install --path "$repo_root/crates/favetto" --bin favetto --locked --force
 
     bin_path="$(resolve_bin_path)"
     [ -x "$bin_path" ] || die "installed binary not found at $bin_path"
