@@ -491,6 +491,43 @@ impl RootView {
             Some(cursor) => format!("{events} events · cursor {cursor}"),
             None => format!("{events} events"),
         };
+        let connected = connection.is_connected();
+        let status_color = match connection {
+            crate::state::ConnectionState::Unauthorized { .. }
+            | crate::state::ConnectionState::Disconnected { .. } => theme.colors.danger,
+            _ => theme.colors.warning,
+        };
+        let status_label = connection.label();
+
+        let left = if connected {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(theme.spacing.s2))
+                .min_w_0()
+                .child(div().font_family("monospace").truncate().child(endpoint))
+                .child("·")
+                .child(div().truncate().child(ping))
+                .when_some(error, |left, error| {
+                    left.child(div().text_color(theme.colors.danger).child(error))
+                })
+        } else {
+            // The ping/endpoint are noise while disconnected; the state label
+            // already names the fix (including the token path).
+            div()
+                .flex()
+                .items_center()
+                .gap(px(theme.spacing.s2))
+                .min_w_0()
+                .child(
+                    div()
+                        .truncate()
+                        .text_color(status_color)
+                        .child(status_label),
+                )
+                .child("·")
+                .child(div().font_family("monospace").truncate().child(endpoint))
+        };
 
         div()
             .flex()
@@ -503,40 +540,12 @@ impl RootView {
             .border_color(theme.colors.border)
             .text_color(theme.colors.muted)
             .text_size(px(theme.font.xs))
+            .child(left)
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(theme.spacing.s2))
-                    .min_w_0()
-                    .child(div().font_family("monospace").truncate().child(endpoint))
-                    .child("·")
-                    .child(div().truncate().child(ping))
-                    .when_some(error, |left, error| {
-                        left.child(div().text_color(theme.colors.danger).child(error))
-                    }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(theme.spacing.s2))
-                    .when(!connection.is_connected(), |right| {
-                        let color = match connection {
-                            crate::state::ConnectionState::Unauthorized { .. }
-                            | crate::state::ConnectionState::Disconnected { .. } => {
-                                theme.colors.danger
-                            }
-                            _ => theme.colors.warning,
-                        };
-                        right.child(
-                            div()
-                                .max_w(px(320.0))
-                                .truncate()
-                                .text_color(color)
-                                .child(connection.label()),
-                        )
-                    })
                     .child(cursor_label)
                     .child(shortcuts)
                     .child(reconnect),
