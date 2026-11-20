@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use favetto_core::model::{
@@ -17,6 +17,7 @@ use favetto_core::model::{
     ToolKind, ToolLocation,
 };
 
+use super::sanitize::{line as clean_line, text as clean_text};
 use super::theme::Theme;
 
 /// Upper bound on retained feed items. Older items are dropped first, so a long
@@ -399,7 +400,7 @@ impl AgentFeed {
         };
 
         if !name.trim().is_empty() {
-            tool.name = name.to_string();
+            tool.name = clean_line(name);
         }
         if let Some(detail) = detail {
             merge_detail(tool, detail);
@@ -497,7 +498,7 @@ impl AgentFeed {
         };
 
         if !name.trim().is_empty() {
-            tool.name = name.to_string();
+            tool.name = clean_line(name);
         }
         if let Some(detail) = detail {
             merge_detail(tool, detail);
@@ -539,7 +540,14 @@ impl AgentFeed {
                     text,
                     streaming,
                     expanded,
-                } => push_thinking(&mut lines, text, *streaming, *expanded, theme),
+                } => push_thinking(
+                    &mut lines,
+                    text,
+                    *streaming,
+                    *expanded,
+                    theme,
+                    selected == Some(item.id),
+                ),
                 FeedKind::Tool(tool) => {
                     push_tool(&mut lines, tool, theme, selected == Some(item.id))
                 }
@@ -558,10 +566,37 @@ impl AgentFeed {
             )));
         }
 
+        // Defense in depth: every span leaving this module is already built from
+        // sanitized strings, but a final pass makes a missed field harmless and
+        // guarantees no control character can reach a ratatui cell.
+        let lines = lines.into_iter().map(clean_spans).collect();
+
         FeedLines {
             lines,
             selected_range,
         }
+    }
+}
+
+/// Rebuild a line with each span sanitized for a single terminal row. The
+/// sanitizer preserves ordinary Unicode and Markdown styling.
+fn clean_spans(line: Line<'static>) -> Line<'static> {
+    let spans = line
+        .spans
+        .into_iter()
+        .map(|span| {
+            let content = clean_line(&span.content);
+            if content == span.content.as_ref() {
+                span
+            } else {
+                Span::styled(content, span.style)
+            }
+        })
+        .collect();
+    Line {
+        spans,
+        style: line.style,
+        alignment: line.alignment,
     }
 }
 
@@ -573,10 +608,10 @@ pub struct FeedLines {
 
 fn merge_detail(tool: &mut ToolCard, detail: &ToolCallDetail) {
     if let Some(name) = &detail.name {
-        tool.name = name.clone();
+        tool.name = clean_line(name);
     }
     if let Some(title) = &detail.title {
-        tool.title = Some(title.clone());
+        tool.title = Some(clean_line(title));
     }
     if let Some(kind) = detail.kind {
         tool.kind = kind;
@@ -668,6 +703,7 @@ fn push_thinking(
     streaming: bool,
     expanded: bool,
     theme: &Theme,
+    selected: bool,
 ) {
     let mut header = vec![
         Span::styled(
@@ -689,7 +725,11 @@ fn push_thinking(
                 .add_modifier(Modifier::ITALIC),
         ));
     }
-    out.push(Line::from(header));
+    let mut line = Line::from(header);
+    if selected {
+        line.style = selected_line_style(theme);
+    }
+    out.push(line);
     if expanded {
         for line in text.lines() {
             out.push(Line::from(Span::styled(
@@ -699,6 +739,21 @@ fn push_thinking(
                     .add_modifier(Modifier::ITALIC),
             )));
         }
+    }
+}
+
+/// Highlight the selected row. A background is enough in a colour theme; the
+/// monochrome theme (`Reset` selection colours) also reverses the cells so
+/// keyboard focus stays visible without colour.
+fn selected_line_style(theme: &Theme) -> Style {
+    let style = Style::default()
+        .fg(theme.selected_fg())
+        .bg(theme.selected_bg())
+        .add_modifier(Modifier::BOLD);
+    if theme.selected_bg() == Color::Reset {
+        style.add_modifier(Modifier::REVERSED)
+    } else {
+        style
     }
 }
 
@@ -717,13 +772,13 @@ fn push_tool(out: &mut Vec<Line<'static>>, tool: &ToolCard, theme: &Theme, selec
             Style::default().fg(theme.accent()),
         ),
         Span::styled(
-            tool.display_name().to_string(),
+            clean_line(tool.display_name()),
             Style::default().fg(theme.fg()).add_modifier(Modifier::BOLD),
         ),
     ];
     if let Some(summary) = tool.summary() {
         header.push(Span::styled(
-            format!(" — {summary}"),
+            format!(" — {}", clean_line(&summary)),
             Style::default().fg(theme.muted()),
         ));
     }
@@ -733,10 +788,7 @@ fn push_tool(out: &mut Vec<Line<'static>>, tool: &ToolCard, theme: &Theme, selec
     ));
     let mut line = Line::from(header);
     if selected {
-        line.style = Style::default()
-            .fg(theme.selected_fg())
-            .bg(theme.selected_bg())
-            .add_modifier(Modifier::BOLD);
+        line.style = selected_line_style(theme);
     }
     out.push(line);
 
@@ -807,36 +859,37 @@ fn content_lines(content: &[ToolContent], theme: &Theme) -> Vec<Line<'static>> {
                 new_text,
             } => {
                 lines.push(Line::from(Span::styled(
-                    format!("diff {path}"),
+                    format!("diff {}", clean_line(path)),
                     Style::default()
                         .fg(theme.accent())
                         .add_modifier(Modifier::BOLD),
                 )));
                 for line in old_text.as_deref().unwrap_or_default().lines() {
                     lines.push(Line::from(Span::styled(
-                        format!("-{line}"),
+                        format!("-{}", clean_line(line)),
                         Style::default().fg(theme.danger()),
                     )));
                 }
                 for line in new_text.lines() {
                     lines.push(Line::from(Span::styled(
-                        format!("+{line}"),
+                        format!("+{}", clean_line(line)),
                         Style::default().fg(theme.success()),
                     )));
                 }
             }
             ToolContent::Terminal { terminal_id } => {
                 lines.push(Line::from(Span::styled(
-                    format!("terminal {terminal_id}"),
+                    format!("terminal {}", clean_line(terminal_id)),
                     Style::default().fg(theme.muted()),
                 )));
             }
             ToolContent::Image { mime_type, uri } => {
                 lines.push(Line::from(Span::styled(
                     format!(
-                        "image {mime_type}{}",
+                        "image {}{}",
+                        clean_line(mime_type),
                         uri.as_deref()
-                            .map(|uri| format!(" <{uri}>"))
+                            .map(|uri| format!(" <{}>", clean_line(uri)))
                             .unwrap_or_default()
                     ),
                     Style::default().fg(theme.muted()),
@@ -844,7 +897,7 @@ fn content_lines(content: &[ToolContent], theme: &Theme) -> Vec<Line<'static>> {
             }
             ToolContent::Audio { mime_type } => {
                 lines.push(Line::from(Span::styled(
-                    format!("audio {mime_type}"),
+                    format!("audio {}", clean_line(mime_type)),
                     Style::default().fg(theme.muted()),
                 )));
             }
@@ -856,10 +909,10 @@ fn content_lines(content: &[ToolContent], theme: &Theme) -> Vec<Line<'static>> {
                 description,
                 size,
             } => {
-                let label = title.as_deref().unwrap_or(name);
-                let mut detail = format!("link {label} <{uri}>");
+                let label = clean_line(title.as_deref().unwrap_or(name));
+                let mut detail = format!("link {label} <{}>", clean_line(uri));
                 if let Some(mime) = mime_type {
-                    detail.push_str(&format!(" {mime}"));
+                    detail.push_str(&format!(" {}", clean_line(mime)));
                 }
                 if let Some(size) = size {
                     detail.push_str(&format!(" {size} bytes"));
@@ -870,7 +923,7 @@ fn content_lines(content: &[ToolContent], theme: &Theme) -> Vec<Line<'static>> {
                 )));
                 if let Some(description) = description {
                     lines.push(Line::from(Span::styled(
-                        description.clone(),
+                        clean_line(description),
                         Style::default().fg(theme.muted()),
                     )));
                 }
@@ -881,9 +934,13 @@ fn content_lines(content: &[ToolContent], theme: &Theme) -> Vec<Line<'static>> {
                 text,
                 binary,
             } => {
-                let kind = mime_type.as_deref().unwrap_or("resource");
+                let kind = clean_line(mime_type.as_deref().unwrap_or("resource"));
                 lines.push(Line::from(Span::styled(
-                    format!("{kind} <{uri}>{}", if *binary { " (binary)" } else { "" }),
+                    format!(
+                        "{kind} <{}>{}",
+                        clean_line(uri),
+                        if *binary { " (binary)" } else { "" }
+                    ),
                     Style::default().fg(theme.fg()),
                 )));
                 if let Some(text) = text {
@@ -928,9 +985,10 @@ fn push_boundary(out: &mut Vec<Line<'static>>, outcome: IdleOutcome, theme: &The
 }
 
 fn format_location(location: &ToolLocation) -> String {
+    let path = clean_line(&location.path);
     match location.line {
-        Some(line) => format!("{}:{line}", location.path),
-        None => location.path.clone(),
+        Some(line) => format!("{path}:{line}"),
+        None => path,
     }
 }
 
@@ -968,16 +1026,21 @@ fn input_summary(value: &serde_json::Value) -> Option<String> {
 fn content_summary(content: &ToolContent) -> Option<String> {
     match content {
         ToolContent::Text { text } => text.lines().next().map(one_line),
-        ToolContent::Diff { path, .. } => Some(format!("diff {path}")),
-        ToolContent::Terminal { terminal_id } => Some(format!("terminal {terminal_id}")),
-        ToolContent::Image { mime_type, .. } => Some(format!("image {mime_type}")),
-        ToolContent::Audio { mime_type } => Some(format!("audio {mime_type}")),
-        ToolContent::ResourceLink { name, uri, .. } => Some(format!("{name} <{uri}>")),
-        ToolContent::Resource { uri, .. } => Some(format!("resource <{uri}>")),
+        ToolContent::Diff { path, .. } => Some(format!("diff {}", clean_line(path))),
+        ToolContent::Terminal { terminal_id } => {
+            Some(format!("terminal {}", clean_line(terminal_id)))
+        }
+        ToolContent::Image { mime_type, .. } => Some(format!("image {}", clean_line(mime_type))),
+        ToolContent::Audio { mime_type } => Some(format!("audio {}", clean_line(mime_type))),
+        ToolContent::ResourceLink { name, uri, .. } => {
+            Some(format!("{} <{}>", clean_line(name), clean_line(uri)))
+        }
+        ToolContent::Resource { uri, .. } => Some(format!("resource <{}>", clean_line(uri))),
     }
 }
 
 fn one_line(text: &str) -> String {
+    let text = clean_line(text);
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut chars = text.chars();
     let short: String = chars.by_ref().take(80).collect();
@@ -986,49 +1049,6 @@ fn one_line(text: &str) -> String {
     } else {
         short
     }
-}
-
-/// Strip terminal control sequences from agent-authored text. The feed renders
-/// text with ratatui, never through a terminal emulator, but removing escapes
-/// also prevents a literal escape from consuming a cell or confusing a reader.
-pub fn clean_text(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\x1b' => match chars.peek() {
-                Some('[') => {
-                    chars.next();
-                    for control in chars.by_ref() {
-                        if ('@'..='~').contains(&control) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    chars.next();
-                    while let Some(control) = chars.next() {
-                        if control == '\x07' {
-                            break;
-                        }
-                        if control == '\x1b' && chars.peek() == Some(&'\\') {
-                            chars.next();
-                            break;
-                        }
-                    }
-                }
-                Some(_) => {
-                    chars.next();
-                }
-                None => {}
-            },
-            '\r' => {}
-            '\n' | '\t' => out.push(c),
-            control if control.is_control() => {}
-            other => out.push(other),
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -1316,8 +1336,8 @@ mod tests {
         assert_eq!(text, "red and plain");
     }
 
-    fn rendered_text(feed: &AgentFeed) -> String {
-        feed.render(&Theme::dark(), None)
+    fn rendered_text_with(feed: &AgentFeed, theme: &Theme) -> String {
+        feed.render(theme, None)
             .lines
             .iter()
             .map(|line| {
@@ -1328,6 +1348,114 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn rendered_text(feed: &AgentFeed) -> String {
+        rendered_text_with(feed, &Theme::dark())
+    }
+
+    #[test]
+    fn tool_metadata_paths_and_content_cannot_inject_controls() {
+        let mut feed = AgentFeed::new();
+        feed.apply(&AgentStateEvent::ToolStarted {
+            id: "escape".to_string(),
+            name: "read\x1b[2J".to_string(),
+            input: json!({ "command": "echo \u{202e}evil", "path": "src/\u{200b}lib.rs" }),
+            detail: Some(Box::new(ToolCallDetail {
+                title: Some("Ti\x1b]0;pwned\x07tle".to_string()),
+                kind: Some(ToolKind::Edit),
+                status: Some(ToolCallStatus::Completed),
+                locations: vec![ToolLocation {
+                    path: "/tmp/\u{202e}etc".to_string(),
+                    line: Some(3),
+                }],
+                content: vec![
+                    ToolContent::Text {
+                        text: "body\x1b[31m".to_string(),
+                    },
+                    ToolContent::Diff {
+                        path: "p\u{202e}".to_string(),
+                        old_text: Some("a\x1b[0m".to_string()),
+                        new_text: "b\u{202e}".to_string(),
+                    },
+                ],
+                ..Default::default()
+            })),
+        });
+        let item = feed.items().next().unwrap().id;
+        assert!(feed.toggle_item(item));
+
+        let text = rendered_text(&feed);
+        assert!(!text.contains('\x1b'), "escape leaked: {text:?}");
+        assert!(!text.contains('\u{202e}'), "bidi override leaked: {text:?}");
+        assert!(!text.contains('\u{200b}'), "zero-width leaked: {text:?}");
+        assert!(text.contains("[U+202E]"), "bidi not made visible: {text:?}");
+        assert!(text.contains("read"), "tool name missing: {text:?}");
+        assert!(text.contains("Title"), "tool title missing: {text:?}");
+        assert!(
+            text.contains("/tmp/[U+202E]etc:3"),
+            "location not shown safely: {text:?}"
+        );
+        assert!(text.contains("body"), "text content missing: {text:?}");
+    }
+
+    #[test]
+    fn assistant_links_are_inert_and_keep_a_distinct_target() {
+        let mut feed = AgentFeed::new();
+        feed.apply(&AgentStateEvent::TextDelta {
+            role: MessageRole::Assistant,
+            text: "[docs](https://example.com/a?b=c) and [https://same.example/path](https://same.example/path) and <b>not html</b>"
+                .to_string(),
+        });
+        let text = rendered_text(&feed);
+        assert!(
+            text.contains("docs (https://example.com/a?b=c)"),
+            "distinct target missing: {text:?}"
+        );
+        assert_eq!(
+            text.matches("https://same.example/path").count(),
+            1,
+            "a target equal to its label should not be repeated: {text:?}"
+        );
+        assert!(
+            text.contains("<b>not html</b>"),
+            "raw HTML must stay literal: {text:?}"
+        );
+    }
+
+    #[test]
+    fn selected_thought_is_visible_without_colour() {
+        let mut feed = AgentFeed::new();
+        feed.apply(&AgentStateEvent::ReasoningDelta {
+            text: "a private thought".to_string(),
+        });
+        let item = feed.items().next().unwrap().id;
+        let rendered = feed.render(&Theme::monochrome(), Some(item));
+        assert_eq!(rendered.selected_range, Some((0, 1)));
+        assert!(
+            rendered.lines[0]
+                .style
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "selection must not rely on colour: {:?}",
+            rendered.lines[0].style
+        );
+        assert!(!rendered_text(&feed).contains("a private thought"));
+    }
+
+    #[test]
+    fn status_labels_remain_readable_without_colour() {
+        let mut feed = AgentFeed::new();
+        feed.apply(&AgentStateEvent::ToolFinished {
+            id: "t".to_string(),
+            name: "bash".to_string(),
+            ok: false,
+            output: None,
+            detail: None,
+        });
+        let text = rendered_text_with(&feed, &Theme::monochrome());
+        assert!(text.contains("bash"), "tool name missing: {text:?}");
+        assert!(text.contains("failed"), "status label missing: {text:?}");
     }
 
     #[test]

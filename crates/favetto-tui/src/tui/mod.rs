@@ -7,6 +7,7 @@ mod editor;
 mod feed;
 mod json;
 mod markdown;
+mod sanitize;
 mod sound;
 mod syntax;
 mod term;

@@ -16,6 +16,7 @@ use super::theme::Theme;
 
 /// Render a task file (TOML front-matter + Markdown body) into styled lines.
 pub fn render_task(source: &str, theme: &Theme) -> Vec<Line<'static>> {
+    let source = super::sanitize::text(source);
     let lines: Vec<&str> = source.lines().collect();
     let separator = lines.iter().position(|l| l.trim() == "---");
 
@@ -38,6 +39,7 @@ pub fn render_task(source: &str, theme: &Theme) -> Vec<Line<'static>> {
 
 /// Render a Markdown document (assistant prose, a catalog prompt, …).
 pub fn render(source: &str, theme: &Theme) -> Vec<Line<'static>> {
+    let source = super::sanitize::text(source);
     let lines: Vec<&str> = source.lines().collect();
     render_markdown(&lines, theme)
 }
@@ -399,11 +401,11 @@ fn inline(text: &str, base: Style, theme: &Theme) -> Vec<Span<'static>> {
                     base.fg(theme.markdown.image).add_modifier(Modifier::ITALIC),
                 ));
                 spans.push(Span::styled(
-                    label,
+                    label.clone(),
                     base.fg(theme.markdown.image_text)
                         .add_modifier(Modifier::ITALIC),
                 ));
-                push_url(&mut spans, &url, base, theme);
+                push_url(&mut spans, &label, &url, base, theme);
                 i = next;
                 continue;
             }
@@ -413,11 +415,11 @@ fn inline(text: &str, base: Style, theme: &Theme) -> Vec<Span<'static>> {
             if let Some((label, url, next)) = parse_link(&chars, i, false) {
                 flush(&mut buf, &mut spans, base);
                 spans.push(Span::styled(
-                    label,
+                    label.clone(),
                     base.fg(theme.markdown.link_text)
                         .add_modifier(Modifier::UNDERLINED),
                 ));
-                push_url(&mut spans, &url, base, theme);
+                push_url(&mut spans, &label, &url, base, theme);
                 i = next;
                 continue;
             }
@@ -430,8 +432,11 @@ fn inline(text: &str, base: Style, theme: &Theme) -> Vec<Span<'static>> {
     spans
 }
 
-fn push_url(spans: &mut Vec<Span<'static>>, url: &str, base: Style, theme: &Theme) {
-    if !url.is_empty() {
+/// Append a link's target as inert text. When the label already is the target,
+/// showing it twice only adds noise, so the target is preserved in full only
+/// when it differs from the label. Nothing here is clickable or auto-opened.
+fn push_url(spans: &mut Vec<Span<'static>>, label: &str, url: &str, base: Style, theme: &Theme) {
+    if !url.is_empty() && label.trim() != url {
         spans.push(Span::styled(format!(" ({url})"), base.fg(theme.syn_link())));
     }
 }
@@ -618,6 +623,34 @@ mod tests {
         assert!(spans
             .iter()
             .any(|s| s.content == "> " && s.style.fg == Some(theme.markdown.block_quote)));
+    }
+
+    #[test]
+    fn link_target_is_kept_when_it_differs_from_the_label() {
+        let (text, _) = rendered("[docs](https://example.com/a?b=c)", &Theme::dark());
+        assert_eq!(text, "docs (https://example.com/a?b=c)");
+    }
+
+    #[test]
+    fn link_target_is_not_duplicated_when_it_equals_the_label() {
+        let (text, _) = rendered(
+            "[https://example.com/docs](https://example.com/docs)",
+            &Theme::dark(),
+        );
+        assert_eq!(text, "https://example.com/docs");
+        assert_eq!(text.matches("https://example.com/docs").count(), 1);
+    }
+
+    #[test]
+    fn control_sequences_in_markdown_are_neutralized() {
+        let (text, _) = rendered(
+            "\x1b[31mred\x1b[0m [x](https://e)\u{202e}txet",
+            &Theme::dark(),
+        );
+        assert!(!text.contains('\x1b'));
+        assert!(!text.contains('\u{202e}'));
+        assert!(text.contains("red x (https://e)"));
+        assert!(text.contains("[U+202E]"));
     }
 
     #[test]
