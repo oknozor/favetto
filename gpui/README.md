@@ -1,10 +1,9 @@
 # favetto GPUI desktop client
 
-Status: **task detail (step 06)** — the client's core surface: a pinned header
-with name, status, agent, repo, attempt, elapsed time, copyable session id and
-usage; three tabs (Output / Events / Runs); a structured event feed with
-grouped deltas, tool badges and usage; and a pinned permission banner that
-answers a blocked run without leaving the app. The plans live in
+Status: **task catalog (step 07)** — browse definitions grouped by repo and
+folder, fuzzy-search names and prompts, read the raw Markdown source beside the
+list, and launch a definition through a validated `[[vars]]` sheet. The one-shot
+session is the toolbar's secondary action. The plans live in
 `docs/design/gpui-client.md`.
 
 ## What it is
@@ -53,6 +52,12 @@ opens the run, `c` cancels and `r` retries a finished run (both confirm first,
 then update the row immediately), `/` focuses the search field, `Esc` clears
 the query, and `[`/`]` step the status filter.
 
+On the Catalog surface, `↑`/`↓` move the definition highlight, `Enter` opens
+the launch sheet, `/` focuses the search field, `⌘N`/`Ctrl+N` opens the one-shot
+session sheet, and `Esc` closes the sheet, then clears the search. Inside a
+sheet, `Tab`/`Shift+Tab` move between fields, `⌘↵`/`Ctrl+↵` launches (or opens
+the one-shot session), and `Esc` cancels.
+
 The Inbox and Tasks surfaces load one `tasks.list` (limit 500) and `agents.list`
 snapshot on connect and follow `task.updated`, `agent.state` and `agent.event`
 pushes. A blocked session shows up without a manual refresh; overlapping pushes
@@ -86,6 +91,29 @@ the pill (or re-enabling Follow) jumps back to live. Empty Output/Events/Runs
 states and per-tab Retry buttons are explicit; a failed read never hides an
 older feed.
 
+The Catalog loads one `catalog.list` on connect and whenever the daemon pushes
+`catalog.updated`. Definitions are grouped by repo namespace (`repo:<name>`),
+then by their folder, then by name; `Global` comes last. Group and folder
+headers collapse, and both the collapsed set and the query survive the session.
+The search field fuzzy-matches definition names and prompt text. Selecting a row
+loads `catalog.get` and shows the raw Markdown in a monospace pane beside the
+list; **Copy** puts the source on the clipboard.
+
+**Start with variables…** (or `Enter`) opens the launch sheet. It shows the
+definition's agent, provider/model, `cwd`, schedule and every declared `[[vars]]`
+entry. Required values are marked and validated inline; `int`/`bool` and fixed
+choice lists are checked before anything is sent. Multiline values use a wrapped
+text area and accept `Enter` as a newline. A launch sends `tasks.start` with
+`{ name, input }`; success closes the sheet, shows a toast and opens the new
+run's detail. A daemon rejection stays attached to the sheet as an inline error,
+so the user can correct the input instead of losing it.
+
+An empty catalog explains that definitions are Markdown files under the repo's
+`.favetto/tasks/` directory. **New one-shot session** (toolbar or `⌘N`/`Ctrl+N`)
+opens the secondary sheet: an agent picker from `agents.list` plus an optional
+working directory, sent through `tasks.start_oneshot`. The resulting run is
+opened in the task detail immediately.
+
 ## Pointing it at a daemon
 
 The connection is configured in `~/.config/favetto/gpui.toml`:
@@ -116,9 +144,13 @@ or `/events` path, and a missing scheme are all accepted.
   `async-channel`: commands in, connection state/cursor/pushes out.
 - `src/state.rs` — the single `ClientState` entity; the foreground drain task
   folds updates in and calls `cx.notify()`. It also owns the active route, the
-  pushed-detail flag, the shared task snapshot (tasks + sessions), the Inbox
-  selection, the Tasks filter/query/selection, the confirmation dialog and the
-  toast.
+  pushed-detail flag, the shared task snapshot (tasks + sessions + agent
+  roster), the Inbox selection, the Tasks filter/query/selection, the Catalog
+  model, the confirmation dialog and the toast.
+- `src/catalog.rs` — the pure Catalog model: repo/folder grouping, fuzzy
+  name+prompt filtering, session-scoped collapse keys, preview state, and the
+  launch/one-shot forms with required/type/choice validation. Unit-tested
+  without a window.
 - `src/inbox.rs` — the pure Inbox model: Needs you vs Recent grouping, the
   24-hour failure window, oldest-first fair-queue order, status fallbacks and
   the compact duration/cost formatters. Unit-tested without a window.
@@ -274,3 +306,36 @@ Deviations from the plan are recorded in this file as the chain progresses
   per-tab. The one-second clock only refreshes the elapsed label of a live run.
 - **Attempt totals are not faked.** The wire carries `attempt` but not a
   configured retry total, so the header says `attempt n`, not `n of m`.
+
+### Step 07 deviations / additions
+
+- **Preview is raw source, with Copy.** As in step 06, this GPUI build has no
+  selectable-text primitive, so `catalog.get` renders a read-only monospace
+  pane with a **Copy** action rather than a Markdown renderer or selectable
+  text.
+- **Form editing is append/backspace at the end.** The launch and one-shot
+  sheets reuse the shell's typed-character routing (the same model as the
+  palette and Tasks search); there is no cursor movement or marked-text IME
+  handling yet. Multiline vars use a wrapped, fixed-height text area and Enter
+  inserts a newline; Tab/Shift+Tab move between fields.
+- **Required vars block the RPC, not the button.** Submit validates every field
+  and renders errors inline; the request is only sent when the form is valid.
+  Optional blank values are omitted from `input`, and declared types/choices
+  are coerced with the same `TaskVar` logic as the TUI.
+- **Declared agents are checked against the roster.** Before sending, the
+  launch sheet rejects an agent that `agents.list` marks missing or unavailable
+  and shows the reason inline. The same check guards the one-shot picker. RPC
+  failures still land in the sheet, never in a toast that hides the form.
+- **A launch is headless.** `tasks.start` sends `interactive: null` (the daemon
+  default), consistent with the other automation clients; the desktop renders
+  the run's structured events instead of embedding a terminal. The embedded TUI
+  remains a TUI feature.
+- **Catalog refresh is coalesced.** A burst of `catalog.updated` pushes collapses
+  into one `catalog.list`; the selected definition's source is invalidated and
+  re-read after the list lands.
+- **The launch sheet is surface-local.** It is an overlay inside the Catalog
+  region rather than a window-level modal; navigating away closes it, so it can
+  never own the keyboard from a hidden surface.
+- **One-shot success opens the task.** The returned task is folded into the
+  snapshot, its live session is added to the roster immediately, and the detail
+  page opens without waiting for the next `agents.list` poll.

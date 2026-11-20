@@ -17,10 +17,13 @@ use std::path::Path;
 use std::time::Duration;
 
 use chrono::Utc;
-use favetto_wire::model::{AgentSessionInfo, AgentUsage, InputReply, Task, TaskStatus};
+use favetto_wire::model::{
+    AgentCatalogEntry, AgentSessionInfo, AgentUsage, InputReply, Task, TaskStatus,
+};
 use favetto_wire::rpc::AgentEventPush;
 use gpui::{ClipboardItem, Context, Task as GpuiTask};
 
+use crate::catalog::{AgentChoice, CatalogState, OneShotFocus};
 use crate::config::{self, ClientConfig};
 use crate::detail::{DetailTab, PendingRequest, TaskDetail};
 use crate::inbox::{self, InboxKey, InboxRows};
@@ -182,6 +185,10 @@ pub struct ClientState {
     tasks: Vec<Task>,
     /// The flattened live sessions from `agents.list`.
     sessions: Vec<AgentSessionInfo>,
+    /// The configured agent roster (the one-shot picker).
+    agents: Vec<AgentCatalogEntry>,
+    /// The Catalog surface: entries, filter, preview and the launch sheets.
+    catalog: CatalogState,
     /// First-fetch skeleton / error state for the shared task snapshot.
     snapshot_status: SnapshotStatus,
     /// The highlighted Needs you row, preserved by identity across refreshes.
@@ -249,7 +256,7 @@ impl ClientState {
             }
         };
 
-        Self {
+        let mut state = Self {
             connection,
             config,
             last_ping: None,
@@ -261,7 +268,9 @@ impl ClientState {
             detail_open: false,
             tasks: Vec::new(),
             sessions: Vec::new(),
-            snapshot_status,
+            agents: Vec::new(),
+            catalog: CatalogState::default(),
+            snapshot_status: snapshot_status.clone(),
             inbox_selected: None,
             tasks_filter: TaskFilter::default(),
             tasks_query: String::new(),
@@ -276,7 +285,11 @@ impl ClientState {
             repo: None,
             runtime,
             drain,
+        };
+        if let SnapshotStatus::Failed { message } = snapshot_status {
+            state.catalog.fail(message);
         }
+        state
     }
 
     /// Fold one runtime update into the entity.
@@ -291,6 +304,7 @@ impl ClientState {
                 if became_connected {
                     self.ping();
                     self.refresh_snapshot();
+                    self.refresh_catalog();
                 } else if !self.connection.is_connected()
                     && !self.has_snapshot_data()
                     && matches!(
@@ -304,6 +318,9 @@ impl ClientState {
                     self.snapshot_status = SnapshotStatus::Failed {
                         message: self.connection.label(),
                     };
+                    if !self.catalog.has_entries() {
+                        self.catalog.fail(self.connection.label());
+                    }
                 }
             }
             Update::Ping(snapshot) => {
@@ -372,10 +389,15 @@ impl ClientState {
                     // A blocked or resolved prompt changes the agent roster,
                     // which only `agents.list` can reconcile.
                     Push::AgentState(_) => self.refresh_snapshot(),
+                    // The definition files changed on disk: reload the list and
+                    // drop the cached source so the preview shows the new text.
+                    Push::CatalogUpdated => {
+                        self.catalog.invalidate_preview();
+                        self.refresh_catalog();
+                    }
                     // Unknown method or event kind: counted above, ignored here
                     // (docs step 06: never fatal).
                     Push::Event(_)
-                    | Push::CatalogUpdated
                     | Push::AgentExit(_)
                     | Push::UnsupportedAgentEvent { .. }
                     | Push::Unknown(_) => {}
@@ -383,9 +405,14 @@ impl ClientState {
             }
             Update::Cursor(cursor) => self.cursor = cursor,
             Update::Malformed(message) => self.last_error = Some(message),
-            Update::SnapshotLoaded { tasks, sessions } => {
+            Update::SnapshotLoaded {
+                tasks,
+                sessions,
+                agents,
+            } => {
                 self.tasks = tasks;
                 self.sessions = sessions;
+                self.agents = agents;
                 self.snapshot_status = SnapshotStatus::Loaded;
             }
             Update::SnapshotFailed { error } => {
@@ -398,6 +425,96 @@ impl ClientState {
                     message: error.to_string(),
                 };
             }
+            Update::CatalogLoaded { entries } => {
+                if let Some(name) = self.catalog.set_entries(entries) {
+                    self.load_catalog_preview(&name);
+                }
+            }
+            Update::CatalogFailed { error } => {
+                if error.is_unauthorized() {
+                    self.connection = ConnectionState::Unauthorized {
+                        token_path: self.config.token_source.label(),
+                    };
+                }
+                self.catalog.fail(error.to_string());
+            }
+            Update::CatalogPreviewLoaded { name, markdown } => {
+                self.catalog.set_preview(&name, markdown);
+            }
+            Update::CatalogPreviewFailed { name, error } => {
+                if error.is_unauthorized() {
+                    self.connection = ConnectionState::Unauthorized {
+                        token_path: self.config.token_source.label(),
+                    };
+                }
+                self.catalog.fail_preview(&name, error.to_string());
+            }
+            Update::CatalogLaunchFinished { name, result } => {
+                match result {
+                    Ok(task) => {
+                        let task = *task;
+                        if self
+                            .catalog
+                            .launch()
+                            .is_some_and(|form| form.entry.name == name)
+                        {
+                            self.catalog.close_launch();
+                        }
+                        let display = inbox::task_display_name(&task.name).to_string();
+                        self.upsert_task(task.clone());
+                        // The new run is the best possible confirmation: land
+                        // on its detail instead of leaving the user in a list
+                        // where the row may not have arrived yet.
+                        self.navigate(Route::Tasks);
+                        self.open_task(task.id);
+                        self.show_toast(ToastKind::Success, format!("Started '{display}'."), cx);
+                    }
+                    Err(error) => {
+                        if error.is_unauthorized() {
+                            self.connection = ConnectionState::Unauthorized {
+                                token_path: self.config.token_source.label(),
+                            };
+                        }
+                        if let Some(form) = self.catalog.launch_mut() {
+                            if form.entry.name == name {
+                                form.submitting = false;
+                                form.server_error =
+                                    Some(format!("The daemon rejected the launch: {error}."));
+                            }
+                        }
+                    }
+                }
+            }
+            Update::OneshotFinished { result } => match result {
+                Ok(result) => {
+                    let result = *result;
+                    self.catalog.close_oneshot();
+                    self.upsert_task(result.task.clone());
+                    // The session is already live; fold it in so the detail
+                    // header shows its agent and id without waiting for the
+                    // next roster poll.
+                    self.sessions.push(result.session);
+                    self.navigate(Route::Tasks);
+                    self.open_task(result.task.id);
+                    self.show_toast(
+                        ToastKind::Success,
+                        "Opened a new one-shot session.".to_string(),
+                        cx,
+                    );
+                }
+                Err(error) => {
+                    if error.is_unauthorized() {
+                        self.connection = ConnectionState::Unauthorized {
+                            token_path: self.config.token_source.label(),
+                        };
+                    }
+                    if let Some(form) = self.catalog.oneshot_mut() {
+                        form.submitting = false;
+                        form.server_error =
+                            Some(format!("The daemon could not open the session: {error}."));
+                    }
+                }
+            },
             Update::TaskLoaded { task } => {
                 if let Some(detail) = self.detail.as_mut() {
                     if detail.task_id == task.id {
@@ -608,11 +725,352 @@ impl ClientState {
         }
     }
 
-    /// Refresh the active surface: its task rows on Inbox/Tasks, and always the
-    /// ping (so the status bar and repo label stay honest).
+    /// Ask the runtime for a fresh `catalog.list`. Like the task snapshot, an
+    /// older list stays visible; only a data-less surface shows the skeleton.
+    pub fn refresh_catalog(&mut self) {
+        match &self.runtime {
+            Some(runtime) => {
+                if !self.catalog.has_entries()
+                    && !matches!(self.catalog.status(), crate::catalog::CatalogStatus::Loaded)
+                {
+                    self.catalog.begin_load();
+                }
+                runtime.refresh_catalog();
+            }
+            None => self
+                .catalog
+                .fail("the transport is not running".to_string()),
+        }
+    }
+
+    /// Fetch the selected definition's raw Markdown.
+    fn load_catalog_preview(&mut self, name: &str) {
+        self.catalog.begin_preview(name);
+        match &self.runtime {
+            Some(runtime) => runtime.load_catalog_entry(name.to_string()),
+            None => self
+                .catalog
+                .fail_preview(name, "the transport is not running".to_string()),
+        }
+    }
+
+    fn ensure_catalog_preview(&mut self) {
+        if let Some(name) = self.catalog.preview_needed() {
+            self.load_catalog_preview(&name);
+        }
+    }
+
+    /// The Catalog model (groups, search, preview, launch sheets).
+    pub fn catalog(&self) -> &CatalogState {
+        &self.catalog
+    }
+
+    /// The configured agent roster, for the one-shot picker.
+    pub fn agent_roster(&self) -> &[AgentCatalogEntry] {
+        &self.agents
+    }
+
+    /// Highlight a catalog row and load its preview when it changed.
+    pub fn select_catalog_entry(&mut self, name: &str) {
+        self.catalog.select(name);
+        self.ensure_catalog_preview();
+    }
+
+    /// Keyboard selection on the Catalog list (↑/↓).
+    pub fn move_catalog_selection(&mut self, delta: isize) {
+        self.catalog.move_selection(delta);
+        self.ensure_catalog_preview();
+    }
+
+    /// Enter on the Catalog list opens the launch sheet for the selected
+    /// definition. While a sheet is already open the key is a no-op, so typed
+    /// var values can never be reset by Enter.
+    pub fn open_catalog_selected(&mut self) {
+        if self.catalog.any_form_open() {
+            return;
+        }
+        self.ensure_catalog_preview();
+        if let Some(name) = self.catalog.selected().map(str::to_string) {
+            self.catalog.open_launch(&name);
+        }
+    }
+
+    pub fn is_catalog_search_active(&self) -> bool {
+        self.catalog.is_search_active()
+    }
+
+    /// Collapse or expand one Catalog namespace/folder.
+    pub fn toggle_catalog_group(&mut self, key: &str) {
+        self.catalog.toggle_collapsed(key);
+    }
+
+    pub fn activate_catalog_search(&mut self) {
+        self.catalog.activate_search();
+    }
+
+    pub fn deactivate_catalog_search(&mut self) {
+        self.catalog.deactivate_search();
+    }
+
+    /// Route one typed character to the launch sheet, the one-shot sheet or the
+    /// search field, in that order (the sheets are modal).
+    pub fn catalog_push_char(&mut self, character: char) {
+        if self.catalog.launch().is_some() {
+            self.catalog.push_launch_char(character);
+        } else if self.catalog.oneshot().is_some() {
+            self.catalog.push_oneshot_char(character);
+        } else if self.catalog.is_search_active() {
+            if let Some(name) = self.catalog.push_search_char(character) {
+                self.load_catalog_preview(&name);
+            }
+        }
+    }
+
+    pub fn catalog_backspace(&mut self) {
+        if self.catalog.launch().is_some() {
+            self.catalog.backspace_launch();
+        } else if self.catalog.oneshot().is_some() {
+            self.catalog.backspace_oneshot();
+        } else if self.catalog.is_search_active() {
+            if let Some(name) = self.catalog.backspace_search() {
+                self.load_catalog_preview(&name);
+            }
+        }
+    }
+
+    /// Enter inside a multiline var inserts a line break and returns true.
+    pub fn catalog_push_newline(&mut self) -> bool {
+        self.catalog.push_launch_newline()
+    }
+
+    /// Tab/Shift+Tab inside the active sheet.
+    pub fn cycle_catalog_form_focus(&mut self, delta: isize) {
+        if self.catalog.launch().is_some() {
+            self.catalog.cycle_launch_focus(delta);
+        } else if self.catalog.oneshot().is_some() {
+            self.catalog.cycle_oneshot_focus();
+        }
+    }
+
+    /// Clear the Catalog search. Returns whether anything changed.
+    pub fn clear_catalog_search(&mut self) -> bool {
+        let changed = self.catalog.clear_search();
+        if changed {
+            self.ensure_catalog_preview();
+        }
+        changed
+    }
+
+    /// The topmost Catalog overlay consumed Escape.
+    pub fn close_catalog_overlay(&mut self) -> bool {
+        self.catalog.close_overlay()
+    }
+
+    /// Open the launch sheet for one definition.
+    pub fn open_catalog_launch(&mut self, name: &str, cx: &mut Context<Self>) -> bool {
+        if self.catalog.open_launch(name) {
+            true
+        } else {
+            self.show_toast(
+                ToastKind::Info,
+                "That definition is no longer in the catalog. Refresh and try again.".to_string(),
+                cx,
+            );
+            false
+        }
+    }
+
+    /// Focus one var in the launch sheet (a field click).
+    pub fn focus_catalog_field(&mut self, index: usize) {
+        if let Some(form) = self.catalog.launch_mut() {
+            if index < form.fields.len() {
+                form.focused = index;
+            }
+        }
+    }
+
+    /// Set a var value from a declared choice chip.
+    pub fn set_catalog_field_value(&mut self, index: usize, value: String) {
+        if let Some(form) = self.catalog.launch_mut() {
+            if let Some(field) = form.fields.get_mut(index) {
+                field.value = value;
+                field.error = None;
+                form.server_error = None;
+                form.focused = index;
+            }
+        }
+    }
+
+    /// Retry a failed preview read.
+    pub fn retry_catalog_preview(&mut self) {
+        self.catalog.invalidate_preview();
+        self.ensure_catalog_preview();
+    }
+
+    /// Copy the selected definition's Markdown source (the preview pane has no
+    /// text selection in this GPUI build).
+    pub fn copy_catalog_source(&mut self, cx: &mut Context<Self>) {
+        let Some(markdown) = self
+            .catalog
+            .preview()
+            .and_then(|preview| preview.markdown.clone())
+        else {
+            self.show_toast(
+                ToastKind::Info,
+                "Select a definition with a loaded source first.".to_string(),
+                cx,
+            );
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(markdown));
+        self.show_toast(
+            ToastKind::Success,
+            "Copied the definition source.".to_string(),
+            cx,
+        );
+    }
+
+    /// Validate the launch sheet and send `tasks.start`. A validation failure
+    /// stays inline; a transport failure is attached to the form too.
+    pub fn submit_catalog_launch(&mut self) {
+        // A declared agent the daemon does not offer is caught here as well as
+        // on the server: the roster is the same `agents.list` the daemon uses,
+        // so the sheet can explain the typo without a round trip.
+        let missing_agent = self
+            .catalog
+            .launch()
+            .and_then(|form| form.entry.agent.clone())
+            .filter(|agent| {
+                !self.agents.is_empty()
+                    && !self
+                        .agents
+                        .iter()
+                        .any(|choice| &choice.name == agent && choice.available)
+            });
+        if let Some(agent) = missing_agent {
+            if let Some(form) = self.catalog.launch_mut() {
+                form.submitting = false;
+                form.server_error = Some(format!(
+                    "Agent '{agent}' is not configured or not available on the daemon."
+                ));
+            }
+            return;
+        }
+        let Some(form) = self.catalog.launch_mut() else {
+            return;
+        };
+        if form.submitting {
+            return;
+        }
+        if !form.validate() {
+            return;
+        }
+        let Some(input) = form.input() else {
+            return;
+        };
+        let name = form.entry.name.clone();
+        form.submitting = true;
+        form.server_error = None;
+        match &self.runtime {
+            Some(runtime) => runtime.start_catalog_task(name, input),
+            None => {
+                if let Some(form) = self.catalog.launch_mut() {
+                    form.submitting = false;
+                    form.server_error = Some(
+                        "The transport is not running, so the task was not started.".to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    pub fn close_catalog_launch(&mut self) {
+        self.catalog.close_launch();
+    }
+
+    /// Open the secondary one-shot sheet with the daemon's agent roster.
+    pub fn open_oneshot(&mut self) {
+        let agents = self
+            .agents
+            .iter()
+            .map(|agent| AgentChoice {
+                name: agent.name.clone(),
+                display_name: if agent.display_name.is_empty() {
+                    agent.name.clone()
+                } else {
+                    agent.display_name.clone()
+                },
+                available: agent.available,
+                default: agent.default,
+            })
+            .collect();
+        self.catalog.open_oneshot(agents);
+    }
+
+    pub fn close_oneshot(&mut self) {
+        self.catalog.close_oneshot();
+    }
+
+    /// Send `tasks.start_oneshot` with the chosen agent and cwd.
+    pub fn submit_oneshot(&mut self) {
+        let Some(form) = self.catalog.oneshot_mut() else {
+            return;
+        };
+        if form.submitting {
+            return;
+        }
+        if form.agent.is_none() {
+            form.server_error = Some("Choose an agent first.".to_string());
+            return;
+        }
+        let unavailable = form
+            .agent
+            .as_ref()
+            .and_then(|name| form.agents.iter().find(|choice| &choice.name == name))
+            .is_some_and(|choice| !choice.available);
+        if unavailable {
+            form.server_error =
+                Some("That agent is not available on the daemon; choose another one.".to_string());
+            return;
+        }
+        let agent = form.agent.clone();
+        let cwd = form.cwd.trim().to_string();
+        form.submitting = true;
+        form.server_error = None;
+        match &self.runtime {
+            Some(runtime) => runtime.start_oneshot(agent, (!cwd.is_empty()).then_some(cwd)),
+            None => {
+                if let Some(form) = self.catalog.oneshot_mut() {
+                    form.submitting = false;
+                    form.server_error =
+                        Some("The transport is not running, so no session was opened.".to_string());
+                }
+            }
+        }
+    }
+
+    /// Select the agent chip in the one-shot sheet.
+    pub fn select_oneshot_agent(&mut self, name: &str) {
+        self.catalog.set_oneshot_agent(name);
+    }
+
+    pub fn focus_oneshot(&mut self, focus: OneShotFocus) {
+        self.catalog.set_oneshot_focus(focus);
+    }
+
+    /// ↑/↓ while the one-shot agent picker has focus.
+    pub fn cycle_oneshot_agent(&mut self, delta: isize) {
+        self.catalog.cycle_oneshot_agent(delta);
+    }
+
+    /// Refresh the active surface: its task rows on Inbox/Tasks, the catalog
+    /// on Catalog, and always the ping (so the status bar and repo label stay
+    /// honest).
     pub fn refresh_active(&mut self) {
-        if matches!(self.active_route, Route::Inbox | Route::Tasks) {
-            self.refresh_snapshot();
+        match self.active_route {
+            Route::Inbox | Route::Tasks => self.refresh_snapshot(),
+            Route::Catalog => self.refresh_catalog(),
+            _ => {}
         }
         self.ping();
     }
@@ -638,6 +1096,13 @@ impl ClientState {
             // (docs §2, Working Memory).
             self.tasks_search_active = false;
         }
+        if self.active_route == Route::Catalog && route != Route::Catalog {
+            // A sheet belongs to the Catalog surface; leaving it must not leave
+            // a hidden modal that still owns the keyboard.
+            self.catalog.deactivate_search();
+            self.catalog.close_launch();
+            self.catalog.close_oneshot();
+        }
         // A confirmation is about one row on one surface; leaving the surface
         // must not leave a hidden dialog targeting it.
         self.task_confirm = None;
@@ -648,6 +1113,8 @@ impl ClientState {
             // missed; later visits keep the current rows until the new
             // snapshot lands.
             self.refresh_snapshot();
+        } else if route == Route::Catalog {
+            self.refresh_catalog();
         }
     }
 

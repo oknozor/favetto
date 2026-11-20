@@ -22,10 +22,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use async_channel::{Receiver, Sender};
-use favetto_wire::model::{AgentSessionInfo, InputReply, Task, TaskRun};
+use favetto_wire::model::{AgentCatalogEntry, AgentSessionInfo, InputReply, Task, TaskRun};
 use favetto_wire::rpc::{
-    AgentReplyParams, AgentReplyResult, EmptyParams, PingParams, PingResult, TaskIdParams,
-    TasksEventsParams, TasksListParams,
+    AgentReplyParams, AgentReplyResult, CatalogEntry, CatalogGetParams, EmptyParams, PingParams,
+    PingResult, StartOneshotParams, StartOneshotResult, TaskIdParams, TasksEventsParams,
+    TasksListParams, TasksStartParams,
 };
 use uuid::Uuid;
 
@@ -52,6 +53,21 @@ pub enum Command {
     /// Loads coalesce, so a burst of pushes costs one round trip, not one per
     /// frame.
     RefreshSnapshot,
+    /// Re-fetch `catalog.list` (connect, Retry or a `catalog.updated` push).
+    RefreshCatalog,
+    /// Fetch one definition's raw Markdown for the preview pane.
+    LoadCatalogEntry { name: String },
+    /// Enqueue a catalog definition with its collected variables.
+    StartCatalogTask {
+        name: String,
+        input: serde_json::Value,
+    },
+    /// Open an inline one-shot agent session (the Catalog toolbar's secondary
+    /// action).
+    StartOneshot {
+        agent: Option<String>,
+        cwd: Option<String>,
+    },
     /// Send `tasks.cancel` or `tasks.retry` for one task. `previous` is the row
     /// the UI optimistically replaced and `optimistic` is the replacement, so a
     /// failed RPC can restore the former only if no newer push replaced it.
@@ -103,10 +119,29 @@ pub enum Update {
     SnapshotLoaded {
         tasks: Vec<Task>,
         sessions: Vec<AgentSessionInfo>,
+        /// The agent roster, used by the one-shot picker.
+        agents: Vec<AgentCatalogEntry>,
     },
     /// The Inbox/Tasks fetch failed (`tasks.list` is required; a failing agents
     /// list keeps the task rows and drops the session overlay).
     SnapshotFailed { error: ClientError },
+    /// A fresh `catalog.list` snapshot.
+    CatalogLoaded { entries: Vec<CatalogEntry> },
+    /// `catalog.list` failed.
+    CatalogFailed { error: ClientError },
+    /// `catalog.get` completed for the selected definition.
+    CatalogPreviewLoaded { name: String, markdown: String },
+    /// `catalog.get` failed for the selected definition.
+    CatalogPreviewFailed { name: String, error: ClientError },
+    /// `tasks.start` completed for the launch sheet.
+    CatalogLaunchFinished {
+        name: String,
+        result: Result<Box<Task>, ClientError>,
+    },
+    /// `tasks.start_oneshot` completed for the one-shot sheet.
+    OneshotFinished {
+        result: Result<Box<StartOneshotResult>, ClientError>,
+    },
     /// A `tasks.cancel`/`tasks.retry` round trip completed. `previous` is the
     /// pre-optimistic row and `optimistic` the local write, used for the guarded
     /// rollback on error.
@@ -209,6 +244,26 @@ impl Runtime {
         self.send(Command::RefreshSnapshot);
     }
 
+    /// Ask for a fresh catalog list. Coalesced by the loader.
+    pub fn refresh_catalog(&self) {
+        self.send(Command::RefreshCatalog);
+    }
+
+    /// Fetch one definition's raw Markdown source.
+    pub fn load_catalog_entry(&self, name: String) {
+        self.send(Command::LoadCatalogEntry { name });
+    }
+
+    /// Enqueue a catalog definition with its collected input.
+    pub fn start_catalog_task(&self, name: String, input: serde_json::Value) {
+        self.send(Command::StartCatalogTask { name, input });
+    }
+
+    /// Open an inline one-shot agent session.
+    pub fn start_oneshot(&self, agent: Option<String>, cwd: Option<String>) {
+        self.send(Command::StartOneshot { agent, cwd });
+    }
+
     /// Run `tasks.cancel`/`tasks.retry` for a row the UI already changed.
     pub fn task_action(&self, action: TaskAction, previous: Task, optimistic: Task) {
         self.send(Command::TaskAction {
@@ -279,6 +334,8 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
     spawn_ping(client.clone(), updates.clone());
     let (inbox_trigger, inbox_triggers) = async_channel::bounded(1);
     spawn_inbox_loader(client.clone(), updates.clone(), inbox_triggers);
+    let (catalog_trigger, catalog_triggers) = async_channel::bounded(1);
+    spawn_catalog_loader(client.clone(), updates.clone(), catalog_triggers);
 
     while let Ok(command) = commands.recv().await {
         match command {
@@ -294,11 +351,24 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
                 // The UI also asks on the Connected transition; this covers a
                 // reconnect whose state transition is not observed.
                 let _ = inbox_trigger.try_send(());
+                let _ = catalog_trigger.try_send(());
             }
             Command::RefreshSnapshot => {
                 // Capacity one: if a load is already queued/running, this is a
                 // no-op rather than a second overlapping RPC pair.
                 let _ = inbox_trigger.try_send(());
+            }
+            Command::RefreshCatalog => {
+                let _ = catalog_trigger.try_send(());
+            }
+            Command::LoadCatalogEntry { name } => {
+                spawn_catalog_entry(client.clone(), updates.clone(), name);
+            }
+            Command::StartCatalogTask { name, input } => {
+                spawn_start_catalog(client.clone(), updates.clone(), name, input);
+            }
+            Command::StartOneshot { agent, cwd } => {
+                spawn_start_oneshot(client.clone(), updates.clone(), agent, cwd);
             }
             Command::TaskAction {
                 action,
@@ -361,6 +431,83 @@ fn spawn_ping(client: Arc<RpcClient>, updates: Sender<Update>) {
     });
 }
 
+/// Drain catalog refresh triggers into one `catalog.list`, coalescing a burst
+/// of `catalog.updated` pushes into a single round trip.
+fn spawn_catalog_loader(client: Arc<RpcClient>, updates: Sender<Update>, triggers: Receiver<()>) {
+    tokio::spawn(async move {
+        while triggers.recv().await.is_ok() {
+            while triggers.try_recv().is_ok() {}
+            let update = match client.catalog_list(EmptyParams {}).await {
+                Ok(entries) => Update::CatalogLoaded { entries },
+                Err(error) => Update::CatalogFailed { error },
+            };
+            let _ = updates.try_send(update);
+        }
+    });
+}
+
+/// Spawn one `catalog.get` for the preview pane.
+fn spawn_catalog_entry(client: Arc<RpcClient>, updates: Sender<Update>, name: String) {
+    tokio::spawn(async move {
+        let result = client
+            .catalog_get(CatalogGetParams { name: name.clone() })
+            .await;
+        let update = match result {
+            Ok(result) => Update::CatalogPreviewLoaded {
+                name,
+                markdown: result.markdown,
+            },
+            Err(error) => Update::CatalogPreviewFailed { name, error },
+        };
+        let _ = updates.try_send(update);
+    });
+}
+
+/// Spawn one `tasks.start` for a catalog definition.
+fn spawn_start_catalog(
+    client: Arc<RpcClient>,
+    updates: Sender<Update>,
+    name: String,
+    input: serde_json::Value,
+) {
+    tokio::spawn(async move {
+        let result = client
+            .tasks_start(TasksStartParams {
+                name: name.clone(),
+                input: Some(input),
+                // The desktop client runs the task headlessly and renders its
+                // structured events; the embedded TUI stays a TUI feature.
+                interactive: None,
+            })
+            .await
+            .map(Box::new);
+        let _ = updates.try_send(Update::CatalogLaunchFinished { name, result });
+    });
+}
+
+/// Spawn one `tasks.start_oneshot` for the toolbar's secondary action.
+fn spawn_start_oneshot(
+    client: Arc<RpcClient>,
+    updates: Sender<Update>,
+    agent: Option<String>,
+    cwd: Option<String>,
+) {
+    tokio::spawn(async move {
+        let result = client
+            .tasks_start_oneshot(StartOneshotParams {
+                agent,
+                provider: None,
+                model: None,
+                cwd,
+                rows: None,
+                cols: None,
+            })
+            .await
+            .map(Box::new);
+        let _ = updates.try_send(Update::OneshotFinished { result });
+    });
+}
+
 /// Drain Inbox refresh triggers into `tasks.list` + `agents.list` snapshots.
 ///
 /// The trigger channel has capacity one and is drained before each fetch, so a
@@ -384,17 +531,24 @@ fn spawn_inbox_loader(client: Arc<RpcClient>, updates: Sender<Update>, triggers:
 
             let update = match tasks {
                 Ok(tasks) => {
-                    // Losing the agents list costs the request text and agent
-                    // names, not the task rows, so it is not fatal.
-                    let sessions = agents
-                        .map(|agents| {
-                            agents
-                                .into_iter()
-                                .flat_map(|agent| agent.sessions)
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    Update::SnapshotLoaded { tasks, sessions }
+                    // Losing the agents list costs the request text, agent
+                    // names and the one-shot roster, not the task rows, so it
+                    // is not fatal.
+                    let (sessions, agents) = match agents {
+                        Ok(agents) => {
+                            let sessions = agents
+                                .iter()
+                                .flat_map(|agent| agent.sessions.iter().cloned())
+                                .collect();
+                            (sessions, agents)
+                        }
+                        Err(_) => (Vec::new(), Vec::new()),
+                    };
+                    Update::SnapshotLoaded {
+                        tasks,
+                        sessions,
+                        agents,
+                    }
                 }
                 Err(error) => Update::SnapshotFailed { error },
             };

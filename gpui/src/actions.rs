@@ -73,6 +73,16 @@ actions!(
         TaskConfirmAccept,
         /// Dismiss the pending cancel/retry (`n`).
         TaskConfirmReject,
+        /// Focus the Catalog search field (`/`).
+        CatalogSearch,
+        /// Open the one-shot session sheet (`secondary-n`).
+        CatalogNewOneshot,
+        /// Validate and launch from the open Catalog sheet (`secondary-↵`).
+        CatalogLaunchSubmit,
+        /// Move to the next Catalog form field (Tab).
+        CatalogFieldNext,
+        /// Move to the previous Catalog form field (Shift+Tab).
+        CatalogFieldPrev,
         /// Refresh the connection and the current surface.
         Refresh,
         /// Restart the transport.
@@ -217,6 +227,33 @@ pub fn bindings() -> Vec<KeyBinding> {
             TaskConfirmReject,
             Some("Tasks && Confirm && !Palette && !Shortcuts"),
         ),
+        // Catalog: search, the secondary one-shot sheet, and the modal form's
+        // submit/focus chords. The submit chord is registered last so it wins
+        // over any generic Enter binding inside the sheet.
+        KeyBinding::new(
+            "/",
+            CatalogSearch,
+            Some("Catalog && !Palette && !Shortcuts && !Search && !Launch && !Oneshot && !Confirm"),
+        ),
+        KeyBinding::new(
+            "secondary-n",
+            CatalogNewOneshot,
+            Some("Catalog && !Palette && !Shortcuts && !Search && !Launch && !Oneshot && !Confirm"),
+        ),
+        KeyBinding::new("tab", CatalogFieldNext, Some("Catalog && Launch")),
+        KeyBinding::new("shift-tab", CatalogFieldPrev, Some("Catalog && Launch")),
+        KeyBinding::new("tab", CatalogFieldNext, Some("Catalog && Oneshot")),
+        KeyBinding::new("shift-tab", CatalogFieldPrev, Some("Catalog && Oneshot")),
+        KeyBinding::new(
+            "secondary-enter",
+            CatalogLaunchSubmit,
+            Some("Catalog && Launch"),
+        ),
+        KeyBinding::new(
+            "secondary-enter",
+            CatalogLaunchSubmit,
+            Some("Catalog && Oneshot"),
+        ),
     ]
 }
 
@@ -341,5 +378,34 @@ mod tests {
         let accept = order.iter().position(|name| name == "TaskConfirmAccept");
         assert!(list_open.is_some() && accept.is_some());
         assert!(accept > list_open);
+    }
+
+    #[test]
+    fn catalog_shortcuts_are_scoped_to_the_catalog_and_its_sheets() {
+        for (action, key) in [
+            ("CatalogSearch", "/"),
+            ("CatalogNewOneshot", "n"),
+            ("CatalogLaunchSubmit", "enter"),
+            ("CatalogFieldNext", "tab"),
+            ("CatalogFieldPrev", "tab"),
+        ] {
+            let matches: Vec<_> = bindings()
+                .into_iter()
+                .filter(|binding| {
+                    binding.action().name().ends_with(action)
+                        && binding
+                            .keystrokes()
+                            .iter()
+                            .any(|stroke| stroke.key() == key)
+                })
+                .collect();
+            assert!(!matches.is_empty(), "{action} has no binding");
+            assert!(
+                matches.iter().all(|binding| binding
+                    .predicate()
+                    .is_some_and(|predicate| predicate.to_string().contains("Catalog"))),
+                "{action} must only fire on the Catalog surface"
+            );
+        }
     }
 }

@@ -240,6 +240,8 @@ typed_calls! {
     tasks_retry => TasksRetryCall,
     /// `tasks.start`.
     tasks_start => TasksStartCall,
+    /// `tasks.start_oneshot`.
+    tasks_start_oneshot => TasksStartOneshotCall,
     /// `catalog.list`.
     catalog_list => CatalogListCall,
     /// `catalog.get`.
@@ -355,6 +357,63 @@ mod tests {
                 }
                 other => panic!("expected a request frame, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn catalog_and_one_shot_requests_carry_their_typed_fields() {
+        let start = encode_request::<TasksStartCall>(
+            11,
+            &TasksStartParams {
+                name: "repo:favetto/triage".to_string(),
+                input: Some(serde_json::json!({ "issue": 7, "note": "hi" })),
+                interactive: None,
+            },
+        )
+        .expect("encode start");
+        let frame: Frame = rmp_serde::from_slice(&start).expect("decode frame");
+        match frame {
+            Frame::Request(request) => {
+                assert_eq!(request.method, method::TASKS_START);
+                assert_eq!(request.params["name"], "repo:favetto/triage");
+                assert_eq!(request.params["input"]["issue"], 7);
+            }
+            other => panic!("expected a request frame, got {other:?}"),
+        }
+
+        let preview = encode_request::<CatalogGetCall>(
+            12,
+            &CatalogGetParams {
+                name: "triage".to_string(),
+            },
+        )
+        .expect("encode catalog get");
+        let frame: Frame = rmp_serde::from_slice(&preview).expect("decode frame");
+        match frame {
+            Frame::Request(request) => {
+                assert_eq!(request.method, method::CATALOG_GET);
+                assert_eq!(request.params["name"], "triage");
+            }
+            other => panic!("expected a request frame, got {other:?}"),
+        }
+
+        let oneshot = encode_request::<TasksStartOneshotCall>(
+            13,
+            &StartOneshotParams {
+                agent: Some("opencode".to_string()),
+                cwd: Some("/code/favetto".to_string()),
+                ..StartOneshotParams::default()
+            },
+        )
+        .expect("encode oneshot");
+        let frame: Frame = rmp_serde::from_slice(&oneshot).expect("decode frame");
+        match frame {
+            Frame::Request(request) => {
+                assert_eq!(request.method, method::TASKS_START_ONESHOT);
+                assert_eq!(request.params["agent"], "opencode");
+                assert_eq!(request.params["cwd"], "/code/favetto");
+            }
+            other => panic!("expected a request frame, got {other:?}"),
         }
     }
 

@@ -16,11 +16,13 @@ use gpui::{
 };
 
 use crate::actions::{
-    self, CloseOverlay, GoCatalog, GoInbox, GoSchedules, GoSettings, GoTasks, GoWorkflows,
+    self, CatalogFieldNext, CatalogFieldPrev, CatalogLaunchSubmit, CatalogNewOneshot,
+    CatalogSearch, CloseOverlay, GoCatalog, GoInbox, GoSchedules, GoSettings, GoTasks, GoWorkflows,
     ListDown, ListEnd, ListHome, ListOpen, ListPageDown, ListPageUp, ListUp, PaletteConfirm,
     PaletteDown, PaletteUp, Refresh, TaskCancel, TaskConfirmAccept, TaskConfirmReject,
     TaskFilterNext, TaskFilterPrev, TaskRetry, TaskSearch, TogglePalette, ToggleShortcuts,
 };
+use crate::catalog::OneShotFocus;
 use crate::components;
 use crate::layout::{container_query, LayoutMode};
 use crate::palette::{CommandKind, CommandPalette};
@@ -177,6 +179,9 @@ impl RootView {
                 } else if state.active_route() == Route::Tasks && state.clear_tasks_search() {
                     // Esc is consumed by the search field; a second Esc steps
                     // back from a pushed detail.
+                } else if state.active_route() == Route::Catalog && state.close_catalog_overlay() {
+                    // The launch sheet, then the one-shot sheet, then the
+                    // search field consume Esc in that order.
                 } else {
                     state.close_detail();
                 }
@@ -210,6 +215,20 @@ impl RootView {
                 state.move_tasks_selection(delta);
                 cx.notify();
             }),
+            Route::Catalog => self.state.update(cx, |state, cx| {
+                if state.catalog().launch().is_some() {
+                    state.cycle_catalog_form_focus(delta);
+                } else if state
+                    .catalog()
+                    .oneshot()
+                    .is_some_and(|form| form.focused == OneShotFocus::Agent)
+                {
+                    state.cycle_oneshot_agent(delta);
+                } else if state.catalog().oneshot().is_none() {
+                    state.move_catalog_selection(delta);
+                }
+                cx.notify();
+            }),
             _ => {}
         }
     }
@@ -240,6 +259,10 @@ impl RootView {
             }),
             Route::Tasks => self.state.update(cx, |state, cx| {
                 state.open_tasks_selected();
+                cx.notify();
+            }),
+            Route::Catalog => self.state.update(cx, |state, cx| {
+                state.open_catalog_selected();
                 cx.notify();
             }),
             _ => {}
@@ -282,6 +305,40 @@ impl RootView {
     fn focus_task_search(&mut self, cx: &mut Context<Self>) {
         self.state.update(cx, |state, cx| {
             state.activate_tasks_search();
+            cx.notify();
+        });
+    }
+
+    fn focus_catalog_search(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.activate_catalog_search();
+            cx.notify();
+        });
+    }
+
+    fn open_oneshot(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.open_oneshot();
+            cx.notify();
+        });
+    }
+
+    /// The sheet's submit chord. Validation stays inline; the action is a
+    /// no-op when no sheet is open.
+    fn submit_catalog_form(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            if state.catalog().launch().is_some() {
+                state.submit_catalog_launch();
+            } else if state.catalog().oneshot().is_some() {
+                state.submit_oneshot();
+            }
+            cx.notify();
+        });
+    }
+
+    fn cycle_catalog_form_focus(&mut self, delta: isize, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.cycle_catalog_form_focus(delta);
             cx.notify();
         });
     }
@@ -1209,7 +1266,16 @@ impl Render for RootView {
                 ),
         };
 
-        let (route, confirm_open, search_active, confirm, toast) = {
+        let (
+            route,
+            confirm_open,
+            search_active,
+            confirm,
+            toast,
+            catalog_search_active,
+            catalog_launch_open,
+            catalog_oneshot_open,
+        ) = {
             let state = self.state.read(cx);
             (
                 state.active_route(),
@@ -1217,6 +1283,9 @@ impl Render for RootView {
                 state.is_tasks_search_active(),
                 state.task_confirm().cloned(),
                 state.toast().cloned(),
+                state.is_catalog_search_active(),
+                state.catalog().launch().is_some(),
+                state.catalog().oneshot().is_some(),
             )
         };
         let mut key_context = String::from("Root");
@@ -1228,6 +1297,20 @@ impl Render for RootView {
             }
             if confirm_open {
                 key_context.push_str(" Confirm");
+            }
+        } else if route == Route::Catalog {
+            key_context.push_str(" Catalog");
+            // A focused form owns typed text exactly like the search field; the
+            // shared `Search` context keeps `g`-jumps, `r` and `?` from firing
+            // while a var or cwd is being typed.
+            if catalog_search_active || catalog_launch_open || catalog_oneshot_open {
+                key_context.push_str(" Search");
+            }
+            if catalog_launch_open {
+                key_context.push_str(" Launch");
+            }
+            if catalog_oneshot_open {
+                key_context.push_str(" Oneshot");
             }
         }
 
@@ -1296,6 +1379,21 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &TaskSearch, _window, cx| {
                 this.focus_task_search(cx);
             }))
+            .on_action(cx.listener(|this, _: &CatalogSearch, _window, cx| {
+                this.focus_catalog_search(cx);
+            }))
+            .on_action(cx.listener(|this, _: &CatalogNewOneshot, _window, cx| {
+                this.open_oneshot(cx);
+            }))
+            .on_action(cx.listener(|this, _: &CatalogLaunchSubmit, _window, cx| {
+                this.submit_catalog_form(cx);
+            }))
+            .on_action(cx.listener(|this, _: &CatalogFieldNext, _window, cx| {
+                this.cycle_catalog_form_focus(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CatalogFieldPrev, _window, cx| {
+                this.cycle_catalog_form_focus(-1, cx);
+            }))
             .on_action(cx.listener(|this, _: &TaskCancel, _window, cx| {
                 this.request_task_action(TaskAction::Cancel, cx);
             }))
@@ -1355,28 +1453,68 @@ impl Render for RootView {
                         return;
                     }
 
-                    // Typed characters reach the Tasks query only in search
-                    // mode and only when no overlay owns the keyboard. Bound
-                    // keys (arrows, Enter, Esc) never get here.
-                    if this.shortcuts_open
-                        || keystroke.modifiers.control
+                    if this.shortcuts_open {
+                        return;
+                    }
+
+                    // Inside a Catalog sheet, Enter is a line break for a
+                    // multiline var; the submit chord (secondary-enter) is a
+                    // bound action and never reaches this branch.
+                    if !keystroke.modifiers.control
+                        && !keystroke.modifiers.platform
+                        && !keystroke.modifiers.alt
+                        && keystroke.key == "enter"
+                    {
+                        let form_open = {
+                            let state = this.state.read(cx);
+                            state.active_route() == Route::Catalog
+                                && state.catalog().any_form_open()
+                        };
+                        if form_open {
+                            let inserted = this.state.update(cx, |state, cx| {
+                                let inserted = state.catalog_push_newline();
+                                cx.notify();
+                                inserted
+                            });
+                            if inserted {
+                                cx.stop_propagation();
+                            }
+                            return;
+                        }
+                    }
+
+                    // Typed characters reach the Tasks query or the Catalog
+                    // search/form only in those modes and only when no overlay
+                    // owns the keyboard. Bound keys (arrows, Enter, Esc) never
+                    // reach here as characters.
+                    if keystroke.modifiers.control
                         || keystroke.modifiers.platform
                         || keystroke.modifiers.alt
                     {
                         return;
                     }
-                    let typing = {
+                    let (task_typing, catalog_typing) = {
                         let state = this.state.read(cx);
-                        state.active_route() == Route::Tasks
-                            && state.is_tasks_search_active()
-                            && state.task_confirm().is_none()
+                        let route = state.active_route();
+                        (
+                            route == Route::Tasks
+                                && state.is_tasks_search_active()
+                                && state.task_confirm().is_none(),
+                            route == Route::Catalog
+                                && (state.is_catalog_search_active()
+                                    || state.catalog().any_form_open()),
+                        )
                     };
-                    if !typing {
+                    if !task_typing && !catalog_typing {
                         return;
                     }
                     if keystroke.key == "backspace" {
                         this.state.update(cx, |state, cx| {
-                            state.backspace_tasks_query();
+                            if catalog_typing {
+                                state.catalog_backspace();
+                            } else {
+                                state.backspace_tasks_query();
+                            }
                             cx.notify();
                         });
                         cx.stop_propagation();
@@ -1388,7 +1526,11 @@ impl Render for RootView {
                         if !characters.is_empty() {
                             this.state.update(cx, |state, cx| {
                                 for character in characters {
-                                    state.push_tasks_query_char(character);
+                                    if catalog_typing {
+                                        state.catalog_push_char(character);
+                                    } else {
+                                        state.push_tasks_query_char(character);
+                                    }
                                 }
                                 cx.notify();
                             });

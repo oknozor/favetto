@@ -6,6 +6,7 @@
 
 mod actions;
 mod app;
+mod catalog;
 mod components;
 mod config;
 mod detail;
