@@ -10,7 +10,9 @@ members = [
 ]
 # The Dioxus client is a standalone workspace with its own toolchain (`dx`);
 # excluding it keeps the native clippy/nextest gates off the WASM/Android deps.
-exclude = ["web"]
+# `gpui` is excluded for the same reason: its standalone workspace must not
+# join the root workspace's native gates (see `docs/design/gpui-client.md`).
+exclude = ["web", "gpui"]
 
 [workspace.package]
 version = "0.1.0"
