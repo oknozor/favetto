@@ -148,8 +148,34 @@ CREATE TABLE IF NOT EXISTS task_dependencies (
     PRIMARY KEY (task_id, depends_on)
 );
 
+-- Durable metadata for every ACP session Favetto creates. The agent remains the
+-- source of truth for conversation history: this table stores identity and
+-- lifecycle only, never transcript content, environment variables, or
+-- credentials. `id` is Favetto's stable local id (the key its RPCs use);
+-- `external_session_id` is the agent's own ACP session id and is only unique
+-- within one configured agent, hence the composite index below. `task_id` and
+-- `run_id` are optional because interactive sessions are not task-backed.
+CREATE TABLE IF NOT EXISTS agent_sessions (
+    id                  TEXT PRIMARY KEY,
+    agent               TEXT NOT NULL,
+    external_session_id TEXT,
+    cwd                 TEXT NOT NULL,
+    task_id             TEXT,
+    run_id              TEXT,
+    title               TEXT,
+    status              TEXT NOT NULL,
+    error               TEXT,
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_task_dependencies_task_id ON task_dependencies(task_id);
 CREATE INDEX IF NOT EXISTS idx_task_dependencies_depends_on ON task_dependencies(depends_on);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_sessions_agent_external
+    ON agent_sessions(agent, external_session_id)
+    WHERE external_session_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_updated_at ON agent_sessions(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_task_id ON agent_sessions(task_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_dedupe_key ON tasks(dedupe_key);
 CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tasks_status_created_at ON tasks(status, created_at);
@@ -1460,6 +1486,318 @@ pub async fn finalize_task_run(pool: &SqlitePool, run: &TaskRun) -> anyhow::Resu
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
+}
+
+// ---------------------------------------------------------------------------
+// Durable agent sessions
+// ---------------------------------------------------------------------------
+
+/// Lifecycle of a durable ACP session record.
+///
+/// `Loading` and `Ready` describe a live or loadable session; `Ended` means the
+/// agent session closed normally, and `Failed` means it could not be started,
+/// loaded, or completed. An unrecognised stored value decodes as `Failed` so a
+/// newer schema can never make an unknown record look resumable.
+#[allow(dead_code)] // wired into session launch/history by the following steps
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentSessionStatus {
+    /// The session exists but has not reported readiness yet (including an ACP
+    /// `session/load` in progress).
+    Loading,
+    /// The session is live and accepting prompts, or is durably loadable.
+    Ready,
+    /// The session closed normally; its metadata is kept for history.
+    Ended,
+    /// Launch, load, or the agent itself failed.
+    Failed,
+}
+
+#[allow(dead_code)] // wired into session launch/history by the following steps
+impl AgentSessionStatus {
+    /// Stable string form stored in SQLite.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentSessionStatus::Loading => "loading",
+            AgentSessionStatus::Ready => "ready",
+            AgentSessionStatus::Ended => "ended",
+            AgentSessionStatus::Failed => "failed",
+        }
+    }
+
+    /// Decode a stored status. Anything unknown is treated as `Failed`.
+    fn from_db(raw: &str) -> Self {
+        match raw {
+            "loading" => Self::Loading,
+            "ready" => Self::Ready,
+            "ended" => Self::Ended,
+            "failed" => Self::Failed,
+            other => {
+                tracing::warn!(
+                    status = %other,
+                    "unrecognised agent session status; falling back to Failed"
+                );
+                Self::Failed
+            }
+        }
+    }
+}
+
+/// Durable metadata for one ACP session created by Favetto.
+///
+/// `id` is Favetto's local routing key and is never the agent's ACP session id.
+/// `external_session_id` belongs to `agent` and is only meaningful within that
+/// configuration, since different ACP servers may reuse ids. There is
+/// deliberately no transcript, environment, or credential column: conversation
+/// history stays with the ACP agent.
+#[allow(dead_code)] // wired into session launch/history by the following steps
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSessionRecord {
+    /// Stable Favetto-local session id.
+    pub id: String,
+    /// Configured `[agents.<name>]` key that owns the session.
+    pub agent: String,
+    /// The agent's own ACP session id, once it reports one.
+    pub external_session_id: Option<String>,
+    /// Working directory the agent was launched in.
+    pub cwd: PathBuf,
+    /// Catalog task this session belongs to, if task-backed.
+    pub task_id: Option<String>,
+    /// Execution attempt this session belongs to, if task-backed.
+    pub run_id: Option<String>,
+    /// Display title, when the agent reports one.
+    pub title: Option<String>,
+    /// Current lifecycle state.
+    pub status: AgentSessionStatus,
+    /// Last error, for a `Failed` record.
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[allow(dead_code)] // wired into session launch/history by the following steps
+impl AgentSessionRecord {
+    /// Build a record that has not reported readiness yet.
+    pub fn loading(
+        id: impl Into<String>,
+        agent: impl Into<String>,
+        cwd: impl Into<PathBuf>,
+        now: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            agent: agent.into(),
+            external_session_id: None,
+            cwd: cwd.into(),
+            task_id: None,
+            run_id: None,
+            title: None,
+            status: AgentSessionStatus::Loading,
+            error: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
+/// Insert a new durable session record. Fails if the local id already exists.
+#[allow(dead_code)] // wired into session launch/history by the following steps
+pub async fn insert_agent_session(
+    pool: &SqlitePool,
+    session: &AgentSessionRecord,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO agent_sessions
+            (id, agent, external_session_id, cwd, task_id, run_id, title, status, error,
+             created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&session.id)
+    .bind(&session.agent)
+    .bind(&session.external_session_id)
+    .bind(session.cwd.to_string_lossy().into_owned())
+    .bind(&session.task_id)
+    .bind(&session.run_id)
+    .bind(&session.title)
+    .bind(session.status.as_str())
+    .bind(&session.error)
+    .bind(ts_ms(session.created_at))
+    .bind(ts_ms(session.updated_at))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Replace a session's mutable metadata. `created_at` is preserved.
+///
+/// Returns whether a row matched. This is the general update used when several
+/// fields change together; the targeted setters below are convenient for the
+/// common lifecycle transitions.
+#[allow(dead_code)] // wired into session launch/history by the following steps
+pub async fn update_agent_session(
+    pool: &SqlitePool,
+    session: &AgentSessionRecord,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        "UPDATE agent_sessions SET
+             agent = ?,
+             external_session_id = ?,
+             cwd = ?,
+             task_id = ?,
+             run_id = ?,
+             title = ?,
+             status = ?,
+             error = ?,
+             updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&session.agent)
+    .bind(&session.external_session_id)
+    .bind(session.cwd.to_string_lossy().into_owned())
+    .bind(&session.task_id)
+    .bind(&session.run_id)
+    .bind(&session.title)
+    .bind(session.status.as_str())
+    .bind(&session.error)
+    .bind(ts_ms(session.updated_at))
+    .bind(&session.id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Update only the lifecycle status (and error) of a session.
+#[allow(dead_code)] // wired into session launch/history by the following steps
+pub async fn set_agent_session_status(
+    pool: &SqlitePool,
+    id: &str,
+    status: AgentSessionStatus,
+    error: Option<&str>,
+    updated_at: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let result =
+        sqlx::query("UPDATE agent_sessions SET status = ?, error = ?, updated_at = ? WHERE id = ?")
+            .bind(status.as_str())
+            .bind(error)
+            .bind(ts_ms(updated_at))
+            .bind(id)
+            .execute(pool)
+            .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Record the agent's own ACP session id once it is known. The id is scoped to
+/// the record's configured agent by the schema's composite unique index.
+#[allow(dead_code)] // wired into session launch/history by the following steps
+pub async fn set_agent_session_external_id(
+    pool: &SqlitePool,
+    id: &str,
+    external_session_id: &str,
+    updated_at: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        "UPDATE agent_sessions SET external_session_id = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(external_session_id)
+    .bind(ts_ms(updated_at))
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Update the display title reported by the agent.
+#[allow(dead_code)] // wired into session launch/history by the following steps
+pub async fn set_agent_session_title(
+    pool: &SqlitePool,
+    id: &str,
+    title: Option<&str>,
+    updated_at: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query("UPDATE agent_sessions SET title = ?, updated_at = ? WHERE id = ?")
+        .bind(title)
+        .bind(ts_ms(updated_at))
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Fetch one durable session by its Favetto-local id.
+#[allow(dead_code)] // wired into session launch/history by the following steps
+pub async fn get_agent_session(
+    pool: &SqlitePool,
+    id: &str,
+) -> anyhow::Result<Option<AgentSessionRecord>> {
+    let row = sqlx::query(
+        "SELECT id, agent, external_session_id, cwd, task_id, run_id, title, status, error,
+                created_at, updated_at
+         FROM agent_sessions WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.as_ref().map(row_to_agent_session))
+}
+
+/// Find a session by the agent-scoped external ACP id.
+///
+/// ACP servers are independent, so the same external id may exist under two
+/// different configured agents; `agent` selects the namespace.
+#[allow(dead_code)] // wired into session launch/history by the following steps
+pub async fn get_agent_session_by_external(
+    pool: &SqlitePool,
+    agent: &str,
+    external_session_id: &str,
+) -> anyhow::Result<Option<AgentSessionRecord>> {
+    let row = sqlx::query(
+        "SELECT id, agent, external_session_id, cwd, task_id, run_id, title, status, error,
+                created_at, updated_at
+         FROM agent_sessions WHERE agent = ? AND external_session_id = ?",
+    )
+    .bind(agent)
+    .bind(external_session_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.as_ref().map(row_to_agent_session))
+}
+
+/// List durable sessions, most recently updated first.
+#[allow(dead_code)] // wired into session launch/history by the following steps
+pub async fn list_agent_sessions(
+    pool: &SqlitePool,
+    limit: i64,
+) -> anyhow::Result<Vec<AgentSessionRecord>> {
+    let rows = sqlx::query(
+        "SELECT id, agent, external_session_id, cwd, task_id, run_id, title, status, error,
+                created_at, updated_at
+         FROM agent_sessions
+         ORDER BY updated_at DESC, created_at DESC, id ASC
+         LIMIT ?",
+    )
+    .bind(limit.max(1))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(row_to_agent_session).collect())
+}
+
+#[allow(dead_code)] // wired into session launch/history by the following steps
+fn row_to_agent_session(row: &SqliteRow) -> AgentSessionRecord {
+    AgentSessionRecord {
+        id: row.get("id"),
+        agent: row.get("agent"),
+        external_session_id: row
+            .try_get::<Option<String>, _>("external_session_id")
+            .ok()
+            .flatten(),
+        cwd: PathBuf::from(row.get::<String, _>("cwd")),
+        task_id: row.try_get::<Option<String>, _>("task_id").ok().flatten(),
+        run_id: row.try_get::<Option<String>, _>("run_id").ok().flatten(),
+        title: row.try_get::<Option<String>, _>("title").ok().flatten(),
+        status: AgentSessionStatus::from_db(&row.get::<String, _>("status")),
+        error: row.try_get::<Option<String>, _>("error").ok().flatten(),
+        created_at: from_ms(row.get("created_at")),
+        updated_at: from_ms(row.get("updated_at")),
+    }
 }
 
 // ---------------------------------------------------------------------------

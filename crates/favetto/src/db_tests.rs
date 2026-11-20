@@ -1924,3 +1924,278 @@ async fn users_crud_round_trips() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn agent_session_metadata_survives_reopen() {
+    let (dir, pool) = scratch_pool("agent-session-reopen").await;
+    let created_at = from_ms(1_700_000_000_000);
+    let mut session =
+        AgentSessionRecord::loading("local-1", "opencode", "/code/favetto", created_at);
+    session.task_id = Some("task-1".to_string());
+    session.run_id = Some("run-1".to_string());
+    session.title = Some("Fix the widget".to_string());
+    insert_agent_session(&pool, &session).await.unwrap();
+
+    // Closing the in-memory session is represented by a status update, not a
+    // delete: the row must remain for history.
+    let ended_at = created_at + ChronoDuration::seconds(30);
+    assert!(
+        set_agent_session_status(&pool, "local-1", AgentSessionStatus::Ended, None, ended_at)
+            .await
+            .unwrap()
+    );
+
+    pool.close().await;
+    let pool = open(&dir.join("test.db")).await.unwrap();
+    migrate(&pool).await.unwrap();
+
+    let got = get_agent_session(&pool, "local-1").await.unwrap().unwrap();
+    assert_eq!(got.id, "local-1");
+    assert_eq!(got.agent, "opencode");
+    assert!(got.external_session_id.is_none());
+    assert_eq!(got.cwd, PathBuf::from("/code/favetto"));
+    assert_eq!(got.task_id.as_deref(), Some("task-1"));
+    assert_eq!(got.run_id.as_deref(), Some("run-1"));
+    assert_eq!(got.title.as_deref(), Some("Fix the widget"));
+    assert_eq!(got.status, AgentSessionStatus::Ended);
+    assert_eq!(got.created_at, created_at);
+    assert_eq!(got.updated_at, ended_at);
+    assert_eq!(list_agent_sessions(&pool, 10).await.unwrap(), vec![got]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn agent_session_updates_preserve_local_identity_and_created_at() {
+    let (dir, pool) = scratch_pool("agent-session-update").await;
+    let created_at = from_ms(1_700_000_000_000);
+    let session = AgentSessionRecord::loading("local-1", "opencode", "/work", created_at);
+    insert_agent_session(&pool, &session).await.unwrap();
+
+    // Targeted setters cover the lifecycle transitions step 2 needs.
+    let ready_at = created_at + ChronoDuration::seconds(1);
+    assert!(
+        set_agent_session_external_id(&pool, "local-1", "ses_acp_1", ready_at)
+            .await
+            .unwrap()
+    );
+    assert!(
+        set_agent_session_title(&pool, "local-1", Some("New title"), ready_at)
+            .await
+            .unwrap()
+    );
+    assert!(
+        set_agent_session_status(&pool, "local-1", AgentSessionStatus::Ready, None, ready_at)
+            .await
+            .unwrap()
+    );
+
+    let mut expected = session.clone();
+    expected.external_session_id = Some("ses_acp_1".to_string());
+    expected.title = Some("New title".to_string());
+    expected.status = AgentSessionStatus::Ready;
+    expected.updated_at = ready_at;
+    assert_eq!(
+        get_agent_session(&pool, "local-1").await.unwrap().unwrap(),
+        expected
+    );
+
+    // A full update replaces mutable fields but never the local id or creation
+    // time.
+    let failed_at = created_at + ChronoDuration::seconds(2);
+    expected.agent = "claude".to_string();
+    expected.cwd = PathBuf::from("/work/other");
+    expected.task_id = Some("task-9".to_string());
+    expected.run_id = Some("run-9".to_string());
+    expected.status = AgentSessionStatus::Failed;
+    expected.error = Some("launch failed".to_string());
+    expected.updated_at = failed_at;
+    assert!(update_agent_session(&pool, &expected).await.unwrap());
+
+    let got = get_agent_session(&pool, "local-1").await.unwrap().unwrap();
+    assert_eq!(got, expected);
+    assert_eq!(got.created_at, created_at, "created_at must be preserved");
+
+    // Updating an unknown local id reports no match rather than inserting.
+    let missing = AgentSessionRecord::loading("local-missing", "opencode", "/work", created_at);
+    assert!(!update_agent_session(&pool, &missing).await.unwrap());
+    assert!(get_agent_session(&pool, "local-missing")
+        .await
+        .unwrap()
+        .is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn agent_external_ids_are_scoped_by_agent_and_may_be_absent() {
+    let (dir, pool) = scratch_pool("agent-session-scoped").await;
+    let now = from_ms(1_700_000_000_000);
+
+    let mut opencode = AgentSessionRecord::loading("local-open", "opencode", "/work", now);
+    opencode.external_session_id = Some("ses_shared".to_string());
+    let mut claude = AgentSessionRecord::loading("local-claude", "claude", "/work", now);
+    claude.external_session_id = Some("ses_shared".to_string());
+    insert_agent_session(&pool, &opencode).await.unwrap();
+    insert_agent_session(&pool, &claude).await.unwrap();
+
+    // The same external id resolves to the record belonging to the requested
+    // agent, not to whichever row happened to be inserted first.
+    assert_eq!(
+        get_agent_session_by_external(&pool, "opencode", "ses_shared")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        "local-open"
+    );
+    assert_eq!(
+        get_agent_session_by_external(&pool, "claude", "ses_shared")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        "local-claude"
+    );
+    assert!(get_agent_session_by_external(&pool, "vibe", "ses_shared")
+        .await
+        .unwrap()
+        .is_none());
+
+    // Within one agent an external id still identifies one session.
+    let mut duplicate = AgentSessionRecord::loading("local-dup", "opencode", "/work", now);
+    duplicate.external_session_id = Some("ses_shared".to_string());
+    assert!(
+        insert_agent_session(&pool, &duplicate).await.is_err(),
+        "external ids are unique per agent"
+    );
+
+    // A session without an external id yet is still durable, and any number of
+    // such records can coexist.
+    let a = AgentSessionRecord::loading("local-pending-a", "opencode", "/work", now);
+    let b = AgentSessionRecord::loading("local-pending-b", "opencode", "/work", now);
+    insert_agent_session(&pool, &a).await.unwrap();
+    insert_agent_session(&pool, &b).await.unwrap();
+    assert!(get_agent_session(&pool, "local-pending-a")
+        .await
+        .unwrap()
+        .unwrap()
+        .external_session_id
+        .is_none());
+    assert!(get_agent_session(&pool, "local-pending-b")
+        .await
+        .unwrap()
+        .unwrap()
+        .external_session_id
+        .is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn list_agent_sessions_orders_by_most_recent_update() {
+    let (dir, pool) = scratch_pool("agent-session-order").await;
+    let base = from_ms(1_700_000_000_000);
+    for (n, name) in ["first", "second", "third"].into_iter().enumerate() {
+        let at = base + ChronoDuration::seconds(n as i64);
+        let session = AgentSessionRecord::loading(format!("local-{name}"), "opencode", "/work", at);
+        insert_agent_session(&pool, &session).await.unwrap();
+    }
+
+    // Newest update first, regardless of creation order.
+    let ids: Vec<String> = list_agent_sessions(&pool, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(ids, vec!["local-third", "local-second", "local-first"]);
+
+    // Touching the oldest record moves it to the front.
+    let touched_at = base + ChronoDuration::seconds(10);
+    assert!(set_agent_session_status(
+        &pool,
+        "local-first",
+        AgentSessionStatus::Ready,
+        None,
+        touched_at
+    )
+    .await
+    .unwrap());
+    let ids: Vec<String> = list_agent_sessions(&pool, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(ids, vec!["local-first", "local-third", "local-second"]);
+
+    // The limit keeps the same ordering.
+    let limited = list_agent_sessions(&pool, 2).await.unwrap();
+    assert_eq!(
+        limited.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        vec!["local-first", "local-third"]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn migrate_creates_agent_sessions_without_touching_existing_data() {
+    let dir = std::env::temp_dir().join(format!(
+        "favetto-agent-session-migrate-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let pool = open(&dir.join("test.db")).await.unwrap();
+
+    // A database from before durable agent sessions existed.
+    sqlx::query(
+        "CREATE TABLE tasks (
+                id          TEXT PRIMARY KEY,
+                name        TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                input       TEXT NOT NULL,
+                output      TEXT,
+                dedupe_key  TEXT UNIQUE,
+                created_at  INTEGER NOT NULL,
+                started_at  INTEGER,
+                finished_at INTEGER,
+                error       TEXT,
+                session_id  TEXT
+            )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let legacy_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO tasks (id, name, status, input, created_at) VALUES (?, 'legacy', 'succeeded', '{}', ?)")
+        .bind(legacy_id.to_string())
+        .bind(ts_ms(Utc::now()))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // The additive migration runs twice without error and leaves task data
+    // intact.
+    migrate(&pool).await.unwrap();
+    migrate(&pool).await.unwrap();
+
+    assert!(get_task(&pool, legacy_id).await.unwrap().is_some());
+    assert!(list_agent_sessions(&pool, 10).await.unwrap().is_empty());
+
+    let created_at = from_ms(1_700_000_000_000);
+    let session = AgentSessionRecord::loading("local-legacy", "opencode", "/work", created_at);
+    insert_agent_session(&pool, &session).await.unwrap();
+    assert_eq!(
+        get_agent_session(&pool, "local-legacy")
+            .await
+            .unwrap()
+            .unwrap(),
+        session
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
