@@ -274,6 +274,171 @@ pub struct ToolCall {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<serde_json::Value>,
+    /// Full tool-call detail, when the adapter reports more than the legacy
+    /// id/name/input/output quadruple.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<Box<ToolCallDetail>>,
+}
+
+/// The normalized category of a tool invocation.
+///
+/// Mirrors ACP's `ToolKind`. [`ToolKind::Other`] is both the protocol default
+/// and the fallback for a kind this client does not understand, so a consumer
+/// must treat it as "no specific icon" rather than an error.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ToolKind {
+    /// Reading files or data.
+    Read,
+    /// Modifying files or content.
+    Edit,
+    /// Removing files or data.
+    Delete,
+    /// Moving or renaming files.
+    Move,
+    /// Searching for information.
+    Search,
+    /// Running commands or code.
+    Execute,
+    /// Internal reasoning or planning.
+    Think,
+    /// Retrieving external data.
+    Fetch,
+    /// Switching the current session mode.
+    SwitchMode,
+    /// Other, unknown, or absent tool kind.
+    #[default]
+    #[serde(other)]
+    Other,
+}
+
+/// The normalized lifecycle status of a tool invocation.
+///
+/// Mirrors ACP's `ToolCallStatus`, which has no cancellation variant: a
+/// cancelled turn leaves the last reported status in place unless the agent
+/// sends [`ToolCallStatus::Failed`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallStatus {
+    /// Waiting on input or approval; the tool has not started running.
+    #[default]
+    Pending,
+    /// Currently running.
+    InProgress,
+    /// Finished successfully.
+    Completed,
+    /// Finished with an error.
+    Failed,
+    /// A status this client does not understand.
+    #[serde(other)]
+    Unknown,
+}
+
+impl ToolCallStatus {
+    /// Whether the status is final (`Completed` or `Failed`).
+    pub fn is_terminal(self) -> bool {
+        matches!(self, ToolCallStatus::Completed | ToolCallStatus::Failed)
+    }
+}
+
+/// One file location touched by a tool call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ToolLocation {
+    /// File path as reported by the agent.
+    pub path: String,
+    /// Optional 1-based line number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+}
+
+/// Structured tool output, without unbounded binary payloads.
+///
+/// Image, audio, and blob resources keep their metadata but deliberately omit
+/// the base64 payload: the CLI renders a placeholder instead of decoding it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolContent {
+    /// Plain or Markdown text produced by the tool.
+    Text { text: String },
+    /// An image result, without its base64 payload.
+    Image {
+        mime_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uri: Option<String>,
+    },
+    /// An audio result, without its base64 payload.
+    Audio { mime_type: String },
+    /// A reference to an external resource.
+    ResourceLink {
+        uri: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<i64>,
+    },
+    /// An embedded resource. Binary resources carry `binary: true` and no text.
+    Resource {
+        uri: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        binary: bool,
+    },
+    /// A file modification.
+    Diff {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        old_text: Option<String>,
+        new_text: String,
+    },
+    /// A terminal the client can render by id.
+    Terminal { terminal_id: String },
+}
+
+/// Cumulative, wire-friendly detail for one tool call.
+///
+/// This is a *snapshot*, not a patch: every field is the latest value the
+/// adapter knows, and consumers replace their previous copy wholesale. ACP
+/// agents vary in how much they populate; every field is optional/empty when
+/// the agent did not report it, so no consumer may assume a value is present.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ToolCallDetail {
+    /// Programmatic tool name, when the agent exposes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Human-readable title (ACP requires one on a start, updates may omit it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Tool category, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ToolKind>,
+    /// Lifecycle status, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<ToolCallStatus>,
+    /// Raw input parameters as reported by the agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
+    /// Raw output as reported by the agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<serde_json::Value>,
+    /// Structured output blocks (text, diffs, terminals, resource metadata).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<ToolContent>,
+    /// Files touched by the call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locations: Vec<ToolLocation>,
 }
 
 /// How a run or turn ended.
@@ -307,23 +472,39 @@ pub enum AgentStateEvent {
     /// Chain-of-thought text (display-only).
     ReasoningDelta { text: String },
     /// A tool invocation started.
+    ///
+    /// `name`/`input` are the legacy flattened fields; `detail` carries the
+    /// cumulative, structured snapshot when the adapter has one.
     ToolStarted {
         id: String,
         name: String,
         input: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<Box<ToolCallDetail>>,
     },
     /// Partial tool output (streaming transports).
+    ///
+    /// `partial` keeps the original metadata/patch payload for older clients;
+    /// `detail` is the cumulative snapshot. A sparse update never clears a
+    /// field that was already present in `detail`.
     ToolUpdated {
         id: String,
         partial: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<Box<ToolCallDetail>>,
     },
     /// A tool invocation finished.
+    ///
+    /// `output` stays the legacy raw output; `detail` carries the final
+    /// snapshot, including status and structured content.
     ToolFinished {
         id: String,
         name: String,
         ok: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<Box<ToolCallDetail>>,
     },
     /// The agent is blocked on the user.
     InputRequested { request: InputRequest },
@@ -416,6 +597,7 @@ mod tests {
                 input: serde_json::json!({ "command": "ls" }),
                 ok: true,
                 output: Some(serde_json::json!("a\nb\n")),
+                detail: None,
             }],
             usage: AgentUsage {
                 input_tokens: 3,
@@ -498,12 +680,14 @@ mod tests {
                 id: "c1".to_string(),
                 name: "read".to_string(),
                 input: serde_json::json!({}),
+                detail: None,
             },
             AgentStateEvent::ToolFinished {
                 id: "c1".to_string(),
                 name: "read".to_string(),
                 ok: false,
                 output: None,
+                detail: None,
             },
             AgentStateEvent::Usage {
                 usage: AgentUsage::default(),
@@ -520,6 +704,95 @@ mod tests {
             let back: AgentStateEvent = serde_json::from_value(json).unwrap();
             assert_eq!(back, event);
         }
+    }
+
+    #[test]
+    fn tool_call_detail_round_trips_and_legacy_payloads_default() {
+        let detail = ToolCallDetail {
+            name: Some("bash".to_string()),
+            title: Some("Run tests".to_string()),
+            kind: Some(ToolKind::Execute),
+            status: Some(ToolCallStatus::Completed),
+            input: Some(serde_json::json!({ "command": "cargo test" })),
+            output: Some(serde_json::json!({ "exit": 0 })),
+            content: vec![
+                ToolContent::Text {
+                    text: "ok".to_string(),
+                },
+                ToolContent::Diff {
+                    path: "src/lib.rs".to_string(),
+                    old_text: Some("a".to_string()),
+                    new_text: "b".to_string(),
+                },
+                ToolContent::Terminal {
+                    terminal_id: "term_1".to_string(),
+                },
+                ToolContent::ResourceLink {
+                    uri: "file:///tmp/a".to_string(),
+                    name: "a".to_string(),
+                    mime_type: Some("text/plain".to_string()),
+                    title: None,
+                    description: None,
+                    size: Some(3),
+                },
+                ToolContent::Image {
+                    mime_type: "image/png".to_string(),
+                    uri: None,
+                },
+            ],
+            locations: vec![ToolLocation {
+                path: "src/lib.rs".to_string(),
+                line: Some(12),
+            }],
+        };
+        let json = serde_json::to_value(&detail).unwrap();
+        assert_eq!(json["kind"], "execute");
+        assert_eq!(json["status"], "completed");
+        assert_eq!(json["content"][1]["type"], "diff");
+        assert_eq!(json["content"][4]["type"], "image");
+        assert!(json["content"][4].get("data").is_none());
+        let back: ToolCallDetail = serde_json::from_value(json).unwrap();
+        assert_eq!(back, detail);
+
+        // A payload from an older daemon has no `detail` field at all.
+        let legacy: AgentStateEvent = serde_json::from_value(serde_json::json!({
+            "event": "tool_started",
+            "id": "c1",
+            "name": "read",
+            "input": { "path": "a" }
+        }))
+        .unwrap();
+        assert_eq!(
+            legacy,
+            AgentStateEvent::ToolStarted {
+                id: "c1".to_string(),
+                name: "read".to_string(),
+                input: serde_json::json!({ "path": "a" }),
+                detail: None,
+            }
+        );
+
+        let unknown_kind: ToolKind = serde_json::from_str("\"future_kind\"").unwrap();
+        assert_eq!(unknown_kind, ToolKind::Other);
+        let unknown_status: ToolCallStatus = serde_json::from_str("\"future_status\"").unwrap();
+        assert_eq!(unknown_status, ToolCallStatus::Unknown);
+        assert!(!unknown_status.is_terminal());
+        assert!(ToolCallStatus::Completed.is_terminal());
+    }
+
+    #[test]
+    fn tool_detail_serializes_sparse_without_null_noise() {
+        let detail = ToolCallDetail {
+            title: Some("Read".to_string()),
+            status: Some(ToolCallStatus::Pending),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&detail).unwrap();
+        assert_eq!(json["title"], "Read");
+        assert!(json.get("name").is_none());
+        assert!(json.get("kind").is_none());
+        assert!(json.get("content").is_none());
+        assert!(json.get("locations").is_none());
     }
 
     #[test]
