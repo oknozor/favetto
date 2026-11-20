@@ -48,16 +48,8 @@ impl Daemon {
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::create_dir_all(&tasks_dir).unwrap();
 
-        let agent = root.join("echo-agent.sh");
-        std::fs::write(
-            &agent,
-            "#!/bin/sh\nsleep 0.4\nprintf 'echo-agent: %s\\n' \"$1\"\nprintf 'ECHO_AGENT_DONE\\n'\n",
-        )
-        .unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        // A deterministic ACP server: echoes the prompt and ends the turn.
+        let agent = env!("CARGO_BIN_EXE_fake-acp-agent");
 
         for name in ["supervisor_plan", "supervisor_implement"] {
             std::fs::write(
@@ -72,10 +64,8 @@ impl Daemon {
             &config_path,
             format!(
                 "[agent]\ndefault = \"echo\"\n\n\
-                 [agents.echo]\ntype = \"configurable\"\ncommand = {:?}\n\
-                 headless_args = [\"{{prompt}}\"]\n\n\
-                 [executor]\ndetect_awaiting_input = false\n",
-                agent.to_string_lossy()
+                 [agents.echo]\ncommand = {:?}\nargs = []\n",
+                agent
             ),
         )
         .unwrap();

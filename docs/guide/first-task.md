@@ -62,8 +62,8 @@ Press `Enter` on the task. This is what happens:
 
 1. The daemon emits **`task_idle`** — the task is queued.
 2. The executor reserves a slot and emits **`task_started`**.
-3. The agent runs the prompt headlessly in a PTY on the daemon.
-4. When the process exits, the task is marked succeeded or failed and the daemon
+3. The agent runs the prompt as one ACP turn on the daemon.
+4. When the turn ends, the task is marked succeeded or failed and the daemon
    emits **`task_finished`**.
 
 ## 5. Watch the agent

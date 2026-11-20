@@ -86,22 +86,13 @@ impl DaemonHarness {
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::create_dir_all(&tasks_dir).unwrap();
 
-        // A fake agent that prints the prompt it was handed ($1) and a
-        // deterministic marker, then exits 0.
-        let agent = root.join("echo-agent.sh");
-        std::fs::write(
-            &agent,
-            "#!/bin/sh\nprintf 'echo-agent: %s\\n' \"$1\"\nprintf 'ECHO_AGENT_DONE\\n'\n",
-        )
-        .unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        // A deterministic ACP server that echoes the prompt it was handed and a
+        // completion marker, then ends the turn.
+        let agent = env!("CARGO_BIN_EXE_fake-acp-agent");
 
         std::fs::write(
             tasks_dir.join("echo_task.md"),
-            "agent = \"echo\"\n---\necho: hello-e2e\n",
+            "agent = \"echo\"\nprovider = \"fake\"\nmodel = \"model-b\"\n---\necho: hello-e2e\n",
         )
         .unwrap();
 
@@ -110,10 +101,8 @@ impl DaemonHarness {
             &config_path,
             format!(
                 "[agent]\ndefault = \"echo\"\n\n\
-                 [agents.echo]\ntype = \"configurable\"\ncommand = {:?}\n\
-                 headless_args = [\"{{prompt}}\"]\n\n\
-                 [executor]\ndetect_awaiting_input = false\n",
-                agent.to_string_lossy()
+                 [agents.echo]\ncommand = {:?}\nargs = []\n",
+                agent
             ),
         )
         .unwrap();
@@ -349,6 +338,10 @@ async fn wire_client_pings_lists_catalog_and_runs_a_task() {
         output.contains("ECHO_AGENT_DONE"),
         "the fake agent's completion marker is missing: {output:?}"
     );
+    assert!(
+        output.contains("model: fake/model-b"),
+        "the task's provider/model was not selected over ACP: {output:?}"
+    );
 }
 
 #[tokio::test]
@@ -464,7 +457,14 @@ async fn spa_is_served_over_http() {
         Some("no-cache")
     );
     let body = index.text().await.expect("index body");
-    assert!(body.contains("favetto-placeholder"), "{body}");
+    // The embedded assets may be the committed placeholder or a local `dx`
+    // build; both are the SPA's HTML entry point.
+    assert!(
+        body.trim_start()
+            .to_ascii_lowercase()
+            .starts_with("<!doctype html"),
+        "{body}"
+    );
 
     // An unmatched HTML navigation falls back to the shell.
     let fallback = http
@@ -476,7 +476,10 @@ async fn spa_is_served_over_http() {
     assert_eq!(fallback.status().as_u16(), 200);
     let fallback_body = fallback.text().await.expect("fallback body");
     assert!(
-        fallback_body.contains("favetto-placeholder"),
+        fallback_body
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("<!doctype html"),
         "{fallback_body}"
     );
 

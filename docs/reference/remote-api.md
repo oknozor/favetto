@@ -47,8 +47,8 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | `events.subscribe` | (Re)subscribe to the live event stream; accepts `last_event_id` to replay missed events before switching to live delivery. |
 | `agents.list` | List configured external agents and live agent sessions, including each agent's `available` flag and capability flags. |
 | `agents.start` | Start an external agent session (optionally attached to a task). |
-| `agents.input` | Write raw bytes (base64) to a session's PTY. |
-| `agents.resize` | Resize a session's PTY. |
+| `agents.prompt` | Send a follow-up prompt to a structured (ACP) agent session. |
+| `agents.cancel` | Interrupt the in-flight turn of a structured (ACP) agent session. |
 | `agents.attach` | Attach to a session: returns the session and a replay of its output. |
 | `agents.close` | Terminate a session. |
 | `agents.reply` | Answer a structured input request on a session's state channel. |
@@ -82,8 +82,8 @@ object
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `cwd` | string | — | yes | The daemon process's current working directory. |
 | `pong` | boolean | — | yes | Always `true` for a live daemon. |
+| `cwd` | string | — | yes | The daemon process's current working directory. |
 
 ### `config.validate`
 
@@ -97,9 +97,9 @@ object
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `errors` | string[] | — | yes | One message per parse/deserialization failure; empty when `valid`. |
-| `path` | string | — | yes | The resolved config path the daemon was started with. |
 | `valid` | boolean | — | yes | True when the file parsed, or is absent so defaults apply. |
+| `path` | string | — | yes | The resolved config path the daemon was started with. |
+| `errors` | string[] | — | yes | One message per parse/deserialization failure; empty when `valid`. |
 
 ### `tasks.list`
 
@@ -129,23 +129,23 @@ Fetch a single task by id, including its stored output.
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
+| `id` | string | — | yes |  |
+| `name` | string | — | yes | Name of the catalog task (the `*.md` file) that defines how to run this. |
+| `status` | TaskStatus | — | yes |  |
 | `attempt` | integer | `0` | no | How many execution attempts this task has had. Starts at 0; each claim increments it and records a [`TaskRun`] under the new attempt. Defaults to 0 so rows and payloads written before attempts existed decode unchanged. |
-| `created_at` | string | — | yes |  |
+| `input` | any | — | yes | Arbitrary input passed to the task's prompt. |
+| `output` | any | — | no | Produced by the task on completion. Omitted from list and push payloads; fetch it on demand with `tasks.get`. |
 | `dedupe_key` | string (optional) | — | no | Optional dedupe key. Inserting a second task with the same key is a no-op. |
+| `created_at` | string | — | yes |  |
+| `started_at` | string (optional) | — | no |  |
+| `finished_at` | string (optional) | — | no |  |
 | `error` | string (optional) | — | no | Human-readable failure reason when `status == Failed`. |
 | `failure` | Failure (optional) | — | no | Machine-readable failure classification when `status == Failed`. Absent on success and on rows/payloads written before typed failures existed. |
-| `finished_at` | string (optional) | — | no |  |
-| `id` | string | — | yes |  |
-| `input` | any | — | yes | Arbitrary input passed to the task's prompt. |
-| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
-| `name` | string | — | yes | Name of the catalog task (the `*.md` file) that defines how to run this. |
-| `output` | any | — | no | Produced by the task on completion. Omitted from list and push payloads; fetch it on demand with `tasks.get`. |
-| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
-| `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
 | `session_id` | string (optional) | — | no | The agent's own session id (e.g. opencode's session id), captured from a task run's output so the session can be reattached later. |
 | `session_title` | string (optional) | — | no | The agent's human-readable session title (e.g. opencode's generated title), resolved once at run completion from the agent's session store. Absent until a run finishes or when the agent reports no title. |
-| `started_at` | string (optional) | — | no |  |
-| `status` | TaskStatus | — | yes |  |
+| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
+| `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
+| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
 
 ### `tasks.runs`
 
@@ -169,17 +169,17 @@ Backfill a task's normalized agent-event feed from its session's bounded ring bu
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `after` | integer (optional) | null | no |  |
 | `id` | string | — | yes |  |
+| `after` | integer (optional) | null | no |  |
 | `limit` | integer (optional) | null | no |  |
 
 **Response**
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
+| `session_id` | string (optional) | — | no |  |
 | `events` | AgentEventPush[] | — | yes |  |
 | `next_cursor` | integer | — | yes |  |
-| `session_id` | string (optional) | — | no |  |
 
 ### `tasks.cancel`
 
@@ -195,23 +195,23 @@ Cancel a task.
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
+| `id` | string | — | yes |  |
+| `name` | string | — | yes | Name of the catalog task (the `*.md` file) that defines how to run this. |
+| `status` | TaskStatus | — | yes |  |
 | `attempt` | integer | `0` | no | How many execution attempts this task has had. Starts at 0; each claim increments it and records a [`TaskRun`] under the new attempt. Defaults to 0 so rows and payloads written before attempts existed decode unchanged. |
-| `created_at` | string | — | yes |  |
+| `input` | any | — | yes | Arbitrary input passed to the task's prompt. |
+| `output` | any | — | no | Produced by the task on completion. Omitted from list and push payloads; fetch it on demand with `tasks.get`. |
 | `dedupe_key` | string (optional) | — | no | Optional dedupe key. Inserting a second task with the same key is a no-op. |
+| `created_at` | string | — | yes |  |
+| `started_at` | string (optional) | — | no |  |
+| `finished_at` | string (optional) | — | no |  |
 | `error` | string (optional) | — | no | Human-readable failure reason when `status == Failed`. |
 | `failure` | Failure (optional) | — | no | Machine-readable failure classification when `status == Failed`. Absent on success and on rows/payloads written before typed failures existed. |
-| `finished_at` | string (optional) | — | no |  |
-| `id` | string | — | yes |  |
-| `input` | any | — | yes | Arbitrary input passed to the task's prompt. |
-| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
-| `name` | string | — | yes | Name of the catalog task (the `*.md` file) that defines how to run this. |
-| `output` | any | — | no | Produced by the task on completion. Omitted from list and push payloads; fetch it on demand with `tasks.get`. |
-| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
-| `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
 | `session_id` | string (optional) | — | no | The agent's own session id (e.g. opencode's session id), captured from a task run's output so the session can be reattached later. |
 | `session_title` | string (optional) | — | no | The agent's human-readable session title (e.g. opencode's generated title), resolved once at run completion from the agent's session store. Absent until a run finishes or when the agent reports no title. |
-| `started_at` | string (optional) | — | no |  |
-| `status` | TaskStatus | — | yes |  |
+| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
+| `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
+| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
 
 ### `tasks.retry`
 
@@ -227,23 +227,23 @@ Retry a terminal task, preserving its prior run history.
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
+| `id` | string | — | yes |  |
+| `name` | string | — | yes | Name of the catalog task (the `*.md` file) that defines how to run this. |
+| `status` | TaskStatus | — | yes |  |
 | `attempt` | integer | `0` | no | How many execution attempts this task has had. Starts at 0; each claim increments it and records a [`TaskRun`] under the new attempt. Defaults to 0 so rows and payloads written before attempts existed decode unchanged. |
-| `created_at` | string | — | yes |  |
+| `input` | any | — | yes | Arbitrary input passed to the task's prompt. |
+| `output` | any | — | no | Produced by the task on completion. Omitted from list and push payloads; fetch it on demand with `tasks.get`. |
 | `dedupe_key` | string (optional) | — | no | Optional dedupe key. Inserting a second task with the same key is a no-op. |
+| `created_at` | string | — | yes |  |
+| `started_at` | string (optional) | — | no |  |
+| `finished_at` | string (optional) | — | no |  |
 | `error` | string (optional) | — | no | Human-readable failure reason when `status == Failed`. |
 | `failure` | Failure (optional) | — | no | Machine-readable failure classification when `status == Failed`. Absent on success and on rows/payloads written before typed failures existed. |
-| `finished_at` | string (optional) | — | no |  |
-| `id` | string | — | yes |  |
-| `input` | any | — | yes | Arbitrary input passed to the task's prompt. |
-| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
-| `name` | string | — | yes | Name of the catalog task (the `*.md` file) that defines how to run this. |
-| `output` | any | — | no | Produced by the task on completion. Omitted from list and push payloads; fetch it on demand with `tasks.get`. |
-| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
-| `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
 | `session_id` | string (optional) | — | no | The agent's own session id (e.g. opencode's session id), captured from a task run's output so the session can be reattached later. |
 | `session_title` | string (optional) | — | no | The agent's human-readable session title (e.g. opencode's generated title), resolved once at run completion from the agent's session store. Absent until a run finishes or when the agent reports no title. |
-| `started_at` | string (optional) | — | no |  |
-| `status` | TaskStatus | — | yes |  |
+| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
+| `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
+| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
 
 ### `tasks.start`
 
@@ -253,31 +253,31 @@ Start a catalog task by name.
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
+| `name` | string | — | yes |  |
 | `input` | any | null | no |  |
 | `interactive` | boolean (optional) | null | no |  |
-| `name` | string | — | yes |  |
 
 **Response**
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
+| `id` | string | — | yes |  |
+| `name` | string | — | yes | Name of the catalog task (the `*.md` file) that defines how to run this. |
+| `status` | TaskStatus | — | yes |  |
 | `attempt` | integer | `0` | no | How many execution attempts this task has had. Starts at 0; each claim increments it and records a [`TaskRun`] under the new attempt. Defaults to 0 so rows and payloads written before attempts existed decode unchanged. |
-| `created_at` | string | — | yes |  |
+| `input` | any | — | yes | Arbitrary input passed to the task's prompt. |
+| `output` | any | — | no | Produced by the task on completion. Omitted from list and push payloads; fetch it on demand with `tasks.get`. |
 | `dedupe_key` | string (optional) | — | no | Optional dedupe key. Inserting a second task with the same key is a no-op. |
+| `created_at` | string | — | yes |  |
+| `started_at` | string (optional) | — | no |  |
+| `finished_at` | string (optional) | — | no |  |
 | `error` | string (optional) | — | no | Human-readable failure reason when `status == Failed`. |
 | `failure` | Failure (optional) | — | no | Machine-readable failure classification when `status == Failed`. Absent on success and on rows/payloads written before typed failures existed. |
-| `finished_at` | string (optional) | — | no |  |
-| `id` | string | — | yes |  |
-| `input` | any | — | yes | Arbitrary input passed to the task's prompt. |
-| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
-| `name` | string | — | yes | Name of the catalog task (the `*.md` file) that defines how to run this. |
-| `output` | any | — | no | Produced by the task on completion. Omitted from list and push payloads; fetch it on demand with `tasks.get`. |
-| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
-| `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
 | `session_id` | string (optional) | — | no | The agent's own session id (e.g. opencode's session id), captured from a task run's output so the session can be reattached later. |
 | `session_title` | string (optional) | — | no | The agent's human-readable session title (e.g. opencode's generated title), resolved once at run completion from the agent's session store. Absent until a run finishes or when the agent reports no title. |
-| `started_at` | string (optional) | — | no |  |
-| `status` | TaskStatus | — | yes |  |
+| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
+| `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
+| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
 
 ### `tasks.start_oneshot`
 
@@ -288,19 +288,19 @@ Start a one-shot task from an inline definition (not added to the catalog) and o
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
 | `agent` | string (optional) | null | no |  |
-| `cols` | integer (optional) | null | no |  |
-| `cwd` | string (optional) | null | no |  |
-| `model` | string (optional) | null | no |  |
 | `provider` | string (optional) | null | no |  |
+| `model` | string (optional) | null | no |  |
+| `cwd` | string (optional) | null | no |  |
 | `rows` | integer (optional) | null | no |  |
+| `cols` | integer (optional) | null | no |  |
 
 **Response**
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `data` | string | — | yes | Base64-encoded `vt100` screen frame. |
-| `session` | AgentSessionInfo | — | yes |  |
 | `task` | Task | — | yes |  |
+| `session` | AgentSessionInfo | — | yes |  |
+| `data` | string | — | yes | Base64-encoded `vt100` screen frame. |
 
 ### `catalog.list`
 
@@ -338,29 +338,29 @@ Add a task definition to the catalog (does not run it).
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `agent` | string (optional) | null | no |  |
-| `cwd` | string (optional) | null | no |  |
-| `model` | string (optional) | null | no |  |
 | `name` | string | — | yes |  |
-| `needs` | string (optional) | null | no |  |
-| `prompt` | string (optional) | null | no |  |
+| `agent` | string (optional) | null | no |  |
 | `provider` | string (optional) | null | no |  |
+| `model` | string (optional) | null | no |  |
+| `cwd` | string (optional) | null | no |  |
 | `schedule` | string (optional) | null | no |  |
+| `needs` | string (optional) | null | no |  |
 | `spawn` | string (optional) | null | no |  |
 | `spawn_file` | string (optional) | null | no |  |
 | `spawn_new_root` | boolean (optional) | null | no |  |
+| `prompt` | string (optional) | null | no |  |
 
 **Response**
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `agent` | string (optional) | — | no |  |
-| `cwd` | string (optional) | — | no |  |
-| `model` | string (optional) | — | no |  |
 | `name` | string | — | yes |  |
-| `needs` | string (optional) | — | no |  |
+| `agent` | string (optional) | — | no |  |
 | `provider` | string (optional) | — | no |  |
+| `model` | string (optional) | — | no |  |
+| `cwd` | string (optional) | — | no |  |
 | `schedule` | string (optional) | — | no |  |
+| `needs` | string (optional) | — | no |  |
 | `vars` | TaskVar[] | — | yes |  |
 
 ### `catalog.update`
@@ -371,8 +371,8 @@ Replace an existing catalog task's raw Markdown source (does not run it).
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `markdown` | string | — | yes |  |
 | `name` | string | — | yes |  |
+| `markdown` | string | — | yes |  |
 
 **Response**
 
@@ -393,8 +393,8 @@ object
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
 | `dot` | string | — | yes |  |
-| `graph` | WorkflowGraph | — | yes |  |
 | `path` | string | — | yes |  |
+| `graph` | WorkflowGraph | — | yes |  |
 
 ### `workflow.inspect`
 
@@ -410,14 +410,14 @@ Fetch the runtime workflow graph for a root (task instances plus ready/running/f
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `blocked` | string[] | — | yes |  |
-| `failed` | string[] | — | yes |  |
-| `ready` | string[] | — | yes |  |
 | `root_id` | string | — | yes |  |
 | `root_task` | string | — | yes |  |
-| `running` | string[] | — | yes |  |
 | `state` | WorkflowState | — | yes |  |
 | `tasks` | WorkflowTaskView[] | — | yes |  |
+| `ready` | string[] | — | yes |  |
+| `running` | string[] | — | yes |  |
+| `failed` | string[] | — | yes |  |
+| `blocked` | string[] | — | yes |  |
 
 ### `workflow.create`
 
@@ -446,33 +446,33 @@ Add one runtime task to an existing workflow root, optionally depending on exist
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `dedupe_key` | string (optional) | null | no |  |
-| `depends_on` | string[] (optional) | null | no |  |
-| `input` | any | null | no |  |
 | `name` | string | — | yes |  |
+| `input` | any | null | no |  |
 | `root_id` | string (optional) | null | no |  |
+| `depends_on` | string[] (optional) | null | no |  |
+| `dedupe_key` | string (optional) | null | no |  |
 
 **Response**
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
+| `id` | string | — | yes |  |
+| `name` | string | — | yes | Name of the catalog task (the `*.md` file) that defines how to run this. |
+| `status` | TaskStatus | — | yes |  |
 | `attempt` | integer | `0` | no | How many execution attempts this task has had. Starts at 0; each claim increments it and records a [`TaskRun`] under the new attempt. Defaults to 0 so rows and payloads written before attempts existed decode unchanged. |
-| `created_at` | string | — | yes |  |
+| `input` | any | — | yes | Arbitrary input passed to the task's prompt. |
+| `output` | any | — | no | Produced by the task on completion. Omitted from list and push payloads; fetch it on demand with `tasks.get`. |
 | `dedupe_key` | string (optional) | — | no | Optional dedupe key. Inserting a second task with the same key is a no-op. |
+| `created_at` | string | — | yes |  |
+| `started_at` | string (optional) | — | no |  |
+| `finished_at` | string (optional) | — | no |  |
 | `error` | string (optional) | — | no | Human-readable failure reason when `status == Failed`. |
 | `failure` | Failure (optional) | — | no | Machine-readable failure classification when `status == Failed`. Absent on success and on rows/payloads written before typed failures existed. |
-| `finished_at` | string (optional) | — | no |  |
-| `id` | string | — | yes |  |
-| `input` | any | — | yes | Arbitrary input passed to the task's prompt. |
-| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
-| `name` | string | — | yes | Name of the catalog task (the `*.md` file) that defines how to run this. |
-| `output` | any | — | no | Produced by the task on completion. Omitted from list and push payloads; fetch it on demand with `tasks.get`. |
-| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
-| `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
 | `session_id` | string (optional) | — | no | The agent's own session id (e.g. opencode's session id), captured from a task run's output so the session can be reattached later. |
 | `session_title` | string (optional) | — | no | The agent's human-readable session title (e.g. opencode's generated title), resolved once at run completion from the agent's session store. Absent until a run finishes or when the agent reports no title. |
-| `started_at` | string (optional) | — | no |  |
-| `status` | TaskStatus | — | yes |  |
+| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
+| `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
+| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
 
 ### `workflow.cancel`
 
@@ -488,8 +488,8 @@ Cancel every non-terminal task in a workflow root, emitting `TaskCancelled` per 
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `cancelled` | string[] | — | yes |  |
 | `root_id` | string | — | yes |  |
+| `cancelled` | string[] | — | yes |  |
 
 ### `workflow.retry`
 
@@ -505,23 +505,23 @@ Retry a terminal task, preserving its prior run history. Single-task alias of `t
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
+| `id` | string | — | yes |  |
+| `name` | string | — | yes | Name of the catalog task (the `*.md` file) that defines how to run this. |
+| `status` | TaskStatus | — | yes |  |
 | `attempt` | integer | `0` | no | How many execution attempts this task has had. Starts at 0; each claim increments it and records a [`TaskRun`] under the new attempt. Defaults to 0 so rows and payloads written before attempts existed decode unchanged. |
-| `created_at` | string | — | yes |  |
+| `input` | any | — | yes | Arbitrary input passed to the task's prompt. |
+| `output` | any | — | no | Produced by the task on completion. Omitted from list and push payloads; fetch it on demand with `tasks.get`. |
 | `dedupe_key` | string (optional) | — | no | Optional dedupe key. Inserting a second task with the same key is a no-op. |
+| `created_at` | string | — | yes |  |
+| `started_at` | string (optional) | — | no |  |
+| `finished_at` | string (optional) | — | no |  |
 | `error` | string (optional) | — | no | Human-readable failure reason when `status == Failed`. |
 | `failure` | Failure (optional) | — | no | Machine-readable failure classification when `status == Failed`. Absent on success and on rows/payloads written before typed failures existed. |
-| `finished_at` | string (optional) | — | no |  |
-| `id` | string | — | yes |  |
-| `input` | any | — | yes | Arbitrary input passed to the task's prompt. |
-| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
-| `name` | string | — | yes | Name of the catalog task (the `*.md` file) that defines how to run this. |
-| `output` | any | — | no | Produced by the task on completion. Omitted from list and push payloads; fetch it on demand with `tasks.get`. |
-| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
-| `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
 | `session_id` | string (optional) | — | no | The agent's own session id (e.g. opencode's session id), captured from a task run's output so the session can be reattached later. |
 | `session_title` | string (optional) | — | no | The agent's human-readable session title (e.g. opencode's generated title), resolved once at run completion from the agent's session store. Absent until a run finishes or when the agent reports no title. |
-| `started_at` | string (optional) | — | no |  |
-| `status` | TaskStatus | — | yes |  |
+| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
+| `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
+| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
 
 ### `events.tail`
 
@@ -574,58 +574,55 @@ Start an external agent session (optionally attached to a task).
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
 | `agent` | string (optional) | null | no |  |
-| `cols` | integer (optional) | null | no |  |
-| `cwd` | string (optional) | null | no |  |
-| `model` | string (optional) | null | no |  |
-| `new` | boolean (optional) | null | no |  |
-| `prompt` | string (optional) | null | no |  |
-| `provider` | string (optional) | null | no |  |
-| `rows` | integer (optional) | null | no |  |
-| `session_id` | string (optional) | null | no |  |
 | `task_id` | string (optional) | null | no |  |
-
-**Response**
-
-| Field | Type | Default | Required | Description |
-|-------|------|---------|----------|-------------|
-| `data` | string | — | yes | Base64-encoded `vt100` screen frame. |
-| `session` | AgentSessionInfo | — | yes |  |
-
-### `agents.input`
-
-Write raw bytes (base64) to a session's PTY.
-
-**Request**
-
-| Field | Type | Default | Required | Description |
-|-------|------|---------|----------|-------------|
-| `data` | string (optional) | null | no |  |
-| `session_id` | string | — | yes |  |
-
-**Response**
-
-| Field | Type | Default | Required | Description |
-|-------|------|---------|----------|-------------|
-| `bytes` | integer | — | yes |  |
-
-### `agents.resize`
-
-Resize a session's PTY.
-
-**Request**
-
-| Field | Type | Default | Required | Description |
-|-------|------|---------|----------|-------------|
-| `cols` | integer (optional) | null | no |  |
+| `prompt` | string (optional) | null | no |  |
+| `session_id` | string (optional) | null | no |  |
 | `rows` | integer (optional) | null | no |  |
+| `cols` | integer (optional) | null | no |  |
+| `new` | boolean (optional) | null | no |  |
+| `provider` | string (optional) | null | no |  |
+| `model` | string (optional) | null | no |  |
+| `cwd` | string (optional) | null | no |  |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `session` | AgentSessionInfo | — | yes |  |
+| `data` | string | — | yes | Base64-encoded `vt100` screen frame. |
+
+### `agents.prompt`
+
+Send a follow-up prompt to a structured (ACP) agent session.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `session_id` | string | — | yes |  |
+| `prompt` | string | — | yes |  |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `accepted` | boolean | — | yes |  |
+
+### `agents.cancel`
+
+Interrupt the in-flight turn of a structured (ACP) agent session.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
 | `session_id` | string | — | yes |  |
 
 **Response**
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `cols` | integer | — | yes |  |
-| `rows` | integer | — | yes |  |
+| `cancelled` | boolean | — | yes |  |
 
 ### `agents.attach`
 
@@ -641,8 +638,8 @@ Attach to a session: returns the session and a replay of its output.
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `data` | string | — | yes | Base64-encoded `vt100` screen frame. |
 | `session` | AgentSessionInfo | — | yes |  |
+| `data` | string | — | yes | Base64-encoded `vt100` screen frame. |
 
 ### `agents.close`
 
@@ -668,9 +665,9 @@ Answer a structured input request on a session's state channel.
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `reply` | InputReply | — | yes |  |
-| `request_id` | string | — | yes |  |
 | `session_id` | string | — | yes |  |
+| `request_id` | string | — | yes |  |
+| `reply` | InputReply | — | yes |  |
 
 **Response**
 
@@ -714,23 +711,23 @@ Create or update a cron schedule.
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `cron` | string | — | yes |  |
-| `enabled` | boolean (optional) | null | no |  |
 | `id` | string (optional) | null | no |  |
-| `input` | any | null | no |  |
+| `cron` | string | — | yes |  |
 | `task` | string | — | yes |  |
+| `input` | any | null | no |  |
+| `enabled` | boolean (optional) | null | no |  |
 
 **Response**
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `cron` | string | — | yes |  |
-| `enabled` | boolean | — | yes |  |
 | `id` | string | — | yes |  |
+| `cron` | string | — | yes |  |
+| `task` | string | — | yes | The catalog task name to enqueue on each fire. |
 | `input` | any | — | yes |  |
+| `enabled` | boolean | — | yes |  |
 | `last_run` | string (optional) | — | no |  |
 | `next_run` | string (optional) | null | no | The next occurrence of `cron` in UTC, computed by the daemon for enabled schedules. `None` when the schedule is disabled, its expression does not parse, or no future occurrence exists. Never persisted; older payloads omit it. |
-| `task` | string | — | yes | The catalog task name to enqueue on each fire. |
 
 ### `schedules.delete`
 
@@ -770,10 +767,10 @@ Send a test notification through a channel.
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `body` | string (optional) | null | no |  |
 | `channel` | string | — | yes |  |
 | `config` | any | null | no |  |
 | `subject` | string (optional) | null | no |  |
+| `body` | string (optional) | null | no |  |
 
 **Response**
 
@@ -789,9 +786,9 @@ Add a notification hook reacting to an event kind.
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
+| `event` | string | — | yes |  |
 | `channel` | string | — | yes |  |
 | `config` | any | null | no |  |
-| `event` | string | — | yes |  |
 
 **Response**
 
@@ -813,9 +810,9 @@ Aggregate persisted per-run token/cost usage into a per-bucket series (day/week/
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `buckets` | UsageBucket[] | — | yes | Oldest bucket first. Empty buckets are included so the TUI chart always has a fixed number of points for the selected period. |
 | `period` | UsagePeriod | — | yes |  |
 | `totals` | UsageTotals | — | yes |  |
+| `buckets` | UsageBucket[] | — | yes | Oldest bucket first. Empty buckets are included so the TUI chart always has a fixed number of points for the selected period. |
 
 ### `repos.list`
 
@@ -829,8 +826,8 @@ object
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `active` | string (optional) | null | no |  |
 | `repos` | RepoInfo[] | — | yes |  |
+| `active` | string (optional) | null | no |  |
 
 ### `repos.add`
 
@@ -840,17 +837,17 @@ Register a repository (by daemon-host path) as a known repo.
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `name` | string (optional) | null | no |  |
 | `path` | string | — | yes |  |
+| `name` | string (optional) | null | no |  |
 
 **Response**
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `active` | boolean | `false` | no | Whether this is the daemon-wide active repo. |
-| `available` | boolean | `true` | no | Whether the repo currently has a `.favetto/tasks/` catalog directory. |
 | `name` | string | — | yes |  |
 | `path` | string | — | yes |  |
+| `available` | boolean | `true` | no | Whether the repo currently has a `.favetto/tasks/` catalog directory. |
+| `active` | boolean | `false` | no | Whether this is the daemon-wide active repo. |
 | `source` | RepoSource | `manual` | no | How the repo entered the registry. |
 
 ### `repos.remove`
@@ -883,8 +880,8 @@ Set (or clear) the daemon-wide active repository.
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `active` | string (optional) | null | no |  |
 | `repos` | RepoInfo[] | — | yes |  |
+| `active` | string (optional) | null | no |  |
 
 ### `repos.refresh`
 
@@ -898,8 +895,8 @@ object
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `active` | string (optional) | null | no |  |
 | `repos` | RepoInfo[] | — | yes |  |
+| `active` | string (optional) | null | no |  |
 
 ## Server → client pushes
 
@@ -908,7 +905,6 @@ object
 | `event` | A persisted event. |
 | `task.updated` | A task row changed. |
 | `catalog.updated` | The task catalog changed on disk; clients should re-fetch it. |
-| `agent.output` | Raw PTY output (base64) from a running agent session. |
 | `agent.exit` | An agent session's child process exited. |
 | `agent.state` | A session's folded live state (activity/usage) changed. |
 | `agent.event` | One normalized agent-state event, in order. Non-durable; backfill with `tasks.events`. |
@@ -925,10 +921,10 @@ A persisted event.
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `created_at` | string | — | yes |  |
 | `id` | integer | — | yes |  |
 | `kind` | EventKind | — | yes |  |
 | `payload` | any | — | yes |  |
+| `created_at` | string | — | yes |  |
 
 ### `task.updated`
 
@@ -938,23 +934,23 @@ A task row changed.
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
+| `id` | string | — | yes |  |
+| `name` | string | — | yes | Name of the catalog task (the `*.md` file) that defines how to run this. |
+| `status` | TaskStatus | — | yes |  |
 | `attempt` | integer | `0` | no | How many execution attempts this task has had. Starts at 0; each claim increments it and records a [`TaskRun`] under the new attempt. Defaults to 0 so rows and payloads written before attempts existed decode unchanged. |
-| `created_at` | string | — | yes |  |
+| `input` | any | — | yes | Arbitrary input passed to the task's prompt. |
+| `output` | any | — | no | Produced by the task on completion. Omitted from list and push payloads; fetch it on demand with `tasks.get`. |
 | `dedupe_key` | string (optional) | — | no | Optional dedupe key. Inserting a second task with the same key is a no-op. |
+| `created_at` | string | — | yes |  |
+| `started_at` | string (optional) | — | no |  |
+| `finished_at` | string (optional) | — | no |  |
 | `error` | string (optional) | — | no | Human-readable failure reason when `status == Failed`. |
 | `failure` | Failure (optional) | — | no | Machine-readable failure classification when `status == Failed`. Absent on success and on rows/payloads written before typed failures existed. |
-| `finished_at` | string (optional) | — | no |  |
-| `id` | string | — | yes |  |
-| `input` | any | — | yes | Arbitrary input passed to the task's prompt. |
-| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
-| `name` | string | — | yes | Name of the catalog task (the `*.md` file) that defines how to run this. |
-| `output` | any | — | no | Produced by the task on completion. Omitted from list and push payloads; fetch it on demand with `tasks.get`. |
-| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
-| `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
 | `session_id` | string (optional) | — | no | The agent's own session id (e.g. opencode's session id), captured from a task run's output so the session can be reattached later. |
 | `session_title` | string (optional) | — | no | The agent's human-readable session title (e.g. opencode's generated title), resolved once at run completion from the agent's session store. Absent until a run finishes or when the agent reports no title. |
-| `started_at` | string (optional) | — | no |  |
-| `status` | TaskStatus | — | yes |  |
+| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
+| `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
+| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
 
 ### `catalog.updated`
 
@@ -964,17 +960,6 @@ The task catalog changed on disk; clients should re-fetch it.
 
 object
 
-### `agent.output`
-
-Raw PTY output (base64) from a running agent session.
-
-**Payload**
-
-| Field | Type | Default | Required | Description |
-|-------|------|---------|----------|-------------|
-| `data` | string | — | yes | Base64-encoded `vt100` screen frame. |
-| `session_id` | string | — | yes |  |
-
 ### `agent.exit`
 
 An agent session's child process exited.
@@ -983,8 +968,8 @@ An agent session's child process exited.
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `code` | integer (optional) | — | no | Process exit code, when one was reported. |
 | `session_id` | string | — | yes |  |
+| `code` | integer (optional) | — | no | Process exit code, when one was reported. |
 
 ### `agent.state`
 
@@ -994,8 +979,8 @@ A session's folded live state (activity/usage) changed.
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `activity` | AgentActivity (optional) | — | no |  |
 | `session_id` | string | — | yes |  |
+| `activity` | AgentActivity (optional) | — | no |  |
 | `usage` | AgentUsage (optional) | — | no |  |
 
 ### `agent.event`
@@ -1006,10 +991,10 @@ One normalized agent-state event, in order. Non-durable; backfill with `tasks.ev
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `event` | AgentStateEvent | — | yes |  |
-| `seq` | integer | — | yes |  |
 | `session_id` | string | — | yes |  |
 | `task_id` | string (optional) | — | no |  |
+| `seq` | integer | — | yes |  |
+| `event` | AgentStateEvent | — | yes |  |
 
 ## Error codes
 

@@ -9,8 +9,6 @@ use tower::ServiceExt as _;
 use crate::config::FavettoConfig;
 use crate::state::{State, StateInit};
 
-/// The marker in the committed `web/dist/index.html` placeholder.
-const EMBEDDED_MARKER: &str = "favetto-placeholder";
 /// The marker the disk-index fixture writes, distinct from the embedded one.
 const DISK_MARKER: &str = "disk-index";
 
@@ -118,6 +116,14 @@ fn cache_control(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.to_str().ok())
 }
 
+/// Whether a body is the SPA's HTML entry point.
+fn looks_like_html(bytes: &[u8]) -> bool {
+    body_text(bytes)
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("<!doctype html")
+}
+
 /// The web-only router (no API routes), for isolating asset/fallback behaviour.
 fn web_router(state: &Arc<State>) -> Router {
     crate::web::routes().with_state(state.clone())
@@ -133,11 +139,9 @@ async fn index_serves_embedded_html() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(content_type(&headers), Some("text/html; charset=utf-8"));
     assert_eq!(cache_control(&headers), Some("no-cache"));
-    assert!(
-        body_text(&bytes).contains(EMBEDDED_MARKER),
-        "{}",
-        body_text(&bytes)
-    );
+    // `web/dist/index.html` may be the committed placeholder or a local `dx`
+    // build; both must be served as the SPA entry point.
+    assert!(looks_like_html(&bytes), "{}", body_text(&bytes));
 }
 
 #[tokio::test]
@@ -253,7 +257,7 @@ async fn index_ignores_accept_for_root() {
     let (status, _, bytes) = request(app, Method::GET, "/", None, Vec::new()).await;
 
     assert_eq!(status, StatusCode::OK);
-    assert!(body_text(&bytes).contains(EMBEDDED_MARKER));
+    assert!(looks_like_html(&bytes));
 }
 
 #[tokio::test]
@@ -272,7 +276,7 @@ async fn api_routes_are_never_shadowed() {
     )
     .await;
     assert_eq!(events, StatusCode::UNAUTHORIZED);
-    assert!(!body_text(&events_body).contains(EMBEDDED_MARKER));
+    assert!(!looks_like_html(&events_body));
 
     // `GET /metrics` renders the metrics registry, not the SPA.
     let (metrics, _, metrics_body) = request(
@@ -285,7 +289,7 @@ async fn api_routes_are_never_shadowed() {
     .await;
     assert_eq!(metrics, StatusCode::OK);
     assert!(body_text(&metrics_body).contains("favetto_tasks_total"));
-    assert!(!body_text(&metrics_body).contains(EMBEDDED_MARKER));
+    assert!(!looks_like_html(&metrics_body));
 
     // `GET /rpc` without WebSocket upgrade headers is rejected by the extractor.
     let (rpc_get, _, rpc_get_body) = request(
@@ -297,7 +301,7 @@ async fn api_routes_are_never_shadowed() {
     )
     .await;
     assert_ne!(rpc_get, StatusCode::OK);
-    assert!(!body_text(&rpc_get_body).contains(EMBEDDED_MARKER));
+    assert!(!looks_like_html(&rpc_get_body));
 
     // `POST /rpc` without a bearer token stays a 401.
     let (rpc_post, _, rpc_post_body) = request(
@@ -309,14 +313,11 @@ async fn api_routes_are_never_shadowed() {
     )
     .await;
     assert_eq!(rpc_post, StatusCode::UNAUTHORIZED);
-    assert!(!body_text(&rpc_post_body).contains(EMBEDDED_MARKER));
+    assert!(!looks_like_html(&rpc_post_body));
 
     // Webhook and agent-hook routes are matched by their own handlers: the
     // fallback would have answered `200` with the SPA for a shadowed route.
-    for (uri, handler_marker) in [
-        ("/webhooks/github", "webhooks disabled"),
-        ("/agent-hooks/claude/x", "unknown agent hook token"),
-    ] {
+    for (uri, handler_marker) in [("/webhooks/github", "webhooks disabled")] {
         let (status, _, body) = request(
             app.clone(),
             Method::POST,
@@ -328,7 +329,10 @@ async fn api_routes_are_never_shadowed() {
         assert_ne!(status, StatusCode::OK, "{uri}: {status}");
         let body = body_text(&body);
         assert!(body.contains(handler_marker), "{uri}: {body}");
-        assert!(!body.contains(EMBEDDED_MARKER), "{uri}");
+        assert!(
+            !body.to_ascii_lowercase().contains("<!doctype html"),
+            "{uri}"
+        );
     }
 }
 

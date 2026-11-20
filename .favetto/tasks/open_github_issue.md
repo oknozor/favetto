@@ -1,7 +1,6 @@
 agent = "opencode"
 provider = "deepseek"
 model = "deepseek-flash"
-cwd = "/code/che"
 
 [[vars]]
 name = "issue_description"

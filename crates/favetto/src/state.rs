@@ -1,6 +1,5 @@
 //! Shared daemon state passed to every connection handler and background task.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -60,7 +59,6 @@ pub struct State {
     /// Live hook list (mutable so the TUI can add notification hooks).
     pub hook_store: Arc<RwLock<Vec<Hook>>>,
     /// Cached provider/model catalogs, keyed by agent name (fetched lazily).
-    pub providers_cache: tokio::sync::Mutex<HashMap<String, Vec<favetto_providers::Provider>>>,
     /// Per-daemon counters rendered on `/metrics`.
     pub metrics: Metrics,
     /// Known repositories whose `.favetto/tasks/` catalogs are loaded.
@@ -123,7 +121,6 @@ impl State {
             login_limiter,
             tickets,
             hook_store: init.hook_store,
-            providers_cache: tokio::sync::Mutex::new(HashMap::new()),
             metrics: Metrics::default(),
             repos: Arc::new(RwLock::new(Vec::new())),
             active_repo: Arc::new(RwLock::new(None)),

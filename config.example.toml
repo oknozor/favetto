@@ -10,95 +10,48 @@
 [agent]
 default = "opencode"
 
-# External coding agents. The daemon launches these in a PTY; the TUI embeds the
-# live terminal in the Agent tab.
+# External agents. Every agent is an Agent Client Protocol (ACP) server: the
+# daemon launches `command args` and speaks ACP over its stdin/stdout. Prompts,
+# tool calls and permission requests are structured protocol messages, not
+# terminal text, so there are no per-vendor adapters to configure.
 #
-# The four built-ins — opencode, claude, pi, vibe — are always registered, so an
-# empty config still exposes them. A `[agents.<name>]` entry is only an overlay:
-# it customizes a built-in's invocation, binds one to a custom name with
-# `type = "opencode"` (etc.), or defines a custom CLI with `type = "configurable"`.
-# Any field you set is merged over the built-in default; omitted fields keep it.
+# The four built-in names are launch presets, not implementations:
+#   opencode -> `opencode acp`
+#   claude   -> `npx -y @zed-industries/claude-agent-acp`
+#   pi       -> `npx -y pi-acp`
+#   vibe     -> `vibe-acp`
+# An empty config exposes all four. A `[agents.<name>]` entry overlays the preset
+# (or defines any other ACP server), so adding a compatible agent is
+# configuration, not code:
 #
-# `args` is the interactive invocation. `headless_args` runs catalog tasks
-# unattended (no model); `run_args` is used instead when the task sets `model`,
-# with `{prompt}`, `{provider}`, and `{model}` substituted so the model flag can
-# sit where the CLI expects it. `resume_args` reopens a previously run session
-# (`{session_id}`). `interactive_model_args` is the interactive invocation used
-# when a model is selected (e.g. the one-shot wizard); it is a path that accepts a
-# model, since some agents' main TUI does not. `session_id_json_key` reads the
-# agent's session id from a run's line-delimited JSON output. `prompt_args` seeds
-# an interactive session (otherwise the prompt is written to stdin).
+# [agents.goose]
+# command = "goose"
+# args = ["acp"]
 #
-# `type` selects the implementation explicitly: "opencode", "claude", "pi",
-# "vibe", or "configurable". Omit it to use the built-in whose name matches the
-# entry, or the template-only agent for a custom name. Add `[agents.<name>.git]`
-# to override the global `[git]` section for that agent (same keys as `[git]`).
+# `permission` is the default policy for the agent's sessions: "ask" (forward a
+# request to a connected client, failing closed if none answers), "allow", or
+# "deny". A catalog task can override it with its own `permission` header.
+# `env` and `cwd` apply to the server process; `[agents.<name>.git]` overrides the
+# global `[git]` section for that agent.
 #
-# Agent state (see docs/design/agent-state-adapters.md): `state` selects how the
-# agent's live state is observed — "auto" (built-in default), "none" (screen
-# fallback), "stdout", "server", or "hooks". `output_format` names a structured
-# stdout format for headless runs ("opencode-json", "claude-stream-json",
-# "pi-json", "pi-rpc", "vibe-streaming", or "plain-jsonl"). `server` selects the
-# opencode server ("managed", "background", or a URL); `hooks = true` lets
-# claude report through per-launch HTTP hooks. A custom `configurable` agent only
-# has a parser for "plain-jsonl": top-level `text`/`content` becomes its summary
-# text, `{"type":"tool_use"}` rows become tool calls, and every other JSON row is
-# preserved verbatim.
-#
-# An agent whose binary is not on PATH is still listed and marked unavailable;
-# launching it fails with a clear error. Availability is resolved once at daemon
-# startup, so a PATH change needs a restart.
-#
-# The blocks below document the shipped built-in defaults, so they are commented
-# out. Uncomment one to override it.
+# The blocks below document the shipped presets; uncomment one to override it.
 #
 # [agents.opencode]
 # command = "opencode"
-# args = []
-# prompt_args = ["--prompt", "{prompt}"]        # seed an interactive session
-# submit_prompt = true                          # press Enter so the prompt is sent
-# headless_args = ["run", "--auto", "{prompt}"] # --auto avoids approval prompts
-# run_args = ["run", "--model", "{provider}/{model}", "--auto", "--format", "json", "{prompt}"]
-# resume_args = ["--session", "{session_id}"]   # reopen a session in the TUI
-# interactive_model_args = ["mini", "--model", "{provider}/{model}"]  # interactive + model
-# session_id_json_key = "sessionID"             # from `run --format json` events
+# args = ["acp"]
+# permission = "ask"
 #
 # [agents.claude]
-# command = "claude"
-# args = []
-# prompt_args = ["{prompt}"]
-# headless_args = ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "{prompt}"]
-# run_args = ["-p", "--model", "{model}", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "{prompt}"]
-# interactive_model_args = ["--model", "{model}"]
-# session_id_json_key = "session_id"
+# command = "npx"
+# args = ["-y", "@zed-industries/claude-agent-acp"]
 #
 # [agents.pi]
-# command = "pi"
-# args = []
-# prompt_args = ["{prompt}"]                     # seed an interactive session
-# headless_args = ["--mode", "rpc", "--session-id", "{session_id}"]  # unattended RPC
-# run_args = ["--mode", "rpc", "--provider", "{provider}", "--model", "{model}", "--session-id", "{session_id}"]
-# resume_args = ["--session", "{session_id}"]    # reopen the run in the TUI
-# interactive_model_args = ["--provider", "{provider}", "--model", "{model}"]
+# command = "npx"
+# args = ["-y", "pi-acp"]
 #
 # [agents.vibe]
-# command = "vibe"
+# command = "vibe-acp"
 # args = []
-# prompt_args = ["{prompt}"]
-# submit_prompt = true
-# headless_args = ["-p", "{prompt}", "--output", "streaming", "--auto-approve"]
-# run_args = ["-p", "--provider", "{provider}", "--model", "{model}", "{prompt}", "--output", "streaming", "--auto-approve"]
-# interactive_model_args = ["--provider", "{provider}", "--model", "{model}"]
-#
-# A custom CLI that emits line-delimited JSON opt into a structured summary with
-# output_format = "plain-jsonl" and keeps its session id via `session_id_json_key`.
-# [agents.mycli]
-# type = "configurable"
-# command = "mycli"
-# headless_args = ["run", "{prompt}"]
-# output_format = "plain-jsonl"
-# session_id_json_key = "session_id"
-# state = "stdout"
 
 # Daemon defaults. CLI flags take precedence over these.
 [daemon]

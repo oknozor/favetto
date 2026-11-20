@@ -12,21 +12,13 @@ For the Agent panel's focus and mouse handling see [Embedded agents](./agents).
 
 *The Tasks tab: recent runs with their repo, kind, status, started time, duration, and session title.*
 
-An opencode run writes its session title a few seconds after its first turn. As
-soon as the agent reports its session id **during** the run, the daemon resolves
-the title and pushes it to connected clients, so the `SESSION` cell fills in
-live without restarting the TUI. If the title is not available in time, the
-completion-time bounded retry and the background backfill still fill it a few
-seconds later. A failed run keeps the session id and title it captured. One-shot
-tasks resolve their title the same way when the agent reports a session id.
-Agents that never expose titles (`claude`, `pi`, `vibe`, custom) show a blank
-cell and skip the retry.
+ACP sessions report an agent-side session id, but session titles are not
+surfaced yet, so the `SESSION` cell stays blank. The id is still recorded on the
+task row.
 
-A task whose agent blocks on a permission prompt, confirmation, choice, or git
-pinentry is shown as **awaiting input** (glyph `!`, warning colour) instead of
-silently staying `running`, and the status bar counts them. Press **Enter** on
-that row to open the Agent panel and answer the prompt; the task returns to
-`running` once the agent continues.
+When a session asks for tool permission it reports `awaiting_input`; open it with
+**Enter** and answer with **Ctrl+R**. (The task row stays `running` until the
+turn ends.)
 
 Each Tasks row also carries a **KIND** column derived from the catalog
 definition: `action` for a built-in deterministic step, `scheduled` for a
@@ -88,13 +80,12 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 | Usage | `3` | month buckets (last 30 days) |
 | Usage | `4` | year buckets (last 12 months) |
 | Agent | `Ctrl+Y` | toggle focus: agent ↔ favetto |
-| Agent | *(agent focus)* | every key is forwarded to the agent |
+| Agent | *(agent focus)* | type a follow-up prompt; `Enter` sends it |
 | Agent | *(favetto focus)* `Ctrl+O` | switch to another session |
 | Agent | *(favetto focus)* `Ctrl+Q` | leave the panel |
 | Agent | *(favetto focus)* `Ctrl+N` | start a new session |
 | Agent | *(favetto focus)* `Esc` | back to Tasks |
 | Agent | drag with the left button | select output; copies to the clipboard on release |
-| Agent | `Shift`+drag | forward the drag to the agent's own mouse UI |
 | Popups | `↑` / `↓` | select |
 | Popups | `Enter` | confirm / next field |
 | Popups | `Esc` | cancel / close |
@@ -120,13 +111,10 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 | Mouse | click a catalog folder | fold/unfold it |
 | Mouse | click a catalog/task row | select; click again starts it |
 
-`Ctrl+P`, `Ctrl+X`, `?`, `w`, `i`, `p`, `e`, `c`, `r`, and `C` are forwarded to
-the embedded agent while the Agent panel has keyboard capture, and are typed
-literally into form/wizard fields when one is open. `p` only toggles the preview
-and `e` only edits on the Catalog tab; `i` only inspects on the Tasks tab, and
-`c`, `r`, and `C` only act on the Tasks tab. A plain left-button drag on the Agent
-panel is captured for copy-on-select instead of being forwarded; hold **Shift** to
-pass the drag through to the agent's own mouse UI.
+While the Agent panel has keyboard capture, printable keys compose a prompt and
+**Enter** sends it with `agents.prompt`. Favetto's own shortcuts (`Ctrl+P`,
+`Ctrl+O`, `Ctrl+Y`, `Ctrl+N`, `Ctrl+Q`) still work in the panel. In form/wizard
+fields, keys are typed literally.
 
 ## Cancel and retry
 
@@ -172,10 +160,8 @@ clipboard tools `wl-copy`, `xclip`, or `xsel` on Linux, `pbcopy` on macOS, or
 `clip` on Windows. When only the escape is available the status bar reads
 `copied N chars (OSC 52)`.
 
-A plain click (no drag) selects nothing. Because copy-on-select takes priority
-over the agent's own mouse handling, hold **Shift** while dragging to forward the
-drag to an agent that reports mouse events. A finished interactive agent stays
-selectable; the structured view shown for headless runs is not.
+A plain click (no drag) selects nothing. The transcript of a finished session
+stays selectable.
 
 Press **Ctrl+P** to open the **command palette**: a borderless, vertically
 centred panel with a bold **Commands** title, a muted `esc` hint on the right, and
@@ -223,8 +209,8 @@ combinations are:
 | `Ctrl+X` `h` | open docs in the browser |
 
 The leader works from every tab while favetto owns the keyboard. While the Agent
-panel has keyboard capture, `Ctrl+X` is forwarded to the agent like the other
-favetto keys, and the `?` overlay documents the leader under **Global**.
+panel has keyboard capture, the leader still works (the panel only consumes
+printable keys and `Enter`), and the `?` overlay documents it under **Global**.
 
 ### Launching a task from the palette
 

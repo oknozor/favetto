@@ -7,9 +7,8 @@
 # repository and never proposes a feature. Scheduled unattended runs pass no
 # input, so `area` defaults to `auto`.
 agent = "opencode"
-provider = "deepseek"
-model = "deepseek-flash"
-cwd = "/code/che"
+provider = "opencode-go"
+model = "deepseek-v4.1-flash"
 schedule = "0 0 */2 * * *"
 worktree = false
 

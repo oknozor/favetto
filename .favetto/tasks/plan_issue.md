@@ -1,7 +1,6 @@
 agent = "opencode"
 provider = "deepseek"  
 model = "deepseek-flash" 
-cwd = "/code/che"
 spawn = "repo:Favetto/implement_issue"
 spawn_file = ".favetto/plans/{{ input.issue_id }}/handoff.json"
 ---

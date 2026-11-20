@@ -836,18 +836,6 @@ async fn run_session(
         let animate = app.needs_animation();
         let _ = terminal.draw(|f| ui::draw(f, app));
 
-        // Keep the daemon-side PTY in sync with the panel size.
-        if let (Some(sid), Some((rows, cols))) =
-            (app.agent_session_id.clone(), app.agent_resize.take())
-        {
-            let _ = client
-                .request(
-                    method::AGENTS_RESIZE,
-                    serde_json::json!({ "session_id": sid, "rows": rows, "cols": cols }),
-                )
-                .await;
-        }
-
         tokio::select! {
             biased;
             _ = anim.tick(), if animate => {
@@ -1290,20 +1278,41 @@ async fn start_oneshot(
     refresh_lists(client, app).await;
 }
 
-/// Forward raw bytes to the active agent session's PTY.
+/// Type into the active ACP session's prompt line. Enter sends the composed
+/// prompt as `agents.prompt`; Backspace edits it. There is no child TUI, so
+/// other control keys are ignored.
 async fn send_agent_input(client: &Client, app: &mut App, bytes: &[u8]) {
     let Some(sid) = app.agent_session_id.clone() else {
         return;
     };
-    let data = base64::engine::general_purpose::STANDARD.encode(bytes);
-    if let Err(e) = client
-        .request(
-            method::AGENTS_INPUT,
-            serde_json::json!({ "session_id": sid, "data": data }),
-        )
-        .await
-    {
-        app.logs.push_back(format!("agent.input failed: {e}"));
+    for byte in bytes {
+        match byte {
+            b'\r' | b'\n' => {
+                let prompt = std::mem::take(&mut app.agent_prompt);
+                if prompt.trim().is_empty() {
+                    continue;
+                }
+                app.agent_status.clear();
+                if let Err(e) = client
+                    .request(
+                        method::AGENTS_PROMPT,
+                        serde_json::json!({ "session_id": sid, "prompt": prompt }),
+                    )
+                    .await
+                {
+                    app.logs.push_back(format!("agents.prompt failed: {e}"));
+                }
+            }
+            0x7f | 0x08 => {
+                app.agent_prompt.pop();
+                app.agent_status = format!("> {}", app.agent_prompt);
+            }
+            b if b.is_ascii_graphic() || *b == b' ' => {
+                app.agent_prompt.push(*b as char);
+                app.agent_status = format!("> {}", app.agent_prompt);
+            }
+            _ => {}
+        }
     }
 }
 

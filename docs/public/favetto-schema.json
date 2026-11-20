@@ -1,156 +1,133 @@
 {
-  "$defs": {
-    "AgentConfig": {
-      "description": "An external coding-agent CLI (opencode, Claude Code, pi, Mistral Vibe, …).\n\n`args` is the interactive invocation used by the embedded terminal panel.\n`prompt_args`, when present, is appended (with `{prompt}` substituted) so a\nsession can start with the task prompt. `headless_args` drives unattended\ncatalog-task runs; `{prompt}` is substituted there too. When a prompt is given\nbut no `prompt_args`/`headless_args` are configured, the prompt is written to\nthe process's stdin.\n\nModel selection uses `run_args` instead of `headless_args` when a task sets a\n`model`. Both support `{prompt}`, `{provider}`, and `{model}` placeholders, so\nthe flag can be placed where the CLI expects it (e.g. after a `run`\nsubcommand). `resume_args` is the interactive invocation for reopening a\npreviously run session and supports `{session_id}`. When `session_id_json_key`\nis set, the agent's session id is read from a run's line-delimited JSON output\nunder that key (e.g. `\"sessionID\"`) and stored on the task.",
-      "properties": {
-        "args": {
-          "default": [],
-          "description": "Interactive arguments.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FavettoConfig",
+  "type": "object",
+  "properties": {
+    "agent": {
+      "description": "Default external agent used for catalog tasks and new agent sessions.",
+      "$ref": "#/$defs/AgentSettings",
+      "default": {}
+    },
+    "agents": {
+      "description": "External coding agents by name (e.g. `claude`, `opencode`, `pi`, `vibe`).",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/AgentConfig"
+      },
+      "default": {}
+    },
+    "daemon": {
+      "description": "Daemon defaults (overridable by CLI flags).",
+      "$ref": "#/$defs/DaemonSettings",
+      "default": {
+        "listen": null,
+        "socket": null,
+        "tasks_dir": null,
+        "data_dir": null,
+        "retention": {
+          "days": 30,
+          "min_tasks": 1000,
+          "vacuum": true
+        }
+      }
+    },
+    "repos": {
+      "description": "Repo-local task catalogs: the known-repos registry seed, the active repo,\nand the optional base directory scanned for repositories. Ignored by\nclients; the daemon persists changes in SQLite.",
+      "$ref": "#/$defs/ReposSettings",
+      "default": {
+        "known": [],
+        "depth": 1
+      }
+    },
+    "executor": {
+      "description": "Task executor concurrency / isolation.",
+      "$ref": "#/$defs/ExecutorSettings",
+      "default": {
+        "parallel": false,
+        "max_concurrency": 4,
+        "worktree": true,
+        "worktree_retention": {
+          "days": 30,
+          "min_worktrees": 0
         },
-        "command": {
-          "description": "Executable to launch (looked up on `PATH`).",
-          "type": "string"
-        },
-        "cwd": {
-          "description": "Working directory (defaults to the daemon's cwd).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "env": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {},
-          "description": "Extra environment variables for the process.",
-          "type": "object"
-        },
-        "git": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/GitSettings"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Per-agent override of the global `[git]` section. Only the fields set\nhere replace the global values; the rest are inherited."
-        },
-        "headless_args": {
-          "description": "Arguments for unattended task runs without a `model`. `{prompt}` is substituted.",
-          "items": {
-            "type": "string"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "hooks": {
-          "description": "claude only: inject favetto's HTTP hooks through a per-launch\n`--settings` file. Unset keeps the built-in default.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "interactive_model_args": {
-          "description": "Interactive arguments used when a model is selected (e.g. for a one-shot\nsession); `{provider}` and `{model}` are substituted. Lets an agent reach a\npath that accepts a model when its plain `args` do not.",
-          "items": {
-            "type": "string"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "output_format": {
-          "description": "Structured stdout format for headless runs and final summaries, e.g.\n`\"opencode-json\"`, `\"claude-stream-json\"`, `\"pi-json\"`, `\"pi-rpc\"`,\n`\"vibe-streaming\"`, or `\"plain-jsonl\"`. Unset keeps the default\n`{ \"text\": raw }` output. A custom (`configurable`) agent only has a\nparser for `\"plain-jsonl\"`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "prompt_args": {
-          "description": "Arguments appended to the interactive command when starting with a prompt.",
-          "items": {
-            "type": "string"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "resume_args": {
-          "description": "Interactive arguments for reopening an existing session; `{session_id}` is\nsubstituted.",
-          "items": {
-            "type": "string"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "run_args": {
-          "description": "Arguments for unattended task runs with a `model`; `{prompt}`, `{provider}`,\nand `{model}` are substituted.",
-          "items": {
-            "type": "string"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "server": {
-          "description": "opencode only: which server to observe. `\"managed\"` (favetto-owned\n`serve`), `\"background\"` (the registered background service), or a URL.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "session_id_json_key": {
-          "description": "Key under which a run's line-delimited JSON output carries the agent's\nsession id (e.g. `\"sessionID\"`). Unset disables capture.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "state": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/AgentStateMode"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "How to observe the agent's live state. Unset (or `auto`) keeps the\nbuilt-in default for the agent; `none` forces the screen fallback."
-        },
-        "submit_prompt": {
-          "description": "After starting interactively with a prompt via `prompt_args`, send Enter to\nsubmit it once the agent's UI has settled (some agents, e.g. opencode,\nonly pre-fill the input with `--prompt`). `None` leaves the built-in\ndefault in place.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "type": {
-          "description": "Implementation discriminator: `opencode`, `claude`, `pi`, `vibe`, or\n`configurable`. Omit to use the built-in whose name matches the entry (or\nthe template-only fallback for a custom name).",
-          "type": [
-            "string",
-            "null"
+        "keep_worktree": false,
+        "max_output_bytes": 262144,
+        "detect_awaiting_input": true,
+        "awaiting_input_quiet_ms": 8000,
+        "stale_run": "fail",
+        "retry": {
+          "max_attempts": 1,
+          "backoff": "exponential",
+          "initial_ms": 5000,
+          "max_ms": 300000,
+          "retry_on": [
+            "infrastructure",
+            "timeout"
           ]
         }
-      },
-      "required": [
-        "command"
-      ],
-      "type": "object"
+      }
     },
+    "git": {
+      "description": "Non-interactive git provisioning for agent processes. Defaults to\n`signing = \"off\"`, which forces `commit.gpgsign = false` so an agent\ncommit can never block on an interactive pinentry/askpass prompt.",
+      "$ref": "#/$defs/GitSettings",
+      "default": {}
+    },
+    "webhook": {
+      "description": "Webhook trigger rules (currently GitHub).",
+      "$ref": "#/$defs/WebhookSettings",
+      "default": {
+        "github": {
+          "enabled": false,
+          "rules": []
+        }
+      }
+    },
+    "tui": {
+      "description": "Client-side TUI settings. Ignored by the daemon, which reads the same file.",
+      "$ref": "#/$defs/TuiSettings",
+      "default": {
+        "sound": {
+          "enabled": true,
+          "player": "auto",
+          "min_interval_ms": 400,
+          "only_when_unfocused": false,
+          "events": {
+            "attention": "none",
+            "awaiting_input": "attention",
+            "task_failed": "failure",
+            "task_finished": "success",
+            "task_started": "none"
+          }
+        },
+        "theme": "opencode",
+        "theme_mode": "system",
+        "show_header": true,
+        "show_footer": true
+      }
+    },
+    "web": {
+      "description": "Web client (embedded SPA) settings.",
+      "$ref": "#/$defs/WebSettings",
+      "default": {
+        "enabled": true,
+        "dir": "",
+        "heartbeat_secs": 15
+      }
+    },
+    "auth": {
+      "description": "Short-lived authentication ticket settings.",
+      "$ref": "#/$defs/AuthSettings",
+      "default": {
+        "ticket_ttl_secs": 30,
+        "login_rate_limit": 5,
+        "login_window_secs": 300,
+        "require_tls": false
+      }
+    }
+  },
+  "$defs": {
     "AgentSettings": {
+      "type": "object",
       "properties": {
         "default": {
           "description": "Name of the default external agent (a key in `[agents.*]`). When set,\ncatalog tasks run through this agent unless a task names its own.",
@@ -159,271 +136,92 @@
             "null"
           ]
         }
-      },
-      "type": "object"
+      }
     },
-    "AgentStateMode": {
-      "description": "How an agent's live state is observed (see\n`docs/design/agent-state-adapters.md`).\n\n`auto` keeps the built-in default for the agent; `none` disables structured\nobservation entirely (the debounced screen heuristic still runs); `stdout`\nparses the CLI's line-delimited JSON output; `server` observes a long-lived\nHTTP/SSE endpoint (opencode); `hooks` observes via per-launch HTTP hooks\n(claude). A custom agent has no built-in transport, so anything but `auto`\nis purely declarative for it.",
-      "oneOf": [
-        {
-          "const": "auto",
-          "description": "Use the built-in default for this agent.",
+    "AgentConfig": {
+      "description": "How an agent's live state is observed (see\n`docs/design/agent-state-adapters.md`).\n\nAn external agent, launched as an Agent Client Protocol (ACP) server.\n\n`command` and `args` must start the agent in its ACP mode (for example\n`command = \"opencode\"`, `args = [\"acp\"]`). Favetto speaks ACP over the\nprocess's stdin/stdout; prompts, tool calls and permission requests are\nstructured protocol messages, not terminal text. Adding another compatible\nagent is configuration, not code.",
+      "type": "object",
+      "properties": {
+        "command": {
+          "description": "Executable that starts the ACP server (looked up on `PATH`).",
           "type": "string"
         },
-        {
-          "const": "none",
-          "description": "Disable structured observation (screen fallback only).",
-          "type": "string"
+        "args": {
+          "description": "Arguments that put the executable into its ACP server mode.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
         },
-        {
-          "const": "stdout",
-          "description": "Observe the CLI's line-delimited JSON output.",
-          "type": "string"
+        "env": {
+          "description": "Extra environment variables for the server process.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
         },
-        {
-          "const": "server",
-          "description": "Observe a long-lived HTTP/SSE endpoint.",
-          "type": "string"
+        "cwd": {
+          "description": "Working directory for the server (defaults to the task's directory).",
+          "type": [
+            "string",
+            "null"
+          ]
         },
-        {
-          "const": "hooks",
-          "description": "Observe via per-launch HTTP hooks.",
-          "type": "string"
+        "permission": {
+          "description": "Default permission policy for this agent's sessions. A catalog task may\noverride it with its own `permission` header.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PermissionPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "git": {
+          "description": "Per-agent override of the global `[git]` section. Only the fields set\nhere replace the global values; the rest are inherited.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GitSettings"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
+      },
+      "required": [
+        "command"
       ]
     },
-    "AuthSettings": {
-      "description": "Authentication settings: short-lived tickets for header-less clients\n(browser WebSocket/SSE auth) plus the username/password login policy.\n\nA ticket is minted over authenticated HTTP and then presented in a query\nstring, where an `Authorization` header cannot go. Login attempts are\nrate-limited per `(username, client)`; `require_tls` rejects non-loopback\nlogins that did not arrive over HTTPS (directly or via a proxy that sets\n`X-Forwarded-Proto: https`).",
-      "properties": {
-        "login_rate_limit": {
-          "default": 5,
-          "description": "Failed `POST /auth/login` attempts allowed per `(username, client)` in\n`login_window_secs` before the client is locked out (0 disables the\nlimit).",
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "login_window_secs": {
-          "default": 300,
-          "description": "Window, in seconds, over which `login_rate_limit` failures accumulate.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "require_tls": {
-          "default": false,
-          "description": "Reject non-loopback logins that did not arrive over HTTPS.",
-          "type": "boolean"
-        },
-        "ticket_ttl_secs": {
-          "default": 30,
-          "description": "Ticket lifetime, in seconds.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "type": "object"
-    },
-    "Backoff": {
-      "description": "How the delay between automatic retry attempts grows.",
+    "PermissionPolicy": {
+      "description": "How a session answers tool-permission requests raised by its agent.\n\nThe policy belongs to the task definition (or the agent entry as a default),\nso an unattended run can choose `deny` while an attended run asks the user.\nAgents that never ask (because their own configuration auto-approves) are\nunaffected: the policy only decides how a request that *does* arrive is\nanswered.",
       "oneOf": [
         {
-          "const": "exponential",
-          "description": "`initial_ms * 2^(attempt - 1)`, capped at `max_ms`.",
-          "type": "string"
+          "description": "Forward the request to a connected client and wait for its answer. With\nno client attached, the request fails closed after a timeout.",
+          "type": "string",
+          "const": "ask"
         },
         {
-          "const": "fixed",
-          "description": "A constant `initial_ms` between every attempt.",
-          "type": "string"
-        }
-      ]
-    },
-    "DaemonSettings": {
-      "properties": {
-        "data_dir": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "listen": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "retention": {
-          "$ref": "#/$defs/RetentionSettings",
-          "default": {
-            "days": 30,
-            "min_tasks": 1000,
-            "vacuum": true
-          },
-          "description": "Bounded database growth. On by default; `days = 0` keeps everything."
-        },
-        "socket": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "tasks_dir": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
-    "ExecutorSettings": {
-      "description": "How the executor runs tasks: concurrency and directory/worktree isolation.\n\nWith `parallel = true` each task gets a git worktree when its working\ndirectory is inside a repository (so tasks can run side by side without\nstepping on each other). Tasks that do **not** run in a worktree are\nserialized per working directory.",
-      "properties": {
-        "awaiting_input_quiet_ms": {
-          "default": 8000,
-          "description": "How long the PTY must be quiet (ms) before the generic prompt detector\nfires (default 8000). Agent-specific detectors ignore this.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "detect_awaiting_input": {
-          "default": true,
-          "description": "Detect when a running agent is blocked waiting for user input and surface\nit as `awaiting_input` on the task (default true).",
-          "type": "boolean"
-        },
-        "keep_worktree": {
-          "default": false,
-          "description": "Keep worktrees after the task finishes (default false) so a completed\ntask cleans up after itself. Set true to keep the agent's branch/changes\nfor inspection; the retention sweep still reclaims kept worktrees after\n`worktree_retention.days`.",
-          "type": "boolean"
-        },
-        "max_concurrency": {
-          "default": 4,
-          "description": "Maximum concurrent tasks when `parallel` is true.",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "max_output_bytes": {
-          "default": 262144,
-          "description": "Cap on the stored `task.output` blob, in bytes (default 256 KiB). Longer\noutput is truncated head+tail and flagged.",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "parallel": {
-          "default": false,
-          "description": "Run multiple tasks at once (default false: one at a time).",
-          "type": "boolean"
-        },
-        "retry": {
-          "$ref": "#/$defs/RetrySettings",
-          "default": {
-            "backoff": "exponential",
-            "initial_ms": 5000,
-            "max_attempts": 1,
-            "max_ms": 300000,
-            "retry_on": [
-              "infrastructure",
-              "timeout"
-            ]
-          },
-          "description": "Automatic retry policy for retryable failures. Disabled by default."
-        },
-        "stale_run": {
-          "$ref": "#/$defs/StaleRunPolicy",
-          "default": "fail",
-          "description": "Startup policy for a task left in flight by a previous daemon: `\"fail\"`\n(default) marks it failed, `\"retry\"` re-enqueues it for a fresh attempt."
-        },
-        "worktree": {
-          "default": true,
-          "description": "Give each task its own `git worktree` when it runs in a repository.",
-          "type": "boolean"
-        },
-        "worktree_dir": {
-          "description": "Where worktrees are created: absolute, or relative to the repo root.\nDefaults to `<data_dir>/worktrees`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "worktree_retention": {
-          "$ref": "#/$defs/WorktreeRetentionSettings",
-          "default": {
-            "days": 30,
-            "min_worktrees": 0
-          },
-          "description": "Retention policy for worktrees left on disk."
-        }
-      },
-      "type": "object"
-    },
-    "FailureKind": {
-      "description": "Why a task ended in failure, so a controller can distinguish a genuine\nagent failure from an infrastructure fault.",
-      "oneOf": [
-        {
-          "const": "agent",
-          "description": "The agent ran and reported failure (non-zero exit, rejected work, …).",
-          "type": "string"
+          "description": "Approve the request using the agent's `allow_once` option.",
+          "type": "string",
+          "const": "allow"
         },
         {
-          "const": "infrastructure",
-          "description": "The daemon could not start or supervise the run (spawn/PTY/daemon fault).",
-          "type": "string"
-        },
-        {
-          "const": "timeout",
-          "description": "The run exceeded its deadline.",
-          "type": "string"
-        },
-        {
-          "const": "invalid_input",
-          "description": "Input was invalid (missing required vars, unparseable manifest, …).",
-          "type": "string"
-        },
-        {
-          "const": "dependency",
-          "description": "A dependency could not be satisfied.",
-          "type": "string"
-        },
-        {
-          "const": "cancelled",
-          "description": "Cancelled by a user or controller.",
-          "type": "string"
-        },
-        {
-          "const": "blocked",
-          "description": "Cannot proceed until something external changes; terminal and never\nretried automatically.",
-          "type": "string"
-        },
-        {
-          "const": "unknown",
-          "description": "Unclassified failure.",
-          "type": "string"
+          "description": "Reject every request.",
+          "type": "string",
+          "const": "deny"
         }
       ]
     },
     "GitSettings": {
       "description": "Non-interactive git provisioning for agent processes.\n\n`signing = None` means \"unset\" so a per-agent/per-task override can be merged\nover the global section; the effective default is [`GitSigning::Off`]. The\nsettings are injected into the agent's environment through git's *environment\nconfig* (`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_<i>`/`GIT_CONFIG_VALUE_<i>`, git ≥\n2.31) and `GIT_AUTHOR_*`/`GIT_COMMITTER_*`; the operator's real git config is\nnever touched.",
+      "type": "object",
       "properties": {
-        "passphrase_command": {
-          "description": "Command (argv list) whose stdout is the passphrase. Embedded in the\ngenerated wrapper script, so the secret never lands in the config file.",
-          "items": {
-            "type": "string"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "passphrase_env": {
-          "description": "Env var (in the daemon's environment) holding the passphrase. The value is\nforwarded to the agent; prefer this for interactive-daemon setups.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "signing": {
+          "description": "`\"off\"` (default), `\"ssh\"`, or `\"gpg\"`.",
           "anyOf": [
             {
               "$ref": "#/$defs/GitSigning"
@@ -431,11 +229,10 @@
             {
               "type": "null"
             }
-          ],
-          "description": "`\"off\"` (default), `\"ssh\"`, or `\"gpg\"`."
+          ]
         },
-        "signing_key": {
-          "description": "GPG key id/fingerprint, or SSH public-key path / literal key.",
+        "user_name": {
+          "description": "Commit author/committer name (`user.name` + `GIT_AUTHOR_NAME`/`GIT_COMMITTER_NAME`).",
           "type": [
             "string",
             "null"
@@ -448,153 +245,116 @@
             "null"
           ]
         },
-        "user_name": {
-          "description": "Commit author/committer name (`user.name` + `GIT_AUTHOR_NAME`/`GIT_COMMITTER_NAME`).",
+        "signing_key": {
+          "description": "GPG key id/fingerprint, or SSH public-key path / literal key.",
           "type": [
             "string",
             "null"
           ]
+        },
+        "passphrase_env": {
+          "description": "Env var (in the daemon's environment) holding the passphrase. The value is\nforwarded to the agent; prefer this for interactive-daemon setups.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "passphrase_command": {
+          "description": "Command (argv list) whose stdout is the passphrase. Embedded in the\ngenerated wrapper script, so the secret never lands in the config file.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
         }
-      },
-      "type": "object"
+      }
     },
     "GitSigning": {
       "description": "How favetto provisions `git` in an agent process.\n\n`off` is the safe default: agent commits are explicitly unsigned so they can\nnever wait for a passphrase prompt nobody can answer. `ssh`/`gpg` opt into\nsigned agent commits with a dedicated identity/key.",
+      "type": "string",
       "enum": [
         "off",
         "gpg",
         "ssh"
-      ],
-      "type": "string"
+      ]
     },
-    "GithubFilter": {
-      "description": "Optional narrowing for a [`GithubRule`]. Unset fields match anything; all set\nfields must match (AND).\n\n`repo`, `author`, `base_ref`, and `head_ref` are globs; `labels_contains` is\nany-of exact.",
+    "DaemonSettings": {
+      "type": "object",
       "properties": {
-        "author": {
+        "listen": {
           "type": [
             "string",
             "null"
           ]
         },
-        "base_ref": {
+        "socket": {
           "type": [
             "string",
             "null"
           ]
         },
-        "head_ref": {
+        "tasks_dir": {
           "type": [
             "string",
             "null"
           ]
         },
-        "labels_contains": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "repo": {
+        "data_dir": {
           "type": [
             "string",
             "null"
           ]
+        },
+        "retention": {
+          "description": "Bounded database growth. On by default; `days = 0` keeps everything.",
+          "$ref": "#/$defs/RetentionSettings",
+          "default": {
+            "days": 30,
+            "min_tasks": 1000,
+            "vacuum": true
+          }
         }
-      },
-      "type": "object"
+      }
     },
-    "GithubRule": {
-      "description": "A single `[[webhook.github.rules]]` entry.",
+    "RetentionSettings": {
+      "description": "Database retention policy.\n\nThis is the one setting that deletes data: on daemon start (and every six\nhours) rows older than `days` are pruned and the database is optionally\n`VACUUM`ed. `min_tasks` guarantees the newest N task rows survive regardless\nof age. Set `days = 0` to opt out and keep everything forever.\n\nPruning happens in two stages. First an old task's `output` blob is cleared\n(space reclaim with the metadata kept); per-run token/cost usage is stored in\nflat `task_runs` columns, so it survives this stage and stays available to\n`usage.stats`. Then, once the task row itself is old enough to delete, its\nrun rows (and their usage) go with it.",
+      "type": "object",
       "properties": {
-        "action": {
-          "description": "Optional action; unset matches any action.",
-          "type": [
-            "string",
-            "null"
-          ]
+        "days": {
+          "description": "Delete rows older than this many days (0 = keep forever).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 30
         },
-        "enabled": {
-          "default": true,
-          "type": "boolean"
+        "min_tasks": {
+          "description": "Always keep at least this many newest task rows.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 1000
         },
-        "event": {
-          "description": "`X-GitHub-Event` value (e.g. `\"issues\"`). Validated at startup.",
-          "type": "string"
-        },
-        "filter": {
-          "$ref": "#/$defs/GithubFilter",
-          "default": {}
-        },
-        "name": {
-          "type": "string"
-        },
-        "task": {
-          "description": "Catalog task name. Validated at startup.",
-          "type": "string"
+        "vacuum": {
+          "description": "VACUUM + WAL checkpoint after a prune that deleted rows.",
+          "type": "boolean",
+          "default": true
         }
-      },
-      "required": [
-        "name",
-        "event",
-        "task"
-      ],
-      "type": "object"
-    },
-    "GithubWebhookSettings": {
-      "description": "GitHub webhook receiver + trigger rules.\n\nGitHub POSTs signed events to `/webhooks/github`; each matching rule enqueues\nthe named catalog task with a truncated summary of the event as its input.\nRules and the secret are read at daemon startup, so a restart is required after\nediting them.",
-      "properties": {
-        "enabled": {
-          "default": false,
-          "description": "Opt-in; disabled unless set.",
-          "type": "boolean"
-        },
-        "rules": {
-          "default": [],
-          "items": {
-            "$ref": "#/$defs/GithubRule"
-          },
-          "type": "array"
-        },
-        "secret": {
-          "description": "Literal secret (accepted but discouraged).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "secret_env": {
-          "description": "Name of the env var holding the signing secret.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
-    "RepoSeed": {
-      "description": "One `[[repos.known]]` entry: a repository path and an optional display name.",
-      "properties": {
-        "name": {
-          "description": "Display name used as the namespace key; defaults to the directory\nbasename.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "path": {
-          "description": "Absolute (or `~`-expanded) path to the repository on the daemon host.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "path"
-      ],
-      "type": "object"
+      }
     },
     "ReposSettings": {
       "description": "Repo-local task catalog settings (`[repos]`).\n\n`known` seeds the daemon's persisted known-repos registry at startup (the\nregistry survives config edits); `active` selects the daemon-wide active repo\nby name at startup. `base_dir`, when set, is scanned for repositories so\ncloned checkouts register themselves without a config edit. Repo task files\nlive in `<repo>/.favetto/tasks/`.",
+      "type": "object",
       "properties": {
+        "known": {
+          "description": "Repositories to register at startup, by daemon-host path.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RepoSeed"
+          },
+          "default": []
+        },
         "active": {
           "description": "The active repo's name at startup; unset means the global catalog.",
           "type": [
@@ -610,94 +370,434 @@
           ]
         },
         "depth": {
-          "default": 1,
           "description": "How many directory levels below `base_dir` to scan. `1` (the default)\nmeans immediate children; `2` also scans `org/repo` nesting.",
+          "type": "integer",
           "format": "uint",
           "minimum": 0,
-          "type": "integer"
+          "default": 1
+        }
+      }
+    },
+    "RepoSeed": {
+      "description": "One `[[repos.known]]` entry: a repository path and an optional display name.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "description": "Absolute (or `~`-expanded) path to the repository on the daemon host.",
+          "type": "string"
         },
-        "known": {
-          "default": [],
-          "description": "Repositories to register at startup, by daemon-host path.",
-          "items": {
-            "$ref": "#/$defs/RepoSeed"
-          },
-          "type": "array"
+        "name": {
+          "description": "Display name used as the namespace key; defaults to the directory\nbasename.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
-      "type": "object"
+      "required": [
+        "path"
+      ]
     },
-    "RetentionSettings": {
-      "description": "Database retention policy.\n\nThis is the one setting that deletes data: on daemon start (and every six\nhours) rows older than `days` are pruned and the database is optionally\n`VACUUM`ed. `min_tasks` guarantees the newest N task rows survive regardless\nof age. Set `days = 0` to opt out and keep everything forever.\n\nPruning happens in two stages. First an old task's `output` blob is cleared\n(space reclaim with the metadata kept); per-run token/cost usage is stored in\nflat `task_runs` columns, so it survives this stage and stays available to\n`usage.stats`. Then, once the task row itself is old enough to delete, its\nrun rows (and their usage) go with it.",
+    "ExecutorSettings": {
+      "description": "How the executor runs tasks: concurrency and directory/worktree isolation.\n\nWith `parallel = true` each task gets a git worktree when its working\ndirectory is inside a repository (so tasks can run side by side without\nstepping on each other). Tasks that do **not** run in a worktree are\nserialized per working directory.",
+      "type": "object",
+      "properties": {
+        "parallel": {
+          "description": "Run multiple tasks at once (default false: one at a time).",
+          "type": "boolean",
+          "default": false
+        },
+        "max_concurrency": {
+          "description": "Maximum concurrent tasks when `parallel` is true.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 4
+        },
+        "worktree": {
+          "description": "Give each task its own `git worktree` when it runs in a repository.",
+          "type": "boolean",
+          "default": true
+        },
+        "worktree_dir": {
+          "description": "Where worktrees are created: absolute, or relative to the repo root.\nDefaults to `<data_dir>/worktrees`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "worktree_retention": {
+          "description": "Retention policy for worktrees left on disk.",
+          "$ref": "#/$defs/WorktreeRetentionSettings",
+          "default": {
+            "days": 30,
+            "min_worktrees": 0
+          }
+        },
+        "keep_worktree": {
+          "description": "Keep worktrees after the task finishes (default false) so a completed\ntask cleans up after itself. Set true to keep the agent's branch/changes\nfor inspection; the retention sweep still reclaims kept worktrees after\n`worktree_retention.days`.",
+          "type": "boolean",
+          "default": false
+        },
+        "max_output_bytes": {
+          "description": "Cap on the stored `task.output` blob, in bytes (default 256 KiB). Longer\noutput is truncated head+tail and flagged.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 262144
+        },
+        "detect_awaiting_input": {
+          "description": "Detect when a running agent is blocked waiting for user input and surface\nit as `awaiting_input` on the task (default true).",
+          "type": "boolean",
+          "default": true
+        },
+        "awaiting_input_quiet_ms": {
+          "description": "How long the PTY must be quiet (ms) before the generic prompt detector\nfires (default 8000). Agent-specific detectors ignore this.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 8000
+        },
+        "stale_run": {
+          "description": "Startup policy for a task left in flight by a previous daemon: `\"fail\"`\n(default) marks it failed, `\"retry\"` re-enqueues it for a fresh attempt.",
+          "$ref": "#/$defs/StaleRunPolicy",
+          "default": "fail"
+        },
+        "retry": {
+          "description": "Automatic retry policy for retryable failures. Disabled by default.",
+          "$ref": "#/$defs/RetrySettings",
+          "default": {
+            "max_attempts": 1,
+            "backoff": "exponential",
+            "initial_ms": 5000,
+            "max_ms": 300000,
+            "retry_on": [
+              "infrastructure",
+              "timeout"
+            ]
+          }
+        }
+      }
+    },
+    "WorktreeRetentionSettings": {
+      "description": "Worktree retention policy. At daemon start (and every six hours) recorded\nworktrees whose owning task is finished and older than `days` are removed,\nalong with their `favetto/*` branch; orphans whose task row was already\npruned are reclaimed regardless of age. `days = 0` keeps opt-in worktrees\nforever. Active (`pending`/`running`/`awaiting_input`) tasks are never\ntouched.",
+      "type": "object",
       "properties": {
         "days": {
-          "default": 30,
-          "description": "Delete rows older than this many days (0 = keep forever).",
+          "description": "Remove a finished task's worktree older than this many days (0 = keep forever).",
+          "type": "integer",
           "format": "uint64",
           "minimum": 0,
-          "type": "integer"
+          "default": 30
         },
-        "min_tasks": {
-          "default": 1000,
-          "description": "Always keep at least this many newest task rows.",
+        "min_worktrees": {
+          "description": "Always keep at least this many newest finished worktrees.",
+          "type": "integer",
           "format": "uint64",
           "minimum": 0,
-          "type": "integer"
-        },
-        "vacuum": {
-          "default": true,
-          "description": "VACUUM + WAL checkpoint after a prune that deleted rows.",
-          "type": "boolean"
+          "default": 0
         }
-      },
-      "type": "object"
+      }
+    },
+    "StaleRunPolicy": {
+      "description": "What the startup reconciler does with a task whose in-flight run was left\nbehind by a previous daemon instance.",
+      "oneOf": [
+        {
+          "description": "Mark the owning task failed (preserves the pre-reconciler behaviour).",
+          "type": "string",
+          "const": "fail"
+        },
+        {
+          "description": "Re-enqueue the owning task so the executor claims a fresh attempt.",
+          "type": "string",
+          "const": "retry"
+        }
+      ]
     },
     "RetrySettings": {
       "description": "Automatic retry policy for retryable task failures (`[executor.retry]`).\n\nRetries are opt-in: the default `max_attempts = 1` means a task runs exactly\nonce. When enabled, after a failed attempt whose [`FailureKind`] is listed in\n`retry_on`, the executor re-enqueues the task for `attempt + 1` after the\nbackoff, recording one run per attempt. Agent and invalid-input failures are\nexcluded from the default `retry_on`, so a genuine failure is never retried\non its own.",
+      "type": "object",
       "properties": {
-        "backoff": {
-          "$ref": "#/$defs/Backoff",
-          "default": "exponential",
-          "description": "How the delay between attempts grows."
-        },
-        "initial_ms": {
-          "default": 5000,
-          "description": "Base delay before the second attempt, in milliseconds.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
         "max_attempts": {
-          "default": 1,
           "description": "Total execution attempts allowed per task, including the first. `1`\n(default) disables automatic retries.",
+          "type": "integer",
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "default": 1
         },
-        "max_ms": {
-          "default": 300000,
-          "description": "Upper bound on any single backoff delay, in milliseconds.",
+        "backoff": {
+          "description": "How the delay between attempts grows.",
+          "$ref": "#/$defs/Backoff",
+          "default": "exponential"
+        },
+        "initial_ms": {
+          "description": "Base delay before the second attempt, in milliseconds.",
+          "type": "integer",
           "format": "uint64",
           "minimum": 0,
-          "type": "integer"
+          "default": 5000
+        },
+        "max_ms": {
+          "description": "Upper bound on any single backoff delay, in milliseconds.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 300000
         },
         "retry_on": {
-          "default": [
-            "infrastructure",
-            "timeout"
-          ],
           "description": "Failure kinds eligible for automatic retry. Defaults to infrastructure\nand timeout faults; `agent` and `invalid_input` should stay out.",
+          "type": "array",
           "items": {
             "$ref": "#/$defs/FailureKind"
           },
-          "type": "array"
+          "default": [
+            "infrastructure",
+            "timeout"
+          ]
+        }
+      }
+    },
+    "Backoff": {
+      "description": "How the delay between automatic retry attempts grows.",
+      "oneOf": [
+        {
+          "description": "`initial_ms * 2^(attempt - 1)`, capped at `max_ms`.",
+          "type": "string",
+          "const": "exponential"
+        },
+        {
+          "description": "A constant `initial_ms` between every attempt.",
+          "type": "string",
+          "const": "fixed"
+        }
+      ]
+    },
+    "FailureKind": {
+      "description": "Why a task ended in failure, so a controller can distinguish a genuine\nagent failure from an infrastructure fault.",
+      "oneOf": [
+        {
+          "description": "The agent ran and reported failure (non-zero exit, rejected work, …).",
+          "type": "string",
+          "const": "agent"
+        },
+        {
+          "description": "The daemon could not start or supervise the run (spawn/PTY/daemon fault).",
+          "type": "string",
+          "const": "infrastructure"
+        },
+        {
+          "description": "The run exceeded its deadline.",
+          "type": "string",
+          "const": "timeout"
+        },
+        {
+          "description": "Input was invalid (missing required vars, unparseable manifest, …).",
+          "type": "string",
+          "const": "invalid_input"
+        },
+        {
+          "description": "A dependency could not be satisfied.",
+          "type": "string",
+          "const": "dependency"
+        },
+        {
+          "description": "Cancelled by a user or controller.",
+          "type": "string",
+          "const": "cancelled"
+        },
+        {
+          "description": "Cannot proceed until something external changes; terminal and never\nretried automatically.",
+          "type": "string",
+          "const": "blocked"
+        },
+        {
+          "description": "Unclassified failure.",
+          "type": "string",
+          "const": "unknown"
+        }
+      ]
+    },
+    "WebhookSettings": {
+      "description": "Webhook trigger settings. Currently only GitHub is supported.",
+      "type": "object",
+      "properties": {
+        "github": {
+          "$ref": "#/$defs/GithubWebhookSettings",
+          "default": {
+            "enabled": false,
+            "rules": []
+          }
+        }
+      }
+    },
+    "GithubWebhookSettings": {
+      "description": "GitHub webhook receiver + trigger rules.\n\nGitHub POSTs signed events to `/webhooks/github`; each matching rule enqueues\nthe named catalog task with a truncated summary of the event as its input.\nRules and the secret are read at daemon startup, so a restart is required after\nediting them.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Opt-in; disabled unless set.",
+          "type": "boolean",
+          "default": false
+        },
+        "secret_env": {
+          "description": "Name of the env var holding the signing secret.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "secret": {
+          "description": "Literal secret (accepted but discouraged).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rules": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GithubRule"
+          },
+          "default": []
+        }
+      }
+    },
+    "GithubRule": {
+      "description": "A single `[[webhook.github.rules]]` entry.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "event": {
+          "description": "`X-GitHub-Event` value (e.g. `\"issues\"`). Validated at startup.",
+          "type": "string"
+        },
+        "action": {
+          "description": "Optional action; unset matches any action.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "task": {
+          "description": "Catalog task name. Validated at startup.",
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "filter": {
+          "$ref": "#/$defs/GithubFilter",
+          "default": {}
         }
       },
-      "type": "object"
+      "required": [
+        "name",
+        "event",
+        "task"
+      ]
+    },
+    "GithubFilter": {
+      "description": "Optional narrowing for a [`GithubRule`]. Unset fields match anything; all set\nfields must match (AND).\n\n`repo`, `author`, `base_ref`, and `head_ref` are globs; `labels_contains` is\nany-of exact.",
+      "type": "object",
+      "properties": {
+        "repo": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "author": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "labels_contains": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "base_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "head_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "TuiSettings": {
+      "description": "TUI-only settings. The daemon parses but ignores this section.",
+      "type": "object",
+      "properties": {
+        "sound": {
+          "$ref": "#/$defs/SoundSettings",
+          "default": {
+            "enabled": true,
+            "player": "auto",
+            "min_interval_ms": 400,
+            "only_when_unfocused": false,
+            "events": {
+              "attention": "none",
+              "awaiting_input": "attention",
+              "task_failed": "failure",
+              "task_finished": "success",
+              "task_started": "none"
+            }
+          }
+        },
+        "editor": {
+          "description": "Editor command for `e` on a Catalog task. Unset -> `$VISUAL`, then\n`$EDITOR`, then `vi`. May include arguments (e.g. `code --wait`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "theme": {
+          "description": "Built-in (`opencode`, `catppuccin`) or user theme name. A user theme is\nloaded from `themes/<name>.json` in the config or `.favetto/themes`\ndirectory. Overridable with `FAVETTO_THEME_NAME`.",
+          "type": "string",
+          "default": "opencode"
+        },
+        "theme_mode": {
+          "description": "Theme mode: `system` (derive from the terminal), `dark`, or `light`.\nOverridable with `FAVETTO_THEME`.",
+          "type": "string",
+          "default": "system"
+        },
+        "show_header": {
+          "description": "Show the tab bar. Default true.",
+          "type": "boolean",
+          "default": true
+        },
+        "show_footer": {
+          "description": "Show the status line. Default true.",
+          "type": "boolean",
+          "default": true
+        }
+      }
     },
     "SoundSettings": {
       "description": "Client-side sound notifications for the TUI.\n\nPrecedence is CLI flags (`--sound`/`--no-sound`/`--sound-command`) over the\n`FAVETTO_SOUND*` environment variables over this section over built-in\ndefaults. Sounds are played on the machine running `favetto tui`.",
+      "type": "object",
       "properties": {
+        "enabled": {
+          "description": "Master switch (default true).",
+          "type": "boolean",
+          "default": true
+        },
+        "player": {
+          "description": "`\"auto\"` (detect a player on `PATH`), `\"bell\"`, or `\"command\"`.",
+          "type": "string",
+          "default": "auto"
+        },
         "command": {
           "description": "Template used when `player = \"command\"`; `{file}` is the sound path.",
           "type": [
@@ -705,12 +805,28 @@
             "null"
           ]
         },
-        "enabled": {
-          "default": true,
-          "description": "Master switch (default true).",
-          "type": "boolean"
+        "sound_dir": {
+          "description": "Directory for relative `.wav` event values. `~` is expanded.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "min_interval_ms": {
+          "description": "Minimum gap between cues; bursts inside it are coalesced (failure wins).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 400
+        },
+        "only_when_unfocused": {
+          "description": "Only play while the terminal is unfocused (best-effort focus reporting).",
+          "type": "boolean",
+          "default": false
         },
         "events": {
+          "description": "Cue key -> sound spec (`success`/`failure`/`attention`/`started`/`bell`,\na `.wav` path, or `none`). Unset keys use the built-in default.",
+          "type": "object",
           "additionalProperties": {
             "type": "string"
           },
@@ -720,282 +836,64 @@
             "task_failed": "failure",
             "task_finished": "success",
             "task_started": "none"
-          },
-          "description": "Cue key -> sound spec (`success`/`failure`/`attention`/`started`/`bell`,\na `.wav` path, or `none`). Unset keys use the built-in default.",
-          "type": "object"
-        },
-        "min_interval_ms": {
-          "default": 400,
-          "description": "Minimum gap between cues; bursts inside it are coalesced (failure wins).",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "only_when_unfocused": {
-          "default": false,
-          "description": "Only play while the terminal is unfocused (best-effort focus reporting).",
-          "type": "boolean"
-        },
-        "player": {
-          "default": "auto",
-          "description": "`\"auto\"` (detect a player on `PATH`), `\"bell\"`, or `\"command\"`.",
-          "type": "string"
-        },
-        "sound_dir": {
-          "description": "Directory for relative `.wav` event values. `~` is expanded.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
-    "StaleRunPolicy": {
-      "description": "What the startup reconciler does with a task whose in-flight run was left\nbehind by a previous daemon instance.",
-      "oneOf": [
-        {
-          "const": "fail",
-          "description": "Mark the owning task failed (preserves the pre-reconciler behaviour).",
-          "type": "string"
-        },
-        {
-          "const": "retry",
-          "description": "Re-enqueue the owning task so the executor claims a fresh attempt.",
-          "type": "string"
-        }
-      ]
-    },
-    "TuiSettings": {
-      "description": "TUI-only settings. The daemon parses but ignores this section.",
-      "properties": {
-        "editor": {
-          "description": "Editor command for `e` on a Catalog task. Unset -> `$VISUAL`, then\n`$EDITOR`, then `vi`. May include arguments (e.g. `code --wait`).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "show_footer": {
-          "default": true,
-          "description": "Show the status line. Default true.",
-          "type": "boolean"
-        },
-        "show_header": {
-          "default": true,
-          "description": "Show the tab bar. Default true.",
-          "type": "boolean"
-        },
-        "sound": {
-          "$ref": "#/$defs/SoundSettings",
-          "default": {
-            "enabled": true,
-            "events": {
-              "attention": "none",
-              "awaiting_input": "attention",
-              "task_failed": "failure",
-              "task_finished": "success",
-              "task_started": "none"
-            },
-            "min_interval_ms": 400,
-            "only_when_unfocused": false,
-            "player": "auto"
           }
-        },
-        "theme": {
-          "default": "opencode",
-          "description": "Built-in (`opencode`, `catppuccin`) or user theme name. A user theme is\nloaded from `themes/<name>.json` in the config or `.favetto/themes`\ndirectory. Overridable with `FAVETTO_THEME_NAME`.",
-          "type": "string"
-        },
-        "theme_mode": {
-          "default": "system",
-          "description": "Theme mode: `system` (derive from the terminal), `dark`, or `light`.\nOverridable with `FAVETTO_THEME`.",
-          "type": "string"
         }
-      },
-      "type": "object"
+      }
     },
     "WebSettings": {
       "description": "Web client (embedded SPA) settings.\n\n`dir` overrides the assets embedded in the binary with a directory on disk\n(development); leave it empty to serve the embedded assets. `heartbeat_secs`\nis the interval of the SSE keep-alive comments that defeat idle proxy\ntimeouts.",
+      "type": "object",
       "properties": {
-        "dir": {
-          "default": "",
-          "description": "Asset directory override; empty serves the embedded assets.",
-          "type": "string"
-        },
         "enabled": {
-          "default": true,
           "description": "Serve the embedded web client from the daemon.",
-          "type": "boolean"
+          "type": "boolean",
+          "default": true
+        },
+        "dir": {
+          "description": "Asset directory override; empty serves the embedded assets.",
+          "type": "string",
+          "default": ""
         },
         "heartbeat_secs": {
-          "default": 15,
           "description": "SSE keep-alive interval, in seconds.",
+          "type": "integer",
           "format": "uint64",
           "minimum": 0,
-          "type": "integer"
+          "default": 15
         }
-      },
-      "type": "object"
+      }
     },
-    "WebhookSettings": {
-      "description": "Webhook trigger settings. Currently only GitHub is supported.",
+    "AuthSettings": {
+      "description": "Authentication settings: short-lived tickets for header-less clients\n(browser WebSocket/SSE auth) plus the username/password login policy.\n\nA ticket is minted over authenticated HTTP and then presented in a query\nstring, where an `Authorization` header cannot go. Login attempts are\nrate-limited per `(username, client)`; `require_tls` rejects non-loopback\nlogins that did not arrive over HTTPS (directly or via a proxy that sets\n`X-Forwarded-Proto: https`).",
+      "type": "object",
       "properties": {
-        "github": {
-          "$ref": "#/$defs/GithubWebhookSettings",
-          "default": {
-            "enabled": false,
-            "rules": []
-          }
-        }
-      },
-      "type": "object"
-    },
-    "WorktreeRetentionSettings": {
-      "description": "Worktree retention policy. At daemon start (and every six hours) recorded\nworktrees whose owning task is finished and older than `days` are removed,\nalong with their `favetto/*` branch; orphans whose task row was already\npruned are reclaimed regardless of age. `days = 0` keeps opt-in worktrees\nforever. Active (`pending`/`running`/`awaiting_input`) tasks are never\ntouched.",
-      "properties": {
-        "days": {
-          "default": 30,
-          "description": "Remove a finished task's worktree older than this many days (0 = keep forever).",
+        "ticket_ttl_secs": {
+          "description": "Ticket lifetime, in seconds.",
+          "type": "integer",
           "format": "uint64",
           "minimum": 0,
-          "type": "integer"
+          "default": 30
         },
-        "min_worktrees": {
-          "default": 0,
-          "description": "Always keep at least this many newest finished worktrees.",
+        "login_rate_limit": {
+          "description": "Failed `POST /auth/login` attempts allowed per `(username, client)` in\n`login_window_secs` before the client is locked out (0 disables the\nlimit).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 5
+        },
+        "login_window_secs": {
+          "description": "Window, in seconds, over which `login_rate_limit` failures accumulate.",
+          "type": "integer",
           "format": "uint64",
           "minimum": 0,
-          "type": "integer"
+          "default": 300
+        },
+        "require_tls": {
+          "description": "Reject non-loopback logins that did not arrive over HTTPS.",
+          "type": "boolean",
+          "default": false
         }
-      },
-      "type": "object"
+      }
     }
-  },
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "properties": {
-    "agent": {
-      "$ref": "#/$defs/AgentSettings",
-      "default": {},
-      "description": "Default external agent used for catalog tasks and new agent sessions."
-    },
-    "agents": {
-      "additionalProperties": {
-        "$ref": "#/$defs/AgentConfig"
-      },
-      "default": {},
-      "description": "External coding agents by name (e.g. `claude`, `opencode`, `pi`, `vibe`).",
-      "type": "object"
-    },
-    "auth": {
-      "$ref": "#/$defs/AuthSettings",
-      "default": {
-        "login_rate_limit": 5,
-        "login_window_secs": 300,
-        "require_tls": false,
-        "ticket_ttl_secs": 30
-      },
-      "description": "Short-lived authentication ticket settings."
-    },
-    "daemon": {
-      "$ref": "#/$defs/DaemonSettings",
-      "default": {
-        "data_dir": null,
-        "listen": null,
-        "retention": {
-          "days": 30,
-          "min_tasks": 1000,
-          "vacuum": true
-        },
-        "socket": null,
-        "tasks_dir": null
-      },
-      "description": "Daemon defaults (overridable by CLI flags)."
-    },
-    "executor": {
-      "$ref": "#/$defs/ExecutorSettings",
-      "default": {
-        "awaiting_input_quiet_ms": 8000,
-        "detect_awaiting_input": true,
-        "keep_worktree": false,
-        "max_concurrency": 4,
-        "max_output_bytes": 262144,
-        "parallel": false,
-        "retry": {
-          "backoff": "exponential",
-          "initial_ms": 5000,
-          "max_attempts": 1,
-          "max_ms": 300000,
-          "retry_on": [
-            "infrastructure",
-            "timeout"
-          ]
-        },
-        "stale_run": "fail",
-        "worktree": true,
-        "worktree_retention": {
-          "days": 30,
-          "min_worktrees": 0
-        }
-      },
-      "description": "Task executor concurrency / isolation."
-    },
-    "git": {
-      "$ref": "#/$defs/GitSettings",
-      "default": {},
-      "description": "Non-interactive git provisioning for agent processes. Defaults to\n`signing = \"off\"`, which forces `commit.gpgsign = false` so an agent\ncommit can never block on an interactive pinentry/askpass prompt."
-    },
-    "repos": {
-      "$ref": "#/$defs/ReposSettings",
-      "default": {
-        "depth": 1,
-        "known": []
-      },
-      "description": "Repo-local task catalogs: the known-repos registry seed, the active repo,\nand the optional base directory scanned for repositories. Ignored by\nclients; the daemon persists changes in SQLite."
-    },
-    "tui": {
-      "$ref": "#/$defs/TuiSettings",
-      "default": {
-        "show_footer": true,
-        "show_header": true,
-        "sound": {
-          "enabled": true,
-          "events": {
-            "attention": "none",
-            "awaiting_input": "attention",
-            "task_failed": "failure",
-            "task_finished": "success",
-            "task_started": "none"
-          },
-          "min_interval_ms": 400,
-          "only_when_unfocused": false,
-          "player": "auto"
-        },
-        "theme": "opencode",
-        "theme_mode": "system"
-      },
-      "description": "Client-side TUI settings. Ignored by the daemon, which reads the same file."
-    },
-    "web": {
-      "$ref": "#/$defs/WebSettings",
-      "default": {
-        "dir": "",
-        "enabled": true,
-        "heartbeat_secs": 15
-      },
-      "description": "Web client (embedded SPA) settings."
-    },
-    "webhook": {
-      "$ref": "#/$defs/WebhookSettings",
-      "default": {
-        "github": {
-          "enabled": false,
-          "rules": []
-        }
-      },
-      "description": "Webhook trigger rules (currently GitHub)."
-    }
-  },
-  "title": "FavettoConfig",
-  "type": "object"
+  }
 }

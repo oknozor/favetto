@@ -10,7 +10,6 @@
 agent = "opencode"
 provider = "deepseek"
 model = "deepseek-flash"
-cwd = "/code/che"
 worktree = false
 spawn = "repo:Favetto/design_supervisor"
 spawn_file = ".favetto/design/{{ input.design }}/next.json"
@@ -19,7 +18,7 @@ spawn_new_root = true
 [[vars]]
 name = "design"
 prompt = "Design document to implement (docs/design/)"
-choices = ["agent-state-adapters.md", "durable-workflow-orchestration.md", "panic-safety.md", "web-client.md"]
+choices = ["acp-migration.md", "durable-workflow-orchestration.md", "panic-safety.md", "web-client.md"]
 required = true
 
 [[vars]]

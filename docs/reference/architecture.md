@@ -2,8 +2,9 @@
 
 favetto is a long-running, LLM-driven agent orchestrator with a
 **remote-TUI-first** design. It schedules and runs declarative tasks by delegating
-to external coding-agent CLIs (opencode, Claude Code, pi, Mistral Vibe, …),
-embedded as live terminals — the orchestrator never implements its own agent loop.
+to external coding agents over the **Agent Client Protocol (ACP)** — the
+orchestrator never implements its own agent loop, and there are no per-vendor
+adapters.
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
@@ -15,7 +16,7 @@ embedded as live terminals — the orchestrator never implements its own agent l
                              │
 ┌───────────────────────────────────────────────────────────────┐
 │                  Favetto Daemon                          │
-│   Scheduler ─► Task Queue ─► Agent Sessions (PTY) ─► Agent CLIs│
+│   Scheduler ─► Task Queue ─► ACP Sessions ─► ACP agent servers │
 │   Event Bus · Hook Engine · Notification Bus                  │
 │   Persistence (SQLite/sqlx) · Remote API (axum)               │
 └───────────────────────────────────────────────────────────────┘
@@ -24,8 +25,9 @@ embedded as live terminals — the orchestrator never implements its own agent l
 ## Design principles
 
 - **Agents as workers** — favetto orchestrates; the coding loop is an external
-  agent CLI embedded as a live PTY session that can be attached, reattached, and
-  keystroke-driven from the TUI.
+  ACP server that is launched as a child process and driven over JSON-RPC.
+  Structured messages, tool calls and permission requests replace terminal
+  screens and keystrokes.
 - **Remote-TUI-first** — the TUI client and the daemon are decoupled over a single
   wire protocol; local attach is just a special case of remote attach.
 - **Event-driven core** — everything is a task, an event, or a hook.
@@ -56,7 +58,7 @@ docs/                         VitePress site: guide + generated reference
 | Area | Scope |
 |------|-------|
 | **Core + remote TUI** | daemon, SQLite, event bus, MessagePack wire protocol over Unix socket + WebSocket, token auth, ratatui client |
-| **Agent sessions** | PTY spawn, server-side `vt100` emulation, remote attach/reattach, terminal query replies |
+| **Agent sessions** | generic ACP runtime, streamed structured events, permission policy per task, remote event replay |
 | **Scheduler + notifications** | cron, task queue → agent sessions, notification channels, Scheduler + Notifications TUI tabs |
 | **Integrations + hardening** | metrics, pairing, webhook receivers + config-driven rules, parallel git-worktree execution |
 

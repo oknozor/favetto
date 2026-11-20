@@ -570,13 +570,50 @@ pub struct AwaitingInputReason {
     pub allow_always: bool,
 }
 
-/// A live external-agent session (a PTY running an agent CLI on the daemon).
+/// How an agent session is driven.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AgentBackend {
+    /// A CLI running in a PTY, observed through its rendered screen.
+    #[default]
+    Pty,
+    /// An ACP server driven over JSON-RPC (structured messages and tool calls).
+    Acp,
+}
+
+/// How a session answers tool-permission requests raised by its agent.
+///
+/// The policy belongs to the task definition (or the agent entry as a default),
+/// so an unattended run can choose `deny` while an attended run asks the user.
+/// Agents that never ask (because their own configuration auto-approves) are
+/// unaffected: the policy only decides how a request that *does* arrive is
+/// answered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionPolicy {
+    /// Forward the request to a connected client and wait for its answer. With
+    /// no client attached, the request fails closed after a timeout.
+    #[default]
+    Ask,
+    /// Approve the request using the agent's `allow_once` option.
+    Allow,
+    /// Reject every request.
+    Deny,
+}
+
+/// A live external-agent session on the daemon.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AgentSessionInfo {
     pub id: String,
     /// Name of the `[agents.*]` entry that launched it.
     pub agent: String,
+    /// Whether this session is PTY-backed or ACP-backed. Clients use it to pick
+    /// between terminal-frame rendering and structured event rendering.
+    #[serde(default)]
+    pub backend: AgentBackend,
     /// Catalog task this session is attached to, if any.
     pub task_id: Option<String>,
     /// Whether the child process is still running.
@@ -610,6 +647,10 @@ pub struct AgentCapabilities {
     /// Can run an attachable interactive TUI (the Agent panel).
     #[serde(default)]
     pub interactive: bool,
+    /// Speaks the Agent Client Protocol, so prompts, tool calls and permissions
+    /// arrive as structured events instead of a terminal screen.
+    #[serde(default)]
+    pub acp: bool,
     /// Can run a task unattended (non-interactively).
     #[serde(default)]
     pub headless: bool,
@@ -758,6 +799,7 @@ mod tests {
             available: true,
             capabilities: AgentCapabilities {
                 interactive: true,
+                acp: false,
                 headless: true,
                 resume: true,
                 model_selection: true,

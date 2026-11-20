@@ -50,22 +50,10 @@ impl Daemon {
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::create_dir_all(&tasks_dir).unwrap();
 
-        let agent = root.join("echo-agent.sh");
-        std::fs::write(
-            &agent,
-            "#!/bin/sh\n\
-             dir=$(dirname \"$0\")\n\
-             : > \"$dir/agent-ready\"\n\
-             while [ ! -f \"$dir/agent-release\" ]; do sleep 0.05; done\n\
-             sleep 0.2\n\
-             printf 'echo-agent: %s\\n' \"$1\"\n\
-             printf 'ECHO_AGENT_DONE\\n'\n",
-        )
-        .unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        // A deterministic ACP server. `FAKE_ACP_GATE_DIR` makes its prompt turn
+        // block until the test writes `agent-release`.
+        let agent = env!("CARGO_BIN_EXE_fake-acp-agent");
+        let gate_dir = root.to_string_lossy().into_owned();
 
         for name in ["supervisor_plan", "supervisor_implement"] {
             std::fs::write(
@@ -80,10 +68,9 @@ impl Daemon {
             &config_path,
             format!(
                 "[agent]\ndefault = \"echo\"\n\n\
-                 [agents.echo]\ntype = \"configurable\"\ncommand = {:?}\n\
-                 headless_args = [\"{{prompt}}\"]\n\n\
-                 [executor]\ndetect_awaiting_input = false\n",
-                agent.to_string_lossy()
+                 [agents.echo]\ncommand = {:?}\nargs = []\n\
+                 [agents.echo.env]\nFAKE_ACP_GATE_DIR = {:?}\n",
+                agent, gate_dir
             ),
         )
         .unwrap();

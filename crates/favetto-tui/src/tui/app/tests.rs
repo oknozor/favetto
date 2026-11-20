@@ -183,6 +183,7 @@ fn agent_session(id: &str, headless: bool, running: bool, awaiting: bool) -> Age
     AgentSessionInfo {
         id: id.to_string(),
         agent: "demo".to_string(),
+        backend: favetto_core::model::AgentBackend::Acp,
         task_id: None,
         running,
         headless,
@@ -680,6 +681,8 @@ fn activity_token_and_cost_cells_render_compactly() {
         cache_read_tokens: 0,
         cache_write_tokens: 0,
         cost_usd: Some(0.5),
+        context_used: None,
+        context_size: None,
     };
     assert_eq!(token_cell(Some(&usage)), "1.5k/20 tok");
     assert_eq!(cost_cell(Some(&usage)), "$0.5000");

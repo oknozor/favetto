@@ -30,7 +30,7 @@ use favetto_core::workflow::{
     WorkflowTaskView,
 };
 
-use crate::agents::{AgentContext, AgentEvent, Invocation};
+use crate::agents::AgentEvent;
 use crate::db;
 use crate::event_bus::{OnLag, ServerPush};
 use crate::state::State;
@@ -125,13 +125,6 @@ pub async fn serve_connection(state: Arc<State>, mut incoming: BoxIn, mut outgoi
                             continue;
                         }
                         let (method, params) = match ev {
-                            AgentEvent::Output { data, .. } => (
-                                push::AGENT_OUTPUT,
-                                encode(AgentOutputPush {
-                                    session_id: sid,
-                                    data: base64::engine::general_purpose::STANDARD.encode(&data),
-                                }),
-                            ),
                             AgentEvent::Exit { code, .. } => (
                                 push::AGENT_EXIT,
                                 encode(AgentExitPush {
@@ -436,22 +429,6 @@ fn encode<T: serde::Serialize>(value: T) -> serde_json::Value {
     serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
 }
 
-/// Map the provider catalog's type into the wire type owned by `favetto-core`.
-fn provider_info(provider: &favetto_providers::Provider) -> ProviderInfo {
-    ProviderInfo {
-        id: provider.id.clone(),
-        name: provider.name.clone(),
-        models: provider
-            .models
-            .iter()
-            .map(|model| ProviderModelInfo {
-                id: model.id.clone(),
-                name: model.name.clone(),
-            })
-            .collect(),
-    }
-}
-
 /// Resolve a method's typed params and produce its result value.
 async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json::Value, RpcError> {
     match req.method.as_str() {
@@ -705,33 +682,26 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
         }
 
         method::PROVIDERS_LIST => {
-            let p: ProvidersListParams = parse_params(&req.method, &req.params)?;
-            match list_providers(state, p.agent.as_deref()).await {
-                Ok(providers) => to_value(ProvidersListResult {
-                    providers: providers.iter().map(provider_info).collect(),
-                }),
+            // ACP agents expose model choices through session options, not a
+            // provider catalog. Until that is surfaced, the list is empty.
+            let _: ProvidersListParams = parse_params(&req.method, &req.params)?;
+            to_value(ProvidersListResult {
+                providers: Vec::new(),
+            })
+        }
+
+        method::AGENTS_PROMPT => {
+            let p: AgentPromptParams = parse_params(&req.method, &req.params)?;
+            match state.agents.prompt(&p.session_id, &p.prompt) {
+                Ok(()) => to_value(AgentPromptResult { accepted: true }),
                 Err(e) => Err(RpcError::Internal(e.to_string())),
             }
         }
 
-        method::AGENTS_INPUT => {
-            let p: AgentInputParams = parse_params(&req.method, &req.params)?;
-            let data = p
-                .data
-                .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
-                .unwrap_or_default();
-            match state.agents.input(&p.session_id, &data) {
-                Ok(()) => to_value(AgentInputResult { bytes: data.len() }),
-                Err(e) => Err(RpcError::Internal(e.to_string())),
-            }
-        }
-
-        method::AGENTS_RESIZE => {
-            let p: AgentResizeParams = parse_params(&req.method, &req.params)?;
-            let rows = p.rows.unwrap_or(24) as u16;
-            let cols = p.cols.unwrap_or(80) as u16;
-            match state.agents.resize(&p.session_id, rows, cols) {
-                Ok(()) => to_value(AgentResizeResult { rows, cols }),
+        method::AGENTS_CANCEL => {
+            let p: AgentCancelParams = parse_params(&req.method, &req.params)?;
+            match state.agents.cancel(&p.session_id) {
+                Ok(()) => to_value(AgentCancelResult { cancelled: true }),
                 Err(e) => Err(RpcError::Internal(e.to_string())),
             }
         }
@@ -1305,21 +1275,16 @@ async fn start_agent(
         agent: requested,
         task_id,
         prompt,
-        session_id,
-        rows,
-        cols,
         new: force_new,
+        cwd,
         provider: requested_provider,
         model: requested_model,
-        cwd,
+        ..
     } = params;
-    let rows = rows.unwrap_or(24) as u16;
-    let cols = cols.unwrap_or(80) as u16;
     let force_new = force_new.unwrap_or(false);
 
     // Resolve the catalog task (if any) up front. An action task runs a built-in
-    // step and has no agent, so there is no PTY to launch: reject it here rather
-    // than letting the missing agent fall back to `[agent].default`.
+    // step and has no agent, so there is no session to open.
     let resolved = match task_id.as_deref() {
         Some(tid) => task_and_definition(state, tid).await,
         None => None,
@@ -1342,12 +1307,8 @@ async fn start_agent(
     let agent = state.registry.get_checked(&name)?;
 
     // A catalog task's prompt is a template over its collected `input`. Render it
-    // here so a freshly seeded interactive session sees the same text a headless
-    // run would, instead of raw `{{ input.* }}` placeholders. Pick up the task's
-    // `provider`/`model` too, so the panel session matches the run instead of
-    // silently falling back to the agent default. The request wins; the task
-    // definition fills in whatever it didn't send.
-    let (prompt, task_provider, task_model) = match resolved {
+    // here so a freshly seeded session sees the same text a headless run would.
+    let (prompt, permission, task_provider, task_model) = match resolved {
         Some((task, def)) => {
             let rendered = crate::executor::render_task_prompt(&def, &task);
             (
@@ -1356,99 +1317,44 @@ async fn start_agent(
                 } else {
                     Some(rendered)
                 },
+                def.permission,
                 def.provider,
                 def.model,
             )
         }
-        // Fall back to the caller-provided prompt when the task (or its
-        // definition) can't be resolved.
-        None => (prompt, None, None),
+        None => (prompt, None, None, None),
     };
     let provider = requested_provider.or(task_provider);
     let model = requested_model.or(task_model);
 
-    let mut ctx = AgentContext {
-        cwd,
-        session_id: session_id.clone(),
-        rows,
-        cols,
-        ..Default::default()
-    };
-
     if !force_new {
-        let live = task_id
+        if let Some(existing) = task_id
             .as_deref()
-            .and_then(|tid| state.agents.find_latest_by_task(tid));
-
-        // Attach directly to a live interactive TUI already bound to the task, or
-        // to a headless run that is blocked waiting for the user so keystrokes
-        // reach the live PTY.
-        if let Some(existing) = &live {
-            if should_attach_to_live(existing) {
-                return Ok(existing.clone());
+            .and_then(|tid| state.agents.find_latest_by_task(tid))
+        {
+            if should_attach_to_live(&existing) {
+                return Ok(existing);
             }
-        }
-
-        // A live headless run's PTY carries machine output, so it is never handed
-        // to the panel. An agent that can attach concurrently (opencode, through
-        // its managed server) opens a real interactive session on the run's agent
-        // session id and leaves the run running in the background. Any other
-        // agent falls through to the retained session below, which the client
-        // renders as a structured state view rather than raw JSON.
-        let live_headless_writer = live.as_ref().is_some_and(|s| s.running && s.headless);
-        let can_attach_concurrently = agent.capabilities().concurrent_attach;
-
-        // Otherwise resume the agent's own session, never the headless run's PTY
-        // (whose screen is machine output). The id comes from the request, the
-        // task row, or an exited run whose session id was captured (the row write
-        // may not have landed yet). A still-writing headless run is only reopened
-        // when the agent supports a concurrent attach; otherwise resuming would
-        // race two writers on the same session file.
-        if agent.capabilities().resume && (!live_headless_writer || can_attach_concurrently) {
-            let sid = match session_id.clone() {
-                Some(sid) => Some(sid),
-                None => match persisted_session_id(state, task_id.as_deref()).await {
-                    Some(sid) => Some(sid),
-                    None => live.as_ref().and_then(|s| s.session_id.clone()),
-                },
-            };
-            if let Some(sid) = sid {
-                // A headless run lives in the task's worktree, and some agents
-                // (pi) scope their session store to the project directory, so the
-                // run's directory is authoritative when reopening its session.
-                // This overrides any base `cwd` the client sent (the task's repo
-                // root, not the worktree) and recreates the worktree if retention
-                // has already reclaimed it.
-                if let Some(tid) = task_id.as_deref().and_then(|tid| Uuid::parse_str(tid).ok()) {
-                    if let Some(cwd) = crate::executor::resume_cwd(state, tid).await {
-                        ctx.cwd = Some(cwd);
-                    }
-                }
-                return state
-                    .agents
-                    .start(&name, agent, task_id, Invocation::Resume(&sid), ctx);
-            }
-        }
-
-        // No interactive session is available (a non-attachable headless run, or
-        // one whose agent session id is not known yet): hand back the retained
-        // session so the client renders its structured state view instead of the
-        // machine PTY.
-        if let Some(existing) = &live {
-            return Ok(existing.clone());
         }
     }
 
-    let invocation = Invocation::Interactive {
-        prompt: prompt.as_deref(),
-        provider: provider.as_deref(),
-        model: model.as_deref(),
-    };
-    // Let the agent create/seed its own session on a managed transport before the
-    // PTY is spawned (opencode's managed server). A failure degrades to the old
-    // prompt-on-the-command-line launch.
-    let _ = agent.prepare_launch(&invocation, &mut ctx).await;
-    state.agents.start(&name, agent, task_id, invocation, ctx)
+    let cwd = cwd
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    state.agents.start(
+        &name,
+        agent,
+        crate::agents::Launch {
+            task_id,
+            prompt,
+            cwd,
+            permission,
+            model: crate::agents::model_selector(provider.as_deref(), model.as_deref()),
+            headless: false,
+            git_env: Default::default(),
+        },
+    )
 }
 
 /// Whether the daemon should reattach to an existing session rather than launch
@@ -1456,16 +1362,6 @@ async fn start_agent(
 /// waiting for the user (so keystrokes can answer the prompt).
 fn should_attach_to_live(info: &AgentSessionInfo) -> bool {
     info.running && (!info.headless || info.awaiting_input.is_some())
-}
-
-/// The agent session id persisted on a task row, if any.
-async fn persisted_session_id(state: &Arc<State>, task_id: Option<&str>) -> Option<String> {
-    let uuid = Uuid::parse_str(task_id?).ok()?;
-    db::get_task(&state.db, uuid)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|t| t.session_id)
 }
 
 /// The persisted task row plus the catalog definition backing it, by task id.
@@ -1485,43 +1381,9 @@ async fn task_and_definition(
     Some((task, def))
 }
 
-/// Providers and models for the requested (or default) agent, cached per agent
-/// for the daemon's lifetime. Returns an empty list for an unknown agent or one
-/// without a provider source.
-async fn list_providers(
-    state: &Arc<State>,
-    requested: Option<&str>,
-) -> anyhow::Result<Vec<favetto_providers::Provider>> {
-    let agent = match requested {
-        Some(name) => state.registry.get(name),
-        None => state.registry.default_agent(),
-    };
-    let Some(agent) = agent else {
-        return Ok(Vec::new());
-    };
-    let Some(source) = agent.provider_source() else {
-        return Ok(Vec::new());
-    };
-    let key = agent.descriptor().id.clone();
-
-    {
-        let cache = state.providers_cache.lock().await;
-        if let Some(providers) = cache.get(&key) {
-            return Ok(providers.clone());
-        }
-    }
-
-    let client = reqwest::Client::new();
-    let providers = source.fetch(&client).await?;
-
-    let mut cache = state.providers_cache.lock().await;
-    cache.insert(key, providers.clone());
-    Ok(providers)
-}
-
 /// Start a one-shot task: an inline (non-catalog) task whose work is an
-/// interactive agent session the user drives from the Agent panel. Emits the
-/// normal task lifecycle and finishes the task when the session exits.
+/// interactive ACP session the user drives from the Agent panel. Emits the
+/// normal task lifecycle and finishes the task when the session ends.
 async fn start_oneshot_task(
     state: &Arc<State>,
     params: StartOneshotParams,
@@ -1531,26 +1393,20 @@ async fn start_oneshot_task(
         provider,
         model,
         cwd,
-        rows,
-        cols,
+        ..
     } = params;
     let cwd = cwd
         .map(|cwd| cwd.trim().to_string())
         .filter(|cwd| !cwd.is_empty());
-    let rows = rows.unwrap_or(24) as u16;
-    let cols = cols.unwrap_or(80) as u16;
-
     let name = requested
         .or_else(|| state.config.agent.default.clone())
         .ok_or_else(|| {
             anyhow::anyhow!("no agent given and no default configured ([agent].default)")
         })?;
     let agent = state.registry.get_checked(&name)?;
-    let cwd_path = cwd.as_ref().map(std::path::PathBuf::from);
-    // Keep a directory for the session-title lookup after `cwd_path` is moved
-    // into the launch context below.
-    let title_cwd = cwd_path
-        .clone()
+    let cwd_path = cwd
+        .as_ref()
+        .map(std::path::PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
@@ -1564,7 +1420,7 @@ async fn start_oneshot_task(
             "agent": name.clone(),
             "provider": provider.clone(),
             "model": model.clone(),
-            "cwd": cwd_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            "cwd": cwd_path.to_string_lossy(),
         }),
         output: None,
         dedupe_key: None,
@@ -1597,62 +1453,29 @@ async fn start_oneshot_task(
         )
         .await;
 
-    let mut ctx = AgentContext {
-        cwd: cwd_path,
-        provider: provider.clone(),
-        model: model.clone(),
-        rows,
-        cols,
-        ..Default::default()
-    };
-    let invocation = Invocation::Interactive {
-        prompt: None,
-        provider: provider.as_deref(),
-        model: model.as_deref(),
-    };
-    let _ = agent.prepare_launch(&invocation, &mut ctx).await;
     let info = state.agents.start(
         &name,
         agent.clone(),
-        Some(task.id.to_string()),
-        invocation,
-        ctx,
+        crate::agents::Launch {
+            task_id: Some(task.id.to_string()),
+            prompt: None,
+            cwd: cwd_path,
+            // A one-shot session takes its policy from the agent entry.
+            permission: None,
+            model: crate::agents::model_selector(provider.as_deref(), model.as_deref()),
+            headless: false,
+            git_env: Default::default(),
+        },
     )?;
 
-    // Best effort: some interactive CLIs do report a session id mid-run; if so the
-    // title fills in live. If not, `finish_oneshot` still handles it at exit.
-    if agent.has_session_titles() {
-        let st = state.clone();
-        let ag = agent.clone();
-        let live = info.id.clone();
-        let tid = task.id;
-        let watch_cwd = title_cwd.clone();
-        tokio::spawn(async move {
-            let _ =
-                crate::executor::watch_title_while_running(&st, tid, ag, &live, &watch_cwd).await;
-        });
-    }
-
-    // Finish the task once the interactive session ends, capturing the agent's
-    // own session id (when the CLI reported one) to resolve its title.
     {
         let state = state.clone();
         let task_id = task.id;
         let session = info.id.clone();
-        let agent_name = name.clone();
-        let title_cwd = title_cwd.clone();
-        let (detect, quiet) = (
-            state.config.executor.detect_awaiting_input,
-            std::time::Duration::from_millis(state.config.executor.awaiting_input_quiet_ms),
-        );
         tokio::spawn(async move {
-            let code = if detect {
-                crate::attention::watch(&state, &session, agent, Some(task_id), quiet).await
-            } else {
-                state.agents.wait(&session).await
-            };
+            let code = state.agents.wait(&session).await;
             let session_id = state.agents.external_session_id(&session);
-            finish_oneshot(&state, task_id, &agent_name, session_id, &title_cwd, code).await;
+            finish_oneshot(&state, task_id, session_id, code).await;
         });
     }
 
@@ -1664,18 +1487,11 @@ async fn start_oneshot_task(
     })
 }
 
-/// Mark a one-shot task finished once its interactive session exits.
-///
-/// An interactive opencode session may not emit a JSON `sessionID` on its PTY,
-/// so `session_id` can be `None`; the task then keeps a blank title. When the
-/// agent did provide one, the title is resolved with a bounded retry and kept on
-/// both success and failure.
+/// Mark a one-shot task finished once its session ends.
 async fn finish_oneshot(
     state: &Arc<State>,
     task_id: Uuid,
-    agent_name: &str,
     session_id: Option<String>,
-    cwd: &std::path::Path,
     code: Option<i32>,
 ) {
     let Ok(Some(mut task)) = db::get_task(&state.db, task_id).await else {
@@ -1685,28 +1501,7 @@ async fn finish_oneshot(
         return;
     }
     let success = code == Some(0);
-
-    // Persist the session even if the agent did not title it, and resolve the
-    // title (with retry) when there is an id. Only overwrite the title when the
-    // exit-time lookup actually found one, so a title persisted mid-run by the
-    // watcher is preserved.
-    task.session_id = session_id.clone();
-    if let Some(sid) = session_id.as_deref() {
-        if let Some(agent) = state.registry.get(agent_name) {
-            if let Some(title) = crate::agents::resolve_session_title(
-                agent,
-                sid,
-                cwd,
-                crate::agents::TITLE_POLL_ATTEMPTS,
-                crate::agents::TITLE_POLL_INTERVAL,
-            )
-            .await
-            {
-                task.session_title = Some(title);
-            }
-        }
-    }
-
+    task.session_id = session_id;
     task.status = if success {
         TaskStatus::Succeeded
     } else {
@@ -1722,8 +1517,7 @@ async fn finish_oneshot(
         ))
     };
     task.finished_at = Some(Utc::now());
-    // Compare-and-set: a cancellation while the exit-time title lookup was in
-    // flight wins; never resurrect the row nor fire `TaskFinished` for it.
+    // Compare-and-set: a cancellation while the session was winding down wins.
     if !db::finish_active_task(&state.db, &task)
         .await
         .unwrap_or(false)
@@ -1827,6 +1621,7 @@ async fn add_catalog_task(
         spawn_file,
         spawn_new_root,
         sign: None,
+        permission: None,
         worktree: None,
         vars: Vec::new(),
         prompt,

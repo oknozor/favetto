@@ -92,6 +92,13 @@ pub struct AgentUsage {
     pub cache_write_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    /// Tokens currently in the model's context, when the agent reports a context
+    /// window rather than per-step token counts (ACP's `usage_update`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_used: Option<u64>,
+    /// The model's total context window size, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_size: Option<u64>,
 }
 
 impl AgentUsage {
@@ -105,6 +112,13 @@ impl AgentUsage {
         if let Some(cost) = other.cost_usd {
             *self.cost_usd.get_or_insert(0.0) += cost;
         }
+        // A context snapshot is state, not a per-step total: keep the latest.
+        if let Some(used) = other.context_used {
+            self.context_used = Some(used);
+        }
+        if let Some(size) = other.context_size {
+            self.context_size = Some(size);
+        }
     }
 
     /// Whether nothing has been reported (all counters zero, no cost).
@@ -115,6 +129,8 @@ impl AgentUsage {
             && self.cache_read_tokens == 0
             && self.cache_write_tokens == 0
             && self.cost_usd.is_none()
+            && self.context_used.is_none()
+            && self.context_size.is_none()
     }
 
     /// Sum of the token classes that are not subsets of one another. Cache
@@ -607,6 +623,8 @@ mod tests {
             cache_read_tokens: 7,
             cache_write_tokens: 2,
             cost_usd: Some(0.25),
+            context_used: None,
+            context_size: None,
         };
         // Cache counters are excluded from the headline total.
         assert_eq!(usage.total_tokens(), 15);

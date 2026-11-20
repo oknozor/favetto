@@ -1,9 +1,9 @@
 # favetto
 
 A long-running, LLM-driven agent orchestrator with a **remote-TUI-first** design.
-It schedules and runs declarative tasks by delegating to external coding-agent CLIs
-(opencode, Claude Code, pi, Mistral Vibe, …), embedded as live terminals — the
-orchestrator never implements its own agent loop.
+It schedules and runs declarative tasks by delegating to external coding agents
+over the **Agent Client Protocol (ACP)** — the orchestrator never implements its
+own agent loop, and there are no per-vendor adapters.
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
@@ -15,7 +15,7 @@ orchestrator never implements its own agent loop.
                              │
 ┌───────────────────────────────────────────────────────────────┐
 │                  Favetto Daemon                               │
-│   Scheduler ─► Task Queue ─► Agent Sessions (PTY) ─► Agent CLIs│
+│   Scheduler ─► Task Queue ─► ACP Sessions ─► ACP agent servers │
 │   Event Bus · Hook Engine · Notification Bus                  │
 │   Persistence (SQLite/sqlx) · Remote API (axum)               │
 └───────────────────────────────────────────────────────────────┘

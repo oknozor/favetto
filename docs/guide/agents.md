@@ -1,74 +1,65 @@
-# Embedded agents
+# Agents (ACP)
 
-favetto does not reimplement a coding agent: it runs a configured agent CLI
-(opencode, Claude Code, pi, Mistral Vibe, …) in a PTY on the daemon and embeds
-its live terminal in the TUI's **Agent** tab.
+favetto does not implement an agent loop and no longer runs agent CLIs in a
+terminal. Every agent is an **Agent Client Protocol (ACP) server**: the daemon
+launches it as a child process, speaks JSON-RPC over its stdin/stdout, and
+receives structured messages, tool calls and permission requests.
+
+That means there are no per-vendor adapters. Any agent that ships an ACP server
+mode can be added with configuration alone. ACP publishes a growing
+[list of compatible agents](https://agentclientprotocol.com/get-started/agents).
 
 ```bash
-# see what is registered, and whether each binary is installed
-favetto daemon   # then, in the TUI, the Tasks tab lists agents and sessions
+# see what is registered, and whether each executable is installed
+favetto daemon   # then open the Tasks tab
 ```
-
-![favetto TUI — Agent tab](/screenshots/tui-agent.png)
-
-*The Agent tab: the embedded agent session, seeded with the task prompt.*
 
 ## Configure an agent
 
-The four built-ins are always registered, so an empty config already exposes
-them. A `[agents.*]` entry is an **overlay**: it customises a built-in's
-invocation, binds a built-in to a custom name, or adds a custom CLI. Every field
-you set is merged over the built-in default; omitted fields keep it.
+The four built-in names are **launch presets**, not implementations:
+
+| Name | Preset |
+|---|---|
+| `opencode` | `opencode acp` |
+| `claude` | `npx -y @zed-industries/claude-agent-acp` |
+| `pi` | `npx -y pi-acp` |
+| `vibe` | `vibe-acp` |
+
+An empty config exposes all four. A `[agents.<name>]` entry overlays a preset, or
+defines any other ACP server:
 
 ```toml
-# ~/.config/favetto/config.toml
 [agent]
 default = "opencode"
 
-[agents.opencode]
-command = "opencode"
-args = []
-prompt_args = ["--prompt", "{prompt}"]   # seed an interactive session with the task prompt
-submit_prompt = true                     # press Enter so the seeded prompt is sent
-headless_args = ["run", "--auto", "{prompt}"]   # unattended runs without a model
-run_args = ["run", "--model", "{provider}/{model}", "--auto", "--format", "json", "{prompt}"]
-resume_args = ["--session", "{session_id}"]     # reopen a session in the TUI
-session_id_json_key = "sessionID"               # captured from the run's JSON events
+# Any ACP server works; no favetto code is needed.
+[agents.goose]
+command = "goose"
+args = ["acp"]
+permission = "ask"     # "ask" (default), "allow", or "deny"
 ```
 
 The fields are documented exhaustively in the
-[configuration reference](../reference/config#agentconfig). In short:
+[configuration reference](../reference/config#agentconfig).
 
-- `args` is the interactive invocation.
-- `headless_args` runs catalog tasks unattended; `run_args` is used instead when
-  the task sets a `model`, with `{prompt}`, `{provider}`, and `{model}`
-  substituted so the model flag can sit where the CLI expects it.
-- `prompt_args` seeds an interactive session with the task prompt (some agents
-  only pre-fill their input, so `submit_prompt = true` sends Enter once the UI
-  has settled). With no `prompt_args`, the prompt is written to stdin.
-- `resume_args` reopens a previously run session (`{session_id}`), and
-  `session_id_json_key` captures the id from the run's line-delimited JSON.
+### Permission policy
 
-A `[agents.*]` entry whose name is one of `opencode`/`claude`/`pi`/`vibe` uses
-that built-in. Set `type = "opencode"` (etc.) to bind a built-in to a custom
-name, or `type = "configurable"` to force the template-only agent. An entry with
-no `type` and a non-built-in name is `configurable`; an unknown `type` fails at
-daemon startup.
+The permission policy decides how a tool-permission request that **reaches the
+client** is answered. It does not force an agent to ask: an agent that
+auto-approves tool calls in its own configuration never sends a request.
 
-## Model selection
+- `ask` — forward the request to a connected client and wait for an answer. With
+  no client attached, it fails closed after a timeout.
+- `allow` — approve the request using the agent's `allow_once` option.
+- `deny` — reject every request.
 
-Model selection lives in the invocation templates, because many CLIs (for
-example opencode) only accept `--model` on a subcommand such as `run`. When a
-task sets `model`, favetto uses `run_args`; otherwise it uses `headless_args` and
-the agent's own default model applies. `{provider}` and `{model}` are the task's
-separate provider/model values; a `provider` without a `model` is ignored.
+Set `permission` on the agent entry as a default, or per task in its header:
 
 ```md
 agent = "opencode"
-provider = "jev"
-model = "1.13"
+permission = "deny"
 ---
-Fix the failing test.
+Update the changelog.
 ```
 
 ## Availability
@@ -76,107 +67,51 @@ Fix the failing test.
 The daemon probes its `PATH` for each agent's executable once at startup and
 reports an `available` flag on `agents.list`. An agent whose binary is not
 installed is still listed but marked unavailable, and launching it fails with a
-clear error. The one-shot wizard dims unavailable agents with `(not installed)`
-and skips over them. Availability is resolved once, so a `PATH` change needs a
-daemon restart.
+clear error. Availability is resolved once, so a `PATH` change needs a daemon
+restart.
 
 ## The Agent panel
 
-From the **Tasks** tab, highlight a task and press **Enter** to open its agent
-session, seeded with the task prompt and running in the task's workspace. Opening
-a task first reattaches to its running session; if the run already finished and a
-session id was captured, it reopens that session with `resume_args`. Press
-**Ctrl+N** to force a new session.
+Opening a task shows its ACP session: streamed assistant text, reasoning, tool
+calls and errors. Type into the panel to compose a follow-up prompt; **Enter**
+sends it as `agents.prompt`. Press **Ctrl+Y** to toggle keyboard focus between
+the panel and favetto, **Ctrl+Q** to leave (the session keeps running), and
+**Ctrl+N** to start a new session.
 
-A task you start from the **Catalog** runs in this real TUI (see
-[Lifecycle](#lifecycle)): the panel attaches to the live session **writable**, so
-you can watch the agent work, answer a permission prompt, or take over by hand.
-Programmatic runs — started by a schedule, a webhook/hook, `needs`, or `spawn` —
-are executed headlessly, but the panel **never** shows the headless machine
-output (the JSON event stream). Instead, opening the panel on a running task
-always yields a real interactive view:
-
-- **opencode** runs its headless turn against the same managed server that backs
-  the interactive TUI (`concurrent_attach`), so the panel opens a genuine,
-  writable `opencode` session on the run's agent session id while the headless
-  process keeps running in the background. You see the agent's reasoning and tool
-  calls live and can answer prompts without waiting for the run to finish.
-- Agents that cannot attach concurrently show a **structured state view** —
-  agent, activity, token usage, session id and task status — not raw JSON. A
-  finished run shows the same view (or the real session, when the agent can
-  resume/open one), never a JSON replay.
-
-When a task's row shows **awaiting input** (see [Lifecycle](#lifecycle)), pressing
-**Enter** attaches to the *live blocked PTY* rather than launching a fresh
-session, so anything you type — a permission key, a passphrase — reaches the
-prompt the agent is waiting on. This applies to headless runs too: a blocked
-machine PTY is the one case where the panel shows it, because the prompt on
-screen is exactly what you must answer.
-
-A resumable agent that cannot attach concurrently is only resumed once its run
-has exited (or is blocked on the user): while the writer is still in flight no
-interactive view is opened, so two processes never write the same session.
-Concurrent sessions can be switched between with **Ctrl+O** (see the [TUI
-keybindings](./tui#agent-session-picker)), which lists every live and retained
-session regardless of agent.
-
-The daemon keeps a `vt100` emulator per session and streams self-contained
-full-screen frames; the panel parses and renders them, keys are forwarded to the
-agent, and the PTY is resized to fit. Common terminal queries (cursor position,
-device attributes, colours, mode reports) are answered by the daemon on the PTY.
-
-- **Keyboard focus.** The panel captures the keyboard by default, so the agent
-  receives every keystroke. Press **Ctrl+Y** to toggle between the agent and
-  favetto; the status bar shows `focus: agent` / `focus: favetto`. With favetto
-  focused, **Ctrl+Q** leaves the panel (the session keeps running) and **Ctrl+N**
-  starts a new session.
-- **Mouse.** Clicks on favetto's own regions (tab bar, row lists) are handled by
-  favetto: a click selects a row and a second click runs its primary action.
-  Clicks in the terminal area are forwarded to the agent as mouse reports when it
-  has enabled them.
-- **Copy.** Drag with the left mouse button over the terminal area to select text;
-  releasing copies it to the clipboard (OSC 52 plus a best-effort local tool) and
-  the status bar confirms with `copied N chars`. Hold **Shift** while dragging to
-  forward the drag to the agent's own mouse UI instead (see
-  [Copy agent output](./tui#copy-agent-output)).
+When the agent asks for permission, the panel shows the request. Answer it with
+**Ctrl+R**; the reply is correlated with the protocol request, not typed as
+terminal bytes.
 
 ## Lifecycle
 
 Agents launch through a small supervisor (`favetto __agent-exec`) that owns a
 process group and dies with the daemon — on both `SIGTERM` and `SIGKILL` — taking
-the agent and its children with it. Live PTYs therefore do **not** survive a
-daemon restart, but an agent's own session (captured via `session_id_json_key`)
-does, so tasks can be resumed after a restart.
+the agent and its children with it.
 
-How a catalog task runs depends on who started it. A task you start from the
-**Catalog** runs in the agent's real interactive TUI, seeded with the rendered
-prompt (`prompt_args` plus `submit_prompt`, or the prompt on stdin); the Agent
-panel attaches to that single session live and writable. The task finishes as
-soon as the agent completes the seeded turn, so its `spawn`/`needs` successors
-fire without you having to quit the TUI: the daemon asks the task's own agent
-session for its newest message and treats the turn as done only when that
-message is a terminal `idle` (opencode), so an interim error that the agent
-recovers from never finalizes the task; it keeps the TUI open afterwards for
-inspection, so you can still interact with it by hand.
-An agent whose interactive mode exits on its own finishes the task at exit
-instead. A task started programmatically — by a schedule, a webhook/hook,
-`needs`, or `spawn` — runs headless, using `headless_args` (or `run_args` when a
-model is set), so it completes unattended and captures structured output and the
-agent session id. Its machine PTY is never shown in the panel: opening a running
-task opens a concurrent interactive attach where the agent supports one
-(opencode), or the structured state view otherwise. A task with no agent and no
-default fails to start, and an agent with no way to seed an interactive prompt
-(`prompt_args`/`submit_prompt`) falls back to a headless run even when started by
-hand.
+A **headless** run is exactly one ACP prompt turn. The session closes itself when
+the turn ends, and the task succeeds only when all of the following hold:
 
-While a run is in flight the daemon watches its terminal screen. If the agent
-blocks on something only a human can answer — a tool permission dialog, a
-confirmation, a multiple-choice prompt, or a git pinentry/askpass — the task is
-marked **awaiting input** (a non-terminal status), a `task_awaiting_input` event
-is emitted so notification hooks fire, and the TUI plays its attention cue. Once
-you answer in the Agent panel the task returns to **running** and continues. The
-built-in `opencode` and `claude` detectors use each CLI's own dialog wording;
-custom agents fall back to a conservative heuristic that requires the PTY to be
-quiet for `[executor].awaiting_input_quiet_ms` (default 8 s) and the last visible
-lines to look like a prompt. Set `[executor].detect_awaiting_input = false` to
-turn detection off.
+- the turn ended with the normal `end_turn` stop reason,
+- no protocol or agent error was recorded, and
+- the agent produced assistant text.
+
+A `stop_reason` alone is not enough: some adapters report `end_turn` after an
+upstream model failure.
+
+An **interactive** session (started from the Agent panel or the one-shot wizard)
+stays open for follow-up prompts until it is closed or its process exits.
+
+While a session waits on a permission request, `agents.list` reports its
+`awaiting_input` and the Agent panel shows the request. The task row itself stays
+`running` until the turn ends; answering with `agents.reply` resumes the turn.
+
+## Current limitations
+
+- Model selection uses the agent's ACP **model config option**: a task's
+  `provider`/`model` is sent as `provider/model` and the run fails with a clear
+  error if the agent does not offer it. The provider catalog
+  (`providers.list`) is still empty, so the UI has no model picker.
+- Sessions are not resumed across daemon restarts; ACP's optional
+  `session/load` is not wired up yet.
+- The provider catalog (`providers.list`) is empty: ACP agents expose model
+  choices through session options rather than a catalog.

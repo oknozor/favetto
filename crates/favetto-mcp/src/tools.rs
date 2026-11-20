@@ -257,9 +257,7 @@ pub fn list() -> Vec<ToolSpec> {
 /// The names deliberately excluded from the vocabulary. Asserted absent by tests
 /// so a future change cannot silently widen the surface.
 pub const EXCLUDED: &[&str] = &[
-    method::AGENTS_INPUT,
     method::AGENTS_START,
-    method::AGENTS_RESIZE,
     method::AGENTS_ATTACH,
     method::AGENTS_CLOSE,
     method::TASKS_START_ONESHOT,

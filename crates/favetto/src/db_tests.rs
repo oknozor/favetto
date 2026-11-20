@@ -468,66 +468,6 @@ async fn task_lineage_round_trips() {
 }
 
 #[tokio::test]
-async fn set_task_status_if_is_conditional() {
-    let (dir, pool) = scratch_pool("status-if").await;
-    let mut task = task_at(Utc::now(), None, None);
-    task.status = TaskStatus::Running;
-    upsert_task(&pool, &task).await.unwrap();
-
-    assert!(set_task_status_if(
-        &pool,
-        task.id,
-        TaskStatus::AwaitingInput,
-        TaskStatus::Running
-    )
-    .await
-    .unwrap());
-    assert_eq!(
-        get_task(&pool, task.id).await.unwrap().unwrap().status,
-        TaskStatus::AwaitingInput
-    );
-
-    // Wrong source status: no-op.
-    assert!(!set_task_status_if(
-        &pool,
-        task.id,
-        TaskStatus::AwaitingInput,
-        TaskStatus::Running
-    )
-    .await
-    .unwrap());
-    assert_eq!(
-        get_task(&pool, task.id).await.unwrap().unwrap().status,
-        TaskStatus::AwaitingInput
-    );
-
-    assert!(set_task_status_if(
-        &pool,
-        task.id,
-        TaskStatus::Running,
-        TaskStatus::AwaitingInput
-    )
-    .await
-    .unwrap());
-    assert_eq!(
-        get_task(&pool, task.id).await.unwrap().unwrap().status,
-        TaskStatus::Running
-    );
-
-    // Unknown id: no row matched.
-    assert!(!set_task_status_if(
-        &pool,
-        Uuid::new_v4(),
-        TaskStatus::Running,
-        TaskStatus::AwaitingInput,
-    )
-    .await
-    .unwrap());
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[tokio::test]
 async fn list_tasks_in_root_scopes_by_root_and_name() {
     let (dir, pool) = scratch_pool("root-queries").await;
     let root_a = Uuid::new_v4();
@@ -625,39 +565,6 @@ async fn list_root_tasks_includes_root_and_descendants_without_output() {
         got.iter().all(|t| t.output.is_none()),
         "list_root_tasks must not carry output blobs"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[tokio::test]
-async fn set_task_session_never_touches_status() {
-    let (dir, pool) = scratch_pool("set-session").await;
-    let mut task = task_at(Utc::now(), None, None);
-    task.status = TaskStatus::AwaitingInput;
-    task.output = Some(serde_json::json!({ "keep": true }));
-    upsert_task(&pool, &task).await.unwrap();
-
-    assert!(set_task_session(&pool, task.id, "ses_1", Some("Title"))
-        .await
-        .unwrap());
-    let got = get_task(&pool, task.id).await.unwrap().unwrap();
-    assert_eq!(got.status, TaskStatus::AwaitingInput);
-    assert_eq!(got.session_id.as_deref(), Some("ses_1"));
-    assert_eq!(got.session_title.as_deref(), Some("Title"));
-    assert_eq!(got.output, Some(serde_json::json!({ "keep": true })));
-
-    // A second call must not overwrite the already-stored values (COALESCE).
-    set_task_session(&pool, task.id, "ses_2", Some("Other"))
-        .await
-        .unwrap();
-    let got = get_task(&pool, task.id).await.unwrap().unwrap();
-    assert_eq!(got.session_id.as_deref(), Some("ses_1"));
-    assert_eq!(got.session_title.as_deref(), Some("Title"));
-
-    // Unknown id: no row matched.
-    assert!(!set_task_session(&pool, Uuid::new_v4(), "ses_x", None)
-        .await
-        .unwrap());
 
     let _ = std::fs::remove_dir_all(&dir);
 }

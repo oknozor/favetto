@@ -224,10 +224,10 @@ typed_calls! {
     agents_list => AgentsListCall,
     /// `agents.start`.
     agents_start => AgentsStartCall,
-    /// `agents.input`.
-    agents_input => AgentsInputCall,
-    /// `agents.resize`.
-    agents_resize => AgentsResizeCall,
+    /// `agents.prompt`.
+    agents_prompt => AgentsPromptCall,
+    /// `agents.cancel`.
+    agents_cancel => AgentsCancelCall,
     /// `agents.attach`.
     agents_attach => AgentsAttachCall,
     /// `agents.close`.

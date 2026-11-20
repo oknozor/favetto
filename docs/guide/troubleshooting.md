@@ -18,9 +18,9 @@ common causes:
   or point `command` at the right executable. Availability is resolved once at
   daemon startup, so restart the daemon after changing your `PATH`.
 
-An external agent **without** the relevant `headless_args` (or `run_args` when a
-model is set) is rejected rather than launched interactively — an interactive TUI
-would never exit and would hang the task.
+An agent that does not speak ACP (or whose `command`/`args` do not start its ACP
+server mode) fails at `initialize`; the task records the protocol error. Check
+the agent's documentation for its ACP mode (for example `opencode acp`).
 
 ## An agent commit hangs (signed commits)
 

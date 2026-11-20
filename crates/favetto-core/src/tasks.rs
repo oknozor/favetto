@@ -39,6 +39,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::Deserialize;
 
 use crate::config::GitSigning;
+use crate::model::PermissionPolicy;
 
 // The pure value types moved to `favetto-wire`; keep the old paths resolving.
 pub use favetto_wire::task_var::{TaskVar, VarType};
@@ -203,6 +204,9 @@ pub struct TaskDef {
     pub spawn_new_root: bool,
     /// Optional per-task override of the `[git] signing` mode for this run.
     pub sign: Option<GitSigning>,
+    /// How an ACP session answers tool-permission requests for this task.
+    /// `None` inherits the agent entry's `permission`, then `ask`.
+    pub permission: Option<PermissionPolicy>,
     /// Optional per-task override of `[executor].worktree` isolation. When
     /// `false`, the task runs directly in its base directory (serialized per
     /// directory) and never creates a `favetto/*` branch or linked worktree.
@@ -241,6 +245,8 @@ struct Header {
     spawn_new_root: bool,
     #[serde(default)]
     sign: Option<GitSigning>,
+    #[serde(default)]
+    permission: Option<PermissionPolicy>,
     #[serde(default)]
     worktree: Option<bool>,
     #[serde(default)]
@@ -439,6 +445,7 @@ pub fn parse_task_md(name: &str, content: &str) -> anyhow::Result<TaskDef> {
         spawn_file: header.spawn_file,
         spawn_new_root: header.spawn_new_root,
         sign: header.sign,
+        permission: header.permission,
         worktree: header.worktree,
         vars: header.vars,
         prompt: prompt.trim().to_string(),
@@ -485,6 +492,14 @@ pub fn to_markdown(def: &TaskDef) -> String {
             GitSigning::Ssh => "ssh",
         };
         out.push_str(&format!("sign = {sign:?}\n"));
+    }
+    if let Some(permission) = &def.permission {
+        let permission = match permission {
+            PermissionPolicy::Ask => "ask",
+            PermissionPolicy::Allow => "allow",
+            PermissionPolicy::Deny => "deny",
+        };
+        out.push_str(&format!("permission = {permission:?}\n"));
     }
     // Only the `false` opt-out is meaningful to persist: `true`/absent inherit
     // the global `[executor].worktree`.
@@ -1079,6 +1094,7 @@ mod tests {
             spawn_file: Some(".favetto/{{ input.id }}/manifest.json".to_string()),
             spawn_new_root: true,
             sign: Some(GitSigning::Off),
+            permission: None,
             worktree: None,
             vars: vec![
                 TaskVar {
@@ -1309,6 +1325,7 @@ mod tests {
             spawn_file: None,
             spawn_new_root: false,
             sign: None,
+            permission: None,
             worktree: None,
             vars: Vec::new(),
             prompt: "nested body".to_string(),
@@ -1477,6 +1494,7 @@ mod tests {
             spawn_file: None,
             spawn_new_root: false,
             sign: None,
+            permission: None,
             worktree: None,
             vars: Vec::new(),
             prompt: String::new(),

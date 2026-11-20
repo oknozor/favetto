@@ -13,15 +13,10 @@ section is optional.
 [agent]
 default = "opencode"           # default external agent (a key in [agents.*])
 
-[agents.opencode]              # external coding agents
+[agents.opencode]              # every agent is an ACP server
 command = "opencode"
-args = []
-prompt_args = ["--prompt", "{prompt}"]   # seed an interactive session
-submit_prompt = true                     # press Enter so the seeded prompt is sent
-headless_args = ["run", "--auto", "{prompt}"]   # unattended runs without a model
-run_args = ["run", "--model", "{provider}/{model}", "--auto", "--format", "json", "{prompt}"]
-resume_args = ["--session", "{session_id}"]     # reopen a run's session
-session_id_json_key = "sessionID"               # captured from run JSON output
+args = ["acp"]
+# permission = "ask"           # "ask" (default), "allow", or "deny"
 
 [daemon]                       # defaults, overridable by CLI flags
 listen = "127.0.0.1:7878"

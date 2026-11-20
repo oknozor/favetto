@@ -27,7 +27,7 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Failure, FailureKind};
+use crate::model::{Failure, FailureKind, PermissionPolicy};
 
 #[derive(Debug, Clone, Default, JsonSchema, Serialize, Deserialize)]
 pub struct FavettoConfig {
@@ -292,109 +292,30 @@ pub struct AgentSettings {
 /// How an agent's live state is observed (see
 /// `docs/design/agent-state-adapters.md`).
 ///
-/// `auto` keeps the built-in default for the agent; `none` disables structured
-/// observation entirely (the debounced screen heuristic still runs); `stdout`
-/// parses the CLI's line-delimited JSON output; `server` observes a long-lived
-/// HTTP/SSE endpoint (opencode); `hooks` observes via per-launch HTTP hooks
-/// (claude). A custom agent has no built-in transport, so anything but `auto`
-/// is purely declarative for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, JsonSchema, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentStateMode {
-    /// Use the built-in default for this agent.
-    Auto,
-    /// Disable structured observation (screen fallback only).
-    None,
-    /// Observe the CLI's line-delimited JSON output.
-    Stdout,
-    /// Observe a long-lived HTTP/SSE endpoint.
-    Server,
-    /// Observe via per-launch HTTP hooks.
-    Hooks,
-}
-
-/// An external coding-agent CLI (opencode, Claude Code, pi, Mistral Vibe, …).
+/// An external agent, launched as an Agent Client Protocol (ACP) server.
 ///
-/// `args` is the interactive invocation used by the embedded terminal panel.
-/// `prompt_args`, when present, is appended (with `{prompt}` substituted) so a
-/// session can start with the task prompt. `headless_args` drives unattended
-/// catalog-task runs; `{prompt}` is substituted there too. When a prompt is given
-/// but no `prompt_args`/`headless_args` are configured, the prompt is written to
-/// the process's stdin.
-///
-/// Model selection uses `run_args` instead of `headless_args` when a task sets a
-/// `model`. Both support `{prompt}`, `{provider}`, and `{model}` placeholders, so
-/// the flag can be placed where the CLI expects it (e.g. after a `run`
-/// subcommand). `resume_args` is the interactive invocation for reopening a
-/// previously run session and supports `{session_id}`. When `session_id_json_key`
-/// is set, the agent's session id is read from a run's line-delimited JSON output
-/// under that key (e.g. `"sessionID"`) and stored on the task.
+/// `command` and `args` must start the agent in its ACP mode (for example
+/// `command = "opencode"`, `args = ["acp"]`). Favetto speaks ACP over the
+/// process's stdin/stdout; prompts, tool calls and permission requests are
+/// structured protocol messages, not terminal text. Adding another compatible
+/// agent is configuration, not code.
 #[derive(Debug, Clone, Default, JsonSchema, Serialize, Deserialize)]
 pub struct AgentConfig {
-    /// Implementation discriminator: `opencode`, `claude`, `pi`, `vibe`, or
-    /// `configurable`. Omit to use the built-in whose name matches the entry (or
-    /// the template-only fallback for a custom name).
-    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
-    pub agent_type: Option<String>,
-    /// Executable to launch (looked up on `PATH`).
+    /// Executable that starts the ACP server (looked up on `PATH`).
     pub command: String,
-    /// Interactive arguments.
+    /// Arguments that put the executable into its ACP server mode.
     #[serde(default)]
     pub args: Vec<String>,
-    /// Arguments for unattended task runs without a `model`. `{prompt}` is substituted.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub headless_args: Option<Vec<String>>,
-    /// Arguments for unattended task runs with a `model`; `{prompt}`, `{provider}`,
-    /// and `{model}` are substituted.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_args: Option<Vec<String>>,
-    /// Interactive arguments for reopening an existing session; `{session_id}` is
-    /// substituted.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resume_args: Option<Vec<String>>,
-    /// Interactive arguments used when a model is selected (e.g. for a one-shot
-    /// session); `{provider}` and `{model}` are substituted. Lets an agent reach a
-    /// path that accepts a model when its plain `args` do not.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub interactive_model_args: Option<Vec<String>>,
-    /// Key under which a run's line-delimited JSON output carries the agent's
-    /// session id (e.g. `"sessionID"`). Unset disables capture.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id_json_key: Option<String>,
-    /// How to observe the agent's live state. Unset (or `auto`) keeps the
-    /// built-in default for the agent; `none` forces the screen fallback.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state: Option<AgentStateMode>,
-    /// Structured stdout format for headless runs and final summaries, e.g.
-    /// `"opencode-json"`, `"claude-stream-json"`, `"pi-json"`, `"pi-rpc"`,
-    /// `"vibe-streaming"`, or `"plain-jsonl"`. Unset keeps the default
-    /// `{ "text": raw }` output. A custom (`configurable`) agent only has a
-    /// parser for `"plain-jsonl"`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_format: Option<String>,
-    /// opencode only: which server to observe. `"managed"` (favetto-owned
-    /// `serve`), `"background"` (the registered background service), or a URL.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub server: Option<String>,
-    /// claude only: inject favetto's HTTP hooks through a per-launch
-    /// `--settings` file. Unset keeps the built-in default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hooks: Option<bool>,
-    /// Arguments appended to the interactive command when starting with a prompt.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt_args: Option<Vec<String>>,
-    /// After starting interactively with a prompt via `prompt_args`, send Enter to
-    /// submit it once the agent's UI has settled (some agents, e.g. opencode,
-    /// only pre-fill the input with `--prompt`). `None` leaves the built-in
-    /// default in place.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub submit_prompt: Option<bool>,
-    /// Extra environment variables for the process.
+    /// Extra environment variables for the server process.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-    /// Working directory (defaults to the daemon's cwd).
+    /// Working directory for the server (defaults to the task's directory).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
+    /// Default permission policy for this agent's sessions. A catalog task may
+    /// override it with its own `permission` header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission: Option<PermissionPolicy>,
     /// Per-agent override of the global `[git]` section. Only the fields set
     /// here replace the global values; the rest are inherited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -998,81 +919,33 @@ mod tests {
     }
 
     #[test]
-    fn agent_config_type_and_submit_prompt_parse() {
+    fn agent_config_parses_acp_fields() {
         let cfg: FavettoConfig = toml::from_str(
             r#"
             [agents.opencode]
-            type = "opencode"
             command = "opencode"
-            submit_prompt = true
+            args = ["acp"]
 
             [agents.custom]
-            command = "custom"
+            command = "mycli"
+            args = ["--acp"]
+            permission = "deny"
             "#,
         )
         .unwrap();
+
         let opencode = &cfg.agents["opencode"];
-        assert_eq!(opencode.agent_type.as_deref(), Some("opencode"));
-        assert_eq!(opencode.submit_prompt, Some(true));
-
-        // An absent `type` and `submit_prompt` stay unset.
-        let custom = &cfg.agents["custom"];
-        assert!(custom.agent_type.is_none());
-        assert!(custom.submit_prompt.is_none());
-    }
-
-    #[test]
-    fn agent_config_state_and_output_format_parse() {
-        let cfg: FavettoConfig = toml::from_str(
-            r#"
-            [agents.custom]
-            command = "mycli"
-            state = "stdout"
-            output_format = "plain-jsonl"
-            server = "managed"
-
-            [agents.claude]
-            command = "claude"
-            state = "hooks"
-            hooks = true
-            "#,
-        )
-        .unwrap();
+        assert_eq!(opencode.command, "opencode");
+        assert_eq!(opencode.args, vec!["acp"]);
+        assert!(opencode.permission.is_none());
 
         let custom = &cfg.agents["custom"];
-        assert_eq!(custom.state, Some(AgentStateMode::Stdout));
-        assert_eq!(custom.output_format.as_deref(), Some("plain-jsonl"));
-        assert_eq!(custom.server.as_deref(), Some("managed"));
-        assert!(custom.hooks.is_none());
+        assert_eq!(custom.args, vec!["--acp"]);
+        assert_eq!(custom.permission, Some(PermissionPolicy::Deny));
 
-        let claude = &cfg.agents["claude"];
-        assert_eq!(claude.state, Some(AgentStateMode::Hooks));
-        assert_eq!(claude.hooks, Some(true));
-
-        // Unknown/absent fields stay unset.
-        let empty: FavettoConfig = toml::from_str("[agents.bare]\ncommand = \"x\"\n").unwrap();
-        assert!(empty.agents["bare"].state.is_none());
-        assert!(empty.agents["bare"].output_format.is_none());
-        assert!(empty.agents["bare"].server.is_none());
-        assert!(empty.agents["bare"].hooks.is_none());
-    }
-
-    #[test]
-    fn agent_config_explicit_configurable_type_parses() {
-        let cfg: FavettoConfig = toml::from_str(
-            r#"
-            [agents.mycli]
-            type = "configurable"
-            command = "mycli"
-            submit_prompt = false
-            "#,
-        )
-        .unwrap();
-        assert_eq!(
-            cfg.agents["mycli"].agent_type.as_deref(),
-            Some("configurable")
-        );
-        assert_eq!(cfg.agents["mycli"].submit_prompt, Some(false));
+        // An absent policy inherits the agent entry default, then `ask`.
+        let bare: FavettoConfig = toml::from_str("[agents.bare]\ncommand = \"x\"\n").unwrap();
+        assert!(bare.agents["bare"].permission.is_none());
     }
 
     #[test]

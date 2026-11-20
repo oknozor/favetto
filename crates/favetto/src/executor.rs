@@ -30,7 +30,7 @@ use favetto_core::model::{
 };
 
 use crate::actions::{evaluate_when, ActionContext};
-use crate::agents::{resolve_session_title, Agent, TITLE_POLL_ATTEMPTS, TITLE_POLL_INTERVAL};
+use crate::agents::Agent;
 use crate::config::{ExecutorSettings, RetrySettings, StaleRunPolicy};
 use crate::db;
 use crate::event_bus::ServerPush;
@@ -610,9 +610,12 @@ async fn run_one(
     let outcome: Result<RunOutcome, RunError> = match def.kind {
         TaskKind::Action => run_action_task(state, &task, &def, &plan.cwd).await,
         TaskKind::Agent => match agent_name.as_deref() {
-            Some(name) => run_agent_task(state, &task, name, &def, &prompt, &plan.cwd)
-                .await
-                .map_err(|e| RunError::new(FailureKind::Infrastructure, e.to_string())),
+            Some(name) => match state.registry.get_checked(name) {
+                Ok(agent) => run_agent_task(state, &task, name, agent, &def, &prompt, &plan.cwd)
+                    .await
+                    .map_err(|e| RunError::new(FailureKind::Infrastructure, e.to_string())),
+                Err(e) => Err(RunError::new(FailureKind::Agent, e.to_string())),
+            },
             None => Err(RunError::new(
                 FailureKind::InvalidInput,
                 format!(
@@ -686,27 +689,6 @@ async fn run_one(
         state
             .bus
             .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
-
-        // If the CLI had not written the title yet, keep polling in the background and
-        // push the update when it appears, so an open TUI fills the cell live.
-        if task.session_id.is_some() && task.session_title.is_none() {
-            let worktree_removed = plan.worktree.is_some() && !config.executor.keep_worktree;
-            let backfill_cwd = if worktree_removed {
-                plan.worktree
-                    .as_ref()
-                    .map(|w| w.repo.clone())
-                    .unwrap_or_else(|| plan.cwd.clone())
-            } else {
-                plan.cwd.clone()
-            };
-            if let Some(agent) = agent_name.as_deref().and_then(|n| state.registry.get(n)) {
-                if agent.has_session_titles() {
-                    if let Some(sid) = task.session_id.clone() {
-                        spawn_title_backfill(state.clone(), task.id, agent, sid, backfill_cwd);
-                    }
-                }
-            }
-        }
 
         // A failure eligible for an automatic retry re-enqueues the task for a fresh
         // attempt instead of ending it: the attempt is not terminal, so the terminal
@@ -1325,338 +1307,84 @@ async fn run_action_task(
     })
 }
 
-/// Run a task through its configured external agent as a real PTY session bound
-/// to the task, so it can be reattached from the TUI and its output captured.
-/// Returns the produced output plus the agent's own session id and its session
-/// title (both optional), even when the run failed.
+/// Run a task as one ACP prompt turn.
+///
+/// Unlike the PTY path there is no process-exit lifecycle: the session closes
+/// itself after the turn, and success is decided by [`AcpOutcome::succeeded`]
+/// (normal stop reason, no recorded error, and an actual answer) rather than by
+/// `stop_reason` alone.
 async fn run_agent_task(
     state: &Arc<State>,
     task: &Task,
     agent_name: &str,
+    agent: Arc<Agent>,
     def: &TaskDef,
     prompt: &str,
     cwd: &Path,
 ) -> anyhow::Result<RunOutcome> {
-    let agent = state.registry.get_checked(agent_name)?;
-
-    // A user-started task runs in the agent's real interactive TUI, seeded with
-    // the rendered prompt, so the Agent panel attaches to the single writer while
-    // the task executes. Programmatic runs (scheduler, webhooks, hooks, `needs`,
-    // `spawn`) stay headless. The agent must be able to run a TUI and accept a
-    // seeded prompt; otherwise the task falls back to headless.
-    let interactive = task.interactive
-        && agent.capabilities().interactive
-        && agent.capabilities().interactive_prompt;
-
-    // Give every headless run a deterministic session id. Agents that accept
-    // `{session_id}` (pi) bind it with `--session-id`, and the manager seeds it
-    // onto the session so the task row and panel can reopen it later. Agents
-    // that report their own id (opencode) ignore the generated one. Interactive
-    // runs never seed one: the TUI may not accept the flag.
-    let mut ctx = crate::agents::AgentContext {
-        cwd: Some(cwd.to_path_buf()),
-        provider: def.provider.clone(),
-        model: def.model.clone(),
-        prompt: Some(prompt.to_string()),
-        session_id: (!interactive).then(|| Uuid::new_v4().to_string()),
-        managed_session: false,
-        rows: 40,
-        cols: 120,
-        git_signing: def.sign,
-    };
-    let invocation = if interactive {
-        crate::agents::Invocation::Interactive {
-            prompt: Some(prompt),
-            provider: def.provider.as_deref(),
-            model: def.model.as_deref(),
-        }
-    } else {
-        crate::agents::Invocation::Headless {
-            prompt,
-            provider: def.provider.as_deref(),
-            model: def.model.as_deref(),
-        }
-    };
-    // The agent may prepare its own session on a managed transport (opencode's
-    // managed server) before the PTY is spawned; headless opencode is a no-op.
-    let _ = agent.prepare_launch(&invocation, &mut ctx).await;
     let info = state.agents.start(
         agent_name,
-        agent.clone(),
-        Some(task.id.to_string()),
-        invocation,
-        ctx,
+        agent,
+        crate::agents::Launch {
+            task_id: Some(task.id.to_string()),
+            prompt: Some(prompt.to_string()),
+            cwd: cwd.to_path_buf(),
+            permission: def.permission,
+            model: crate::agents::model_selector(def.provider.as_deref(), def.model.as_deref()),
+            headless: true,
+            git_env: Default::default(),
+        },
     )?;
 
-    // Resolve the title as soon as the CLI reports its session id instead of
-    // waiting for the run to end, so an open TUI fills the `SESSION` cell live.
-    let title_watch = if agent.has_session_titles() {
-        let st = state.clone();
-        let ag = agent.clone();
-        let live = info.id.clone();
-        let tid = task.id;
-        let watch_cwd = cwd.to_path_buf();
-        Some(tokio::spawn(async move {
-            watch_title_while_running(&st, tid, ag, &live, &watch_cwd).await
-        }))
-    } else {
-        None
-    };
+    // A headless ACP session ends when its prompt turn ends.
+    let code = state.agents.wait(&info.id).await;
+    let outcome = state.agents.acp_outcome(&info.id).unwrap_or_default();
+    let raw = state.agents.output(&info.id);
+    let session_id = state
+        .agents
+        .external_session_id(&info.id)
+        .or_else(|| info.session_id.clone());
 
-    let (detect, quiet) = (
-        state.config.executor.detect_awaiting_input,
-        Duration::from_millis(state.config.executor.awaiting_input_quiet_ms),
-    );
-    // A user-started interactive run is watched for a finished turn as well as
-    // for the process exit: opencode's TUI stays open after the agent answers
-    // the prompt, so waiting for it to exit would leave the task `running`
-    // forever and never fire its `spawn`/`needs` successors.
-    let end = if interactive {
-        let since = task.started_at.unwrap_or_else(Utc::now);
-        crate::attention::watch_run(
-            state,
-            crate::attention::WatchRun {
-                session: &info.id,
-                agent: agent.clone(),
-                task_id: Some(task.id),
-                quiet,
-                detect,
-                cwd,
-                since,
-            },
-        )
-        .await
-    } else if detect {
-        crate::attention::WatchEnd::Exited(
-            crate::attention::watch(state, &info.id, agent.clone(), Some(task.id), quiet).await,
-        )
-    } else {
-        crate::attention::WatchEnd::Exited(state.agents.wait(&info.id).await)
-    };
-    let (code, turn_finished) = match end {
-        crate::attention::WatchEnd::Exited(code) => (code, false),
-        crate::attention::WatchEnd::TurnFinished { success } => {
-            (Some(if success { 0 } else { 1 }), true)
-        }
-    };
-    // An interactive run's PTY holds a TUI, not machine output; capture the
-    // emulator's plain-text screen instead of the raw escape stream.
-    let raw = if interactive {
-        state.agents.screen_text(&info.id)
-    } else {
-        state.agents.output(&info.id)
-    };
-    let mut result = agent.parse_output(&raw, code);
-    // The manager also captures the id live from the PTY; prefer it if the
-    // implementation's parser did not find one.
-    if result.session_id.is_none() {
-        result.session_id = state.agents.external_session_id(&info.id);
-    }
-    // Prefer the title resolved (and already published) while the run was still
-    // in progress. Only fall back to a fresh bounded lookup when the watcher
-    // never saw a session id, so the retry budget is never spent twice in a row.
-    //
-    // When the task ended because the agent finished its turn, the process is
-    // still alive and (for an interactive run) never reports a session id, so
-    // the title watcher would block forever. Drop it and resolve best-effort.
-    let session_title = match (turn_finished, title_watch) {
-        (true, handle) => {
-            if let Some(handle) = handle {
-                handle.abort();
-            }
-            resolve_title_fallback(agent.clone(), result.session_id.clone(), cwd).await
-        }
-        (false, Some(handle)) => match handle.await {
-            Ok(TitleWatch::Observed(title)) => title,
-            Ok(TitleWatch::Skipped) | Err(_) => {
-                resolve_title_fallback(agent.clone(), result.session_id.clone(), cwd).await
-            }
-        },
-        (false, None) => {
-            resolve_title_fallback(agent.clone(), result.session_id.clone(), cwd).await
-        }
-    };
-    // The run's PTY only carried machine output (e.g. JSON events); drop it once
-    // its session id is captured, since reattaching launches a fresh interactive
-    // TUI on that session. Agents without resume keep the PTY so its final screen
-    // can still be replayed.
-    if !interactive && result.session_id.is_some() && agent.capabilities().resume {
-        let _ = state.agents.close(&info.id);
-    }
+    let succeeded = outcome.succeeded() && code == Some(0);
     let max = state.config.executor.max_output_bytes;
+    let parsed = serde_json::json!({
+        "text": raw,
+        "stop_reason": outcome.stop_reason,
+        "tool_calls": outcome.tool_calls,
+        "failed_tools": outcome.failed_tools,
+        "succeeded": succeeded,
+    });
     let output = build_task_output(
-        &result.raw,
-        &result.output,
+        &raw,
+        &parsed,
         Some(agent_name),
-        result.session_id.clone(),
-        session_title.clone(),
+        session_id.clone(),
+        None,
         max,
     );
-    let failure = match result.exit_code {
-        Some(0) => None,
-        Some(_) if turn_finished => Some(Failure::new(
+    let failure = if succeeded {
+        None
+    } else {
+        Some(Failure::new(
             FailureKind::Agent,
-            format!("agent '{agent_name}' finished the task unsuccessfully"),
-        )),
-        Some(c) => Some(Failure::new(
-            FailureKind::Agent,
-            format!("agent '{agent_name}' exited with {c}:\n{raw}"),
-        )),
-        // No exit code: the PTY/session disappeared, i.e. a daemon/supervisor fault.
-        None => Some(Failure::new(
-            FailureKind::Infrastructure,
-            format!("agent '{agent_name}' session disappeared"),
-        )),
+            outcome.failure_reason(agent_name),
+        ))
     };
-    // Structured agents serialize their folded `RunSummary` into `result.output`;
-    // recover its usage from there. Interactive runs carry a TUI screen rather
-    // than machine output, so fall back to the folded live state observed while
-    // the run was in progress. A run that reported nothing stays `None`.
     let live_usage = state
         .agents
         .find_latest_by_task(&task.id.to_string())
         .and_then(|session| session.usage);
-    let usage = reported_usage(&result.output, live_usage);
+    // The headless session closed itself; drop the registry entry.
+    let _ = state.agents.close(&info.id);
     Ok(RunOutcome {
         output,
-        session_id: result.session_id,
-        session_title,
-        exit_code: result.exit_code,
-        usage,
+        session_id,
+        session_title: None,
+        exit_code: code,
+        usage: reported_usage(&parsed, live_usage),
         failure,
-        alive: interactive && turn_finished,
+        alive: false,
     })
-}
-
-/// Background title poll window (after the synchronous poll gave up): ~60 s.
-const BACKFILL_ATTEMPTS: u32 = 30;
-const BACKFILL_INTERVAL: Duration = Duration::from_secs(2);
-
-/// How often to check whether a running agent has reported its session id yet.
-const SESSION_ID_POLL_INTERVAL: Duration = Duration::from_millis(250);
-
-/// The completion-time safety net: resolve the title from the parsed session id
-/// with a bounded retry before the worktree is torn down.
-async fn resolve_title_fallback(
-    agent: Arc<dyn Agent>,
-    session_id: Option<String>,
-    cwd: &Path,
-) -> Option<String> {
-    let sid = session_id?;
-    resolve_session_title(agent, &sid, cwd, TITLE_POLL_ATTEMPTS, TITLE_POLL_INTERVAL).await
-}
-
-/// What a mid-run title watch produced.
-pub(crate) enum TitleWatch {
-    /// The live session id was seen; the title budget was spent (`Some` when a
-    /// title was found/stored, `None` when it never appeared).
-    Observed(Option<String>),
-    /// The session exited before any external session id was captured.
-    Skipped,
-}
-
-/// While a run is in progress, wait for its live external session id, then
-/// resolve and persist the title (publishing `TaskUpdated`) immediately instead
-/// of waiting for the run to end.
-pub(crate) async fn watch_title_while_running(
-    state: &Arc<State>,
-    task_id: Uuid,
-    agent: Arc<dyn Agent>,
-    live_session: &str,
-    cwd: &Path,
-) -> TitleWatch {
-    loop {
-        if let Some(sid) = state.agents.external_session_id(live_session) {
-            let title = backfill_title(
-                state,
-                task_id,
-                agent,
-                sid,
-                cwd.to_path_buf(),
-                TITLE_POLL_ATTEMPTS,
-                TITLE_POLL_INTERVAL,
-            )
-            .await;
-            return TitleWatch::Observed(title);
-        }
-        if !state.agents.is_running(live_session) {
-            return TitleWatch::Skipped;
-        }
-        tokio::time::sleep(SESSION_ID_POLL_INTERVAL).await;
-    }
-}
-
-/// Poll for a missing session title in the background and persist the first one
-/// that appears, publishing a `TaskUpdated` so an open TUI fills the cell live.
-fn spawn_title_backfill(
-    state: Arc<State>,
-    task_id: Uuid,
-    agent: Arc<dyn Agent>,
-    session_id: String,
-    cwd: PathBuf,
-) {
-    tokio::spawn(async move {
-        backfill_title(
-            &state,
-            task_id,
-            agent,
-            session_id,
-            cwd,
-            BACKFILL_ATTEMPTS,
-            BACKFILL_INTERVAL,
-        )
-        .await;
-    });
-}
-
-/// The body of [`spawn_title_backfill`], split out so it can be awaited in tests.
-/// Returns the stored title, if any. Persists the session id when the row that
-/// the live run is attached to has not recorded it yet.
-async fn backfill_title(
-    state: &Arc<State>,
-    task_id: Uuid,
-    agent: Arc<dyn Agent>,
-    session_id: String,
-    cwd: PathBuf,
-    attempts: u32,
-    interval: Duration,
-) -> Option<String> {
-    // Fast read for the idempotence check only; do NOT keep this snapshot across
-    // the long `resolve_session_title` await below.
-    let Ok(Some(existing)) = db::get_task(&state.db, task_id).await else {
-        return None;
-    };
-    // Already complete: don't do a redundant write/publish.
-    if existing.session_id.as_deref() == Some(session_id.as_str())
-        && existing.session_title.is_some()
-    {
-        return existing.session_title;
-    }
-
-    // The long await happens with no snapshot held.
-    let title = if existing.session_title.is_none() {
-        resolve_session_title(agent, &session_id, &cwd, attempts, interval).await
-    } else {
-        None
-    };
-
-    // Targeted write: never touches status, so a concurrent mark/resume stands.
-    let changed = db::set_task_session(&state.db, task_id, &session_id, title.as_deref())
-        .await
-        .unwrap_or(false);
-    if changed {
-        if let Ok(Some(task)) = db::get_task(&state.db, task_id).await {
-            state
-                .bus
-                .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
-        }
-    }
-    // Re-read so the returned value is the authoritative stored title.
-    db::get_task(&state.db, task_id)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|t| t.session_title)
 }
 
 /// Mark a task failed (used when it can't even be started).
@@ -1824,31 +1552,6 @@ async fn make_plan(
         needs_lock: true,
         worktree: None,
     })
-}
-
-/// The directory a reopened panel session should be launched in.
-///
-/// A headless run executes inside the task's worktree and some agents (pi)
-/// scope their session store to the project directory, so resuming from the
-/// daemon's cwd cannot find the run's session. Reuse [`make_plan`] to resolve
-/// the same directory, recreating the worktree when retention already reclaimed
-/// it. Returns `None` when the task or its catalog definition is missing.
-pub async fn resume_cwd(state: &State, task_id: Uuid) -> Option<PathBuf> {
-    let task = db::get_task(&state.db, task_id).await.ok().flatten()?;
-    let def = lookup_def(state, &task.name)?;
-    let cfg = state.config.executor.clone();
-    let base = resolve_base_dir(&def, &task);
-    match make_plan(state, &cfg, &base, &task, def.worktree.unwrap_or(true)).await {
-        Ok(plan) => Some(plan.cwd),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                task_id = %task_id,
-                "failed to resolve the resumed session's working directory"
-            );
-            None
-        }
-    }
 }
 
 async fn git_toplevel(dir: &Path) -> Option<PathBuf> {

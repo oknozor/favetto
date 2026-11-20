@@ -455,39 +455,33 @@ pub struct AgentAttachResult {
     pub data: String,
 }
 
-/// `agents.input` params.
+/// `agents.prompt` params: a follow-up prompt for a structured (ACP) session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct AgentInputParams {
+pub struct AgentPromptParams {
     pub session_id: String,
-    #[serde(default, deserialize_with = "lenient")]
-    pub data: Option<String>,
+    pub prompt: String,
 }
 
-/// `agents.input` result: the number of decoded bytes written to the PTY.
+/// `agents.prompt` result: whether the prompt turn was accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct AgentInputResult {
-    pub bytes: usize,
+pub struct AgentPromptResult {
+    pub accepted: bool,
 }
 
-/// `agents.resize` params. `rows`/`cols` default to 24/80.
+/// `agents.cancel` params: interrupt the in-flight turn of a structured session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct AgentResizeParams {
+pub struct AgentCancelParams {
     pub session_id: String,
-    #[serde(default, deserialize_with = "lenient")]
-    pub rows: Option<u64>,
-    #[serde(default, deserialize_with = "lenient")]
-    pub cols: Option<u64>,
 }
 
-/// `agents.resize` result: the applied size.
+/// `agents.cancel` result: whether a cancellation was requested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct AgentResizeResult {
-    pub rows: u16,
-    pub cols: u16,
+pub struct AgentCancelResult {
+    pub cancelled: bool,
 }
 
 /// `agents.attach` / `agents.close` params.
@@ -722,15 +716,6 @@ pub type ReposRefreshResult = ReposListResult;
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CatalogUpdatedPush {}
 
-/// `agent.output` push: raw PTY screen data (base64).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct AgentOutputPush {
-    pub session_id: String,
-    /// Base64-encoded `vt100` screen frame.
-    pub data: String,
-}
-
 /// `agent.exit` push: the session's child process exited.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -846,10 +831,10 @@ rpc_calls! {
     AgentsListCall => method::AGENTS_LIST, EmptyParams, AgentsListResult;
     /// Typed call for `agents.start`.
     AgentsStartCall => method::AGENTS_START, StartAgentParams, AgentAttachResult;
-    /// Typed call for `agents.input`.
-    AgentsInputCall => method::AGENTS_INPUT, AgentInputParams, AgentInputResult;
-    /// Typed call for `agents.resize`.
-    AgentsResizeCall => method::AGENTS_RESIZE, AgentResizeParams, AgentResizeResult;
+    /// Typed call for `agents.prompt`.
+    AgentsPromptCall => method::AGENTS_PROMPT, AgentPromptParams, AgentPromptResult;
+    /// Typed call for `agents.cancel`.
+    AgentsCancelCall => method::AGENTS_CANCEL, AgentCancelParams, AgentCancelResult;
     /// Typed call for `agents.attach`.
     AgentsAttachCall => method::AGENTS_ATTACH, SessionIdParams, AgentAttachResult;
     /// Typed call for `agents.close`.
@@ -1027,14 +1012,14 @@ pub const CLIENT_CALLS: &[RpcCallSpec] = &[
         result_schema: schema_of::<AgentAttachResult>,
     },
     RpcCallSpec {
-        method: method::AGENTS_INPUT,
-        params_schema: schema_of::<AgentInputParams>,
-        result_schema: schema_of::<AgentInputResult>,
+        method: method::AGENTS_PROMPT,
+        params_schema: schema_of::<AgentPromptParams>,
+        result_schema: schema_of::<AgentPromptResult>,
     },
     RpcCallSpec {
-        method: method::AGENTS_RESIZE,
-        params_schema: schema_of::<AgentResizeParams>,
-        result_schema: schema_of::<AgentResizeResult>,
+        method: method::AGENTS_CANCEL,
+        params_schema: schema_of::<AgentCancelParams>,
+        result_schema: schema_of::<AgentCancelResult>,
     },
     RpcCallSpec {
         method: method::AGENTS_ATTACH,
@@ -1142,10 +1127,6 @@ pub const PUSH_CALLS: &[PushSpec] = &[
     PushSpec {
         method: super::push::CATALOG_UPDATED,
         params_schema: schema_of::<CatalogUpdatedPush>,
-    },
-    PushSpec {
-        method: super::push::AGENT_OUTPUT,
-        params_schema: schema_of::<AgentOutputPush>,
     },
     PushSpec {
         method: super::push::AGENT_EXIT,

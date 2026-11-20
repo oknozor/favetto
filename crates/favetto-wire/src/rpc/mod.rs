@@ -149,10 +149,10 @@ pub mod method {
     pub const AGENTS_LIST: &str = "agents.list";
     /// Start an external agent session (optionally attached to a task).
     pub const AGENTS_START: &str = "agents.start";
-    /// Write raw bytes (base64) to a session's PTY.
-    pub const AGENTS_INPUT: &str = "agents.input";
-    /// Resize a session's PTY.
-    pub const AGENTS_RESIZE: &str = "agents.resize";
+    /// Send a follow-up prompt to a structured (ACP) session.
+    pub const AGENTS_PROMPT: &str = "agents.prompt";
+    /// Interrupt the in-flight turn of a structured (ACP) session.
+    pub const AGENTS_CANCEL: &str = "agents.cancel";
     /// Attach to a session: returns the session and a replay of its output.
     pub const AGENTS_ATTACH: &str = "agents.attach";
     /// Terminate a session.
@@ -194,8 +194,6 @@ pub mod push {
     pub const TASK_UPDATED: &str = "task.updated";
     /// The task catalog changed on disk; clients should re-fetch it.
     pub const CATALOG_UPDATED: &str = "catalog.updated";
-    /// Raw PTY output (base64) from a running agent session.
-    pub const AGENT_OUTPUT: &str = "agent.output";
     /// An agent session's child process exited.
     pub const AGENT_EXIT: &str = "agent.exit";
     /// A session's folded live state (activity/usage) changed.
@@ -300,10 +298,13 @@ pub const CLIENT_METHODS: &[(&str, &str)] = &[
         "Start an external agent session (optionally attached to a task).",
     ),
     (
-        method::AGENTS_INPUT,
-        "Write raw bytes (base64) to a session's PTY.",
+        method::AGENTS_PROMPT,
+        "Send a follow-up prompt to a structured (ACP) agent session.",
     ),
-    (method::AGENTS_RESIZE, "Resize a session's PTY."),
+    (
+        method::AGENTS_CANCEL,
+        "Interrupt the in-flight turn of a structured (ACP) agent session.",
+    ),
     (
         method::AGENTS_ATTACH,
         "Attach to a session: returns the session and a replay of its output.",
@@ -368,10 +369,6 @@ pub const SERVER_PUSHES: &[(&str, &str)] = &[
     (
         push::CATALOG_UPDATED,
         "The task catalog changed on disk; clients should re-fetch it.",
-    ),
-    (
-        push::AGENT_OUTPUT,
-        "Raw PTY output (base64) from a running agent session.",
     ),
     (push::AGENT_EXIT, "An agent session's child process exited."),
     (
@@ -505,8 +502,8 @@ mod tests {
             method::EVENTS_SUBSCRIBE,
             method::AGENTS_LIST,
             method::AGENTS_START,
-            method::AGENTS_INPUT,
-            method::AGENTS_RESIZE,
+            method::AGENTS_PROMPT,
+            method::AGENTS_CANCEL,
             method::AGENTS_ATTACH,
             method::AGENTS_CLOSE,
             method::AGENTS_REPLY,
@@ -535,7 +532,6 @@ mod tests {
             push::EVENT,
             push::TASK_UPDATED,
             push::CATALOG_UPDATED,
-            push::AGENT_OUTPUT,
             push::AGENT_EXIT,
             push::AGENT_STATE,
             push::AGENT_EVENT,

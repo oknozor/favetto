@@ -231,9 +231,6 @@
   .grow {
     flex-grow: 1;
   }
-  .resize {
-    resize: both;
-  }
   .text-primary {
     color: var(--primary);
   }

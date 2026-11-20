@@ -10,6 +10,7 @@ fn session(id: &str, agent: &str, headless: bool, running: bool) -> AgentSession
     AgentSessionInfo {
         id: id.to_string(),
         agent: agent.to_string(),
+        backend: favetto_core::model::AgentBackend::Acp,
         task_id: None,
         running,
         headless,

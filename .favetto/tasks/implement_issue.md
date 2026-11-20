@@ -1,7 +1,6 @@
 agent = "opencode"
 provider = "deepseek"  
 model = "deepseek-flash" 
-cwd = "/code/che"
 ---
 
 You are an implementation agent for the `oknozor/favetto` repository.

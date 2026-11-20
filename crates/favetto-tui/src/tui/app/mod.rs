@@ -13,12 +13,10 @@ use ratatui::layout::Rect;
 use serde_json::Value;
 use uuid::Uuid;
 
-use base64::Engine as _;
-
 use favetto_core::model::{
-    AgentActivity, AgentCapabilities, AgentCatalogEntry, AgentSessionInfo, AgentUsage,
-    AwaitingInputKind, Event, EventKind, InputReply, InputRequest, NotificationRecord, RepoInfo,
-    Schedule, Task, TaskStatus, UsagePeriod, UsageStats,
+    AgentActivity, AgentCapabilities, AgentCatalogEntry, AgentSessionInfo, AgentStateEvent,
+    AgentUsage, AwaitingInputKind, Event, EventKind, InputReply, InputRequest, MessageRole,
+    NotificationRecord, RepoInfo, Schedule, Task, TaskStatus, UsagePeriod, UsageStats,
 };
 use favetto_core::rpc::{method, push, Notification};
 use favetto_core::workflow::WorkflowInspect;
@@ -891,6 +889,8 @@ pub struct App {
     pub agent_name: Option<String>,
     pub agent_running: bool,
     pub agent_status: String,
+    /// The prompt line being composed for the active ACP session.
+    pub agent_prompt: String,
     /// When true, keystrokes are forwarded to the embedded agent; when false they
     /// are handled by the favetto TUI. Toggled with Ctrl+Y.
     pub agent_capture: bool,
@@ -1025,6 +1025,7 @@ impl App {
             agent_name: None,
             agent_running: false,
             agent_status: String::new(),
+            agent_prompt: String::new(),
             agent_capture: false,
             agent_read_only: false,
             agent_structured: false,
@@ -1952,10 +1953,38 @@ impl App {
         ))
     }
 
-    /// Feed a full-screen frame to the active session's terminal.
-    pub fn agent_output(&mut self, session_id: &str, frame: &[u8]) {
-        if self.agent_session_id.as_deref() == Some(session_id) {
-            self.term.process(frame);
+    /// Render one structured ACP event into the active session's transcript.
+    pub fn agent_event(&mut self, session_id: &str, event: &AgentStateEvent) {
+        if self.agent_session_id.as_deref() != Some(session_id) {
+            return;
+        }
+        let mut text = String::new();
+        match event {
+            AgentStateEvent::TextDelta { role, text: delta } => match role {
+                MessageRole::User => {
+                    text.push_str("\r\n> ");
+                    text.push_str(delta);
+                }
+                _ => text.push_str(delta),
+            },
+            AgentStateEvent::ReasoningDelta { text: delta } => text.push_str(delta),
+            AgentStateEvent::ToolStarted { name, .. } => {
+                text.push_str(&format!("\r\n[tool] {name}\r\n"));
+            }
+            AgentStateEvent::ToolFinished { name, ok, .. } => {
+                text.push_str(&format!(
+                    "\r\n[tool] {name} {}\r\n",
+                    if *ok { "ok" } else { "failed" }
+                ));
+            }
+            AgentStateEvent::Error { message } => {
+                text.push_str(&format!("\r\n[error] {message}\r\n"));
+            }
+            AgentStateEvent::Idle { .. } => text.push_str("\r\n"),
+            _ => {}
+        }
+        if !text.is_empty() {
+            self.term.process(text.replace('\n', "\r\n").as_bytes());
         }
     }
 
@@ -2583,15 +2612,15 @@ impl App {
                 // picker and status badge refresh.
                 self.repos_dirty = true;
             }
-            push::AGENT_OUTPUT => {
+            push::AGENT_EVENT => {
                 let sid = n.params.get("session_id").and_then(|v| v.as_str());
-                let data = n
+                let event = n
                     .params
-                    .get("data")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok());
-                if let (Some(sid), Some(data)) = (sid, data) {
-                    self.agent_output(sid, &data);
+                    .get("event")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value::<AgentStateEvent>(v).ok());
+                if let (Some(sid), Some(event)) = (sid, event) {
+                    self.agent_event(sid, &event);
                 }
             }
             push::AGENT_EXIT => {

@@ -536,6 +536,8 @@ fn usage_from_row(row: &SqliteRow) -> Option<AgentUsage> {
         cache_read_tokens: cache_read.unwrap_or(0).max(0) as u64,
         cache_write_tokens: cache_write.unwrap_or(0).max(0) as u64,
         cost_usd: cost,
+        context_used: None,
+        context_size: None,
     })
 }
 
@@ -1309,48 +1311,6 @@ pub async fn list_root_dependencies(
         .collect())
 }
 
-/// Set a task's status only when it currently has `from`. Targeted, so it can
-/// never overwrite `session_id`, `session_title`, `output`, or terminal fields
-/// written concurrently. Returns whether a row changed.
-pub async fn set_task_status_if(
-    pool: &SqlitePool,
-    id: Uuid,
-    to: TaskStatus,
-    from: TaskStatus,
-) -> anyhow::Result<bool> {
-    let result = sqlx::query("UPDATE tasks SET status = ? WHERE id = ? AND status = ?")
-        .bind(to.as_str())
-        .bind(id.to_string())
-        .bind(from.as_str())
-        .execute(pool)
-        .await?;
-    Ok(result.rows_affected() > 0)
-}
-
-/// Persist a run's session id/title without touching `status`, `output`, or any
-/// other column. `session_id` is written only when currently NULL;
-/// `session_title` only when currently NULL and `title` is `Some`. Returns
-/// whether a row matched.
-pub async fn set_task_session(
-    pool: &SqlitePool,
-    id: Uuid,
-    session_id: &str,
-    title: Option<&str>,
-) -> anyhow::Result<bool> {
-    let result = sqlx::query(
-        "UPDATE tasks SET
-             session_id = COALESCE(session_id, ?),
-             session_title = COALESCE(session_title, ?)
-         WHERE id = ?",
-    )
-    .bind(session_id)
-    .bind(title)
-    .bind(id.to_string())
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected() > 0)
-}
-
 // ---------------------------------------------------------------------------
 // Task runs
 // ---------------------------------------------------------------------------
@@ -1569,6 +1529,8 @@ pub async fn usage_stats(
             cache_read_tokens: row.get::<i64, _>("cache_read_tokens").max(0) as u64,
             cache_write_tokens: row.get::<i64, _>("cache_write_tokens").max(0) as u64,
             cost_usd: row.try_get::<Option<f64>, _>("cost_usd").ok().flatten(),
+            context_used: None,
+            context_size: None,
         };
         let runs = row.get::<i64, _>("runs").max(0) as u64;
         let entry = grouped.entry(key).or_default();

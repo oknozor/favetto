@@ -99,9 +99,6 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     // Resolve `[git]` (global + per-agent) and materialize any generated scripts
     // once, so a malformed section fails startup like an unknown agent type.
     agents.configure_git(&config, data_dir.clone())?;
-    // Claude sessions report live state over a per-launch loopback HTTP hook.
-    // Hooks are always available in daemon mode; unit tests never configure them.
-    agents.configure_hooks(&listen, data_dir.clone());
     let scheduler = tokio_cron_scheduler::JobScheduler::new().await?;
 
     // Resolve webhook secrets from config/env before starting up.
@@ -304,7 +301,6 @@ pub(crate) fn http_app(state: &Arc<State>) -> Router {
         .route("/events", get(crate::server::events_handler))
         .route("/metrics", get(crate::metrics::metrics_handler))
         .merge(crate::webhooks::routes())
-        .merge(crate::agent_hooks::routes())
         .merge(crate::auth::routes())
         .merge(crate::pair::routes())
         .merge(crate::ticket::routes());
