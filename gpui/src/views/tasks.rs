@@ -27,6 +27,9 @@ pub struct TasksView {
     state: Entity<ClientState>,
     /// Persisted across renders so live updates keep the scroll position.
     scroll: ScrollHandle,
+    /// The row that was last scrolled into view, so keyboard navigation keeps
+    /// the highlight visible without fighting a manual scroll.
+    scrolled_to: Option<Uuid>,
     retry_focus: FocusHandle,
     reset_focus: FocusHandle,
 }
@@ -37,6 +40,7 @@ impl TasksView {
         Self {
             state,
             scroll: ScrollHandle::new(),
+            scrolled_to: None,
             retry_focus: cx.focus_handle().tab_index(33).tab_stop(true),
             reset_focus: cx.focus_handle().tab_index(34).tab_stop(true),
         }
@@ -612,21 +616,6 @@ impl TasksView {
                 });
             }))
     }
-
-    fn rows_body(
-        &self,
-        theme: &Theme,
-        list: &TaskList,
-        selected: Option<Uuid>,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let mut body = div().flex().flex_col().gap(px(2.0)).p(px(theme.spacing.s2));
-        for (index, row) in list.rows.iter().enumerate() {
-            let is_selected = selected.is_some_and(|id| id == row.id);
-            body = body.child(self.row(theme, index, row, is_selected, cx));
-        }
-        body
-    }
 }
 
 impl Render for TasksView {
@@ -643,6 +632,16 @@ impl Render for TasksView {
             )
         };
         let selected = self.state.read(cx).selected_tasks_id();
+
+        // Keep keyboard selection visible: Home/End and PageUp/PageDown can
+        // move the highlight far past the viewport. Non-strict scrolling means
+        // a row that is already visible never shifts the list.
+        if selected != self.scrolled_to {
+            if let Some(index) = selected.and_then(|id| list.position(id)) {
+                self.scroll.scroll_to_item(index);
+            }
+            self.scrolled_to = selected;
+        }
 
         if matches!(&status, SnapshotStatus::Loading) && list.total == 0 {
             return div()
@@ -668,63 +667,74 @@ impl Render for TasksView {
             }
         }
 
-        let body = if list.is_truly_empty() {
-            components::empty_state(
+        let show_rows = !list.rows.is_empty();
+        let mut scroll = div()
+            .id("tasks-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll)
+            .flex()
+            .flex_col()
+            .gap(px(2.0));
+
+        if list.is_truly_empty() {
+            scroll = scroll.child(components::empty_state(
                 theme,
                 Route::Tasks.icon(),
                 "ALL RUNS",
                 "No runs yet",
                 "Every run the daemon starts appears here with its status, agent, attempt and elapsed time. Start a task from the Catalog (g c) and it lands here, live.",
                 "Start a task from the Catalog (g c)",
-            )
-            .into_any_element()
+            ));
         } else if list.is_filtered_empty() {
-            self.filtered_empty(theme, &list, &query, filter, cx)
-                .into_any_element()
+            scroll = scroll.child(self.filtered_empty(theme, &list, &query, filter, cx));
         } else {
-            let mut content = div()
-                .flex()
-                .flex_col()
-                .gap(px(theme.spacing.s3))
-                .p(px(theme.spacing.s3));
-            if let SnapshotStatus::Failed { message } = &status {
-                content = content.child(self.error_banner(theme, message, cx));
+            // Rows are direct children of the scroll container so
+            // `ScrollHandle::scroll_to_item` can address them by index.
+            scroll = scroll.p(px(theme.spacing.s2));
+            for (index, row) in list.rows.iter().enumerate() {
+                let is_selected = selected.is_some_and(|id| id == row.id);
+                scroll = scroll.child(self.row(theme, index, row, is_selected, cx));
             }
-            content
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(theme.spacing.s2))
-                        .px(px(theme.spacing.s1))
-                        .child(components::section_label(theme, "ALL RUNS"))
-                        .child(hint(
-                            theme,
-                            &format!("{} shown of {} · newest first", list.rows.len(), list.total),
-                        ))
-                        .child(div().flex_1())
-                        .child(hint(theme, "selected row highlights; ↵ opens")),
-                )
-                .child(self.rows_body(theme, &list, selected, cx))
-                .into_any_element()
-        };
+        }
 
-        div()
+        let mut list_header = div()
+            .flex()
+            .flex_col()
+            .gap(px(theme.spacing.s2))
+            .p(px(theme.spacing.s3));
+        if let SnapshotStatus::Failed { message } = &status {
+            list_header = list_header.child(self.error_banner(theme, message, cx));
+        }
+        if show_rows {
+            list_header = list_header.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s2))
+                    .px(px(theme.spacing.s1))
+                    .child(components::section_label(theme, "ALL RUNS"))
+                    .child(hint(
+                        theme,
+                        &format!("{} shown of {} · newest first", list.rows.len(), list.total),
+                    ))
+                    .child(div().flex_1())
+                    .child(hint(theme, "selected row highlights; ↵ opens")),
+            );
+        }
+
+        let mut root = div()
             .size_full()
             .flex()
             .flex_col()
             .bg(theme.colors.bg)
             .child(self.header(theme))
-            .child(self.controls(theme, &list, &query, search_active, filter, cx))
-            .child(
-                div()
-                    .id("tasks-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
-                    .child(body),
-            )
+            .child(self.controls(theme, &list, &query, search_active, filter, cx));
+        if show_rows || matches!(&status, SnapshotStatus::Failed { .. }) {
+            root = root.child(list_header);
+        }
+        root.child(scroll)
     }
 }
 
@@ -736,8 +746,13 @@ fn hint(theme: &Theme, text: &str) -> Div {
 }
 
 fn meta_chip(theme: &Theme, label: String) -> Div {
+    // Agent and repo strings come from the daemon and are arbitrary text; cap
+    // and truncate them so one long value cannot widen the whole row.
     div()
-        .flex_shrink_0()
+        .flex_shrink()
+        .min_w(px(0.0))
+        .max_w(px(150.0))
+        .truncate()
         .px(px(theme.spacing.s1 + 2.0))
         .py(px(1.0))
         .rounded(px(theme.radii.r4))
