@@ -1,6 +1,8 @@
 # examples/workflow/report — a `needs` successor; draws the triage → report
 # dependency edge and reads the predecessor result through `{{ prev.* }}`.
 agent = "opencode"
+provider = "opencode-go"
+model = "deepseek-v4.1-flash"
 needs = "examples/workflow/triage:finished"
 ---
 

@@ -1,9 +1,10 @@
 # examples/variables — the variables form (screenshot `tui-vars-form`).
 # Declares one var per field type: multiline text, required text with a default,
 # int, choices and bool.
+
 agent = "opencode"
-provider = "deepseek"
-model = "deepseek-flash"
+provider = "opencode-go"
+model = "deepseek-v4.1-flash"
 
 [[vars]]
 name = "issue"

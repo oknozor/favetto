@@ -8,8 +8,8 @@
 # program, it re-arms itself by spawning this same task as a new root with the
 # next `round`, and stops by writing an empty manifest.
 agent = "opencode"
-provider = "deepseek"
-model = "deepseek-flash"
+provider = "opencode-go"
+model = "deepseek-v4.1-flash"
 worktree = false
 spawn = "repo:Favetto/design_supervisor"
 spawn_file = ".favetto/design/{{ input.design }}/next.json"

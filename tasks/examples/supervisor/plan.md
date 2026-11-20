@@ -3,6 +3,8 @@
 # the reference supervisor (`crates/favetto-tui/examples/reference_supervisor.rs`)
 # owns the sequencing, so the daemon stays a deterministic executor.
 agent = "opencode"
+provider = "opencode-go"
+model = "deepseek-v4.1-flash"
 ---
 
 You are the planning step of the `examples/supervisor` demo pipeline.

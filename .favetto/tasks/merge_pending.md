@@ -1,6 +1,6 @@
 agent = "opencode"
-provider = "deepseek"
-model = "deepseek-flash"
+provider = "opencode-go"
+model = "deepseek-v4.1-flash"
 spawn = "repo:Favetto/merge_pending"
 spawn_file = ".favetto/merge_pending/{{ task.id }}/manifest.json"
 spawn_new_root = true

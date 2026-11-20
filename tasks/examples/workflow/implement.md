@@ -1,8 +1,8 @@
 # examples/workflow/implement — leaf of the demo pipeline; also shows a
 # `provider`/`model` in the header.
 agent = "opencode"
-provider = "deepseek"
-model = "deepseek-flash"
+provider = "opencode-go"
+model = "deepseek-v4.1-flash"
 ---
 
 You are an implementation agent for the `examples/workflow` demo pipeline.

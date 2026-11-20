@@ -2,6 +2,8 @@
 # triage → plan edge in the workflow graph (`w`) and creates one child run per
 # manifest entry.
 agent = "opencode"
+provider = "opencode-go"
+model = "deepseek-v4.1-flash"
 spawn = "examples/workflow/plan"
 spawn_file = ".favetto/examples/{{ task.id }}/manifest.json"
 ---

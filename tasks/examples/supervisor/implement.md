@@ -2,6 +2,8 @@
 # The reference supervisor spawns this task into the plan root once the plan
 # succeeds; there is no catalog edge between the two tasks.
 agent = "opencode"
+provider = "opencode-go"
+model = "deepseek-v4.1-flash"
 ---
 
 You are the implementation step of the `examples/supervisor` demo pipeline.

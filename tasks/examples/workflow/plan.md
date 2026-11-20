@@ -1,6 +1,8 @@
 # examples/workflow/plan — child of triage; `spawn` draws the plan → implement
 # edge. Receives one manifest element as its `input`.
 agent = "opencode"
+provider = "opencode-go"
+model = "deepseek-v4.1-flash"
 spawn = "examples/workflow/implement"
 spawn_file = ".favetto/examples/{{ task.id }}/handoff.json"
 ---

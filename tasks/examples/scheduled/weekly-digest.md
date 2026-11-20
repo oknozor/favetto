@@ -1,6 +1,8 @@
 # examples/scheduled/weekly-digest — a second recurring task, every Monday at
 # 09:00 (six-field cron: second minute hour day month weekday).
 agent = "opencode"
+provider = "opencode-go"
+model = "deepseek-v4.1-flash"
 schedule = "0 0 9 * * 1"
 ---
 

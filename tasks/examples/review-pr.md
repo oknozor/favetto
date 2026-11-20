@@ -1,8 +1,9 @@
 # examples/review-pr — an int + choices form, and a `provider`/`model`
 # selection so the preview shows the model headers (Agents guide).
+
 agent = "opencode"
-provider = "deepseek"
-model = "deepseek-flash"
+provider = "opencode-go"
+model = "deepseek-v4.1-flash"
 
 [[vars]]
 name = "pr_number"
