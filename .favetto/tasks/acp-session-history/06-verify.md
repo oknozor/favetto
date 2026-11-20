@@ -11,6 +11,7 @@ You are implementing **step 06 of 6** of Favetto's ACP session-history workflow.
 Read first:
 - `AGENT.md` — required workspace checks and commit conventions.
 - `docs/guide/agents.md`, `docs/guide/tui.md`, and all changed session-history code.
+- `gpui/README.md` and the changed GPUI session-history transport/state/view code.
 
 ## Goal
 
@@ -18,12 +19,13 @@ Verify the full past-session loading path and leave an accurate record. Do not a
 
 ## Work
 
-1. Run focused tests for session metadata migrations, early ACP ID persistence, capability negotiation, history replay ordering, RPC compatibility, and UI state.
-2. Run the repository gates from `AGENT.md`: formatting, Clippy, workspace tests, dependency check, generated-reference drift check, and docs check. Use the documented commands and record any environment limitation precisely.
-3. Use the deterministic fake ACP server for end-to-end coverage. Verify that it can create a session, exit, be loaded by external ID after daemon/store recreation, replay history before readiness, and accept a follow-up prompt.
-4. Verify negative cases: no `loadSession` capability, agent load error, failed initialization, and daemon restart during an active task. Confirm loading a past session does not re-run the task or mark an interrupted run successful.
-5. Do not require credentials or live third-party ACP agents. Do not change retry policy or add session discovery/import.
-6. Update the agent guide with verified behavior and limitations. Report commands/results and any remaining issues in the task response; do not create a verification artifact unless the existing project convention requires one.
+1. Run focused tests for session metadata migrations, early ACP ID persistence, capability negotiation, history replay ordering, RPC compatibility, and TUI/web/GPUI session UI state.
+2. Run the GPUI standalone gates from `gpui/`: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`. Verify the desktop session surface lists prior sessions, shows loading then replayed history on success, and clearly reports unsupported/load-failed sessions without starting a fresh session.
+3. Run the repository gates from `AGENT.md`: formatting, Clippy, workspace tests, dependency check, generated-reference drift check, and docs check. Use the documented commands and record any environment limitation precisely.
+4. Use the deterministic fake ACP server for end-to-end coverage. Verify that it can create a session, exit, be loaded by external ID after daemon/store recreation, replay history before readiness, and accept a follow-up prompt. Exercise this path through the GPUI client-facing list/load contract as well as the existing client paths where practical.
+5. Verify negative cases: no `loadSession` capability, agent load error, failed initialization, and daemon restart during an active task. Confirm loading a past session does not re-run the task or mark an interrupted run successful.
+6. Do not require credentials or live third-party ACP agents. Do not change retry policy or add session discovery/import.
+7. Update the agent guide with verified behavior and limitations. Report commands/results and any remaining issues in the task response; do not create a verification artifact unless the existing project convention requires one.
 
 ## Definition of done
 
