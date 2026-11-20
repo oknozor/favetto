@@ -611,9 +611,11 @@ async fn run_one(
         TaskKind::Action => run_action_task(state, &task, &def, &plan.cwd).await,
         TaskKind::Agent => match agent_name.as_deref() {
             Some(name) => match state.registry.get_checked(name) {
-                Ok(agent) => run_agent_task(state, &task, name, agent, &def, &prompt, &plan.cwd)
-                    .await
-                    .map_err(|e| RunError::new(FailureKind::Infrastructure, e.to_string())),
+                Ok(agent) => {
+                    run_agent_task(state, &task, &run, agent, &def, &prompt, &plan.cwd)
+                        .await
+                        .map_err(|e| RunError::new(FailureKind::Infrastructure, e.to_string()))
+                }
                 Err(e) => Err(RunError::new(FailureKind::Agent, e.to_string())),
             },
             None => Err(RunError::new(
@@ -1316,25 +1318,30 @@ async fn run_action_task(
 async fn run_agent_task(
     state: &Arc<State>,
     task: &Task,
-    agent_name: &str,
+    run: &TaskRun,
     agent: Arc<Agent>,
     def: &TaskDef,
     prompt: &str,
     cwd: &Path,
 ) -> anyhow::Result<RunOutcome> {
-    let info = state.agents.start(
-        agent_name,
-        agent,
-        crate::agents::Launch {
-            task_id: Some(task.id.to_string()),
-            prompt: Some(prompt.to_string()),
-            cwd: cwd.to_path_buf(),
-            permission: def.permission,
-            model: crate::agents::model_selector(def.provider.as_deref(), def.model.as_deref()),
-            headless: true,
-            git_env: Default::default(),
-        },
-    )?;
+    let agent_name = agent.descriptor().id.clone();
+    let info = state
+        .agents
+        .start(
+            &agent_name,
+            agent,
+            crate::agents::Launch {
+                task_id: Some(task.id.to_string()),
+                run_id: Some(run.id.to_string()),
+                prompt: Some(prompt.to_string()),
+                cwd: cwd.to_path_buf(),
+                permission: def.permission,
+                model: crate::agents::model_selector(def.provider.as_deref(), def.model.as_deref()),
+                headless: true,
+                git_env: Default::default(),
+            },
+        )
+        .await?;
 
     // A headless ACP session ends when its prompt turn ends.
     let code = state.agents.wait(&info.id).await;
@@ -1357,7 +1364,7 @@ async fn run_agent_task(
     let output = build_task_output(
         &raw,
         &parsed,
-        Some(agent_name),
+        Some(agent_name.as_str()),
         session_id.clone(),
         None,
         max,
@@ -1367,7 +1374,7 @@ async fn run_agent_task(
     } else {
         Some(Failure::new(
             FailureKind::Agent,
-            outcome.failure_reason(agent_name),
+            outcome.failure_reason(&agent_name),
         ))
     };
     let live_usage = state
@@ -1375,7 +1382,7 @@ async fn run_agent_task(
         .find_latest_by_task(&task.id.to_string())
         .and_then(|session| session.usage);
     // The headless session closed itself; drop the registry entry.
-    let _ = state.agents.close(&info.id);
+    let _ = state.agents.close(&info.id).await;
     Ok(RunOutcome {
         output,
         session_id,

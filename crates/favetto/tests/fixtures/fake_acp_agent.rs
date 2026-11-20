@@ -36,6 +36,9 @@ fn main() {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     let mut selected_model = DEFAULT_MODEL.to_string();
+    // Unique per process, so two sessions from the same run (and the durable
+    // per-agent uniqueness constraint) do not collide.
+    let session_id = format!("{SESSION_ID}-{}", std::process::id());
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         let line = line.trim();
@@ -66,7 +69,7 @@ fn main() {
                     &mut stdout,
                     id,
                     json!({
-                        "sessionId": SESSION_ID,
+                        "sessionId": session_id.clone(),
                         "configOptions": config_options(&selected_model)
                     }),
                 );
@@ -92,6 +95,20 @@ fn main() {
                 }
             }
             "session/prompt" => {
+                // Tests can ask the agent to report a display title, proving the
+                // daemon persists ACP title updates on the durable session row.
+                if let Some(title) = std::env::var_os("FAKE_ACP_TITLE") {
+                    notify(
+                        &mut stdout,
+                        json!({
+                            "sessionId": session_id.clone(),
+                            "update": {
+                                "sessionUpdate": "session_info_update",
+                                "title": title.to_string_lossy()
+                            }
+                        }),
+                    );
+                }
                 // Tests can make the turn block deterministically: create
                 // `$FAKE_ACP_GATE_DIR/agent-ready`, then wait for
                 // `agent-release` before answering.
@@ -107,7 +124,7 @@ fn main() {
                 notify(
                     &mut stdout,
                     json!({
-                        "sessionId": SESSION_ID,
+                        "sessionId": session_id.clone(),
                         "update": {
                             "sessionUpdate": "agent_message_chunk",
                             "content": {

@@ -21,7 +21,9 @@ use serde::de::DeserializeOwned;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
-use favetto_core::model::{AgentCatalogEntry, AgentSessionInfo, EventKind, Task, TaskStatus};
+use favetto_core::model::{
+    AgentCatalogEntry, AgentSessionInfo, EventKind, Failure, FailureKind, Task, TaskStatus,
+};
 use favetto_core::rpc::messages::*;
 use favetto_core::rpc::{method, push, Frame, Notification, Request, Response, RpcError};
 use favetto_core::wire::WireError;
@@ -292,7 +294,7 @@ async fn handle_request(
         let resp = match parse_params::<SessionIdParams>(&req.method, &req.params) {
             Ok(p) => {
                 subscribed.lock().remove(&p.session_id);
-                match state.agents.close(&p.session_id) {
+                match state.agents.close(&p.session_id).await {
                     Ok(()) => Response::ok(
                         id,
                         encode(AgentCloseResult {
@@ -970,7 +972,7 @@ async fn cancel_workflow(state: &State, root_id: Uuid) -> Result<WorkflowCancelR
                 // Stop the run's agent process so it cannot outlive the
                 // cancellation; its eventual outcome is rejected by
                 // `db::finish_active_task` and never fires `TaskFinished`.
-                state.agents.close_by_task(&task.id.to_string());
+                state.agents.close_by_task(&task.id.to_string()).await;
                 // Re-read so the push carries the persisted `cancelled` status.
                 if let Ok(Some(fresh)) = db::get_task(&state.db, task.id).await {
                     announce_cancelled(state, &fresh).await;
@@ -1342,19 +1344,23 @@ async fn start_agent(
         .filter(|path| !path.as_os_str().is_empty())
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    state.agents.start(
-        &name,
-        agent,
-        crate::agents::Launch {
-            task_id,
-            prompt,
-            cwd,
-            permission,
-            model: crate::agents::model_selector(provider.as_deref(), model.as_deref()),
-            headless: false,
-            git_env: Default::default(),
-        },
-    )
+    state
+        .agents
+        .start(
+            &name,
+            agent,
+            crate::agents::Launch {
+                task_id,
+                run_id: None,
+                prompt,
+                cwd,
+                permission,
+                model: crate::agents::model_selector(provider.as_deref(), model.as_deref()),
+                headless: false,
+                git_env: Default::default(),
+            },
+        )
+        .await
 }
 
 /// Whether the daemon should reattach to an existing session rather than launch
@@ -1453,20 +1459,57 @@ async fn start_oneshot_task(
         )
         .await;
 
-    let info = state.agents.start(
-        &name,
-        agent.clone(),
-        crate::agents::Launch {
-            task_id: Some(task.id.to_string()),
-            prompt: None,
-            cwd: cwd_path,
-            // A one-shot session takes its policy from the agent entry.
-            permission: None,
-            model: crate::agents::model_selector(provider.as_deref(), model.as_deref()),
-            headless: false,
-            git_env: Default::default(),
-        },
-    )?;
+    let info = match state
+        .agents
+        .start(
+            &name,
+            agent.clone(),
+            crate::agents::Launch {
+                task_id: Some(task.id.to_string()),
+                run_id: None,
+                prompt: None,
+                cwd: cwd_path,
+                // A one-shot session takes its policy from the agent entry.
+                permission: None,
+                model: crate::agents::model_selector(provider.as_deref(), model.as_deref()),
+                headless: false,
+                git_env: Default::default(),
+            },
+        )
+        .await
+    {
+        Ok(info) => info,
+        Err(error) => {
+            // The inline task was already inserted, so a launch failure must
+            // leave it terminal rather than stuck `running` with no session.
+            let mut failed = task.clone();
+            failed.status = TaskStatus::Failed;
+            failed.error = Some(error.to_string());
+            failed.failure = Some(Failure::new(FailureKind::Infrastructure, error.to_string()));
+            failed.finished_at = Some(Utc::now());
+            if db::finish_active_task(&state.db, &failed)
+                .await
+                .unwrap_or(false)
+            {
+                state
+                    .bus
+                    .publish(ServerPush::TaskUpdated(Box::new(failed.summary())));
+                state
+                    .emit_event(
+                        EventKind::TaskFailed,
+                        serde_json::json!({ "task_id": failed.id }),
+                    )
+                    .await;
+                state
+                    .emit_event(
+                        EventKind::TaskFinished,
+                        crate::executor::finished_payload(&failed, false),
+                    )
+                    .await;
+            }
+            return Err(error);
+        }
+    };
 
     {
         let state = state.clone();
@@ -1804,7 +1847,7 @@ async fn cancel_task(state: &State, id: Uuid) -> anyhow::Result<favetto_core::mo
         return Ok(task.summary());
     }
     // Only a task this call actually cancelled gets its agent torn down.
-    state.agents.close_by_task(&id.to_string());
+    state.agents.close_by_task(&id.to_string()).await;
     let cancelled = db::get_task(&state.db, id).await?.unwrap_or(task);
     announce_cancelled(state, &cancelled).await;
     Ok(cancelled.summary())

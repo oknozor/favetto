@@ -45,6 +45,8 @@ use favetto_core::model::{
     ToolCallDetail, ToolCallStatus, ToolContent, ToolKind, ToolLocation,
 };
 
+use super::session_store::SessionBinding;
+
 /// Deadline for an `ask`-policy permission answered by a remote client.
 pub(crate) const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -72,6 +74,8 @@ pub(crate) struct AcpLaunch {
     pub close_after_turn: bool,
     /// How long an `ask` request waits for a client answer.
     pub permission_timeout: Duration,
+    /// Durable metadata writer for the Favetto-local session record.
+    pub session: Option<SessionBinding>,
 }
 
 /// Commands that do not need the prompt turn to be in flight.
@@ -251,6 +255,8 @@ pub(crate) fn spawn(
     let running_task = running.clone();
     let exit_task = exit_code.clone();
     let session_id_slot = external_session_id.clone();
+    let ready_binding = launch.session.clone();
+    let end_binding = launch.session;
 
     let result_outcome = outcome.clone();
     let result_events = events_tx.clone();
@@ -302,6 +308,33 @@ pub(crate) fn spawn(
                         .block_task()
                         .await?;
                     let session_id = session.session_id.clone();
+                    let external_session_id = session_id.0.to_string();
+                    // Record the agent's identity immediately: a task run can be
+                    // finalized (or the daemon can crash) long before the first
+                    // turn ends. A write fault aborts the session rather than
+                    // letting an untracked conversation continue.
+                    if let Some(binding) = &ready_binding {
+                        if let Err(error) = binding
+                            .store
+                            .mark_ready(
+                                &binding.id,
+                                &external_session_id,
+                                binding.run_id.as_deref(),
+                            )
+                            .await
+                        {
+                            let message = format!(
+                                "agent '{agent_name}': cannot record ACP session id: {error}"
+                            );
+                            let _ = events_tx.send(AgentStateEvent::Error {
+                                message: message.clone(),
+                            });
+                            return Err(anyhow::anyhow!(message).into());
+                        }
+                    }
+                    // Expose the id to the manager even if model selection
+                    // fails below, so a failed run still reports its identity.
+                    *session_id_slot.lock() = Some(external_session_id.clone());
                     // A task names its model explicitly; apply it instead of
                     // relying on the agent's last-used default (which may be
                     // stale or unavailable on this account).
@@ -319,9 +352,8 @@ pub(crate) fn spawn(
                     } else {
                         current_model(&session)
                     };
-                    *session_id_slot.lock() = Some(session_id.0.to_string());
                     let _ = events_tx.send(AgentStateEvent::Session {
-                        session_id: Some(session_id.0.to_string()),
+                        session_id: Some(external_session_id),
                         title: None,
                         model: chosen_model,
                     });
@@ -462,6 +494,24 @@ pub(crate) fn spawn(
                 }
                 let _ = result_events.send(AgentStateEvent::Error { message });
                 exit_task.store(1, Ordering::SeqCst);
+            }
+        }
+        // Record the terminal state before the session reports itself stopped, so
+        // a waiter (and the headless executor) never observes a finished session
+        // without its durable outcome. The row itself is kept for history.
+        if let Some(binding) = &end_binding {
+            let error = result_outcome.lock().error.clone();
+            let recorded = match error.as_deref() {
+                Some(error) => binding.store.mark_failed(&binding.id, error).await,
+                None => binding.store.mark_ended(&binding.id).await,
+            };
+            if let Err(write) = recorded {
+                tracing::warn!(
+                    target: "favetto::acp",
+                    session = %binding.id,
+                    error = %write,
+                    "failed to record the terminal session state"
+                );
             }
         }
         running_task.store(false, Ordering::SeqCst);
@@ -1631,6 +1681,7 @@ mod tests {
             prompt: None,
             close_after_turn: true,
             permission_timeout: Duration::from_secs(1),
+            session: None,
         };
         let error = match spawn(launch) {
             Ok(_) => panic!("a missing cwd must not spawn"),

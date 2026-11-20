@@ -103,6 +103,7 @@ impl State {
         // normalized event is published as an `agent.event` push.
         let mut agents = init.agents;
         agents.set_bus(init.bus.clone());
+        agents.set_store(init.db.clone());
         Self {
             db: init.db,
             bus: init.bus,

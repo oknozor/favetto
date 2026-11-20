@@ -15,7 +15,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use chrono::Utc;
 use parking_lot::Mutex;
+use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 
 use favetto_core::model::{
@@ -25,6 +27,7 @@ use favetto_core::model::{
 use favetto_core::rpc::AgentEventPush;
 
 use crate::config::{AgentConfig, FavettoConfig, GitSettings};
+use crate::db::AgentSessionRecord;
 use crate::event_bus::{EventBus, ServerPush};
 
 pub use acp::AcpOutcome;
@@ -32,6 +35,9 @@ pub use registry::AgentRegistry;
 
 mod acp;
 mod registry;
+mod session_store;
+
+use session_store::{SessionBinding, SessionStore};
 
 /// How many normalized events are kept per session for feed backfill
 /// (`tasks.events`). The live feed arrives over the bus; this is only the
@@ -122,6 +128,8 @@ struct LaunchSpec {
 pub struct Launch {
     /// Catalog task this session is attached to, if any.
     pub task_id: Option<String>,
+    /// Execution attempt this session belongs to, if task-backed.
+    pub run_id: Option<String>,
     /// Prompt to send once the session is ready.
     pub prompt: Option<String>,
     /// Working directory for the agent process and its session.
@@ -224,6 +232,8 @@ struct Session {
     awaiting_input: Arc<Mutex<Option<AwaitingInputReason>>>,
     live: Arc<Mutex<AgentLiveState>>,
     responder: Arc<acp::AcpResponder>,
+    /// Durable metadata writer, when the manager has a database attached.
+    store: Option<SessionStore>,
     state_tx: broadcast::Sender<AgentStateEvent>,
     feed: Arc<Mutex<VecDeque<(u64, AgentStateEvent)>>>,
     next_seq: Arc<AtomicU64>,
@@ -275,6 +285,8 @@ pub struct AgentManager {
     /// The daemon event bus, attached in `State::new` so normalized events are
     /// published as `agent.event` pushes for the web feed.
     bus: Option<EventBus>,
+    /// Durable session metadata, attached in `State::new`.
+    store: Option<SessionStore>,
 }
 
 impl Default for AgentManager {
@@ -302,6 +314,7 @@ impl AgentManager {
             next_order: AtomicU64::new(0),
             git: GitRuntime::default(),
             bus: None,
+            store: None,
         }
     }
 
@@ -309,6 +322,11 @@ impl AgentManager {
     /// `agent.event` pushes. Called once from `State::new`.
     pub fn set_bus(&mut self, bus: EventBus) {
         self.bus = Some(bus);
+    }
+
+    /// Attach durable session metadata storage. Called once from `State::new`.
+    pub(crate) fn set_store(&mut self, pool: SqlitePool) {
+        self.store = Some(SessionStore::new(pool));
     }
 
     /// Resolve the global and per-agent `[git]` settings once at startup, so a
@@ -420,8 +438,12 @@ impl AgentManager {
         })
     }
 
-    /// Spawn an ACP session.
-    pub fn start(
+    /// Spawn an ACP session and record its durable metadata.
+    ///
+    /// The local record is inserted before the agent process starts: a session
+    /// that cannot be tracked is not launched at all. The agent's ACP id is
+    /// written by the runtime as soon as `session/new` returns.
+    pub async fn start(
         &self,
         name: &str,
         agent: Arc<Agent>,
@@ -458,7 +480,26 @@ impl AgentManager {
         }
 
         let cwd = spec.cwd.clone().unwrap_or(launch.cwd);
-        let (handles, events) = acp::spawn(acp::AcpLaunch {
+        let id = uuid::Uuid::new_v4().to_string();
+
+        // The durable row exists before the agent does. Only the identity,
+        // lifecycle and optional task/run link are stored; the transcript stays
+        // with the agent.
+        let mut record = AgentSessionRecord::loading(id.clone(), name, cwd.clone(), Utc::now());
+        record.task_id = launch.task_id.clone();
+        record.run_id = launch.run_id.clone();
+        if let Some(store) = &self.store {
+            store.create(&record).await.map_err(|error| {
+                anyhow::anyhow!("agent '{name}': cannot record ACP session '{id}': {error}")
+            })?;
+        }
+        let binding = self.store.as_ref().map(|store| SessionBinding {
+            store: store.clone(),
+            id: id.clone(),
+            run_id: record.run_id.clone(),
+        });
+
+        let (handles, events) = match acp::spawn(acp::AcpLaunch {
             agent: name.to_string(),
             program,
             args,
@@ -473,9 +514,21 @@ impl AgentManager {
             prompt: launch.prompt,
             close_after_turn: launch.headless,
             permission_timeout: acp::PERMISSION_TIMEOUT,
-        })?;
+            session: binding,
+        }) {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                // The record exists but no session does. Mark it failed rather
+                // than leaving it looking loadable.
+                if let Some(store) = &self.store {
+                    if let Err(write) = store.mark_failed(&id, &error.to_string()).await {
+                        tracing::warn!(session = %id, error = %write, "failed to record session launch failure");
+                    }
+                }
+                return Err(error);
+            }
+        };
 
-        let id = uuid::Uuid::new_v4().to_string();
         let order = self.next_order.fetch_add(1, Ordering::SeqCst);
         let (state_tx, _) = broadcast::channel(256);
         let session = Arc::new(Session {
@@ -493,6 +546,7 @@ impl AgentManager {
                 usage: None,
             })),
             responder: handles.responder.clone(),
+            store: self.store.clone(),
             state_tx: state_tx.clone(),
             feed: Arc::new(Mutex::new(VecDeque::new())),
             next_seq: Arc::new(AtomicU64::new(1)),
@@ -589,17 +643,29 @@ impl AgentManager {
             .await
     }
 
-    /// Terminate a session and drop it from the registry.
-    pub fn close(&self, session_id: &str) -> anyhow::Result<()> {
-        if let Some(session) = self.sessions.lock().remove(session_id) {
-            session.running.store(false, Ordering::SeqCst);
-            session.handles.shutdown();
+    /// Terminate a session, mark its durable record terminal, and drop it from
+    /// the registry. The metadata row is kept for history.
+    pub async fn close(&self, session_id: &str) -> anyhow::Result<()> {
+        let session = self.sessions.lock().remove(session_id);
+        let Some(session) = session else {
+            return Ok(());
+        };
+        session.running.store(false, Ordering::SeqCst);
+        session.handles.shutdown();
+        if let Some(store) = &session.store {
+            if let Err(error) = store.mark_ended(&session.id).await {
+                tracing::warn!(
+                    session = %session.id,
+                    error = %error,
+                    "failed to record session close"
+                );
+            }
         }
         Ok(())
     }
 
     /// Terminate every live session attached to `task_id`.
-    pub fn close_by_task(&self, task_id: &str) {
+    pub async fn close_by_task(&self, task_id: &str) {
         let ids: Vec<String> = self
             .sessions
             .lock()
@@ -608,7 +674,7 @@ impl AgentManager {
             .map(|session| session.id.clone())
             .collect();
         for id in ids {
-            let _ = self.close(&id);
+            let _ = self.close(&id).await;
         }
     }
 
@@ -694,6 +760,17 @@ fn spawn_state_task(
                         *slot = Some(session_id.clone());
                     }
                 }
+                AgentStateEvent::Title { title } => {
+                    if let Some(store) = &session.store {
+                        if let Err(error) = store.set_title(&session.id, title).await {
+                            tracing::warn!(
+                                session = %session.id,
+                                error = %error,
+                                "failed to record the session title"
+                            );
+                        }
+                    }
+                }
                 _ => {}
             }
             // A completed turn is an observation point for the transcript.
@@ -727,6 +804,117 @@ fn spawn_state_task(
             code: Some(session.exit_code.load(Ordering::SeqCst)),
         });
     });
+}
+
+#[cfg(test)]
+mod session_launch_tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use sqlx::SqlitePool;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::db::{self, AgentSessionStatus};
+
+    async fn scratch_pool(tag: &str) -> (PathBuf, SqlitePool) {
+        let dir = std::env::temp_dir().join(format!(
+            "favetto-{tag}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = db::open(&dir.join("test.db")).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        (dir, pool)
+    }
+
+    fn launch(cwd: PathBuf) -> Launch {
+        Launch {
+            task_id: Some("task-1".to_string()),
+            run_id: Some("run-1".to_string()),
+            prompt: None,
+            cwd,
+            permission: None,
+            model: None,
+            headless: true,
+            git_env: Default::default(),
+        }
+    }
+
+    fn agent(command: &str) -> Arc<Agent> {
+        Arc::new(Agent::from_config(
+            "broken",
+            &AgentConfig {
+                command: command.to_string(),
+                ..Default::default()
+            },
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_failed_metadata_write_aborts_the_launch() {
+        let (dir, pool) = scratch_pool("session-insert-failure").await;
+        sqlx::query("DROP TABLE agent_sessions")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut manager = AgentManager::new();
+        manager.set_store(pool.clone());
+
+        let error = manager
+            .start(
+                "broken",
+                agent("/nonexistent/favetto-agent"),
+                launch(dir.clone()),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("cannot record ACP session"), "{error}");
+        assert!(
+            manager.sessions().is_empty(),
+            "an untracked session must not run"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_failed_spawn_leaves_a_terminal_failed_record() {
+        let (dir, pool) = scratch_pool("session-spawn-failure").await;
+        let mut manager = AgentManager::new();
+        manager.set_store(pool.clone());
+
+        let error = manager
+            .start(
+                "broken",
+                agent("/nonexistent/favetto-agent"),
+                launch(dir.clone()),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot launch"), "{error}");
+        assert!(manager.sessions().is_empty());
+
+        let rows = db::list_agent_sessions(&pool, 10).await.unwrap();
+        assert_eq!(rows.len(), 1, "the launch record is kept for history");
+        let record = &rows[0];
+        assert_eq!(record.agent, "broken");
+        assert_eq!(record.cwd, dir);
+        assert_eq!(record.task_id.as_deref(), Some("task-1"));
+        assert_eq!(record.run_id.as_deref(), Some("run-1"));
+        assert_eq!(record.status, AgentSessionStatus::Failed);
+        assert!(record
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("cannot launch")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]

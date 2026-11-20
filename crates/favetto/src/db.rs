@@ -1666,7 +1666,7 @@ pub async fn update_agent_session(
 }
 
 /// Update only the lifecycle status (and error) of a session.
-#[allow(dead_code)] // wired into session launch/history by the following steps
+#[allow(dead_code)] // used by the durable session store and its tests
 pub async fn set_agent_session_status(
     pool: &SqlitePool,
     id: &str,
@@ -1682,6 +1682,89 @@ pub async fn set_agent_session_status(
             .bind(id)
             .execute(pool)
             .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Record the agent's ACP session id and mark the session ready in one write.
+///
+/// The two values must advance together: a row that is `ready` without an
+/// external id cannot be resumed, and must never be advertised as resumable.
+/// Returns whether a row matched.
+pub async fn mark_agent_session_ready(
+    pool: &SqlitePool,
+    id: &str,
+    external_session_id: &str,
+    updated_at: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        "UPDATE agent_sessions
+         SET external_session_id = ?, status = 'ready', error = NULL, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(external_session_id)
+    .bind(ts_ms(updated_at))
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Mark a live session closed, keeping its metadata for history.
+///
+/// Only a session that was still live (`loading`/`ready`) transitions, so a
+/// recorded failure or a repeated close is left untouched.
+pub async fn close_agent_session(
+    pool: &SqlitePool,
+    id: &str,
+    updated_at: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        "UPDATE agent_sessions SET status = 'ended', updated_at = ?
+         WHERE id = ? AND status IN ('loading', 'ready')",
+    )
+    .bind(ts_ms(updated_at))
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Mark a session failed with the reason, keeping its metadata for history.
+///
+/// Only a session that was still live (`loading`/`ready`) transitions, so an
+/// already-ended session is never rewritten as failed.
+pub async fn fail_agent_session(
+    pool: &SqlitePool,
+    id: &str,
+    error: &str,
+    updated_at: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        "UPDATE agent_sessions SET status = 'failed', error = ?, updated_at = ?
+         WHERE id = ? AND status IN ('loading', 'ready')",
+    )
+    .bind(error)
+    .bind(ts_ms(updated_at))
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Persist the agent's ACP session id on a run as soon as it is known.
+///
+/// The run is finalized later with `COALESCE`, so this early write is the
+/// durable record a crash between launch and finalization leaves behind.
+pub async fn set_task_run_session_id(
+    pool: &SqlitePool,
+    run_id: &str,
+    session_id: &str,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query("UPDATE task_runs SET session_id = ? WHERE id = ?")
+        .bind(session_id)
+        .bind(run_id)
+        .execute(pool)
+        .await?;
     Ok(result.rows_affected() == 1)
 }
 
