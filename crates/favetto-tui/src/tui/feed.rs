@@ -625,12 +625,10 @@ fn merge_detail(tool: &mut ToolCard, detail: &ToolCallDetail) {
     if let Some(output) = &detail.output {
         tool.output = Some(output.clone());
     }
-    if !detail.content.is_empty() {
-        tool.content = detail.content.clone();
-    }
-    if !detail.locations.is_empty() {
-        tool.locations = detail.locations.clone();
-    }
+    // `detail` is a cumulative snapshot, not a patch: an empty collection is an
+    // explicit clear and must replace what the card held before.
+    tool.content = detail.content.clone();
+    tool.locations = detail.locations.clone();
 }
 
 /// A tool lifecycle only moves forward. A late or repeated snapshot must not
@@ -1200,6 +1198,45 @@ mod tests {
             panic!("expected a tool card");
         };
         assert_eq!(tool.status, ToolCallStatus::InProgress);
+    }
+
+    #[test]
+    fn a_snapshot_with_empty_content_clears_previous_content_and_locations() {
+        let mut feed = AgentFeed::new();
+        feed.apply(&AgentStateEvent::ToolStarted {
+            id: "t".to_string(),
+            name: "read".to_string(),
+            input: json!({}),
+            detail: Some(Box::new(ToolCallDetail {
+                status: Some(ToolCallStatus::InProgress),
+                content: vec![ToolContent::Text {
+                    text: "stale".to_string(),
+                }],
+                locations: vec![ToolLocation {
+                    path: "stale.rs".to_string(),
+                    line: None,
+                }],
+                ..Default::default()
+            })),
+        });
+
+        feed.apply(&AgentStateEvent::ToolUpdated {
+            id: "t".to_string(),
+            partial: json!({}),
+            detail: Some(Box::new(ToolCallDetail {
+                status: Some(ToolCallStatus::InProgress),
+                ..Default::default()
+            })),
+        });
+
+        let FeedKind::Tool(tool) = &feed.items().next().unwrap().kind else {
+            panic!("expected a tool card");
+        };
+        assert!(tool.content.is_empty(), "empty snapshot must clear content");
+        assert!(
+            tool.locations.is_empty(),
+            "empty snapshot must clear locations"
+        );
     }
 
     #[test]
