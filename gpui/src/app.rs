@@ -765,6 +765,7 @@ impl RootView {
             theme,
         );
 
+        let commands = [("Command palette", "⌘K")];
         let navigation: [(&'static str, &'static str); 6] =
             Route::ALL.map(|route| (route.label(), route.shortcut()));
         let anywhere = [
@@ -799,6 +800,18 @@ impl RootView {
                             .child("Keyboard shortcuts"),
                     )
                     .child(close),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(components::section_label(theme, "COMMANDS"))
+                    .children(
+                        commands
+                            .iter()
+                            .map(|(label, keys)| components::shortcut_row(theme, label, keys)),
+                    ),
             )
             .child(
                 div()
