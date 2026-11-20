@@ -42,6 +42,9 @@ pub struct CatalogView {
     launch_submit_focus: FocusHandle,
     oneshot_cancel_focus: FocusHandle,
     oneshot_submit_focus: FocusHandle,
+    error_copy_focus: FocusHandle,
+    search_clear_focus: FocusHandle,
+    start_focus: FocusHandle,
 }
 
 impl CatalogView {
@@ -52,14 +55,17 @@ impl CatalogView {
             list_scroll: ScrollHandle::new(),
             preview_scroll: ScrollHandle::new(),
             scrolled_to: None,
-            retry_focus: cx.focus_handle().tab_index(41).tab_stop(true),
-            oneshot_focus: cx.focus_handle().tab_index(42).tab_stop(true),
-            copy_focus: cx.focus_handle().tab_index(43).tab_stop(true),
-            preview_retry_focus: cx.focus_handle().tab_index(44).tab_stop(true),
-            launch_cancel_focus: cx.focus_handle().tab_index(45).tab_stop(true),
-            launch_submit_focus: cx.focus_handle().tab_index(46).tab_stop(true),
-            oneshot_cancel_focus: cx.focus_handle().tab_index(47).tab_stop(true),
-            oneshot_submit_focus: cx.focus_handle().tab_index(48).tab_stop(true),
+            retry_focus: cx.focus_handle().tab_index(20).tab_stop(true),
+            oneshot_focus: cx.focus_handle().tab_index(21).tab_stop(true),
+            copy_focus: cx.focus_handle().tab_index(22).tab_stop(true),
+            preview_retry_focus: cx.focus_handle().tab_index(23).tab_stop(true),
+            launch_cancel_focus: cx.focus_handle().tab_index(24).tab_stop(true),
+            launch_submit_focus: cx.focus_handle().tab_index(25).tab_stop(true),
+            oneshot_cancel_focus: cx.focus_handle().tab_index(26).tab_stop(true),
+            oneshot_submit_focus: cx.focus_handle().tab_index(27).tab_stop(true),
+            error_copy_focus: cx.focus_handle().tab_index(28).tab_stop(true),
+            search_clear_focus: cx.focus_handle().tab_index(29).tab_stop(true),
+            start_focus: cx.focus_handle().tab_index(30).tab_stop(true),
         }
     }
 
@@ -123,6 +129,8 @@ impl CatalogView {
                     .child(hint(theme, "move"))
                     .child(components::keycap(theme, "↵"))
                     .child(hint(theme, "start"))
+                    .child(components::keycap(theme, "h"))
+                    .child(hint(theme, "collapse"))
                     .child(oneshot),
             )
     }
@@ -138,25 +146,29 @@ impl CatalogView {
     ) -> Stateful<Div> {
         let clear = (!query.is_empty()).then(|| {
             let state = self.state.clone();
-            div()
-                .id("catalog-search-clear")
-                .flex()
-                .items_center()
-                .justify_center()
-                .w(px(18.0))
-                .h(px(18.0))
-                .rounded(px(theme.radii.r4))
-                .text_color(theme.colors.muted)
-                .cursor_pointer()
-                .hover(|style| style.bg(theme.colors.bg))
-                .child("×")
-                .on_click(cx.listener(move |_this, _event, _window, cx| {
-                    state.update(cx, |state, cx| {
-                        state.clear_catalog_search();
-                        cx.notify();
-                    });
-                    cx.stop_propagation();
-                }))
+            components::with_focus(
+                div()
+                    .id("catalog-search-clear")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(theme.controls.min))
+                    .px(px(theme.spacing.s2))
+                    .rounded(px(theme.radii.r4))
+                    .text_color(theme.colors.muted)
+                    .cursor_pointer()
+                    .track_focus(&self.search_clear_focus)
+                    .hover(|style| style.bg(theme.colors.bg))
+                    .child("Clear")
+                    .on_click(cx.listener(move |_this, _event, _window, cx| {
+                        state.update(cx, |state, cx| {
+                            state.clear_catalog_search();
+                            cx.notify();
+                        });
+                        cx.stop_propagation();
+                    })),
+                theme,
+            )
         });
 
         div()
@@ -265,7 +277,7 @@ impl CatalogView {
                 .flex()
                 .items_center()
                 .gap(px(theme.spacing.s2))
-                .h(px(36.0))
+                .h(px(theme.controls.primary))
                 .px(px(theme.spacing.s3))
                 .rounded(px(theme.radii.r8))
                 .bg(Hsla::from(theme.colors.accent).opacity(0.16))
@@ -281,6 +293,24 @@ impl CatalogView {
                     });
                 })),
             theme,
+        )
+    }
+
+    fn error_copy_button(
+        &self,
+        theme: &Theme,
+        message: &str,
+        id: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let message = message.to_string();
+        components::copy_button(theme, id, "Copy error", &self.error_copy_focus).on_click(
+            cx.listener(move |this, _event, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.copy_text(message.clone(), "the error", cx);
+                    cx.notify();
+                });
+            }),
         )
     }
 
@@ -344,7 +374,14 @@ impl CatalogView {
                     .text_center()
                     .child(message.to_string()),
             )
-            .child(self.retry_button(theme, cx))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s2))
+                    .child(self.error_copy_button(theme, message, "catalog-error-copy", cx))
+                    .child(self.retry_button(theme, cx)),
+            )
     }
 
     fn error_banner(&self, theme: &Theme, message: &str, cx: &mut Context<Self>) -> Div {
@@ -372,6 +409,7 @@ impl CatalogView {
                     .text_color(theme.colors.text)
                     .child(format!("Refresh failed: {message}")),
             )
+            .child(self.error_copy_button(theme, message, "catalog-error-copy-banner", cx))
             .child(self.retry_button(theme, cx))
     }
 
@@ -446,7 +484,7 @@ impl CatalogView {
             .items_center()
             .gap(px(theme.spacing.s2))
             .w_full()
-            .h(px(26.0))
+            .h(px(theme.controls.min))
             .pl(px(theme.spacing.s6))
             .pr(px(theme.spacing.s2))
             .cursor_pointer()
@@ -641,6 +679,7 @@ impl CatalogView {
                             .text_size(px(theme.font.sm))
                             .text_color(theme.colors.accent)
                             .cursor_pointer()
+                            .track_focus(&self.search_clear_focus)
                             .child("Clear search")
                             .on_click(cx.listener(move |_this, _event, _window, cx| {
                                 state.update(cx, |state, cx| {
@@ -753,27 +792,39 @@ impl CatalogView {
                                 .text_color(theme.colors.danger)
                                 .child(format!("The source could not load: {error}")),
                         )
-                        .child(components::with_focus(
+                        .child(
                             div()
-                                .id("catalog-preview-retry")
-                                .px(px(theme.spacing.s2))
-                                .py(px(2.0))
-                                .rounded(px(theme.radii.r4))
-                                .border_1()
-                                .border_color(theme.colors.border)
-                                .text_size(px(theme.font.xs))
-                                .text_color(theme.colors.accent)
-                                .cursor_pointer()
-                                .track_focus(&self.preview_retry_focus)
-                                .child("Retry")
-                                .on_click(cx.listener(|this, _event, _window, cx| {
-                                    this.state.update(cx, |state, cx| {
-                                        state.retry_catalog_preview();
-                                        cx.notify();
-                                    });
-                                })),
-                            theme,
-                        ))
+                                .flex()
+                                .items_center()
+                                .gap(px(theme.spacing.s2))
+                                .child(self.error_copy_button(
+                                    theme,
+                                    error,
+                                    "catalog-preview-error-copy",
+                                    cx,
+                                ))
+                                .child(components::with_focus(
+                                    div()
+                                        .id("catalog-preview-retry")
+                                        .px(px(theme.spacing.s2))
+                                        .py(px(2.0))
+                                        .rounded(px(theme.radii.r4))
+                                        .border_1()
+                                        .border_color(theme.colors.border)
+                                        .text_size(px(theme.font.xs))
+                                        .text_color(theme.colors.accent)
+                                        .cursor_pointer()
+                                        .track_focus(&self.preview_retry_focus)
+                                        .child("Retry")
+                                        .on_click(cx.listener(|this, _event, _window, cx| {
+                                            this.state.update(cx, |state, cx| {
+                                                state.retry_catalog_preview();
+                                                cx.notify();
+                                            });
+                                        })),
+                                    theme,
+                                )),
+                        )
                         .into_any_element()
                 } else {
                     div()
@@ -806,14 +857,15 @@ impl CatalogView {
                     .flex()
                     .items_center()
                     .gap(px(theme.spacing.s2))
+                    .h(px(theme.controls.primary))
                     .px(px(theme.spacing.s3))
-                    .py(px(theme.spacing.s1))
                     .rounded(px(theme.radii.r8))
                     .bg(Hsla::from(theme.colors.accent).opacity(0.16))
-                    .text_size(px(theme.font.xs))
+                    .text_size(px(theme.font.sm))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.colors.accent)
                     .cursor_pointer()
+                    .track_focus(&self.start_focus)
                     .child("Start with variables…")
                     .on_click(cx.listener(move |this, _event, _window, cx| {
                         this.state.update(cx, |state, cx| {
@@ -1016,8 +1068,10 @@ impl CatalogView {
                     row = row.child(
                         div()
                             .id(("catalog-choice", index * 100 + choice_index))
+                            .flex()
+                            .items_center()
+                            .h(px(theme.controls.min))
                             .px(px(theme.spacing.s2))
-                            .py(px(1.0))
                             .rounded(px(theme.radii.r4))
                             .border_1()
                             .border_color(if selected {
@@ -1032,6 +1086,7 @@ impl CatalogView {
                             .when(!selected, |chip| chip.text_color(theme.colors.muted))
                             .text_size(px(theme.font.xs))
                             .cursor_pointer()
+                            .when(selected, |chip| chip.child("✓"))
                             .child(choice)
                             .on_click(cx.listener(move |_this, _event, _window, cx| {
                                 state.update(cx, |state, cx| {
@@ -1064,6 +1119,7 @@ impl CatalogView {
         }
 
         let server_error = form.server_error.clone().map(|message| {
+            let copy = self.error_copy_button(theme, &message, "catalog-sheet-error-copy", cx);
             div()
                 .flex()
                 .items_start()
@@ -1089,6 +1145,7 @@ impl CatalogView {
                         .text_color(theme.colors.text)
                         .child(message),
                 )
+                .child(copy)
         });
 
         let cancel = components::with_focus(
@@ -1208,6 +1265,8 @@ impl CatalogView {
                             .gap(px(theme.spacing.s2))
                             .child(components::keycap(theme, "tab"))
                             .child(hint(theme, "next field"))
+                            .child(components::keycap(theme, "←→"))
+                            .child(hint(theme, "choice"))
                             .child(components::keycap(theme, "⌘↵"))
                             .child(hint(theme, "launch")),
                     )
@@ -1356,6 +1415,7 @@ impl CatalogView {
             });
 
         let server_error = form.server_error.clone().map(|message| {
+            let copy = self.error_copy_button(theme, &message, "catalog-sheet-error-copy", cx);
             div()
                 .flex()
                 .items_start()
@@ -1381,6 +1441,7 @@ impl CatalogView {
                         .text_color(theme.colors.text)
                         .child(message),
                 )
+                .child(copy)
         });
 
         let cancel = components::with_focus(

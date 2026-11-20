@@ -11,25 +11,28 @@
 //! [`crate::layout::container_query`] reads the equivalent full-window width.
 
 use gpui::{
-    div, prelude::*, px, AnyElement, Context, Div, Entity, FocusHandle, Hsla, IntoElement, Render,
-    Stateful, Window,
+    div, prelude::*, px, Animation, AnimationExt, AnyElement, Context, Div, Entity, FocusHandle,
+    Hsla, IntoElement, Render, Stateful, Window,
 };
 
 use crate::actions::{
-    self, CatalogFieldNext, CatalogFieldPrev, CatalogLaunchSubmit, CatalogNewOneshot,
-    CatalogSearch, CloseOverlay, GoCatalog, GoInbox, GoSchedules, GoSettings, GoTasks, GoWorkflows,
+    self, CatalogChoiceNext, CatalogChoicePrev, CatalogFieldNext, CatalogFieldPrev,
+    CatalogLaunchSubmit, CatalogNewOneshot, CatalogSearch, CatalogToggleFolder, CloseOverlay,
+    FocusNext, FocusPrev, GoCatalog, GoInbox, GoSchedules, GoSettings, GoTasks, GoWorkflows,
     ListDown, ListEnd, ListHome, ListOpen, ListPageDown, ListPageUp, ListUp, PaletteConfirm,
     PaletteDown, PaletteUp, Refresh, ScheduleDelete, ScheduleEdit, ScheduleFieldNext,
     ScheduleFieldPrev, ScheduleNew, ScheduleSubmit, ScheduleToggleEnabled, SettingsActivate,
     SettingsFieldNext, SettingsFieldPrev, SettingsSave, SettingsTest, TaskCancel,
     TaskConfirmAccept, TaskConfirmReject, TaskFilterNext, TaskFilterPrev, TaskRetry, TaskSearch,
-    TogglePalette, ToggleShortcuts, WorkflowCancelRoot, WorkflowRetryInstance,
+    TogglePalette, ToggleShortcuts, WorkflowCancelRoot, WorkflowRetryInstance, WorkflowRootNext,
+    WorkflowRootPrev,
 };
 use crate::catalog::OneShotFocus;
 use crate::components;
 use crate::layout::{container_query, LayoutMode};
 use crate::palette::{CommandKind, CommandPalette};
 use crate::routes::Route;
+use crate::schedules::ScheduleField;
 use crate::state::{ClientState, TaskConfirm, Toast, ToastKind};
 use crate::tasks::TaskAction;
 use crate::theme::{Theme, DETAIL_WIDTH, SIDEBAR_WIDTH, STATUS_BAR_HEIGHT, TOP_BAR_HEIGHT};
@@ -70,6 +73,11 @@ pub struct RootView {
     settings_button_focus: FocusHandle,
     shortcuts_button_focus: FocusHandle,
     reconnect_button_focus: FocusHandle,
+    toast_dismiss_focus: FocusHandle,
+    confirm_back_focus: FocusHandle,
+    confirm_accept_focus: FocusHandle,
+    confirm_copy_focus: FocusHandle,
+    toast_copy_focus: FocusHandle,
     shortcuts_close_focus: FocusHandle,
 }
 
@@ -102,8 +110,13 @@ impl RootView {
                     .tab_stop(true)
             })
             .collect();
-        let shortcuts_button_focus = cx.focus_handle().tab_index(30).tab_stop(true);
-        let reconnect_button_focus = cx.focus_handle().tab_index(31).tab_stop(true);
+        let shortcuts_button_focus = cx.focus_handle().tab_index(70).tab_stop(true);
+        let reconnect_button_focus = cx.focus_handle().tab_index(71).tab_stop(true);
+        let toast_dismiss_focus = cx.focus_handle().tab_index(72).tab_stop(true);
+        let confirm_back_focus = cx.focus_handle().tab_index(73).tab_stop(true);
+        let confirm_accept_focus = cx.focus_handle().tab_index(74).tab_stop(true);
+        let confirm_copy_focus = cx.focus_handle().tab_index(75).tab_stop(true);
+        let toast_copy_focus = cx.focus_handle().tab_index(76).tab_stop(true);
         let shortcuts_close_focus = cx.focus_handle().tab_index(100).tab_stop(true);
 
         window.focus(&root_focus);
@@ -121,6 +134,11 @@ impl RootView {
             settings_button_focus,
             shortcuts_button_focus,
             reconnect_button_focus,
+            toast_dismiss_focus,
+            confirm_back_focus,
+            confirm_accept_focus,
+            confirm_copy_focus,
+            toast_copy_focus,
             shortcuts_close_focus,
         }
     }
@@ -205,9 +223,10 @@ impl RootView {
         }
     }
 
-    fn on_jump(&mut self, action: &dyn gpui::Action, cx: &mut Context<Self>) {
+    fn on_jump(&mut self, action: &dyn gpui::Action, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(route) = actions::route_for_action(action) {
             self.navigate(route, cx);
+            window.focus(&self.root_focus);
         }
     }
 
@@ -248,7 +267,15 @@ impl RootView {
                 cx.notify();
             }),
             Route::Schedules => self.state.update(cx, |state, cx| {
-                state.move_schedule_selection(delta);
+                if state.schedule_editor_open() {
+                    // The sheet owns ↑/↓ while its task picker is focused;
+                    // otherwise the keys do not move the table behind the modal.
+                    if state.schedule_focus() == Some(ScheduleField::Task) {
+                        state.cycle_schedule_task(delta);
+                    }
+                } else {
+                    state.move_schedule_selection(delta);
+                }
                 cx.notify();
             }),
             Route::Settings => {}
@@ -295,7 +322,12 @@ impl RootView {
     }
 
     /// Open the highlighted row's detail (step 06 fills the detail).
-    fn open_list(&mut self, cx: &mut Context<Self>) {
+    fn open_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Tab focus can land on a real button. Enter then belongs to that
+        // button (GPUI activates it on key-up), not to the list underneath.
+        if window.focused(cx).as_ref() != Some(&self.root_focus) {
+            return;
+        }
         let route = self.state.read(cx).active_route();
         match route {
             Route::Inbox => self.state.update(cx, |state, cx| {
@@ -340,7 +372,15 @@ impl RootView {
     }
 
     /// Enter/Space on the confirmation: apply optimistically and reconcile.
-    fn accept_task_confirm(&mut self, cx: &mut Context<Self>) {
+    fn accept_task_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The Back button owns Enter while it is focused; otherwise the shell's
+        // confirm action would contradict the visible focus.
+        if window.focused(cx).as_ref() == Some(&self.confirm_back_focus) {
+            return;
+        }
+        // The confirmation is about to close (or has been rejected); return the
+        // keyboard to the shell so Tab starts from a predictable place.
+        window.focus(&self.root_focus);
         let route = self.state.read(cx).active_route();
         self.state.update(cx, |state, cx| {
             if route == Route::Workflows {
@@ -575,8 +615,9 @@ impl RootView {
                 .track_focus(&self.settings_button_focus)
                 .child(Route::Settings.icon())
                 .child("Settings")
-                .on_click(cx.listener(|this, _event, _window, cx| {
+                .on_click(cx.listener(|this, _event, window, cx| {
                     this.navigate(Route::Settings, cx);
+                    window.focus(&this.root_focus);
                 })),
             theme,
         );
@@ -744,8 +785,9 @@ impl RootView {
                     )
                 })
                 .when_some(badge, |entry, badge| entry.child(badge))
-                .on_click(cx.listener(move |this, _event, _window, cx| {
+                .on_click(cx.listener(move |this, _event, window, cx| {
                     this.navigate(route, cx);
+                    window.focus(&this.root_focus);
                 })),
             theme,
         )
@@ -1101,6 +1143,29 @@ impl RootView {
             ("Previous / next filter", "[ ]"),
             ("Confirm a dialog", "↵"),
         ];
+        let catalog = [
+            ("Move the definition", "↑ ↓"),
+            ("Open the launch sheet", "↵"),
+            ("Search definitions", "/"),
+            ("Collapse the folder", "h"),
+            ("Test connection", "⌘T"),
+            ("Save settings", "⌘↵"),
+        ];
+        let workflows = [
+            ("Move the instance", "↑ ↓"),
+            ("Previous / next root", "[ ]"),
+            ("Open the run", "↵"),
+            ("Cancel the root", "c"),
+            ("Retry a failed instance", "r"),
+        ];
+        let schedules = [
+            ("New schedule", "n"),
+            ("Edit the row", "↵"),
+            ("Delete the row", "d"),
+            ("Next / previous field", "tab"),
+            ("Toggle enabled", "⌘E"),
+            ("Save schedule", "⌘↵"),
+        ];
 
         let panel = div()
             .w(px(640.0))
@@ -1141,6 +1206,21 @@ impl RootView {
                     .gap(px(theme.spacing.s6))
                     .items_start()
                     .child(shortcut_section(theme, "TASKS", &tasks))
+                    .child(shortcut_section(theme, "CATALOG", &catalog)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(theme.spacing.s6))
+                    .items_start()
+                    .child(shortcut_section(theme, "WORKFLOWS", &workflows))
+                    .child(shortcut_section(theme, "SCHEDULES", &schedules)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(theme.spacing.s6))
+                    .items_start()
                     .child(shortcut_section(theme, "ANYWHERE", &anywhere)),
             );
 
@@ -1184,6 +1264,7 @@ impl RootView {
                 .text_size(px(theme.font.sm))
                 .text_color(theme.colors.text)
                 .cursor_pointer()
+                .track_focus(&self.confirm_back_focus)
                 .child("Back")
                 .child(components::keycap(theme, "esc"))
                 .on_click(cx.listener(|this, _event, window, cx| {
@@ -1207,10 +1288,11 @@ impl RootView {
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(primary_fg)
                 .cursor_pointer()
+                .track_focus(&self.confirm_accept_focus)
                 .child(confirm.confirm_label())
                 .child(components::keycap(theme, "↵"))
-                .on_click(cx.listener(|this, _event, _window, cx| {
-                    this.accept_task_confirm(cx);
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.accept_task_confirm(window, cx);
                 })),
             theme,
         );
@@ -1301,6 +1383,7 @@ impl RootView {
                 .text_size(px(theme.font.sm))
                 .text_color(theme.colors.text)
                 .cursor_pointer()
+                .track_focus(&self.confirm_back_focus)
                 .child("Back")
                 .child(components::keycap(theme, "esc"))
                 .on_click(cx.listener(|this, _event, window, cx| {
@@ -1330,10 +1413,11 @@ impl RootView {
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(accept_color)
                 .cursor_pointer()
+                .track_focus(&self.confirm_accept_focus)
                 .child(confirm.confirm_label())
                 .child(components::keycap(theme, "↵"))
-                .on_click(cx.listener(|this, _event, _window, cx| {
-                    this.accept_task_confirm(cx);
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.accept_task_confirm(window, cx);
                 })),
             theme,
         );
@@ -1423,6 +1507,7 @@ impl RootView {
                 .text_size(px(theme.font.sm))
                 .text_color(theme.colors.text)
                 .cursor_pointer()
+                .track_focus(&self.confirm_back_focus)
                 .child("Back")
                 .child(components::keycap(theme, "esc"))
                 .on_click(cx.listener(|this, _event, window, cx| {
@@ -1451,19 +1536,42 @@ impl RootView {
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(accept_color)
                 .cursor_pointer()
+                .track_focus(&self.confirm_accept_focus)
                 .child(confirm.confirm_label())
                 .child(components::keycap(theme, "↵"))
-                .on_click(cx.listener(|this, _event, _window, cx| {
-                    this.accept_task_confirm(cx);
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.accept_task_confirm(window, cx);
                 })),
             theme,
         );
 
         let error = confirm.error.clone().map(|message| {
+            let copy_text = message.clone();
+            let copy = components::copy_button(
+                theme,
+                "schedule-confirm-error-copy",
+                "Copy error",
+                &self.confirm_copy_focus,
+            )
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.copy_text(copy_text.clone(), "the error", cx);
+                    cx.notify();
+                });
+            }));
             div()
-                .text_size(px(theme.font.xs))
-                .text_color(theme.colors.danger)
-                .child(message)
+                .flex()
+                .items_center()
+                .gap(px(theme.spacing.s2))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_size(px(theme.font.xs))
+                        .text_color(theme.colors.danger)
+                        .child(message),
+                )
+                .child(copy)
         });
 
         let panel = div()
@@ -1523,32 +1631,47 @@ impl RootView {
     }
 
     /// The self-dismissing toast above the status bar.
-    fn toast_overlay(&self, theme: &Theme, toast: &Toast, cx: &mut Context<Self>) -> Div {
+    fn toast_overlay(&self, theme: &Theme, toast: &Toast, cx: &mut Context<Self>) -> AnyElement {
         let (icon, color) = match toast.kind {
             ToastKind::Info => ("ℹ", theme.colors.accent),
             ToastKind::Success => ("✓", theme.colors.success),
             ToastKind::Error => ("⚠", theme.colors.danger),
         };
-        let dismiss = div()
-            .id("toast-dismiss")
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(px(20.0))
-            .h(px(20.0))
-            .rounded(px(theme.radii.r4))
-            .text_color(theme.colors.muted)
-            .cursor_pointer()
-            .hover(|style| style.bg(theme.colors.bg))
-            .child("×")
-            .on_click(cx.listener(|this, _event, _window, cx| {
-                this.state.update(cx, |state, cx| {
-                    state.dismiss_toast();
-                    cx.notify();
-                });
-            }));
+        let dismiss = components::with_focus(
+            div()
+                .id("toast-dismiss")
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(theme.spacing.s1))
+                .px(px(theme.spacing.s2))
+                .h(px(theme.controls.min))
+                .rounded(px(theme.radii.r4))
+                .text_color(theme.colors.muted)
+                .cursor_pointer()
+                .track_focus(&self.toast_dismiss_focus)
+                .hover(|style| style.bg(theme.colors.bg))
+                .child("Dismiss")
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.state.update(cx, |state, cx| {
+                        state.dismiss_toast();
+                        cx.notify();
+                    });
+                })),
+            theme,
+        );
 
-        div()
+        let copy = (toast.kind == ToastKind::Error).then(|| {
+            let message = toast.message.clone();
+            components::copy_button(theme, "toast-copy", "Copy error", &self.toast_copy_focus)
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.state.update(cx, |state, cx| {
+                        state.copy_text(message.clone(), "the error", cx);
+                        cx.notify();
+                    });
+                }))
+        });
+        let panel = div()
             .absolute()
             .bottom(px(STATUS_BAR_HEIGHT + theme.spacing.s3))
             .right(px(theme.spacing.s4))
@@ -1576,7 +1699,23 @@ impl RootView {
                     .text_color(theme.colors.text)
                     .child(toast.message.clone()),
             )
-            .child(dismiss)
+            .when_some(copy, |panel, copy| panel.child(copy))
+            .child(dismiss);
+
+        // The toast is the one decorative entrance in the client. Reduced motion
+        // removes the fade but keeps the same final state; the icon and message
+        // are already present, so nothing is conveyed by the motion alone.
+        if crate::motion::prefers_reduced_motion() {
+            panel.into_any_element()
+        } else {
+            panel
+                .with_animation(
+                    "toast-in",
+                    Animation::new(crate::motion::duration(140)),
+                    |panel, delta| panel.opacity(delta),
+                )
+                .into_any_element()
+        }
     }
 }
 
@@ -1742,29 +1881,37 @@ impl Render for RootView {
                     this.open_palette(window, cx);
                 }
             }))
+            .on_action(cx.listener(|_this, _: &FocusNext, window, cx| {
+                window.focus_next();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|_this, _: &FocusPrev, window, cx| {
+                window.focus_prev();
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &CloseOverlay, window, cx| {
                 this.close_overlay(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleShortcuts, window, cx| {
                 this.toggle_shortcuts(window, cx);
             }))
-            .on_action(cx.listener(|this, action: &GoInbox, _window, cx| {
-                this.on_jump(action, cx);
+            .on_action(cx.listener(|this, action: &GoInbox, window, cx| {
+                this.on_jump(action, window, cx);
             }))
-            .on_action(cx.listener(|this, action: &GoTasks, _window, cx| {
-                this.on_jump(action, cx);
+            .on_action(cx.listener(|this, action: &GoTasks, window, cx| {
+                this.on_jump(action, window, cx);
             }))
-            .on_action(cx.listener(|this, action: &GoCatalog, _window, cx| {
-                this.on_jump(action, cx);
+            .on_action(cx.listener(|this, action: &GoCatalog, window, cx| {
+                this.on_jump(action, window, cx);
             }))
-            .on_action(cx.listener(|this, action: &GoWorkflows, _window, cx| {
-                this.on_jump(action, cx);
+            .on_action(cx.listener(|this, action: &GoWorkflows, window, cx| {
+                this.on_jump(action, window, cx);
             }))
-            .on_action(cx.listener(|this, action: &GoSchedules, _window, cx| {
-                this.on_jump(action, cx);
+            .on_action(cx.listener(|this, action: &GoSchedules, window, cx| {
+                this.on_jump(action, window, cx);
             }))
-            .on_action(cx.listener(|this, action: &GoSettings, _window, cx| {
-                this.on_jump(action, cx);
+            .on_action(cx.listener(|this, action: &GoSettings, window, cx| {
+                this.on_jump(action, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ListUp, _window, cx| {
                 this.move_list(-1, cx);
@@ -1784,8 +1931,8 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &ListPageDown, _window, cx| {
                 this.jump_list(ListJump::PageDown, cx);
             }))
-            .on_action(cx.listener(|this, _: &ListOpen, _window, cx| {
-                this.open_list(cx);
+            .on_action(cx.listener(|this, _: &ListOpen, window, cx| {
+                this.open_list(window, cx);
             }))
             .on_action(cx.listener(|this, _: &TaskSearch, _window, cx| {
                 this.focus_task_search(cx);
@@ -1804,6 +1951,18 @@ impl Render for RootView {
             }))
             .on_action(cx.listener(|this, _: &CatalogFieldPrev, _window, cx| {
                 this.cycle_catalog_form_focus(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CatalogChoicePrev, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.cycle_catalog_choice(-1);
+                    cx.notify();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &CatalogChoiceNext, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.cycle_catalog_choice(1);
+                    cx.notify();
+                });
             }))
             .on_action(cx.listener(|this, _: &ScheduleNew, _window, cx| {
                 this.new_schedule(cx);
@@ -1859,14 +2018,32 @@ impl Render for RootView {
                     cx.notify();
                 });
             }))
+            .on_action(cx.listener(|this, _: &WorkflowRootPrev, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.move_workflow_root(-1);
+                    cx.notify();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &WorkflowRootNext, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.move_workflow_root(1);
+                    cx.notify();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &CatalogToggleFolder, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.toggle_catalog_selected_folder();
+                    cx.notify();
+                });
+            }))
             .on_action(cx.listener(|this, _: &TaskFilterPrev, _window, cx| {
                 this.cycle_task_filter(-1, cx);
             }))
             .on_action(cx.listener(|this, _: &TaskFilterNext, _window, cx| {
                 this.cycle_task_filter(1, cx);
             }))
-            .on_action(cx.listener(|this, _: &TaskConfirmAccept, _window, cx| {
-                this.accept_task_confirm(cx);
+            .on_action(cx.listener(|this, _: &TaskConfirmAccept, window, cx| {
+                this.accept_task_confirm(window, cx);
             }))
             .on_action(cx.listener(|this, _: &TaskConfirmReject, _window, cx| {
                 this.dismiss_task_confirm(cx);

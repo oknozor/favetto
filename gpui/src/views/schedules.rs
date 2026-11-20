@@ -28,6 +28,7 @@ pub struct SchedulesView {
     retry_focus: FocusHandle,
     save_focus: FocusHandle,
     cancel_focus: FocusHandle,
+    error_copy_focus: FocusHandle,
 }
 
 impl SchedulesView {
@@ -37,11 +38,12 @@ impl SchedulesView {
             state,
             table_scroll: ScrollHandle::new(),
             scrolled_to: None,
-            new_focus: cx.focus_handle().tab_index(40).tab_stop(true),
-            refresh_focus: cx.focus_handle().tab_index(41).tab_stop(true),
-            retry_focus: cx.focus_handle().tab_index(42).tab_stop(true),
-            save_focus: cx.focus_handle().tab_index(43).tab_stop(true),
-            cancel_focus: cx.focus_handle().tab_index(44).tab_stop(true),
+            new_focus: cx.focus_handle().tab_index(21).tab_stop(true),
+            refresh_focus: cx.focus_handle().tab_index(20).tab_stop(true),
+            retry_focus: cx.focus_handle().tab_index(22).tab_stop(true),
+            save_focus: cx.focus_handle().tab_index(23).tab_stop(true),
+            cancel_focus: cx.focus_handle().tab_index(24).tab_stop(true),
+            error_copy_focus: cx.focus_handle().tab_index(25).tab_stop(true),
         }
     }
 
@@ -296,8 +298,10 @@ impl SchedulesView {
                     .child(
                         div()
                             .id(("schedule-edit", index))
+                            .h(px(theme.controls.min))
                             .px(px(theme.spacing.s2))
-                            .py(px(3.0))
+                            .flex()
+                            .items_center()
                             .rounded(px(theme.radii.r4))
                             .text_size(px(theme.font.xs))
                             .text_color(theme.colors.accent)
@@ -316,8 +320,10 @@ impl SchedulesView {
                     .child(
                         div()
                             .id(("schedule-delete", index))
+                            .h(px(theme.controls.min))
                             .px(px(theme.spacing.s2))
-                            .py(px(3.0))
+                            .flex()
+                            .items_center()
                             .rounded(px(theme.radii.r4))
                             .text_size(px(theme.font.xs))
                             .text_color(theme.colors.muted)
@@ -379,7 +385,26 @@ impl SchedulesView {
                     .text_color(theme.colors.text)
                     .child(format!("Could not load schedules: {message}")),
             )
+            .child(self.error_copy_button(theme, message, "schedules-error-copy-banner", cx))
             .child(retry)
+    }
+
+    fn error_copy_button(
+        &self,
+        theme: &Theme,
+        message: &str,
+        id: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let message = message.to_string();
+        components::copy_button(theme, id, "Copy error", &self.error_copy_focus).on_click(
+            cx.listener(move |this, _event, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.copy_text(message.clone(), "the error", cx);
+                    cx.notify();
+                });
+            }),
+        )
     }
 
     fn editor_sheet(
@@ -485,7 +510,7 @@ impl SchedulesView {
                         .items_center()
                         .justify_between()
                         .gap(px(theme.spacing.s2))
-                        .h(px(30.0))
+                        .h(px(theme.controls.min))
                         .px(px(theme.spacing.s2))
                         .rounded(px(theme.radii.r4))
                         .when(selected, |row| {
@@ -566,6 +591,12 @@ impl SchedulesView {
                         editor.task
                     )),
             );
+        }
+        if editor.focus == ScheduleField::Task && !catalog.is_empty() {
+            task_field = task_field.child(hint(
+                theme,
+                "↑/↓ moves the task picker; ⌘E toggles enabled.",
+            ));
         }
 
         let enabled_color = if editor.enabled {
@@ -670,6 +701,7 @@ impl SchedulesView {
         );
 
         let server_error = editor.server_error.clone().map(|message| {
+            let copy = self.error_copy_button(theme, &message, "schedule-sheet-error-copy", cx);
             div()
                 .flex()
                 .items_start()
@@ -694,6 +726,7 @@ impl SchedulesView {
                         .text_color(theme.colors.text)
                         .child(message),
                 )
+                .child(copy)
         });
 
         let panel = div()
@@ -792,7 +825,7 @@ impl SchedulesView {
             div()
                 .id("schedules-error-retry")
                 .mt(px(theme.spacing.s2))
-                .h(px(36.0))
+                .h(px(theme.controls.primary))
                 .px(px(theme.spacing.s3))
                 .flex()
                 .items_center()
@@ -834,7 +867,14 @@ impl SchedulesView {
                     .text_color(theme.colors.muted)
                     .child(message.to_string()),
             )
-            .child(retry)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s2))
+                    .child(self.error_copy_button(theme, message, "schedules-error-copy", cx))
+                    .child(retry),
+            )
     }
 }
 

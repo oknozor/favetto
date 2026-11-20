@@ -163,6 +163,35 @@ impl LaunchForm {
         self.focused = (self.focused as isize + delta).rem_euclid(count) as usize;
     }
 
+    /// Cycle the focused field's fixed choice list (←/→). Returns whether the
+    /// focused field actually offered choices. Typing an exact value still
+    /// works; this is the discoverable keyboard path for a declared enum.
+    pub fn cycle_choice(&mut self, delta: isize) -> bool {
+        let Some(field) = self.fields.get_mut(self.focused) else {
+            return false;
+        };
+        let next_value = {
+            let Some(choices) = field.var.choices.as_ref() else {
+                return false;
+            };
+            if choices.is_empty() {
+                return false;
+            }
+            let current = choices.iter().position(|choice| choice == &field.value);
+            let next = match current {
+                Some(current) => {
+                    let last = choices.len() as isize - 1;
+                    (current as isize + delta).clamp(0, last) as usize
+                }
+                None => 0,
+            };
+            choices[next].clone()
+        };
+        field.value = next_value;
+        field.error = None;
+        true
+    }
+
     /// Validate every field inline. Returns true when the form can be sent.
     pub fn validate(&mut self) -> bool {
         let mut valid = true;
@@ -588,6 +617,32 @@ impl CatalogState {
         }
     }
 
+    /// `h` on the Catalog list: collapse/expand the folder that contains the
+    /// highlighted definition. With no visible row (every group collapsed) it
+    /// reopens the first collapsed key, so the list is never keyboard-trapped.
+    pub fn toggle_selected_folder(&mut self) -> bool {
+        let key = self.selected.as_ref().and_then(|name| {
+            self.entries
+                .iter()
+                .find(|entry| &entry.name == name)
+                .map(|entry| {
+                    let view = CatalogEntryView::new(entry);
+                    if view.folder.is_empty() {
+                        view.namespace
+                    } else {
+                        format!("{}/{}", view.namespace, view.folder)
+                    }
+                })
+        });
+        let key = key.or_else(|| self.collapsed.iter().next().cloned());
+        let Some(key) = key else {
+            return false;
+        };
+        self.toggle_collapsed(&key);
+        self.ensure_selection();
+        true
+    }
+
     pub fn move_selection(&mut self, delta: isize) {
         let names = self.visible_names();
         if names.is_empty() {
@@ -681,6 +736,13 @@ impl CatalogState {
         if let Some(form) = self.launch.as_mut() {
             form.cycle_focus(delta);
         }
+    }
+
+    /// Cycle the focused launch field's fixed choices.
+    pub fn cycle_launch_choice(&mut self, delta: isize) -> bool {
+        self.launch
+            .as_mut()
+            .is_some_and(|form| form.cycle_choice(delta))
     }
 
     // -- one-shot ----------------------------------------------------------
@@ -896,6 +958,34 @@ mod tests {
     }
 
     #[test]
+    fn h_toggles_the_highlighted_folder_and_recovers_from_an_empty_list() {
+        let mut state = CatalogState {
+            entries: vec![
+                entry(
+                    "repo:favetto/gpui/01-scaffold",
+                    Some("favetto"),
+                    "shell",
+                    vec![],
+                ),
+                entry("repo:favetto/release", Some("favetto"), "ship", vec![]),
+            ],
+            status: CatalogStatus::Loaded,
+            ..CatalogState::default()
+        };
+        state.select("repo:favetto/gpui/01-scaffold");
+        assert!(state.toggle_selected_folder());
+        assert!(state.is_collapsed("repo:favetto/gpui"));
+        assert_eq!(state.selected(), Some("repo:favetto/release"));
+
+        // Collapse every remaining namespace/folder, then `h` reopens the
+        // first one instead of trapping the highlight outside the list.
+        state.toggle_collapsed("repo:favetto");
+        assert!(state.visible_names().is_empty());
+        assert!(state.toggle_selected_folder());
+        assert!(!state.visible_names().is_empty());
+    }
+
+    #[test]
     fn an_unset_repo_prefix_is_still_split_defensively() {
         let state = CatalogState {
             entries: vec![entry("repo:other/docs/guide", None, "read", vec![])],
@@ -1015,6 +1105,25 @@ mod tests {
             form.input().unwrap(),
             serde_json::json!({ "count": 3, "mode": "fast" })
         );
+    }
+
+    #[test]
+    fn the_launch_sheet_cycles_declared_choices_with_the_arrow_keys() {
+        let mut choice_var = var("mode", false);
+        choice_var.choices = Some(vec!["fast".to_string(), "slow".to_string()]);
+        let mut form = LaunchForm::new(entry("plan", None, "plan", vec![choice_var]));
+        form.focused = 0;
+        assert!(form.cycle_choice(1));
+        assert_eq!(form.fields[0].value, "fast");
+        assert!(form.cycle_choice(1));
+        assert_eq!(form.fields[0].value, "slow");
+        assert!(form.cycle_choice(1));
+        assert_eq!(form.fields[0].value, "slow", "clamped at the end");
+        assert!(form.cycle_choice(-1));
+        assert_eq!(form.fields[0].value, "fast");
+
+        let mut plain = LaunchForm::new(entry("plan", None, "plan", vec![var("issue", false)]));
+        assert!(!plain.cycle_choice(1));
     }
 
     #[test]

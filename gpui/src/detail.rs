@@ -29,6 +29,11 @@ use uuid::Uuid;
 use crate::inbox::{self, StatusKind};
 use crate::tasks;
 
+/// The maximum number of event frames retained for one open detail. The daemon
+/// already caps the backfill at 2000; this keeps a long-running live feed from
+/// growing without bound while the window stays open.
+pub const MAX_RETAINED_EVENTS: usize = 2_000;
+
 /// The three tabs of the detail surface (docs §2, Miller's Law: three chunks).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DetailTab {
@@ -555,6 +560,9 @@ pub struct TaskDetail {
     pub events_loaded: bool,
     /// Event kinds skipped because this client does not know them.
     pub events_ignored: usize,
+    /// Monotonic revision of [`TaskDetail::events`], used by the virtualized
+    /// feed to rebuild its item list only when the events actually changed.
+    pub events_revision: u64,
     /// The attempt table from `tasks.runs`.
     pub runs: Vec<TaskRun>,
     /// Whether the first `tasks.runs` fetch is in flight.
@@ -590,6 +598,7 @@ impl TaskDetail {
             events_error: None,
             events_loaded: false,
             events_ignored: 0,
+            events_revision: 0,
             runs: Vec::new(),
             runs_loading: true,
             runs_error: None,
@@ -633,6 +642,7 @@ impl TaskDetail {
             self.events_cursor = 0;
             self.events_loaded = false;
             self.events_ignored = 0;
+            self.events_revision = self.events_revision.wrapping_add(1);
             self.new_events = 0;
             self.runs.clear();
             self.runs_loaded = false;
@@ -677,6 +687,8 @@ impl TaskDetail {
         let mut events: Vec<AgentEventPush> = merged.into_values().collect();
         events.sort_by_key(|event| (event.seq, event.session_id.clone()));
         self.events = events;
+        self.trim_events();
+        self.events_revision = self.events_revision.wrapping_add(1);
         if latest_session.is_some() {
             self.events_session = latest_session;
         }
@@ -712,6 +724,8 @@ impl TaskDetail {
         // The daemon sends live events in order, but a reconnect can replay a
         // frame; sorting keeps the feed ordered by `seq` either way.
         self.events.sort_by_key(|event| event.seq);
+        self.trim_events();
+        self.events_revision = self.events_revision.wrapping_add(1);
         debug_assert!(self
             .events
             .windows(2)
@@ -720,6 +734,15 @@ impl TaskDetail {
             self.new_events = self.new_events.saturating_add(1);
         }
         true
+    }
+
+    /// Keep the retained feed bounded. The oldest frames go first; an open
+    /// permission prompt is the newest unresolved request, so it survives.
+    fn trim_events(&mut self) {
+        let excess = self.events.len().saturating_sub(MAX_RETAINED_EVENTS);
+        if excess > 0 {
+            self.events.drain(..excess);
+        }
     }
 
     /// Fold a `tasks.runs` result in.
@@ -1114,6 +1137,20 @@ mod tests {
         assert_eq!(detail.events.len(), 2);
         assert_eq!(detail.events[0].seq, 1, "events stay ordered by seq");
         assert_eq!(detail.new_events, 1);
+    }
+
+    #[test]
+    fn the_live_feed_is_capped_and_keeps_the_newest_frames() {
+        let mut detail = TaskDetail::new(Uuid::from_u128(7));
+        for seq in 0..(MAX_RETAINED_EVENTS as u64 + 25) {
+            detail.push_event(text(seq, MessageRole::Assistant, "line"));
+        }
+        assert_eq!(detail.events.len(), MAX_RETAINED_EVENTS);
+        assert_eq!(detail.events.first().map(|event| event.seq), Some(25));
+        assert_eq!(
+            detail.events.last().map(|event| event.seq),
+            Some(MAX_RETAINED_EVENTS as u64 + 24)
+        );
     }
 
     #[test]

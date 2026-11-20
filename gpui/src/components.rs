@@ -3,10 +3,13 @@
 //! Everything here takes the active [`Theme`] and never hard-codes a color or
 //! a spacing value (docs/design/gpui-client.md §3, Aesthetic-Usability).
 
-use gpui::{div, prelude::*, px, transparent_black, Div, Hsla, StyleRefinement};
+use gpui::{
+    div, prelude::*, px, transparent_black, Div, ElementId, FocusHandle, Hsla, Stateful,
+    StyleRefinement,
+};
 
 use crate::state::ConnectionState;
-use crate::theme::Theme;
+use crate::theme::{Theme, MICRO_GAP};
 
 /// The focus ring used by every interactive element. The transparent base
 /// border reserves the 2px so focusing never reflows the layout.
@@ -17,7 +20,7 @@ pub fn focus_ring(theme: &Theme) -> impl FnOnce(StyleRefinement) -> StyleRefinem
 /// A small keycap used for `⌘K`, `g i`, `↑` and friends.
 pub fn keycap(theme: &Theme, keys: &str) -> Div {
     div()
-        .px(px(theme.spacing.s1 + 2.0))
+        .px(px(theme.spacing.s1 + MICRO_GAP))
         .py(px(2.0))
         .rounded(px(theme.radii.r4))
         .border_1()
@@ -174,9 +177,44 @@ pub fn shortcut_row(theme: &Theme, label: &str, keys: &str) -> Div {
 }
 
 /// Visible focus ring for an already-built button.
+///
+/// Every interactive control routes through here or the equivalent
+/// `.focus(..)` style. The minimum size is enforced here so a later view cannot
+/// accidentally ship a target below the 32 px accessibility floor (docs §2).
 pub fn with_focus<T: Styled + gpui::InteractiveElement>(element: T, theme: &Theme) -> T {
     element
+        .min_h(px(theme.controls.min))
+        .min_w(px(theme.controls.min))
         .border_2()
         .border_color(transparent_black())
         .focus(focus_ring(theme))
+}
+
+/// A small secondary action used to make an error message copyable. The caller
+/// supplies the listener (the message and the toast copy live in the view).
+pub fn copy_button(
+    theme: &Theme,
+    id: impl Into<ElementId>,
+    label: &str,
+    focus: &FocusHandle,
+) -> Stateful<Div> {
+    with_focus(
+        div()
+            .id(id.into())
+            .flex()
+            .items_center()
+            .gap(px(theme.spacing.s1))
+            .h(px(theme.controls.min))
+            .px(px(theme.spacing.s2))
+            .rounded(px(theme.radii.r4))
+            .border_1()
+            .border_color(theme.colors.border)
+            .text_size(px(theme.font.xs))
+            .text_color(theme.colors.text)
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.colors.bg))
+            .track_focus(focus)
+            .child(label.to_string()),
+        theme,
+    )
 }

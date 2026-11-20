@@ -32,6 +32,7 @@ pub struct InboxView {
     /// Persisted across renders so live row updates keep the scroll position.
     scroll: ScrollHandle,
     retry_focus: gpui::FocusHandle,
+    error_copy_focus: gpui::FocusHandle,
 }
 
 impl InboxView {
@@ -40,7 +41,8 @@ impl InboxView {
         Self {
             state,
             scroll: ScrollHandle::new(),
-            retry_focus: cx.focus_handle().tab_index(32).tab_stop(true),
+            retry_focus: cx.focus_handle().tab_index(20).tab_stop(true),
+            error_copy_focus: cx.focus_handle().tab_index(21).tab_stop(true),
         }
     }
 
@@ -104,7 +106,7 @@ impl InboxView {
                 .flex()
                 .items_center()
                 .gap(px(theme.spacing.s2))
-                .h(px(36.0))
+                .h(px(theme.controls.primary))
                 .px(px(theme.spacing.s3))
                 .rounded(px(theme.radii.r8))
                 .bg(Hsla::from(theme.colors.accent).opacity(0.16))
@@ -121,6 +123,24 @@ impl InboxView {
                     });
                 })),
             theme,
+        )
+    }
+
+    fn error_copy_button(
+        &self,
+        theme: &Theme,
+        message: &str,
+        id: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let message = message.to_string();
+        components::copy_button(theme, id, "Copy error", &self.error_copy_focus).on_click(
+            cx.listener(move |this, _event, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.copy_text(message.clone(), "the error", cx);
+                    cx.notify();
+                });
+            }),
         )
     }
 
@@ -191,7 +211,14 @@ impl InboxView {
                     .text_center()
                     .child(message.to_string()),
             )
-            .child(self.retry_button(theme, cx))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s2))
+                    .child(self.error_copy_button(theme, message, "inbox-error-copy", cx))
+                    .child(self.retry_button(theme, cx)),
+            )
             .child(
                 div()
                     .max_w(px(480.0))
@@ -230,6 +257,7 @@ impl InboxView {
                     .text_color(theme.colors.text)
                     .child(format!("Refresh failed: {message}")),
             )
+            .child(self.error_copy_button(theme, message, "inbox-error-copy-banner", cx))
             .child(self.retry_button(theme, cx))
     }
 

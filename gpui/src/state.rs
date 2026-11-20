@@ -13,8 +13,10 @@
 
 #![allow(dead_code)] // Accessors and `ping()` are consumed by the views in steps 03+.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -176,6 +178,23 @@ impl TaskConfirm {
     }
 }
 
+/// Cached derivations of the task/session snapshot.
+///
+/// A view renders on every clock tick and every live push. Rebuilding the
+/// sorted/filtered Tasks list and the Inbox grouping on each frame would clone
+/// the whole snapshot repeatedly, so both are memoized by the snapshot
+/// revision plus the Tasks query/filter. The cached values are shared with
+/// `Rc`, so a view receives a cheap handle rather than a clone.
+#[derive(Debug, Default)]
+struct DerivedSnapshot {
+    revision: u64,
+    inbox: Option<Rc<InboxRows>>,
+    task_revision: u64,
+    task_query: String,
+    task_filter: TaskFilter,
+    tasks: Option<Rc<TaskList>>,
+}
+
 /// The single client entity.
 pub struct ClientState {
     connection: ConnectionState,
@@ -194,6 +213,10 @@ pub struct ClientState {
     tasks: Vec<Task>,
     /// The flattened live sessions from `agents.list`.
     sessions: Vec<AgentSessionInfo>,
+    /// Bumped whenever `tasks` or `sessions` change; keys the derived cache.
+    snapshot_revision: u64,
+    /// Memoized Inbox/Tasks derivations (see [`DerivedSnapshot`]).
+    derived: RefCell<DerivedSnapshot>,
     /// The configured agent roster (the one-shot picker).
     agents: Vec<AgentCatalogEntry>,
     /// The Catalog surface: entries, filter, preview and the launch sheets.
@@ -302,6 +325,8 @@ impl ClientState {
             detail_open: false,
             tasks: Vec::new(),
             sessions: Vec::new(),
+            snapshot_revision: 0,
+            derived: RefCell::new(DerivedSnapshot::default()),
             agents: Vec::new(),
             catalog: CatalogState::default(),
             snapshot_status: snapshot_status.clone(),
@@ -485,6 +510,7 @@ impl ClientState {
                 self.tasks = tasks;
                 self.sessions = sessions;
                 self.agents = agents;
+                self.touch_snapshot();
                 self.snapshot_status = SnapshotStatus::Loaded;
                 // The Workflows root list is derived from this same snapshot,
                 // so a recovered daemon fills it without another RPC. The open
@@ -571,6 +597,7 @@ impl ClientState {
                     // header shows its agent and id without waiting for the
                     // next roster poll.
                     self.sessions.push(result.session);
+                    self.touch_snapshot();
                     self.navigate(Route::Tasks);
                     self.open_task(result.task.id);
                     self.show_toast(
@@ -816,11 +843,16 @@ impl ClientState {
                         // Keep the shared snapshot in step until its own push
                         // and reconciling load land.
                         let now = Utc::now();
+                        let mut changed = false;
                         for task in &mut self.tasks {
                             if cancelled.contains(&task.id) {
                                 task.status = TaskStatus::Cancelled;
                                 task.finished_at = Some(now);
+                                changed = true;
                             }
+                        }
+                        if changed {
+                            self.touch_snapshot();
                         }
                         self.workflow_cancel_previous = None;
                         let count = cancelled.len();
@@ -1206,6 +1238,32 @@ impl ClientState {
         }
     }
 
+    /// Move the root highlight with `[`/`]` (or a click + arrows on the roots
+    /// list). Clamped like every other list; the detail reloads for the new root.
+    pub fn move_workflow_root(&mut self, delta: isize) {
+        let roots = self.workflow_roots();
+        if roots.is_empty() {
+            self.workflow_root = None;
+            return;
+        }
+        let current = self
+            .selected_workflow_root()
+            .and_then(|id| roots.iter().position(|root| root.root_id == id))
+            .unwrap_or(0);
+        let last = roots.len() as isize - 1;
+        let next = (current as isize + delta).clamp(0, last) as usize;
+        let root_id = roots[next].root_id;
+        if self.workflow_root != Some(root_id)
+            || self
+                .workflow_detail
+                .as_ref()
+                .is_none_or(|detail| detail.root_id != root_id)
+        {
+            self.workflow_root = Some(root_id);
+            self.load_workflow_inspect(root_id);
+        }
+    }
+
     /// Open the Workflows surface for one root (the task detail's button).
     pub fn open_workflow_root(&mut self, root_id: uuid::Uuid) {
         self.workflow_root = Some(root_id);
@@ -1530,6 +1588,11 @@ impl ClientState {
         self.schedules.editor_open()
     }
 
+    /// The sheet's logical focus, when the sheet is open.
+    pub fn schedule_focus(&self) -> Option<ScheduleField> {
+        self.schedules.editor().map(|editor| editor.focus)
+    }
+
     pub fn close_schedule_editor(&mut self) {
         self.schedules.close_editor();
     }
@@ -1568,6 +1631,21 @@ impl ClientState {
     pub fn select_schedule_task(&mut self, task: &str) {
         if let Some(editor) = self.schedules.editor_mut() {
             editor.select_task(task);
+        }
+    }
+
+    /// Move the task picker in the schedule sheet with ↑/↓ while the Task field
+    /// is focused. Catalog names stay in their daemon order, so the movement is
+    /// deterministic and matches the visible list.
+    pub fn cycle_schedule_task(&mut self, delta: isize) {
+        let names: Vec<String> = self
+            .catalog
+            .entries()
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        if let Some(editor) = self.schedules.editor_mut() {
+            editor.cycle_task(&names, delta);
         }
     }
 
@@ -1969,6 +2047,13 @@ impl ClientState {
         self.catalog.toggle_collapsed(key);
     }
 
+    /// `h` on the Catalog list: collapse/expand the highlighted folder.
+    pub fn toggle_catalog_selected_folder(&mut self) {
+        if self.catalog.toggle_selected_folder() {
+            self.ensure_catalog_preview();
+        }
+    }
+
     pub fn activate_catalog_search(&mut self) {
         self.catalog.activate_search();
     }
@@ -2015,6 +2100,11 @@ impl ClientState {
         } else if self.catalog.oneshot().is_some() {
             self.catalog.cycle_oneshot_focus();
         }
+    }
+
+    /// ←/→ in the launch sheet: cycle the focused field's fixed choices.
+    pub fn cycle_catalog_choice(&mut self, delta: isize) -> bool {
+        self.catalog.cycle_launch_choice(delta)
     }
 
     /// Clear the Catalog search. Returns whether anything changed.
@@ -2339,8 +2429,20 @@ impl ClientState {
     }
 
     /// The current Needs you + Recent groups, derived from the latest snapshot.
-    pub fn inbox_rows(&self) -> InboxRows {
-        inbox::build(&self.tasks, &self.sessions, Utc::now())
+    ///
+    /// Memoized: the result is shared by `Rc`, so the Inbox and the sidebar
+    /// badge do not re-group 500 rows on every frame.
+    pub fn inbox_rows(&self) -> Rc<InboxRows> {
+        let mut derived = self.derived.borrow_mut();
+        if derived.revision == self.snapshot_revision {
+            if let Some(rows) = &derived.inbox {
+                return rows.clone();
+            }
+        }
+        let rows = Rc::new(inbox::build(&self.tasks, &self.sessions, Utc::now()));
+        derived.revision = self.snapshot_revision;
+        derived.inbox = Some(rows.clone());
+        rows
     }
 
     /// First-fetch skeleton / error banner state.
@@ -2403,14 +2505,37 @@ impl ClientState {
     }
 
     /// The Tasks rows for the active filter and query.
-    pub fn task_list(&self) -> TaskList {
-        tasks::build(
+    ///
+    /// Memoized on the snapshot revision and the query/filter, and shared by
+    /// `Rc` so a render never clones the rows.
+    pub fn task_list(&self) -> Rc<TaskList> {
+        let mut derived = self.derived.borrow_mut();
+        if derived.task_revision == self.snapshot_revision
+            && derived.task_query == self.tasks_query
+            && derived.task_filter == self.tasks_filter
+        {
+            if let Some(list) = &derived.tasks {
+                return list.clone();
+            }
+        }
+        let list = Rc::new(tasks::build(
             &self.tasks,
             &self.sessions,
             &self.tasks_query,
             self.tasks_filter,
             Utc::now(),
-        )
+        ));
+        derived.task_revision = self.snapshot_revision;
+        derived.task_query = self.tasks_query.clone();
+        derived.task_filter = self.tasks_filter;
+        derived.tasks = Some(list.clone());
+        list
+    }
+
+    /// Note that the task/session snapshot changed so the next read rebuilds
+    /// the memoized derivations.
+    fn touch_snapshot(&mut self) {
+        self.snapshot_revision = self.snapshot_revision.wrapping_add(1);
     }
 
     /// The active Tasks segment.
@@ -2646,6 +2771,7 @@ impl ClientState {
                     detail.events_cursor = 0;
                     detail.events_loaded = false;
                     detail.events_ignored = 0;
+                    detail.events_revision = detail.events_revision.wrapping_add(1);
                     detail.new_events = 0;
                     detail.runs.clear();
                     detail.runs_loaded = false;
@@ -2707,6 +2833,7 @@ impl ClientState {
         if let Some(current) = self.tasks.iter_mut().find(|task| task.id == previous.id) {
             if current == optimistic {
                 *current = previous.clone();
+                self.touch_snapshot();
             }
         }
     }
@@ -2982,6 +3109,14 @@ impl ClientState {
         }
     }
 
+    /// Copy an arbitrary message (an error banner or a diagnostic) to the
+    /// clipboard. Error surfaces use this so a screenshot is never required to
+    /// report a failure.
+    pub fn copy_text(&mut self, text: String, label: &str, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.show_toast(ToastKind::Info, format!("Copied {label}."), cx);
+    }
+
     /// Copy the persisted output to the clipboard (the plain-text pane has no
     /// text selection in this GPUI build, so Copy is the accessible path).
     pub fn copy_detail_output(&mut self, cx: &mut Context<Self>) {
@@ -3099,6 +3234,7 @@ impl ClientState {
         } else {
             self.tasks.push(task);
         }
+        self.touch_snapshot();
     }
 
     pub fn last_ping(&self) -> Option<&PingSnapshot> {

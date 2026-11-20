@@ -12,7 +12,7 @@ use gpui::{
 
 use crate::components;
 use crate::settings::{latency_label, ConnectionTest, SettingsFocus};
-use crate::state::ClientState;
+use crate::state::{ClientState, ConnectionState, SnapshotStatus};
 use crate::theme::Theme;
 
 /// Where the About card points.
@@ -37,6 +37,8 @@ pub struct SettingsView {
     save_focus: FocusHandle,
     defaults_focus: FocusHandle,
     docs_focus: FocusHandle,
+    error_copy_focus: FocusHandle,
+    agents_retry_focus: FocusHandle,
 }
 
 impl SettingsView {
@@ -45,11 +47,13 @@ impl SettingsView {
         Self {
             state,
             scroll: ScrollHandle::new(),
-            reconnect_focus: cx.focus_handle().tab_index(50).tab_stop(true),
-            test_focus: cx.focus_handle().tab_index(51).tab_stop(true),
-            save_focus: cx.focus_handle().tab_index(52).tab_stop(true),
-            defaults_focus: cx.focus_handle().tab_index(53).tab_stop(true),
-            docs_focus: cx.focus_handle().tab_index(54).tab_stop(true),
+            reconnect_focus: cx.focus_handle().tab_index(20).tab_stop(true),
+            test_focus: cx.focus_handle().tab_index(21).tab_stop(true),
+            save_focus: cx.focus_handle().tab_index(22).tab_stop(true),
+            defaults_focus: cx.focus_handle().tab_index(23).tab_stop(true),
+            docs_focus: cx.focus_handle().tab_index(24).tab_stop(true),
+            error_copy_focus: cx.focus_handle().tab_index(25).tab_stop(true),
+            agents_retry_focus: cx.focus_handle().tab_index(26).tab_stop(true),
         }
     }
 
@@ -156,6 +160,24 @@ impl SettingsView {
             })
     }
 
+    fn error_copy_button(
+        &self,
+        theme: &Theme,
+        message: &str,
+        id: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let message = message.to_string();
+        components::copy_button(theme, id, "Copy error", &self.error_copy_focus).on_click(
+            cx.listener(move |this, _event, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.copy_text(message.clone(), "the error", cx);
+                    cx.notify();
+                });
+            }),
+        )
+    }
+
     fn connection_card(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let (endpoint, token, token_source, focus, normalized, test, save_error, connection) = {
             let state = self.state.read(cx);
@@ -247,14 +269,23 @@ impl SettingsView {
                     latency_label(*latency_ms)
                 ))
                 .into_any_element(),
-            ConnectionTest::Failed { endpoint, message } => div()
-                .flex()
-                .items_start()
-                .gap(px(theme.spacing.s1))
-                .text_size(px(theme.font.xs))
-                .text_color(theme.colors.danger)
-                .child(format!("⚠ {endpoint} failed: {message}"))
-                .into_any_element(),
+            ConnectionTest::Failed { endpoint, message } => {
+                let copy = self.error_copy_button(theme, message, "settings-test-error-copy", cx);
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s2))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_size(px(theme.font.xs))
+                            .text_color(theme.colors.danger)
+                            .child(format!("⚠ {endpoint} failed: {message}")),
+                    )
+                    .child(copy)
+                    .into_any_element()
+            }
         };
 
         let test = components::with_focus(
@@ -419,13 +450,66 @@ impl SettingsView {
                             .child(reconnect),
                     ),
             )
+            .when(
+                matches!(
+                    &connection,
+                    ConnectionState::Unauthorized { .. } | ConnectionState::Disconnected { .. }
+                ),
+                |card| {
+                    let message = match &connection {
+                        ConnectionState::Unauthorized { token_path } => format!(
+                            "The daemon rejected the token. Replace or edit the token at {token_path}, then Save or Reconnect."
+                        ),
+                        ConnectionState::Disconnected { message } => format!(
+                            "The client cannot reach the daemon: {message}. Check the address above and Reconnect."
+                        ),
+                        _ => String::new(),
+                    };
+                    card.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(theme.spacing.s2))
+                            .rounded(px(theme.radii.r4))
+                            .border_1()
+                            .border_color(Hsla::from(theme.colors.danger).opacity(0.45))
+                            .bg(Hsla::from(theme.colors.danger).opacity(0.10))
+                            .px(px(theme.spacing.s3))
+                            .py(px(theme.spacing.s2))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .text_size(px(theme.font.xs))
+                                    .text_color(theme.colors.text)
+                                    .child(message),
+                            )
+                            .child(self.error_copy_button(
+                                theme,
+                                &connection.label(),
+                                "settings-connection-error-copy",
+                                cx,
+                            )),
+                    )
+                },
+            )
             .child(test_line)
             .when_some(save_error, |card, error| {
+                let copy = self.error_copy_button(theme, &error, "settings-save-error-copy", cx);
                 card.child(
                     div()
-                        .text_size(px(theme.font.xs))
-                        .text_color(theme.colors.danger)
-                        .child(error),
+                        .flex()
+                        .items_center()
+                        .gap(px(theme.spacing.s2))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .text_size(px(theme.font.xs))
+                                .text_color(theme.colors.danger)
+                                .child(error),
+                        )
+                        .child(copy),
                 )
             })
             .child(
@@ -442,7 +526,95 @@ impl SettingsView {
     }
 
     fn agents_card(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
-        let agents = self.state.read(cx).agent_roster().to_vec();
+        let (agents, status, has_snapshot) = {
+            let state = self.state.read(cx);
+            (
+                state.agent_roster().to_vec(),
+                state.snapshot_status().clone(),
+                state.has_snapshot_data(),
+            )
+        };
+        let notice: Option<Div> = match &status {
+            SnapshotStatus::Loading if agents.is_empty() => Some(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s2))
+                    .child(components::section_label(theme, "AGENTS"))
+                    .child(hint(theme, "Loading the daemon roster…")),
+            ),
+            SnapshotStatus::Failed { message } if agents.is_empty() => {
+                let copy = self.error_copy_button(theme, message, "settings-agents-error-copy", cx);
+                let retry = components::with_focus(
+                    div()
+                        .id("settings-agents-retry")
+                        .h(px(theme.controls.min))
+                        .px(px(theme.spacing.s3))
+                        .flex()
+                        .items_center()
+                        .rounded(px(theme.radii.r8))
+                        .bg(Hsla::from(theme.colors.accent).opacity(0.16))
+                        .text_size(px(theme.font.sm))
+                        .text_color(theme.colors.accent)
+                        .cursor_pointer()
+                        .track_focus(&self.agents_retry_focus)
+                        .child("Retry")
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.state.update(cx, |state, cx| {
+                                state.refresh_snapshot();
+                                cx.notify();
+                            });
+                        })),
+                    theme,
+                );
+                Some(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(theme.spacing.s2))
+                        .child(
+                            div()
+                                .text_size(px(theme.font.sm))
+                                .text_color(theme.colors.text)
+                                .child("The agent roster could not load."),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(theme.font.xs))
+                                .text_color(theme.colors.muted)
+                                .child(message.to_string()),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(theme.spacing.s2))
+                                .child(copy)
+                                .child(retry),
+                        ),
+                )
+            }
+            SnapshotStatus::Failed { message } if has_snapshot => {
+                let copy =
+                    self.error_copy_button(theme, message, "settings-agents-banner-copy", cx);
+                Some(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(theme.spacing.s2))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .text_size(px(theme.font.xs))
+                                .text_color(theme.colors.text)
+                                .child(format!("Roster refresh failed: {message}")),
+                        )
+                        .child(copy),
+                )
+            }
+            _ => None,
+        };
         let rows: Vec<_> = if agents.is_empty() {
             vec![div()
                 .text_size(px(theme.font.sm))
@@ -548,6 +720,7 @@ impl SettingsView {
                 theme,
                 "Read-only: the daemon reports availability, command and backend for each configured agent.",
             ))
+            .when_some(notice, |card, notice| card.child(notice))
             .child(
                 div()
                     .flex()
@@ -602,10 +775,11 @@ impl SettingsView {
                     let selected = theme_choice == choice;
                     div()
                         .id(("settings-theme", chip_index))
-                        .h(px(32.0))
+                        .h(px(theme.controls.min))
                         .px(px(theme.spacing.s3))
                         .flex()
                         .items_center()
+                        .gap(px(theme.spacing.s1))
                         .rounded(px(theme.radii.r4))
                         .border_1()
                         .border_color(if selected {
@@ -623,6 +797,7 @@ impl SettingsView {
                         })
                         .text_size(px(theme.font.sm))
                         .cursor_pointer()
+                        .when(selected, |chip| chip.child("✓"))
                         .child(choice.label())
                         .on_click(cx.listener(move |this, _event, _window, cx| {
                             this.state.update(cx, |state, cx| {
@@ -656,10 +831,11 @@ impl SettingsView {
                     let selected = density == choice;
                     div()
                         .id(("settings-density", chip_index))
-                        .h(px(32.0))
+                        .h(px(theme.controls.min))
                         .px(px(theme.spacing.s3))
                         .flex()
                         .items_center()
+                        .gap(px(theme.spacing.s1))
                         .rounded(px(theme.radii.r4))
                         .border_1()
                         .border_color(if selected {
@@ -677,6 +853,7 @@ impl SettingsView {
                         })
                         .text_size(px(theme.font.sm))
                         .cursor_pointer()
+                        .when(selected, |chip| chip.child("✓"))
                         .child(choice.label())
                         .on_click(cx.listener(move |this, _event, _window, cx| {
                             this.state.update(cx, |state, cx| {

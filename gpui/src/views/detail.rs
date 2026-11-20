@@ -13,14 +13,16 @@
 //! The aggregation and feed grouping live in [`crate::detail`] (pure and
 //! unit-tested); this file only paints them.
 
+use std::rc::Rc;
 use std::time::Duration;
 
 use chrono::Utc;
 use favetto_wire::model::{AgentUsage, InputReply, MessageRole, Task, TaskRun};
 use gpui::{
-    div, prelude::*, px, AnyElement, Context, Div, Entity, FocusHandle, Hsla, IntoElement, Render,
-    ScrollHandle, ScrollWheelEvent, Stateful, Window,
+    div, list, prelude::*, px, AnyElement, Context, Div, Entity, FocusHandle, Hsla, IntoElement,
+    ListAlignment, ListState, Render, ScrollHandle, ScrollWheelEvent, Stateful, Window,
 };
+use uuid::Uuid;
 
 use crate::components;
 use crate::detail::{
@@ -53,44 +55,64 @@ pub struct DetailView {
     reply_once_focus: FocusHandle,
     reply_always_focus: FocusHandle,
     reply_reject_focus: FocusHandle,
+    new_events_focus: FocusHandle,
+    /// Copy action for whichever full-body error state is visible.
+    error_copy_focus: FocusHandle,
     /// Persisted across renders so live events never jump the reader.
     output_scroll: ScrollHandle,
-    events_scroll: ScrollHandle,
+    /// Virtualized feed state: only the visible window is measured/painted.
+    events_list: ListState,
+    /// The grouped feed, rebuilt only when the event revision changes.
+    events_feed: Rc<Vec<FeedItem>>,
+    events_feed_key: Option<(Uuid, u64)>,
     /// The content length at the last tail scroll, so auto-follow only reacts to
     /// growth (and never fights a deliberate scroll).
     output_rendered: usize,
-    events_rendered: usize,
 }
 
 impl DetailView {
     pub fn new(state: Entity<ClientState>, cx: &mut Context<Self>) -> Self {
         cx.observe(&state, |_this, _state, cx| cx.notify()).detach();
+        let events_list = ListState::new(0, ListAlignment::Bottom, px(600.0));
+        let follow_state = state.clone();
+        events_list.set_scroll_handler(move |event, _window, cx| {
+            let at_bottom = !event.is_scrolled;
+            follow_state.update(cx, |state, cx| {
+                if state.detail_follow() != at_bottom {
+                    state.set_detail_follow(at_bottom);
+                    cx.notify();
+                }
+            });
+        });
         let view = Self {
             state,
-            back_focus: cx.focus_handle().tab_index(20).tab_stop(true),
+            back_focus: cx.focus_handle().tab_index(50).tab_stop(true),
             tab_focus: (0..DetailTab::ALL.len())
                 .map(|index| {
                     cx.focus_handle()
-                        .tab_index(21 + index as isize)
+                        .tab_index(59 + index as isize)
                         .tab_stop(true)
                 })
                 .collect(),
-            cancel_focus: cx.focus_handle().tab_index(24).tab_stop(true),
-            retry_focus: cx.focus_handle().tab_index(25).tab_stop(true),
-            copy_focus: cx.focus_handle().tab_index(26).tab_stop(true),
-            session_focus: cx.focus_handle().tab_index(27).tab_stop(true),
-            follow_focus: cx.focus_handle().tab_index(28).tab_stop(true),
-            output_retry_focus: cx.focus_handle().tab_index(29).tab_stop(true),
-            events_retry_focus: cx.focus_handle().tab_index(30).tab_stop(true),
-            runs_retry_focus: cx.focus_handle().tab_index(31).tab_stop(true),
-            reply_once_focus: cx.focus_handle().tab_index(32).tab_stop(true),
-            reply_always_focus: cx.focus_handle().tab_index(33).tab_stop(true),
-            reply_reject_focus: cx.focus_handle().tab_index(34).tab_stop(true),
-            workflow_focus: cx.focus_handle().tab_index(35).tab_stop(true),
+            cancel_focus: cx.focus_handle().tab_index(53).tab_stop(true),
+            retry_focus: cx.focus_handle().tab_index(54).tab_stop(true),
+            copy_focus: cx.focus_handle().tab_index(55).tab_stop(true),
+            session_focus: cx.focus_handle().tab_index(51).tab_stop(true),
+            follow_focus: cx.focus_handle().tab_index(62).tab_stop(true),
+            output_retry_focus: cx.focus_handle().tab_index(63).tab_stop(true),
+            events_retry_focus: cx.focus_handle().tab_index(64).tab_stop(true),
+            runs_retry_focus: cx.focus_handle().tab_index(65).tab_stop(true),
+            reply_once_focus: cx.focus_handle().tab_index(56).tab_stop(true),
+            reply_always_focus: cx.focus_handle().tab_index(57).tab_stop(true),
+            reply_reject_focus: cx.focus_handle().tab_index(58).tab_stop(true),
+            workflow_focus: cx.focus_handle().tab_index(52).tab_stop(true),
+            new_events_focus: cx.focus_handle().tab_index(66).tab_stop(true),
+            error_copy_focus: cx.focus_handle().tab_index(67).tab_stop(true),
             output_scroll: ScrollHandle::new(),
-            events_scroll: ScrollHandle::new(),
+            events_list,
+            events_feed: Rc::new(Vec::new()),
+            events_feed_key: None,
             output_rendered: 0,
-            events_rendered: 0,
         };
         view.start_clock(cx);
         view
@@ -142,15 +164,6 @@ impl DetailView {
         });
     }
 
-    fn on_events_wheel(
-        &mut self,
-        _event: &ScrollWheelEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.sync_follow(self.events_scroll.clone(), cx);
-    }
-
     fn on_output_wheel(
         &mut self,
         _event: &ScrollWheelEvent,
@@ -167,7 +180,7 @@ impl DetailView {
                 .flex()
                 .items_center()
                 .gap(px(theme.spacing.s1))
-                .h(px(26.0))
+                .h(px(theme.controls.min))
                 .px(px(theme.spacing.s2))
                 .rounded(px(theme.radii.r4))
                 .border_1()
@@ -193,10 +206,11 @@ impl DetailView {
                         cx.notify();
                     });
                     if !follow {
-                        // Resuming: jump straight to the newest content.
-                        this.events_scroll.scroll_to_bottom();
+                        // Resuming: jump straight to the newest content. The
+                        // virtualized feed resets to the bottom on the next
+                        // paint; the output handle scrolls immediately.
                         this.output_scroll.scroll_to_bottom();
-                        this.events_rendered = 0;
+                        this.events_list.reset(this.events_list.item_count());
                         this.output_rendered = 0;
                     }
                 })),
@@ -440,7 +454,7 @@ impl DetailView {
                 .flex_shrink_0()
                 .flex()
                 .items_center()
-                .h(px(28.0))
+                .h(px(theme.controls.min))
                 .px(px(theme.spacing.s2))
                 .rounded(px(theme.radii.r4))
                 .border_1()
@@ -501,7 +515,7 @@ impl DetailView {
                     .flex()
                     .items_center()
                     .gap(px(theme.spacing.s1))
-                    .h(px(28.0))
+                    .h(px(theme.controls.min))
                     .px(px(theme.spacing.s2))
                     .rounded(px(theme.radii.r4))
                     .when(selected, |button| {
@@ -701,7 +715,7 @@ impl DetailView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .h(px(30.0))
+                .h(px(theme.controls.primary))
                 .px(px(theme.spacing.s3))
                 .rounded(px(theme.radii.r4))
                 .border_1()
@@ -769,7 +783,7 @@ impl DetailView {
                 .id("detail-tab-retry")
                 .flex()
                 .items_center()
-                .h(px(32.0))
+                .h(px(theme.controls.primary))
                 .px(px(theme.spacing.s3))
                 .rounded(px(theme.radii.r8))
                 .bg(Hsla::from(theme.colors.accent).opacity(0.16))
@@ -784,6 +798,15 @@ impl DetailView {
                 })),
             theme,
         );
+        let copy =
+            components::copy_button(theme, "detail-error-copy", "Copy error", data.copy_focus);
+        let message = data.message.to_string();
+        let copy = copy.on_click(cx.listener(move |this, _event, _window, cx| {
+            this.state.update(cx, |state, cx| {
+                state.copy_text(message.clone(), "the error", cx);
+                cx.notify();
+            });
+        }));
         div()
             .flex()
             .flex_col()
@@ -823,10 +846,27 @@ impl DetailView {
                     .text_center()
                     .child(data.message.to_string()),
             )
-            .child(retry)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s2))
+                    .child(copy)
+                    .child(retry),
+            )
     }
 
-    fn error_banner(&self, theme: &Theme, message: &str) -> Div {
+    fn error_banner(&self, theme: &Theme, message: &str, cx: &mut Context<Self>) -> Div {
+        let copy_text = message.to_string();
+        let copy = components::copy_button(
+            theme,
+            "detail-error-copy-banner",
+            "Copy error",
+            &self.error_copy_focus,
+        )
+        .on_click(cx.listener(move |_this, _event, _window, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_text.clone()));
+        }));
         div()
             .flex()
             .items_center()
@@ -846,11 +886,12 @@ impl DetailView {
             .child(
                 div()
                     .flex_1()
-                    .min_w_0()
+                    .min_w(px(0.0))
                     .text_size(px(theme.font.xs))
                     .text_color(theme.colors.text)
                     .child(format!("Refresh failed: {message}")),
             )
+            .child(copy)
     }
 
     fn empty_body(&self, theme: &Theme, icon: &str, label: &str, title: &str, body: &str) -> Div {
@@ -916,6 +957,7 @@ impl DetailView {
                         title: "The run output could not load",
                         message,
                         focus: &self.output_retry_focus,
+                        copy_focus: &self.error_copy_focus,
                     },
                     |this, cx| {
                         this.state.update(cx, |state, cx| {
@@ -956,7 +998,7 @@ impl DetailView {
             .gap(px(theme.spacing.s2))
             .p(px(theme.spacing.s3));
         if let Some(message) = task_error {
-            column = column.child(self.error_banner(theme, &message));
+            column = column.child(self.error_banner(theme, &message, cx));
         }
         if truncated {
             column = column.child(
@@ -1004,10 +1046,42 @@ impl DetailView {
             .into_any_element()
     }
 
+    /// Rebuild the grouped feed only when its source revision changes, and keep
+    /// the virtualized list's item count in sync. A paused reader keeps their
+    /// logical position; a following reader stays at the tail.
+    fn feed_for(
+        &mut self,
+        task_id: Uuid,
+        revision: u64,
+        cx: &mut Context<Self>,
+    ) -> Rc<Vec<FeedItem>> {
+        let key = (task_id, revision);
+        if self.events_feed_key != Some(key) {
+            let feed = {
+                let state = self.state.read(cx);
+                state
+                    .detail()
+                    .filter(|detail| detail.task_id == task_id)
+                    .map(TaskDetail::feed)
+                    .unwrap_or_default()
+            };
+            self.events_feed = Rc::new(feed);
+            self.events_feed_key = Some(key);
+
+            let follow = self.state.read(cx).detail_follow();
+            let len = self.events_feed.len();
+            let top = (!follow).then(|| self.events_list.logical_scroll_top());
+            self.events_list.reset(len);
+            if let Some(top) = top {
+                self.events_list.scroll_to(top);
+            }
+        }
+        self.events_feed.clone()
+    }
+
     fn events_body(&mut self, theme: &Theme, data: EventsBody, cx: &mut Context<Self>) -> Div {
         let EventsBody {
             feed,
-            event_count,
             loading,
             loaded,
             error: events_error,
@@ -1025,6 +1099,7 @@ impl DetailView {
                     title: "The event feed could not load",
                     message: events_error.as_deref().unwrap_or_default(),
                     focus: &self.events_retry_focus,
+                    copy_focus: &self.error_copy_focus,
                 },
                 |this, cx| {
                     this.state.update(cx, |state, cx| {
@@ -1062,36 +1137,22 @@ impl DetailView {
             return self.empty_body(theme, "≋", "EVENTS", title, body);
         }
 
-        let mut column = div()
-            .flex()
-            .flex_col()
-            .gap(px(theme.spacing.s2))
-            .p(px(theme.spacing.s3));
-        if let Some(message) = events_error {
-            column = column.child(self.error_banner(theme, &message));
-        }
-        if ignored > 0 {
-            column = column.child(
-                div()
-                    .text_size(px(theme.font.xs))
-                    .text_color(theme.colors.muted)
-                    .child(format!(
-                        "{ignored} event{} with a kind this client does not render yet were skipped.",
-                        if ignored == 1 { "" } else { "s" }
-                    )),
-            );
-        }
-        column = column.children(feed.iter().map(|item| feed_item(theme, item)));
+        let new_events = self.state.read(cx).detail_new_events();
 
-        let (follow, new_events) = {
-            let state = self.state.read(cx);
-            (state.detail_follow(), state.detail_new_events())
-        };
-        if follow && self.events_rendered != event_count {
-            self.events_scroll.scroll_to_bottom();
-        }
-        self.events_rendered = event_count;
-        self.sync_follow(self.events_scroll.clone(), cx);
+        let list_theme = *theme;
+        let list_feed = feed.clone();
+        let list = list(self.events_list.clone(), move |index, _window, _cx| {
+            let Some(item) = list_feed.get(index) else {
+                return div().into_any_element();
+            };
+            div()
+                .px(px(list_theme.spacing.s3))
+                .pb(px(list_theme.spacing.s2))
+                .child(feed_item(&list_theme, item))
+                .into_any_element()
+        })
+        .flex_1()
+        .min_h_0();
 
         let pill = (new_events > 0).then(|| {
             components::with_focus(
@@ -1110,6 +1171,7 @@ impl DetailView {
                     .text_color(theme.colors.accent)
                     .cursor_pointer()
                     .shadow_lg()
+                    .track_focus(&self.new_events_focus)
                     .child(format!(
                         "{new_events} new event{}",
                         if new_events == 1 { "" } else { "s" }
@@ -1120,35 +1182,43 @@ impl DetailView {
                             state.set_detail_follow(true);
                             cx.notify();
                         });
-                        this.events_scroll.scroll_to_bottom();
-                        this.events_rendered = 0;
+                        this.events_list.reset(this.events_list.item_count());
                     })),
                 theme,
             )
         });
 
-        div()
-            .relative()
-            .flex_1()
-            .min_h_0()
-            .child(
+        let mut container = div().relative().flex_1().min_h_0().flex().flex_col();
+        if let Some(message) = events_error {
+            container = container.child(
                 div()
-                    .id("detail-events-scroll")
-                    .size_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.events_scroll)
-                    .on_scroll_wheel(cx.listener(Self::on_events_wheel))
-                    .child(column),
+                    .px(px(theme.spacing.s3))
+                    .pt(px(theme.spacing.s2))
+                    .child(self.error_banner(theme, &message, cx)),
+            );
+        }
+        if ignored > 0 {
+            container = container.child(
+                div()
+                    .px(px(theme.spacing.s3))
+                    .pt(px(theme.spacing.s2))
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.muted)
+                    .child(format!(
+                        "{ignored} event{} with a kind this client does not render yet were skipped.",
+                        if ignored == 1 { "" } else { "s" }
+                    )),
+            );
+        }
+        container.child(list).when_some(pill, |container, pill| {
+            container.child(
+                div()
+                    .absolute()
+                    .right(px(theme.spacing.s3))
+                    .bottom(px(theme.spacing.s3))
+                    .child(pill),
             )
-            .when_some(pill, |container, pill| {
-                container.child(
-                    div()
-                        .absolute()
-                        .right(px(theme.spacing.s3))
-                        .bottom(px(theme.spacing.s3))
-                        .child(pill),
-                )
-            })
+        })
     }
 
     fn runs_body(
@@ -1176,6 +1246,7 @@ impl DetailView {
                         title: "The attempt table could not load",
                         message: runs_error.as_deref().unwrap_or_default(),
                         focus: &self.runs_retry_focus,
+                        copy_focus: &self.error_copy_focus,
                     },
                     |this, cx| {
                         this.state.update(cx, |state, cx| {
@@ -1205,7 +1276,7 @@ impl DetailView {
             .gap(px(theme.spacing.s2))
             .p(px(theme.spacing.s2));
         if let Some(message) = runs_error {
-            column = column.child(self.error_banner(theme, &message));
+            column = column.child(self.error_banner(theme, &message, cx));
         }
         column = column.child(runs_header(theme));
         for run in runs.iter().rev() {
@@ -1236,12 +1307,12 @@ struct ErrorBody<'a> {
     title: &'a str,
     message: &'a str,
     focus: &'a FocusHandle,
+    copy_focus: &'a FocusHandle,
 }
 
 /// Everything the Events tab body needs, extracted from the state in one go.
 struct EventsBody {
-    feed: Vec<FeedItem>,
-    event_count: usize,
+    feed: Rc<Vec<FeedItem>>,
     loading: bool,
     loaded: bool,
     error: Option<String>,
@@ -1351,12 +1422,11 @@ impl Render for DetailView {
                 self.output_body(theme, output, loading, error, terminal, cx)
             }
             DetailTab::Events => {
-                let (feed, count, loading, loaded, error, session, ignored) = {
+                let (revision, loading, loaded, error, session, ignored) = {
                     let state = self.state.read(cx);
                     let detail = state.detail();
                     (
-                        detail.map(TaskDetail::feed).unwrap_or_default(),
-                        detail.map(|detail| detail.events.len()).unwrap_or(0),
+                        detail.map(|detail| detail.events_revision).unwrap_or(0),
                         detail.is_some_and(|detail| detail.events_loading),
                         detail.is_some_and(|detail| detail.events_loaded),
                         detail.and_then(|detail| detail.events_error.clone()),
@@ -1364,11 +1434,11 @@ impl Render for DetailView {
                         detail.map(|detail| detail.events_ignored).unwrap_or(0),
                     )
                 };
+                let feed = self.feed_for(task.id, revision, cx);
                 self.events_body(
                     theme,
                     EventsBody {
                         feed,
-                        event_count: count,
                         loading,
                         loaded,
                         error,

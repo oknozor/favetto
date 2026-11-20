@@ -10,8 +10,8 @@
 //! actions, so the surface is usable with either hand (docs §1, Fitts's Law).
 
 use gpui::{
-    div, prelude::*, px, Context, Div, Entity, FocusHandle, Hsla, IntoElement, Render,
-    ScrollHandle, Stateful, Window,
+    div, prelude::*, px, uniform_list, AnyElement, Context, Div, Entity, FocusHandle, Hsla,
+    IntoElement, Render, ScrollStrategy, Stateful, UniformListScrollHandle, Window,
 };
 use uuid::Uuid;
 
@@ -22,16 +22,21 @@ use crate::state::{ClientState, SnapshotStatus};
 use crate::tasks::{TaskFilter, TaskList, TaskRow};
 use crate::theme::Theme;
 
+/// Fixed height of one virtualized task row (36 px target + 2 px separator).
+const TASK_ROW_HEIGHT: f32 = 38.0;
+
 /// The Tasks surface.
 pub struct TasksView {
     state: Entity<ClientState>,
     /// Persisted across renders so live updates keep the scroll position.
-    scroll: ScrollHandle,
+    scroll: UniformListScrollHandle,
     /// The row that was last scrolled into view, so keyboard navigation keeps
     /// the highlight visible without fighting a manual scroll.
     scrolled_to: Option<Uuid>,
     retry_focus: FocusHandle,
     reset_focus: FocusHandle,
+    error_copy_focus: FocusHandle,
+    search_clear_focus: FocusHandle,
 }
 
 impl TasksView {
@@ -39,10 +44,12 @@ impl TasksView {
         cx.observe(&state, |_this, _state, cx| cx.notify()).detach();
         Self {
             state,
-            scroll: ScrollHandle::new(),
+            scroll: UniformListScrollHandle::new(),
             scrolled_to: None,
-            retry_focus: cx.focus_handle().tab_index(33).tab_stop(true),
-            reset_focus: cx.focus_handle().tab_index(34).tab_stop(true),
+            retry_focus: cx.focus_handle().tab_index(21).tab_stop(true),
+            reset_focus: cx.focus_handle().tab_index(22).tab_stop(true),
+            error_copy_focus: cx.focus_handle().tab_index(23).tab_stop(true),
+            search_clear_focus: cx.focus_handle().tab_index(20).tab_stop(true),
         }
     }
 
@@ -98,25 +105,29 @@ impl TasksView {
     ) -> Stateful<Div> {
         let clear = (!query.is_empty()).then(|| {
             let state = self.state.clone();
-            div()
-                .id("tasks-search-clear")
-                .flex()
-                .items_center()
-                .justify_center()
-                .w(px(18.0))
-                .h(px(18.0))
-                .rounded(px(theme.radii.r4))
-                .text_color(theme.colors.muted)
-                .cursor_pointer()
-                .hover(|style| style.bg(theme.colors.bg))
-                .child("×")
-                .on_click(cx.listener(move |_this, _event, _window, cx| {
-                    state.update(cx, |state, cx| {
-                        state.clear_tasks_search();
-                        cx.notify();
-                    });
-                    cx.stop_propagation();
-                }))
+            components::with_focus(
+                div()
+                    .id("tasks-search-clear")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(theme.controls.min))
+                    .px(px(theme.spacing.s2))
+                    .rounded(px(theme.radii.r4))
+                    .text_color(theme.colors.muted)
+                    .cursor_pointer()
+                    .track_focus(&self.search_clear_focus)
+                    .hover(|style| style.bg(theme.colors.bg))
+                    .child("Clear")
+                    .on_click(cx.listener(move |_this, _event, _window, cx| {
+                        state.update(cx, |state, cx| {
+                            state.clear_tasks_search();
+                            cx.notify();
+                        });
+                        cx.stop_propagation();
+                    })),
+                theme,
+            )
         });
 
         div()
@@ -238,6 +249,7 @@ impl TasksView {
                         segment.hover(|style| style.bg(theme.colors.surface))
                     })
                     .cursor_pointer()
+                    .when(selected, |segment| segment.child("✓"))
                     .child(filter.label())
                     .child(
                         div()
@@ -291,7 +303,7 @@ impl TasksView {
                 .flex()
                 .items_center()
                 .gap(px(theme.spacing.s2))
-                .h(px(36.0))
+                .h(px(theme.controls.primary))
                 .px(px(theme.spacing.s3))
                 .rounded(px(theme.radii.r8))
                 .bg(Hsla::from(theme.colors.accent).opacity(0.16))
@@ -307,6 +319,24 @@ impl TasksView {
                     });
                 })),
             theme,
+        )
+    }
+
+    fn error_copy_button(
+        &self,
+        theme: &Theme,
+        message: &str,
+        id: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let message = message.to_string();
+        components::copy_button(theme, id, "Copy error", &self.error_copy_focus).on_click(
+            cx.listener(move |this, _event, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.copy_text(message.clone(), "the error", cx);
+                    cx.notify();
+                });
+            }),
         )
     }
 
@@ -370,7 +400,14 @@ impl TasksView {
                     .text_center()
                     .child(message.to_string()),
             )
-            .child(self.retry_button(theme, cx))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s2))
+                    .child(self.error_copy_button(theme, message, "tasks-error-copy", cx))
+                    .child(self.retry_button(theme, cx)),
+            )
             .child(
                 div()
                     .max_w(px(480.0))
@@ -408,6 +445,7 @@ impl TasksView {
                     .text_color(theme.colors.text)
                     .child(format!("Refresh failed: {message}")),
             )
+            .child(self.error_copy_button(theme, message, "tasks-error-copy-banner", cx))
             .child(self.retry_button(theme, cx))
     }
 
@@ -430,7 +468,7 @@ impl TasksView {
                 .flex()
                 .items_center()
                 .gap(px(theme.spacing.s2))
-                .h(px(36.0))
+                .h(px(theme.controls.primary))
                 .px(px(theme.spacing.s3))
                 .rounded(px(theme.radii.r8))
                 .bg(Hsla::from(theme.colors.accent).opacity(0.16))
@@ -494,128 +532,120 @@ impl TasksView {
             .child(reset)
             .child(hint(theme, "Esc clears the search"))
     }
+}
 
-    fn row(
-        &self,
-        theme: &Theme,
-        index: usize,
-        row: &TaskRow,
-        selected: bool,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
-        let awaiting = row.status == favetto_wire::model::TaskStatus::AwaitingInput;
-        let failed = row.status == favetto_wire::model::TaskStatus::Failed;
-        let status = row.status_kind();
-        let color = status_color(theme, status);
-        let stripe = if awaiting {
-            theme.colors.accent
-        } else if failed {
-            theme.colors.danger
+/// One task row. Shared by the static (tiny) path and the virtualized list, so
+/// both paint exactly the same target and status cluster.
+fn task_row(
+    theme: &Theme,
+    index: usize,
+    row: &TaskRow,
+    selected: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> Stateful<Div> {
+    let awaiting = row.status == favetto_wire::model::TaskStatus::AwaitingInput;
+    let failed = row.status == favetto_wire::model::TaskStatus::Failed;
+    let status = row.status_kind();
+    let color = status_color(theme, status);
+    let stripe = if awaiting {
+        theme.colors.accent
+    } else if failed {
+        theme.colors.danger
+    } else {
+        theme.colors.border
+    };
+
+    div()
+        .id(("tasks-row", index))
+        .flex()
+        .items_center()
+        .gap(px(theme.spacing.s3))
+        .w_full()
+        .h(px(TASK_ROW_HEIGHT - 2.0))
+        .py(px(theme.spacing.s1))
+        .rounded(px(theme.radii.r4))
+        .border_1()
+        .border_color(if selected {
+            Hsla::from(theme.colors.accent)
+        } else if awaiting {
+            Hsla::from(theme.colors.accent).opacity(0.45)
         } else {
-            theme.colors.border
-        };
-        let task_id = row.id;
-
-        div()
-            .id(("tasks-row", index))
-            .flex()
-            .items_center()
-            .gap(px(theme.spacing.s3))
-            .w_full()
-            .min_h(px(36.0))
-            .px(px(theme.spacing.s2))
-            .py(px(theme.spacing.s1))
-            .rounded(px(theme.radii.r4))
-            .border_1()
-            .border_color(if selected {
-                Hsla::from(theme.colors.accent)
-            } else if awaiting {
-                Hsla::from(theme.colors.accent).opacity(0.45)
-            } else {
-                Hsla::from(theme.colors.bg)
-            })
-            .bg(if selected {
-                Hsla::from(theme.colors.accent).opacity(0.10)
-            } else if awaiting {
-                Hsla::from(theme.colors.accent).opacity(0.06)
-            } else {
-                Hsla::from(theme.colors.bg)
-            })
-            .when(!selected, |line| {
-                line.hover(|style| style.bg(Hsla::from(theme.colors.accent).opacity(0.05)))
-            })
-            .cursor_pointer()
-            // Von Restorff: awaiting rows carry the accent stripe + icon; the
-            // label always accompanies the color (docs §2/§3).
-            .child(
-                div()
-                    .w(px(3.0))
-                    .h(px(22.0))
-                    .flex_shrink_0()
-                    .rounded(px(2.0))
-                    .bg(stripe),
-            )
-            .child(
-                div()
-                    .w(px(108.0))
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .gap(px(2.0))
-                    .text_size(px(theme.font.xs))
-                    .text_color(color)
-                    .child(status.icon())
-                    .child(status.label()),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(theme.font.sm))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.colors.text)
-                    .child(row.name.clone()),
-            )
-            .when_some(row.repo.clone(), |line, repo| {
-                line.child(meta_chip(theme, format!("repo:{repo}")))
-            })
-            .when_some(row.agent.clone(), |line, agent| {
-                line.child(meta_chip(theme, format!("agent {agent}")))
-            })
-            .child(
+            Hsla::from(theme.colors.bg)
+        })
+        .bg(if selected {
+            Hsla::from(theme.colors.accent).opacity(0.10)
+        } else if awaiting {
+            Hsla::from(theme.colors.accent).opacity(0.06)
+        } else {
+            Hsla::from(theme.colors.bg)
+        })
+        .when(!selected, |line| {
+            line.hover(|style| style.bg(Hsla::from(theme.colors.accent).opacity(0.05)))
+        })
+        .cursor_pointer()
+        // Von Restorff: awaiting rows carry the accent stripe + icon; the
+        // label always accompanies the color (docs §2/§3).
+        .child(
+            div()
+                .w(px(3.0))
+                .h(px(22.0))
+                .flex_shrink_0()
+                .rounded(px(2.0))
+                .bg(stripe),
+        )
+        .child(
+            div()
+                .w(px(108.0))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap(px(2.0))
+                .text_size(px(theme.font.xs))
+                .text_color(color)
+                .child(status.icon())
+                .child(status.label()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(px(theme.font.sm))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.colors.text)
+                .child(row.name.clone()),
+        )
+        .when_some(row.repo.clone(), |line, repo| {
+            line.child(meta_chip(theme, format!("repo:{repo}")))
+        })
+        .when_some(row.agent.clone(), |line, agent| {
+            line.child(meta_chip(theme, format!("agent {agent}")))
+        })
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(theme.font.xs))
+                .text_color(theme.colors.muted)
+                .child(format!("attempt {}", row.attempt)),
+        )
+        .child(
+            div()
+                .w(px(58.0))
+                .flex_shrink_0()
+                .text_size(px(theme.font.xs))
+                .text_color(theme.colors.muted)
+                .child(inbox::format_duration(row.duration)),
+        )
+        .when_some(inbox::format_cost(row.cost_usd), |line, cost| {
+            line.child(
                 div()
                     .flex_shrink_0()
                     .text_size(px(theme.font.xs))
                     .text_color(theme.colors.muted)
-                    .child(format!("attempt {}", row.attempt)),
+                    .child(cost),
             )
-            .child(
-                div()
-                    .w(px(58.0))
-                    .flex_shrink_0()
-                    .text_size(px(theme.font.xs))
-                    .text_color(theme.colors.muted)
-                    .child(inbox::format_duration(row.duration)),
-            )
-            .when_some(inbox::format_cost(row.cost_usd), |line, cost| {
-                line.child(
-                    div()
-                        .flex_shrink_0()
-                        .text_size(px(theme.font.xs))
-                        .text_color(theme.colors.muted)
-                        .child(cost),
-                )
-            })
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                this.state.update(cx, |state, cx| {
-                    state.select_tasks_row(task_id);
-                    state.deactivate_tasks_search();
-                    state.open_task(task_id);
-                    cx.notify();
-                });
-            }))
-    }
+        })
+        .on_click(on_click)
 }
 
 impl Render for TasksView {
@@ -638,7 +668,7 @@ impl Render for TasksView {
         // a row that is already visible never shifts the list.
         if selected != self.scrolled_to {
             if let Some(index) = selected.and_then(|id| list.position(id)) {
-                self.scroll.scroll_to_item(index);
+                self.scroll.scroll_to_item(index, ScrollStrategy::Center);
             }
             self.scrolled_to = selected;
         }
@@ -668,36 +698,72 @@ impl Render for TasksView {
         }
 
         let show_rows = !list.rows.is_empty();
-        let mut scroll = div()
-            .id("tasks-scroll")
+
+        // Long lists are virtualized: only the visible window is painted and
+        // measured. The row data itself is an `Rc` from the state cache, so a
+        // render never clones the snapshot.
+        let scroll: AnyElement = if list.is_truly_empty() {
+            div()
+                .flex_1()
+                .min_h_0()
+                .child(components::empty_state(
+                    theme,
+                    Route::Tasks.icon(),
+                    "ALL RUNS",
+                    "No runs yet",
+                    "Every run the daemon starts appears here with its status, agent, attempt and elapsed time. Start a task from the Catalog (g c) and it lands here, live.",
+                    "Start a task from the Catalog (g c)",
+                ))
+                .into_any_element()
+        } else if list.is_filtered_empty() {
+            div()
+                .flex_1()
+                .min_h_0()
+                .child(self.filtered_empty(theme, &list, &query, filter, cx))
+                .into_any_element()
+        } else {
+            let rows = list.clone();
+            let view = cx.entity();
+            let list_theme = *theme;
+            let selected_id = selected;
+            uniform_list("tasks-list", rows.rows.len(), move |range, _window, _cx| {
+                range
+                    .filter_map(|index| {
+                        let row = rows.rows.get(index)?;
+                        let is_selected = selected_id == Some(row.id);
+                        let view = view.clone();
+                        let task_id = row.id;
+                        Some(
+                            div()
+                                .h(px(TASK_ROW_HEIGHT))
+                                .px(px(list_theme.spacing.s2))
+                                .py(px(1.0))
+                                .child(task_row(
+                                    &list_theme,
+                                    index,
+                                    row,
+                                    is_selected,
+                                    move |_event, _window, cx| {
+                                        view.update(cx, |this, cx| {
+                                            this.state.update(cx, |state, cx| {
+                                                state.select_tasks_row(task_id);
+                                                state.deactivate_tasks_search();
+                                                state.open_task(task_id);
+                                                cx.notify();
+                                            });
+                                        });
+                                    },
+                                ))
+                                .into_any_element(),
+                        )
+                    })
+                    .collect()
+            })
+            .track_scroll(self.scroll.clone())
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll)
-            .flex()
-            .flex_col()
-            .gap(px(2.0));
-
-        if list.is_truly_empty() {
-            scroll = scroll.child(components::empty_state(
-                theme,
-                Route::Tasks.icon(),
-                "ALL RUNS",
-                "No runs yet",
-                "Every run the daemon starts appears here with its status, agent, attempt and elapsed time. Start a task from the Catalog (g c) and it lands here, live.",
-                "Start a task from the Catalog (g c)",
-            ));
-        } else if list.is_filtered_empty() {
-            scroll = scroll.child(self.filtered_empty(theme, &list, &query, filter, cx));
-        } else {
-            // Rows are direct children of the scroll container so
-            // `ScrollHandle::scroll_to_item` can address them by index.
-            scroll = scroll.p(px(theme.spacing.s2));
-            for (index, row) in list.rows.iter().enumerate() {
-                let is_selected = selected.is_some_and(|id| id == row.id);
-                scroll = scroll.child(self.row(theme, index, row, is_selected, cx));
-            }
-        }
+            .into_any_element()
+        };
 
         let mut list_header = div()
             .flex()

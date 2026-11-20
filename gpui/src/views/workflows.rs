@@ -18,7 +18,7 @@ use gpui::{
 use crate::components;
 use crate::inbox::StatusKind;
 use crate::routes::Route;
-use crate::state::ClientState;
+use crate::state::{ClientState, SnapshotStatus};
 use crate::theme::Theme;
 use crate::workflow::{self, WorkflowBucket, WorkflowDetail, WorkflowGraphState, WorkflowRow};
 
@@ -28,10 +28,14 @@ pub struct WorkflowsView {
     roots_scroll: ScrollHandle,
     rows_scroll: ScrollHandle,
     dot_scroll: ScrollHandle,
+    root_scrolled_to: Option<uuid::Uuid>,
     refresh_focus: FocusHandle,
     cancel_focus: FocusHandle,
     copy_focus: FocusHandle,
     dot_toggle_focus: FocusHandle,
+    retry_focus: FocusHandle,
+    graph_retry_focus: FocusHandle,
+    error_copy_focus: FocusHandle,
     /// The DOT panel is open by default; collapsing it gives the instance
     /// buckets more height on short windows.
     show_dot: bool,
@@ -45,10 +49,14 @@ impl WorkflowsView {
             roots_scroll: ScrollHandle::new(),
             rows_scroll: ScrollHandle::new(),
             dot_scroll: ScrollHandle::new(),
-            refresh_focus: cx.focus_handle().tab_index(40).tab_stop(true),
-            cancel_focus: cx.focus_handle().tab_index(41).tab_stop(true),
-            copy_focus: cx.focus_handle().tab_index(42).tab_stop(true),
-            dot_toggle_focus: cx.focus_handle().tab_index(43).tab_stop(true),
+            root_scrolled_to: None,
+            refresh_focus: cx.focus_handle().tab_index(20).tab_stop(true),
+            cancel_focus: cx.focus_handle().tab_index(21).tab_stop(true),
+            retry_focus: cx.focus_handle().tab_index(22).tab_stop(true),
+            error_copy_focus: cx.focus_handle().tab_index(23).tab_stop(true),
+            copy_focus: cx.focus_handle().tab_index(24).tab_stop(true),
+            dot_toggle_focus: cx.focus_handle().tab_index(25).tab_stop(true),
+            graph_retry_focus: cx.focus_handle().tab_index(26).tab_stop(true),
             show_dot: true,
         }
     }
@@ -60,7 +68,7 @@ impl WorkflowsView {
                 .flex()
                 .items_center()
                 .gap(px(theme.spacing.s1))
-                .h(px(30.0))
+                .h(px(theme.controls.min))
                 .px(px(theme.spacing.s2))
                 .rounded(px(theme.radii.r4))
                 .border_1()
@@ -124,6 +132,8 @@ impl WorkflowsView {
                     .child(hint(theme, "instance"))
                     .child(components::keycap(theme, "↵"))
                     .child(hint(theme, "open"))
+                    .child(components::keycap(theme, "[ ]"))
+                    .child(hint(theme, "root"))
                     .child(components::keycap(theme, "c"))
                     .child(hint(theme, "cancel root"))
                     .child(components::keycap(theme, "r"))
@@ -294,6 +304,106 @@ impl WorkflowsView {
                     .child(hint(theme, &roots.len().to_string())),
             )
             .child(list)
+    }
+
+    fn roots_loading(&self, theme: &Theme) -> Div {
+        let mut list = div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .gap(px(theme.spacing.s2))
+            .p(px(theme.spacing.s2));
+        for index in 0..5 {
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme.spacing.s1))
+                    .p(px(theme.spacing.s2))
+                    .rounded(px(theme.radii.r4))
+                    .border_1()
+                    .border_color(theme.colors.border)
+                    .bg(theme.colors.bg)
+                    .child(
+                        div()
+                            .w(px(120.0 + index as f32 * 16.0))
+                            .h(px(10.0))
+                            .rounded(px(theme.radii.r4))
+                            .bg(theme.colors.border),
+                    )
+                    .child(
+                        div()
+                            .w(px(64.0))
+                            .h(px(6.0))
+                            .rounded(px(theme.radii.r4))
+                            .bg(theme.colors.border),
+                    ),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .w(px(250.0))
+            .flex_shrink_0()
+            .border_r_1()
+            .border_color(theme.colors.border)
+            .bg(theme.colors.surface)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(theme.spacing.s2))
+                    .px(px(theme.spacing.s3))
+                    .py(px(theme.spacing.s2))
+                    .border_b_1()
+                    .border_color(theme.colors.border)
+                    .child(components::section_label(theme, "ROOTS"))
+                    .child(hint(theme, "Loading…")),
+            )
+            .child(list)
+    }
+
+    fn roots_error(&self, theme: &Theme, message: &str, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(theme.spacing.s2))
+            .p(px(theme.spacing.s6))
+            .child(
+                div()
+                    .text_size(px(theme.font.lg))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.colors.text)
+                    .child("The workflow list could not load"),
+            )
+            .child(
+                div()
+                    .max_w(px(520.0))
+                    .text_center()
+                    .text_size(px(theme.font.sm))
+                    .text_color(theme.colors.muted)
+                    .child(message.to_string()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s2))
+                    .child(self.error_copy_button(theme, message, "workflow-roots-error-copy", cx))
+                    .child(self.retry_button(
+                        theme,
+                        "workflow-retry-roots-error",
+                        "Retry",
+                        &self.retry_focus,
+                        cx,
+                    )),
+            )
     }
 
     fn detail_header(&self, theme: &Theme, detail: &WorkflowDetail, cx: &mut Context<Self>) -> Div {
@@ -493,7 +603,14 @@ impl WorkflowsView {
                     .text_color(theme.colors.text)
                     .child(format!("The workflow could not refresh: {message}")),
             )
-            .child(self.retry_button(theme, "workflow-retry-inspect", "Retry", cx))
+            .child(self.error_copy_button(theme, message, "workflow-error-copy", cx))
+            .child(self.retry_button(
+                theme,
+                "workflow-retry-inspect",
+                "Retry",
+                &self.retry_focus,
+                cx,
+            ))
     }
 
     fn retry_button(
@@ -501,6 +618,7 @@ impl WorkflowsView {
         theme: &Theme,
         id: &'static str,
         label: &str,
+        focus: &FocusHandle,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         components::with_focus(
@@ -508,13 +626,14 @@ impl WorkflowsView {
                 .id(id)
                 .flex()
                 .items_center()
-                .h(px(28.0))
+                .h(px(theme.controls.min))
                 .px(px(theme.spacing.s2))
                 .rounded(px(theme.radii.r4))
                 .bg(Hsla::from(theme.colors.accent).opacity(0.16))
                 .text_size(px(theme.font.xs))
                 .text_color(theme.colors.accent)
                 .cursor_pointer()
+                .track_focus(focus)
                 .child(label.to_string())
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.state.update(cx, |state, cx| {
@@ -523,6 +642,24 @@ impl WorkflowsView {
                     });
                 })),
             theme,
+        )
+    }
+
+    fn error_copy_button(
+        &self,
+        theme: &Theme,
+        message: &str,
+        id: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let message = message.to_string();
+        components::copy_button(theme, id, "Copy error", &self.error_copy_focus).on_click(
+            cx.listener(move |this, _event, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.copy_text(message.clone(), "the error", cx);
+                    cx.notify();
+                });
+            }),
         )
     }
 
@@ -682,7 +819,7 @@ impl WorkflowsView {
                     .flex_shrink_0()
                     .flex()
                     .items_center()
-                    .h(px(24.0))
+                    .h(px(theme.controls.min))
                     .px(px(theme.spacing.s2))
                     .rounded(px(theme.radii.r4))
                     .border_1()
@@ -790,7 +927,7 @@ impl WorkflowsView {
                 .id("workflow-copy-dot")
                 .flex()
                 .items_center()
-                .h(px(24.0))
+                .h(px(theme.controls.min))
                 .px(px(theme.spacing.s2))
                 .rounded(px(theme.radii.r4))
                 .border_1()
@@ -814,7 +951,7 @@ impl WorkflowsView {
                 .id("workflow-toggle-dot")
                 .flex()
                 .items_center()
-                .h(px(24.0))
+                .h(px(theme.controls.min))
                 .px(px(theme.spacing.s2))
                 .rounded(px(theme.radii.r4))
                 .text_size(px(theme.font.xs))
@@ -937,7 +1074,14 @@ impl WorkflowsView {
                     .text_color(theme.colors.text)
                     .child(format!("workflow.get failed: {message}")),
             )
-            .child(self.retry_button(theme, "workflow-retry-graph", "Retry", cx))
+            .child(self.error_copy_button(theme, message, "workflow-graph-error-copy", cx))
+            .child(self.retry_button(
+                theme,
+                "workflow-retry-graph",
+                "Retry",
+                &self.graph_retry_focus,
+                cx,
+            ))
     }
 
     fn empty_detail(&self, theme: &Theme) -> Div {
@@ -977,7 +1121,13 @@ impl WorkflowsView {
                     .flex()
                     .justify_center()
                     .pb(px(theme.spacing.s4))
-                    .child(self.retry_button(theme, "workflow-retry-roots", "Refresh roots", cx)),
+                    .child(self.retry_button(
+                        theme,
+                        "workflow-retry-roots",
+                        "Refresh roots",
+                        &self.retry_focus,
+                        cx,
+                    )),
             )
     }
 }
@@ -985,18 +1135,39 @@ impl WorkflowsView {
 impl Render for WorkflowsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.state.read(cx).theme(window.appearance());
-        let (roots, selected, detail, graph) = {
+        let (roots, selected, detail, graph, snapshot_status, has_snapshot) = {
             let state = self.state.read(cx);
             (
                 state.workflow_roots(),
                 state.selected_workflow_root(),
                 state.workflow_detail().cloned(),
                 state.workflow_graph().clone(),
+                state.snapshot_status().clone(),
+                state.has_snapshot_data(),
             )
         };
 
+        if selected != self.root_scrolled_to {
+            if let Some(index) =
+                selected.and_then(|id| roots.iter().position(|root| root.root_id == id))
+            {
+                self.roots_scroll.scroll_to_item(index);
+            }
+            self.root_scrolled_to = selected;
+        }
+
         let body: AnyElement = if roots.is_empty() {
-            self.empty_detail(theme).into_any_element()
+            if matches!(snapshot_status, SnapshotStatus::Loading) && !has_snapshot {
+                self.roots_loading(theme).into_any_element()
+            } else if let SnapshotStatus::Failed { message } = &snapshot_status {
+                if !has_snapshot {
+                    self.roots_error(theme, message, cx).into_any_element()
+                } else {
+                    self.empty_detail(theme).into_any_element()
+                }
+            } else {
+                self.empty_detail(theme).into_any_element()
+            }
         } else {
             let Some(detail) = detail else {
                 return div()
@@ -1057,7 +1228,13 @@ impl Render for WorkflowsView {
                                     "The daemon returned an empty inspect payload. It may have been pruned; refresh to retry.",
                                 ),
                         )
-                        .child(self.retry_button(theme, "workflow-retry-empty", "Retry", cx)),
+                        .child(self.retry_button(
+                            theme,
+                            "workflow-retry-empty",
+                            "Retry",
+                            &self.retry_focus,
+                            cx,
+                        )),
                 );
             } else {
                 column = column.child(self.instances_body(theme, &detail, cx));
@@ -1066,13 +1243,27 @@ impl Render for WorkflowsView {
             column.into_any_element()
         };
 
-        div()
+        let mut root = div()
             .size_full()
             .flex()
             .flex_col()
             .bg(theme.colors.bg)
-            .child(self.header(theme, roots.len(), cx))
-            .child(
+            .child(self.header(theme, roots.len(), cx));
+        if let SnapshotStatus::Failed { message } = &snapshot_status {
+            if has_snapshot {
+                root = root.child(self.error_banner(theme, message, cx));
+            }
+        }
+        let roots_pending = roots.is_empty()
+            && !has_snapshot
+            && matches!(
+                snapshot_status,
+                SnapshotStatus::Loading | SnapshotStatus::Failed { .. }
+            );
+        if roots_pending {
+            root.child(body)
+        } else {
+            root.child(
                 div()
                     .flex()
                     .flex_1()
@@ -1080,6 +1271,7 @@ impl Render for WorkflowsView {
                     .child(self.roots_panel(theme, &roots, selected, cx))
                     .child(body),
             )
+        }
     }
 }
 

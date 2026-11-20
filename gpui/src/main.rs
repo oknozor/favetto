@@ -12,6 +12,7 @@ mod config;
 mod detail;
 mod inbox;
 mod layout;
+mod motion;
 mod palette;
 mod routes;
 mod runtime;

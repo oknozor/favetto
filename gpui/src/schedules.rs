@@ -153,6 +153,23 @@ impl ScheduleEditor {
         self.focus = ScheduleField::Task;
     }
 
+    /// Step the task picker through the catalog names, clamping at both ends.
+    pub fn cycle_task(&mut self, names: &[String], delta: isize) {
+        if names.is_empty() {
+            return;
+        }
+        let current = names.iter().position(|name| name == &self.task);
+        let next = match current {
+            Some(current) => {
+                let last = names.len() as isize - 1;
+                (current as isize + delta).clamp(0, last) as usize
+            }
+            // Nothing selected yet: the first arrow picks the first task.
+            None => 0,
+        };
+        self.select_task(&names[next]);
+    }
+
     pub fn toggle_enabled(&mut self) {
         self.enabled = !self.enabled;
         self.focus = ScheduleField::Enabled;
@@ -801,6 +818,24 @@ mod tests {
         assert_eq!(cron, "0 0 9 * * 1-5");
         assert_eq!(task, "repo:favetto/triage");
         assert!(enabled);
+    }
+
+    #[test]
+    fn the_task_picker_moves_in_catalog_order_and_clamps() {
+        let mut editor = ScheduleEditor::new(None);
+        let names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        editor.cycle_task(&names, 1);
+        assert_eq!(editor.task, "a");
+        editor.cycle_task(&names, 1);
+        assert_eq!(editor.task, "b");
+        assert_eq!(editor.focus, ScheduleField::Task);
+        editor.cycle_task(&names, 5);
+        assert_eq!(editor.task, "c");
+        editor.cycle_task(&names, -5);
+        assert_eq!(editor.task, "a");
+        let empty: Vec<String> = Vec::new();
+        editor.cycle_task(&empty, 1);
+        assert_eq!(editor.task, "a");
     }
 
     #[test]

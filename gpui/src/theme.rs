@@ -28,6 +28,21 @@ pub const DETAIL_WIDTH: f32 = 360.0;
 /// of a third column (docs §1, "Responsive layout").
 pub const NARROW_BREAKPOINT: f32 = 1120.0;
 
+/// The smallest target an interactive control may have (docs §2, Fitts's Law:
+/// "rows ≥ 32 px high"). Enforced by [`crate::components::with_focus`].
+pub const MIN_TARGET: f32 = 32.0;
+
+/// The height of a primary action (docs §2, Fitts's Law: "primary buttons
+/// ≥ 40 px").
+pub const PRIMARY_TARGET: f32 = 40.0;
+
+/// The default row height used by dense lists and tables.
+pub const ROW_HEIGHT: f32 = 32.0;
+
+/// The gap between tightly coupled chips or keycaps. Not a spacing step: it is
+/// a hairline-scale separator, deliberately outside the 4/8/12/16/24 scale.
+pub const MICRO_GAP: f32 = 2.0;
+
 /// The spacing scale in px (docs §3): 4/8/12/16/24.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Spacing {
@@ -94,12 +109,25 @@ pub struct Colors {
     pub success: Rgba,
 }
 
+/// Control heights in px. Compact density changes spacing, never these values:
+/// a target below [`MIN_TARGET`] would break Fitts's Law (docs §2).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Controls {
+    /// The minimum target size.
+    pub min: f32,
+    /// Dense table/list row.
+    pub row: f32,
+    /// The primary action on a surface.
+    pub primary: f32,
+}
+
 /// The two themes of the client (docs §3).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Theme {
     pub spacing: Spacing,
     pub radii: Radii,
     pub font: FontScale,
+    pub controls: Controls,
     pub colors: Colors,
 }
 
@@ -122,6 +150,11 @@ static DARK: LazyLock<Theme> = LazyLock::new(|| Theme {
         base: 15.0,
         lg: 20.0,
         xl: 28.0,
+    },
+    controls: Controls {
+        min: MIN_TARGET,
+        row: ROW_HEIGHT,
+        primary: PRIMARY_TARGET,
     },
     colors: Colors {
         bg: rgb(0x171717),
@@ -155,6 +188,11 @@ static LIGHT: LazyLock<Theme> = LazyLock::new(|| Theme {
         base: 15.0,
         lg: 20.0,
         xl: 28.0,
+    },
+    controls: Controls {
+        min: MIN_TARGET,
+        row: ROW_HEIGHT,
+        primary: PRIMARY_TARGET,
     },
     colors: Colors {
         bg: rgb(0xF5F5F5),
@@ -241,6 +279,9 @@ mod tests {
         );
         assert!(compact.spacing.s4 < DARK.spacing.s4);
         assert_eq!(compact.colors.bg, DARK.colors.bg);
+        // Density must never shrink a target below the accessibility floor.
+        assert_eq!(compact.controls.min, MIN_TARGET);
+        assert_eq!(compact.controls.primary, PRIMARY_TARGET);
         let light = Theme::for_settings(
             WindowAppearance::Dark,
             ThemeChoice::Light,

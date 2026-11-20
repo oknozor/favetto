@@ -1,13 +1,13 @@
 # favetto GPUI desktop client
 
-Status: **task catalog (step 09)** — browse definitions grouped by repo and
-folder, fuzzy-search names and prompts, read the raw Markdown source beside the
-list, and launch a definition through a validated `[[vars]]` sheet. The
-Workflows surface lists the roots in the current task snapshot and inspects one
-root's ready/running/failed/blocked/terminal instances, progress and catalog DAG
-source. Schedules create/edit/delete cron triggers, and Settings edits the
-daemon connection, tests it, lists the agents and applies a theme/density. The
-plans live in `docs/design/gpui-client.md`.
+Status: **step 10 (polish)** — the client now has an accessibility and
+state-coverage pass. Every surface has loading, empty, error and unauthorized
+states; errors carry an actionable message plus a **Copy error** control; Tab
+traverses the real tab stops in visual order with a visible focus ring; all
+targets meet the 32 px floor (40 px for primary actions); long task and event
+lists are virtualized; the live event feed is capped; and the one decorative
+animation (the toast fade) respects the OS reduced-motion setting. The plans
+live in `docs/design/gpui-client.md`.
 
 ## What it is
 
@@ -47,8 +47,11 @@ Reconnect action retries after the token/test daemon is corrected.
 Keyboard: `⌘K`/`Ctrl+K` opens the command palette, `g i`/`g t`/`g c`/`g w`/
 `g s` jump to Inbox/Tasks/Catalog/Workflows/Schedules, `⌘,`/`Ctrl+,` opens
 Settings, `?` opens the shortcut sheet, `Esc` closes the topmost overlay or
-steps back from a pushed detail. On the Inbox, `↑`/`↓` move the Needs you
-highlight, `Enter` opens the highlighted run, and `r` refreshes the surface.
+steps back from a pushed detail. **Tab** and **Shift+Tab** move real focus
+through the top bar, sidebar, active surface, detail column and status bar in
+visual order; **Enter** or **Space** activates the focused control. On the
+Inbox, `↑`/`↓` move the Needs you highlight, `Enter` opens the highlighted run,
+and `r` refreshes the surface.
 
 On the Tasks surface, `↑`/`↓` move (Home/End and PageUp/PageDown jump), `Enter`
 opens the run, `c` cancels and `r` retries a finished run (both confirm first,
@@ -56,16 +59,24 @@ then update the row immediately), `/` focuses the search field, `Esc` clears
 the query, and `[`/`]` step the status filter.
 
 On the Catalog surface, `↑`/`↓` move the definition highlight, `Enter` opens
-the launch sheet, `/` focuses the search field, `⌘N`/`Ctrl+N` opens the one-shot
-session sheet, and `Esc` closes the sheet, then clears the search. Inside a
-sheet, `Tab`/`Shift+Tab` move between fields, `⌘↵`/`Ctrl+↵` launches (or opens
-the one-shot session), and `Esc` cancels.
+the launch sheet, `/` focuses the search field, `h` collapses/expands the
+highlighted folder, `⌘N`/`Ctrl+N` opens the one-shot session sheet, and `Esc`
+closes the sheet, then clears the search. Inside a sheet, `Tab`/`Shift+Tab`
+move between fields, `←`/`→` cycle a declared choice list, `⌘↵`/`Ctrl+↵`
+launches (or opens the one-shot session), and `Esc` cancels.
 
 The Inbox and Tasks surfaces load one `tasks.list` (limit 500) and `agents.list`
 snapshot on connect and follow `task.updated`, `agent.state` and `agent.event`
 pushes. A blocked session shows up without a manual refresh; overlapping pushes
 coalesce into one RPC round trip. A refresh keeps the previous rows visible, so
 the list never flickers.
+
+The Inbox grouping and the filtered Tasks list are memoized on the snapshot
+revision plus the search/filter, and handed to the views as `Rc` values, so a
+render never clones or re-sorts the 500-row snapshot. The Tasks table is a
+`uniform_list`: only the visible row window is measured and painted. The
+detail's Events tab uses GPUI's variable-height `list` with the same lazy
+window, and the live feed is capped at 2,000 retained frames.
 
 Opening a run (Enter or a row click) fills the detail column. The header stays
 pinned while the tab body scrolls:
@@ -129,9 +140,10 @@ from instead of showing a blank panel.
 
 `↑`/`↓` move the instance highlight, `↵` opens the instance in the task detail,
 `c` opens the root-cancel confirmation (it names the number of non-terminal
-instances) and `r` retries the highlighted failed instance. The same actions are
-available as buttons; **Refresh** (or the palette's Refresh data) reloads the
-inspect and the DAG source. Cancel marks every non-terminal row immediately and
+instances) and `r` retries the highlighted failed instance. `[`/`]` move the
+root highlight without a mouse. The same actions are available as buttons;
+**Refresh** (or the palette's Refresh data) reloads the inspect and the DAG
+source. Cancel marks every non-terminal row immediately and
 retry moves its row to Ready, then both reconcile with the RPC response and the
 next `task.updated` push. `workflow.get` is shown as readable DOT in a monospace
 panel with a one-line edge legend and **Copy DOT** (no Graphviz binary is
@@ -144,8 +156,9 @@ a relative hint). `n` opens the create sheet, `↵` edits the highlighted row an
 validation and a plain-language hint (five-field expressions get a zero-seconds
 field; the hint names the cadence and the next fire), a task picker from
 `catalog.list`, and an enabled toggle (`⌘E`/`Ctrl+E` or a click). `Tab`/
-`Shift+Tab` walk the fields and `⌘↵`/`Ctrl+↵` saves. A rejected save stays
-attached to the sheet; a saved row appears immediately with its `next_run`.
+`Shift+Tab` walk the fields; when the task picker is focused, `↑`/`↓` move its
+selection. `⌘↵`/`Ctrl+↵` saves. A rejected save stays attached to the sheet; a
+saved row appears immediately with its `next_run`.
 Deleting names the task and cadence, and the row disappears only after the
 daemon answers.
 
@@ -203,7 +216,9 @@ field blank keeps the shared token file.
   folds updates in and calls `cx.notify()`. It also owns the active route, the
   pushed-detail flag, the shared task snapshot (tasks + sessions + agent
   roster), the Inbox selection, the Tasks filter/query/selection, the Catalog
-  model, the confirmation dialog and the toast.
+  model, the confirmation dialog and the toast. Inbox/Tasks derivations are
+  memoized on a snapshot revision and shared with `Rc`; action errors use one
+  `copy_text` clipboard path.
 - `src/catalog.rs` — the pure Catalog model: repo/folder grouping, fuzzy
   name+prompt filtering, session-scoped collapse keys, preview state, and the
   launch/one-shot forms with required/type/choice validation. Unit-tested
@@ -239,9 +254,14 @@ field blank keeps the shared token file.
   selection, recents and command execution kinds (unit-tested without a window).
 - `src/layout.rs` — the responsive breakpoint helper (the container-query
   equivalent for this GPUI version).
-- `src/components.rs` — focus ring, keycaps, connection pill, empty state and
-  shortcut rows shared by the shell and route views.
-- `src/views/` — one entity per route plus the contextual detail view.
+- `src/motion.rs` — OS reduced-motion detection (GTK settings plus
+  `FAVETTO_REDUCE_MOTION`/`GTK_ENABLE_ANIMATIONS`). The only decorative motion
+  is the toast fade; everything else changes state immediately.
+- `src/components.rs` — focus ring, keycaps, connection pill, empty state,
+  copy-error action and shortcut rows shared by the shell and route views. The
+  focus helper enforces the 32 px minimum target.
+- `src/views/` — one entity per route plus the contextual detail view. Tasks
+  and the detail Events tab are virtualized.
 
 ## Development
 
@@ -485,3 +505,141 @@ Deviations from the plan are recorded in this file as the chain progresses
   time fields plus common day/weekday/month shapes; anything more complex still
   gets the computed next fire under `Custom schedule` rather than a wrong
   description.
+
+### Step 10 deviations / additions
+
+This step added no product features. It made the existing surfaces trustworthy
+under keyboard-only use, failure, long lists and reduced-motion preferences.
+
+#### Accessibility
+
+- **Focus traversal is explicit.** The pinned GPUI build does not move focus on
+  Tab by itself; the shell now binds `Tab`/`Shift+Tab` to `FocusNext`/`FocusPrev`
+  and calls `window.focus_next()`/`focus_prev()` plus `cx.notify()` so the ring
+  actually repaints. The palette, Catalog sheets, Schedules sheet and Settings
+  keep their own, more specific Tab bindings (logical field focus), which take
+  precedence by context depth.
+- **Tab order is one scheme.** Top bar `1–2`, sidebar `10–15`, active surface
+  `20–30`, detail column `50–67`, status bar `70–76`, overlays `100`. The old
+  overlapping 20–35/40–54 range is gone, so Tab follows the visual order on wide
+  windows and still follows it when the detail becomes a pushed page.
+- **Every focusable control has a ring.** `components::with_focus` reserves a
+  2 px border and paints it with the accent color on focus. The same helper now
+  enforces the 32 px minimum target; primary actions use the 40 px token from
+  `theme::Controls`. Compact density never shrinks either value.
+- **Labels are visible, not icon-only.** Search-clear actions say **Clear**,
+  the toast says **Dismiss**, and every error action says **Copy error**. Status
+  remains icon + label + color everywhere (`✓ succeeded`, `✕ failed`,
+  `⚠ awaiting input`, `◐ running`), never color alone. Declared choice lists and
+  the theme/density chips mark the selected value with `✓`.
+- **Focus returns to the shell** after a nav click, a `g` jump and a confirmed
+  action, so Tab always starts from a predictable place. `Enter` on a focused
+  button belongs to that button (the shell's list-open action checks the focused
+  handle first).
+- **Known framework limit.** `gpui 0.2.2` exposes no accessibility tree/AT-SPI
+  API. The client therefore guarantees visible labels, focus order and keyboard
+  operation, but a screen reader cannot consume widget roles or names from this
+  build. This is recorded below as a limitation, not silently claimed as an
+  ARIA implementation.
+
+#### States audit
+
+| Surface | Loading | Empty | Error / unauthorized |
+|---|---|---|---|
+| Inbox | static skeleton, previous rows stay | calm empty state + Catalog hint | full error panel with **Copy error** + Retry; refresh failures keep rows and show a copyable banner; unauthorized names the token path |
+| Tasks | skeleton, previous rows stay | “No runs yet” vs “No matches” reset | full error panel / copyable banner; unauthorized names the token path |
+| Task detail | per-tab skeleton | terminal vs running output, empty feed, no attempts | per-tab error state with **Copy error** + Retry; a failed refresh keeps the older feed and shows a banner |
+| Catalog | skeleton | no definitions vs no search matches | full error panel / banner + preview error with **Copy error** + Retry |
+| Workflows | root-list skeleton + inspect skeleton | no roots vs root without instances | root-list error and inspect error with **Copy error** + Retry; a stale snapshot keeps the older roots |
+| Schedules | skeleton | empty trigger state | table error panel / banner + **Copy error** + Retry; sheet and delete rejections stay attached and copyable |
+| Settings | agent roster loading line | explicit no-agents copy | connection pill + token path, reconnect/copyable connection notice, roster error with Retry, copyable test/save errors |
+
+No view renders a bare network error or a blank panel: each failure has a title,
+the daemon/transport message, a next action and a copy control. Network and
+persisted data are never `unwrap`/`expect`ed (the only `expect` is the initial
+window creation, which is not network data).
+
+#### Reduced motion
+
+The shell reads the OS setting through `motion::prefers_reduced_motion()`:
+`FAVETTO_REDUCE_MOTION` first, then `GTK_ENABLE_ANIMATIONS`, then
+`gtk-enable-animations` in the GTK 3/GTK 4 `settings.ini`. The only decorative
+motion is the 140 ms toast fade; reduced motion removes the fade and renders the
+same final panel immediately. Skeleton rows are static, status changes are
+text/icon changes, and no message is conveyed by motion alone.
+
+#### Performance
+
+- `ClientState` memoizes the Inbox grouping and the filtered Tasks list on a
+  snapshot revision plus query/filter, and returns `Rc` handles. A render no
+  longer re-groups or clones the 500-row snapshot.
+- The Tasks table is a `uniform_list` (38 px rows); only the visible range is
+  measured and painted, and keyboard selection reveals the row.
+- The detail Events tab is GPUI's variable-height `list`, rebuilt only when the
+  event revision changes. A paused reader keeps their logical position; a
+  following reader stays at the tail.
+- The live feed is capped at `MAX_RETAINED_EVENTS = 2_000`; the oldest frames
+  are trimmed first, so the newest permission/error frames survive.
+
+#### Keyboard-only pass (X11, live daemon)
+
+Run on the local daemon with the pointer used only to give the window focus:
+
+1. `g t` → Tasks; `↑`/`↓`, `Home`/`End`, `PageUp`/`PageDown` move the
+   highlight; `↵` opened a run; Tab reached the detail tabs and header actions.
+2. `g c` → Catalog; `↓` changed the definition; `↵` opened the launch sheet;
+   `Tab` moved through the declared vars; `←`/`→` toggled the `supervise` /
+   `escalate` choice; `Esc` closed the sheet without sending anything. `h`
+   collapsed the highlighted folder and the selection moved to the next visible
+   definition.
+3. `g w` → Workflows; `]` changed the root (progress, buckets and DOT panel
+   updated); `↑`/`↓` changed the instance; `c` opened the root-cancel
+   confirmation and `Esc` backed out.
+4. `g s` → Schedules; `n` opened the sheet; `Tab` moved focus to the task
+   picker; `↓` moved the selection through the catalog; `⌘E` toggles enabled;
+   `Esc` closed the sheet without writing.
+5. `⌘,` → Settings; `Tab` moved the logical focus through Endpoint, Token,
+   Test, Defaults, Save, Reconnect, Theme and Density; `⌘T` ran the connection
+   test and showed latency + daemon cwd; `⌘↵` is the save chord.
+6. `?` opened the shortcut sheet; `Esc` closed it; `⌘K` opened the palette and
+   `Esc` returned to the list.
+
+The live daemon had no blocked agent prompt at the time, so the permission
+banner was verified through the existing `pending_request` unit tests and its
+focusable 40 px reply buttons. Cancel/retry confirmations were opened and
+dismissed without applying an RPC to a real run; the optimistic apply/rollback
+path remains covered by the step-05 live RPC check and its unit tests.
+
+#### Laws of UX design-review walk
+
+| # | Question | Finding | Fix in this step |
+|---|---|---|---|
+| 1 | What decision is the user making, and how many options compete? | Inbox and Tasks still have one primary action; Catalog separates launch from one-shot. Selected filter/chips were color-only. | Added `✓` markers to selected filters, choices, theme and density; kept one primary per surface. |
+| 2 | What must the user remember? | The detail header, palette recents and catalog collapse were already persistent. | Memoized derivations and kept the selection/scroll position across live refreshes. |
+| 3 | Are related things grouped and unrelated separated? | Three regions and cards were sound; error actions were scattered as text. | Copy + Retry now form one action cluster on every failure surface; spacing follows `theme.rs`. |
+| 4 | Is the primary action the most distinct thing? | Launch/Save were 40 px, but the Catalog “Start with variables” and permission buttons were smaller and quieter. | Raised both to the 40 px primary token; danger remains the only danger-colored action. |
+| 5 | What is seen in the first 400 ms and while waiting? | Optimistic actions and skeletons existed; the toast was the only motion. | Kept static skeletons, added the reduced-motion switch and preserved optimistic reconciliation. |
+| 6 | Does the flow match conventions? | `g` jumps and arrows did, but Tab did nothing because GPUI has no built-in traversal. | Added explicit `FocusNext`/`FocusPrev`, visible rings and shell focus after navigation. |
+| 7 | What happens at the peak and the end, especially after error? | The outcome block existed, but a failure could end in a bare string. | Every failure now ends with Copy error + Retry; the transport keeps the older feed. |
+| 8 | What input might be rejected unnecessarily? | Endpoint forms and typed values were liberal; choice-only vars required typing an exact string. | `←`/`→` cycles declared choices; the schedule task picker uses `↑`/`↓`. |
+| 9 | Which 20% carries 80% of the value? | Inbox → Tasks → detail is the core loop; large snapshots were re-rendered. | Virtualized the task and event lists and cached the derivations. |
+| 10 | Are we reducing complexity or moving it to the user? | SSE reconnect, resume cursors and rollback are absorbed by the client; Workflows exposes the raw complexity only as counts and buckets. | Kept that model; added copyable diagnostics rather than more controls. |
+
+#### Known limitations
+
+- **No accessibility tree in this GPUI build.** Widget roles/names are not
+  exposed to AT-SPI; the guarantees are visual labels, focus order, keyboard
+  operation and target sizes.
+- **No text selection.** Output, source, DOT and errors are copyable via buttons
+  (and error copy) instead of selectable text.
+- **No IME marked-text composition.** Typed characters are appended at the end;
+  cursor movement inside a field is not implemented.
+- **No embedded Graphviz.** `workflow.get` is readable DOT source.
+- **No daemon version.** `system.ping` does not report one; Settings says so.
+- **No container queries.** The responsive breakpoint reads the window width.
+- **The Workflows root and bucket lists are not virtualized.** They are derived
+  from the same 500-row snapshot; the first 500 roots are still painted. The
+  Tasks and Events lists, which are the long scroll surfaces, are virtualized.
+- **The toast fade is the only animation.** If a future surface adds motion, it
+  must call `motion::prefers_reduced_motion()` and preserve the final-state
+  information.

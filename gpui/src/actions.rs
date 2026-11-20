@@ -19,6 +19,10 @@ actions!(
     [
         /// Open or close the command palette (`⌘K` / `Ctrl+K`).
         TogglePalette,
+        /// Move keyboard focus to the next tab stop (Tab).
+        FocusNext,
+        /// Move keyboard focus to the previous tab stop (Shift+Tab).
+        FocusPrev,
         /// Close the topmost overlay, or step back from a pushed detail.
         CloseOverlay,
         /// Open or close the shortcut sheet (`?`).
@@ -83,10 +87,20 @@ actions!(
         CatalogFieldNext,
         /// Move to the previous Catalog form field (Shift+Tab).
         CatalogFieldPrev,
+        /// Cycle the focused launch field to its previous fixed choice (←).
+        CatalogChoicePrev,
+        /// Cycle the focused launch field to its next fixed choice (→).
+        CatalogChoiceNext,
         /// Open the root-cancel confirmation on Workflows (`c`).
         WorkflowCancelRoot,
         /// Retry the highlighted failed workflow instance (`r`).
         WorkflowRetryInstance,
+        /// Move the root highlight up ([).
+        WorkflowRootPrev,
+        /// Move the root highlight down (]).
+        WorkflowRootNext,
+        /// Collapse/expand the highlighted catalog folder (`h`).
+        CatalogToggleFolder,
         /// Open the Schedules create sheet (`n`).
         ScheduleNew,
         /// Open the Schedules edit sheet for the highlighted row (`↵`).
@@ -123,6 +137,11 @@ actions!(
 pub fn bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("secondary-k", TogglePalette, Some("Root")),
+        // GPUI does not traverse tab stops by itself. This is the shell-wide
+        // binding; the palette/sheet/settings bindings are registered later and
+        // therefore win inside their modal scope.
+        KeyBinding::new("tab", FocusNext, Some("Root")),
+        KeyBinding::new("shift-tab", FocusPrev, Some("Root")),
         KeyBinding::new("escape", CloseOverlay, Some("Root")),
         KeyBinding::new(
             "shift-/",
@@ -263,6 +282,15 @@ pub fn bindings() -> Vec<KeyBinding> {
             CatalogSearch,
             Some("Catalog && !Palette && !Shortcuts && !Search && !Launch && !Oneshot && !Confirm"),
         ),
+        // `h` collapses/expands the folder containing the highlighted
+        // definition; collapsed headers stay visible, so this is recoverable
+        // even if every folder is closed. A letter avoids the Space/Enter
+        // activation that a focused button already owns.
+        KeyBinding::new(
+            "h",
+            CatalogToggleFolder,
+            Some("Catalog && !Palette && !Shortcuts && !Search && !Launch && !Oneshot && !Confirm"),
+        ),
         KeyBinding::new(
             "secondary-n",
             CatalogNewOneshot,
@@ -270,6 +298,8 @@ pub fn bindings() -> Vec<KeyBinding> {
         ),
         KeyBinding::new("tab", CatalogFieldNext, Some("Catalog && Launch")),
         KeyBinding::new("shift-tab", CatalogFieldPrev, Some("Catalog && Launch")),
+        KeyBinding::new("left", CatalogChoicePrev, Some("Catalog && Launch")),
+        KeyBinding::new("right", CatalogChoiceNext, Some("Catalog && Launch")),
         KeyBinding::new("tab", CatalogFieldNext, Some("Catalog && Oneshot")),
         KeyBinding::new("shift-tab", CatalogFieldPrev, Some("Catalog && Oneshot")),
         KeyBinding::new(
@@ -292,6 +322,16 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new(
             "r",
             WorkflowRetryInstance,
+            Some("Workflows && !Palette && !Shortcuts && !Confirm"),
+        ),
+        KeyBinding::new(
+            "[",
+            WorkflowRootPrev,
+            Some("Workflows && !Palette && !Shortcuts && !Confirm"),
+        ),
+        KeyBinding::new(
+            "]",
+            WorkflowRootNext,
             Some("Workflows && !Palette && !Shortcuts && !Confirm"),
         ),
         KeyBinding::new(
@@ -442,6 +482,8 @@ mod tests {
     fn the_keymap_binds_actions_in_the_right_contexts() {
         let contexts = contexts();
         assert!(contexts.contains(&("TogglePalette".into(), Some("Root".into()))));
+        assert!(contexts.contains(&("FocusNext".into(), Some("Root".into()))));
+        assert!(contexts.contains(&("FocusPrev".into(), Some("Root".into()))));
         assert!(contexts.iter().any(|(action, context)| {
             action == "GoInbox" && context.as_deref().is_some_and(|c| c.contains("!Palette"))
         }));
@@ -510,7 +552,12 @@ mod tests {
 
     #[test]
     fn workflow_shortcuts_are_scoped_to_the_workflows_surface() {
-        for (action, key) in [("WorkflowCancelRoot", "c"), ("WorkflowRetryInstance", "r")] {
+        for (action, key) in [
+            ("WorkflowCancelRoot", "c"),
+            ("WorkflowRetryInstance", "r"),
+            ("WorkflowRootPrev", "["),
+            ("WorkflowRootNext", "]"),
+        ] {
             let matches: Vec<_> = bindings()
                 .into_iter()
                 .filter(|binding| {
@@ -539,6 +586,7 @@ mod tests {
             ("CatalogLaunchSubmit", "enter"),
             ("CatalogFieldNext", "tab"),
             ("CatalogFieldPrev", "tab"),
+            ("CatalogToggleFolder", "h"),
         ] {
             let matches: Vec<_> = bindings()
                 .into_iter()
