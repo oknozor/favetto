@@ -179,11 +179,17 @@ fn config_error_popup_closes_on_esc_and_enter_only() {
     assert!(matches!(app.popup, Popup::None));
 }
 
-fn agent_session(id: &str, headless: bool, running: bool, awaiting: bool) -> AgentSessionInfo {
+fn session_with_backend(
+    id: &str,
+    headless: bool,
+    running: bool,
+    awaiting: bool,
+    backend: favetto_core::model::AgentBackend,
+) -> AgentSessionInfo {
     AgentSessionInfo {
         id: id.to_string(),
         agent: "demo".to_string(),
-        backend: favetto_core::model::AgentBackend::Acp,
+        backend,
         task_id: None,
         running,
         headless,
@@ -198,6 +204,26 @@ fn agent_session(id: &str, headless: bool, running: bool, awaiting: bool) -> Age
         activity: None,
         usage: None,
     }
+}
+
+fn agent_session(id: &str, headless: bool, running: bool, awaiting: bool) -> AgentSessionInfo {
+    session_with_backend(
+        id,
+        headless,
+        running,
+        awaiting,
+        favetto_core::model::AgentBackend::Acp,
+    )
+}
+
+fn pty_session(id: &str, headless: bool, running: bool, awaiting: bool) -> AgentSessionInfo {
+    session_with_backend(
+        id,
+        headless,
+        running,
+        awaiting,
+        favetto_core::model::AgentBackend::Pty,
+    )
 }
 
 #[test]
@@ -222,6 +248,7 @@ fn open_agent_marks_headless_runs_read_only() {
 fn open_agent_keeps_a_blocked_headless_run_writable() {
     let mut app = App::new();
     app.open_agent(agent_session("s2", true, true, true), b"");
+    assert!(app.agent_structured, "ACP always uses the feed");
     assert!(!app.agent_read_only);
     assert!(app.agent_capture);
     match app.handle_key(key(KeyCode::Char('y'), KeyModifiers::empty())) {
@@ -237,21 +264,23 @@ fn open_agent_keeps_interactive_sessions_writable() {
     assert!(!app.agent_read_only);
     assert!(app.agent_capture);
     assert!(app.agent_status.is_empty());
-    assert!(!app.agent_structured);
+    assert!(app.agent_structured, "ACP renders the structured feed");
+    assert_eq!(app.agent_backend, favetto_core::model::AgentBackend::Acp);
 }
 
 #[test]
 fn open_agent_marks_headless_runs_structured() {
-    // A live headless run with no interactive attach: structured, never JSON.
+    // A live ACP run with no interactive attach: structured feed, never JSON.
     let mut app = App::new();
     app.open_agent(agent_session("s5", true, true, false), b"");
     assert!(app.agent_structured);
     assert!(app.agent_read_only && !app.agent_capture);
 
-    // A blocked headless run is interactive so its dialog stays visible.
-    app.open_agent(agent_session("s6", true, true, true), b"");
+    // A blocked PTY run is interactive so its dialog stays visible.
+    app.open_agent(pty_session("s6", true, true, true), b"");
     assert!(!app.agent_structured);
     assert!(!app.agent_read_only);
+    assert_eq!(app.agent_backend, favetto_core::model::AgentBackend::Pty);
 }
 
 #[test]
@@ -260,6 +289,124 @@ fn open_agent_clears_a_previous_error() {
     app.agent_error = Some("boom".to_string());
     app.open_agent(agent_session("s4", false, true, false), b"");
     assert!(app.agent_error.is_none());
+}
+
+#[test]
+fn acp_events_fill_the_structured_feed_not_the_terminal() {
+    let mut app = App::new();
+    app.open_agent(agent_session("s1", false, true, false), b"");
+    app.agent_event(
+        "s1",
+        &AgentStateEvent::ReasoningDelta {
+            text: "considering".to_string(),
+        },
+    );
+    app.agent_event(
+        "s1",
+        &AgentStateEvent::TextDelta {
+            role: MessageRole::Assistant,
+            text: "\x1b[2Jvisible".to_string(),
+        },
+    );
+    app.agent_event(
+        "s1",
+        &AgentStateEvent::ToolStarted {
+            id: "call-1".to_string(),
+            name: "read".to_string(),
+            input: serde_json::json!({ "path": "src/lib.rs" }),
+            detail: None,
+        },
+    );
+    app.agent_event(
+        "s1",
+        &AgentStateEvent::ToolFinished {
+            id: "call-1".to_string(),
+            name: "read".to_string(),
+            ok: true,
+            output: Some(serde_json::json!("ok")),
+            detail: None,
+        },
+    );
+
+    assert_eq!(app.agent_feed.len(), 3);
+    let terminal = app.term.screen().contents();
+    assert!(
+        !terminal.contains("visible") && !terminal.contains("[tool]"),
+        "ACP text must not be parsed as terminal input: {terminal:?}"
+    );
+    let rendered = app.agent_feed.render(&app.theme, None);
+    let text = rendered
+        .lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("Thinking"));
+    assert!(!text.contains("considering"), "thought body starts folded");
+    assert!(text.contains("visible"));
+    assert!(
+        !text.contains("\x1b[2J"),
+        "escape sequence leaked into feed"
+    );
+    assert!(text.contains("read"));
+    assert!(text.contains("completed"));
+}
+
+#[test]
+fn acp_feed_folds_the_selected_tool_from_the_keyboard() {
+    let mut app = App::new();
+    app.open_agent(agent_session("s1", false, true, false), b"");
+    app.agent_event(
+        "s1",
+        &AgentStateEvent::ToolStarted {
+            id: "call-1".to_string(),
+            name: "read".to_string(),
+            input: serde_json::json!({ "path": "src/lib.rs" }),
+            detail: None,
+        },
+    );
+    assert_eq!(app.agent_feed.tool_expanded("call-1"), Some(false));
+
+    // Ctrl+Y hands the keyboard to favetto; Up selects the last foldable row.
+    app.handle_key(key(KeyCode::Char('y'), KeyModifiers::CONTROL));
+    app.handle_key(key(KeyCode::Up, KeyModifiers::empty()));
+    assert!(app.agent_feed_selected.is_some());
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
+    assert_eq!(app.agent_feed.tool_expanded("call-1"), Some(true));
+
+    // A later lifecycle update keeps the user's expanded state.
+    app.agent_event(
+        "s1",
+        &AgentStateEvent::ToolFinished {
+            id: "call-1".to_string(),
+            name: "read".to_string(),
+            ok: false,
+            output: None,
+            detail: None,
+        },
+    );
+    assert_eq!(app.agent_feed.tool_expanded("call-1"), Some(true));
+    assert_eq!(app.agent_feed.len(), 1, "no duplicate card on finish");
+}
+
+#[test]
+fn pty_events_keep_the_terminal_path() {
+    let mut app = App::new();
+    app.open_agent(pty_session("pty", false, true, false), b"");
+    app.agent_event(
+        "pty",
+        &AgentStateEvent::TextDelta {
+            role: MessageRole::Assistant,
+            text: "terminal text".to_string(),
+        },
+    );
+    assert!(app.agent_feed.is_empty(), "PTY does not use the ACP feed");
+    assert!(app.term.screen().contents().contains("terminal text"));
 }
 
 #[test]

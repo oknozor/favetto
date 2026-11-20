@@ -12,7 +12,9 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use favetto_core::model::{AgentSessionInfo, FailureKind, Task, TaskStatus, UsagePeriod};
+use favetto_core::model::{
+    AgentBackend, AgentSessionInfo, FailureKind, Task, TaskStatus, UsagePeriod,
+};
 use favetto_core::workflow::{WorkflowInspect, WorkflowState};
 
 use super::app::{
@@ -1356,6 +1358,15 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("Ctrl+Y", "toggle focus: agent ↔ favetto"),
             ("(agent focus)", "every key is forwarded to the agent"),
+            ("(ACP, favetto focus) ↑ / ↓", "select a thought or tool row"),
+            (
+                "(ACP, favetto focus) Enter / Space",
+                "fold/unfold the selected row",
+            ),
+            (
+                "(ACP, favetto focus) PageUp / PageDown",
+                "scroll the feed; Home/End jump to the ends",
+            ),
             ("(favetto focus) Ctrl+O", "switch to another session"),
             (
                 "(pending prompt) Ctrl+R",
@@ -2372,8 +2383,13 @@ fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
         return;
     }
 
-    // A headless run has no interactive view: render its structured state, never
-    // the raw machine-output PTY (JSON event stream).
+    // ACP sessions render the structured event feed. A non-ACP headless run with
+    // no interactive view keeps its structured state snapshot, never the raw
+    // machine-output PTY (JSON event stream).
+    if app.agent_backend == AgentBackend::Acp {
+        draw_agent_feed(frame, app, inner_area, theme);
+        return;
+    }
     if app.agent_structured {
         draw_agent_structured(frame, app, inner_area, theme);
         return;
@@ -2425,6 +2441,42 @@ fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     if !hide_cursor && cursor_row < inner_area.height && cursor_col < inner_area.width {
         frame.set_cursor_position((inner_area.x + cursor_col, inner_area.y + cursor_row));
     }
+}
+
+/// Draw the ordered ACP feed: prose messages, muted foldable thoughts, and tool
+/// cards whose details fold on request. New events follow the bottom unless the
+/// user has scrolled up or selected a row.
+fn draw_agent_feed(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    if let Some(selected) = app.agent_feed_selected {
+        if !app.agent_feed.contains_item(selected) {
+            app.agent_feed_selected = None;
+        }
+    }
+
+    let rendered = app.agent_feed.render(&theme, app.agent_feed_selected);
+    let paragraph = Paragraph::new(rendered.lines).wrap(Wrap { trim: false });
+    let total = paragraph.line_count(area.width) as u16;
+    let max_scroll = total.saturating_sub(area.height);
+    app.agent_feed_max_scroll = max_scroll;
+
+    let mut scroll = app.agent_feed_scroll.min(max_scroll);
+    if app.agent_feed_follow {
+        scroll = max_scroll;
+    } else if let Some((start, end)) = rendered.selected_range {
+        let start = (start as u16).min(max_scroll);
+        let end = (end as u16).min(max_scroll.saturating_add(area.height));
+        if start < scroll {
+            scroll = start;
+        } else if end > scroll.saturating_add(area.height) {
+            scroll = end.saturating_sub(area.height);
+        }
+    }
+    app.agent_feed_scroll = scroll;
+
+    frame.render_widget(paragraph.scroll((scroll, 0)), area);
 }
 
 /// The Agent-panel body for a headless run that has no interactive view: a

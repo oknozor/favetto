@@ -186,6 +186,50 @@ impl App {
             }
             return UiAction::None;
         }
+
+        // The ACP feed has its own row selection and scroll: Up/Down move between
+        // foldable thoughts/tool cards, Enter/Space fold one, and PageUp/PageDown
+        // plus Home/End scroll the transcript. A PTY session keeps its terminal
+        // keys unchanged.
+        if self.agent_backend == AgentBackend::Acp {
+            let page = self.agent_feed_page();
+            match key.code {
+                KeyCode::Up => {
+                    if !self.select_agent_feed_item(-1) {
+                        self.scroll_agent_feed(-1);
+                    }
+                    return UiAction::None;
+                }
+                KeyCode::Down => {
+                    if !self.select_agent_feed_item(1) {
+                        self.scroll_agent_feed(1);
+                    }
+                    return UiAction::None;
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    self.toggle_selected_agent_feed_item();
+                    return UiAction::None;
+                }
+                KeyCode::PageUp => {
+                    self.scroll_agent_feed(-page);
+                    return UiAction::None;
+                }
+                KeyCode::PageDown => {
+                    self.scroll_agent_feed(page);
+                    return UiAction::None;
+                }
+                KeyCode::Home => {
+                    self.jump_agent_feed(false);
+                    return UiAction::None;
+                }
+                KeyCode::End => {
+                    self.jump_agent_feed(true);
+                    return UiAction::None;
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
             KeyCode::Tab | KeyCode::Right => {
                 self.next_tab();
@@ -268,6 +312,29 @@ impl App {
             }
         }
 
+        // The wheel over the ACP feed scrolls its transcript rather than a list.
+        if self.tab == Tab::Agent && self.agent_backend == AgentBackend::Acp {
+            if let Some(area) = self.agent_area {
+                let over = mouse.column >= area.x
+                    && mouse.column < area.x + area.width
+                    && mouse.row >= area.y
+                    && mouse.row < area.y + area.height;
+                if over {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => {
+                            self.scroll_agent_feed(-3);
+                            return UiAction::None;
+                        }
+                        MouseEventKind::ScrollDown => {
+                            self.scroll_agent_feed(3);
+                            return UiAction::None;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
         // The wheel over a list scrolls that list's selection.
         let wheel_delta = match mouse.kind {
             MouseEventKind::ScrollUp => Some(-3),
@@ -291,6 +358,7 @@ impl App {
         }
 
         if self.tab == Tab::Agent
+            && self.agent_backend == AgentBackend::Pty
             && self.agent_running
             && self.agent_session_id.is_some()
             && !self.agent_read_only

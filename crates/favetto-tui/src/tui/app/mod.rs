@@ -14,9 +14,9 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use favetto_core::model::{
-    AgentActivity, AgentCapabilities, AgentCatalogEntry, AgentSessionInfo, AgentStateEvent,
-    AgentUsage, AwaitingInputKind, Event, EventKind, InputReply, InputRequest, MessageRole,
-    NotificationRecord, RepoInfo, Schedule, Task, TaskStatus, UsagePeriod, UsageStats,
+    AgentActivity, AgentBackend, AgentCapabilities, AgentCatalogEntry, AgentSessionInfo,
+    AgentStateEvent, AgentUsage, AwaitingInputKind, Event, EventKind, InputReply, InputRequest,
+    MessageRole, NotificationRecord, RepoInfo, Schedule, Task, TaskStatus, UsagePeriod, UsageStats,
 };
 use favetto_core::rpc::{method, push, Notification};
 use favetto_core::workflow::WorkflowInspect;
@@ -24,6 +24,7 @@ use favetto_providers::Provider;
 
 use crate::tasks::TaskVar;
 
+use super::feed::AgentFeed;
 use super::sound::SoundCue;
 use super::term::TerminalView;
 use super::text_buffer::TextBuffer;
@@ -897,9 +898,22 @@ pub struct App {
     /// True when the panel is showing a retained headless PTY that must not
     /// receive keystrokes (a read-only replay or a live unattended run).
     pub agent_read_only: bool,
-    /// True when the panel renders the structured state view for a headless run
-    /// instead of the machine PTY's screen (which carries raw JSON events).
+    /// True when the panel renders a structured view instead of a PTY screen: the
+    /// ACP event feed, or the headless-run snapshot for a non-ACP session.
     pub agent_structured: bool,
+    /// How the active session is driven. ACP sessions render the structured feed;
+    /// PTY sessions keep the embedded terminal.
+    pub agent_backend: AgentBackend,
+    /// Ordered, bounded feed of the active ACP session's events.
+    pub agent_feed: AgentFeed,
+    /// Vertical scroll offset (in rendered lines) of the ACP feed.
+    pub agent_feed_scroll: u16,
+    /// Maximum useful feed scroll offset (set during draw).
+    pub agent_feed_max_scroll: u16,
+    /// Whether the feed follows new events at the bottom.
+    pub agent_feed_follow: bool,
+    /// Stable id of the selected foldable feed row (a thought or tool card).
+    pub agent_feed_selected: Option<u64>,
     /// The last `agents.start` / `agents.attach` / `tasks.get` error, shown in the
     /// status bar.
     pub agent_error: Option<String>,
@@ -1029,6 +1043,12 @@ impl App {
             agent_capture: false,
             agent_read_only: false,
             agent_structured: false,
+            agent_backend: AgentBackend::Pty,
+            agent_feed: AgentFeed::new(),
+            agent_feed_scroll: 0,
+            agent_feed_max_scroll: 0,
+            agent_feed_follow: true,
+            agent_feed_selected: None,
             agent_error: None,
             notice: None,
             agent_selection: None,
@@ -1802,8 +1822,13 @@ impl App {
         // Ctrl+R reply sees the latest prompt without waiting for an `agents.list`.
         self.agent_sessions
             .insert(session.id.clone(), session.clone());
-        let structured = session.headless && session.awaiting_input.is_none();
-        let read_only = structured;
+        let backend = session.backend;
+        let acp = backend == AgentBackend::Acp;
+        // ACP always renders its event feed. A non-ACP headless run with no
+        // interactive view keeps the structured state snapshot, never its raw
+        // machine-output PTY (the JSON event stream).
+        let structured = acp || (session.headless && session.awaiting_input.is_none());
+        let read_only = session.headless && session.awaiting_input.is_none();
         let status = if !session.headless {
             String::new()
         } else if session.awaiting_input.is_some() {
@@ -1814,21 +1839,33 @@ impl App {
             "headless run (replay, read-only)".to_string()
         };
 
-        if self.agent_session_id.as_deref() != Some(session.id.as_str()) {
+        let new_session = self.agent_session_id.as_deref() != Some(session.id.as_str());
+        if new_session {
             self.term = TerminalView::default();
+            self.agent_feed.clear();
+            self.agent_feed_scroll = 0;
+            self.agent_feed_max_scroll = 0;
+            self.agent_feed_follow = true;
+            self.agent_feed_selected = None;
         }
-        self.term.process(frame);
+        // An ACP attach payload is a plain transcript, not a terminal frame; it
+        // must never be parsed as terminal control input. Live events seed the
+        // feed instead.
+        if !acp {
+            self.term.process(frame);
+        }
         self.agent_session_id = Some(session.id);
         self.agent_task_id = session.task_id;
         self.agent_name = Some(session.agent);
         self.agent_running = session.running;
         self.agent_read_only = read_only;
         self.agent_structured = structured;
+        self.agent_backend = backend;
         self.agent_status = status;
         self.agent_error = None;
         self.agent_selection = None;
         // The embedded agent owns the keyboard as soon as the panel is opened,
-        // unless the PTY is read-only.
+        // unless the PTY (or ACP turn) is read-only.
         self.agent_capture = !read_only;
         self.tab = Tab::Agent;
     }
@@ -1953,11 +1990,24 @@ impl App {
         ))
     }
 
-    /// Render one structured ACP event into the active session's transcript.
+    /// Fold one structured ACP event into the active session. ACP sessions render
+    /// the ordered feed; PTY sessions keep their existing terminal-transcript
+    /// behavior.
     pub fn agent_event(&mut self, session_id: &str, event: &AgentStateEvent) {
         if self.agent_session_id.as_deref() != Some(session_id) {
             return;
         }
+        if self.agent_backend == AgentBackend::Acp {
+            self.agent_feed.apply(event);
+            // A pruned tool/thought may have taken the selection with it.
+            if let Some(selected) = self.agent_feed_selected {
+                if !self.agent_feed.contains_item(selected) {
+                    self.agent_feed_selected = None;
+                }
+            }
+            return;
+        }
+
         let mut text = String::new();
         match event {
             AgentStateEvent::TextDelta { role, text: delta } => match role {
@@ -1988,10 +2038,68 @@ impl App {
         }
     }
 
+    /// Move the ACP feed selection to the previous/next foldable row. Without a
+    /// selection, Down starts at the first row and Up at the last.
+    pub fn select_agent_feed_item(&mut self, delta: isize) -> bool {
+        let ids = self.agent_feed.foldable_ids();
+        if ids.is_empty() {
+            return false;
+        }
+        let next = match self
+            .agent_feed_selected
+            .and_then(|selected| ids.iter().position(|id| *id == selected))
+        {
+            Some(current) => {
+                let index = (current as isize + delta).clamp(0, ids.len() as isize - 1);
+                ids[index as usize]
+            }
+            None if delta >= 0 => ids[0],
+            None => ids[ids.len() - 1],
+        };
+        self.agent_feed_selected = Some(next);
+        // Selecting a row pauses auto-follow so streaming output cannot scroll it
+        // out from under the user.
+        self.agent_feed_follow = false;
+        true
+    }
+
+    /// Fold/unfold the selected thought or tool row.
+    pub fn toggle_selected_agent_feed_item(&mut self) -> bool {
+        let Some(selected) = self.agent_feed_selected else {
+            return false;
+        };
+        self.agent_feed.toggle_item(selected)
+    }
+
+    /// Scroll the ACP feed by `delta` rendered lines (negative scrolls up).
+    pub fn scroll_agent_feed(&mut self, delta: i32) {
+        let max = self.agent_feed_max_scroll as i32;
+        let next = (self.agent_feed_scroll as i32 + delta).clamp(0, max);
+        self.agent_feed_scroll = next as u16;
+        self.agent_feed_follow = next >= max;
+    }
+
+    /// A page-sized ACP feed scroll step: its inner height, or 10 lines before
+    /// the feed has been laid out.
+    pub fn agent_feed_page(&self) -> i32 {
+        self.agent_area.map_or(10, |a| a.height.max(1)) as i32
+    }
+
+    /// Jump the ACP feed to the top or bottom.
+    pub fn jump_agent_feed(&mut self, bottom: bool) {
+        self.agent_feed_scroll = if bottom {
+            self.agent_feed_max_scroll
+        } else {
+            0
+        };
+        self.agent_feed_follow = bottom;
+    }
+
     /// Mark the active session as exited.
     pub fn agent_exit(&mut self, session_id: &str, code: Option<i32>) {
         if self.agent_session_id.as_deref() == Some(session_id) {
             self.agent_running = false;
+            self.agent_feed.finish_streaming();
             self.agent_status = match code {
                 Some(c) => format!("exited ({c}) — Ctrl+N for a new session"),
                 None => "exited — Ctrl+N for a new session".to_string(),
