@@ -40,3 +40,10 @@ recent runs second, updating live.
 - Opening the app against a daemon with a blocked session shows it in
   "Needs you" first.
 - No `unwrap` on task/session fields; unknown status degrades to a neutral row.
+
+## Commit
+
+- After the definition of done is satisfied, create a git commit for this task before reporting completion.
+- Review `git status` and the diff; stage only changes made for this task. Do not include pre-existing or unrelated changes, and never amend an existing commit.
+- If task changes overlap pre-existing edits and cannot be cleanly isolated, stop and ask before committing.
+- Use a concise commit message, e.g. `feat(gpui): build inbox surface`.

@@ -50,7 +50,6 @@ SSE over `GET /events` with resume, and a connection state the UI can render.
 
 - Work only in `gpui/`. Do not modify the daemon, TUI or web client.
 - No unwrap/expect on network data; errors are values shown in the UI.
-- Do not commit.
 
 ## Definition of done
 
@@ -58,3 +57,10 @@ SSE over `GET /events` with resume, and a connection state the UI can render.
 - With the daemon running, the app shows `Connected` and the ping round-trip
   result; stopping the daemon flips to `Reconnecting`, restarting recovers, and
   a bad token shows `Unauthorized` with the token field path.
+
+## Commit
+
+- After the definition of done is satisfied, create a git commit for this task before reporting completion.
+- Review `git status` and the diff; stage only changes made for this task. Do not include pre-existing or unrelated changes, and never amend an existing commit.
+- If task changes overlap pre-existing edits and cannot be cleanly isolated, stop and ask before committing.
+- Use a concise commit message, e.g. `feat(gpui): add daemon transport`.

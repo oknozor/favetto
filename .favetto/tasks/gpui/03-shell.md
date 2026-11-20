@@ -45,3 +45,10 @@ status bar, routing, command palette and keyboard model.
 - Every route is reachable by keyboard from launch; the palette opens/closes
   with `⌘K`/`Esc`; the active route is visibly distinct.
 - No placeholder "TODO" screens remain, only intentional empty states.
+
+## Commit
+
+- After the definition of done is satisfied, create a git commit for this task before reporting completion.
+- Review `git status` and the diff; stage only changes made for this task. Do not include pre-existing or unrelated changes, and never amend an existing commit.
+- If task changes overlap pre-existing edits and cannot be cleanly isolated, stop and ask before committing.
+- Use a concise commit message, e.g. `feat(gpui): build navigation shell`.

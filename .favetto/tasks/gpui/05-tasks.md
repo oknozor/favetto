@@ -39,3 +39,10 @@ Build the Tasks list: every run, searchable and filterable, with safe actions.
 - Filter counts match the rows; cancel/retry work against a live daemon and
   roll back visibly when the RPC fails.
 - No list row panics on unknown status/agent values.
+
+## Commit
+
+- After the definition of done is satisfied, create a git commit for this task before reporting completion.
+- Review `git status` and the diff; stage only changes made for this task. Do not include pre-existing or unrelated changes, and never amend an existing commit.
+- If task changes overlap pre-existing edits and cannot be cleanly isolated, stop and ask before committing.
+- Use a concise commit message, e.g. `feat(gpui): build tasks list`.

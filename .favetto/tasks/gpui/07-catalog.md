@@ -42,3 +42,10 @@ Browse the task catalog and launch a definition with its declared variables.
 - Launching a catalog task with required variables is blocked until they are
   filled, and succeeds against a live daemon afterwards.
 - A server error (e.g. unknown agent) is shown inline, not as a crash/log line.
+
+## Commit
+
+- After the definition of done is satisfied, create a git commit for this task before reporting completion.
+- Review `git status` and the diff; stage only changes made for this task. Do not include pre-existing or unrelated changes, and never amend an existing commit.
+- If task changes overlap pre-existing edits and cannot be cleanly isolated, stop and ask before committing.
+- Use a concise commit message, e.g. `feat(gpui): build task catalog`.

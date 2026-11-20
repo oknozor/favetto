@@ -54,7 +54,6 @@ Create the `gpui/` desktop client skeleton as a **standalone cargo workspace**
 
 - Work only in `gpui/`, plus the one root `Cargo.toml` exclude edit.
 - Do not modify `crates/`, `web/`, or the daemon.
-- Do not commit; leave the tree ready for review.
 
 ## Definition of done
 
@@ -62,3 +61,10 @@ Create the `gpui/` desktop client skeleton as a **standalone cargo workspace**
 - `cargo fmt --check` and `cargo clippy -- -D warnings` succeed in `gpui/`.
 - The app opens a window with the shell and six navigation entries.
 - `cargo test --workspace` at the repository root still passes (GPUI is excluded).
+
+## Commit
+
+- After the definition of done is satisfied, create a git commit for this task before reporting completion.
+- Review `git status` and the diff; stage only changes made for this task. Do not include pre-existing or unrelated changes, and never amend an existing commit.
+- If task changes overlap pre-existing edits and cannot be cleanly isolated, stop and ask before committing.
+- Use a concise commit message, e.g. `feat(gpui): scaffold desktop client`.
