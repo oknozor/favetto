@@ -1208,6 +1208,8 @@ mod tests {
             }),
             activity: None,
             usage: None,
+            load_state: Default::default(),
+            load_error: None,
         };
         let pending = detail
             .pending_request(std::slice::from_ref(&session))

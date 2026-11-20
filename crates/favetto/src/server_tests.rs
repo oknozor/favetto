@@ -1047,6 +1047,8 @@ fn live_session(running: bool, headless: bool, awaiting: bool) -> AgentSessionIn
         }),
         activity: None,
         usage: None,
+        load_state: Default::default(),
+        load_error: None,
     }
 }
 

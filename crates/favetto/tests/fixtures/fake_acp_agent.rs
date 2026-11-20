@@ -92,6 +92,45 @@ fn main() {
                     let _ = std::fs::write(marker, format!("{loaded}\n{cwd}\n"));
                 }
                 session_id = loaded;
+                // Replaying history: an optional user message followed by one
+                // assistant chunk per `|`-separated piece, all before the load
+                // response exactly as a real agent's `session/load` replay is.
+                if let Ok(user) = std::env::var("FAKE_ACP_LOAD_USER") {
+                    notify(
+                        &mut stdout,
+                        json!({
+                            "sessionId": session_id.clone(),
+                            "update": {
+                                "sessionUpdate": "user_message_chunk",
+                                "content": { "type": "text", "text": user }
+                            }
+                        }),
+                    );
+                }
+                if let Ok(history) = std::env::var("FAKE_ACP_LOAD_UPDATES") {
+                    for piece in history.split('|') {
+                        notify(
+                            &mut stdout,
+                            json!({
+                                "sessionId": session_id.clone(),
+                                "update": {
+                                    "sessionUpdate": "agent_message_chunk",
+                                    "content": { "type": "text", "text": piece }
+                                }
+                            }),
+                        );
+                    }
+                }
+                // Deterministic delay: wait for `load-release` after announcing
+                // `load-ready`, so tests can attach while the load is in flight.
+                if let Some(dir) = load_gate_dir() {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(dir.join("load-ready"), b"");
+                    let release = dir.join("load-release");
+                    while !release.exists() {
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                }
                 if std::env::var("FAKE_ACP_LOAD_RESULT").as_deref() == Ok("error") {
                     if let Some(id) = id {
                         error(&mut stdout, id, -32000, "cannot load session");
@@ -199,6 +238,11 @@ fn load_supported() -> bool {
 /// The optional file gate directory, from `FAKE_ACP_GATE_DIR`.
 fn gate_dir() -> Option<PathBuf> {
     std::env::var_os("FAKE_ACP_GATE_DIR").map(PathBuf::from)
+}
+
+/// The optional `session/load` delay gate, from `FAKE_ACP_LOAD_GATE_DIR`.
+fn load_gate_dir() -> Option<PathBuf> {
+    std::env::var_os("FAKE_ACP_LOAD_GATE_DIR").map(PathBuf::from)
 }
 
 /// Concatenate every text block in the prompt request.

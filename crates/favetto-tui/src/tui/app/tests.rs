@@ -203,6 +203,8 @@ fn session_with_backend(
         }),
         activity: None,
         usage: None,
+        load_state: Default::default(),
+        load_error: None,
     }
 }
 

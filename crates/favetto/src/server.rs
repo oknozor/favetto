@@ -231,13 +231,14 @@ async fn handle_request(
         let resp = match parse_params::<StartAgentParams>(&req.method, &req.params) {
             Ok(params) => match start_agent(state, params).await {
                 Ok(session) => match state.agents.attach(&session.id) {
-                    Ok((session, data)) => {
+                    Ok((session, data, seq)) => {
                         subscribed.lock().insert(session.id.clone());
                         Response::ok(
                             id,
                             encode(AgentAttachResult {
                                 session,
                                 data: base64::engine::general_purpose::STANDARD.encode(&data),
+                                seq,
                             }),
                         )
                     }
@@ -272,13 +273,14 @@ async fn handle_request(
     if req.method == method::AGENTS_ATTACH {
         let resp = match parse_params::<SessionIdParams>(&req.method, &req.params) {
             Ok(p) => match state.agents.attach(&p.session_id) {
-                Ok((session, data)) => {
+                Ok((session, data, seq)) => {
                     subscribed.lock().insert(p.session_id);
                     Response::ok(
                         id,
                         encode(AgentAttachResult {
                             session,
                             data: base64::engine::general_purpose::STANDARD.encode(&data),
+                            seq,
                         }),
                     )
                 }
@@ -1571,11 +1573,12 @@ async fn start_oneshot_task(
         });
     }
 
-    let (session_info, frame) = state.agents.attach(&info.id)?;
+    let (session_info, frame, seq) = state.agents.attach(&info.id)?;
     Ok(StartOneshotResult {
         task,
         session: session_info,
         data: base64::engine::general_purpose::STANDARD.encode(&frame),
+        seq,
     })
 }
 

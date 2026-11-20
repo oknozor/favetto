@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use favetto_core::rpc::method;
+use base64::Engine;
+use favetto_core::rpc::{method, push};
 use favetto_tui::client::{Client, Transport};
 use serde_json::json;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -48,6 +49,8 @@ impl Daemon {
         let echo_load = root.join("echo-load");
         let echo_prompt = root.join("echo-prompt");
         let bad_load = root.join("bad-load");
+        let replay_gate = root.join("replay-gate");
+        let replay_bad_gate = root.join("replay-bad-gate");
         let config_path = root.join("config.toml");
         std::fs::write(
             &config_path,
@@ -62,7 +65,17 @@ impl Daemon {
                  [agents.bad]\ncommand = {agent:?}\nargs = []\n\
                  [agents.bad.env]\n\
                  FAKE_ACP_LOAD_RESULT = \"error\"\n\
-                 FAKE_ACP_LOAD_MARKER = {bad_load:?}\n"
+                 FAKE_ACP_LOAD_MARKER = {bad_load:?}\n\n\
+                 [agents.replay]\ncommand = {agent:?}\nargs = []\n\
+                 [agents.replay.env]\n\
+                 FAKE_ACP_LOAD_GATE_DIR = {replay_gate:?}\n\
+                 FAKE_ACP_LOAD_USER = \"restored question\"\n\
+                 FAKE_ACP_LOAD_UPDATES = \"history-one|history-two|history-three\"\n\n\
+                 [agents.replay-bad]\ncommand = {agent:?}\nargs = []\n\
+                 [agents.replay-bad.env]\n\
+                 FAKE_ACP_LOAD_RESULT = \"error\"\n\
+                 FAKE_ACP_LOAD_GATE_DIR = {replay_bad_gate:?}\n\
+                 FAKE_ACP_LOAD_UPDATES = \"partial-one|partial-two\"\n"
             ),
         )
         .unwrap();
@@ -213,6 +226,257 @@ async fn close_session(client: &Client, pool: &SqlitePool, local: &str) {
         method::AGENTS_CLOSE,
     );
     wait_for_status(pool, local, "ended").await;
+}
+
+/// Wait until the fake agent has announced that a gated load is holding its
+/// replay. File-based, so the test never races a wall-clock delay.
+async fn wait_for_file(path: &Path) {
+    let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        if path.exists() {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("{} was never created", path.display());
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// The attach snapshot's plain-text transcript.
+fn attach_text(value: &serde_json::Value) -> String {
+    let encoded = value["data"].as_str().expect("attach data");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("base64 attach data");
+    String::from_utf8(bytes).expect("utf-8 transcript")
+}
+
+/// Attach to `local` and return the decoded transcript plus the cursor.
+async fn attach(client: &Client, local: &str) -> (serde_json::Value, String, u64) {
+    let value = result(
+        client
+            .request(method::AGENTS_ATTACH, json!({ "session_id": local }))
+            .await
+            .unwrap(),
+        method::AGENTS_ATTACH,
+    );
+    let seq = value["seq"].as_u64().unwrap_or(0);
+    let text = attach_text(&value);
+    (value, text, seq)
+}
+
+/// Collect this session's `agent.event` pushes observed by a subscriber.
+///
+/// Waits for a short quiet period; readiness is published only after replay is
+/// in the feed, so everything the load produced is already on the bus.
+async fn agent_events(
+    rx: &mut tokio::sync::broadcast::Receiver<favetto_core::rpc::Notification>,
+    local: &str,
+) -> Vec<(u64, serde_json::Value)> {
+    let mut out = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            Ok(Ok(notification)) if notification.method == push::AGENT_EVENT => {
+                let params = &notification.params;
+                if params["session_id"].as_str() != Some(local) {
+                    continue;
+                }
+                let Some(seq) = params["seq"].as_u64() else {
+                    continue;
+                };
+                out.push((seq, params["event"].clone()));
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+    out
+}
+
+/// Every assistant/user text delta, in delivery order.
+fn text_deltas(events: &[(u64, serde_json::Value)]) -> Vec<(String, String)> {
+    events
+        .iter()
+        .filter_map(|(_, event)| {
+            if event["event"].as_str() != Some("text_delta") {
+                return None;
+            }
+            Some((
+                event["role"].as_str().unwrap_or_default().to_string(),
+                event["text"].as_str().unwrap_or_default().to_string(),
+            ))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn load_replays_history_in_order_before_it_is_ready() {
+    let daemon = Daemon::spawn();
+    wait_for_socket(&daemon.socket).await;
+    let client = Client::connect(Transport::Unix(daemon.socket.clone()))
+        .await
+        .expect("connect to the daemon");
+    let observer = Client::connect(Transport::Unix(daemon.socket.clone()))
+        .await
+        .expect("connect the observer");
+    let mut pushes = observer.subscribe();
+    let pool = open_db(&daemon.db_path()).await;
+
+    let (local, _external) = start_session(&client, &pool, &daemon, "replay").await;
+    close_session(&client, &pool, &local).await;
+
+    let load = {
+        let client = client.clone();
+        let local = local.clone();
+        tokio::spawn(async move {
+            client
+                .request(
+                    method::AGENTS_START,
+                    json!({ "agent": "replay", "session_id": local }),
+                )
+                .await
+                .unwrap()
+        })
+    };
+
+    // The fake agent has emitted its whole replay but is holding the response.
+    wait_for_file(&daemon.root.join("replay-gate/load-ready")).await;
+
+    // Discard pushes from the just-closed creation session; the replay itself
+    // has not been published yet.
+    while pushes.try_recv().is_ok() {}
+
+    // Attaching during the load sees an explicitly loading session with no
+    // transcript yet; the replay is not allowed to leak early.
+    let (during, during_text, during_seq) = attach(&observer, &local).await;
+    assert_eq!(
+        during["session"]["load_state"], "loading",
+        "an in-flight restore is explicitly loading"
+    );
+    assert_eq!(during_text, "", "no replay is exposed before it succeeds");
+    assert_eq!(during_seq, 0, "no replay events have a sequence yet");
+
+    std::fs::write(daemon.root.join("replay-gate/load-release"), b"").unwrap();
+    let loaded = result(load.await.expect("load task"), method::AGENTS_START);
+    assert_eq!(loaded["session"]["load_state"], "ready");
+    assert!(
+        loaded["session"].get("load_error").is_none(),
+        "a successful load carries no error"
+    );
+    assert_eq!(
+        attach_text(&loaded),
+        "history-onehistory-twohistory-three",
+        "the complete replay is attached, in arrival order"
+    );
+    let loaded_seq = loaded["seq"].as_u64().unwrap();
+    assert!(
+        loaded_seq >= 3,
+        "the replay has sequence numbers before readiness: {loaded_seq}"
+    );
+
+    // Reconnecting after readiness returns the same single copy of history; the
+    // replay is not re-emitted per attach.
+    let (again, again_text, again_seq) = attach(&observer, &local).await;
+    assert_eq!(again["session"]["load_state"], "ready");
+    assert_eq!(again_text, "history-onehistory-twohistory-three");
+    assert_eq!(again_seq, loaded_seq);
+    let (_, third_text, third_seq) = attach(&observer, &local).await;
+    assert_eq!(third_text, "history-onehistory-twohistory-three");
+    assert_eq!(third_seq, loaded_seq);
+
+    // The event feed also contains the replay exactly once, in order, with
+    // strictly increasing cursors.
+    let events = agent_events(&mut pushes, &local).await;
+    let deltas = text_deltas(&events);
+    assert_eq!(
+        deltas,
+        vec![
+            ("user".to_string(), "restored question".to_string()),
+            ("assistant".to_string(), "history-one".to_string()),
+            ("assistant".to_string(), "history-two".to_string()),
+            ("assistant".to_string(), "history-three".to_string()),
+        ]
+    );
+    let text_seqs: Vec<u64> = events
+        .iter()
+        .filter(|(_, event)| event["event"].as_str() == Some("text_delta"))
+        .map(|(seq, _)| *seq)
+        .collect();
+    assert!(
+        text_seqs.windows(2).all(|pair| pair[0] < pair[1]),
+        "replay event sequence must be strictly increasing: {text_seqs:?}"
+    );
+
+    close_session(&client, &pool, &local).await;
+}
+
+#[tokio::test]
+async fn failed_load_discards_its_partial_replay() {
+    let daemon = Daemon::spawn();
+    wait_for_socket(&daemon.socket).await;
+    let client = Client::connect(Transport::Unix(daemon.socket.clone()))
+        .await
+        .expect("connect to the daemon");
+    let observer = Client::connect(Transport::Unix(daemon.socket.clone()))
+        .await
+        .expect("connect the observer");
+    let mut pushes = observer.subscribe();
+    let pool = open_db(&daemon.db_path()).await;
+
+    let (local, _external) = start_session(&client, &pool, &daemon, "replay-bad").await;
+    close_session(&client, &pool, &local).await;
+
+    let load = {
+        let client = client.clone();
+        let local = local.clone();
+        tokio::spawn(async move {
+            client
+                .request(
+                    method::AGENTS_START,
+                    json!({ "agent": "replay-bad", "session_id": local }),
+                )
+                .await
+                .unwrap()
+        })
+    };
+
+    // The failed load emits its replay updates first, then holds the response.
+    wait_for_file(&daemon.root.join("replay-bad-gate/load-ready")).await;
+    while pushes.try_recv().is_ok() {}
+    let (during, during_text, during_seq) = attach(&observer, &local).await;
+    assert_eq!(during["session"]["load_state"], "loading");
+    assert_eq!(during_text, "");
+    assert_eq!(during_seq, 0);
+
+    std::fs::write(daemon.root.join("replay-bad-gate/load-release"), b"").unwrap();
+    let response = load.await.expect("load task");
+    let error = response
+        .error
+        .expect("a failed load reports an error")
+        .message;
+    assert!(error.contains("could not load ACP session"), "{error}");
+
+    let (failed, failed_text, _failed_seq) = attach(&observer, &local).await;
+    assert_eq!(failed["session"]["load_state"], "failed");
+    assert!(
+        failed["session"]["load_error"]
+            .as_str()
+            .is_some_and(|message| message.contains("could not load ACP session")),
+        "the snapshot carries the restore failure"
+    );
+    assert_eq!(
+        failed_text, "",
+        "a failed load must not expose its partial replay as restored text"
+    );
+
+    // Nothing from the discarded replay reached the live feed either.
+    let events = agent_events(&mut pushes, &local).await;
+    let deltas = text_deltas(&events);
+    assert!(
+        deltas.iter().all(|(_, text)| !text.contains("partial")),
+        "partial replay leaked into the feed: {deltas:?}"
+    );
 }
 
 #[tokio::test]

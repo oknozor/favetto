@@ -194,6 +194,9 @@ pub struct StartOneshotResult {
     pub session: AgentSessionInfo,
     /// Base64-encoded `vt100` screen frame.
     pub data: String,
+    /// See [`AgentAttachResult::seq`].
+    #[serde(default)]
+    pub seq: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +456,12 @@ pub struct AgentAttachResult {
     pub session: AgentSessionInfo,
     /// Base64-encoded `vt100` screen frame.
     pub data: String,
+    /// The last normalized-event sequence already folded into `data`. A client
+    /// that also consumes `agent.event` / `tasks.events` can resume strictly
+    /// after this cursor without replaying text that the snapshot already
+    /// contains. Older payloads omit it and decode as `0`.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 /// `agents.prompt` params: a follow-up prompt for a structured (ACP) session.
@@ -1259,6 +1268,35 @@ mod tests {
         let p: TasksEventsParams =
             serde_json::from_value(serde_json::json!({ "id": Uuid::nil(), "after": "x" })).unwrap();
         assert_eq!(p.after, None);
+    }
+
+    #[test]
+    fn attach_result_seq_is_additive_on_the_wire() {
+        // Older daemons omit `seq`; newer clients decode it as zero and keep the
+        // rest of the attach contract intact.
+        let legacy: AgentAttachResult = serde_json::from_value(serde_json::json!({
+            "session": {
+                "id": "s1",
+                "agent": "opencode",
+                "task_id": null,
+                "running": true,
+                "headless": false
+            },
+            "data": ""
+        }))
+        .unwrap();
+        assert_eq!(legacy.seq, 0);
+        assert_eq!(legacy.session.id, "s1");
+
+        let current = AgentAttachResult {
+            seq: 7,
+            ..legacy.clone()
+        };
+        let json = serde_json::to_value(&current).unwrap();
+        assert_eq!(json["seq"], 7);
+        let back: AgentAttachResult = serde_json::from_value(json).unwrap();
+        assert_eq!(back.seq, 7);
+        assert_eq!(back.session.load_state, crate::model::AgentLoadState::Ready);
     }
 
     #[test]

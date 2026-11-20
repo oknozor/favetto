@@ -604,6 +604,25 @@ pub enum PermissionPolicy {
     Deny,
 }
 
+/// Whether a session's ACP conversation is available yet.
+///
+/// A newly created session is [`Ready`](AgentLoadState::Ready) once its process
+/// exists. A restored session starts [`Loading`](AgentLoadState::Loading): the
+/// daemon does not publish its replay as ready until `session/load` succeeds.
+/// A failed restore is terminal for that attempt and never reported as ready.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLoadState {
+    /// The conversation is live or was newly created; history is available.
+    #[default]
+    Ready,
+    /// A persisted conversation is being restored; its replay is not ready yet.
+    Loading,
+    /// The restore failed; no partial conversation is exposed as restored.
+    Failed,
+}
+
 /// A live external-agent session on the daemon.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -635,6 +654,13 @@ pub struct AgentSessionInfo {
     /// Token/cost usage reported for this session so far.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<AgentUsage>,
+    /// Whether this session's conversation is still being restored. Additive on
+    /// the wire: older payloads default to `ready`, and older clients ignore it.
+    #[serde(default)]
+    pub load_state: AgentLoadState,
+    /// Why a restore failed, when `load_state` is `failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_error: Option<String>,
 }
 
 /// What an external agent CLI can do, so the daemon and TUI can adapt without
@@ -1397,6 +1423,9 @@ mod tests {
         .unwrap();
         assert!(legacy.activity.is_none());
         assert!(legacy.usage.is_none());
+        // Legacy payloads predate restore state; they are ready, not loading.
+        assert_eq!(legacy.load_state, AgentLoadState::Ready);
+        assert!(legacy.load_error.is_none());
 
         let live = AgentSessionInfo {
             activity: Some(AgentActivity::Responding),
@@ -1410,9 +1439,12 @@ mod tests {
         let json = serde_json::to_value(&live).unwrap();
         assert_eq!(json["activity"]["kind"], "responding");
         assert_eq!(json["usage"]["input_tokens"], 12);
+        assert_eq!(json["load_state"], "ready");
+        assert!(json.get("load_error").is_none());
         let back: AgentSessionInfo = serde_json::from_value(json).unwrap();
         assert_eq!(back.activity, live.activity);
         assert_eq!(back.usage, live.usage);
+        assert_eq!(back.load_state, AgentLoadState::Ready);
 
         // A session with neither field omits both from the wire.
         let bare: AgentSessionInfo = serde_json::from_str(
@@ -1422,6 +1454,63 @@ mod tests {
         let json = serde_json::to_value(&bare).unwrap();
         assert!(json.get("activity").is_none());
         assert!(json.get("usage").is_none());
+    }
+
+    #[test]
+    fn agent_session_info_load_state_round_trips_and_defaults_ready() {
+        for state in [
+            AgentLoadState::Ready,
+            AgentLoadState::Loading,
+            AgentLoadState::Failed,
+        ] {
+            let info = AgentSessionInfo {
+                id: "s1".to_string(),
+                agent: "opencode".to_string(),
+                backend: AgentBackend::Acp,
+                task_id: None,
+                running: true,
+                headless: false,
+                session_id: Some("ses_acp".to_string()),
+                awaiting_input: None,
+                activity: None,
+                usage: None,
+                load_state: state,
+                load_error: (state == AgentLoadState::Failed).then(|| "boom".to_string()),
+            };
+            let json = serde_json::to_value(&info).unwrap();
+            assert_eq!(json["load_state"], serde_json::json!(state));
+            let back: AgentSessionInfo = serde_json::from_value(json).unwrap();
+            assert_eq!(back.load_state, state);
+            assert_eq!(back.load_error, info.load_error);
+        }
+
+        // A newer daemon's failed snapshot keeps the reason; successful ones
+        // omit the empty error field.
+        let failed = AgentSessionInfo {
+            id: "s2".to_string(),
+            agent: "opencode".to_string(),
+            backend: AgentBackend::Acp,
+            task_id: None,
+            running: false,
+            headless: false,
+            session_id: None,
+            awaiting_input: None,
+            activity: None,
+            usage: None,
+            load_state: AgentLoadState::Failed,
+            load_error: Some("cannot load session".to_string()),
+        };
+        let json = serde_json::to_value(&failed).unwrap();
+        assert_eq!(json["load_state"], "failed");
+        assert_eq!(json["load_error"], "cannot load session");
+
+        let ready = AgentSessionInfo {
+            load_state: AgentLoadState::Ready,
+            load_error: None,
+            ..failed
+        };
+        let json = serde_json::to_value(&ready).unwrap();
+        assert!(json.get("load_error").is_none());
     }
 
     #[test]

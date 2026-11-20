@@ -41,11 +41,12 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use favetto_core::model::{
-    AgentStateEvent, AwaitingInputKind, InputReply, InputRequest, MessageRole, PermissionPolicy,
-    ToolCallDetail, ToolCallStatus, ToolContent, ToolKind, ToolLocation,
+    AgentLoadState, AgentStateEvent, AwaitingInputKind, InputReply, InputRequest, MessageRole,
+    PermissionPolicy, ToolCallDetail, ToolCallStatus, ToolContent, ToolKind, ToolLocation,
 };
 
 use super::session_store::SessionBinding;
+use super::SessionLifecycle;
 
 /// Deadline for an `ask`-policy permission answered by a remote client.
 pub(crate) const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
@@ -87,6 +88,63 @@ pub(crate) struct AcpLaunch {
     pub permission_timeout: Duration,
     /// Durable metadata writer for the Favetto-local session record.
     pub session: Option<SessionBinding>,
+    /// For a load, wait for the manager to register the local session before
+    /// issuing `session/load`. Replay notifications must have a stable owner
+    /// (and a snapshot clients can attach to) before they can arrive.
+    pub start_gate: Option<oneshot::Receiver<()>>,
+    /// The restore lifecycle shared with the manager's session snapshot.
+    pub lifecycle: Option<Arc<Mutex<SessionLifecycle>>>,
+}
+
+/// Internal messages from the ACP runtime to the manager's state task.
+///
+/// Only [`AcpEvent::State`] is wire-visible. The marker keeps readiness ordered
+/// behind replay: the runtime waits for the state task to fold every replayed
+/// update into the feed (and event sequence) before reporting the load complete.
+#[derive(Debug)]
+pub(crate) enum AcpEvent {
+    State(AgentStateEvent),
+    /// Replay is fully emitted; acknowledge once it is in the feed.
+    ReplayApplied(oneshot::Sender<()>),
+}
+
+/// How replay notifications are handled before `session/load` settles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayPhase {
+    /// Hold updates; nothing is exposed to clients yet.
+    Buffering,
+    /// The load succeeded; updates can be delivered in order.
+    Forwarding,
+    /// The load failed; discard buffered updates instead of exposing a partial
+    /// transcript as if the restore had succeeded.
+    Discarded,
+}
+
+#[derive(Debug)]
+struct ReplayGate {
+    phase: ReplayPhase,
+    buffered: Vec<SessionNotification>,
+}
+
+impl ReplayGate {
+    fn new() -> Self {
+        Self {
+            phase: ReplayPhase::Buffering,
+            buffered: Vec::new(),
+        }
+    }
+
+    /// Stop buffering and hand over the replay in arrival order.
+    fn take_buffered(&mut self) -> Vec<SessionNotification> {
+        self.phase = ReplayPhase::Forwarding;
+        std::mem::take(&mut self.buffered)
+    }
+
+    /// Drop any buffered replay and ignore later updates.
+    fn discard(&mut self) {
+        self.phase = ReplayPhase::Discarded;
+        self.buffered.clear();
+    }
 }
 
 /// Commands that do not need the prompt turn to be in flight.
@@ -158,8 +216,9 @@ pub(crate) struct AcpHandles {
     #[allow(dead_code)] // read by later session-history steps and capability-aware callers
     pub capabilities: Arc<Mutex<Option<AgentCapabilities>>>,
     /// Completion of a load-mode startup, when `mode` was [`AcpSessionMode::Load`].
-    /// `None` means the load has not settled yet; the receiver closes if the
-    /// server exits before reporting either way.
+    /// `None` means the load has not settled yet; `Ok` is sent only after the
+    /// agent acknowledged `session/load` and the complete replay has been applied
+    /// to the feed. The receiver closes if the server exits before either way.
     pub load: Option<tokio::sync::watch::Receiver<Option<Result<(), String>>>>,
     pub last_activity: Arc<Mutex<Instant>>,
     /// Plain-text transcript (assistant text plus tool summaries) used as the
@@ -188,7 +247,7 @@ impl AcpHandles {
 /// `start` is also synchronous.
 pub(crate) fn spawn(
     launch: AcpLaunch,
-) -> anyhow::Result<(AcpHandles, mpsc::UnboundedReceiver<AgentStateEvent>)> {
+) -> anyhow::Result<(AcpHandles, mpsc::UnboundedReceiver<AcpEvent>)> {
     if tokio::runtime::Handle::try_current().is_err() {
         anyhow::bail!("ACP sessions require the daemon's async runtime");
     }
@@ -264,6 +323,9 @@ pub(crate) fn spawn(
     let notification_transcript = transcript.clone();
     let notification_outcome = outcome.clone();
     let notification_tools = tools.clone();
+    let replay_transcript = transcript.clone();
+    let replay_outcome = outcome.clone();
+    let replay_tools = tools.clone();
     let permission_responder = responder.clone();
 
     let permission_events = events_tx.clone();
@@ -282,6 +344,8 @@ pub(crate) fn spawn(
     let session_id_slot = external_session_id.clone();
     let ready_binding = launch.session.clone();
     let end_binding = launch.session;
+    let mut start_gate = launch.start_gate;
+    let lifecycle = launch.lifecycle.clone();
 
     let result_outcome = outcome.clone();
     let result_events = events_tx.clone();
@@ -295,22 +359,49 @@ pub(crate) fn spawn(
         }
         AcpSessionMode::New => (None, None),
     };
+    // A load's replay arrives before `session/load` returns. Hold it until the
+    // response proves the restore succeeded, so a failure cannot expose a
+    // partial transcript.
+    let replay_gate = match &mode {
+        AcpSessionMode::Load { .. } => Some(Arc::new(Mutex::new(ReplayGate::new()))),
+        AcpSessionMode::New => None,
+    };
+    // The terminal error path must be able to fail the load even when setup
+    // aborted before reaching the explicit load-request branch.
+    let failure_mode = mode.clone();
+    let failure_lifecycle = lifecycle.clone();
+    let failure_load_tx = load_tx.clone();
+    let failure_replay = replay_gate.clone();
+    let notification_replay = replay_gate.clone();
     let mut child = child;
-    let task = tokio::spawn(async move {
-        let notification_transcript = Arc::clone(&notification_transcript);
-        let result = Client
+    let task =
+        tokio::spawn(async move {
+            let notification_transcript = Arc::clone(&notification_transcript);
+            let result = Client
             .v1()
             .on_receive_notification(
                 async move |notification: SessionNotification, _cx| {
-                    let mapped = map_update(
+                    // While a restore is in flight, buffer raw updates rather
+                    // than folding them into the transcript: readiness must be
+                    // published only after the whole replay is applied.
+                    if let Some(replay) = &notification_replay {
+                        let mut replay = replay.lock();
+                        match replay.phase {
+                            ReplayPhase::Buffering => {
+                                replay.buffered.push(notification);
+                                return Ok(());
+                            }
+                            ReplayPhase::Discarded => return Ok(()),
+                            ReplayPhase::Forwarding => {}
+                        }
+                    }
+                    emit_update(
                         &notification.update,
+                        &notification_events,
                         &notification_transcript,
                         &notification_outcome,
                         &notification_tools,
                     );
-                    for event in mapped {
-                        let _ = notification_events.send(event);
-                    }
                     Ok(())
                 },
                 agent_client_protocol::on_receive_notification!(),
@@ -339,6 +430,23 @@ pub(crate) fn spawn(
                         "ACP agent initialized"
                     );
 
+                    // The manager registers the local session before the gate
+                    // opens, so replay notifications and lifecycle pushes have a
+                    // stable owner and snapshot from their first update.
+                    if let Some(gate) = start_gate.take() {
+                        if gate.await.is_err() {
+                            let message = format!(
+                                "agent '{agent_name}': session registration ended before the \
+                                 restore could start"
+                            );
+                            fail_load(&lifecycle, &load_tx, &message);
+                            let _ = events_tx.send(AcpEvent::State(AgentStateEvent::Error {
+                                message: message.clone(),
+                            }));
+                            return Err(anyhow::anyhow!(message).into());
+                        }
+                    }
+
                     // Session setup differs only here: a new conversation is
                     // created, while a load restores the agent's own session id.
                     // A load never falls back to `session/new`, because a fresh
@@ -352,12 +460,10 @@ pub(crate) fn spawn(
                                     "agent '{agent_name}' does not support loading ACP sessions \
                                      (session/load); cannot restore session '{known}'"
                                 );
-                                if let Some(tx) = &load_tx {
-                                    let _ = tx.send(Some(Err(message.clone())));
-                                }
-                                let _ = events_tx.send(AgentStateEvent::Error {
+                                fail_load(&lifecycle, &load_tx, &message);
+                                let _ = events_tx.send(AcpEvent::State(AgentStateEvent::Error {
                                     message: message.clone(),
-                                });
+                                }));
                                 return Err(anyhow::anyhow!(message).into());
                             }
                             let loaded = connection
@@ -372,12 +478,10 @@ pub(crate) fn spawn(
                                         "agent '{agent_name}' could not load ACP session \
                                          '{known}': {error}"
                                     );
-                                    if let Some(tx) = &load_tx {
-                                        let _ = tx.send(Some(Err(message.clone())));
-                                    }
-                                    let _ = events_tx.send(AgentStateEvent::Error {
+                                    fail_load(&lifecycle, &load_tx, &message);
+                                    let _ = events_tx.send(AcpEvent::State(AgentStateEvent::Error {
                                         message: message.clone(),
-                                    });
+                                    }));
                                     anyhow::anyhow!(message)
                                 })?;
                             // The local id is the routing key; the ACP id stays
@@ -392,12 +496,10 @@ pub(crate) fn spawn(
                                         "agent '{agent_name}': cannot record loaded ACP session \
                                          id: {error}"
                                     );
-                                    if let Some(tx) = &load_tx {
-                                        let _ = tx.send(Some(Err(message.clone())));
-                                    }
-                                    let _ = events_tx.send(AgentStateEvent::Error {
+                                    fail_load(&lifecycle, &load_tx, &message);
+                                    let _ = events_tx.send(AcpEvent::State(AgentStateEvent::Error {
                                         message: message.clone(),
-                                    });
+                                    }));
                                     return Err(anyhow::anyhow!(message).into());
                                 }
                             }
@@ -434,9 +536,9 @@ pub(crate) fn spawn(
                                         "agent '{agent_name}': cannot record ACP session id: \
                                          {error}"
                                     );
-                                    let _ = events_tx.send(AgentStateEvent::Error {
+                                    let _ = events_tx.send(AcpEvent::State(AgentStateEvent::Error {
                                         message: message.clone(),
-                                    });
+                                    }));
                                     return Err(anyhow::anyhow!(message).into());
                                 }
                             }
@@ -453,9 +555,11 @@ pub(crate) fn spawn(
                                     Ok(model) => Some(model),
                                     Err(error) => {
                                         let message = format!("agent '{agent_name}': {error}");
-                                        let _ = events_tx.send(AgentStateEvent::Error {
-                                            message: message.clone(),
-                                        });
+                                        let _ = events_tx.send(AcpEvent::State(
+                                            AgentStateEvent::Error {
+                                                message: message.clone(),
+                                            },
+                                        ));
                                         return Err(anyhow::anyhow!(message).into());
                                     }
                                 }
@@ -465,13 +569,43 @@ pub(crate) fn spawn(
                             (session_id, external_session_id, chosen_model)
                         }
                     };
-                    let _ = events_tx.send(AgentStateEvent::Session {
+                    // A successful load releases the buffered replay in arrival
+                    // order, then waits for the manager to fold it into the feed
+                    // before readiness is published. Nothing here runs for a
+                    // failed load: its buffered updates are discarded.
+                    if let Some(replay) = &replay_gate {
+                        let mut replay = replay.lock();
+                        let buffered = replay.take_buffered();
+                        for notification in buffered {
+                            emit_update(
+                                &notification.update,
+                                &events_tx,
+                                &replay_transcript,
+                                &replay_outcome,
+                                &replay_tools,
+                            );
+                        }
+                    }
+                    let _ = events_tx.send(AcpEvent::State(AgentStateEvent::Session {
                         session_id: Some(external_session_id),
                         title: None,
                         model: chosen_model,
-                    });
-                    // A load is only reported as restored after the agent
-                    // acknowledged it and the record is ready.
+                    }));
+                    if replay_gate.is_some() {
+                        let (applied_tx, applied_rx) = oneshot::channel();
+                        let _ = events_tx.send(AcpEvent::ReplayApplied(applied_tx));
+                        // The state task acknowledges after the replay has a
+                        // sequence and is in the feed, so attach snapshots and
+                        // `tasks.events` cursors agree with this readiness.
+                        let _ = applied_rx.await;
+                        if let Some(lifecycle) = &lifecycle {
+                            let mut lifecycle = lifecycle.lock();
+                            lifecycle.state = AgentLoadState::Ready;
+                            lifecycle.error = None;
+                        }
+                    }
+                    // A load is only reported as restored after the replay is
+                    // applied and the record is ready.
                     if let Some(tx) = &load_tx {
                         let _ = tx.send(Some(Ok(())));
                     }
@@ -558,16 +692,16 @@ pub(crate) fn spawn(
                                     state.error = Some(message.clone());
                                     state.stop_reason = None;
                                 }
-                                let _ = events_tx.send(AgentStateEvent::Error {
+                                let _ = events_tx.send(AcpEvent::State(AgentStateEvent::Error {
                                     message: message.clone(),
-                                });
+                                }));
                                 (None, favetto_core::model::IdleOutcome::Failed)
                             }
                         };
 
-                        let _ = events_tx.send(AgentStateEvent::Idle {
+                        let _ = events_tx.send(AcpEvent::State(AgentStateEvent::Idle {
                             outcome: turn_outcome,
-                        });
+                        }));
                         tracing::debug!(target: "favetto::acp", ?stop_reason, "ACP turn finished");
 
                         if close_after_turn || *shutdown_rx.borrow() {
@@ -596,49 +730,58 @@ pub(crate) fn spawn(
             )
             .await;
 
-        match result {
-            Ok(()) => {
-                if exit_task.load(Ordering::SeqCst) < 0 {
-                    exit_task.store(0, Ordering::SeqCst);
-                }
-            }
-            Err(error) => {
-                let message = error.to_string();
-                {
-                    let mut state = result_outcome.lock();
-                    if state.error.is_none() {
-                        state.error = Some(message.clone());
+            match result {
+                Ok(()) => {
+                    if exit_task.load(Ordering::SeqCst) < 0 {
+                        exit_task.store(0, Ordering::SeqCst);
                     }
                 }
-                let _ = result_events.send(AgentStateEvent::Error { message });
-                exit_task.store(1, Ordering::SeqCst);
+                Err(error) => {
+                    let message = error.to_string();
+                    // Setup can fail before reaching the explicit load branches
+                    // (initialize, transport, registration). A load that has not
+                    // succeeded must expose the failure, not a partial transcript.
+                    if matches!(failure_mode, AcpSessionMode::Load { .. }) {
+                        if let Some(replay) = &failure_replay {
+                            replay.lock().discard();
+                        }
+                        fail_load(&failure_lifecycle, &failure_load_tx, &message);
+                    }
+                    {
+                        let mut state = result_outcome.lock();
+                        if state.error.is_none() {
+                            state.error = Some(message.clone());
+                        }
+                    }
+                    let _ = result_events.send(AcpEvent::State(AgentStateEvent::Error { message }));
+                    exit_task.store(1, Ordering::SeqCst);
+                }
             }
-        }
-        // Record the terminal state before the session reports itself stopped, so
-        // a waiter (and the headless executor) never observes a finished session
-        // without its durable outcome. The row itself is kept for history.
-        if let Some(binding) = &end_binding {
-            let error = result_outcome.lock().error.clone();
-            let recorded = match error.as_deref() {
-                Some(error) => binding.store.mark_failed(&binding.id, error).await,
-                None => binding.store.mark_ended(&binding.id).await,
-            };
-            if let Err(write) = recorded {
-                tracing::warn!(
-                    target: "favetto::acp",
-                    session = %binding.id,
-                    error = %write,
-                    "failed to record the terminal session state"
-                );
+            // Record the terminal state before the session reports itself stopped, so
+            // a waiter (and the headless executor) never observes a finished session
+            // without its durable outcome. The row itself is kept for history.
+            if let Some(binding) = &end_binding {
+                let error = result_outcome.lock().error.clone();
+                let recorded = match error.as_deref() {
+                    Some(error) => binding.store.mark_failed(&binding.id, error).await,
+                    None => binding.store.mark_ended(&binding.id).await,
+                };
+                if let Err(write) = recorded {
+                    tracing::warn!(
+                        target: "favetto::acp",
+                        session = %binding.id,
+                        error = %write,
+                        "failed to record the terminal session state"
+                    );
+                }
             }
-        }
-        running_task.store(false, Ordering::SeqCst);
-        // Kill and reap the server: a clean `close_session` normally ends it,
-        // but a stuck or crashed server must not outlive the daemon or become a
-        // zombie.
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-    });
+            running_task.store(false, Ordering::SeqCst);
+            // Kill and reap the server: a clean `close_session` normally ends it,
+            // but a stuck or crashed server must not outlive the daemon or become a
+            // zombie.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        });
 
     Ok((
         AcpHandles {
@@ -662,7 +805,7 @@ pub(crate) fn spawn(
 /// Answers permission requests according to the session's policy.
 pub(crate) struct AcpResponder {
     policy: PermissionPolicy,
-    events: mpsc::UnboundedSender<AgentStateEvent>,
+    events: mpsc::UnboundedSender<AcpEvent>,
     pending: Mutex<HashMap<String, oneshot::Sender<InputReply>>>,
     timeout: Duration,
 }
@@ -683,28 +826,32 @@ impl AcpResponder {
                     .unwrap_or_else(|| "tool call".to_string());
                 let (tx, rx) = oneshot::channel();
                 self.pending.lock().insert(id.clone(), tx);
-                let _ = self.events.send(AgentStateEvent::InputRequested {
-                    request: InputRequest {
-                        id: id.clone(),
-                        kind: AwaitingInputKind::Permission,
-                        message: title,
-                        options: request
-                            .options
-                            .iter()
-                            .map(|option| option.name.clone())
-                            .collect(),
-                        allow_always: request
-                            .options
-                            .iter()
-                            .any(|option| option.kind == PermissionOptionKind::AllowAlways),
-                    },
-                });
+                let _ = self
+                    .events
+                    .send(AcpEvent::State(AgentStateEvent::InputRequested {
+                        request: InputRequest {
+                            id: id.clone(),
+                            kind: AwaitingInputKind::Permission,
+                            message: title,
+                            options: request
+                                .options
+                                .iter()
+                                .map(|option| option.name.clone())
+                                .collect(),
+                            allow_always: request
+                                .options
+                                .iter()
+                                .any(|option| option.kind == PermissionOptionKind::AllowAlways),
+                        },
+                    }));
                 let reply = tokio::time::timeout(self.timeout, rx)
                     .await
                     .ok()
                     .and_then(Result::ok);
                 self.pending.lock().remove(&id);
-                let _ = self.events.send(AgentStateEvent::InputResolved { id });
+                let _ = self
+                    .events
+                    .send(AcpEvent::State(AgentStateEvent::InputResolved { id }));
                 match reply {
                     Some(reply) => Self::response_for(request, reply),
                     // No client answered in time: fail closed.
@@ -966,6 +1113,45 @@ fn tool_name(detail: &ToolCallDetail) -> String {
         .unwrap_or_else(|| "tool".to_string())
 }
 
+/// Fold one update into the transcript/outcome and queue its normalized events.
+fn emit_update(
+    update: &SessionUpdate,
+    events: &mpsc::UnboundedSender<AcpEvent>,
+    transcript: &Mutex<String>,
+    outcome: &Mutex<AcpOutcome>,
+    tools: &Mutex<ToolTracker>,
+) {
+    for event in map_update(update, transcript, outcome, tools) {
+        let _ = events.send(AcpEvent::State(event));
+    }
+}
+
+/// Fail an in-flight load exactly once. A load that already became ready (a
+/// later prompt/transport error) is not overwritten with a restore failure.
+fn fail_load(
+    lifecycle: &Option<Arc<Mutex<SessionLifecycle>>>,
+    load: &Option<tokio::sync::watch::Sender<Option<Result<(), String>>>>,
+    message: &str,
+) {
+    let was_loading = match lifecycle {
+        Some(lifecycle) => {
+            let mut lifecycle = lifecycle.lock();
+            if lifecycle.state == AgentLoadState::Loading {
+                lifecycle.state = AgentLoadState::Failed;
+                lifecycle.error = Some(message.to_string());
+                true
+            } else {
+                false
+            }
+        }
+        None => true,
+    };
+    if was_loading {
+        if let Some(tx) = load {
+            let _ = tx.send(Some(Err(message.to_string())));
+        }
+    }
+}
 /// Map one ACP update into normalized events, folding text into `transcript`
 /// and counts into `outcome`.
 fn map_update(
@@ -1801,6 +1987,8 @@ mod tests {
             close_after_turn: true,
             permission_timeout: Duration::from_secs(1),
             session: None,
+            start_gate: None,
+            lifecycle: None,
         };
         let error = match spawn(launch) {
             Ok(_) => panic!("a missing cwd must not spawn"),

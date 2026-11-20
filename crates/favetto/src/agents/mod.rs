@@ -21,8 +21,8 @@ use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 
 use favetto_core::model::{
-    AgentActivity, AgentBackend, AgentCapabilities, AgentSessionInfo, AgentStateEvent, AgentUsage,
-    AwaitingInputReason, InputReply, PermissionPolicy,
+    AgentActivity, AgentBackend, AgentCapabilities, AgentLoadState, AgentSessionInfo,
+    AgentStateEvent, AgentUsage, AwaitingInputReason, InputReply, PermissionPolicy,
 };
 use favetto_core::rpc::AgentEventPush;
 
@@ -43,6 +43,34 @@ use session_store::{SessionBinding, SessionStore};
 /// (`tasks.events`). The live feed arrives over the bus; this is only the
 /// bounded replay window after a reload or reconnect.
 const FEED_CAP: usize = 512;
+
+/// In-memory restore lifecycle exposed with each session snapshot.
+///
+/// A new session starts ready. A load-mode session starts loading and becomes
+/// ready only after the whole ACP replay has been applied; a failed restore
+/// stays failed and carries its reason. This mirrors the durable session status
+/// but is updated at the same points clients observe replay and readiness.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionLifecycle {
+    pub state: AgentLoadState,
+    pub error: Option<String>,
+}
+
+impl SessionLifecycle {
+    fn ready() -> Self {
+        Self {
+            state: AgentLoadState::Ready,
+            error: None,
+        }
+    }
+
+    fn loading() -> Self {
+        Self {
+            state: AgentLoadState::Loading,
+            error: None,
+        }
+    }
+}
 
 /// Identity and resolved executable of an agent.
 #[derive(Debug, Clone)]
@@ -240,6 +268,8 @@ struct Session {
     last_activity: Arc<Mutex<std::time::Instant>>,
     awaiting_input: Arc<Mutex<Option<AwaitingInputReason>>>,
     live: Arc<Mutex<AgentLiveState>>,
+    /// Restore lifecycle shared with the ACP runtime.
+    lifecycle: Arc<Mutex<SessionLifecycle>>,
     responder: Arc<acp::AcpResponder>,
     /// Durable metadata writer, when the manager has a database attached.
     store: Option<SessionStore>,
@@ -253,6 +283,7 @@ struct Session {
 impl Session {
     fn info(&self) -> AgentSessionInfo {
         let live = self.live.lock();
+        let lifecycle = self.lifecycle.lock();
         AgentSessionInfo {
             id: self.id.clone(),
             agent: self.agent.clone(),
@@ -264,7 +295,18 @@ impl Session {
             awaiting_input: self.awaiting_input.lock().clone(),
             activity: live.activity.clone(),
             usage: live.usage.clone(),
+            load_state: lifecycle.state,
+            load_error: lifecycle.error.clone(),
         }
+    }
+
+    /// The last normalized-event sequence already folded into the transcript.
+    fn feed_cursor(&self) -> u64 {
+        self.feed
+            .lock()
+            .back()
+            .map(|(seq, _)| *seq)
+            .unwrap_or_default()
     }
 }
 
@@ -549,6 +591,8 @@ impl AgentManager {
             close_after_turn: launch.headless,
             permission_timeout: acp::PERMISSION_TIMEOUT,
             session: binding,
+            start_gate: None,
+            lifecycle: None,
         }) {
             Ok(spawned) => spawned,
             Err(error) => {
@@ -579,6 +623,7 @@ impl AgentManager {
                 activity: Some(AgentActivity::Starting),
                 usage: None,
             })),
+            lifecycle: Arc::new(Mutex::new(SessionLifecycle::ready())),
             responder: handles.responder.clone(),
             store: self.store.clone(),
             state_tx: state_tx.clone(),
@@ -647,6 +692,11 @@ impl AgentManager {
             id: id.clone(),
             run_id: record.run_id.clone(),
         };
+        // Nothing about a restored conversation is exposed until the whole
+        // replay has been applied. The runtime shares this lifecycle with the
+        // snapshot clients read and gates `session/load` behind registration.
+        let lifecycle = Arc::new(Mutex::new(SessionLifecycle::loading()));
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
 
         let (mut handles, events) = match acp::spawn(acp::AcpLaunch {
             agent: name.to_string(),
@@ -666,6 +716,8 @@ impl AgentManager {
             close_after_turn: false,
             permission_timeout: acp::PERMISSION_TIMEOUT,
             session: Some(binding),
+            start_gate: Some(start_rx),
+            lifecycle: Some(lifecycle.clone()),
         }) {
             Ok(spawned) => spawned,
             Err(error) => {
@@ -697,6 +749,7 @@ impl AgentManager {
                 activity: Some(AgentActivity::Starting),
                 usage: None,
             })),
+            lifecycle: lifecycle.clone(),
             responder: handles.responder.clone(),
             store: self.store.clone(),
             state_tx: state_tx.clone(),
@@ -705,12 +758,24 @@ impl AgentManager {
             order,
             handles,
         });
-        // Register before awaiting the agent's acknowledgement so replay and
-        // lifecycle events have a stable owner.
+        // Register before opening the gate: replay notifications and lifecycle
+        // pushes get an owner, and an attaching client sees `loading` rather
+        // than a missing or falsely-ready session.
         spawn_state_task(session.clone(), self.tx.clone(), events, self.bus.clone());
         self.sessions.lock().insert(id, session.clone());
+        let _ = start_tx.send(());
 
-        wait_for_load(load, outcome).await?;
+        if let Err(error) = wait_for_load(load, outcome).await {
+            // The runtime normally records this already; keep the snapshot
+            // honest for failures that happen before it can (initialize,
+            // transport teardown).
+            let mut lifecycle = lifecycle.lock();
+            if lifecycle.state != AgentLoadState::Failed {
+                lifecycle.state = AgentLoadState::Failed;
+                lifecycle.error = Some(error.to_string());
+            }
+            return Err(error);
+        }
         Ok(session.info())
     }
 
@@ -719,18 +784,26 @@ impl AgentManager {
         self.get(session_id).ok().map(|session| session.info())
     }
 
-    /// A (re)attaching client's current view: the session plus its plain-text
-    /// transcript. Clients render structured `agent.event` updates for the live
-    /// conversation; this is the replay seed and the captured run output.
-    pub fn attach(&self, session_id: &str) -> anyhow::Result<(AgentSessionInfo, Vec<u8>)> {
+    /// A (re)attaching client's current view: the session, its plain-text
+    /// transcript, and the last event sequence folded into that transcript.
+    /// Clients render structured `agent.event` updates for the live
+    /// conversation; events after `seq` are the part not yet in this snapshot.
+    pub fn attach(&self, session_id: &str) -> anyhow::Result<(AgentSessionInfo, Vec<u8>, u64)> {
         let session = self.get(session_id)?;
+        // Take the cursor before the transcript: every event up to it is
+        // included below. A completed restore is applied before readiness, so
+        // its cursor and transcript are fixed together and reconnecting cannot
+        // duplicate the replayed text. Ordinary streaming may advance the
+        // transcript slightly ahead of the cursor; the snapshot still contains
+        // the complete text up to `seq`.
+        let seq = session.feed_cursor();
         let frame = session
             .handles
             .transcript
             .lock()
             .replace('\n', "\r\n")
             .into_bytes();
-        Ok((session.info(), frame))
+        Ok((session.info(), frame, seq))
     }
 
     /// Wait for a session to stop running (the turn ended and the session
@@ -914,11 +987,20 @@ fn wrap_agent() -> bool {
 fn spawn_state_task(
     session: Arc<Session>,
     tx: broadcast::Sender<AgentEvent>,
-    mut events: tokio::sync::mpsc::UnboundedReceiver<AgentStateEvent>,
+    mut events: tokio::sync::mpsc::UnboundedReceiver<acp::AcpEvent>,
     bus: Option<EventBus>,
 ) {
     tokio::spawn(async move {
-        while let Some(event) = events.recv().await {
+        while let Some(message) = events.recv().await {
+            let event = match message {
+                acp::AcpEvent::State(event) => event,
+                acp::AcpEvent::ReplayApplied(applied) => {
+                    // Replay is now in the feed with its final sequence. Only
+                    // then may the runtime publish readiness.
+                    let _ = applied.send(());
+                    continue;
+                }
+            };
             {
                 let mut live = session.live.lock();
                 live.apply(&event);

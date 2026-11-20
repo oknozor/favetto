@@ -19,6 +19,8 @@ fn session(id: &str, agent: &str, headless: bool, running: bool) -> AgentSession
         awaiting_input: None,
         activity: None,
         usage: None,
+        load_state: Default::default(),
+        load_error: None,
     }
 }
 
