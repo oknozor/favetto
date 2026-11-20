@@ -636,12 +636,9 @@ fn push_message(out: &mut Vec<Line<'static>>, role: MessageRole, text: &str, the
             }
         }
         MessageRole::Assistant => {
-            for line in text.lines() {
-                out.push(Line::from(Span::styled(
-                    line.to_string(),
-                    Style::default().fg(theme.fg()),
-                )));
-            }
+            // Assistant prose is Markdown. Tool names, paths, commands, and other
+            // protocol fields are rendered by their own plain-text paths below.
+            out.extend(super::markdown::render(&text, theme));
         }
         MessageRole::System | MessageRole::Tool => {
             let label = if role == MessageRole::System {
@@ -1359,6 +1356,96 @@ mod tests {
         assert!(
             !finished.contains("streaming…"),
             "a trailing thought stops streaming once another event follows"
+        );
+    }
+
+    #[test]
+    fn assistant_markdown_renders_headings_links_and_fenced_code() {
+        let mut feed = AgentFeed::new();
+        feed.apply(&AgentStateEvent::TextDelta {
+            role: MessageRole::Assistant,
+            text: "# Heading\n\nA [link](https://example.com).\n\n```rust\nfn main() {}\n```"
+                .to_string(),
+        });
+        let theme = Theme::dark();
+        let rendered = feed.render(&theme, None);
+        let text = rendered
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("# Heading"));
+        assert!(text.contains("link (https://example.com)"));
+        assert!(text.contains("```rust"));
+        assert!(text.contains("fn main() {}"));
+
+        let spans: Vec<_> = rendered
+            .lines
+            .into_iter()
+            .flat_map(|line| line.spans)
+            .collect();
+        assert!(spans
+            .iter()
+            .any(|s| s.content == "# Heading" && s.style.fg == Some(theme.syn_heading())));
+        assert!(spans
+            .iter()
+            .any(|s| s.content == "link" && s.style.add_modifier.contains(Modifier::UNDERLINED)));
+        assert!(spans
+            .iter()
+            .any(|s| s.content == "fn" && s.style.fg == Some(theme.syntax.keyword)));
+    }
+
+    #[test]
+    fn user_messages_and_tool_fields_are_not_rendered_as_markdown() {
+        let mut feed = AgentFeed::new();
+        feed.apply(&AgentStateEvent::TextDelta {
+            role: MessageRole::User,
+            text: "# not a heading".to_string(),
+        });
+        feed.apply(&AgentStateEvent::ToolStarted {
+            id: "t".to_string(),
+            name: "bash".to_string(),
+            input: json!({ "command": "echo **x**" }),
+            detail: Some(Box::new(ToolCallDetail {
+                title: Some("**tool title**".to_string()),
+                ..Default::default()
+            })),
+        });
+
+        let theme = Theme::dark();
+        let rendered = feed.render(&theme, None);
+        let text = rendered
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("# not a heading"));
+        assert!(
+            text.contains("**tool title**"),
+            "tool titles must stay literal: {text:?}"
+        );
+        let user = rendered
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content == "# not a heading")
+            .expect("user text is rendered");
+        assert!(
+            user.style.add_modifier.is_empty(),
+            "user text must stay plain: {:?}",
+            user.style
         );
     }
 

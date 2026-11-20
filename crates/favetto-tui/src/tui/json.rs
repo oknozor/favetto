@@ -8,7 +8,13 @@ use super::theme::Theme;
 /// Render a JSON value as pretty-printed, highlighted lines.
 pub fn render(value: &serde_json::Value, theme: &Theme) -> Vec<Line<'static>> {
     let pretty = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
-    pretty
+    render_source(&pretty, theme)
+}
+
+/// Highlight an already-formatted JSON source. This lets fenced `json` code in
+/// Markdown reuse the same token colours as the event payload pane.
+pub fn render_source(source: &str, theme: &Theme) -> Vec<Line<'static>> {
+    source
         .lines()
         .map(|line| highlight_line(line, theme))
         .collect()
