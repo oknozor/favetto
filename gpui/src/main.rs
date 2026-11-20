@@ -1,18 +1,22 @@
 //! Entry point for the favetto GPUI desktop client.
 //!
-//! Step 01 delivered the shell: a window titled "favetto" (default 1280×800,
-//! minimum 900×600) with the three-region layout of docs/design/gpui-client.md
-//! §4. Step 02 adds the daemon transport: MessagePack RPC over `POST /rpc`, the
-//! authenticated SSE stream over `GET /events`, and the connection state the
-//! status bar renders.
+//! Step 01 delivered the window; step 02 the daemon transport; step 03 the
+//! navigation frame — sidebar, top bar, status bar, routes, command palette and
+//! the action-based keyboard model (docs/design/gpui-client.md §1, §4).
 
+mod actions;
 mod app;
+mod components;
 mod config;
+mod layout;
+mod palette;
+mod routes;
 mod runtime;
 mod sse;
 mod state;
 mod theme;
 mod transport;
+mod views;
 
 use gpui::{px, size, App, AppContext as _, Application, Bounds, WindowBounds, WindowOptions};
 
@@ -20,6 +24,8 @@ use app::RootView;
 
 fn main() {
     Application::new().run(|cx: &mut App| {
+        cx.bind_keys(actions::bindings());
+
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -32,7 +38,7 @@ fn main() {
             },
             |window, cx| {
                 window.set_window_title("favetto");
-                cx.new(RootView::new)
+                cx.new(|cx| RootView::new(window, cx))
             },
         )
         .expect("opening the main window must succeed");

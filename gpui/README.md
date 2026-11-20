@@ -1,11 +1,11 @@
 # favetto GPUI desktop client
 
-Status: **transport (step 02)** — the standalone workspace from step 01 now has
-a real daemon connection: MessagePack RPC over `POST /rpc`, the authenticated
-SSE stream over `GET /events` with `Last-Event-ID` resume, connection settings
-from `~/.config/favetto/gpui.toml`, and a `ClientState` entity the shell renders
-in a temporary status line. The navigation surfaces land in steps 03+; the plans
-live in `docs/design/gpui-client.md`.
+Status: **navigation shell (step 03)** — the window now has the real frame:
+sidebar with the six surfaces (Inbox → Tasks → Catalog → Workflows →
+Schedules → Settings), top bar with the active repo and connection pill, the
+working-list and detail regions, a command palette (`⌘K` / `Ctrl+K`), `g`-jump
+shortcuts, a shortcut sheet, and intentional empty states for surfaces whose
+rows arrive in later steps. The plans live in `docs/design/gpui-client.md`.
 
 ## What it is
 
@@ -35,11 +35,17 @@ cargo run
 ```
 
 The window opens titled **"favetto"** (default 1280×800, minimum 900×600). With
-the daemon running locally, the status bar shows **Connected**, the ping
-round-trip cwd/latency, and the live event cursor. Stopping the daemon flips it
-to **Reconnecting**; restarting recovers automatically. A rejected token shows
-**Unauthorized** together with the token file path to fix, and the Reconnect
-button retries after the token/test daemon is corrected.
+the daemon running locally, the top bar shows the repo name and the connection
+pill (**● Connected**), and the status bar shows the endpoint, ping round-trip
+and live event cursor. Stopping the daemon flips the pill to
+**◌ Reconnecting (n)**; restarting recovers automatically. A rejected token
+shows **● Unauthorized** together with the token file path to fix, and the
+Reconnect action retries after the token/test daemon is corrected.
+
+Keyboard: `⌘K`/`Ctrl+K` opens the command palette, `g i`/`g t`/`g c`/`g w`/
+`g s` jump to Inbox/Tasks/Catalog/Workflows/Schedules, `⌘,`/`Ctrl+,` opens
+Settings, `?` opens the shortcut sheet, and `Esc` closes the topmost overlay or
+steps back from a pushed detail.
 
 ## Pointing it at a daemon
 
@@ -57,7 +63,7 @@ Without a file the client uses `http://127.0.0.1:7878` and the token at
 Endpoint input is normalized (Postel's Law): trailing slashes, a pasted `/rpc`
 or `/events` path, and a missing scheme are all accepted.
 
-## Architecture notes for this step
+## Architecture notes
 
 - `src/config.rs` — config/token loading and endpoint normalization.
 - `src/transport.rs` — typed `RpcClient` over `favetto-wire` frames, bearer auth,
@@ -70,7 +76,19 @@ or `/events` path, and a missing scheme are all accepted.
 - `src/runtime.rs` — a dedicated tokio thread bridged to GPUI with
   `async-channel`: commands in, connection state/cursor/pushes out.
 - `src/state.rs` — the single `ClientState` entity; the foreground drain task
-  folds updates in and calls `cx.notify()`.
+  folds updates in and calls `cx.notify()`. It also owns the active route and the
+  pushed-detail flag.
+- `src/routes.rs` — the route vocabulary, labels, icons, jump hints and empty
+  copy in one place.
+- `src/actions.rs` — actions plus the keymap; every shortcut is bound to an
+  action in a `key_context`, never matched as a raw key string in a view.
+- `src/palette.rs` — pure command-palette model: fuzzy filtering, wrapping
+  selection, recents and command execution kinds (unit-tested without a window).
+- `src/layout.rs` — the responsive breakpoint helper (the container-query
+  equivalent for this GPUI version).
+- `src/components.rs` — focus ring, keycaps, connection pill, empty state and
+  shortcut rows shared by the shell and route views.
+- `src/views/` — one entity per route plus the contextual detail view.
 
 ## Development
 
@@ -92,3 +110,24 @@ Deviations from the plan are recorded in this file as the chain progresses
 - `RpcClient` exposes the full set of step-02 required wrappers but does not yet
   have UI call sites for all of them; the module carries a scoped
   `#![allow(dead_code)]` until the views arrive.
+
+### Step 03 deviations / additions
+
+- **No container queries in this GPUI build.** The pinned `gpui 0.2.2` exposes
+  no `container_query` primitive, so `layout::container_query` reads the
+  full-window viewport width behind one named function. For this shell the root
+  container is the window, so the result is equivalent; the breakpoint is
+  `theme::NARROW_BREAKPOINT` (1120 px). Below it the detail column becomes a
+  pushed page with a Back button.
+- **Settings is read-only in this step.** It shows the effective endpoint, token
+  source, live connection pill, appearance and a Reconnect action; editing and
+  the agent roster land with step 09.
+- **Palette input scope.** The palette accepts typed characters and Backspace
+  through GPUI key events (`key_char`); full IME marked-text handling via
+  `EntityInputHandler` is deferred until search needs non-ASCII composition.
+  The palette remembers its last query for the session and keeps five recent
+  commands in memory (newest first).
+- **Inbox badge wiring.** `ClientState::awaiting_count` and the badge rendering
+  path are live; the inbox feed that increments it arrives in step 04.
+- **Extra Settings chord.** `⌘,`/`Ctrl+,` opens Settings in addition to the
+  required `g` jumps and the palette, because `g s` belongs to Schedules.

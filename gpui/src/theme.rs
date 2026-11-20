@@ -13,8 +13,18 @@ use gpui::{rgb, Rgba, WindowAppearance};
 /// Sidebar width in px — the default width of the navigation region.
 pub const SIDEBAR_WIDTH: f32 = 220.0;
 
+/// Top bar height in px.
+pub const TOP_BAR_HEIGHT: f32 = 52.0;
+
 /// Status bar height in px — the default height of the status region.
 pub const STATUS_BAR_HEIGHT: f32 = 28.0;
+
+/// Detail column width in px on wide windows.
+pub const DETAIL_WIDTH: f32 = 360.0;
+
+/// Below this viewport width the detail region becomes a pushed page instead
+/// of a third column (docs §1, "Responsive layout").
+pub const NARROW_BREAKPOINT: f32 = 1120.0;
 
 /// The spacing scale in px (docs §3): 4/8/12/16/24.
 pub struct Spacing {

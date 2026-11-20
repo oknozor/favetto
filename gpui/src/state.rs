@@ -1,19 +1,23 @@
-//! The client's GPUI entity: connection state, settings and the last ping.
+//! The client's GPUI entity: connection state, routing, settings and the last
+//! ping.
 //!
 //! Only one [`ClientState`] exists (created by the root view). It owns the
 //! [`Runtime`] and a foreground task that drains runtime updates; every UI
 //! observation is a read of this entity, so there are no global statics
 //! (docs/design/gpui-client.md §4).
 //!
-//! Step 02 keeps the entity deliberately small: connection, config, the last
-//! `system.ping` result, and a summary of the last push. Steps 04+ add tasks,
-//! sessions, the catalog and per-task event feeds here.
+//! Step 03 adds the active route and the pushed-detail flag that drive the
+//! shell. Steps 04+ add tasks, sessions, the catalog and per-task event feeds
+//! here.
 
 #![allow(dead_code)] // Accessors and `ping()` are consumed by the views in steps 03+.
+
+use std::path::Path;
 
 use gpui::{Context, Task};
 
 use crate::config::{self, ClientConfig};
+use crate::routes::Route;
 use crate::runtime::{PingSnapshot, Runtime, Update};
 use crate::transport::ClientError;
 
@@ -68,6 +72,15 @@ pub struct ClientState {
     push_count: u64,
     last_push: Option<String>,
     last_error: Option<String>,
+    /// The active top-level surface (owned here so views and the palette agree).
+    active_route: Route,
+    /// On narrow windows the detail region is a pushed page; this is the flag
+    /// the root view uses instead of rendering a third column.
+    detail_open: bool,
+    /// Blocked/failed runs that need a decision; the Inbox badge reads this.
+    awaiting_count: u32,
+    /// The daemon's repo name, derived from the `system.ping` cwd.
+    repo: Option<String>,
     /// The foreground task that drains [`Runtime`] updates. Declared before the
     /// runtime so dropping the entity cancels the drain first.
     drain: Option<Task<()>>,
@@ -114,6 +127,10 @@ impl ClientState {
             push_count: 0,
             last_push: None,
             last_error,
+            active_route: Route::default(),
+            detail_open: false,
+            awaiting_count: 0,
+            repo: None,
             runtime,
             drain,
         }
@@ -143,6 +160,9 @@ impl ClientState {
                     self.connection = ConnectionState::Unauthorized {
                         token_path: self.config.token_source.label(),
                     };
+                }
+                if let Ok(result) = &snapshot.result {
+                    self.repo = repo_name(&result.cwd);
                 }
                 self.last_ping = Some(snapshot);
             }
@@ -184,6 +204,44 @@ impl ClientState {
         &self.config
     }
 
+    /// The active top-level surface.
+    pub fn active_route(&self) -> Route {
+        self.active_route
+    }
+
+    /// Switch surfaces. Changing routes always leaves a pushed detail page, so
+    /// the sidebar never navigates "back" into a stale detail.
+    pub fn navigate(&mut self, route: Route) {
+        self.active_route = route;
+        self.detail_open = false;
+    }
+
+    /// Whether the narrow layout is showing the pushed detail page.
+    pub fn is_detail_open(&self) -> bool {
+        self.detail_open
+    }
+
+    /// Push the detail page on a narrow window.
+    pub fn open_detail(&mut self) {
+        self.detail_open = true;
+    }
+
+    /// Leave the pushed detail page (Escape/back).
+    pub fn close_detail(&mut self) {
+        self.detail_open = false;
+    }
+
+    /// The active repo name shown in the top bar. Until the first successful
+    /// `system.ping` the daemon has not told us where it runs.
+    pub fn repo_label(&self) -> &str {
+        self.repo.as_deref().unwrap_or("—")
+    }
+
+    /// Blocked/failed runs waiting for a decision (the Inbox badge).
+    pub fn awaiting_count(&self) -> u32 {
+        self.awaiting_count
+    }
+
     pub fn last_ping(&self) -> Option<&PingSnapshot> {
         self.last_ping.as_ref()
     }
@@ -217,6 +275,15 @@ impl ClientState {
     }
 }
 
+/// The repo name the top bar shows: the final component of the daemon's cwd.
+fn repo_name(cwd: &str) -> Option<String> {
+    Path::new(cwd)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +311,13 @@ mod tests {
 
         assert!(ConnectionState::Connected.is_connected());
         assert!(!ConnectionState::Connecting.is_connected());
+    }
+
+    #[test]
+    fn repo_name_is_the_daemon_cwd_basename() {
+        assert_eq!(repo_name("/code/favetto"), Some("favetto".to_string()));
+        assert_eq!(repo_name("/code/favetto/"), Some("favetto".to_string()));
+        assert_eq!(repo_name("/"), None);
+        assert_eq!(repo_name(""), None);
     }
 }
