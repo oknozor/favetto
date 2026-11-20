@@ -22,12 +22,17 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use async_channel::{Receiver, Sender};
-use favetto_wire::rpc::{PingParams, PingResult};
+use favetto_wire::model::{AgentSessionInfo, Task};
+use favetto_wire::rpc::{EmptyParams, PingParams, PingResult, TasksListParams};
 
 use crate::config::ClientConfig;
 use crate::sse::{self, Push, SseEvent, SseStatus};
 use crate::state::ConnectionState;
 use crate::transport::{ClientError, RpcClient};
+
+/// How many rows `tasks.list` fetches for the Inbox. The Recent group caps its
+/// own display; the larger window keeps every blocked/failed run visible.
+pub const INBOX_TASK_LIMIT: u64 = 500;
 
 /// Work the UI asks the runtime to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +41,9 @@ pub enum Command {
     Ping,
     /// Drop the SSE stream, start a fresh one, and re-validate the connection.
     Reconnect,
+    /// Re-fetch `tasks.list` and `agents.list` for the Inbox. Loads coalesce, so
+    /// a burst of pushes costs one round trip, not one per frame.
+    RefreshInbox,
     /// Stop the worker thread.
     Shutdown,
 }
@@ -60,6 +68,14 @@ pub enum Update {
     Cursor(Option<i64>),
     /// A push whose payload could not be decoded (shown, never fatal).
     Malformed(String),
+    /// A fresh Inbox snapshot: task rows plus every live agent session.
+    InboxLoaded {
+        tasks: Vec<Task>,
+        sessions: Vec<AgentSessionInfo>,
+    },
+    /// The Inbox fetch failed (`tasks.list` is required; a failing agents list
+    /// keeps the task rows and drops the session overlay).
+    InboxFailed { error: ClientError },
 }
 
 /// The runtime thread handle plus both ends of the bridge.
@@ -125,6 +141,11 @@ impl Runtime {
     pub fn reconnect(&self) {
         self.send(Command::Reconnect);
     }
+
+    /// Ask for a fresh Inbox snapshot. Coalesced by the loader.
+    pub fn refresh_inbox(&self) {
+        self.send(Command::RefreshInbox);
+    }
 }
 
 impl Drop for Runtime {
@@ -156,6 +177,8 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
     let token_hint = config.token_source.label();
     let mut sse_task = Some(spawn_sse(&config, &updates, token_hint.clone()));
     spawn_ping(client.clone(), updates.clone());
+    let (inbox_trigger, inbox_triggers) = async_channel::bounded(1);
+    spawn_inbox_loader(client.clone(), updates.clone(), inbox_triggers);
 
     while let Ok(command) = commands.recv().await {
         match command {
@@ -168,6 +191,14 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
                 let _ = updates.try_send(Update::Connection(ConnectionState::Connecting));
                 sse_task = Some(spawn_sse(&config, &updates, token_hint.clone()));
                 spawn_ping(client.clone(), updates.clone());
+                // The UI also asks on the Connected transition; this covers a
+                // reconnect whose state transition is not observed.
+                let _ = inbox_trigger.try_send(());
+            }
+            Command::RefreshInbox => {
+                // Capacity one: if a load is already queued/running, this is a
+                // no-op rather than a second overlapping RPC pair.
+                let _ = inbox_trigger.try_send(());
             }
         }
     }
@@ -187,6 +218,48 @@ fn spawn_ping(client: Arc<RpcClient>, updates: Sender<Update>) {
             round_trip: started.elapsed(),
         };
         let _ = updates.try_send(Update::Ping(snapshot));
+    });
+}
+
+/// Drain Inbox refresh triggers into `tasks.list` + `agents.list` snapshots.
+///
+/// The trigger channel has capacity one and is drained before each fetch, so a
+/// burst of `task.updated` / `agent.state` / `agent.event` pushes (or several
+/// `r` presses) collapses into at most one follow-up load. That keeps the SSE
+/// tick responsive without letting a chatty agent starve the daemon's RPC path.
+fn spawn_inbox_loader(client: Arc<RpcClient>, updates: Sender<Update>, triggers: Receiver<()>) {
+    tokio::spawn(async move {
+        while triggers.recv().await.is_ok() {
+            // Fold every trigger already waiting into this load.
+            while triggers.try_recv().is_ok() {}
+
+            // The two reads are independent; run them concurrently so the
+            // snapshot lands within one UI tick on a local daemon.
+            let (tasks, agents) = tokio::join!(
+                client.tasks_list(TasksListParams {
+                    limit: Some(INBOX_TASK_LIMIT),
+                }),
+                client.agents_list(EmptyParams {})
+            );
+
+            let update = match tasks {
+                Ok(tasks) => {
+                    // Losing the agents list costs the request text and agent
+                    // names, not the task rows, so it is not fatal.
+                    let sessions = agents
+                        .map(|agents| {
+                            agents
+                                .into_iter()
+                                .flat_map(|agent| agent.sessions)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Update::InboxLoaded { tasks, sessions }
+                }
+                Err(error) => Update::InboxFailed { error },
+            };
+            let _ = updates.try_send(update);
+        }
     });
 }
 

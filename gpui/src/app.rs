@@ -17,7 +17,8 @@ use gpui::{
 
 use crate::actions::{
     self, CloseOverlay, GoCatalog, GoInbox, GoSchedules, GoSettings, GoTasks, GoWorkflows,
-    PaletteConfirm, PaletteDown, PaletteUp, TogglePalette, ToggleShortcuts,
+    InboxDown, InboxOpen, InboxUp, PaletteConfirm, PaletteDown, PaletteUp, Refresh, TogglePalette,
+    ToggleShortcuts,
 };
 use crate::components;
 use crate::layout::{container_query, LayoutMode};
@@ -171,6 +172,29 @@ impl RootView {
         cx.notify();
     }
 
+    /// Move the Inbox highlight, but only while the Inbox is the active surface
+    /// (the shell keeps focus, so the list stays one keystroke away).
+    fn move_inbox(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.state.read(cx).active_route() != Route::Inbox {
+            return;
+        }
+        self.state.update(cx, |state, cx| {
+            state.move_inbox_selection(delta);
+            cx.notify();
+        });
+    }
+
+    /// Open the highlighted Inbox row's detail (step 06 fills the detail).
+    fn open_inbox(&mut self, cx: &mut Context<Self>) {
+        if self.state.read(cx).active_route() != Route::Inbox {
+            return;
+        }
+        self.state.update(cx, |state, cx| {
+            state.open_inbox_selected();
+            cx.notify();
+        });
+    }
+
     fn select_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(kind) = self.palette.activate() {
             self.execute(kind, window, cx);
@@ -196,7 +220,7 @@ impl RootView {
             }
             CommandKind::Refresh => {
                 self.state.update(cx, |state, cx| {
-                    state.ping();
+                    state.refresh_active();
                     cx.notify();
                 });
             }
@@ -326,6 +350,7 @@ impl RootView {
 
     fn sidebar(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let active = self.state.read(cx).active_route();
+        let needs = self.state.read(cx).needs_count();
         div()
             .flex_col()
             .w(px(SIDEBAR_WIDTH))
@@ -344,7 +369,7 @@ impl RootView {
             .children(
                 Route::ALL
                     .iter()
-                    .map(|route| self.nav_entry(*route, theme, cx)),
+                    .map(|route| self.nav_entry(*route, needs, theme, cx)),
             )
             .child(div().flex_1())
             .child(
@@ -364,10 +389,15 @@ impl RootView {
             )
     }
 
-    fn nav_entry(&self, route: Route, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn nav_entry(
+        &self,
+        route: Route,
+        needs: u32,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let active = self.state.read(cx).active_route() == route;
-        let awaiting = self.state.read(cx).awaiting_count();
-        let badge = (route == Route::Inbox && awaiting > 0).then(|| {
+        let badge = (route == Route::Inbox && needs > 0).then(|| {
             div()
                 .flex()
                 .items_center()
@@ -380,7 +410,7 @@ impl RootView {
                 .border_color(theme.colors.warning)
                 .text_color(theme.colors.warning)
                 .text_size(px(theme.font.xs))
-                .child(awaiting.to_string())
+                .child(needs.to_string())
         });
 
         components::with_focus(
@@ -933,6 +963,21 @@ impl Render for RootView {
             }))
             .on_action(cx.listener(|this, action: &GoSettings, _window, cx| {
                 this.on_jump(action, cx);
+            }))
+            .on_action(cx.listener(|this, _: &InboxUp, _window, cx| {
+                this.move_inbox(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &InboxDown, _window, cx| {
+                this.move_inbox(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &InboxOpen, _window, cx| {
+                this.open_inbox(cx);
+            }))
+            .on_action(cx.listener(|this, _: &Refresh, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.refresh_active();
+                    cx.notify();
+                });
             }))
             .on_action(cx.listener(|this, _: &PaletteUp, _window, cx| {
                 this.move_palette(-1, cx);

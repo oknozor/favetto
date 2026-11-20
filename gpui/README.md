@@ -1,11 +1,11 @@
 # favetto GPUI desktop client
 
-Status: **navigation shell (step 03)** — the window now has the real frame:
-sidebar with the six surfaces (Inbox → Tasks → Catalog → Workflows →
-Schedules → Settings), top bar with the active repo and connection pill, the
-working-list and detail regions, a command palette (`⌘K` / `Ctrl+K`), `g`-jump
-shortcuts, a shortcut sheet, and intentional empty states for surfaces whose
-rows arrive in later steps. The plans live in `docs/design/gpui-client.md`.
+Status: **inbox (step 04)** — the landing surface now answers "What needs
+me now?": blocked sessions and failures from the last 24 hours in **Needs you**
+(oldest waiting first, accent stripe + icon), the newest runs in **Recent**, a
+first-fetch skeleton, an error state with Retry, and live refreshes driven by
+`task.updated`, `agent.state` and `agent.event` pushes. The plans live in
+`docs/design/gpui-client.md`.
 
 ## What it is
 
@@ -44,8 +44,13 @@ Reconnect action retries after the token/test daemon is corrected.
 
 Keyboard: `⌘K`/`Ctrl+K` opens the command palette, `g i`/`g t`/`g c`/`g w`/
 `g s` jump to Inbox/Tasks/Catalog/Workflows/Schedules, `⌘,`/`Ctrl+,` opens
-Settings, `?` opens the shortcut sheet, and `Esc` closes the topmost overlay or
-steps back from a pushed detail.
+Settings, `?` opens the shortcut sheet, `Esc` closes the topmost overlay or
+steps back from a pushed detail. On the Inbox, `↑`/`↓` move the Needs you
+highlight, `Enter` opens the highlighted run, and `r` refreshes the surface.
+
+The Inbox loads `tasks.list` and `agents.list` on connect and follows
+`task.updated`, `agent.state` and `agent.event` pushes. A blocked session shows
+up without a manual refresh; overlapping pushes coalesce into one RPC round trip.
 
 ## Pointing it at a daemon
 
@@ -76,8 +81,12 @@ or `/events` path, and a missing scheme are all accepted.
 - `src/runtime.rs` — a dedicated tokio thread bridged to GPUI with
   `async-channel`: commands in, connection state/cursor/pushes out.
 - `src/state.rs` — the single `ClientState` entity; the foreground drain task
-  folds updates in and calls `cx.notify()`. It also owns the active route and the
-  pushed-detail flag.
+  folds updates in and calls `cx.notify()`. It also owns the active route, the
+  pushed-detail flag, the Inbox snapshot (tasks + sessions), its selection and
+  the selected run.
+- `src/inbox.rs` — the pure Inbox model: Needs you vs Recent grouping, the
+  24-hour failure window, oldest-first fair-queue order, status fallbacks and
+  the compact duration/cost formatters. Unit-tested without a window.
 - `src/routes.rs` — the route vocabulary, labels, icons, jump hints and empty
   copy in one place.
 - `src/actions.rs` — actions plus the keymap; every shortcut is bound to an
@@ -131,3 +140,23 @@ Deviations from the plan are recorded in this file as the chain progresses
   path are live; the inbox feed that increments it arrives in step 04.
 - **Extra Settings chord.** `⌘,`/`Ctrl+,` opens Settings in addition to the
   required `g` jumps and the palette, because `g s` belongs to Schedules.
+
+### Step 04 deviations / additions
+
+- **Recent excludes Needs you rows.** A blocked or recently failed run is
+  already in the first group; repeating it one line below would make the
+  landing surface look busier than it is.
+- **Usage cost comes from live sessions.** `tasks.list` omits the run output and
+  the task row carries no usage, so a Recent row shows a cost only while an
+  `agents.list` session for that task reports `cost_usd`. The detail surface
+  (step 06) owns persisted per-run usage.
+- **Elapsed waiting time is the run clock.** The wire exposes `started_at` but
+  not when a prompt first appeared, so the fair-queue order and the elapsed cell
+  use `started_at`, falling back to `created_at`.
+- **Task detail is still a placeholder.** `Enter` (or a row click) selects the
+  run, pushes the detail page on narrow windows and echoes the selected name in
+  the wide detail column; the header, tabs and permission controls land in
+  step 06 exactly as planned.
+- **First-fetch error coverage.** An unauthorized/disconnected transport that
+  never reaches `Connected` transitions the Inbox from skeleton to the error
+  state with Retry, instead of waiting forever for a first fetch that cannot run.

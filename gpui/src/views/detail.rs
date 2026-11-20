@@ -4,6 +4,7 @@
 use gpui::{div, prelude::*, px, Context, Entity, FocusHandle, IntoElement, Render, Window};
 
 use crate::components;
+use crate::inbox::{self, StatusKind};
 use crate::layout::{container_query, LayoutMode};
 use crate::routes::Route;
 use crate::state::ClientState;
@@ -32,6 +33,28 @@ impl Render for DetailView {
         let route = self.state.read(cx).active_route();
         let narrow = container_query(window.viewport_size().width) == LayoutMode::Narrow;
         let (icon, eyebrow, title, body) = detail_copy(route);
+
+        // Step 04 wires `Enter` to the selected run; the full header and tabs
+        // arrive with step 06, so echo the run here to make the action visible.
+        let selected = self
+            .state
+            .read(cx)
+            .selected_task()
+            .map(|task| (task.name.clone(), task.status, task.attempt));
+        let (icon, title, body) = match selected {
+            Some((name, status, attempt)) if matches!(route, Route::Inbox | Route::Tasks) => {
+                let status = StatusKind::from_task_status(status);
+                (
+                    status.icon(),
+                    inbox::task_display_name(&name).to_string(),
+                    format!(
+                        "{} · attempt {attempt}. Output, events and runs arrive with the task-detail step.",
+                        status.label()
+                    ),
+                )
+            }
+            _ => (icon, title.to_string(), body.to_string()),
+        };
 
         let header = div()
             .flex()
@@ -80,8 +103,8 @@ impl Render for DetailView {
                 theme,
                 icon,
                 eyebrow,
-                title,
-                body,
+                &title,
+                &body,
                 "Open a row to inspect it",
             ))
     }

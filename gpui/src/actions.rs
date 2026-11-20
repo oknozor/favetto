@@ -40,6 +40,12 @@ actions!(
         PaletteDown,
         /// Activate the focused sidebar entry.
         ActivateNav,
+        /// Move the Inbox Needs you highlight up.
+        InboxUp,
+        /// Move the Inbox Needs you highlight down.
+        InboxDown,
+        /// Open the highlighted Inbox row's task detail.
+        InboxOpen,
         /// Refresh the connection and the current surface.
         Refresh,
         /// Restart the transport.
@@ -66,6 +72,11 @@ pub fn bindings() -> Vec<KeyBinding> {
             GoSettings,
             Some("Root && !Palette && !Shortcuts"),
         ),
+        // Inbox list navigation (docs §1: every list is operable with ↑/↓/Enter).
+        KeyBinding::new("up", InboxUp, Some("Root && !Palette && !Shortcuts")),
+        KeyBinding::new("down", InboxDown, Some("Root && !Palette && !Shortcuts")),
+        KeyBinding::new("enter", InboxOpen, Some("Root && !Palette && !Shortcuts")),
+        KeyBinding::new("r", Refresh, Some("Root && !Palette && !Shortcuts")),
         KeyBinding::new("up", PaletteUp, Some("Palette")),
         KeyBinding::new("down", PaletteDown, Some("Palette")),
         // Tab cycles the palette selection instead of leaving the modal, so the
@@ -137,5 +148,14 @@ mod tests {
         assert!(contexts.iter().any(|(action, context)| {
             action == "PaletteConfirm" && context.as_deref() == Some("Palette")
         }));
+        for action in ["InboxUp", "InboxDown", "InboxOpen", "Refresh"] {
+            assert!(
+                contexts.iter().any(|(bound, context)| bound == action
+                    && context
+                        .as_deref()
+                        .is_some_and(|context| context.contains("!Palette"))),
+                "{action} must be reachable outside the palette"
+            );
+        }
     }
 }
