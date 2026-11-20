@@ -8,6 +8,7 @@ mod feed;
 mod json;
 mod markdown;
 mod sound;
+mod syntax;
 mod term;
 mod text_buffer;
 mod theme;
