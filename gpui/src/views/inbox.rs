@@ -23,7 +23,7 @@ use gpui::{
 use crate::components;
 use crate::inbox::{self, InboxKey, NeedsRow, RecentRow, StatusKind};
 use crate::routes::Route;
-use crate::state::{ClientState, InboxStatus};
+use crate::state::{ClientState, SnapshotStatus};
 use crate::theme::Theme;
 
 /// The Inbox surface.
@@ -116,7 +116,7 @@ impl InboxView {
                 .child(components::keycap(theme, "r"))
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.state.update(cx, |state, cx| {
-                        state.refresh_inbox();
+                        state.refresh_snapshot();
                         cx.notify();
                     });
                 })),
@@ -532,13 +532,13 @@ impl Render for InboxView {
             let state = self.state.read(cx);
             (
                 state.inbox_rows(),
-                state.inbox_status().clone(),
-                state.has_inbox_data(),
+                state.snapshot_status().clone(),
+                state.has_snapshot_data(),
             )
         };
         let selected = self.state.read(cx).selected_inbox_key(&rows);
 
-        if matches!(&status, InboxStatus::Loading) && !has_data {
+        if matches!(&status, SnapshotStatus::Loading) && !has_data {
             return div()
                 .size_full()
                 .flex()
@@ -548,7 +548,7 @@ impl Render for InboxView {
                 .child(self.loading_body(theme));
         }
 
-        if let InboxStatus::Failed { message } = &status {
+        if let SnapshotStatus::Failed { message } = &status {
             if !has_data {
                 return div()
                     .size_full()
@@ -579,7 +579,7 @@ impl Render for InboxView {
                 .flex_col()
                 .gap(px(theme.spacing.s4))
                 .p(px(theme.spacing.s4));
-            if let InboxStatus::Failed { message } = &status {
+            if let SnapshotStatus::Failed { message } = &status {
                 content = content.child(self.error_banner(theme, message, cx));
             }
             content

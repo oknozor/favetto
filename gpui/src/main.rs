@@ -15,6 +15,7 @@ mod routes;
 mod runtime;
 mod sse;
 mod state;
+mod tasks;
 mod theme;
 mod transport;
 mod views;

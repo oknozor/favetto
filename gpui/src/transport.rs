@@ -334,6 +334,31 @@ mod tests {
     }
 
     #[test]
+    fn cancel_and_retry_requests_carry_the_task_id_and_method() {
+        let id = uuid::Uuid::from_u128(42);
+        let params = TaskIdParams { id };
+        for (bytes, method_name) in [
+            (
+                encode_request::<TasksCancelCall>(1, &params).expect("encode cancel"),
+                method::TASKS_CANCEL,
+            ),
+            (
+                encode_request::<TasksRetryCall>(2, &params).expect("encode retry"),
+                method::TASKS_RETRY,
+            ),
+        ] {
+            let frame: Frame = rmp_serde::from_slice(&bytes).expect("decode frame");
+            match frame {
+                Frame::Request(request) => {
+                    assert_eq!(request.method, method_name);
+                    assert_eq!(request.params["id"], id.to_string());
+                }
+                other => panic!("expected a request frame, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn agent_reply_request_carries_the_typed_reply() {
         let params = AgentReplyParams {
             session_id: "sess-1".to_string(),

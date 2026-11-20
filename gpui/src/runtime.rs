@@ -23,27 +23,38 @@ use std::time::{Duration, Instant};
 
 use async_channel::{Receiver, Sender};
 use favetto_wire::model::{AgentSessionInfo, Task};
-use favetto_wire::rpc::{EmptyParams, PingParams, PingResult, TasksListParams};
+use favetto_wire::rpc::{EmptyParams, PingParams, PingResult, TaskIdParams, TasksListParams};
 
 use crate::config::ClientConfig;
 use crate::sse::{self, Push, SseEvent, SseStatus};
 use crate::state::ConnectionState;
+use crate::tasks::TaskAction;
 use crate::transport::{ClientError, RpcClient};
 
-/// How many rows `tasks.list` fetches for the Inbox. The Recent group caps its
-/// own display; the larger window keeps every blocked/failed run visible.
-pub const INBOX_TASK_LIMIT: u64 = 500;
+/// How many rows `tasks.list` fetches for the Inbox and the Tasks surface. The
+/// Inbox caps its Recent group; the larger window keeps every run the Tasks
+/// filter and search can reach.
+pub const TASK_LIST_LIMIT: u64 = 500;
 
 /// Work the UI asks the runtime to do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     /// Run one `system.ping` round trip.
     Ping,
     /// Drop the SSE stream, start a fresh one, and re-validate the connection.
     Reconnect,
-    /// Re-fetch `tasks.list` and `agents.list` for the Inbox. Loads coalesce, so
-    /// a burst of pushes costs one round trip, not one per frame.
-    RefreshInbox,
+    /// Re-fetch `tasks.list` and `agents.list` for the Inbox and Tasks views.
+    /// Loads coalesce, so a burst of pushes costs one round trip, not one per
+    /// frame.
+    RefreshSnapshot,
+    /// Send `tasks.cancel` or `tasks.retry` for one task. `previous` is the row
+    /// the UI optimistically replaced and `optimistic` is the replacement, so a
+    /// failed RPC can restore the former only if no newer push replaced it.
+    TaskAction {
+        action: TaskAction,
+        previous: Box<Task>,
+        optimistic: Box<Task>,
+    },
     /// Stop the worker thread.
     Shutdown,
 }
@@ -69,13 +80,22 @@ pub enum Update {
     /// A push whose payload could not be decoded (shown, never fatal).
     Malformed(String),
     /// A fresh Inbox snapshot: task rows plus every live agent session.
-    InboxLoaded {
+    SnapshotLoaded {
         tasks: Vec<Task>,
         sessions: Vec<AgentSessionInfo>,
     },
-    /// The Inbox fetch failed (`tasks.list` is required; a failing agents list
-    /// keeps the task rows and drops the session overlay).
-    InboxFailed { error: ClientError },
+    /// The Inbox/Tasks fetch failed (`tasks.list` is required; a failing agents
+    /// list keeps the task rows and drops the session overlay).
+    SnapshotFailed { error: ClientError },
+    /// A `tasks.cancel`/`tasks.retry` round trip completed. `previous` is the
+    /// pre-optimistic row and `optimistic` the local write, used for the guarded
+    /// rollback on error.
+    TaskActionFinished {
+        action: TaskAction,
+        previous: Box<Task>,
+        optimistic: Box<Task>,
+        result: Result<Box<Task>, ClientError>,
+    },
 }
 
 /// The runtime thread handle plus both ends of the bridge.
@@ -142,9 +162,18 @@ impl Runtime {
         self.send(Command::Reconnect);
     }
 
-    /// Ask for a fresh Inbox snapshot. Coalesced by the loader.
-    pub fn refresh_inbox(&self) {
-        self.send(Command::RefreshInbox);
+    /// Ask for a fresh task snapshot. Coalesced by the loader.
+    pub fn refresh_snapshot(&self) {
+        self.send(Command::RefreshSnapshot);
+    }
+
+    /// Run `tasks.cancel`/`tasks.retry` for a row the UI already changed.
+    pub fn task_action(&self, action: TaskAction, previous: Task, optimistic: Task) {
+        self.send(Command::TaskAction {
+            action,
+            previous: Box::new(previous),
+            optimistic: Box::new(optimistic),
+        });
     }
 }
 
@@ -195,10 +224,23 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
                 // reconnect whose state transition is not observed.
                 let _ = inbox_trigger.try_send(());
             }
-            Command::RefreshInbox => {
+            Command::RefreshSnapshot => {
                 // Capacity one: if a load is already queued/running, this is a
                 // no-op rather than a second overlapping RPC pair.
                 let _ = inbox_trigger.try_send(());
+            }
+            Command::TaskAction {
+                action,
+                previous,
+                optimistic,
+            } => {
+                spawn_task_action(
+                    client.clone(),
+                    updates.clone(),
+                    action,
+                    *previous,
+                    *optimistic,
+                );
             }
         }
     }
@@ -237,7 +279,7 @@ fn spawn_inbox_loader(client: Arc<RpcClient>, updates: Sender<Update>, triggers:
             // snapshot lands within one UI tick on a local daemon.
             let (tasks, agents) = tokio::join!(
                 client.tasks_list(TasksListParams {
-                    limit: Some(INBOX_TASK_LIMIT),
+                    limit: Some(TASK_LIST_LIMIT),
                 }),
                 client.agents_list(EmptyParams {})
             );
@@ -254,12 +296,38 @@ fn spawn_inbox_loader(client: Arc<RpcClient>, updates: Sender<Update>, triggers:
                                 .collect()
                         })
                         .unwrap_or_default();
-                    Update::InboxLoaded { tasks, sessions }
+                    Update::SnapshotLoaded { tasks, sessions }
                 }
-                Err(error) => Update::InboxFailed { error },
+                Err(error) => Update::SnapshotFailed { error },
             };
             let _ = updates.try_send(update);
         }
+    });
+}
+
+/// Spawn one `tasks.cancel` / `tasks.retry`; the reply is a
+/// [`Update::TaskActionFinished`] so the optimistic row can be confirmed or
+/// rolled back.
+fn spawn_task_action(
+    client: Arc<RpcClient>,
+    updates: Sender<Update>,
+    action: TaskAction,
+    previous: Task,
+    optimistic: Task,
+) {
+    tokio::spawn(async move {
+        let params = TaskIdParams { id: previous.id };
+        let result = match action {
+            TaskAction::Cancel => client.tasks_cancel(params).await,
+            TaskAction::Retry => client.tasks_retry(params).await,
+        }
+        .map(Box::new);
+        let _ = updates.try_send(Update::TaskActionFinished {
+            action,
+            previous: Box::new(previous),
+            optimistic: Box::new(optimistic),
+            result,
+        });
     });
 }
 

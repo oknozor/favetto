@@ -4,6 +4,11 @@
 //! a `key_context`; no view compares raw key strings for shortcuts. The keyboard
 //! model is therefore discoverable (`?`), rebindable in one place, and testable
 //! independently of the keymap.
+//!
+//! The root view renders its key context from the live state (`Root`, plus
+//! `Tasks`, `Search` or `Confirm` as appropriate), so typed search text never
+//! triggers the `g`-jumps, `r` or `?` bindings. The more specific bindings are
+//! registered last: GPUI resolves equal-depth matches by binding order.
 
 use gpui::{actions, Action, KeyBinding};
 
@@ -40,12 +45,34 @@ actions!(
         PaletteDown,
         /// Activate the focused sidebar entry.
         ActivateNav,
-        /// Move the Inbox Needs you highlight up.
-        InboxUp,
-        /// Move the Inbox Needs you highlight down.
-        InboxDown,
-        /// Open the highlighted Inbox row's task detail.
-        InboxOpen,
+        /// Move the active list highlight up.
+        ListUp,
+        /// Move the active list highlight down.
+        ListDown,
+        /// Open the highlighted list row's detail.
+        ListOpen,
+        /// Move the active list highlight to the first row.
+        ListHome,
+        /// Move the active list highlight to the last row.
+        ListEnd,
+        /// Move the active list highlight one page up.
+        ListPageUp,
+        /// Move the active list highlight one page down.
+        ListPageDown,
+        /// Focus the Tasks search field (`/`).
+        TaskSearch,
+        /// Open the cancel confirmation for the highlighted run (`c`).
+        TaskCancel,
+        /// Open the retry confirmation for the highlighted finished run (`r`).
+        TaskRetry,
+        /// Select the previous status segment (`[`).
+        TaskFilterPrev,
+        /// Select the next status segment (`]`).
+        TaskFilterNext,
+        /// Confirm the pending cancel/retry (`↵`).
+        TaskConfirmAccept,
+        /// Dismiss the pending cancel/retry (`n`).
+        TaskConfirmReject,
         /// Refresh the connection and the current surface.
         Refresh,
         /// Restart the transport.
@@ -59,24 +86,88 @@ pub fn bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("secondary-k", TogglePalette, Some("Root")),
         KeyBinding::new("escape", CloseOverlay, Some("Root")),
-        KeyBinding::new("shift-/", ToggleShortcuts, Some("Root && !Palette")),
+        KeyBinding::new(
+            "shift-/",
+            ToggleShortcuts,
+            Some("Root && !Palette && !Search && !Confirm"),
+        ),
         // Some layouts deliver `?` as its own key rather than shift-/.
-        KeyBinding::new("?", ToggleShortcuts, Some("Root && !Palette")),
-        KeyBinding::new("g i", GoInbox, Some("Root && !Palette && !Shortcuts")),
-        KeyBinding::new("g t", GoTasks, Some("Root && !Palette && !Shortcuts")),
-        KeyBinding::new("g c", GoCatalog, Some("Root && !Palette && !Shortcuts")),
-        KeyBinding::new("g w", GoWorkflows, Some("Root && !Palette && !Shortcuts")),
-        KeyBinding::new("g s", GoSchedules, Some("Root && !Palette && !Shortcuts")),
+        KeyBinding::new(
+            "?",
+            ToggleShortcuts,
+            Some("Root && !Palette && !Search && !Confirm"),
+        ),
+        KeyBinding::new(
+            "g i",
+            GoInbox,
+            Some("Root && !Palette && !Shortcuts && !Search && !Confirm"),
+        ),
+        KeyBinding::new(
+            "g t",
+            GoTasks,
+            Some("Root && !Palette && !Shortcuts && !Search && !Confirm"),
+        ),
+        KeyBinding::new(
+            "g c",
+            GoCatalog,
+            Some("Root && !Palette && !Shortcuts && !Search && !Confirm"),
+        ),
+        KeyBinding::new(
+            "g w",
+            GoWorkflows,
+            Some("Root && !Palette && !Shortcuts && !Search && !Confirm"),
+        ),
+        KeyBinding::new(
+            "g s",
+            GoSchedules,
+            Some("Root && !Palette && !Shortcuts && !Search && !Confirm"),
+        ),
         KeyBinding::new(
             "secondary-,",
             GoSettings,
-            Some("Root && !Palette && !Shortcuts"),
+            Some("Root && !Palette && !Shortcuts && !Search && !Confirm"),
         ),
-        // Inbox list navigation (docs §1: every list is operable with ↑/↓/Enter).
-        KeyBinding::new("up", InboxUp, Some("Root && !Palette && !Shortcuts")),
-        KeyBinding::new("down", InboxDown, Some("Root && !Palette && !Shortcuts")),
-        KeyBinding::new("enter", InboxOpen, Some("Root && !Palette && !Shortcuts")),
-        KeyBinding::new("r", Refresh, Some("Root && !Palette && !Shortcuts")),
+        // List navigation (docs §1: every list is operable with ↑/↓/Enter).
+        KeyBinding::new(
+            "up",
+            ListUp,
+            Some("Root && !Palette && !Shortcuts && !Confirm"),
+        ),
+        KeyBinding::new(
+            "down",
+            ListDown,
+            Some("Root && !Palette && !Shortcuts && !Confirm"),
+        ),
+        KeyBinding::new(
+            "home",
+            ListHome,
+            Some("Root && !Palette && !Shortcuts && !Confirm"),
+        ),
+        KeyBinding::new(
+            "end",
+            ListEnd,
+            Some("Root && !Palette && !Shortcuts && !Confirm"),
+        ),
+        KeyBinding::new(
+            "pageup",
+            ListPageUp,
+            Some("Root && !Palette && !Shortcuts && !Confirm"),
+        ),
+        KeyBinding::new(
+            "pagedown",
+            ListPageDown,
+            Some("Root && !Palette && !Shortcuts && !Confirm"),
+        ),
+        KeyBinding::new(
+            "enter",
+            ListOpen,
+            Some("Root && !Palette && !Shortcuts && !Confirm"),
+        ),
+        KeyBinding::new(
+            "r",
+            Refresh,
+            Some("Root && !Palette && !Shortcuts && !Search && !Confirm"),
+        ),
         KeyBinding::new("up", PaletteUp, Some("Palette")),
         KeyBinding::new("down", PaletteDown, Some("Palette")),
         // Tab cycles the palette selection instead of leaving the modal, so the
@@ -84,6 +175,48 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("tab", PaletteDown, Some("Palette")),
         KeyBinding::new("shift-tab", PaletteUp, Some("Palette")),
         KeyBinding::new("enter", PaletteConfirm, Some("Palette")),
+        // Tasks-specific bindings are registered after the generic ones so a
+        // same-depth match resolves to them (GPUI prefers the later binding).
+        KeyBinding::new(
+            "c",
+            TaskCancel,
+            Some("Tasks && !Palette && !Shortcuts && !Search && !Confirm"),
+        ),
+        KeyBinding::new(
+            "r",
+            TaskRetry,
+            Some("Tasks && !Palette && !Shortcuts && !Search && !Confirm"),
+        ),
+        KeyBinding::new(
+            "/",
+            TaskSearch,
+            Some("Tasks && !Palette && !Shortcuts && !Search && !Confirm"),
+        ),
+        KeyBinding::new(
+            "[",
+            TaskFilterPrev,
+            Some("Tasks && !Palette && !Shortcuts && !Search && !Confirm"),
+        ),
+        KeyBinding::new(
+            "]",
+            TaskFilterNext,
+            Some("Tasks && !Palette && !Shortcuts && !Search && !Confirm"),
+        ),
+        KeyBinding::new(
+            "enter",
+            TaskConfirmAccept,
+            Some("Tasks && Confirm && !Palette && !Shortcuts"),
+        ),
+        KeyBinding::new(
+            "y",
+            TaskConfirmAccept,
+            Some("Tasks && Confirm && !Palette && !Shortcuts"),
+        ),
+        KeyBinding::new(
+            "n",
+            TaskConfirmReject,
+            Some("Tasks && Confirm && !Palette && !Shortcuts"),
+        ),
     ]
 }
 
@@ -111,21 +244,8 @@ pub fn route_for_action(action: &dyn Action) -> Option<Route> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn every_jump_action_maps_to_its_route() {
-        assert_eq!(route_for_action(&GoInbox), Some(Route::Inbox));
-        assert_eq!(route_for_action(&GoTasks), Some(Route::Tasks));
-        assert_eq!(route_for_action(&GoCatalog), Some(Route::Catalog));
-        assert_eq!(route_for_action(&GoWorkflows), Some(Route::Workflows));
-        assert_eq!(route_for_action(&GoSchedules), Some(Route::Schedules));
-        assert_eq!(route_for_action(&GoSettings), Some(Route::Settings));
-        assert_eq!(route_for_action(&TogglePalette), None);
-    }
-
-    #[test]
-    fn the_keymap_binds_actions_in_the_right_contexts() {
-        let bindings = bindings();
-        let contexts: Vec<_> = bindings
+    fn contexts() -> Vec<(String, Option<String>)> {
+        bindings()
             .iter()
             .map(|binding| {
                 (
@@ -139,8 +259,23 @@ mod tests {
                     binding.predicate().map(|predicate| predicate.to_string()),
                 )
             })
-            .collect();
+            .collect()
+    }
 
+    #[test]
+    fn every_jump_action_maps_to_its_route() {
+        assert_eq!(route_for_action(&GoInbox), Some(Route::Inbox));
+        assert_eq!(route_for_action(&GoTasks), Some(Route::Tasks));
+        assert_eq!(route_for_action(&GoCatalog), Some(Route::Catalog));
+        assert_eq!(route_for_action(&GoWorkflows), Some(Route::Workflows));
+        assert_eq!(route_for_action(&GoSchedules), Some(Route::Schedules));
+        assert_eq!(route_for_action(&GoSettings), Some(Route::Settings));
+        assert_eq!(route_for_action(&TogglePalette), None);
+    }
+
+    #[test]
+    fn the_keymap_binds_actions_in_the_right_contexts() {
+        let contexts = contexts();
         assert!(contexts.contains(&("TogglePalette".into(), Some("Root".into()))));
         assert!(contexts.iter().any(|(action, context)| {
             action == "GoInbox" && context.as_deref().is_some_and(|c| c.contains("!Palette"))
@@ -148,7 +283,7 @@ mod tests {
         assert!(contexts.iter().any(|(action, context)| {
             action == "PaletteConfirm" && context.as_deref() == Some("Palette")
         }));
-        for action in ["InboxUp", "InboxDown", "InboxOpen", "Refresh"] {
+        for action in ["ListUp", "ListDown", "ListOpen", "Refresh"] {
             assert!(
                 contexts.iter().any(|(bound, context)| bound == action
                     && context
@@ -157,5 +292,54 @@ mod tests {
                 "{action} must be reachable outside the palette"
             );
         }
+    }
+
+    #[test]
+    fn task_shortcuts_are_scoped_to_the_tasks_surface() {
+        let contexts = contexts();
+        for (action, keys) in [
+            ("TaskCancel", "c"),
+            ("TaskRetry", "r"),
+            ("TaskSearch", "/"),
+            ("TaskFilterPrev", "["),
+            ("TaskFilterNext", "]"),
+        ] {
+            let matches: Vec<_> = bindings()
+                .into_iter()
+                .filter(|binding| {
+                    binding.action().name().ends_with(action)
+                        && binding.keystrokes().iter().any(|key| key.key() == keys)
+                })
+                .collect();
+            assert_eq!(matches.len(), 1, "{action} must have exactly one binding");
+            assert!(
+                matches[0]
+                    .predicate()
+                    .is_some_and(|predicate| predicate.to_string().contains("Tasks")),
+                "{action} must only fire on the Tasks surface"
+            );
+            assert!(
+                contexts.iter().any(|(bound, _)| bound == action),
+                "{action} missing from the keymap"
+            );
+        }
+        // The confirmation dialog owns Enter (registered after ListOpen).
+        let order: Vec<_> = bindings()
+            .iter()
+            .filter(|binding| binding.keystrokes().iter().any(|key| key.key() == "enter"))
+            .map(|binding| {
+                binding
+                    .action()
+                    .name()
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        let list_open = order.iter().position(|name| name == "ListOpen");
+        let accept = order.iter().position(|name| name == "TaskConfirmAccept");
+        assert!(list_open.is_some() && accept.is_some());
+        assert!(accept > list_open);
     }
 }

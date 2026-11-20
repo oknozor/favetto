@@ -17,18 +17,28 @@ use gpui::{
 
 use crate::actions::{
     self, CloseOverlay, GoCatalog, GoInbox, GoSchedules, GoSettings, GoTasks, GoWorkflows,
-    InboxDown, InboxOpen, InboxUp, PaletteConfirm, PaletteDown, PaletteUp, Refresh, TogglePalette,
-    ToggleShortcuts,
+    ListDown, ListEnd, ListHome, ListOpen, ListPageDown, ListPageUp, ListUp, PaletteConfirm,
+    PaletteDown, PaletteUp, Refresh, TaskCancel, TaskConfirmAccept, TaskConfirmReject,
+    TaskFilterNext, TaskFilterPrev, TaskRetry, TaskSearch, TogglePalette, ToggleShortcuts,
 };
 use crate::components;
 use crate::layout::{container_query, LayoutMode};
 use crate::palette::{CommandKind, CommandPalette};
 use crate::routes::Route;
-use crate::state::ClientState;
+use crate::state::{ClientState, TaskConfirm, Toast, ToastKind};
+use crate::tasks::TaskAction;
 use crate::theme::{Theme, DETAIL_WIDTH, SIDEBAR_WIDTH, STATUS_BAR_HEIGHT, TOP_BAR_HEIGHT};
 use crate::views::{
     CatalogView, DetailView, InboxView, SchedulesView, SettingsView, TasksView, WorkflowsView,
 };
+
+/// A Home/End/Page key, routed to the active list.
+enum ListJump {
+    Home,
+    End,
+    PageUp,
+    PageDown,
+}
 
 /// The route entities, created once with the shell.
 struct RouteViews {
@@ -121,6 +131,10 @@ impl RootView {
 
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.shortcuts_open = false;
+        self.state.update(cx, |state, cx| {
+            state.cancel_task_confirm();
+            cx.notify();
+        });
         self.palette.open();
         window.focus(&self.palette_focus);
         cx.notify();
@@ -136,6 +150,10 @@ impl RootView {
         self.shortcuts_open = !self.shortcuts_open;
         if self.shortcuts_open {
             self.palette.close();
+            self.state.update(cx, |state, cx| {
+                state.cancel_task_confirm();
+                cx.notify();
+            });
             window.focus(&self.shortcuts_close_focus);
         } else {
             window.focus(&self.root_focus);
@@ -143,8 +161,8 @@ impl RootView {
         cx.notify();
     }
 
-    /// Escape closes the topmost overlay; with no overlay it acts as Back out
-    /// of a pushed detail page (docs §1, responsive layout).
+    /// Escape closes the topmost overlay; with no overlay it clears the Tasks
+    /// search, then acts as Back out of a pushed detail page (docs §1).
     fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.palette.is_open() {
             self.close_palette(window, cx);
@@ -154,7 +172,14 @@ impl RootView {
             cx.notify();
         } else {
             self.state.update(cx, |state, cx| {
-                state.close_detail();
+                if state.task_confirm().is_some() {
+                    state.cancel_task_confirm();
+                } else if state.active_route() == Route::Tasks && state.clear_tasks_search() {
+                    // Esc is consumed by the search field; a second Esc steps
+                    // back from a pushed detail.
+                } else {
+                    state.close_detail();
+                }
                 cx.notify();
             });
             window.focus(&self.root_focus);
@@ -172,25 +197,91 @@ impl RootView {
         cx.notify();
     }
 
-    /// Move the Inbox highlight, but only while the Inbox is the active surface
-    /// (the shell keeps focus, so the list stays one keystroke away).
-    fn move_inbox(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.state.read(cx).active_route() != Route::Inbox {
+    /// Move the active list highlight. The shell keeps focus, so the list stays
+    /// one keystroke away; route guards keep Inbox and Tasks independent.
+    fn move_list(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let route = self.state.read(cx).active_route();
+        match route {
+            Route::Inbox => self.state.update(cx, |state, cx| {
+                state.move_inbox_selection(delta);
+                cx.notify();
+            }),
+            Route::Tasks => self.state.update(cx, |state, cx| {
+                state.move_tasks_selection(delta);
+                cx.notify();
+            }),
+            _ => {}
+        }
+    }
+
+    /// Home/End/PageUp/PageDown on the active list.
+    fn jump_list(&mut self, jump: ListJump, cx: &mut Context<Self>) {
+        if self.state.read(cx).active_route() != Route::Tasks {
             return;
         }
         self.state.update(cx, |state, cx| {
-            state.move_inbox_selection(delta);
+            match jump {
+                ListJump::Home => state.tasks_home(),
+                ListJump::End => state.tasks_end(),
+                ListJump::PageUp => state.tasks_page(-1),
+                ListJump::PageDown => state.tasks_page(1),
+            }
             cx.notify();
         });
     }
 
-    /// Open the highlighted Inbox row's detail (step 06 fills the detail).
-    fn open_inbox(&mut self, cx: &mut Context<Self>) {
-        if self.state.read(cx).active_route() != Route::Inbox {
-            return;
+    /// Open the highlighted row's detail (step 06 fills the detail).
+    fn open_list(&mut self, cx: &mut Context<Self>) {
+        let route = self.state.read(cx).active_route();
+        match route {
+            Route::Inbox => self.state.update(cx, |state, cx| {
+                state.open_inbox_selected();
+                cx.notify();
+            }),
+            Route::Tasks => self.state.update(cx, |state, cx| {
+                state.open_tasks_selected();
+                cx.notify();
+            }),
+            _ => {}
         }
+    }
+
+    /// `[` / `]` on the Tasks segmented control.
+    fn cycle_task_filter(&mut self, delta: isize, cx: &mut Context<Self>) {
         self.state.update(cx, |state, cx| {
-            state.open_inbox_selected();
+            state.cycle_tasks_filter(delta);
+            cx.notify();
+        });
+    }
+
+    /// `c` / `r`: open the confirmation, explaining when the action cannot
+    /// apply (a live run cannot be retried, a finished one cannot be cancelled).
+    fn request_task_action(&mut self, action: TaskAction, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.request_task_action(action, cx);
+            cx.notify();
+        });
+    }
+
+    /// Enter/Space on the confirmation: apply optimistically and reconcile.
+    fn accept_task_confirm(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.accept_task_confirm(cx);
+            cx.notify();
+        });
+    }
+
+    /// Esc on the confirmation.
+    fn dismiss_task_confirm(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.cancel_task_confirm();
+            cx.notify();
+        });
+    }
+
+    fn focus_task_search(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.activate_tasks_search();
             cx.notify();
         });
     }
@@ -805,9 +896,20 @@ impl RootView {
             ("Run palette command", "↵"),
             ("Move focus", "Tab"),
         ];
+        let tasks = [
+            ("Move the list", "↑ ↓"),
+            ("First / last", "Home End"),
+            ("Page up / down", "PgUp PgDn"),
+            ("Open the run", "↵"),
+            ("Search name, agent, repo", "/"),
+            ("Cancel a run", "c"),
+            ("Retry a finished run", "r"),
+            ("Previous / next filter", "[ ]"),
+            ("Confirm a dialog", "↵"),
+        ];
 
         let panel = div()
-            .w(px(520.0))
+            .w(px(640.0))
             .flex()
             .flex_col()
             .gap(px(theme.spacing.s3))
@@ -834,38 +936,18 @@ impl RootView {
             .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .child(components::section_label(theme, "COMMANDS"))
-                    .children(
-                        commands
-                            .iter()
-                            .map(|(label, keys)| components::shortcut_row(theme, label, keys)),
-                    ),
+                    .gap(px(theme.spacing.s6))
+                    .items_start()
+                    .child(shortcut_section(theme, "COMMANDS", &commands))
+                    .child(shortcut_section(theme, "NAVIGATION", &navigation)),
             )
             .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .child(components::section_label(theme, "NAVIGATION"))
-                    .children(
-                        navigation
-                            .iter()
-                            .map(|(label, keys)| components::shortcut_row(theme, label, keys)),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .child(components::section_label(theme, "ANYWHERE"))
-                    .children(
-                        anywhere
-                            .iter()
-                            .map(|(label, keys)| components::shortcut_row(theme, label, keys)),
-                    ),
+                    .gap(px(theme.spacing.s6))
+                    .items_start()
+                    .child(shortcut_section(theme, "TASKS", &tasks))
+                    .child(shortcut_section(theme, "ANYWHERE", &anywhere)),
             );
 
         div()
@@ -878,6 +960,210 @@ impl RootView {
             .key_context("Shortcuts")
             .child(panel)
     }
+    /// The cancel/retry confirmation. It names the task and spells out the
+    /// consequence; the destructive action is the only danger-colored control
+    /// on the surface (docs §2, Von Restorff).
+    fn confirm_overlay(&self, theme: &Theme, confirm: &TaskConfirm, cx: &mut Context<Self>) -> Div {
+        let (primary_bg, primary_fg) = if confirm.danger() {
+            (
+                Hsla::from(theme.colors.danger).opacity(0.16),
+                theme.colors.danger,
+            )
+        } else {
+            (
+                Hsla::from(theme.colors.accent).opacity(0.16),
+                theme.colors.accent,
+            )
+        };
+
+        let back = components::with_focus(
+            div()
+                .id("task-confirm-back")
+                .flex()
+                .items_center()
+                .gap(px(theme.spacing.s2))
+                .h(px(36.0))
+                .px(px(theme.spacing.s3))
+                .rounded(px(theme.radii.r4))
+                .border_1()
+                .border_color(theme.colors.border)
+                .text_size(px(theme.font.sm))
+                .text_color(theme.colors.text)
+                .cursor_pointer()
+                .child("Back")
+                .child(components::keycap(theme, "esc"))
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.dismiss_task_confirm(cx);
+                    window.focus(&this.root_focus);
+                })),
+            theme,
+        );
+
+        let accept = components::with_focus(
+            div()
+                .id("task-confirm-accept")
+                .flex()
+                .items_center()
+                .gap(px(theme.spacing.s2))
+                .h(px(40.0))
+                .px(px(theme.spacing.s4))
+                .rounded(px(theme.radii.r8))
+                .bg(primary_bg)
+                .text_size(px(theme.font.sm))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(primary_fg)
+                .cursor_pointer()
+                .child(confirm.confirm_label())
+                .child(components::keycap(theme, "↵"))
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.accept_task_confirm(cx);
+                })),
+            theme,
+        );
+
+        let panel = div()
+            .w(px(440.0))
+            .flex()
+            .flex_col()
+            .gap(px(theme.spacing.s3))
+            .p(px(theme.spacing.s4))
+            .rounded(px(theme.radii.r12))
+            .border_1()
+            .border_color(theme.colors.border)
+            .bg(theme.colors.surface)
+            .shadow_lg()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(theme.spacing.s2))
+                    .child(
+                        div()
+                            .text_size(px(theme.font.lg))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.colors.text)
+                            .child(confirm.title()),
+                    )
+                    .child(components::keycap(theme, "esc")),
+            )
+            .child(
+                div()
+                    .text_size(px(theme.font.sm))
+                    .text_color(theme.colors.text)
+                    .child(confirm.body()),
+            )
+            .child(
+                div()
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.muted)
+                    .child(
+                        "The row updates immediately; if the daemon rejects the call it is rolled back.",
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(theme.spacing.s2))
+                    .pt(px(theme.spacing.s1))
+                    .child(backend_hint(theme))
+                    .child(back)
+                    .child(accept),
+            );
+
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(Hsla::from(theme.colors.bg).opacity(0.86))
+            .key_context("Confirm")
+            .child(panel)
+    }
+
+    /// The self-dismissing toast above the status bar.
+    fn toast_overlay(&self, theme: &Theme, toast: &Toast, cx: &mut Context<Self>) -> Div {
+        let (icon, color) = match toast.kind {
+            ToastKind::Info => ("ℹ", theme.colors.accent),
+            ToastKind::Success => ("✓", theme.colors.success),
+            ToastKind::Error => ("⚠", theme.colors.danger),
+        };
+        let dismiss = div()
+            .id("toast-dismiss")
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(20.0))
+            .h(px(20.0))
+            .rounded(px(theme.radii.r4))
+            .text_color(theme.colors.muted)
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.colors.bg))
+            .child("×")
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.dismiss_toast();
+                    cx.notify();
+                });
+            }));
+
+        div()
+            .absolute()
+            .bottom(px(STATUS_BAR_HEIGHT + theme.spacing.s3))
+            .right(px(theme.spacing.s4))
+            .w(px(380.0))
+            .flex()
+            .items_start()
+            .gap(px(theme.spacing.s2))
+            .p(px(theme.spacing.s3))
+            .rounded(px(theme.radii.r8))
+            .border_1()
+            .border_color(Hsla::from(color).opacity(0.5))
+            .bg(theme.colors.surface)
+            .shadow_lg()
+            .child(
+                div()
+                    .text_size(px(theme.font.sm))
+                    .text_color(color)
+                    .child(icon),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(theme.font.sm))
+                    .text_color(theme.colors.text)
+                    .child(toast.message.clone()),
+            )
+            .child(dismiss)
+    }
+}
+
+/// A tiny hint in the confirmation footer (kept out of the title row so the
+/// task name is the first thing read).
+fn backend_hint(theme: &Theme) -> Div {
+    div()
+        .text_size(px(theme.font.xs))
+        .text_color(theme.colors.muted)
+        .child("↵ confirm · esc back")
+}
+
+/// One column of the shortcut sheet.
+fn shortcut_section(theme: &Theme, title: &str, rows: &[(&str, &str)]) -> Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .child(components::section_label(theme, title))
+        .children(
+            rows.iter()
+                .map(|(label, keys)| components::shortcut_row(theme, label, keys)),
+        )
 }
 
 impl Render for RootView {
@@ -923,6 +1209,28 @@ impl Render for RootView {
                 ),
         };
 
+        let (route, confirm_open, search_active, confirm, toast) = {
+            let state = self.state.read(cx);
+            (
+                state.active_route(),
+                state.task_confirm().is_some(),
+                state.is_tasks_search_active(),
+                state.task_confirm().cloned(),
+                state.toast().cloned(),
+            )
+        };
+        let mut key_context = String::from("Root");
+        if route == Route::Tasks {
+            key_context.push_str(" Tasks");
+            if search_active {
+                // Typed characters reach the query instead of the g/r/? bindings.
+                key_context.push_str(" Search");
+            }
+            if confirm_open {
+                key_context.push_str(" Confirm");
+            }
+        }
+
         let root = div()
             .relative()
             .flex()
@@ -931,7 +1239,7 @@ impl Render for RootView {
             .bg(theme.colors.bg)
             .text_color(theme.colors.text)
             .text_size(px(theme.font.base))
-            .key_context("Root")
+            .key_context(key_context.as_str())
             .track_focus(&self.root_focus)
             .on_action(cx.listener(|this, _: &TogglePalette, window, cx| {
                 if this.palette.is_open() {
@@ -964,14 +1272,47 @@ impl Render for RootView {
             .on_action(cx.listener(|this, action: &GoSettings, _window, cx| {
                 this.on_jump(action, cx);
             }))
-            .on_action(cx.listener(|this, _: &InboxUp, _window, cx| {
-                this.move_inbox(-1, cx);
+            .on_action(cx.listener(|this, _: &ListUp, _window, cx| {
+                this.move_list(-1, cx);
             }))
-            .on_action(cx.listener(|this, _: &InboxDown, _window, cx| {
-                this.move_inbox(1, cx);
+            .on_action(cx.listener(|this, _: &ListDown, _window, cx| {
+                this.move_list(1, cx);
             }))
-            .on_action(cx.listener(|this, _: &InboxOpen, _window, cx| {
-                this.open_inbox(cx);
+            .on_action(cx.listener(|this, _: &ListHome, _window, cx| {
+                this.jump_list(ListJump::Home, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ListEnd, _window, cx| {
+                this.jump_list(ListJump::End, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ListPageUp, _window, cx| {
+                this.jump_list(ListJump::PageUp, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ListPageDown, _window, cx| {
+                this.jump_list(ListJump::PageDown, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ListOpen, _window, cx| {
+                this.open_list(cx);
+            }))
+            .on_action(cx.listener(|this, _: &TaskSearch, _window, cx| {
+                this.focus_task_search(cx);
+            }))
+            .on_action(cx.listener(|this, _: &TaskCancel, _window, cx| {
+                this.request_task_action(TaskAction::Cancel, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TaskRetry, _window, cx| {
+                this.request_task_action(TaskAction::Retry, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TaskFilterPrev, _window, cx| {
+                this.cycle_task_filter(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TaskFilterNext, _window, cx| {
+                this.cycle_task_filter(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TaskConfirmAccept, _window, cx| {
+                this.accept_task_confirm(cx);
+            }))
+            .on_action(cx.listener(|this, _: &TaskConfirmReject, _window, cx| {
+                this.dismiss_task_confirm(cx);
             }))
             .on_action(cx.listener(|this, _: &Refresh, _window, cx| {
                 this.state.update(cx, |state, cx| {
@@ -990,28 +1331,69 @@ impl Render for RootView {
             }))
             .on_key_down(
                 cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
-                    if !this.palette.is_open() {
+                    let keystroke = &event.keystroke;
+                    if this.palette.is_open() {
+                        if keystroke.modifiers.control
+                            || keystroke.modifiers.platform
+                            || keystroke.modifiers.alt
+                        {
+                            return;
+                        }
+                        if keystroke.key == "backspace" {
+                            this.palette.backspace();
+                            cx.stop_propagation();
+                            cx.notify();
+                            return;
+                        }
+                        if let Some(text) = &keystroke.key_char {
+                            for character in text.chars() {
+                                this.palette.push_char(character);
+                            }
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
                         return;
                     }
-                    let keystroke = &event.keystroke;
-                    if keystroke.modifiers.control
+
+                    // Typed characters reach the Tasks query only in search
+                    // mode and only when no overlay owns the keyboard. Bound
+                    // keys (arrows, Enter, Esc) never get here.
+                    if this.shortcuts_open
+                        || keystroke.modifiers.control
                         || keystroke.modifiers.platform
                         || keystroke.modifiers.alt
                     {
                         return;
                     }
+                    let typing = {
+                        let state = this.state.read(cx);
+                        state.active_route() == Route::Tasks
+                            && state.is_tasks_search_active()
+                            && state.task_confirm().is_none()
+                    };
+                    if !typing {
+                        return;
+                    }
                     if keystroke.key == "backspace" {
-                        this.palette.backspace();
+                        this.state.update(cx, |state, cx| {
+                            state.backspace_tasks_query();
+                            cx.notify();
+                        });
                         cx.stop_propagation();
-                        cx.notify();
                         return;
                     }
                     if let Some(text) = &keystroke.key_char {
-                        for character in text.chars() {
-                            this.palette.push_char(character);
+                        let characters: Vec<char> =
+                            text.chars().filter(|c| !c.is_control()).collect();
+                        if !characters.is_empty() {
+                            this.state.update(cx, |state, cx| {
+                                for character in characters {
+                                    state.push_tasks_query_char(character);
+                                }
+                                cx.notify();
+                            });
+                            cx.stop_propagation();
                         }
-                        cx.stop_propagation();
-                        cx.notify();
                     }
                 }),
             )
@@ -1024,6 +1406,13 @@ impl Render for RootView {
         } else if shortcuts_open {
             root.child(self.shortcuts_overlay(theme, cx))
         } else {
+            let mut root = root;
+            if let Some(toast) = &toast {
+                root = root.child(self.toast_overlay(theme, toast, cx));
+            }
+            if let Some(confirm) = &confirm {
+                root = root.child(self.confirm_overlay(theme, confirm, cx));
+            }
             root
         }
     }

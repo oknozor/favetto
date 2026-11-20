@@ -1,10 +1,10 @@
 # favetto GPUI desktop client
 
-Status: **inbox (step 04)** — the landing surface now answers "What needs
-me now?": blocked sessions and failures from the last 24 hours in **Needs you**
-(oldest waiting first, accent stripe + icon), the newest runs in **Recent**, a
-first-fetch skeleton, an error state with Retry, and live refreshes driven by
-`task.updated`, `agent.state` and `agent.event` pushes. The plans live in
+Status: **tasks (step 05)** — the list of every run: one segmented status
+filter (All / Running / Awaiting input / Failed / Succeeded) with live counts,
+a fuzzy search over task name, agent and repo, rows with status, repo, agent,
+attempt, duration and cost, and optimistic cancel/retry behind a confirmation
+dialog with a visible rollback toast. The plans live in
 `docs/design/gpui-client.md`.
 
 ## What it is
@@ -48,9 +48,16 @@ Settings, `?` opens the shortcut sheet, `Esc` closes the topmost overlay or
 steps back from a pushed detail. On the Inbox, `↑`/`↓` move the Needs you
 highlight, `Enter` opens the highlighted run, and `r` refreshes the surface.
 
-The Inbox loads `tasks.list` and `agents.list` on connect and follows
-`task.updated`, `agent.state` and `agent.event` pushes. A blocked session shows
-up without a manual refresh; overlapping pushes coalesce into one RPC round trip.
+On the Tasks surface, `↑`/`↓` move (Home/End and PageUp/PageDown jump), `Enter`
+opens the run, `c` cancels and `r` retries a finished run (both confirm first,
+then update the row immediately), `/` focuses the search field, `Esc` clears
+the query, and `[`/`]` step the status filter.
+
+The Inbox and Tasks surfaces load one `tasks.list` (limit 500) and `agents.list`
+snapshot on connect and follow `task.updated`, `agent.state` and `agent.event`
+pushes. A blocked session shows up without a manual refresh; overlapping pushes
+coalesce into one RPC round trip. A refresh keeps the previous rows visible, so
+the list never flickers.
 
 ## Pointing it at a daemon
 
@@ -82,11 +89,16 @@ or `/events` path, and a missing scheme are all accepted.
   `async-channel`: commands in, connection state/cursor/pushes out.
 - `src/state.rs` — the single `ClientState` entity; the foreground drain task
   folds updates in and calls `cx.notify()`. It also owns the active route, the
-  pushed-detail flag, the Inbox snapshot (tasks + sessions), its selection and
-  the selected run.
+  pushed-detail flag, the shared task snapshot (tasks + sessions), the Inbox
+  selection, the Tasks filter/query/selection, the confirmation dialog and the
+  toast.
 - `src/inbox.rs` — the pure Inbox model: Needs you vs Recent grouping, the
   24-hour failure window, oldest-first fair-queue order, status fallbacks and
   the compact duration/cost formatters. Unit-tested without a window.
+- `src/tasks.rs` — the pure Tasks model: the five-segment filter with
+  query-scoped counts, fuzzy matching over name/agent/repo, newest-first and
+  relevance ordering, selection resolution, and the terminal/cancellable
+  helpers behind `c`/`r`. Unit-tested without a window.
 - `src/routes.rs` — the route vocabulary, labels, icons, jump hints and empty
   copy in one place.
 - `src/actions.rs` — actions plus the keymap; every shortcut is bound to an
@@ -160,3 +172,42 @@ Deviations from the plan are recorded in this file as the chain progresses
 - **First-fetch error coverage.** An unauthorized/disconnected transport that
   never reaches `Connected` transitions the Inbox from skeleton to the error
   state with Retry, instead of waiting forever for a first fetch that cannot run.
+
+### Step 05 deviations / additions
+
+- **One shared snapshot.** `tasks.list(500)` + `agents.list` feed both the Inbox
+  and Tasks, so the loader/command were renamed to `RefreshSnapshot` /
+  `SnapshotLoaded` / `SnapshotFailed` and both surfaces share one skeleton and
+  error state. This guarantees the Inbox and Tasks can never disagree about a
+  row, and a push burst still costs one RPC pair rather than two.
+- **Pending and cancelled rows stay under All.** The daemon's six states would
+  make a six-segment control a filter maze (Hick's Law). The five required
+  segments own the control; the other two keep their row label and remain
+  visible under All.
+- **Counts follow the search.** Each segment's badge is computed over the
+  query-matched rows, so "Failed 2" always means *two rows* when Failed is
+  selected, even with a query active. The All count is therefore the number of
+  search matches, not the whole snapshot; the list header still shows the
+  snapshot total.
+- **`r` means retry on Tasks.** The generic `r` refresh binding is shadowed on
+  the Tasks surface (the palette's "Refresh data" and the error Retry button
+  still refresh). `c`/`r`/`/`/`[`/`]` are registered in a `Tasks` key context,
+  and typed search text switches to a `Search` context, so nothing fires while
+  the user is typing a query.
+- **Keyboard filter stepping.** The segments are clickable and also reachable
+  with `[`/`]`; the root keeps keyboard focus (like the palette input) instead of
+  introducing a second focus ring that would compete with the list.
+- **Optimistic rollback is guarded.** A failed cancel/retry restores the
+  previous row only while the row is still exactly the optimistic snapshot, so a
+  newer `task.updated` push wins over a late error response.
+- **Task cost is live-session cost.** As in step 04, `tasks.list` carries no
+  usage; a row shows a cost only while an `agents.list` session for that task
+  reports one. Persisted per-run usage lands with the detail surface.
+- **Search input scope.** Like the palette, the field accepts typed characters
+  and Backspace through GPUI key events (`key_char`); full IME marked-text
+  handling via `EntityInputHandler` is still deferred.
+- **Live RPC check.** The typed `tasks.cancel` / `tasks.retry` request encoding
+  is unit-tested, and both endpoints were exercised against the running daemon
+  with an unknown id: they return structured RPC errors, the path that drives
+  the toast and rollback. A real cancel/retry exercise is part of the step-11
+  live smoke run.

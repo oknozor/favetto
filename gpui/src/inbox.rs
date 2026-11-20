@@ -452,7 +452,7 @@ pub fn format_cost(cost: Option<f64>) -> Option<String> {
 
 /// Elapsed time of a task: live elapsed for a running task, total for a
 /// finished one, `None` before it starts.
-fn task_duration(task: &Task, now: DateTime<Utc>) -> Option<Duration> {
+pub fn task_duration(task: &Task, now: DateTime<Utc>) -> Option<Duration> {
     let started = task.started_at?;
     let end = task.finished_at.unwrap_or(now);
     let seconds = end.timestamp().saturating_sub(started.timestamp());
