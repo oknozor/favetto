@@ -1209,7 +1209,9 @@ mod tests {
             activity: None,
             usage: None,
         };
-        let pending = detail.pending_request(&[session.clone()]).expect("pending");
+        let pending = detail
+            .pending_request(std::slice::from_ref(&session))
+            .expect("pending");
         assert_eq!(pending.request_id.as_deref(), Some("perm_1"));
         assert!(pending.can_reply());
         assert!(pending.allow_always);
