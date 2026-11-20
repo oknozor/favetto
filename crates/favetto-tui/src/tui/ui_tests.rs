@@ -1571,6 +1571,45 @@ fn agent_tab_renders_acp_messages_thinking_and_tool_cards() {
 }
 
 #[test]
+fn agent_feed_keyboard_selection_is_visible_without_colour() {
+    use favetto_core::model::AgentStateEvent;
+
+    let mut app = App::with_theme(Theme::monochrome());
+    app.tab = Tab::Agent;
+    app.open_agent(session("s1", "opencode", false, true), b"");
+    app.agent_event(
+        "s1",
+        &AgentStateEvent::ReasoningDelta {
+            text: "a thought".to_string(),
+        },
+    );
+
+    // Ctrl+Y hands the keyboard to favetto; Up selects the last foldable row.
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
+    assert!(app.agent_feed_selected.is_some());
+
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+    let area = app.agent_area.expect("agent area recorded during draw");
+    let buffer = terminal.backend().buffer();
+    let reversed = (area.top()..area.bottom()).any(|y| {
+        (area.left()..area.right()).any(|x| {
+            buffer
+                .cell((x, y))
+                .is_some_and(|cell| cell.modifier.contains(Modifier::REVERSED))
+        })
+    });
+    assert!(
+        reversed,
+        "selected feed row must be visible without colour: {:?}",
+        render_text(&mut app, 80, 24)
+    );
+}
+
+#[test]
 fn agent_tab_renders_unknown_tool_values_with_a_neutral_fallback() {
     use favetto_core::model::{AgentStateEvent, ToolCallDetail, ToolCallStatus, ToolKind};
 
