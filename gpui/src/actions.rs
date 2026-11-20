@@ -54,6 +54,8 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("secondary-k", TogglePalette, Some("Root")),
         KeyBinding::new("escape", CloseOverlay, Some("Root")),
         KeyBinding::new("shift-/", ToggleShortcuts, Some("Root && !Palette")),
+        // Some layouts deliver `?` as its own key rather than shift-/.
+        KeyBinding::new("?", ToggleShortcuts, Some("Root && !Palette")),
         KeyBinding::new("g i", GoInbox, Some("Root && !Palette && !Shortcuts")),
         KeyBinding::new("g t", GoTasks, Some("Root && !Palette && !Shortcuts")),
         KeyBinding::new("g c", GoCatalog, Some("Root && !Palette && !Shortcuts")),

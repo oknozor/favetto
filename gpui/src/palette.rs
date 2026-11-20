@@ -307,7 +307,6 @@ mod tests {
         assert_eq!(ids.first(), Some(&"nav-inbox"));
 
         // Recents move to the top and never duplicate.
-        let _ = palette_with("refresh");
         palette.set_query("refresh".into());
         palette.activate();
         palette.set_query(String::new());
@@ -339,6 +338,17 @@ mod tests {
         );
         palette.move_selection(-1);
         assert_eq!(palette.selected(), 0, "single match wraps to itself");
+
+        // With every command listed, selection wraps in both directions.
+        palette.set_query(String::new());
+        let count = palette.filtered().len();
+        palette.move_selection(-1);
+        assert_eq!(palette.selected(), count - 1);
+        palette.move_selection(1);
+        assert_eq!(palette.selected(), 0);
+        palette.move_selection(count as isize);
+        assert_eq!(palette.selected(), 0, "a full cycle returns to the start");
+
         palette.set_query("zzzz-no-match".into());
         assert!(palette.filtered().is_empty());
         assert_eq!(palette.activate(), None);
@@ -379,7 +389,7 @@ mod tests {
         }
         // Six distinct activations, but only five are remembered; the newest is first.
         assert_eq!(
-            palette.recent.iter().copied().collect::<Vec<_>>(),
+            palette.recent.to_vec(),
             vec![
                 "open-settings",
                 "nav-schedules",
