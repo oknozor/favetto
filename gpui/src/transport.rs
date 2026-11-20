@@ -510,6 +510,28 @@ mod tests {
     }
 
     #[test]
+    fn agent_load_response_carries_the_replayed_frame() {
+        let bytes = response_bytes(
+            22,
+            Ok(serde_json::json!({
+                "session": {
+                    "id": "local-past",
+                    "agent": "opencode",
+                    "task_id": null,
+                    "running": true
+                },
+                "data": "aGlzdG9yeQ==",
+                "seq": 4
+            })),
+        );
+        let result: AgentAttachResult =
+            decode_response::<AgentsLoadCall>(&bytes, 22).expect("decode load");
+        assert_eq!(result.session.id, "local-past");
+        assert_eq!(result.data, "aGlzdG9yeQ==");
+        assert_eq!(result.seq, 4);
+    }
+
+    #[test]
     fn mismatched_id_is_rejected() {
         let bytes = response_bytes(1, Ok(serde_json::json!({ "pong": true, "cwd": "/" })));
         assert_eq!(

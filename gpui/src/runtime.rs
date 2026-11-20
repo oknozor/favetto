@@ -27,11 +27,11 @@ use favetto_wire::model::{
     TaskRun,
 };
 use favetto_wire::rpc::{
-    AgentReplyParams, AgentReplyResult, AgentsHistoryParams, CatalogEntry, CatalogGetParams,
-    EmptyParams, PingParams, PingResult, ScheduleDeleteParams, ScheduleUpsertParams,
-    SchedulesDeleteResult, SessionIdParams, StartOneshotParams, StartOneshotResult, TaskIdParams,
-    TasksEventsParams, TasksListParams, TasksStartParams, WorkflowCancelResultBody,
-    WorkflowGetResult, WorkflowInspectParams, WorkflowRetryParams,
+    AgentAttachResult, AgentReplyParams, AgentReplyResult, AgentsHistoryParams, CatalogEntry,
+    CatalogGetParams, EmptyParams, PingParams, PingResult, ScheduleDeleteParams,
+    ScheduleUpsertParams, SchedulesDeleteResult, SessionIdParams, StartOneshotParams,
+    StartOneshotResult, TaskIdParams, TasksEventsParams, TasksListParams, TasksStartParams,
+    WorkflowCancelResultBody, WorkflowGetResult, WorkflowInspectParams, WorkflowRetryParams,
 };
 use favetto_wire::workflow::WorkflowInspect;
 use uuid::Uuid;
@@ -212,7 +212,7 @@ pub enum Update {
     /// `agents.load` completed for the Favetto-local session id.
     AgentSessionLoaded {
         session_id: String,
-        result: Result<Box<AgentSessionInfo>, ClientError>,
+        result: Result<Box<AgentAttachResult>, ClientError>,
     },
     /// `workflow.inspect` completed for one root.
     WorkflowInspectLoaded {
@@ -900,7 +900,7 @@ fn spawn_agent_load(client: Arc<RpcClient>, updates: Sender<Update>, session_id:
                 session_id: session_id.clone(),
             })
             .await
-            .map(|attached| Box::new(attached.session));
+            .map(Box::new);
         let _ = updates.try_send(Update::AgentSessionLoaded { session_id, result });
     });
 }

@@ -56,6 +56,12 @@ fn main() {
 
         match method {
             "initialize" => {
+                if std::env::var_os("FAKE_ACP_INIT_ERROR").is_some() {
+                    if let Some(id) = id {
+                        error(&mut stdout, id, -32000, "cannot initialize fake agent");
+                    }
+                    continue;
+                }
                 respond(
                     &mut stdout,
                     id,

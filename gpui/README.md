@@ -174,7 +174,9 @@ latency and daemon cwd, or the exact transport error. **Save** rewrites
 plus **Past sessions** from `agents.history`: active, ended, loading, failed and
 cannot-load rows are labelled, and a loadable row restores the provider's
 conversation through `agents.load` by Favetto-local id. A load never starts a
-fresh session; progress and errors are shown inline and as a toast.
+fresh session; progress and errors are shown inline and as a toast, and the
+replayed transcript appears under the row only after the load succeeds (a
+bounded preview; the full conversation stays with the agent).
 **Appearance** switches System/Dark/Light and Comfortable/Compact live and
 persists both. **About** shows the client version, daemon cwd, endpoint, config
 path and a docs link, and states that no telemetry is collected.
@@ -242,6 +244,10 @@ field blank keeps the shared token file.
   with the daemon's parser configuration, plain-language cadence and next-fire
   hints, the sorted table, the create/edit sheet and the delete confirmation.
   Unit-tested without a window.
+- `src/sessions.rs` — the pure persisted-session model: the `agents.history`
+  snapshot, load states (active/loading/ready/failed/cannot-load), load by
+  Favetto-local id, and the restored transcript preview. Unit-tested without a
+  window.
 - `src/settings.rs` — the pure Settings model: the endpoint/token draft, the
   precise normalization preview, the connection-test result and the logical
   Tab order. Unit-tested without a window.
@@ -636,6 +642,10 @@ path remains covered by the step-05 live RPC check and its unit tests.
   operation and target sizes.
 - **No text selection.** Output, source, DOT and errors are copyable via buttons
   (and error copy) instead of selectable text.
+- **Restored transcripts are previews.** Settings caps the replayed text at
+  4,000 characters; the TUI Agent panel is the full interactive transcript.
+  A session whose daemon stopped before recording an ACP id remains `loading`
+  and cannot be restored.
 - **No IME marked-text composition.** Typed characters are appended at the end;
   cursor movement inside a field is not implemented.
 - **No embedded Graphviz.** `workflow.get` is readable DOT source.

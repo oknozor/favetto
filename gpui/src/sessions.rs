@@ -9,7 +9,13 @@
 
 use std::collections::HashMap;
 
+use base64::Engine;
 use favetto_wire::model::{AgentSessionHistoryEntry, AgentSessionInfo, AgentSessionState};
+use favetto_wire::rpc::AgentAttachResult;
+
+/// How much of a restored transcript the Settings card renders. The agent owns
+/// the full conversation; this is a bounded preview, never a stored copy.
+pub const TRANSCRIPT_PREVIEW_CHARS: usize = 4_000;
 
 /// The effective state of one history row: the persisted lifecycle plus any
 /// load request made from this client.
@@ -55,7 +61,11 @@ impl SessionRowState {
 #[derive(Debug, Clone, PartialEq)]
 enum LoadRequest {
     Loading,
-    Ready(Box<AgentSessionInfo>),
+    Ready {
+        session: Box<AgentSessionInfo>,
+        /// The replayed plain-text transcript that came back with the load.
+        transcript: String,
+    },
     Failed(String),
 }
 
@@ -86,7 +96,7 @@ impl SessionHistory {
     pub fn state(&self, entry: &AgentSessionHistoryEntry) -> SessionRowState {
         match self.loads.get(&entry.id) {
             Some(LoadRequest::Loading) => return SessionRowState::Loading,
-            Some(LoadRequest::Ready(session)) => {
+            Some(LoadRequest::Ready { session, .. }) => {
                 // A ready restore is only meaningful for the same local record.
                 if session.id == entry.id {
                     return SessionRowState::Ready;
@@ -126,7 +136,7 @@ impl SessionHistory {
             return false;
         }
         !matches!(self.loads.get(&entry.id), Some(LoadRequest::Loading))
-            && !matches!(self.loads.get(&entry.id), Some(LoadRequest::Ready(_)))
+            && !matches!(self.loads.get(&entry.id), Some(LoadRequest::Ready { .. }))
     }
 
     /// Start a load for `id`, or return `false` when it is not loadable.
@@ -141,21 +151,35 @@ impl SessionHistory {
         true
     }
 
-    /// Record a completed `agents.load`. Success stores the attached session so
-    /// the row can show `ready`; failure keeps the daemon's message and leaves
-    /// the row retryable.
-    pub fn finish_load(&mut self, id: &str, result: Result<AgentSessionInfo, String>) {
+    /// Record a completed `agents.load`. Success stores the attached session and
+    /// its replayed transcript so the row can show `ready`; failure keeps the
+    /// daemon's message and leaves the row retryable.
+    pub fn finish_load(&mut self, id: &str, result: Result<AgentAttachResult, String>) {
         match result {
-            Ok(session) if session.id == id => {
-                self.loads
-                    .insert(id.to_string(), LoadRequest::Ready(Box::new(session)));
+            Ok(attached) if attached.session.id == id => {
+                let request = match base64::engine::general_purpose::STANDARD.decode(&attached.data)
+                {
+                    Ok(bytes) => match String::from_utf8(bytes) {
+                        Ok(transcript) => LoadRequest::Ready {
+                            session: Box::new(attached.session),
+                            transcript,
+                        },
+                        Err(_) => LoadRequest::Failed(
+                            "the daemon returned a transcript that is not valid UTF-8".to_string(),
+                        ),
+                    },
+                    Err(_) => LoadRequest::Failed(
+                        "the daemon returned an unreadable session transcript".to_string(),
+                    ),
+                };
+                self.loads.insert(id.to_string(), request);
             }
-            Ok(session) => {
+            Ok(attached) => {
                 self.loads.insert(
                     id.to_string(),
                     LoadRequest::Failed(format!(
                         "the daemon loaded session '{}' instead of '{id}'",
-                        session.id
+                        attached.session.id
                     )),
                 );
             }
@@ -166,11 +190,27 @@ impl SessionHistory {
         }
     }
 
+    /// The restored plain-text transcript for a successfully loaded row.
+    ///
+    /// `None` until the daemon confirms the load, so a partial replay or a
+    /// failed restore can never be rendered as restored history.
+    pub fn transcript(&self, id: &str) -> Option<&str> {
+        match self.loads.get(id) {
+            Some(LoadRequest::Ready { transcript, .. }) => Some(transcript),
+            _ => None,
+        }
+    }
+
+    /// A bounded, display-only preview of the restored transcript.
+    pub fn transcript_preview(&self, id: &str) -> Option<String> {
+        self.transcript(id).map(preview_transcript)
+    }
+
     /// The loaded session for a row, when this client restored it successfully.
     #[cfg(test)]
     pub fn loaded(&self, id: &str) -> Option<&AgentSessionInfo> {
         match self.loads.get(id) {
-            Some(LoadRequest::Ready(session)) => Some(session.as_ref()),
+            Some(LoadRequest::Ready { session, .. }) => Some(session.as_ref()),
             _ => None,
         }
     }
@@ -180,6 +220,16 @@ impl SessionHistory {
     pub fn is_loading(&self, id: &str) -> bool {
         matches!(self.loads.get(id), Some(LoadRequest::Loading))
     }
+}
+
+/// Bound the displayed transcript so a long restored conversation cannot make
+/// the Settings card expensive to paint. The full text stays with the daemon.
+fn preview_transcript(transcript: &str) -> String {
+    if transcript.chars().count() <= TRANSCRIPT_PREVIEW_CHARS {
+        return transcript.to_string();
+    }
+    let head: String = transcript.chars().take(TRANSCRIPT_PREVIEW_CHARS).collect();
+    format!("{head}\n… (transcript truncated for display)")
 }
 
 #[cfg(test)]
@@ -218,6 +268,14 @@ mod tests {
             usage: None,
             load_state: Default::default(),
             load_error: None,
+        }
+    }
+
+    fn attached(id: &str, text: &str) -> AgentAttachResult {
+        AgentAttachResult {
+            session: session(id),
+            data: base64::engine::general_purpose::STANDARD.encode(text.as_bytes()),
+            seq: 3,
         }
     }
 
@@ -272,13 +330,101 @@ mod tests {
             SessionRowState::Loading
         );
 
-        history.finish_load("local-past", Ok(session("local-past")));
+        history.finish_load(
+            "local-past",
+            Ok(attached("local-past", "restored question\nhello")),
+        );
         assert_eq!(history.state(&history.entries()[0]), SessionRowState::Ready);
         assert_eq!(
             history.loaded("local-past").map(|s| s.id.as_str()),
             Some("local-past")
         );
+        assert_eq!(
+            history.transcript("local-past"),
+            Some("restored question\nhello"),
+            "the replay is shown only after the load succeeds"
+        );
         assert!(!history.can_load(&history.entries()[0]));
+    }
+
+    #[test]
+    fn a_replay_is_absent_while_loading_and_after_a_failure() {
+        let mut history = SessionHistory::default();
+        history.set_entries(vec![entry("local-past", AgentSessionState::Ended, true)]);
+
+        assert!(history.begin_load("local-past"));
+        assert!(history.is_loading("local-past"));
+        assert_eq!(
+            history.transcript("local-past"),
+            None,
+            "an in-flight load exposes no replay"
+        );
+
+        history.finish_load("local-past", Err("agent could not load".to_string()));
+        assert_eq!(
+            history.transcript("local-past"),
+            None,
+            "a failed load discards its replay"
+        );
+        assert!(matches!(
+            history.state(&history.entries()[0]),
+            SessionRowState::Failed(_)
+        ));
+
+        assert!(history.begin_load("local-past"));
+        history.finish_load("local-past", Ok(attached("local-past", "complete replay")));
+        assert_eq!(history.transcript("local-past"), Some("complete replay"));
+    }
+
+    #[test]
+    fn a_load_for_another_local_id_fails_without_exposing_its_replay() {
+        let mut history = SessionHistory::default();
+        history.set_entries(vec![entry("local-past", AgentSessionState::Ended, true)]);
+        assert!(history.begin_load("local-past"));
+
+        history.finish_load(
+            "local-past",
+            Ok(attached("provider-id", "wrong transcript")),
+        );
+        assert_eq!(history.transcript("local-past"), None);
+        let state = history.state(&history.entries()[0]);
+        assert!(
+            matches!(&state, SessionRowState::Failed(message) if message.contains("provider-id")),
+            "{state:?}"
+        );
+        assert!(history.can_load(&history.entries()[0]), "still retryable");
+    }
+
+    #[test]
+    fn an_unreadable_replay_is_reported_instead_of_rendered() {
+        let mut history = SessionHistory::default();
+        history.set_entries(vec![entry("local-past", AgentSessionState::Ended, true)]);
+        assert!(history.begin_load("local-past"));
+
+        history.finish_load(
+            "local-past",
+            Ok(AgentAttachResult {
+                session: session("local-past"),
+                data: "not base64!".to_string(),
+                seq: 0,
+            }),
+        );
+        assert_eq!(history.transcript("local-past"), None);
+        let state = history.state(&history.entries()[0]);
+        assert!(
+            matches!(&state, SessionRowState::Failed(message) if message.contains("unreadable")),
+            "{state:?}"
+        );
+    }
+
+    #[test]
+    fn the_transcript_preview_is_bounded() {
+        let long = "x".repeat(TRANSCRIPT_PREVIEW_CHARS + 10);
+        let preview = preview_transcript(&long);
+        assert!(preview.starts_with(&"x".repeat(TRANSCRIPT_PREVIEW_CHARS)));
+        assert!(preview.contains("truncated for display"));
+        assert!(preview.chars().count() > TRANSCRIPT_PREVIEW_CHARS);
+        assert_eq!(preview_transcript("short"), "short");
     }
 
     #[test]
@@ -312,7 +458,7 @@ mod tests {
         let mut history = SessionHistory::default();
         history.set_entries(vec![entry("local-past", AgentSessionState::Ended, true)]);
         assert!(history.begin_load("local-past"));
-        history.finish_load("local-past", Ok(session("local-past")));
+        history.finish_load("local-past", Ok(attached("local-past", "replay")));
 
         history.set_entries(vec![entry("other", AgentSessionState::Ended, true)]);
         assert!(history.loaded("local-past").is_none());

@@ -30,14 +30,7 @@ struct Daemon {
 
 impl Daemon {
     fn spawn() -> Self {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "favetto-session-load-{}-{nanos}",
-            std::process::id()
-        ));
+        let root = scratch_root("session-load");
         let data_dir = root.join("data");
         let tasks_dir = root.join("tasks");
         let work_dir = root.join("work");
@@ -80,33 +73,38 @@ impl Daemon {
         )
         .unwrap();
 
-        let socket = root.join("favetto.sock");
-        let log = std::fs::File::create(root.join("daemon.log")).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_favetto"))
-            .arg("daemon")
-            .arg("--config")
-            .arg(&config_path)
-            .arg("--data-dir")
-            .arg(&data_dir)
-            .arg("--tasks-dir")
-            .arg(&tasks_dir)
-            .arg("--socket")
-            .arg(&socket)
-            .arg("--listen")
-            .arg("127.0.0.1:0")
-            .current_dir(&root)
-            .stdout(Stdio::from(log.try_clone().unwrap()))
-            .stderr(Stdio::from(log))
-            .env_remove("FAVETTO_CONFIG")
-            .env_remove("FAVETTO_DATA_DIR")
-            .spawn()
-            .expect("spawn favetto daemon");
+        Self::spawn_at(root)
+    }
 
+    /// Start a daemon on an already-prepared root (used after a restart).
+    fn spawn_at(root: PathBuf) -> Self {
+        let socket = root.join("favetto.sock");
+        let _ = std::fs::remove_file(&socket);
+        let child = spawn_daemon_child(&root, &socket);
         Self {
             root,
             socket,
             child,
         }
+    }
+
+    fn config_path(&self) -> PathBuf {
+        self.root.join("config.toml")
+    }
+
+    /// Stop the process without deleting its data, so a new daemon can reopen
+    /// the same store and socket.
+    fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    fn restart(&mut self, config: &str) {
+        self.stop();
+        std::fs::write(self.config_path(), config).unwrap();
+        self.socket = self.root.join("favetto.sock");
+        let _ = std::fs::remove_file(&self.socket);
+        self.child = spawn_daemon_child(&self.root, &self.socket);
     }
 
     fn db_path(&self) -> PathBuf {
@@ -118,10 +116,40 @@ impl Daemon {
     }
 }
 
+fn scratch_root(tag: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("favetto-{tag}-{}-{nanos}", std::process::id()))
+}
+
+fn spawn_daemon_child(root: &Path, socket: &Path) -> Child {
+    let log = std::fs::File::create(root.join("daemon.log")).unwrap();
+    Command::new(env!("CARGO_BIN_EXE_favetto"))
+        .arg("daemon")
+        .arg("--config")
+        .arg(root.join("config.toml"))
+        .arg("--data-dir")
+        .arg(root.join("data"))
+        .arg("--tasks-dir")
+        .arg(root.join("tasks"))
+        .arg("--socket")
+        .arg(socket)
+        .arg("--listen")
+        .arg("127.0.0.1:0")
+        .current_dir(root)
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log))
+        .env_remove("FAVETTO_CONFIG")
+        .env_remove("FAVETTO_DATA_DIR")
+        .spawn()
+        .expect("spawn favetto daemon")
+}
+
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.stop();
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
@@ -226,6 +254,71 @@ async fn close_session(client: &Client, pool: &SqlitePool, local: &str) {
         method::AGENTS_CLOSE,
     );
     wait_for_status(pool, local, "ended").await;
+}
+
+/// A one-agent config with the fake ACP server. `env` is a TOML table body.
+fn echo_config(env: &str) -> String {
+    let agent = env!("CARGO_BIN_EXE_fake-acp-agent");
+    format!(
+        "[agent]\ndefault = \"echo\"\n\n\
+         [agents.echo]\ncommand = {agent:?}\nargs = []\n\
+         [agents.echo.env]\n{env}"
+    )
+}
+
+/// Wait until an attached transcript contains `needle`.
+async fn wait_for_attach_text(client: &Client, local: &str, needle: &str) -> String {
+    let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let (_, text, _) = attach(client, local).await;
+        if text.contains(needle) {
+            return text;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("transcript never contained {needle:?}; last: {text:?}");
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// The persisted task status and attempt.
+async fn task_status(pool: &SqlitePool, id: &str) -> Option<(String, i64)> {
+    sqlx::query("SELECT status, attempt FROM tasks WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        .map(|row| (row.get("status"), row.get("attempt")))
+}
+
+async fn wait_for_task_status(pool: &SqlitePool, id: &str, status: &str) -> (String, i64) {
+    let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        if let Some(row) = task_status(pool, id).await {
+            if row.0 == status {
+                return row;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "task {id} did not reach {status}; last: {:?}",
+                task_status(pool, id).await
+            );
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// The run statuses for one task, newest first.
+async fn run_statuses(pool: &SqlitePool, task_id: &str) -> Vec<String> {
+    sqlx::query("SELECT status FROM task_runs WHERE task_id = ? ORDER BY attempt DESC")
+        .bind(task_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get("status"))
+        .collect()
 }
 
 /// Wait until the fake agent has announced that a gated load is holding its
@@ -579,4 +672,342 @@ async fn persisted_sessions_load_only_when_the_agent_supports_it() {
     wait_for_status(&pool, &local, "failed").await;
 
     assert!(session_row(&pool, &local).await.is_some());
+}
+
+#[tokio::test]
+async fn a_failed_initialization_reports_a_failed_restore_without_a_new_session() {
+    let mut daemon = Daemon::spawn();
+    wait_for_socket(&daemon.socket).await;
+    let client = Client::connect(Transport::Unix(daemon.socket.clone()))
+        .await
+        .expect("connect to the daemon");
+    let pool = open_db(&daemon.db_path()).await;
+
+    let (local, external) = start_session(&client, &pool, &daemon, "echo").await;
+    close_session(&client, &pool, &local).await;
+    drop(client);
+
+    daemon.restart(&echo_config("FAKE_ACP_INIT_ERROR = \"1\"\n"));
+    wait_for_socket(&daemon.socket).await;
+    let client = Client::connect(Transport::Unix(daemon.socket.clone()))
+        .await
+        .expect("connect to the restarted daemon");
+    let pool = open_db(&daemon.db_path()).await;
+
+    let response = client
+        .request(method::AGENTS_LOAD, json!({ "session_id": local }))
+        .await
+        .unwrap();
+    let message = response
+        .error
+        .expect("a failed initialize fails the load")
+        .message;
+    assert!(message.contains("initialize"), "{message}");
+
+    let (failed, text, _seq) = attach(&client, &local).await;
+    assert_eq!(failed["session"]["load_state"], "failed");
+    assert!(
+        failed["session"]["load_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("initialize")),
+        "the snapshot carries the initialization failure"
+    );
+    assert_eq!(text, "", "a failed initialization exposes no replay");
+
+    let row = session_row(&pool, &local).await.expect("durable record");
+    assert_eq!(row.status, "failed");
+    assert_eq!(
+        row.external_session_id.as_deref(),
+        Some(external.as_str()),
+        "no fresh ACP session replaced the stored identity"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_sessions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "the load did not create another session record");
+}
+
+#[tokio::test]
+async fn restarted_daemon_restores_replay_before_readiness_and_accepts_a_follow_up() {
+    let mut daemon = Daemon::spawn();
+    wait_for_socket(&daemon.socket).await;
+    let client = Client::connect(Transport::Unix(daemon.socket.clone()))
+        .await
+        .expect("connect to the daemon");
+    let pool = open_db(&daemon.db_path()).await;
+
+    let (local, external) = start_session(&client, &pool, &daemon, "echo").await;
+    close_session(&client, &pool, &local).await;
+    drop(client);
+
+    // Reopen the same store with the replay gate and a prompt marker. The ACP
+    // agent persists the conversation under `external`, which only the daemon
+    // knows; the client still routes the load by `local`.
+    let load_marker = daemon.root.join("restart-load");
+    let prompt_marker = daemon.root.join("restart-prompt");
+    let gate = daemon.root.join("restart-replay-gate");
+    daemon.restart(&echo_config(&format!(
+        "FAKE_ACP_LOAD_MARKER = {load_marker:?}\n\
+         FAKE_ACP_PROMPT_MARKER = {prompt_marker:?}\n\
+         FAKE_ACP_LOAD_GATE_DIR = {gate:?}\n\
+         FAKE_ACP_LOAD_USER = \"restored question\"\n\
+         FAKE_ACP_LOAD_UPDATES = \"history-one|history-two|history-three\"\n"
+    )));
+    wait_for_socket(&daemon.socket).await;
+
+    let client = Client::connect(Transport::Unix(daemon.socket.clone()))
+        .await
+        .expect("connect to the restarted daemon");
+    let observer = Client::connect(Transport::Unix(daemon.socket.clone()))
+        .await
+        .expect("connect the observer");
+    let pool = open_db(&daemon.db_path()).await;
+
+    let history = result(
+        client
+            .request(method::AGENTS_HISTORY, json!({ "limit": 10 }))
+            .await
+            .unwrap(),
+        method::AGENTS_HISTORY,
+    );
+    let row = history
+        .as_array()
+        .expect("history rows")
+        .iter()
+        .find(|row| row["id"] == json!(local))
+        .expect("the session survives the restart");
+    assert_eq!(row["state"], "ended");
+    assert_eq!(row["loadable"], true);
+    assert!(
+        !history.to_string().contains(&external),
+        "history must not expose the provider ACP id: {history}"
+    );
+
+    let load = {
+        let client = client.clone();
+        let local = local.clone();
+        tokio::spawn(async move {
+            client
+                .request(method::AGENTS_LOAD, json!({ "session_id": local }))
+                .await
+                .unwrap()
+        })
+    };
+    wait_for_file(&gate.join("load-ready")).await;
+
+    let (during, during_text, during_seq) = attach(&observer, &local).await;
+    assert_eq!(during["session"]["load_state"], "loading");
+    assert_eq!(
+        during_text, "",
+        "a restarted daemon exposes no replay before the load succeeds"
+    );
+    assert_eq!(during_seq, 0);
+
+    std::fs::write(gate.join("load-release"), b"").unwrap();
+    let loaded = result(load.await.expect("load task"), method::AGENTS_LOAD);
+    assert_eq!(loaded["session"]["id"], local);
+    assert_eq!(
+        loaded["session"]["session_id"], external,
+        "the stored provider ACP id is still the one passed to session/load"
+    );
+    assert_eq!(loaded["session"]["load_state"], "ready");
+    assert_eq!(
+        attach_text(&loaded),
+        "history-onehistory-twohistory-three",
+        "the replay arrives before readiness"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&load_marker).unwrap(),
+        format!("{external}\n{}\n", daemon.work().display()),
+        "the stored ACP id and directory survive store recreation"
+    );
+    assert!(!prompt_marker.exists(), "a load must not submit a prompt");
+
+    let prompted = result(
+        client
+            .request(
+                method::AGENTS_PROMPT,
+                json!({ "session_id": local, "prompt": "follow-up after restart" }),
+            )
+            .await
+            .unwrap(),
+        method::AGENTS_PROMPT,
+    );
+    assert_eq!(prompted["accepted"], true);
+    wait_for_file(&prompt_marker).await;
+    assert_eq!(
+        std::fs::read_to_string(&prompt_marker).unwrap(),
+        "follow-up after restart"
+    );
+    let transcript =
+        wait_for_attach_text(&client, &local, "echo-agent: follow-up after restart").await;
+    assert!(
+        transcript.contains("history-onehistory-twohistory-three"),
+        "the replayed history is kept alongside the follow-up: {transcript:?}"
+    );
+
+    close_session(&client, &pool, &local).await;
+}
+
+#[tokio::test]
+async fn restart_during_an_active_task_never_resumes_or_succeeds_it() {
+    let mut daemon = Daemon::spawn();
+    let tasks_dir = daemon.root.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    std::fs::write(
+        tasks_dir.join("echo_task.md"),
+        "agent = \"echo\"\n---\necho: restart\n",
+    )
+    .unwrap();
+    // The initial daemon gates the prompt turn, so the task is genuinely
+    // in-flight when the daemon is killed.
+    daemon.restart(&echo_config(&format!(
+        "FAKE_ACP_GATE_DIR = {:?}\nFAKE_ACP_TITLE = \"Interrupted session\"\n",
+        daemon.root
+    )));
+    wait_for_socket(&daemon.socket).await;
+
+    let client = Client::connect(Transport::Unix(daemon.socket.clone()))
+        .await
+        .expect("connect to the daemon");
+    let pool = open_db(&daemon.db_path()).await;
+
+    let started = result(
+        client
+            .request(method::TASKS_START, json!({ "name": "echo_task" }))
+            .await
+            .unwrap(),
+        method::TASKS_START,
+    );
+    let task_id = started["id"].as_str().expect("task id").to_string();
+    wait_for_file(&daemon.root.join("agent-ready")).await;
+
+    let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+    let session_id = loop {
+        let row = sqlx::query(
+            "SELECT id FROM agent_sessions WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&task_id)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        if let Some(row) = row {
+            break row.get::<String, _>("id");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no session row for task {task_id}"
+        );
+        tokio::time::sleep(POLL).await;
+    };
+    let session = wait_for_status(&pool, &session_id, "ready").await;
+    let external = session.external_session_id.expect("ACP id");
+    let before_task = task_status(&pool, &task_id).await.expect("task row");
+    assert_eq!(before_task.0, "running");
+    assert_eq!(run_statuses(&pool, &task_id).await, vec!["running"]);
+    drop(client);
+
+    let prompt_marker = daemon.root.join("restart-task-prompt");
+    daemon.restart(&echo_config(&format!(
+        "FAKE_ACP_LOAD_MARKER = {:?}\n\
+         FAKE_ACP_PROMPT_MARKER = {prompt_marker:?}\n\
+         FAKE_ACP_LOAD_USER = \"interrupted question\"\n\
+         FAKE_ACP_LOAD_UPDATES = \"interrupted history\"\n",
+        daemon.root.join("restart-task-load")
+    )));
+    wait_for_socket(&daemon.socket).await;
+
+    let client = Client::connect(Transport::Unix(daemon.socket.clone()))
+        .await
+        .expect("connect to the restarted daemon");
+    let pool = open_db(&daemon.db_path()).await;
+
+    // Startup reconciliation interrupts the run and fails the stale task; the
+    // durable session record stays loadable.
+    let after_task = wait_for_task_status(&pool, &task_id, "failed").await;
+    assert_eq!(after_task.0, "failed");
+    assert_eq!(
+        after_task.1, before_task.1,
+        "no retry attempt was scheduled"
+    );
+    let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+    while run_statuses(&pool, &task_id).await != vec!["interrupted"] {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "run was not marked interrupted: {:?}",
+            run_statuses(&pool, &task_id).await
+        );
+        tokio::time::sleep(POLL).await;
+    }
+
+    let history = result(
+        client
+            .request(method::AGENTS_HISTORY, json!({ "limit": 10 }))
+            .await
+            .unwrap(),
+        method::AGENTS_HISTORY,
+    );
+    let row = history
+        .as_array()
+        .expect("history rows")
+        .iter()
+        .find(|row| row["id"] == json!(session_id))
+        .expect("the interrupted session is listed");
+    assert_eq!(row["state"], "ended");
+    assert_eq!(row["loadable"], true);
+    assert_eq!(row["task_id"], task_id);
+
+    let loaded = result(
+        client
+            .request(method::AGENTS_LOAD, json!({ "session_id": session_id }))
+            .await
+            .unwrap(),
+        method::AGENTS_LOAD,
+    );
+    assert_eq!(loaded["session"]["id"], session_id);
+    assert_eq!(loaded["session"]["session_id"], external);
+    assert_eq!(loaded["session"]["load_state"], "ready");
+    assert_eq!(attach_text(&loaded), "interrupted history");
+    assert!(
+        !prompt_marker.exists(),
+        "restoring the conversation must not run the task's prompt"
+    );
+
+    // The restored session is usable, but it never resumes or completes the
+    // interrupted task.
+    let prompted = result(
+        client
+            .request(
+                method::AGENTS_PROMPT,
+                json!({ "session_id": session_id, "prompt": "what happened?" }),
+            )
+            .await
+            .unwrap(),
+        method::AGENTS_PROMPT,
+    );
+    assert_eq!(prompted["accepted"], true);
+    wait_for_file(&prompt_marker).await;
+    wait_for_attach_text(&client, &session_id, "echo-agent: what happened?").await;
+
+    assert_eq!(
+        task_status(&pool, &task_id).await,
+        Some(after_task.clone()),
+        "loading a past session neither re-runs nor succeeds the task"
+    );
+    assert_eq!(
+        run_statuses(&pool, &task_id).await,
+        vec!["interrupted"],
+        "no new task run was created"
+    );
+    let task = result(
+        client
+            .request(method::TASKS_GET, json!({ "id": task_id }))
+            .await
+            .unwrap(),
+        method::TASKS_GET,
+    );
+    assert_eq!(task["status"], "failed");
+
+    close_session(&client, &pool, &session_id).await;
 }

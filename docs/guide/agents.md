@@ -129,13 +129,26 @@ loadable row previews its local id, agent, title, directory and state, then
 loads when selected. Rows that are loading, failed, or cannot be loaded explain
 why and do nothing rather than opening a blank session. The web Settings page
 and the desktop **Settings → Agents → Past sessions** card use the same
-`agents.history` / `agents.load` contract.
+`agents.history` / `agents.load` contract. The desktop card shows the restored
+transcript under a row only after `agents.load` succeeds; while the replay is in
+flight the row reads `loading` and no transcript is shown.
+
+Restoring is durable across daemon restarts and store reopens. The daemon looks
+up the stored ACP id from its own record, passes it to `session/load`, and keeps
+the Favetto-local id as the only routing key; the provider id is never returned
+by `agents.history`, and `agents.load` accepts only the local id. A successful
+restore applies the whole replay before the session becomes ready, keeps the
+replayed transcript across reconnects, and accepts follow-up prompts. Loading a
+session does not send a prompt, run its linked task, create a new run, or change
+an interrupted run's status.
 
 Only sessions **created by Favetto** are listed. Importing arbitrary sessions
 from a provider via ACP `session/list` is out of scope; whether a past session is
 loadable also depends on the agent advertising the ACP `loadSession`
-capability. An unsupported capability or agent error is reported as a failed
-restore, with the session still listed.
+capability. An unsupported capability, an agent-reported `session/load` error,
+or an initialization failure is reported as a failed restore, with the session
+still listed and any partial replay discarded. A failed restore can be retried
+from the clients; it never falls back to a fresh session.
 
 Conversation transcript ownership stays with the ACP agent. Favetto stores
 metadata only; the bounded, prunable task output/event feed is not a transcript
@@ -151,5 +164,9 @@ and is never used as one when loading a past session.
   durable record and the agent's own persisted session survive, and the agent
   advertises ACP `loadSession`. A session created entirely outside Favetto is
   not discoverable or importable.
+- The GPUI **Past sessions** card shows a bounded (4,000-character) preview of
+  the restored transcript; open the session from the TUI to read the full
+  replay. A session whose daemon died before it recorded an ACP id remains
+  `loading` and is not loadable.
 - The provider catalog (`providers.list`) is empty: ACP agents expose model
   choices through session options rather than a catalog.

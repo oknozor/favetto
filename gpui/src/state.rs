@@ -736,12 +736,12 @@ impl ClientState {
             }
             Update::AgentSessionLoaded { session_id, result } => {
                 match result {
-                    Ok(session) => {
+                    Ok(attached) => {
                         let label = format!(
-                            "Loaded session '{}' ({session_id}).",
-                            session.id.chars().take(8).collect::<String>()
+                            "Restored session '{}' and its replay.",
+                            session_id.chars().take(8).collect::<String>()
                         );
-                        self.session_history.finish_load(&session_id, Ok(*session));
+                        self.session_history.finish_load(&session_id, Ok(*attached));
                         self.show_toast(ToastKind::Success, label, cx);
                     }
                     Err(error) => {

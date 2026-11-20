@@ -533,7 +533,14 @@ impl SettingsView {
             let rows = history
                 .entries()
                 .iter()
-                .map(|entry| (entry.clone(), history.state(entry), history.can_load(entry)))
+                .map(|entry| {
+                    (
+                        entry.clone(),
+                        history.state(entry),
+                        history.can_load(entry),
+                        history.transcript_preview(&entry.id),
+                    )
+                })
                 .collect::<Vec<_>>();
             (
                 state.agent_roster().to_vec(),
@@ -734,7 +741,7 @@ impl SettingsView {
             history_rows
                 .iter()
                 .enumerate()
-                .map(|(index, (entry, row_state, can_load))| {
+                .map(|(index, (entry, row_state, can_load, transcript))| {
                     let title = entry.title.clone().unwrap_or_else(|| {
                         format!("session {}", &entry.id[..entry.id.len().min(8)])
                     });
@@ -861,6 +868,26 @@ impl SettingsView {
                                 )
                                 .child(div().w(px(96.0)).flex_shrink_0().child(action)),
                         )
+                        .when_some(transcript.clone(), |row, text: String| {
+                            let text = if text.trim().is_empty() {
+                                "The provider returned no replayed history.".to_string()
+                            } else {
+                                text
+                            };
+                            row.child(
+                                div()
+                                    .mx(px(theme.spacing.s2))
+                                    .mb(px(theme.spacing.s1))
+                                    .p(px(theme.spacing.s2))
+                                    .rounded(px(theme.radii.r8))
+                                    .bg(Hsla::from(theme.colors.border).opacity(0.25))
+                                    .font_family("monospace")
+                                    .text_size(px(theme.font.xs))
+                                    .text_color(theme.colors.text)
+                                    .whitespace_normal()
+                                    .child(text),
+                            )
+                        })
                         .into_any_element()
                 })
                 .collect()
