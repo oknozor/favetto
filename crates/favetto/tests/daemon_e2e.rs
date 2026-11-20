@@ -101,7 +101,8 @@ impl DaemonHarness {
             &config_path,
             format!(
                 "[agent]\ndefault = \"echo\"\n\n\
-                 [agents.echo]\ncommand = {:?}\nargs = []\n",
+                 [agents.echo]\ncommand = {:?}\nargs = []\n\
+                 [agents.echo.env]\nFAKE_ACP_IGNORE_CLOSE = \"1\"\n",
                 agent
             ),
         )

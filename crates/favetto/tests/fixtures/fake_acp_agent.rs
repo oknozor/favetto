@@ -121,7 +121,12 @@ fn main() {
                 );
                 respond(&mut stdout, id, json!({ "stopReason": "end_turn" }));
             }
-            "session/close" => respond(&mut stdout, id, json!({})),
+            "session/close" => {
+                // Simulate agents that ignore the optional close request.
+                if std::env::var_os("FAKE_ACP_IGNORE_CLOSE").is_none() {
+                    respond(&mut stdout, id, json!({}));
+                }
+            }
             // `session/cancel` is a notification: no response.
             _ => {
                 if let Some(id) = id {

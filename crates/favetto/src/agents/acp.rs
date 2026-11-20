@@ -43,6 +43,11 @@ use favetto_core::model::{
 /// Deadline for an `ask`-policy permission answered by a remote client.
 pub(crate) const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How long to wait for `session/close` before ending the session anyway. The
+/// method is optional in practice, and a completed turn must never leave the
+/// task `running`.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// What to launch and how to drive it.
 pub(crate) struct AcpLaunch {
     /// The configured agent name, used in diagnostics.
@@ -412,12 +417,22 @@ pub(crate) fn spawn(
                         }
                     }
 
-                    let _ = connection
+                    // Closing is best-effort. `session/close` is not part of the
+                    // v1 session capabilities every agent advertises, and an
+                    // agent that ignores it never answers: awaiting it would
+                    // hold the session `running` forever after the final turn.
+                    let close = connection
                         .send_request(agent_client_protocol::v1::schema::CloseSessionRequest::new(
                             session_id,
                         ))
-                        .block_task()
-                        .await;
+                        .block_task();
+                    if tokio::time::timeout(CLOSE_TIMEOUT, close).await.is_err() {
+                        tracing::debug!(
+                            target: "favetto::acp",
+                            agent = %agent_name,
+                            "agent did not acknowledge session/close; ending the session anyway"
+                        );
+                    }
                     Ok(())
                 },
             )
