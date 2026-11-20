@@ -21,6 +21,7 @@ mod tasks;
 mod theme;
 mod transport;
 mod views;
+mod workflow;
 
 use gpui::{px, size, App, AppContext as _, Application, Bounds, WindowBounds, WindowOptions};
 

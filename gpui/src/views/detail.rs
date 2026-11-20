@@ -44,6 +44,7 @@ pub struct DetailView {
     cancel_focus: FocusHandle,
     retry_focus: FocusHandle,
     copy_focus: FocusHandle,
+    workflow_focus: FocusHandle,
     session_focus: FocusHandle,
     follow_focus: FocusHandle,
     output_retry_focus: FocusHandle,
@@ -85,6 +86,7 @@ impl DetailView {
             reply_once_focus: cx.focus_handle().tab_index(32).tab_stop(true),
             reply_always_focus: cx.focus_handle().tab_index(33).tab_stop(true),
             reply_reject_focus: cx.focus_handle().tab_index(34).tab_stop(true),
+            workflow_focus: cx.focus_handle().tab_index(35).tab_stop(true),
             output_scroll: ScrollHandle::new(),
             events_scroll: ScrollHandle::new(),
             output_rendered: 0,
@@ -219,6 +221,22 @@ impl DetailView {
             .unwrap_or_else(|| "—".to_string());
         let usage = detail::usage_summary(data.usage);
 
+        let workflow = self.action_button(
+            theme,
+            "detail-workflow",
+            "View workflow",
+            false,
+            &self.workflow_focus,
+            cx.listener(|this, _event, _window, cx| {
+                let task_id = this.state.read(cx).selected_task_id();
+                if let Some(task_id) = task_id {
+                    this.state.update(cx, |state, cx| {
+                        state.open_workflow_for_task(task_id, cx);
+                        cx.notify();
+                    });
+                }
+            }),
+        );
         let cancel = self.action_button(
             theme,
             "detail-cancel",
@@ -369,6 +387,7 @@ impl DetailView {
                         row.child(div().flex_1().min_w_0().child(session))
                     })
                     .when(data.session_id.is_none(), |row| row.child(div().flex_1()))
+                    .child(workflow)
                     .child(cancel)
                     .child(retry)
                     .child(copy),

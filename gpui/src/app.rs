@@ -21,6 +21,7 @@ use crate::actions::{
     ListDown, ListEnd, ListHome, ListOpen, ListPageDown, ListPageUp, ListUp, PaletteConfirm,
     PaletteDown, PaletteUp, Refresh, TaskCancel, TaskConfirmAccept, TaskConfirmReject,
     TaskFilterNext, TaskFilterPrev, TaskRetry, TaskSearch, TogglePalette, ToggleShortcuts,
+    WorkflowCancelRoot, WorkflowRetryInstance,
 };
 use crate::catalog::OneShotFocus;
 use crate::components;
@@ -33,6 +34,7 @@ use crate::theme::{Theme, DETAIL_WIDTH, SIDEBAR_WIDTH, STATUS_BAR_HEIGHT, TOP_BA
 use crate::views::{
     CatalogView, DetailView, InboxView, SchedulesView, SettingsView, TasksView, WorkflowsView,
 };
+use crate::workflow::WorkflowCancelConfirm;
 
 /// A Home/End/Page key, routed to the active list.
 enum ListJump {
@@ -176,6 +178,8 @@ impl RootView {
             self.state.update(cx, |state, cx| {
                 if state.task_confirm().is_some() {
                     state.cancel_task_confirm();
+                } else if state.workflow_confirm().is_some() {
+                    state.cancel_workflow_confirm();
                 } else if state.active_route() == Route::Tasks && state.clear_tasks_search() {
                     // Esc is consumed by the search field; a second Esc steps
                     // back from a pushed detail.
@@ -229,13 +233,30 @@ impl RootView {
                 }
                 cx.notify();
             }),
+            Route::Workflows => self.state.update(cx, |state, cx| {
+                state.move_workflow_selection(delta);
+                cx.notify();
+            }),
             _ => {}
         }
     }
 
     /// Home/End/PageUp/PageDown on the active list.
     fn jump_list(&mut self, jump: ListJump, cx: &mut Context<Self>) {
-        if self.state.read(cx).active_route() != Route::Tasks {
+        let route = self.state.read(cx).active_route();
+        if route == Route::Workflows {
+            self.state.update(cx, |state, cx| {
+                match jump {
+                    ListJump::Home => state.workflow_selection_edge(false),
+                    ListJump::End => state.workflow_selection_edge(true),
+                    ListJump::PageUp => state.workflow_selection_page(-1),
+                    ListJump::PageDown => state.workflow_selection_page(1),
+                }
+                cx.notify();
+            });
+            return;
+        }
+        if route != Route::Tasks {
             return;
         }
         self.state.update(cx, |state, cx| {
@@ -265,6 +286,10 @@ impl RootView {
                 state.open_catalog_selected();
                 cx.notify();
             }),
+            Route::Workflows => self.state.update(cx, |state, cx| {
+                state.open_workflow_selected();
+                cx.notify();
+            }),
             _ => {}
         }
     }
@@ -288,16 +313,26 @@ impl RootView {
 
     /// Enter/Space on the confirmation: apply optimistically and reconcile.
     fn accept_task_confirm(&mut self, cx: &mut Context<Self>) {
+        let route = self.state.read(cx).active_route();
         self.state.update(cx, |state, cx| {
-            state.accept_task_confirm(cx);
+            if route == Route::Workflows {
+                state.accept_workflow_confirm(cx);
+            } else {
+                state.accept_task_confirm(cx);
+            }
             cx.notify();
         });
     }
 
     /// Esc on the confirmation.
     fn dismiss_task_confirm(&mut self, cx: &mut Context<Self>) {
+        let route = self.state.read(cx).active_route();
         self.state.update(cx, |state, cx| {
-            state.cancel_task_confirm();
+            if route == Route::Workflows {
+                state.cancel_workflow_confirm();
+            } else {
+                state.cancel_task_confirm();
+            }
             cx.notify();
         });
     }
@@ -1141,6 +1176,129 @@ impl RootView {
             .child(panel)
     }
 
+    /// The root-cancel confirmation. It names the root and the exact number of
+    /// non-terminal instances the RPC will transition (docs §2, Von Restorff:
+    /// it is the only danger control on the surface).
+    fn workflow_confirm_overlay(
+        &self,
+        theme: &Theme,
+        confirm: &WorkflowCancelConfirm,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let back = components::with_focus(
+            div()
+                .id("workflow-confirm-back")
+                .flex()
+                .items_center()
+                .gap(px(theme.spacing.s2))
+                .h(px(36.0))
+                .px(px(theme.spacing.s3))
+                .rounded(px(theme.radii.r4))
+                .border_1()
+                .border_color(theme.colors.border)
+                .text_size(px(theme.font.sm))
+                .text_color(theme.colors.text)
+                .cursor_pointer()
+                .child("Back")
+                .child(components::keycap(theme, "esc"))
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.dismiss_task_confirm(cx);
+                    window.focus(&this.root_focus);
+                })),
+            theme,
+        );
+
+        let danger = confirm.danger();
+        let accept_color = if danger {
+            theme.colors.danger
+        } else {
+            theme.colors.accent
+        };
+        let accept = components::with_focus(
+            div()
+                .id("workflow-confirm-accept")
+                .flex()
+                .items_center()
+                .gap(px(theme.spacing.s2))
+                .h(px(40.0))
+                .px(px(theme.spacing.s4))
+                .rounded(px(theme.radii.r8))
+                .bg(Hsla::from(accept_color).opacity(0.16))
+                .text_size(px(theme.font.sm))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(accept_color)
+                .cursor_pointer()
+                .child(confirm.confirm_label())
+                .child(components::keycap(theme, "↵"))
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.accept_task_confirm(cx);
+                })),
+            theme,
+        );
+
+        let panel = div()
+            .w(px(460.0))
+            .flex()
+            .flex_col()
+            .gap(px(theme.spacing.s3))
+            .p(px(theme.spacing.s4))
+            .rounded(px(theme.radii.r12))
+            .border_1()
+            .border_color(theme.colors.border)
+            .bg(theme.colors.surface)
+            .shadow_lg()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(theme.spacing.s2))
+                    .child(
+                        div()
+                            .text_size(px(theme.font.lg))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.colors.text)
+                            .child(confirm.title()),
+                    )
+                    .child(components::keycap(theme, "esc")),
+            )
+            .child(
+                div()
+                    .text_size(px(theme.font.sm))
+                    .text_color(theme.colors.text)
+                    .child(confirm.body()),
+            )
+            .child(
+                div()
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.muted)
+                    .child(
+                        "Every non-terminal row updates immediately; if the daemon rejects the call it is rolled back.",
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(theme.spacing.s2))
+                    .pt(px(theme.spacing.s1))
+                    .child(backend_hint(theme))
+                    .child(back)
+                    .child(accept),
+            );
+
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(Hsla::from(theme.colors.bg).opacity(0.86))
+            .key_context("Confirm")
+            .child(panel)
+    }
+
     /// The self-dismissing toast above the status bar.
     fn toast_overlay(&self, theme: &Theme, toast: &Toast, cx: &mut Context<Self>) -> Div {
         let (icon, color) = match toast.kind {
@@ -1271,6 +1429,7 @@ impl Render for RootView {
             confirm_open,
             search_active,
             confirm,
+            workflow_confirm,
             toast,
             catalog_search_active,
             catalog_launch_open,
@@ -1282,6 +1441,7 @@ impl Render for RootView {
                 state.task_confirm().is_some(),
                 state.is_tasks_search_active(),
                 state.task_confirm().cloned(),
+                state.workflow_confirm().cloned(),
                 state.toast().cloned(),
                 state.is_catalog_search_active(),
                 state.catalog().launch().is_some(),
@@ -1296,6 +1456,11 @@ impl Render for RootView {
                 key_context.push_str(" Search");
             }
             if confirm_open {
+                key_context.push_str(" Confirm");
+            }
+        } else if route == Route::Workflows {
+            key_context.push_str(" Workflows");
+            if workflow_confirm.is_some() {
                 key_context.push_str(" Confirm");
             }
         } else if route == Route::Catalog {
@@ -1399,6 +1564,18 @@ impl Render for RootView {
             }))
             .on_action(cx.listener(|this, _: &TaskRetry, _window, cx| {
                 this.request_task_action(TaskAction::Retry, cx);
+            }))
+            .on_action(cx.listener(|this, _: &WorkflowCancelRoot, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.request_workflow_cancel(cx);
+                    cx.notify();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &WorkflowRetryInstance, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.retry_workflow_selected(cx);
+                    cx.notify();
+                });
             }))
             .on_action(cx.listener(|this, _: &TaskFilterPrev, _window, cx| {
                 this.cycle_task_filter(-1, cx);
@@ -1554,6 +1731,9 @@ impl Render for RootView {
             }
             if let Some(confirm) = &confirm {
                 root = root.child(self.confirm_overlay(theme, confirm, cx));
+            }
+            if let Some(confirm) = &workflow_confirm {
+                root = root.child(self.workflow_confirm_overlay(theme, confirm, cx));
             }
             root
         }

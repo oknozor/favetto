@@ -1,10 +1,11 @@
 # favetto GPUI desktop client
 
-Status: **task catalog (step 07)** — browse definitions grouped by repo and
+Status: **task catalog (step 08)** — browse definitions grouped by repo and
 folder, fuzzy-search names and prompts, read the raw Markdown source beside the
-list, and launch a definition through a validated `[[vars]]` sheet. The one-shot
-session is the toolbar's secondary action. The plans live in
-`docs/design/gpui-client.md`.
+list, and launch a definition through a validated `[[vars]]` sheet. The
+Workflows surface lists the roots in the current task snapshot and inspects one
+root's ready/running/failed/blocked/terminal instances, progress and catalog DAG
+source. The plans live in `docs/design/gpui-client.md`.
 
 ## What it is
 
@@ -114,6 +115,26 @@ opens the secondary sheet: an agent picker from `agents.list` plus an optional
 working directory, sent through `tasks.start_oneshot`. The resulting run is
 opened in the task detail immediately.
 
+The Workflows surface is reached with `g w` or from a run's **View workflow**
+button. It groups the current `tasks.list` snapshot by `root_or_self` and shows
+each root's `done / total` and a progress bar (counted from the instances the
+daemon returns, never estimated). Selecting a root loads `workflow.inspect` and
+renders its five buckets — **Ready**, **Running**, **Failed**, **Blocked** and
+**Terminal** — with status, attempt and the predecessor each instance waited
+for. A directly started run is its own root and carries a short explanation;
+when the snapshot has no roots at all the surface explains where roots come
+from instead of showing a blank panel.
+
+`↑`/`↓` move the instance highlight, `↵` opens the instance in the task detail,
+`c` opens the root-cancel confirmation (it names the number of non-terminal
+instances) and `r` retries the highlighted failed instance. The same actions are
+available as buttons; **Refresh** (or the palette's Refresh data) reloads the
+inspect and the DAG source. Cancel marks every non-terminal row immediately and
+retry moves its row to Ready, then both reconcile with the RPC response and the
+next `task.updated` push. `workflow.get` is shown as readable DOT in a monospace
+panel with a one-line edge legend and **Copy DOT** (no Graphviz binary is
+embedded).
+
 ## Pointing it at a daemon
 
 The connection is configured in `~/.config/favetto/gpui.toml`:
@@ -158,6 +179,10 @@ or `/events` path, and a missing scheme are all accepted.
   query-scoped counts, fuzzy matching over name/agent/repo, newest-first and
   relevance ordering, selection resolution, and the terminal/cancellable
   helpers behind `c`/`r`. Unit-tested without a window.
+- `src/workflow.rs` — the pure Workflows model: roots grouped by
+  `root_or_self`, the five runtime buckets, dependency labels joined from the
+  cached task rows, `done / total` progress, optimistic cancel/retry state and
+  the `workflow.get` source model. Unit-tested without a window.
 - `src/detail.rs` — the pure detail model: output-envelope extraction and ANSI
   stripping, usage/cost formatting, event-feed grouping (text, reasoning,
   tools, usage, errors, boundaries), the permission-request resolver, and a
@@ -339,3 +364,45 @@ Deviations from the plan are recorded in this file as the chain progresses
 - **One-shot success opens the task.** The returned task is folded into the
   snapshot, its live session is added to the roster immediately, and the detail
   page opens without waiting for the next `agents.list` poll.
+
+### Step 08 deviations / additions
+
+- **Roots come from the shared snapshot.** There is no `workflow.list` RPC, so
+  the Workflows list groups the same `tasks.list` rows the Inbox and Tasks use
+  by `root_or_self`, newest root first. A root whose root task fell outside the
+  500-row window keeps working and is named after its first visible instance.
+- **Five buckets, one terminal section.** `workflow.inspect` returns `ready`,
+  `running`, `failed` and `blocked`; the terminal section is the remaining
+  succeeded/cancelled instances, in inspect order. Empty buckets still render
+  their explanation and a `0`, so counts and rows cannot disagree.
+- **Done means succeeded.** `done / total` and the progress bar count only
+  `succeeded` instances. A failed or cancelled root therefore never shows a
+  full bar even though every row is terminal; totals are never estimated.
+- **Dependencies join through `tasks.list`.** `workflow.inspect` omits
+  `parent_id`, so each row's predecessor label is joined from the cached task
+  rows. A fresh snapshot re-joins the open root locally instead of issuing
+  another inspect RPC.
+- **DAG source, not Graphviz.** `workflow.get` is a catalog-wide DOT string, so
+  it is rendered as readable monospace source beside the runtime view with a
+  short spawn/needs/join legend, **Copy DOT** (no text selection in this GPUI
+  build) and a collapse toggle. No Graphviz binary or DOT parser is embedded.
+- **Only failed instances retry from Workflows.** `r` and the row button call
+  `workflow.retry` for a `failed` row; succeeded/cancelled rows stay retryable
+  from the Tasks surface, which already has the broader terminal rule.
+- **Cancel is root-scoped and counted.** `c` (or **Cancel root**) opens a
+  confirmation naming the exact non-terminal count. The optimistic write marks
+  every non-terminal row terminal; a rejected RPC restores the previous detail,
+  and the response's cancelled ids reconcile with any newer push.
+- **Live refresh is coalesced.** A `task.updated` for a task in the open root
+  folds the row immediately, then marks the view dirty so overlapping pushes
+  collapse into one follow-up `workflow.inspect`. The highlight follows the
+  instance id and survives bucket moves.
+- **Direct starts explain themselves.** A run whose snapshot row has no
+  `root_id` is its own root (`root_or_self`); the surface keeps its single
+  instance visible and adds a banner explaining that spawned children appear
+  there. A snapshot with no roots shows the route's empty state, never a blank
+  panel.
+- **No embedded root graph renderer.** The runtime inspect is a structured row
+  view rather than a drawn DAG; the required catalog DAG is the DOT source
+  panel. A layout engine can be added behind the same `WorkflowGraph` model
+  later without changing the RPCs.

@@ -13,6 +13,7 @@
 
 #![allow(dead_code)] // Accessors and `ping()` are consumed by the views in steps 03+.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -32,6 +33,9 @@ use crate::runtime::{PingSnapshot, Runtime, Update};
 use crate::sse::Push;
 use crate::tasks::{self, TaskAction, TaskFilter, TaskList};
 use crate::transport::ClientError;
+use crate::workflow::{
+    self, WorkflowCancelConfirm, WorkflowDetail, WorkflowGraphState, WorkflowRow,
+};
 
 /// How long a toast stays on screen before dismissing itself.
 const TOAST_LINGER: Duration = Duration::from_secs(6);
@@ -212,6 +216,26 @@ pub struct ClientState {
     selected_task: Option<uuid::Uuid>,
     /// The open detail's output, structured feed and attempt table.
     detail: Option<TaskDetail>,
+    /// The selected workflow root in the Workflows list.
+    workflow_root: Option<uuid::Uuid>,
+    /// The selected root's runtime inspect joined with cached dependencies.
+    workflow_detail: Option<WorkflowDetail>,
+    /// The last raw `workflow.inspect`, kept so a fresh task snapshot can
+    /// re-join dependency labels without another RPC.
+    workflow_inspect: Option<favetto_wire::workflow::WorkflowInspect>,
+    /// True while a `workflow.inspect` read is in flight.
+    workflow_loading: bool,
+    /// A `task.updated` arrived while the inspect read was in flight; reload
+    /// once it lands (coalesced, never one RPC per push).
+    workflow_dirty: bool,
+    /// The catalog DAG source shown beside the runtime view.
+    workflow_graph: WorkflowGraphState,
+    /// The root cancel awaiting confirmation.
+    workflow_confirm: Option<WorkflowCancelConfirm>,
+    /// The detail before an optimistic root cancel, for a guarded rollback.
+    workflow_cancel_previous: Option<WorkflowDetail>,
+    /// The prior row for each retry in flight, for a guarded rollback.
+    workflow_retry_previous: HashMap<uuid::Uuid, WorkflowRow>,
     /// The daemon's repo name, derived from the `system.ping` cwd.
     repo: Option<String>,
     /// The foreground task that drains [`Runtime`] updates. Declared before the
@@ -282,6 +306,15 @@ impl ClientState {
             toast_id: 0,
             selected_task: None,
             detail: None,
+            workflow_root: None,
+            workflow_detail: None,
+            workflow_inspect: None,
+            workflow_loading: false,
+            workflow_dirty: false,
+            workflow_graph: WorkflowGraphState::default(),
+            workflow_confirm: None,
+            workflow_cancel_previous: None,
+            workflow_retry_previous: HashMap::new(),
             repo: None,
             runtime,
             drain,
@@ -348,6 +381,23 @@ impl ClientState {
                     // Fold the row immediately (Doherty: a local change within
                     // 100 ms), then reload to pick up the session/request text.
                     Push::TaskUpdated(task) => {
+                        // The open workflow view gets the row immediately, then
+                        // one coalesced inspect reload (Doherty Threshold).
+                        let workflow_root = self
+                            .workflow_detail
+                            .as_ref()
+                            .filter(|detail| {
+                                detail.root_id == task.root_or_self() || detail.root_id == task.id
+                            })
+                            .map(|detail| detail.root_id);
+                        if let Some(root_id) = workflow_root {
+                            if let Some(detail) = &mut self.workflow_detail {
+                                detail.apply_task(task);
+                            }
+                            if self.active_route == Route::Workflows {
+                                self.load_workflow_inspect(root_id);
+                            }
+                        }
                         let open =
                             self.detail.as_ref().map(|detail| detail.task_id) == Some(task.id);
                         let was_terminal = self
@@ -394,6 +444,10 @@ impl ClientState {
                     Push::CatalogUpdated => {
                         self.catalog.invalidate_preview();
                         self.refresh_catalog();
+                        // The DAG source is derived from the same catalog.
+                        if self.active_route == Route::Workflows || self.workflow_graph.loaded {
+                            self.refresh_workflow_graph();
+                        }
                     }
                     // Unknown method or event kind: counted above, ignored here
                     // (docs step 06: never fatal).
@@ -414,6 +468,11 @@ impl ClientState {
                 self.sessions = sessions;
                 self.agents = agents;
                 self.snapshot_status = SnapshotStatus::Loaded;
+                // The Workflows root list is derived from this same snapshot,
+                // so a recovered daemon fills it without another RPC. The open
+                // root re-joins its dependency labels against the new rows.
+                self.rejoin_workflow_detail();
+                self.ensure_workflow_root();
             }
             Update::SnapshotFailed { error } => {
                 if error.is_unauthorized() {
@@ -674,6 +733,160 @@ impl ClientState {
                 }
                 self.refresh_snapshot();
             }
+            Update::WorkflowInspectLoaded { root_id, view } => {
+                if self
+                    .workflow_detail
+                    .as_ref()
+                    .is_none_or(|detail| detail.root_id != root_id)
+                {
+                    // A stale response for a root the user already left.
+                    return;
+                }
+                self.workflow_inspect = Some((*view).clone());
+                self.workflow_loading = false;
+                self.rejoin_workflow_detail();
+                if self.workflow_dirty {
+                    self.workflow_dirty = false;
+                    if self.active_route == Route::Workflows {
+                        if let Some(root_id) = self.workflow_root {
+                            self.load_workflow_inspect(root_id);
+                        }
+                    }
+                }
+            }
+            Update::WorkflowInspectFailed { root_id, error } => {
+                if self
+                    .workflow_detail
+                    .as_ref()
+                    .is_none_or(|detail| detail.root_id != root_id)
+                {
+                    // A stale failure for a root the user already left.
+                    return;
+                }
+                self.workflow_loading = false;
+                self.workflow_dirty = false;
+                if error.is_unauthorized() {
+                    self.connection = ConnectionState::Unauthorized {
+                        token_path: self.config.token_source.label(),
+                    };
+                }
+                if let Some(detail) = self.workflow_detail.as_mut() {
+                    detail.loading = false;
+                    detail.error = Some(error.to_string());
+                }
+            }
+            Update::WorkflowGraphLoaded { result } => {
+                self.workflow_graph.set(result.dot, result.path);
+            }
+            Update::WorkflowGraphFailed { error } => {
+                if error.is_unauthorized() {
+                    self.connection = ConnectionState::Unauthorized {
+                        token_path: self.config.token_source.label(),
+                    };
+                }
+                self.workflow_graph.fail(error.to_string());
+            }
+            Update::WorkflowCancelFinished { root_id, result } => {
+                match result {
+                    Ok(result) => {
+                        let cancelled: Vec<uuid::Uuid> = result.cancelled;
+                        if let Some(detail) = self.workflow_detail.as_mut() {
+                            if detail.root_id == root_id {
+                                detail.finish_cancel(&cancelled);
+                            }
+                        }
+                        // Keep the shared snapshot in step until its own push
+                        // and reconciling load land.
+                        let now = Utc::now();
+                        for task in &mut self.tasks {
+                            if cancelled.contains(&task.id) {
+                                task.status = TaskStatus::Cancelled;
+                                task.finished_at = Some(now);
+                            }
+                        }
+                        self.workflow_cancel_previous = None;
+                        let count = cancelled.len();
+                        let label = if count == 1 {
+                            "1 instance".to_string()
+                        } else {
+                            format!("{count} instances")
+                        };
+                        self.show_toast(
+                            ToastKind::Success,
+                            format!("Cancelled {label} in the workflow."),
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        if error.is_unauthorized() {
+                            self.connection = ConnectionState::Unauthorized {
+                                token_path: self.config.token_source.label(),
+                            };
+                        }
+                        if let Some(previous) = self.workflow_cancel_previous.take() {
+                            if let Some(detail) = self.workflow_detail.as_mut() {
+                                if detail.root_id == root_id {
+                                    *detail = previous;
+                                }
+                            }
+                        }
+                        self.show_toast(
+                            ToastKind::Error,
+                            format!("Could not cancel the workflow: {error}. The change was rolled back."),
+                            cx,
+                        );
+                    }
+                }
+                if self.workflow_root == Some(root_id)
+                    || self
+                        .workflow_detail
+                        .as_ref()
+                        .is_some_and(|detail| detail.root_id == root_id)
+                {
+                    self.load_workflow_inspect(root_id);
+                }
+                self.refresh_snapshot();
+            }
+            Update::WorkflowRetryFinished { task_id, result } => {
+                match result {
+                    Ok(task) => {
+                        self.workflow_retry_previous.remove(&task_id);
+                        let task = *task;
+                        let name = inbox::task_display_name(&task.name).to_string();
+                        let attempt = task.attempt;
+                        if let Some(detail) = self.workflow_detail.as_mut() {
+                            detail.finish_retry(&task);
+                        }
+                        self.upsert_task(task);
+                        self.show_toast(
+                            ToastKind::Success,
+                            format!("Retried '{name}' (attempt {attempt})."),
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        if error.is_unauthorized() {
+                            self.connection = ConnectionState::Unauthorized {
+                                token_path: self.config.token_source.label(),
+                            };
+                        }
+                        if let Some(previous) = self.workflow_retry_previous.remove(&task_id) {
+                            if let Some(detail) = self.workflow_detail.as_mut() {
+                                detail.rollback_retry(previous);
+                            }
+                        }
+                        self.show_toast(
+                            ToastKind::Error,
+                            format!("Could not retry the instance: {error}. The change was rolled back."),
+                            cx,
+                        );
+                    }
+                }
+                if let Some(root_id) = self.workflow_root {
+                    self.load_workflow_inspect(root_id);
+                }
+                self.refresh_snapshot();
+            }
         }
     }
 
@@ -723,6 +936,424 @@ impl ClientState {
                 };
             }
         }
+    }
+
+    /// Ask the runtime for a fresh `workflow.inspect` for the selected root.
+    ///
+    /// Overlapping requests coalesce: a burst of `task.updated` pushes marks the
+    /// view dirty and a single follow-up read lands after the current one.
+    fn load_workflow_inspect(&mut self, root_id: uuid::Uuid) {
+        let same_root = self
+            .workflow_detail
+            .as_ref()
+            .is_some_and(|detail| detail.root_id == root_id);
+        if self.workflow_loading && same_root {
+            self.workflow_dirty = true;
+            return;
+        }
+
+        let name = self.workflow_root_name(root_id);
+        if same_root {
+            if let Some(detail) = &mut self.workflow_detail {
+                detail.loading = true;
+                detail.error = None;
+            }
+        } else {
+            // A new root starts from a loading placeholder, never the previous
+            // root's rows.
+            self.workflow_detail = Some(WorkflowDetail::loading(root_id, name));
+            self.workflow_inspect = None;
+            self.workflow_dirty = false;
+        }
+        self.workflow_loading = true;
+        match &self.runtime {
+            Some(runtime) => runtime.load_workflow_inspect(root_id),
+            None => {
+                self.workflow_loading = false;
+                if let Some(detail) = self.workflow_detail.as_mut() {
+                    if detail.root_id == root_id {
+                        detail.loading = false;
+                        detail.error = Some("the transport is not running".to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Rebuild the open root's rows from the cached inspect payload and the
+    /// current task snapshot. This refreshes dependency labels (which only live
+    /// on the full task rows) without another `workflow.inspect` RPC, while
+    /// preserving the highlight and any optimistic action.
+    fn rejoin_workflow_detail(&mut self) {
+        let Some(inspect) = self.workflow_inspect.clone() else {
+            return;
+        };
+        let Some(old) = self.workflow_detail.as_ref() else {
+            return;
+        };
+        if old.root_id != inspect.root_id {
+            return;
+        }
+        let selected = old.selected_id();
+        let pending_cancel = old.pending_cancel;
+        let pending_retries: Vec<uuid::Uuid> = old
+            .rows
+            .iter()
+            .filter(|row| row.retry_pending)
+            .map(|row| row.id)
+            .collect();
+        let mut fresh = WorkflowDetail::from_inspect(&inspect, &self.tasks, selected);
+        if pending_cancel {
+            // Keep the optimistic cancellation while the RPC is still in
+            // flight; the response reconciles it.
+            fresh.begin_cancel();
+            fresh.pending_cancel = true;
+        }
+        for id in pending_retries {
+            fresh.begin_retry(id);
+        }
+        self.workflow_detail = Some(fresh);
+    }
+
+    /// Keep the selected root valid as the shared task snapshot changes. Picks
+    /// the newest root when nothing is selected and drops a root that vanished.
+    fn ensure_workflow_root(&mut self) {
+        if self.active_route != Route::Workflows {
+            return;
+        }
+        let roots = self.workflow_roots();
+        if roots.is_empty() {
+            self.workflow_root = None;
+            self.workflow_detail = None;
+            self.workflow_inspect = None;
+            self.workflow_loading = false;
+            self.workflow_dirty = false;
+            return;
+        }
+        let selected = self
+            .workflow_root
+            .filter(|id| roots.iter().any(|root| root.root_id == *id))
+            .unwrap_or_else(|| roots[0].root_id);
+        let changed = self.workflow_root != Some(selected);
+        self.workflow_root = Some(selected);
+        let detail_matches = self
+            .workflow_detail
+            .as_ref()
+            .is_some_and(|detail| detail.root_id == selected);
+        if !detail_matches {
+            self.load_workflow_inspect(selected);
+        } else if changed {
+            // The previous selection came back into the list; refresh it.
+            self.load_workflow_inspect(selected);
+        }
+    }
+
+    fn workflow_root_name(&self, root_id: uuid::Uuid) -> String {
+        self.tasks
+            .iter()
+            .find(|task| task.id == root_id)
+            .or_else(|| {
+                self.tasks
+                    .iter()
+                    .find(|task| task.root_or_self() == root_id)
+            })
+            .map(|task| inbox::task_display_name(&task.name).to_string())
+            .unwrap_or_else(|| format!("workflow {}", short_id(root_id)))
+    }
+
+    /// The roots visible in the shared task snapshot, newest first.
+    pub fn workflow_roots(&self) -> Vec<workflow::WorkflowRoot> {
+        workflow::roots(&self.tasks)
+    }
+
+    /// The selected root, falling back to the newest one so the surface is
+    /// useful immediately.
+    pub fn selected_workflow_root(&self) -> Option<uuid::Uuid> {
+        let roots = self.workflow_roots();
+        self.workflow_root
+            .filter(|id| roots.iter().any(|root| root.root_id == *id))
+            .or_else(|| roots.first().map(|root| root.root_id))
+    }
+
+    /// The selected root's joined runtime view.
+    pub fn workflow_detail(&self) -> Option<&WorkflowDetail> {
+        self.workflow_detail.as_ref()
+    }
+
+    /// The catalog DAG source (`workflow.get`).
+    pub fn workflow_graph(&self) -> &WorkflowGraphState {
+        &self.workflow_graph
+    }
+
+    /// Select a root in the Workflows list (a row click).
+    pub fn select_workflow_root(&mut self, root_id: uuid::Uuid) {
+        if self.workflow_root == Some(root_id)
+            && self
+                .workflow_detail
+                .as_ref()
+                .is_some_and(|detail| detail.root_id == root_id)
+        {
+            return;
+        }
+        self.workflow_root = Some(root_id);
+        if self
+            .workflow_detail
+            .as_ref()
+            .is_none_or(|detail| detail.root_id != root_id)
+        {
+            self.load_workflow_inspect(root_id);
+        }
+    }
+
+    /// Open the Workflows surface for one root (the task detail's button).
+    pub fn open_workflow_root(&mut self, root_id: uuid::Uuid) {
+        self.workflow_root = Some(root_id);
+        self.navigate(Route::Workflows);
+        // `navigate` may have fallen back to another root if the requested one
+        // was not in the snapshot yet; the explicit request wins.
+        self.workflow_root = Some(root_id);
+        if self
+            .workflow_detail
+            .as_ref()
+            .is_none_or(|detail| detail.root_id != root_id)
+        {
+            self.load_workflow_inspect(root_id);
+        }
+        if !self.workflow_graph.loaded && !self.workflow_graph.loading {
+            self.refresh_workflow_graph();
+        }
+    }
+
+    /// The "View workflow" action on a task: use `root_or_self` exactly like
+    /// the TUI, so a directly started run inspects its own single-node root.
+    pub fn open_workflow_for_task(&mut self, task_id: uuid::Uuid, cx: &mut Context<Self>) {
+        let root_id = self
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .map(Task::root_or_self)
+            .or_else(|| self.selected_task().map(Task::root_or_self));
+        match root_id {
+            Some(root_id) => self.open_workflow_root(root_id),
+            None => self.show_toast(
+                ToastKind::Info,
+                "That run is no longer in the list, so its workflow cannot be opened.".to_string(),
+                cx,
+            ),
+        }
+    }
+
+    /// Ask for a fresh inspect read and DAG source (the surface's Refresh).
+    pub fn refresh_workflow(&mut self) {
+        self.refresh_snapshot();
+        if let Some(root_id) = self.workflow_root.or_else(|| self.selected_workflow_root()) {
+            self.load_workflow_inspect(root_id);
+        }
+        self.refresh_workflow_graph();
+    }
+
+    /// Fetch the catalog DAG source. An older source stays visible on error.
+    pub fn refresh_workflow_graph(&mut self) {
+        if self.workflow_graph.loading {
+            return;
+        }
+        self.workflow_graph.begin_load();
+        match &self.runtime {
+            Some(runtime) => runtime.load_workflow_graph(),
+            None => self
+                .workflow_graph
+                .fail("the transport is not running".to_string()),
+        }
+    }
+
+    /// Move the highlighted instance within the selected root.
+    pub fn move_workflow_selection(&mut self, delta: isize) {
+        if let Some(detail) = self.workflow_detail.as_mut() {
+            detail.move_selection(delta);
+        }
+    }
+
+    /// Home/End on the Workflows instance list.
+    pub fn workflow_selection_edge(&mut self, last: bool) {
+        if let Some(detail) = self.workflow_detail.as_mut() {
+            detail.select_edge(last);
+        }
+    }
+
+    /// PageUp/PageDown on the Workflows instance list.
+    pub fn workflow_selection_page(&mut self, direction: isize) {
+        if let Some(detail) = self.workflow_detail.as_mut() {
+            detail.move_selection(direction * TASKS_PAGE_ROWS as isize);
+        }
+    }
+
+    /// Highlight one workflow instance (a row click).
+    pub fn select_workflow_instance(&mut self, task_id: uuid::Uuid) {
+        if let Some(detail) = self.workflow_detail.as_mut() {
+            detail.select(task_id);
+        }
+    }
+
+    /// Open the highlighted workflow instance in the task detail.
+    pub fn open_workflow_selected(&mut self) -> Option<uuid::Uuid> {
+        let task_id = self.workflow_detail.as_ref()?.selected_id()?;
+        self.navigate(Route::Tasks);
+        self.select_tasks_row(task_id);
+        self.open_task(task_id);
+        Some(task_id)
+    }
+
+    /// Open the root-cancel confirmation, naming the number of instances.
+    pub fn request_workflow_cancel(&mut self, cx: &mut Context<Self>) {
+        let Some(detail) = self.workflow_detail.as_ref() else {
+            self.show_toast(
+                ToastKind::Info,
+                "Select a workflow root first.".to_string(),
+                cx,
+            );
+            return;
+        };
+        let cancellable = detail.cancellable();
+        if cancellable == 0 {
+            self.show_toast(
+                ToastKind::Info,
+                format!(
+                    "Every instance in '{}' has already finished.",
+                    detail.root_name
+                ),
+                cx,
+            );
+            return;
+        }
+        self.workflow_confirm = Some(WorkflowCancelConfirm {
+            root_id: detail.root_id,
+            root_name: detail.root_name.clone(),
+            cancellable,
+        });
+    }
+
+    /// The root-cancel dialog, when one is open.
+    pub fn workflow_confirm(&self) -> Option<&WorkflowCancelConfirm> {
+        self.workflow_confirm.as_ref()
+    }
+
+    /// Dismiss the root-cancel dialog.
+    pub fn cancel_workflow_confirm(&mut self) {
+        self.workflow_confirm = None;
+    }
+
+    /// Confirm the root cancel: mark every non-terminal row locally, send the
+    /// RPC, and reconcile (or roll back) when the response lands.
+    pub fn accept_workflow_confirm(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(confirm) = self.workflow_confirm.take() else {
+            return false;
+        };
+        let Some(detail) = self.workflow_detail.as_mut() else {
+            return true;
+        };
+        if detail.root_id != confirm.root_id {
+            return true;
+        }
+        let previous = detail.clone();
+        if detail.begin_cancel() == 0 {
+            return true;
+        }
+        self.workflow_cancel_previous = Some(previous.clone());
+        match &self.runtime {
+            Some(runtime) => runtime.cancel_workflow(confirm.root_id),
+            None => {
+                if let Some(detail) = self.workflow_detail.as_mut() {
+                    if detail.root_id == confirm.root_id {
+                        *detail = previous;
+                    }
+                }
+                self.workflow_cancel_previous = None;
+                self.show_toast(
+                    ToastKind::Error,
+                    "The transport is not running. The workflow was not cancelled.".to_string(),
+                    cx,
+                );
+            }
+        }
+        true
+    }
+
+    /// Retry one failed instance (`workflow.retry`).
+    ///
+    /// The row moves to Ready with its optimistic marker immediately; the
+    /// response and the next `task.updated` carry the real attempt.
+    pub fn retry_workflow_instance(&mut self, task_id: uuid::Uuid, cx: &mut Context<Self>) {
+        let Some(detail) = self.workflow_detail.as_mut() else {
+            return;
+        };
+        let Some(previous) = detail.begin_retry(task_id) else {
+            let message = detail
+                .rows
+                .iter()
+                .find(|row| row.id == task_id)
+                .map(|row| {
+                    format!(
+                        "Only a failed instance can be retried; '{}' is {}.",
+                        row.name,
+                        row.status_kind().label()
+                    )
+                })
+                .unwrap_or_else(|| "Select a failed instance first.".to_string());
+            self.show_toast(ToastKind::Info, message, cx);
+            return;
+        };
+        self.workflow_retry_previous.insert(task_id, previous);
+        match &self.runtime {
+            Some(runtime) => runtime.retry_workflow_task(task_id),
+            None => {
+                if let Some(previous) = self.workflow_retry_previous.remove(&task_id) {
+                    if let Some(detail) = self.workflow_detail.as_mut() {
+                        detail.rollback_retry(previous);
+                    }
+                }
+                self.show_toast(
+                    ToastKind::Error,
+                    "The transport is not running. The retry was not sent.".to_string(),
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Retry the highlighted instance (the `r` shortcut).
+    pub fn retry_workflow_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(task_id) = self
+            .workflow_detail
+            .as_ref()
+            .and_then(WorkflowDetail::selected_id)
+        else {
+            self.show_toast(
+                ToastKind::Info,
+                "Select a failed instance first.".to_string(),
+                cx,
+            );
+            return;
+        };
+        self.retry_workflow_instance(task_id, cx);
+    }
+
+    /// Copy the catalog DOT source (the monospace pane has no text selection in
+    /// this GPUI build).
+    pub fn copy_workflow_dot(&mut self, cx: &mut Context<Self>) {
+        if self.workflow_graph.dot.is_empty() {
+            self.show_toast(
+                ToastKind::Info,
+                "The catalog DAG source has not loaded yet.".to_string(),
+                cx,
+            );
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(self.workflow_graph.dot.clone()));
+        self.show_toast(
+            ToastKind::Success,
+            "Copied the catalog DAG source.".to_string(),
+            cx,
+        );
     }
 
     /// Ask the runtime for a fresh `catalog.list`. Like the task snapshot, an
@@ -1070,6 +1701,14 @@ impl ClientState {
         match self.active_route {
             Route::Inbox | Route::Tasks => self.refresh_snapshot(),
             Route::Catalog => self.refresh_catalog(),
+            Route::Workflows => {
+                self.refresh_snapshot();
+                self.refresh_workflow_graph();
+                if let Some(root_id) = self.workflow_root.or_else(|| self.selected_workflow_root())
+                {
+                    self.load_workflow_inspect(root_id);
+                }
+            }
             _ => {}
         }
         self.ping();
@@ -1106,6 +1745,7 @@ impl ClientState {
         // A confirmation is about one row on one surface; leaving the surface
         // must not leave a hidden dialog targeting it.
         self.task_confirm = None;
+        self.workflow_confirm = None;
         self.active_route = route;
         self.detail_open = false;
         if route == Route::Tasks {
@@ -1115,6 +1755,12 @@ impl ClientState {
             self.refresh_snapshot();
         } else if route == Route::Catalog {
             self.refresh_catalog();
+        } else if route == Route::Workflows {
+            // The root list is derived from the shared snapshot; a first visit
+            // fetches it and then selects the newest root.
+            self.refresh_snapshot();
+            self.ensure_workflow_root();
+            self.refresh_workflow_graph();
         }
     }
 
@@ -1933,6 +2579,13 @@ impl ClientState {
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
     }
+}
+
+/// An id suffix for the rare placeholder whose root task is outside the
+/// snapshot window: short enough for a heading, unique enough to disambiguate.
+fn short_id(id: uuid::Uuid) -> String {
+    let value = id.to_string();
+    value.chars().take(8).collect()
 }
 
 /// The repo name the top bar shows: the final component of the daemon's cwd.

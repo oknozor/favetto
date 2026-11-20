@@ -250,6 +250,8 @@ typed_calls! {
     agents_list => AgentsListCall,
     /// `agents.reply`.
     agents_reply => AgentsReplyCall,
+    /// `workflow.get`.
+    workflow_get => WorkflowGetCall,
     /// `workflow.inspect`.
     workflow_inspect => WorkflowInspectCall,
     /// `workflow.cancel`.
@@ -355,6 +357,32 @@ mod tests {
                     assert_eq!(request.method, method_name);
                     assert_eq!(request.params["id"], id.to_string());
                 }
+                other => panic!("expected a request frame, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn workflow_requests_carry_the_root_or_task_id() {
+        let root_id = uuid::Uuid::from_u128(7);
+        let task_id = uuid::Uuid::from_u128(8);
+        let graph = encode_request::<WorkflowGetCall>(1, &EmptyParams {}).expect("encode get");
+        let inspect = encode_request::<WorkflowInspectCall>(2, &WorkflowInspectParams { root_id })
+            .expect("encode inspect");
+        let cancel = encode_request::<WorkflowCancelCall>(3, &WorkflowInspectParams { root_id })
+            .expect("encode cancel");
+        let retry = encode_request::<WorkflowRetryCall>(4, &WorkflowRetryParams { task_id })
+            .expect("encode retry");
+
+        for (bytes, method_name) in [
+            (graph, method::WORKFLOW_GET),
+            (inspect, method::WORKFLOW_INSPECT),
+            (cancel, method::WORKFLOW_CANCEL),
+            (retry, method::WORKFLOW_RETRY),
+        ] {
+            let frame: Frame = rmp_serde::from_slice(&bytes).expect("decode frame");
+            match frame {
+                Frame::Request(request) => assert_eq!(request.method, method_name),
                 other => panic!("expected a request frame, got {other:?}"),
             }
         }

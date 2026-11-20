@@ -83,6 +83,10 @@ actions!(
         CatalogFieldNext,
         /// Move to the previous Catalog form field (Shift+Tab).
         CatalogFieldPrev,
+        /// Open the root-cancel confirmation on Workflows (`c`).
+        WorkflowCancelRoot,
+        /// Retry the highlighted failed workflow instance (`r`).
+        WorkflowRetryInstance,
         /// Refresh the connection and the current surface.
         Refresh,
         /// Restart the transport.
@@ -254,6 +258,33 @@ pub fn bindings() -> Vec<KeyBinding> {
             CatalogLaunchSubmit,
             Some("Catalog && Oneshot"),
         ),
+        // Workflows: the root cancel and failed-instance retry are registered
+        // after the generic `r` refresh so they win on this surface only.
+        KeyBinding::new(
+            "c",
+            WorkflowCancelRoot,
+            Some("Workflows && !Palette && !Shortcuts && !Confirm"),
+        ),
+        KeyBinding::new(
+            "r",
+            WorkflowRetryInstance,
+            Some("Workflows && !Palette && !Shortcuts && !Confirm"),
+        ),
+        KeyBinding::new(
+            "enter",
+            TaskConfirmAccept,
+            Some("Workflows && Confirm && !Palette && !Shortcuts"),
+        ),
+        KeyBinding::new(
+            "y",
+            TaskConfirmAccept,
+            Some("Workflows && Confirm && !Palette && !Shortcuts"),
+        ),
+        KeyBinding::new(
+            "n",
+            TaskConfirmReject,
+            Some("Workflows && Confirm && !Palette && !Shortcuts"),
+        ),
     ]
 }
 
@@ -378,6 +409,29 @@ mod tests {
         let accept = order.iter().position(|name| name == "TaskConfirmAccept");
         assert!(list_open.is_some() && accept.is_some());
         assert!(accept > list_open);
+    }
+
+    #[test]
+    fn workflow_shortcuts_are_scoped_to_the_workflows_surface() {
+        for (action, key) in [("WorkflowCancelRoot", "c"), ("WorkflowRetryInstance", "r")] {
+            let matches: Vec<_> = bindings()
+                .into_iter()
+                .filter(|binding| {
+                    binding.action().name().ends_with(action)
+                        && binding
+                            .keystrokes()
+                            .iter()
+                            .any(|stroke| stroke.key() == key)
+                })
+                .collect();
+            assert_eq!(matches.len(), 1, "{action} must have exactly one binding");
+            assert!(
+                matches[0]
+                    .predicate()
+                    .is_some_and(|predicate| predicate.to_string().contains("Workflows")),
+                "{action} must only fire on the Workflows surface"
+            );
+        }
     }
 
     #[test]
