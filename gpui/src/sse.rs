@@ -14,8 +14,21 @@
 //! The parser, cursor and backoff are pure and unit-tested on the host; only
 //! [`run`] touches the network.
 
-use favetto_wire::model::{Event, Task};
+use favetto_wire::model::{AgentStateEvent, Event, Task};
 use favetto_wire::rpc::{push, AgentEventPush, AgentExitPush, AgentStatePush};
+use serde::Deserialize;
+
+/// The outer shape of an `agent.event` push. The event itself stays raw until
+/// it is known to be renderable, so an event kind this client does not know can
+/// be skipped instead of failing the whole frame.
+#[derive(Deserialize)]
+struct RawAgentEventPush {
+    session_id: String,
+    #[serde(default)]
+    task_id: Option<String>,
+    seq: u64,
+    event: serde_json::Value,
+}
 
 /// One dispatched SSE frame.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -52,6 +65,15 @@ pub enum Push {
     CatalogUpdated,
     /// One normalized agent-state event (`agent.event`).
     AgentEvent(AgentEventPush),
+    /// An `agent.event` whose kind this client does not know yet. The frame is
+    /// deliberately ignored rather than failed, so a newer daemon cannot break
+    /// the feed (docs step 06).
+    UnsupportedAgentEvent {
+        /// The session the skipped event belonged to.
+        session_id: String,
+        /// The skipped event's sequence number, for diagnostics.
+        seq: u64,
+    },
     /// A session's folded live state changed (`agent.state`).
     AgentState(AgentStatePush),
     /// An agent session's child process exited (`agent.exit`).
@@ -68,6 +90,9 @@ impl Push {
             Self::TaskUpdated(task) => format!("task {} ({:?})", task.name, task.status),
             Self::CatalogUpdated => "catalog updated".to_string(),
             Self::AgentEvent(event) => format!("agent event {} #{}", event.session_id, event.seq),
+            Self::UnsupportedAgentEvent { session_id, seq } => {
+                format!("agent event {session_id} #{seq} (unsupported)")
+            }
             Self::AgentState(event) => format!("agent state {}", event.session_id),
             Self::AgentExit(event) => format!("agent exit {}", event.session_id),
             Self::Unknown(method) => method.clone(),
@@ -90,6 +115,8 @@ pub struct PushError {
 /// Frames without an `event:` field are ignored (`Ok(None)`), matching the
 /// daemon, which always names its pushes. Unknown methods become
 /// [`Push::Unknown`] rather than an error so forward compatibility is free.
+/// An `agent.event` with an unknown event kind becomes
+/// [`Push::UnsupportedAgentEvent`] for the same reason.
 pub fn decode_push(event: &SseEvent) -> Result<Option<Push>, PushError> {
     let Some(method) = event.event.as_deref() else {
         return Ok(None);
@@ -99,29 +126,42 @@ pub fn decode_push(event: &SseEvent) -> Result<Option<Push>, PushError> {
         message: err.to_string(),
     })?;
 
-    let decode = |value: serde_json::Value| -> Result<Push, PushError> {
-        let result = match method {
-            push::EVENT => serde_json::from_value::<Event>(value).map(Push::Event),
-            push::TASK_UPDATED => serde_json::from_value::<Task>(value).map(Push::TaskUpdated),
-            push::AGENT_EVENT => {
-                serde_json::from_value::<AgentEventPush>(value).map(Push::AgentEvent)
-            }
-            push::AGENT_STATE => {
-                serde_json::from_value::<AgentStatePush>(value).map(Push::AgentState)
-            }
-            push::AGENT_EXIT => serde_json::from_value::<AgentExitPush>(value).map(Push::AgentExit),
-            _ => return Ok(Push::Unknown(method.to_string())),
-        };
-        result.map_err(|err| PushError {
-            method: method.to_string(),
-            message: err.to_string(),
-        })
-    };
-
     if method == push::CATALOG_UPDATED {
         return Ok(Some(Push::CatalogUpdated));
     }
-    decode(params).map(Some)
+
+    let failure = |message: String| PushError {
+        method: method.to_string(),
+        message,
+    };
+    let decoded = match method {
+        push::EVENT => serde_json::from_value::<Event>(params).map(Push::Event),
+        push::TASK_UPDATED => serde_json::from_value::<Task>(params).map(Push::TaskUpdated),
+        push::AGENT_EVENT => return decode_agent_event(params).map(Some).map_err(failure),
+        push::AGENT_STATE => serde_json::from_value::<AgentStatePush>(params).map(Push::AgentState),
+        push::AGENT_EXIT => serde_json::from_value::<AgentExitPush>(params).map(Push::AgentExit),
+        _ => return Ok(Some(Push::Unknown(method.to_string()))),
+    };
+    decoded.map(Some).map_err(|err| failure(err.to_string()))
+}
+
+/// Decode an `agent.event` push, tolerating an event kind this client does not
+/// know. The envelope must still be well-formed; only the inner event may be
+/// unsupported.
+fn decode_agent_event(params: serde_json::Value) -> Result<Push, String> {
+    let raw: RawAgentEventPush = serde_json::from_value(params).map_err(|err| err.to_string())?;
+    match serde_json::from_value::<AgentStateEvent>(raw.event) {
+        Ok(event) => Ok(Push::AgentEvent(AgentEventPush {
+            session_id: raw.session_id,
+            task_id: raw.task_id,
+            seq: raw.seq,
+            event,
+        })),
+        Err(_) => Ok(Push::UnsupportedAgentEvent {
+            session_id: raw.session_id,
+            seq: raw.seq,
+        }),
+    }
 }
 
 /// Incremental SSE frame parser.
@@ -564,5 +604,35 @@ mod tests {
         let error = decode_push(&malformed).expect_err("malformed");
         assert_eq!(error.method, push::TASK_UPDATED);
         assert!(!error.message.is_empty());
+    }
+
+    #[test]
+    fn unknown_agent_event_kinds_are_skipped_not_fatal() {
+        let frame = SseEvent {
+            event: Some(push::AGENT_EVENT.to_string()),
+            data: serde_json::json!({
+                "session_id": "ses_1",
+                "task_id": "task-1",
+                "seq": 7,
+                "event": { "event": "future_kind", "detail": 1 },
+            })
+            .to_string(),
+            ..SseEvent::default()
+        };
+        match decode_push(&frame).expect("decode") {
+            Some(Push::UnsupportedAgentEvent { session_id, seq }) => {
+                assert_eq!(session_id, "ses_1");
+                assert_eq!(seq, 7);
+            }
+            other => panic!("expected an unsupported agent event, got {other:?}"),
+        }
+
+        // A malformed envelope is still an error, not silently dropped.
+        let broken = SseEvent {
+            event: Some(push::AGENT_EVENT.to_string()),
+            data: "{\"session_id\":\"ses_1\"}".into(),
+            ..SseEvent::default()
+        };
+        assert!(decode_push(&broken).is_err());
     }
 }

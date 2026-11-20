@@ -7,8 +7,9 @@
 //! (docs/design/gpui-client.md §4).
 //!
 //! Step 03 adds the active route and the pushed-detail flag that drive the
-//! shell. Steps 04+ add tasks, sessions, the catalog and per-task event feeds
-//! here.
+//! shell. Steps 04–05 add the shared task/session snapshot and list models;
+//! step 06 adds the opened run's output, structured feed, attempt table and
+//! permission reply.
 
 #![allow(dead_code)] // Accessors and `ping()` are consumed by the views in steps 03+.
 
@@ -16,10 +17,12 @@ use std::path::Path;
 use std::time::Duration;
 
 use chrono::Utc;
-use favetto_wire::model::{AgentSessionInfo, Task, TaskStatus};
-use gpui::{Context, Task as GpuiTask};
+use favetto_wire::model::{AgentSessionInfo, AgentUsage, InputReply, Task, TaskStatus};
+use favetto_wire::rpc::AgentEventPush;
+use gpui::{ClipboardItem, Context, Task as GpuiTask};
 
 use crate::config::{self, ClientConfig};
+use crate::detail::{DetailTab, PendingRequest, TaskDetail};
 use crate::inbox::{self, InboxKey, InboxRows};
 use crate::routes::Route;
 use crate::runtime::{PingSnapshot, Runtime, Update};
@@ -200,6 +203,8 @@ pub struct ClientState {
     toast_id: u64,
     /// The run opened from a list (step 06 renders its detail).
     selected_task: Option<uuid::Uuid>,
+    /// The open detail's output, structured feed and attempt table.
+    detail: Option<TaskDetail>,
     /// The daemon's repo name, derived from the `system.ping` cwd.
     repo: Option<String>,
     /// The foreground task that drains [`Runtime`] updates. Declared before the
@@ -267,6 +272,7 @@ impl ClientState {
             toast: None,
             toast_id: 0,
             selected_task: None,
+            detail: None,
             repo: None,
             runtime,
             drain,
@@ -325,15 +331,53 @@ impl ClientState {
                     // Fold the row immediately (Doherty: a local change within
                     // 100 ms), then reload to pick up the session/request text.
                     Push::TaskUpdated(task) => {
+                        let open =
+                            self.detail.as_ref().map(|detail| detail.task_id) == Some(task.id);
+                        let was_terminal = self
+                            .detail
+                            .as_ref()
+                            .and_then(TaskDetail::status)
+                            .is_some_and(tasks::is_terminal);
+                        let attempt_changed = self
+                            .detail
+                            .as_ref()
+                            .and_then(|detail| detail.task.as_ref())
+                            .is_some_and(|existing| existing.attempt != task.attempt);
                         self.upsert_task(task.clone());
+                        if open {
+                            if let Some(detail) = &mut self.detail {
+                                detail.update_summary(task.clone());
+                            }
+                            // A finished run persists its output and final
+                            // attempt row, and a retry starts a fresh feed;
+                            // both need the detail reads again.
+                            if attempt_changed || (!was_terminal && tasks::is_terminal(task.status))
+                            {
+                                self.load_detail(task.id);
+                            }
+                        }
+                        self.refresh_snapshot();
+                    }
+                    // Fold one structured event into the open detail, then
+                    // reconcile the session roster (the permission banner's
+                    // authoritative source).
+                    Push::AgentEvent(event) => {
+                        if self.event_belongs_to_open_task(event) {
+                            if let Some(detail) = &mut self.detail {
+                                detail.push_event(event.clone());
+                            }
+                        }
                         self.refresh_snapshot();
                     }
                     // A blocked or resolved prompt changes the agent roster,
                     // which only `agents.list` can reconcile.
-                    Push::AgentState(_) | Push::AgentEvent(_) => self.refresh_snapshot(),
+                    Push::AgentState(_) => self.refresh_snapshot(),
+                    // Unknown method or event kind: counted above, ignored here
+                    // (docs step 06: never fatal).
                     Push::Event(_)
                     | Push::CatalogUpdated
                     | Push::AgentExit(_)
+                    | Push::UnsupportedAgentEvent { .. }
                     | Push::Unknown(_) => {}
                 }
             }
@@ -353,6 +397,115 @@ impl ClientState {
                 self.snapshot_status = SnapshotStatus::Failed {
                     message: error.to_string(),
                 };
+            }
+            Update::TaskLoaded { task } => {
+                if let Some(detail) = self.detail.as_mut() {
+                    if detail.task_id == task.id {
+                        detail.set_task(*task);
+                    }
+                }
+            }
+            Update::TaskLoadFailed { task_id, error } => {
+                if error.is_unauthorized() {
+                    self.connection = ConnectionState::Unauthorized {
+                        token_path: self.config.token_source.label(),
+                    };
+                }
+                if let Some(detail) = self.detail.as_mut() {
+                    if detail.task_id == task_id {
+                        detail.fail_task(error.to_string());
+                    }
+                }
+            }
+            Update::EventsLoaded { task_id, result } => {
+                if let Some(detail) = self.detail.as_mut() {
+                    if detail.task_id == task_id {
+                        let result = *result;
+                        detail.merge_events(
+                            result.session_id,
+                            result.events,
+                            result.next_cursor,
+                            result.ignored,
+                        );
+                    }
+                }
+            }
+            Update::EventsFailed { task_id, error } => {
+                if error.is_unauthorized() {
+                    self.connection = ConnectionState::Unauthorized {
+                        token_path: self.config.token_source.label(),
+                    };
+                }
+                if let Some(detail) = self.detail.as_mut() {
+                    if detail.task_id == task_id {
+                        detail.fail_events(error.to_string());
+                    }
+                }
+            }
+            Update::RunsLoaded { task_id, runs } => {
+                if let Some(detail) = self.detail.as_mut() {
+                    if detail.task_id == task_id {
+                        detail.set_runs(runs);
+                    }
+                }
+            }
+            Update::RunsFailed { task_id, error } => {
+                if error.is_unauthorized() {
+                    self.connection = ConnectionState::Unauthorized {
+                        token_path: self.config.token_source.label(),
+                    };
+                }
+                if let Some(detail) = self.detail.as_mut() {
+                    if detail.task_id == task_id {
+                        detail.fail_runs(error.to_string());
+                    }
+                }
+            }
+            Update::ReplyFinished {
+                request_id,
+                reply,
+                result,
+                ..
+            } => {
+                let open = self.detail.as_ref().is_some_and(|detail| {
+                    detail.reply_pending.as_deref() == Some(request_id.as_str())
+                });
+                if let Some(detail) = self.detail.as_mut() {
+                    if detail.reply_pending.as_deref() == Some(request_id.as_str()) {
+                        detail.reply_pending = None;
+                    }
+                }
+                match result {
+                    Ok(result) if result.replied => {
+                        if open {
+                            if let Some(detail) = self.detail.as_mut() {
+                                detail.answered_request = Some(request_id);
+                            }
+                        }
+                        self.show_toast(ToastKind::Success, reply_done_message(&reply), cx);
+                    }
+                    Ok(_) => self.show_toast(
+                        ToastKind::Error,
+                        "The daemon did not accept the reply. The prompt is still open."
+                            .to_string(),
+                        cx,
+                    ),
+                    Err(error) => {
+                        if error.is_unauthorized() {
+                            self.connection = ConnectionState::Unauthorized {
+                                token_path: self.config.token_source.label(),
+                            };
+                        }
+                        self.show_toast(
+                            ToastKind::Error,
+                            format!("Could not answer the agent: {error}."),
+                            cx,
+                        );
+                    }
+                }
+                // The daemon also pushes `agent.state`; one reconciling load
+                // keeps the banner's request text in step.
+                self.refresh_snapshot();
             }
             Update::TaskActionFinished {
                 action,
@@ -395,6 +548,13 @@ impl ClientState {
                 }
                 // The daemon also pushes `task.updated`; one reconciling load
                 // keeps session-derived fields (agent, cost) in step.
+                if self
+                    .detail
+                    .as_ref()
+                    .is_some_and(|detail| detail.task_id == previous.id)
+                {
+                    self.load_detail(previous.id);
+                }
                 self.refresh_snapshot();
             }
         }
@@ -807,11 +967,37 @@ impl ClientState {
         }
         let optimistic_snapshot = optimistic.clone();
         self.upsert_task(optimistic);
+        if let Some(detail) = self.detail.as_mut() {
+            if detail.task_id == optimistic_snapshot.id {
+                detail.task = Some(optimistic_snapshot.clone());
+                detail.task_loading = false;
+                detail.task_error = None;
+                if confirm.action == TaskAction::Retry {
+                    // A retry starts a new attempt: the prior feed and attempt
+                    // rows belong to the old run, so clear them until the
+                    // reconciling reload lands.
+                    detail.events.clear();
+                    detail.events_cursor = 0;
+                    detail.events_loaded = false;
+                    detail.events_ignored = 0;
+                    detail.new_events = 0;
+                    detail.runs.clear();
+                    detail.runs_loaded = false;
+                    detail.answered_request = None;
+                    detail.reply_pending = None;
+                }
+            }
+        }
 
         if let Some(runtime) = &self.runtime {
             runtime.task_action(confirm.action, previous, optimistic_snapshot);
         } else {
             self.rollback_task(&previous, &optimistic_snapshot);
+            if let Some(detail) = self.detail.as_mut() {
+                if detail.task_id == previous.id {
+                    detail.task = Some(previous);
+                }
+            }
             self.show_toast(
                 ToastKind::Error,
                 "The transport is not running. The change was rolled back.".to_string(),
@@ -860,9 +1046,360 @@ impl ClientState {
     }
 
     /// Select and push the detail page for a specific task (a Recent row click).
+    ///
+    /// Opening the same run again refreshes it without discarding the feed; a
+    /// different run starts a fresh detail so stale output can never appear
+    /// under another task's header.
     pub fn open_task(&mut self, task_id: uuid::Uuid) {
+        let same = self
+            .detail
+            .as_ref()
+            .is_some_and(|detail| detail.task_id == task_id);
+        if same {
+            if let Some(detail) = &mut self.detail {
+                detail.reload();
+            }
+        } else {
+            self.detail = Some(TaskDetail::new(task_id));
+        }
         self.selected_task = Some(task_id);
         self.detail_open = true;
+        self.load_detail(task_id);
+    }
+
+    /// Fetch every part of one task's detail (initial open, terminal transition
+    /// and post-action reconciliation).
+    fn load_detail(&mut self, task_id: uuid::Uuid) {
+        if let Some(detail) = self.detail.as_mut() {
+            if detail.task_id == task_id {
+                // Keep loaded rows visible; this only marks the reads in
+                // flight and clears the previous errors.
+                detail.reload();
+            }
+        }
+        match &self.runtime {
+            Some(runtime) => runtime.load_task_detail(task_id),
+            None => {
+                if let Some(detail) = self.detail.as_mut() {
+                    if detail.task_id == task_id {
+                        let message = "the transport is not running".to_string();
+                        detail.fail_task(message.clone());
+                        detail.fail_events(message.clone());
+                        detail.fail_runs(message);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The open detail, when a run is selected.
+    pub fn detail(&self) -> Option<&TaskDetail> {
+        self.detail.as_ref()
+    }
+
+    /// The active detail tab.
+    pub fn detail_tab(&self) -> DetailTab {
+        self.detail
+            .as_ref()
+            .map(|detail| detail.tab)
+            .unwrap_or_default()
+    }
+
+    /// Switch tabs. Selecting Events while following consumes the unseen count.
+    pub fn set_detail_tab(&mut self, tab: DetailTab) {
+        if let Some(detail) = self.detail.as_mut() {
+            detail.tab = tab;
+            if tab == DetailTab::Events && detail.follow {
+                detail.new_events = 0;
+            }
+        }
+    }
+
+    /// Whether the detail viewport follows new content.
+    pub fn detail_follow(&self) -> bool {
+        self.detail
+            .as_ref()
+            .map(|detail| detail.follow)
+            .unwrap_or(true)
+    }
+
+    /// Pause or resume tailing. Resuming clears the unseen counter.
+    pub fn set_detail_follow(&mut self, follow: bool) {
+        if let Some(detail) = self.detail.as_mut() {
+            detail.follow = follow;
+            if follow {
+                detail.new_events = 0;
+            }
+        }
+    }
+
+    /// Events that arrived while the detail was pinned off the tail.
+    pub fn detail_new_events(&self) -> u64 {
+        self.detail
+            .as_ref()
+            .map(|detail| detail.new_events)
+            .unwrap_or(0)
+    }
+
+    /// The prompt the permission banner should render, when one is open.
+    pub fn detail_pending_request(&self) -> Option<PendingRequest> {
+        self.detail.as_ref()?.pending_request(&self.sessions)
+    }
+
+    /// The agent that owns the selected run, from the live session or the most
+    /// recent attempt (the task row itself carries no agent).
+    pub fn detail_agent(&self) -> Option<String> {
+        let task_id = self.selected_task?;
+        let task_id = task_id.to_string();
+        self.sessions
+            .iter()
+            .find(|session| session.task_id.as_deref() == Some(task_id.as_str()))
+            .map(|session| session.agent.clone())
+            .or_else(|| {
+                self.detail
+                    .as_ref()
+                    .and_then(|detail| detail.runs.iter().rev().find_map(|run| run.agent.clone()))
+            })
+    }
+
+    /// Token/cost usage for the selected run: the live session wins while it is
+    /// running, otherwise the most recent attempt that reported usage.
+    pub fn detail_usage(&self) -> Option<AgentUsage> {
+        let task_id = self.selected_task?;
+        let task_id = task_id.to_string();
+        let live = self
+            .sessions
+            .iter()
+            .find(|session| session.task_id.as_deref() == Some(task_id.as_str()))
+            .and_then(|session| session.usage.clone())
+            .filter(|usage| !usage.is_empty());
+        live.or_else(|| {
+            self.detail
+                .as_ref()
+                .and_then(|detail| detail.runs.iter().rev().find_map(|run| run.usage.clone()))
+        })
+    }
+
+    /// The agent's own session id, from whichever source has it.
+    pub fn detail_session_id(&self) -> Option<String> {
+        let detail = self.detail.as_ref()?;
+        detail
+            .task
+            .as_ref()
+            .and_then(|task| task.session_id.clone())
+            .or_else(|| {
+                detail
+                    .runs
+                    .iter()
+                    .rev()
+                    .find_map(|run| run.session_id.clone())
+            })
+            .or_else(|| detail.events_session.clone())
+            .or_else(|| {
+                let task_id = detail.task_id.to_string();
+                self.sessions
+                    .iter()
+                    .find(|session| session.task_id.as_deref() == Some(task_id.as_str()))
+                    .and_then(|session| session.session_id.clone())
+            })
+            .or_else(|| {
+                self.selected_task()
+                    .and_then(|task| task.session_id.clone())
+            })
+    }
+
+    /// Retry the persisted-output fetch for the open detail.
+    pub fn retry_detail_task(&mut self) {
+        let Some(task_id) = self.detail.as_ref().map(|detail| detail.task_id) else {
+            return;
+        };
+        if let Some(detail) = self.detail.as_mut() {
+            detail.task_loading = true;
+            detail.task_error = None;
+        }
+        match &self.runtime {
+            Some(runtime) => runtime.load_task(task_id),
+            None => {
+                if let Some(detail) = self.detail.as_mut() {
+                    detail.fail_task("the transport is not running".to_string());
+                }
+            }
+        }
+    }
+
+    /// Retry the structured-event backfill for the open detail.
+    pub fn retry_detail_events(&mut self) {
+        let Some(task_id) = self.detail.as_ref().map(|detail| detail.task_id) else {
+            return;
+        };
+        if let Some(detail) = self.detail.as_mut() {
+            detail.events_loading = true;
+            detail.events_error = None;
+        }
+        match &self.runtime {
+            Some(runtime) => runtime.load_task_events(task_id),
+            None => {
+                if let Some(detail) = self.detail.as_mut() {
+                    detail.fail_events("the transport is not running".to_string());
+                }
+            }
+        }
+    }
+
+    /// Retry the attempt-table fetch for the open detail.
+    pub fn retry_detail_runs(&mut self) {
+        let Some(task_id) = self.detail.as_ref().map(|detail| detail.task_id) else {
+            return;
+        };
+        if let Some(detail) = self.detail.as_mut() {
+            detail.runs_loading = true;
+            detail.runs_error = None;
+        }
+        match &self.runtime {
+            Some(runtime) => runtime.load_task_runs(task_id),
+            None => {
+                if let Some(detail) = self.detail.as_mut() {
+                    detail.fail_runs("the transport is not running".to_string());
+                }
+            }
+        }
+    }
+
+    /// Answer the open permission prompt. The request id is correlated exactly;
+    /// a screen-detected prompt has none and is explained instead of guessed.
+    pub fn reply_to_pending(
+        &mut self,
+        request: &PendingRequest,
+        reply: InputReply,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(request_id) = request.request_id.clone() else {
+            self.show_toast(
+                ToastKind::Info,
+                "This prompt was detected on the agent's screen and cannot be answered here. \
+                 Answer it in the agent's terminal."
+                    .to_string(),
+                cx,
+            );
+            return;
+        };
+        if request.session_id.is_empty() {
+            self.show_toast(
+                ToastKind::Info,
+                "The daemon has not reported which session owns this prompt yet.".to_string(),
+                cx,
+            );
+            return;
+        }
+        let already_pending = self
+            .detail
+            .as_ref()
+            .is_some_and(|detail| detail.reply_pending.is_some());
+        if already_pending {
+            return;
+        }
+        if let Some(detail) = self.detail.as_mut() {
+            detail.reply_pending = Some(request_id.clone());
+        }
+        match &self.runtime {
+            Some(runtime) => runtime.reply(request.session_id.clone(), request_id, reply),
+            None => {
+                if let Some(detail) = self.detail.as_mut() {
+                    detail.reply_pending = None;
+                }
+                self.show_toast(
+                    ToastKind::Error,
+                    "The transport is not running, so the reply was not sent.".to_string(),
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Copy the persisted output to the clipboard (the plain-text pane has no
+    /// text selection in this GPUI build, so Copy is the accessible path).
+    pub fn copy_detail_output(&mut self, cx: &mut Context<Self>) {
+        let Some(output) = self.detail.as_ref().and_then(TaskDetail::output) else {
+            self.show_toast(
+                ToastKind::Info,
+                "This run has no persisted output yet.".to_string(),
+                cx,
+            );
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(output.text));
+        self.show_toast(
+            ToastKind::Success,
+            "Copied the run output to the clipboard.".to_string(),
+            cx,
+        );
+    }
+
+    /// Copy the agent's session id (the header's copyable identity).
+    pub fn copy_session_id(&mut self, session_id: String, cx: &mut Context<Self>) {
+        if session_id.is_empty() {
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(session_id));
+        self.show_toast(ToastKind::Success, "Copied the session id.".to_string(), cx);
+    }
+
+    /// Cancel/retry for the open detail, with the same confirmation and
+    /// validation as the list rows (docs §2, Von Restorff: one danger control).
+    pub fn request_detail_action(&mut self, action: TaskAction, cx: &mut Context<Self>) {
+        let Some(task) = self.selected_task().cloned() else {
+            self.show_toast(ToastKind::Info, "Select a run first.".to_string(), cx);
+            return;
+        };
+        let allowed = match action {
+            TaskAction::Cancel => tasks::can_cancel(task.status),
+            TaskAction::Retry => tasks::can_retry(task.status),
+        };
+        if !allowed {
+            let name = inbox::task_display_name(&task.name);
+            let message = match action {
+                TaskAction::Cancel => {
+                    format!("'{name}' has already finished. Retry it instead.")
+                }
+                TaskAction::Retry => {
+                    format!("'{name}' is still active. Cancel it before retrying.")
+                }
+            };
+            self.show_toast(ToastKind::Info, message, cx);
+            return;
+        }
+        self.task_confirm = Some(TaskConfirm {
+            action,
+            task_id: task.id,
+            task_name: inbox::task_display_name(&task.name).to_string(),
+        });
+    }
+
+    /// Whether a live agent event belongs to the open detail. The daemon marks
+    /// pushes with `task_id`; older pushes only carry the session.
+    fn event_belongs_to_open_task(&self, event: &AgentEventPush) -> bool {
+        let Some(detail) = &self.detail else {
+            return false;
+        };
+        if event
+            .task_id
+            .as_deref()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            == Some(detail.task_id)
+        {
+            return true;
+        }
+        if detail.events_session.as_deref() == Some(event.session_id.as_str()) {
+            return true;
+        }
+        self.sessions.iter().any(|session| {
+            session.id == event.session_id
+                && session
+                    .task_id
+                    .as_deref()
+                    .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                    == Some(detail.task_id)
+        })
     }
 
     /// The task opened from the Inbox, when there is one.
@@ -870,9 +1407,17 @@ impl ClientState {
         self.selected_task
     }
 
-    /// The selected task row, for the detail placeholder.
+    /// The selected task row, for the detail header. The full `tasks.get` copy
+    /// wins over the summary in the list because it carries the output blob.
     pub fn selected_task(&self) -> Option<&Task> {
         let id = self.selected_task?;
+        if let Some(detail) = &self.detail {
+            if detail.task_id == id {
+                if let Some(task) = &detail.task {
+                    return Some(task);
+                }
+            }
+        }
         self.tasks.iter().find(|task| task.id == id)
     }
 
@@ -930,6 +1475,19 @@ fn repo_name(cwd: &str) -> Option<String> {
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .map(str::to_string)
+}
+
+/// The success toast for one answered prompt, in the user's terms.
+fn reply_done_message(reply: &InputReply) -> String {
+    match reply {
+        InputReply::Once => "Allowed the agent's request once.".to_string(),
+        InputReply::Always => "Allowed the agent's request and remembered it.".to_string(),
+        InputReply::Reject => "Rejected the agent's request.".to_string(),
+        InputReply::Value { .. } => "Sent the requested value to the agent.".to_string(),
+        InputReply::Confirmed { confirmed: true } => "Confirmed the agent's request.".to_string(),
+        InputReply::Confirmed { confirmed: false } => "Declined the agent's request.".to_string(),
+        InputReply::Cancelled => "Dismissed the agent's request.".to_string(),
+    }
 }
 
 #[cfg(test)]

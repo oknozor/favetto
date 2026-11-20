@@ -1,62 +1,1435 @@
-//! The detail region: a third column on wide windows, a pushed page on narrow
-//! ones (docs/design/gpui-client.md §1).
+//! The task detail surface: a pinned header, three tabs and the permission
+//! banner (docs/design/gpui-client.md §1, §2, §5 step 06).
+//!
+//! This is the client's core surface, so it follows three rules:
+//!
+//! - **Working Memory** — the header (name, status, agent, repo, attempt,
+//!   elapsed, session id, usage) never scrolls away; only the tab body scrolls.
+//! - **Peak-End** — a finished run ends with its outcome and usage in the
+//!   header, and every tab has an explicit empty/error state with Retry.
+//! - **Von Restorff** — a blocked run gets the only warning-colored surface
+//!   (the permission banner), and Cancel is the only danger-colored action.
+//!
+//! The aggregation and feed grouping live in [`crate::detail`] (pure and
+//! unit-tested); this file only paints them.
 
-use gpui::{div, prelude::*, px, Context, Entity, FocusHandle, IntoElement, Render, Window};
+use std::time::Duration;
+
+use chrono::Utc;
+use favetto_wire::model::{AgentUsage, InputReply, MessageRole, Task, TaskRun};
+use gpui::{
+    div, prelude::*, px, AnyElement, Context, Div, Entity, FocusHandle, Hsla, IntoElement, Render,
+    ScrollDelta, ScrollHandle, ScrollWheelEvent, Stateful, Window,
+};
 
 use crate::components;
+use crate::detail::{
+    self, DetailTab, FeedItem, OutputText, PendingRequest, TaskDetail, ToolStatus,
+};
 use crate::inbox::{self, StatusKind};
 use crate::layout::{container_query, LayoutMode};
 use crate::routes::Route;
 use crate::state::ClientState;
+use crate::tasks;
 use crate::theme::Theme;
 
-/// The detail surface. It reads the active route so the placeholder copy names
-/// the right kind of selection (run, definition, schedule).
+/// Pixels from the bottom within which the viewport counts as "at the tail".
+const FOLLOW_THRESHOLD: f32 = 24.0;
+
+/// The detail surface.
 pub struct DetailView {
     state: Entity<ClientState>,
     back_focus: FocusHandle,
+    tab_focus: Vec<FocusHandle>,
+    cancel_focus: FocusHandle,
+    retry_focus: FocusHandle,
+    copy_focus: FocusHandle,
+    session_focus: FocusHandle,
+    follow_focus: FocusHandle,
+    output_retry_focus: FocusHandle,
+    events_retry_focus: FocusHandle,
+    runs_retry_focus: FocusHandle,
+    reply_once_focus: FocusHandle,
+    reply_always_focus: FocusHandle,
+    reply_reject_focus: FocusHandle,
+    /// Persisted across renders so live events never jump the reader.
+    output_scroll: ScrollHandle,
+    events_scroll: ScrollHandle,
+    /// The content length at the last tail scroll, so auto-follow only reacts to
+    /// growth (and never fights a deliberate scroll).
+    output_rendered: usize,
+    events_rendered: usize,
 }
 
 impl DetailView {
     pub fn new(state: Entity<ClientState>, cx: &mut Context<Self>) -> Self {
         cx.observe(&state, |_this, _state, cx| cx.notify()).detach();
-        Self {
+        let view = Self {
             state,
             back_focus: cx.focus_handle().tab_index(20).tab_stop(true),
+            tab_focus: (0..DetailTab::ALL.len())
+                .map(|index| {
+                    cx.focus_handle()
+                        .tab_index(21 + index as isize)
+                        .tab_stop(true)
+                })
+                .collect(),
+            cancel_focus: cx.focus_handle().tab_index(24).tab_stop(true),
+            retry_focus: cx.focus_handle().tab_index(25).tab_stop(true),
+            copy_focus: cx.focus_handle().tab_index(26).tab_stop(true),
+            session_focus: cx.focus_handle().tab_index(27).tab_stop(true),
+            follow_focus: cx.focus_handle().tab_index(28).tab_stop(true),
+            output_retry_focus: cx.focus_handle().tab_index(29).tab_stop(true),
+            events_retry_focus: cx.focus_handle().tab_index(30).tab_stop(true),
+            runs_retry_focus: cx.focus_handle().tab_index(31).tab_stop(true),
+            reply_once_focus: cx.focus_handle().tab_index(32).tab_stop(true),
+            reply_always_focus: cx.focus_handle().tab_index(33).tab_stop(true),
+            reply_reject_focus: cx.focus_handle().tab_index(34).tab_stop(true),
+            output_scroll: ScrollHandle::new(),
+            events_scroll: ScrollHandle::new(),
+            output_rendered: 0,
+            events_rendered: 0,
+        };
+        view.start_clock(cx);
+        view
+    }
+
+    /// Keep `elapsed` honest for a live run even when the agent is quiet.
+    fn start_clock(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |weak, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            let alive = weak
+                .update(cx, |this: &mut Self, cx| {
+                    let live = this
+                        .state
+                        .read(cx)
+                        .selected_task()
+                        .is_some_and(|task| !tasks::is_terminal(task.status));
+                    if live {
+                        cx.notify();
+                    }
+                })
+                .is_ok();
+            if !alive {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    fn pause_follow(&mut self, cx: &mut Context<Self>) {
+        if self.state.read(cx).detail_follow() {
+            self.state.update(cx, |state, cx| {
+                state.set_detail_follow(false);
+                cx.notify();
+            });
         }
     }
+
+    /// Pause following if a render finds the viewport off the tail. This catches
+    /// scrollbar drags and scroll keys, which do not emit a wheel event.
+    fn watch_bottom(&self, handle: ScrollHandle, cx: &mut Context<Self>) {
+        let state = self.state.clone();
+        cx.defer(move |cx| {
+            if !at_bottom(&handle) {
+                state.update(cx, |state, cx| {
+                    if state.detail_follow() {
+                        state.set_detail_follow(false);
+                        cx.notify();
+                    }
+                });
+            }
+        });
+    }
+
+    /// Re-arm following when a downward wheel comes to rest at the bottom.
+    fn resume_if_at_bottom(&self, handle: ScrollHandle, cx: &mut Context<Self>) {
+        let state = self.state.clone();
+        cx.defer(move |cx| {
+            if at_bottom(&handle) {
+                state.update(cx, |state, cx| {
+                    if !state.detail_follow() {
+                        state.set_detail_follow(true);
+                        cx.notify();
+                    }
+                });
+            }
+        });
+    }
+
+    fn on_events_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if scrolled_up(event.delta) {
+            if f32::from(self.events_scroll.max_offset().height) > 0.0 {
+                self.pause_follow(cx);
+            }
+        } else {
+            self.resume_if_at_bottom(self.events_scroll.clone(), cx);
+        }
+    }
+
+    fn on_output_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if scrolled_up(event.delta) {
+            if f32::from(self.output_scroll.max_offset().height) > 0.0 {
+                self.pause_follow(cx);
+            }
+        } else {
+            self.resume_if_at_bottom(self.output_scroll.clone(), cx);
+        }
+    }
+
+    fn follow_toggle(&self, theme: &Theme, follow: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+        components::with_focus(
+            div()
+                .id("detail-follow")
+                .flex()
+                .items_center()
+                .gap(px(theme.spacing.s1))
+                .h(px(26.0))
+                .px(px(theme.spacing.s2))
+                .rounded(px(theme.radii.r4))
+                .border_1()
+                .border_color(if follow {
+                    Hsla::from(theme.colors.accent).opacity(0.5)
+                } else {
+                    Hsla::from(theme.colors.border)
+                })
+                .text_size(px(theme.font.xs))
+                .text_color(if follow {
+                    theme.colors.accent
+                } else {
+                    theme.colors.muted
+                })
+                .cursor_pointer()
+                .track_focus(&self.follow_focus)
+                .child(if follow { "◉" } else { "○" })
+                .child(if follow { "Following" } else { "Follow tail" })
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    let follow = this.state.read(cx).detail_follow();
+                    this.state.update(cx, |state, cx| {
+                        state.set_detail_follow(!follow);
+                        cx.notify();
+                    });
+                    if !follow {
+                        // Resuming: jump straight to the newest content.
+                        this.events_scroll.scroll_to_bottom();
+                        this.output_scroll.scroll_to_bottom();
+                        this.events_rendered = 0;
+                        this.output_rendered = 0;
+                    }
+                })),
+            theme,
+        )
+    }
+
+    fn header(
+        &self,
+        theme: &Theme,
+        data: HeaderData<'_>,
+        narrow: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let task = data.task;
+        let status = StatusKind::from_task_status(task.status);
+        let color = status_color(theme, status);
+        let name = inbox::task_display_name(&task.name);
+        let repo = inbox::task_repo(&task.name);
+        let elapsed = inbox::task_duration(task, Utc::now())
+            .map(|duration| inbox::format_duration(Some(duration)))
+            .unwrap_or_else(|| "—".to_string());
+        let usage = detail::usage_summary(data.usage);
+
+        let cancel = self.action_button(
+            theme,
+            "detail-cancel",
+            "Cancel",
+            false,
+            &self.cancel_focus,
+            cx.listener(|this, _event, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.request_detail_action(tasks::TaskAction::Cancel, cx);
+                    cx.notify();
+                });
+            }),
+        );
+        let retry = self.action_button(
+            theme,
+            "detail-retry",
+            "Retry",
+            false,
+            &self.retry_focus,
+            cx.listener(|this, _event, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.request_detail_action(tasks::TaskAction::Retry, cx);
+                    cx.notify();
+                });
+            }),
+        );
+        let copy = self.action_button(
+            theme,
+            "detail-copy",
+            "Copy output",
+            false,
+            &self.copy_focus,
+            cx.listener(|this, _event, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.copy_detail_output(cx);
+                    cx.notify();
+                });
+            }),
+        );
+
+        let session_row = data.session_id.map(|session_id| {
+            let value = session_id.to_string();
+            let copy = components::with_focus(
+                div()
+                    .id("detail-copy-session")
+                    .px(px(theme.spacing.s1))
+                    .rounded(px(theme.radii.r4))
+                    .text_color(theme.colors.muted)
+                    .cursor_pointer()
+                    .track_focus(&self.session_focus)
+                    .hover(|style| style.bg(theme.colors.bg))
+                    .child("copy")
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.state.update(cx, |state, cx| {
+                            state.copy_session_id(value.clone(), cx);
+                            cx.notify();
+                        });
+                    })),
+                theme,
+            );
+            div()
+                .flex()
+                .items_center()
+                .gap(px(theme.spacing.s2))
+                .min_w_0()
+                .text_size(px(theme.font.xs))
+                .text_color(theme.colors.muted)
+                .child("session")
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .font_family("monospace")
+                        .text_color(theme.colors.text)
+                        .child(session_id.to_string()),
+                )
+                .child(copy)
+        });
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(theme.spacing.s2))
+            .px(px(theme.spacing.s3))
+            .py(px(theme.spacing.s3))
+            .border_b_1()
+            .border_color(theme.colors.border)
+            .bg(theme.colors.surface)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s2))
+                    .min_w_0()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(theme.spacing.s1))
+                            .flex_shrink_0()
+                            .px(px(theme.spacing.s2))
+                            .py(px(3.0))
+                            .rounded(px(theme.radii.r12))
+                            .border_1()
+                            .border_color(Hsla::from(color).opacity(0.45))
+                            .bg(Hsla::from(color).opacity(0.12))
+                            .text_size(px(theme.font.xs))
+                            .text_color(color)
+                            .child(status.icon())
+                            .child(status.label()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(theme.font.lg))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.colors.text)
+                            .child(name.to_string()),
+                    )
+                    .when(narrow, |row| row.child(self.back_button(theme, cx))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_x(px(theme.spacing.s4))
+                    .gap_y(px(theme.spacing.s1))
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.muted)
+                    .when_some(repo.map(str::to_string), |row, repo| {
+                        row.child(meta(theme, "repo", &repo))
+                    })
+                    .child(meta(theme, "agent", data.agent.unwrap_or("—")))
+                    .child(meta(theme, "attempt", &task.attempt.to_string()))
+                    .child(meta(theme, "elapsed", &elapsed))
+                    .when_some(usage, |row, usage| row.child(meta(theme, "usage", &usage))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s2))
+                    .min_w_0()
+                    .when_some(session_row, |row, session| {
+                        row.child(div().flex_1().min_w_0().child(session))
+                    })
+                    .when(data.session_id.is_none(), |row| row.child(div().flex_1()))
+                    .child(cancel)
+                    .child(retry)
+                    .child(copy),
+            )
+    }
+
+    fn back_button(&self, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
+        let state = self.state.clone();
+        components::with_focus(
+            div()
+                .id("detail-back")
+                .flex_shrink_0()
+                .px(px(theme.spacing.s2))
+                .py(px(2.0))
+                .rounded(px(theme.radii.r4))
+                .text_size(px(theme.font.xs))
+                .text_color(theme.colors.text)
+                .cursor_pointer()
+                .track_focus(&self.back_focus)
+                .child("← Back")
+                .on_click(cx.listener(move |_this, _event, _window, cx| {
+                    state.update(cx, |state, cx| {
+                        state.close_detail();
+                        cx.notify();
+                    });
+                })),
+            theme,
+        )
+    }
+
+    /// A small secondary button used by the header. The click handler comes in
+    /// as a listener so each action keeps its own `cx`.
+    fn action_button(
+        &self,
+        theme: &Theme,
+        id: &'static str,
+        label: &'static str,
+        danger: bool,
+        focus: &FocusHandle,
+        on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+    ) -> Stateful<Div> {
+        let color = if danger {
+            theme.colors.danger
+        } else {
+            theme.colors.text
+        };
+        components::with_focus(
+            div()
+                .id(id)
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .h(px(28.0))
+                .px(px(theme.spacing.s2))
+                .rounded(px(theme.radii.r4))
+                .border_1()
+                .border_color(if danger {
+                    Hsla::from(theme.colors.danger).opacity(0.45)
+                } else {
+                    Hsla::from(theme.colors.border)
+                })
+                .text_size(px(theme.font.xs))
+                .text_color(color)
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.colors.bg))
+                .track_focus(focus)
+                .child(label)
+                .on_click(on_click),
+            theme,
+        )
+    }
+
+    fn tabs(
+        &self,
+        theme: &Theme,
+        tab: DetailTab,
+        new_events: u64,
+        follow: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mut bar = div()
+            .flex()
+            .items_center()
+            .gap(px(theme.spacing.s1))
+            .px(px(theme.spacing.s3))
+            .h(px(38.0))
+            .border_b_1()
+            .border_color(theme.colors.border)
+            .bg(theme.colors.surface);
+
+        for (index, candidate) in DetailTab::ALL.iter().enumerate() {
+            let selected = *candidate == tab;
+            let candidate = *candidate;
+            let badge = (candidate == DetailTab::Events && new_events > 0).then(|| {
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .min_w(px(16.0))
+                    .h(px(16.0))
+                    .px(px(3.0))
+                    .rounded(px(theme.radii.r12))
+                    .bg(Hsla::from(theme.colors.warning).opacity(0.2))
+                    .text_color(theme.colors.warning)
+                    .text_size(px(theme.font.xs))
+                    .child(new_events.to_string())
+            });
+            bar = bar.child(components::with_focus(
+                div()
+                    .id(("detail-tab", index))
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s1))
+                    .h(px(28.0))
+                    .px(px(theme.spacing.s2))
+                    .rounded(px(theme.radii.r4))
+                    .when(selected, |button| {
+                        button
+                            .bg(Hsla::from(theme.colors.accent).opacity(0.16))
+                            .text_color(theme.colors.accent)
+                    })
+                    .when(!selected, |button| {
+                        button
+                            .text_color(theme.colors.muted)
+                            .hover(|style| style.bg(theme.colors.bg))
+                    })
+                    .text_size(px(theme.font.sm))
+                    .cursor_pointer()
+                    .track_focus(&self.tab_focus[index])
+                    .child(candidate.label())
+                    .when_some(badge, |button, badge| button.child(badge))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.state.update(cx, |state, cx| {
+                            state.set_detail_tab(candidate);
+                            cx.notify();
+                        });
+                    })),
+                theme,
+            ));
+        }
+
+        bar.child(div().flex_1())
+            .child(self.follow_toggle(theme, follow, cx))
+    }
+
+    /// The pinned permission banner. It names the request and gives exactly
+    /// three outcomes (once / always when offered / reject); a screen-detected
+    /// prompt with no correlation id explains that it must be answered in the
+    /// terminal instead (docs §6, permission semantics).
+    fn banner(
+        &self,
+        theme: &Theme,
+        request: &PendingRequest,
+        pending: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let color = theme.colors.warning;
+        let can_reply = request.can_reply() && !pending;
+
+        let mut options = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(theme.spacing.s1));
+        if !request.options.is_empty() {
+            options = options.child(
+                div()
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.muted)
+                    .child("options"),
+            );
+            for option in &request.options {
+                options = options.child(
+                    div()
+                        .px(px(theme.spacing.s1 + 2.0))
+                        .py(px(1.0))
+                        .rounded(px(theme.radii.r4))
+                        .border_1()
+                        .border_color(Hsla::from(color).opacity(0.35))
+                        .text_size(px(theme.font.xs))
+                        .text_color(theme.colors.text)
+                        .child(option.clone()),
+                );
+            }
+        }
+
+        let prompt = div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .flex_col()
+            .gap(px(theme.spacing.s1))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s1))
+                    .text_size(px(theme.font.xs))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(color)
+                    .child("⚠")
+                    .child(format!("Awaiting {}", request.kind_label())),
+            )
+            .child(
+                div()
+                    .text_size(px(theme.font.sm))
+                    .text_color(theme.colors.text)
+                    .child(request.message.clone()),
+            )
+            .child(options)
+            .when(!request.can_reply(), |prompt| {
+                prompt.child(
+                    div()
+                        .text_size(px(theme.font.xs))
+                        .text_color(theme.colors.muted)
+                        .child(
+                            "This prompt was detected on the agent's screen; answer it in the agent's terminal.",
+                        ),
+                )
+            })
+            .when(pending, |prompt| {
+                prompt.child(
+                    div()
+                        .text_size(px(theme.font.xs))
+                        .text_color(theme.colors.muted)
+                        .child("Sending the reply…"),
+                )
+            });
+
+        let once = self.reply_button(
+            theme,
+            "reply-once",
+            "Allow once",
+            false,
+            can_reply,
+            &self.reply_once_focus,
+            request,
+            InputReply::Once,
+            cx,
+        );
+        let always = request.allow_always.then(|| {
+            self.reply_button(
+                theme,
+                "reply-always",
+                "Always allow",
+                false,
+                can_reply,
+                &self.reply_always_focus,
+                request,
+                InputReply::Always,
+                cx,
+            )
+        });
+        let reject = self.reply_button(
+            theme,
+            "reply-reject",
+            "Reject",
+            true,
+            can_reply,
+            &self.reply_reject_focus,
+            request,
+            InputReply::Reject,
+            cx,
+        );
+
+        div()
+            .flex()
+            .items_start()
+            .gap(px(theme.spacing.s3))
+            .px(px(theme.spacing.s3))
+            .py(px(theme.spacing.s3))
+            .border_b_1()
+            .border_color(Hsla::from(color).opacity(0.45))
+            .bg(Hsla::from(color).opacity(0.10))
+            .child(prompt)
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_col()
+                    .items_end()
+                    .gap(px(theme.spacing.s1))
+                    .child(once)
+                    .when_some(always, |column, always| column.child(always))
+                    .child(reject),
+            )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reply_button(
+        &self,
+        theme: &Theme,
+        id: &'static str,
+        label: &'static str,
+        danger: bool,
+        enabled: bool,
+        focus: &FocusHandle,
+        request: &PendingRequest,
+        reply: InputReply,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let color = if danger {
+            theme.colors.danger
+        } else {
+            theme.colors.text
+        };
+        let request = request.clone();
+        components::with_focus(
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(30.0))
+                .px(px(theme.spacing.s3))
+                .rounded(px(theme.radii.r4))
+                .border_1()
+                .border_color(if danger {
+                    Hsla::from(theme.colors.danger).opacity(0.5)
+                } else {
+                    Hsla::from(theme.colors.border)
+                })
+                .when(enabled, |button| {
+                    button.text_color(color).cursor_pointer().hover(|style| {
+                        style.bg(if danger {
+                            Hsla::from(theme.colors.danger).opacity(0.16)
+                        } else {
+                            Hsla::from(theme.colors.accent).opacity(0.16)
+                        })
+                    })
+                })
+                .when(!enabled, |button| {
+                    button
+                        .text_color(theme.colors.muted)
+                        .opacity(0.55)
+                        .cursor_default()
+                })
+                .text_size(px(theme.font.xs))
+                .when(enabled, |button| button.track_focus(focus))
+                .child(label)
+                .when(enabled, |button| {
+                    button.on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.state.update(cx, |state, cx| {
+                            state.reply_to_pending(&request, reply.clone(), cx);
+                            cx.notify();
+                        });
+                    }))
+                }),
+            theme,
+        )
+    }
+
+    fn loading(&self, theme: &Theme, label: &str) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(theme.spacing.s2))
+            .p(px(theme.spacing.s4))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s2))
+                    .child(components::section_label(theme, label))
+                    .child(hint(theme, "Loading…")),
+            )
+            .children((0..5).map(|index| skeleton_line(theme, 130.0 + index as f32 * 30.0)))
+    }
+
+    fn error_body(
+        &self,
+        theme: &Theme,
+        data: ErrorBody<'_>,
+        retry: impl Fn(&mut DetailView, &mut Context<DetailView>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let retry = components::with_focus(
+            div()
+                .id("detail-tab-retry")
+                .flex()
+                .items_center()
+                .h(px(32.0))
+                .px(px(theme.spacing.s3))
+                .rounded(px(theme.radii.r8))
+                .bg(Hsla::from(theme.colors.accent).opacity(0.16))
+                .text_color(theme.colors.accent)
+                .text_size(px(theme.font.sm))
+                .cursor_pointer()
+                .track_focus(data.focus)
+                .child("Retry")
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    retry(this, cx);
+                    cx.notify();
+                })),
+            theme,
+        );
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(theme.spacing.s2))
+            .p(px(theme.spacing.s6))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(42.0))
+                    .h(px(42.0))
+                    .rounded(px(theme.radii.r12))
+                    .border_1()
+                    .border_color(Hsla::from(theme.colors.danger).opacity(0.35))
+                    .bg(Hsla::from(theme.colors.danger).opacity(0.12))
+                    .text_color(theme.colors.danger)
+                    .text_size(px(theme.font.lg))
+                    .child("⚠"),
+            )
+            .child(components::section_label(theme, data.label))
+            .child(
+                div()
+                    .text_size(px(theme.font.sm))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.colors.text)
+                    .text_center()
+                    .child(data.title.to_string()),
+            )
+            .child(
+                div()
+                    .max_w(px(320.0))
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.muted)
+                    .text_center()
+                    .child(data.message.to_string()),
+            )
+            .child(retry)
+    }
+
+    fn error_banner(&self, theme: &Theme, message: &str) -> Div {
+        div()
+            .flex()
+            .items_center()
+            .gap(px(theme.spacing.s2))
+            .px(px(theme.spacing.s3))
+            .py(px(theme.spacing.s2))
+            .rounded(px(theme.radii.r4))
+            .border_1()
+            .border_color(Hsla::from(theme.colors.danger).opacity(0.45))
+            .bg(Hsla::from(theme.colors.danger).opacity(0.10))
+            .child(
+                div()
+                    .text_color(theme.colors.danger)
+                    .text_size(px(theme.font.xs))
+                    .child("⚠"),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.text)
+                    .child(format!("Refresh failed: {message}")),
+            )
+    }
+
+    fn empty_body(&self, theme: &Theme, icon: &str, label: &str, title: &str, body: &str) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(theme.spacing.s2))
+            .p(px(theme.spacing.s6))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(44.0))
+                    .h(px(44.0))
+                    .rounded(px(theme.radii.r12))
+                    .border_1()
+                    .border_color(Hsla::from(theme.colors.accent).opacity(0.35))
+                    .bg(Hsla::from(theme.colors.accent).opacity(0.12))
+                    .text_color(theme.colors.accent)
+                    .text_size(px(theme.font.lg))
+                    .child(icon.to_string()),
+            )
+            .child(components::section_label(theme, label))
+            .child(
+                div()
+                    .text_size(px(theme.font.sm))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.colors.text)
+                    .text_center()
+                    .child(title.to_string()),
+            )
+            .child(
+                div()
+                    .max_w(px(320.0))
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.muted)
+                    .text_center()
+                    .child(body.to_string()),
+            )
+    }
+
+    fn output_body(
+        &mut self,
+        theme: &Theme,
+        output: Option<OutputText>,
+        loading: bool,
+        task_error: Option<String>,
+        terminal: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if loading && output.is_none() {
+            return self.loading(theme, "OUTPUT").into_any_element();
+        }
+        if let (None, Some(message)) = (&output, &task_error) {
+            return self
+                .error_body(
+                    theme,
+                    ErrorBody {
+                        label: "OUTPUT",
+                        title: "The run output could not load",
+                        message,
+                        focus: &self.output_retry_focus,
+                    },
+                    |this, cx| {
+                        this.state.update(cx, |state, cx| {
+                            state.retry_detail_task();
+                            cx.notify();
+                        });
+                    },
+                    cx,
+                )
+                .into_any_element();
+        }
+        let Some(output) = output else {
+            let title = if terminal {
+                "The run finished without persisted output"
+            } else {
+                "No output yet"
+            };
+            return self.empty_body(
+                theme,
+                "≡",
+                "OUTPUT",
+                title,
+                if terminal {
+                    "The daemon has no output blob for this run. The Events and Runs tabs keep the structured record."
+                } else {
+                    "The daemon persists output when the run produces it. Follow the Events tab while it runs."
+                },
+            )
+            .into_any_element();
+        };
+
+        let text = output.text;
+        let truncated = output.truncated;
+
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .gap(px(theme.spacing.s2))
+            .p(px(theme.spacing.s3));
+        if let Some(message) = task_error {
+            column = column.child(self.error_banner(theme, &message));
+        }
+        if truncated {
+            column = column.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s2))
+                    .px(px(theme.spacing.s2))
+                    .py(px(theme.spacing.s1))
+                    .rounded(px(theme.radii.r4))
+                    .border_1()
+                    .border_color(Hsla::from(theme.colors.warning).opacity(0.45))
+                    .bg(Hsla::from(theme.colors.warning).opacity(0.10))
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.text)
+                    .child("⚠")
+                    .child("The daemon truncated this output; the text below is what it kept."),
+            );
+        }
+        column = column.child(
+            div()
+                .id("detail-output")
+                .font_family("monospace")
+                .text_size(px(theme.font.sm))
+                .text_color(theme.colors.text)
+                .whitespace_normal()
+                .child(text.clone()),
+        );
+
+        // Follow the tail only when the content grew, never on every render.
+        if self.state.read(cx).detail_follow() && self.output_rendered != text.len() {
+            self.output_scroll.scroll_to_bottom();
+        }
+        self.output_rendered = text.len();
+        self.watch_bottom(self.output_scroll.clone(), cx);
+
+        div()
+            .id("detail-output-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.output_scroll)
+            .on_scroll_wheel(cx.listener(Self::on_output_wheel))
+            .child(column)
+            .into_any_element()
+    }
+
+    fn events_body(&mut self, theme: &Theme, data: EventsBody, cx: &mut Context<Self>) -> Div {
+        let EventsBody {
+            feed,
+            event_count,
+            loading,
+            loaded,
+            error: events_error,
+            session,
+            ignored,
+        } = data;
+        if loading && feed.is_empty() && !loaded {
+            return self.loading(theme, "EVENTS");
+        }
+        if feed.is_empty() && events_error.is_some() {
+            return self.error_body(
+                theme,
+                ErrorBody {
+                    label: "EVENTS",
+                    title: "The event feed could not load",
+                    message: events_error.as_deref().unwrap_or_default(),
+                    focus: &self.events_retry_focus,
+                },
+                |this, cx| {
+                    this.state.update(cx, |state, cx| {
+                        state.retry_detail_events();
+                        cx.notify();
+                    });
+                },
+                cx,
+            );
+        }
+        if feed.is_empty() {
+            if ignored > 0 {
+                return self.empty_body(
+                    theme,
+                    "≋",
+                    "EVENTS",
+                    "Events from a newer daemon",
+                    &format!(
+                        "{ignored} event{} used a kind this client does not render yet. Upgrade the client to see them.",
+                        if ignored == 1 { "" } else { "s" }
+                    ),
+                );
+            }
+            let (title, body) = if session.is_some() {
+                (
+                    "No events yet",
+                    "The session is attached but has not reported a structured event yet. Live events land here as they arrive.",
+                )
+            } else {
+                (
+                    "No structured feed",
+                    "This session does not report structured events (a PTY-backed agent). The Output tab is its durable view.",
+                )
+            };
+            return self.empty_body(theme, "≋", "EVENTS", title, body);
+        }
+
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .gap(px(theme.spacing.s2))
+            .p(px(theme.spacing.s3));
+        if let Some(message) = events_error {
+            column = column.child(self.error_banner(theme, &message));
+        }
+        if ignored > 0 {
+            column = column.child(
+                div()
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.muted)
+                    .child(format!(
+                        "{ignored} event{} with a kind this client does not render yet were skipped.",
+                        if ignored == 1 { "" } else { "s" }
+                    )),
+            );
+        }
+        column = column.children(feed.iter().map(|item| feed_item(theme, item)));
+
+        let (follow, new_events) = {
+            let state = self.state.read(cx);
+            (state.detail_follow(), state.detail_new_events())
+        };
+        if follow && self.events_rendered != event_count {
+            self.events_scroll.scroll_to_bottom();
+        }
+        self.events_rendered = event_count;
+        self.watch_bottom(self.events_scroll.clone(), cx);
+
+        let pill = (new_events > 0).then(|| {
+            components::with_focus(
+                div()
+                    .id("detail-new-events")
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s1))
+                    .px(px(theme.spacing.s2))
+                    .py(px(theme.spacing.s1))
+                    .rounded(px(theme.radii.r12))
+                    .border_1()
+                    .border_color(Hsla::from(theme.colors.accent).opacity(0.5))
+                    .bg(theme.colors.surface)
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.accent)
+                    .cursor_pointer()
+                    .shadow_lg()
+                    .child(format!(
+                        "{new_events} new event{}",
+                        if new_events == 1 { "" } else { "s" }
+                    ))
+                    .child("↓")
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.state.update(cx, |state, cx| {
+                            state.set_detail_follow(true);
+                            cx.notify();
+                        });
+                        this.events_scroll.scroll_to_bottom();
+                        this.events_rendered = 0;
+                    })),
+                theme,
+            )
+        });
+
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .child(
+                div()
+                    .id("detail-events-scroll")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.events_scroll)
+                    .on_scroll_wheel(cx.listener(Self::on_events_wheel))
+                    .child(column),
+            )
+            .when_some(pill, |container, pill| {
+                container.child(
+                    div()
+                        .absolute()
+                        .right(px(theme.spacing.s3))
+                        .bottom(px(theme.spacing.s3))
+                        .child(pill),
+                )
+            })
+    }
+
+    fn runs_body(
+        &mut self,
+        theme: &Theme,
+        data: RunsBody<'_>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let RunsBody {
+            runs,
+            current_attempt,
+            loading,
+            loaded,
+            error: runs_error,
+        } = data;
+        if loading && runs.is_empty() && !loaded {
+            return self.loading(theme, "RUNS").into_any_element();
+        }
+        if runs.is_empty() && runs_error.is_some() {
+            return self
+                .error_body(
+                    theme,
+                    ErrorBody {
+                        label: "RUNS",
+                        title: "The attempt table could not load",
+                        message: runs_error.as_deref().unwrap_or_default(),
+                        focus: &self.runs_retry_focus,
+                    },
+                    |this, cx| {
+                        this.state.update(cx, |state, cx| {
+                            state.retry_detail_runs();
+                            cx.notify();
+                        });
+                    },
+                    cx,
+                )
+                .into_any_element();
+        }
+        if runs.is_empty() {
+            return self.empty_body(
+                theme,
+                "↻",
+                "RUNS",
+                "No attempts recorded",
+                "The daemon records a run row for every execution attempt. A queued task gets its first row when it starts.",
+            )
+            .into_any_element();
+        }
+
+        let now = Utc::now();
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .gap(px(theme.spacing.s2))
+            .p(px(theme.spacing.s2));
+        if let Some(message) = runs_error {
+            column = column.child(self.error_banner(theme, &message));
+        }
+        column = column.child(runs_header(theme));
+        for run in runs.iter().rev() {
+            column = column.child(run_row(theme, run, current_attempt, now));
+        }
+        div()
+            .id("detail-runs-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .child(column)
+            .into_any_element()
+    }
+}
+
+/// The identity cluster the pinned header renders. Grouped so the header helper
+/// stays readable and under the argument limit.
+struct HeaderData<'a> {
+    task: &'a Task,
+    agent: Option<&'a str>,
+    session_id: Option<&'a str>,
+    usage: Option<&'a AgentUsage>,
+}
+
+/// The copy for one tab's full-body error state.
+struct ErrorBody<'a> {
+    label: &'a str,
+    title: &'a str,
+    message: &'a str,
+    focus: &'a FocusHandle,
+}
+
+/// Everything the Events tab body needs, extracted from the state in one go.
+struct EventsBody {
+    feed: Vec<FeedItem>,
+    event_count: usize,
+    loading: bool,
+    loaded: bool,
+    error: Option<String>,
+    session: Option<String>,
+    ignored: usize,
+}
+
+/// Everything the Runs tab body needs, extracted from the state in one go.
+struct RunsBody<'a> {
+    runs: &'a [TaskRun],
+    current_attempt: u32,
+    loading: bool,
+    loaded: bool,
+    error: Option<String>,
 }
 
 impl Render for DetailView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
-        let route = self.state.read(cx).active_route();
         let narrow = container_query(window.viewport_size().width) == LayoutMode::Narrow;
-        let (icon, eyebrow, title, body) = detail_copy(route);
+        let route = self.state.read(cx).active_route();
 
-        // Step 04 wires `Enter` to the selected run; the full header and tabs
-        // arrive with step 06, so echo the run here to make the action visible.
-        let selected = self
-            .state
-            .read(cx)
-            .selected_task()
-            .map(|task| (task.name.clone(), task.status, task.attempt));
-        let (icon, title, body) = match selected {
-            Some((name, status, attempt)) if matches!(route, Route::Inbox | Route::Tasks) => {
-                let status = StatusKind::from_task_status(status);
-                (
-                    status.icon(),
-                    inbox::task_display_name(&name).to_string(),
-                    format!(
-                        "{} · attempt {attempt}. Output, events and runs arrive with the task-detail step.",
-                        status.label()
-                    ),
-                )
-            }
-            _ => (icon, title.to_string(), body.to_string()),
+        // The detail only holds runs on the Inbox and Tasks surfaces.
+        if !matches!(route, Route::Inbox | Route::Tasks) {
+            let (icon, eyebrow, title, body) = route_copy(route);
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .bg(theme.colors.surface)
+                .child(self.plain_route_header(theme, narrow, cx))
+                .child(components::empty_state(
+                    theme,
+                    icon,
+                    eyebrow,
+                    title,
+                    body,
+                    "Open a row to inspect it",
+                ));
+        }
+
+        let (task, agent, session_id, usage, tab, follow, new_events, pending) = {
+            let state = self.state.read(cx);
+            (
+                state.selected_task().cloned(),
+                state.detail_agent(),
+                state.detail_session_id(),
+                state.detail_usage(),
+                state.detail_tab(),
+                state.detail_follow(),
+                state.detail_new_events(),
+                state.detail_pending_request(),
+            )
         };
 
-        let header = div()
+        let Some(task) = task else {
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .bg(theme.colors.surface)
+                .child(self.plain_route_header(theme, narrow, cx))
+                .child(components::empty_state(
+                    theme,
+                    "◎",
+                    "RUN",
+                    "No run selected",
+                    "Open a run in the list to see its status, agent and attempt here. Output, Events and Runs stay one tab away.",
+                    "Open a row to inspect it",
+                ));
+        };
+
+        let header = self.header(
+            theme,
+            HeaderData {
+                task: &task,
+                agent: agent.as_deref(),
+                session_id: session_id.as_deref(),
+                usage: usage.as_ref(),
+            },
+            narrow,
+            cx,
+        );
+        let banner = pending.as_ref().map(|request| {
+            let in_flight = self
+                .state
+                .read(cx)
+                .detail()
+                .is_some_and(|detail| detail.reply_in_flight(request.request_id.as_deref()));
+            self.banner(theme, request, in_flight, cx)
+        });
+        let tabs = self.tabs(theme, tab, new_events, follow, cx);
+        let current_attempt = task.attempt;
+
+        let body = match tab {
+            DetailTab::Output => {
+                let (output, loading, error, terminal) = {
+                    let state = self.state.read(cx);
+                    let detail = state.detail();
+                    (
+                        detail.and_then(TaskDetail::output),
+                        detail.is_some_and(|detail| detail.task_loading && detail.task.is_none()),
+                        detail.and_then(|detail| detail.task_error.clone()),
+                        detail.is_some_and(TaskDetail::is_terminal),
+                    )
+                };
+                self.output_body(theme, output, loading, error, terminal, cx)
+            }
+            DetailTab::Events => {
+                let (feed, count, loading, loaded, error, session, ignored) = {
+                    let state = self.state.read(cx);
+                    let detail = state.detail();
+                    (
+                        detail.map(TaskDetail::feed).unwrap_or_default(),
+                        detail.map(|detail| detail.events.len()).unwrap_or(0),
+                        detail.is_some_and(|detail| detail.events_loading),
+                        detail.is_some_and(|detail| detail.events_loaded),
+                        detail.and_then(|detail| detail.events_error.clone()),
+                        detail.and_then(|detail| detail.events_session.clone()),
+                        detail.map(|detail| detail.events_ignored).unwrap_or(0),
+                    )
+                };
+                self.events_body(
+                    theme,
+                    EventsBody {
+                        feed,
+                        event_count: count,
+                        loading,
+                        loaded,
+                        error,
+                        session,
+                        ignored,
+                    },
+                    cx,
+                )
+                .into_any_element()
+            }
+            DetailTab::Runs => {
+                let (runs, loading, loaded, error) = {
+                    let state = self.state.read(cx);
+                    let detail = state.detail();
+                    (
+                        detail.map(|detail| detail.runs.clone()).unwrap_or_default(),
+                        detail.is_some_and(|detail| detail.runs_loading),
+                        detail.is_some_and(|detail| detail.runs_loaded),
+                        detail.and_then(|detail| detail.runs_error.clone()),
+                    )
+                };
+                self.runs_body(
+                    theme,
+                    RunsBody {
+                        runs: &runs,
+                        current_attempt,
+                        loading,
+                        loaded,
+                        error,
+                    },
+                    cx,
+                )
+            }
+        };
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme.colors.surface)
+            .child(header)
+            .when_some(banner, |detail, banner| detail.child(banner))
+            .child(tabs)
+            .child(div().flex_1().min_h_0().flex().flex_col().child(body))
+    }
+}
+
+impl DetailView {
+    /// The title strip used when the active route is not a run list.
+    fn plain_route_header(&self, theme: &Theme, narrow: bool, cx: &mut Context<Self>) -> Div {
+        div()
             .flex()
             .items_center()
             .justify_between()
@@ -66,58 +1439,12 @@ impl Render for DetailView {
             .border_b_1()
             .border_color(theme.colors.border)
             .child(components::section_label(theme, "DETAIL"))
-            .when(narrow, |header| {
-                let state = self.state.clone();
-                header.child(
-                    components::with_focus(
-                        div()
-                            .id("detail-back")
-                            .px(px(theme.spacing.s2))
-                            .py(px(2.0))
-                            .rounded(px(theme.radii.r4))
-                            .text_size(px(theme.font.xs))
-                            .text_color(theme.colors.text)
-                            .cursor_pointer()
-                            .track_focus(&self.back_focus)
-                            .child("← Back"),
-                        theme,
-                    )
-                    .on_click(cx.listener(
-                        move |_this, _event, _window, cx| {
-                            state.update(cx, |state, cx| {
-                                state.close_detail();
-                                cx.notify();
-                            });
-                        },
-                    )),
-                )
-            });
-
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(theme.colors.surface)
-            .child(header)
-            .child(components::empty_state(
-                theme,
-                icon,
-                eyebrow,
-                &title,
-                &body,
-                "Open a row to inspect it",
-            ))
+            .when(narrow, |header| header.child(self.back_button(theme, cx)))
     }
 }
 
-fn detail_copy(route: Route) -> (&'static str, &'static str, &'static str, &'static str) {
+fn route_copy(route: Route) -> (&'static str, &'static str, &'static str, &'static str) {
     match route {
-        Route::Inbox | Route::Tasks => (
-            "◎",
-            "RUN",
-            "No run selected",
-            "Open a run in the list to see its status, agent and attempt here. Output, Events and Runs stay one tab away.",
-        ),
         Route::Catalog => (
             Route::Catalog.icon(),
             "DEFINITION",
@@ -142,5 +1469,461 @@ fn detail_copy(route: Route) -> (&'static str, &'static str, &'static str, &'sta
             "Current connection",
             "The settings surface owns editing. This column keeps the endpoint and token source visible while you work.",
         ),
+        Route::Inbox | Route::Tasks => (
+            "◎",
+            "RUN",
+            "No run selected",
+            "Open a run in the list to see its status, agent and attempt here.",
+        ),
+    }
+}
+
+fn meta(theme: &Theme, label: &str, value: &str) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(theme.spacing.s1))
+        .min_w_0()
+        .child(
+            div()
+                .text_size(px(theme.font.xs))
+                .text_color(theme.colors.muted)
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_size(px(theme.font.xs))
+                .text_color(theme.colors.text)
+                .child(value.to_string()),
+        )
+}
+
+fn hint(theme: &Theme, text: &str) -> Div {
+    div()
+        .text_size(px(theme.font.xs))
+        .text_color(theme.colors.muted)
+        .child(text.to_string())
+}
+
+fn status_color(theme: &Theme, status: StatusKind) -> gpui::Rgba {
+    match status {
+        StatusKind::AwaitingInput => theme.colors.warning,
+        StatusKind::Failed => theme.colors.danger,
+        StatusKind::Running => theme.colors.accent,
+        StatusKind::Succeeded => theme.colors.success,
+        StatusKind::Pending | StatusKind::Cancelled | StatusKind::Neutral => theme.colors.muted,
+    }
+}
+
+fn role_label(role: MessageRole) -> &'static str {
+    match role {
+        MessageRole::System => "system",
+        MessageRole::User => "user",
+        MessageRole::Assistant => "assistant",
+        MessageRole::Tool => "tool",
+    }
+}
+
+fn outcome_label(outcome: favetto_wire::model::IdleOutcome) -> &'static str {
+    match outcome {
+        favetto_wire::model::IdleOutcome::Succeeded => "succeeded",
+        favetto_wire::model::IdleOutcome::Failed => "failed",
+        favetto_wire::model::IdleOutcome::Interrupted => "interrupted",
+    }
+}
+
+/// One feed item. Message and reasoning blocks can be long, so the text wraps
+/// inside the narrow detail column; nothing here interprets ANSI.
+fn feed_item(theme: &Theme, item: &FeedItem) -> Div {
+    match item {
+        FeedItem::Message { role, text } => div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(
+                div()
+                    .text_size(px(theme.font.xs))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(match role {
+                        MessageRole::Assistant => theme.colors.accent,
+                        MessageRole::User => theme.colors.success,
+                        MessageRole::System | MessageRole::Tool => theme.colors.muted,
+                    })
+                    .child(role_label(*role)),
+            )
+            .child(
+                div()
+                    .text_size(px(theme.font.sm))
+                    .text_color(theme.colors.text)
+                    .child(text.clone()),
+            ),
+        FeedItem::Reasoning { text, streaming } => div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s1))
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.muted)
+                    .child("reasoning")
+                    .when(*streaming, |row| row.child("…")),
+            )
+            .child(
+                div()
+                    .text_size(px(theme.font.sm))
+                    .text_color(theme.colors.muted)
+                    .italic()
+                    .child(text.clone()),
+            ),
+        FeedItem::Tool {
+            name,
+            input,
+            status,
+            output,
+            ..
+        } => {
+            let (color, border) = match status {
+                ToolStatus::Running => (theme.colors.accent, theme.colors.accent),
+                ToolStatus::Ok => (theme.colors.success, theme.colors.border),
+                ToolStatus::Error => (theme.colors.danger, theme.colors.danger),
+            };
+            let name = if name.is_empty() {
+                "tool"
+            } else {
+                name.as_str()
+            };
+            let mut card = div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .px(px(theme.spacing.s2))
+                .py(px(theme.spacing.s1))
+                .rounded(px(theme.radii.r4))
+                .border_1()
+                .border_color(Hsla::from(border).opacity(0.45))
+                .bg(Hsla::from(border).opacity(0.06))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(theme.spacing.s1))
+                        .child(
+                            div()
+                                .text_size(px(theme.font.xs))
+                                .text_color(color)
+                                .child(status.icon()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .font_family("monospace")
+                                .text_size(px(theme.font.xs))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme.colors.text)
+                                .child(name.to_string()),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(px(theme.font.xs))
+                                .text_color(color)
+                                .child(status.label()),
+                        ),
+                );
+            if let Some(summary) = detail::compact_json(input) {
+                card = card.child(
+                    div()
+                        .font_family("monospace")
+                        .text_size(px(theme.font.xs))
+                        .text_color(theme.colors.muted)
+                        .child(format!("→ {summary}")),
+                );
+            }
+            if let Some(output) = output.as_ref().and_then(detail::compact_json) {
+                card = card.child(
+                    div()
+                        .font_family("monospace")
+                        .text_size(px(theme.font.xs))
+                        .text_color(if *status == ToolStatus::Error {
+                            theme.colors.danger
+                        } else {
+                            theme.colors.muted
+                        })
+                        .child(output),
+                );
+            }
+            card
+        }
+        FeedItem::Usage(usage) => div()
+            .flex()
+            .items_center()
+            .gap(px(theme.spacing.s1))
+            .text_size(px(theme.font.xs))
+            .text_color(theme.colors.muted)
+            .child("⚡")
+            .child(
+                detail::usage_summary(Some(usage)).unwrap_or_else(|| "usage reported".to_string()),
+            ),
+        FeedItem::Error(message) => div()
+            .flex()
+            .items_start()
+            .gap(px(theme.spacing.s1))
+            .px(px(theme.spacing.s2))
+            .py(px(theme.spacing.s1))
+            .rounded(px(theme.radii.r4))
+            .border_1()
+            .border_color(Hsla::from(theme.colors.danger).opacity(0.45))
+            .bg(Hsla::from(theme.colors.danger).opacity(0.10))
+            .child(
+                div()
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.danger)
+                    .child("⚠"),
+            )
+            .child(
+                div()
+                    .text_size(px(theme.font.sm))
+                    .text_color(theme.colors.text)
+                    .child(message.clone()),
+            ),
+        FeedItem::Boundary(outcome) => div()
+            .py(px(theme.spacing.s1))
+            .text_size(px(theme.font.xs))
+            .text_color(theme.colors.muted)
+            .text_center()
+            .child(format!("— turn {}", outcome_label(*outcome))),
+        FeedItem::InputRequest { request, resolved } => div()
+            .flex()
+            .items_start()
+            .gap(px(theme.spacing.s1))
+            .px(px(theme.spacing.s2))
+            .py(px(theme.spacing.s1))
+            .rounded(px(theme.radii.r4))
+            .border_1()
+            .border_color(Hsla::from(theme.colors.warning).opacity(0.4))
+            .bg(Hsla::from(theme.colors.warning).opacity(0.08))
+            .child(
+                div()
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.warning)
+                    .child(if *resolved { "✓" } else { "⚠" }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(theme.font.xs))
+                    .text_color(if *resolved {
+                        theme.colors.muted
+                    } else {
+                        theme.colors.text
+                    })
+                    .child(format!(
+                        "{} · {}",
+                        if *resolved { "answered" } else { "waiting" },
+                        request.message
+                    )),
+            ),
+        FeedItem::Session { title } => div()
+            .text_size(px(theme.font.xs))
+            .text_color(theme.colors.muted)
+            .child(match title {
+                Some(title) => format!("session · {title}"),
+                None => "session attached".to_string(),
+            }),
+        FeedItem::Title(title) => div()
+            .text_size(px(theme.font.xs))
+            .text_color(theme.colors.muted)
+            .child(format!("session · {title}")),
+    }
+}
+
+fn runs_header(theme: &Theme) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(theme.spacing.s2))
+        .px(px(theme.spacing.s2))
+        .py(px(theme.spacing.s1))
+        .text_size(px(theme.font.xs))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(theme.colors.muted)
+        .child(div().w(px(28.0)).flex_shrink_0().child("#"))
+        .child(div().flex_1().min_w_0().child("STATUS"))
+        .child(div().w(px(38.0)).flex_shrink_0().child("EXIT"))
+        .child(div().w(px(52.0)).flex_shrink_0().child("TIME"))
+        .child(
+            div()
+                .w(px(72.0))
+                .flex_shrink_0()
+                .text_right()
+                .child("USAGE"),
+        )
+}
+
+fn run_row(theme: &Theme, run: &TaskRun, current_attempt: u32, now: chrono::DateTime<Utc>) -> Div {
+    let status = detail::run_status_kind(run.status);
+    let color = status_color(theme, status);
+    let current = run.attempt == current_attempt;
+    let duration = detail::run_duration(run, now)
+        .map(|duration| inbox::format_duration(Some(duration)))
+        .unwrap_or_else(|| "—".to_string());
+    let usage = detail::usage_summary(run.usage.as_ref()).unwrap_or_else(|| "—".to_string());
+
+    let mut row = div()
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .px(px(theme.spacing.s2))
+        .py(px(theme.spacing.s1))
+        .rounded(px(theme.radii.r4))
+        .border_1()
+        .border_color(if current {
+            Hsla::from(theme.colors.accent).opacity(0.45)
+        } else {
+            Hsla::from(theme.colors.bg)
+        })
+        .when(current, |row| {
+            row.bg(Hsla::from(theme.colors.accent).opacity(0.08))
+        })
+        .when(!current, |row| row.hover(|style| style.bg(theme.colors.bg)))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(theme.spacing.s2))
+                .text_size(px(theme.font.xs))
+                .child(
+                    div()
+                        .w(px(28.0))
+                        .flex_shrink_0()
+                        .text_color(theme.colors.text)
+                        .child(run.attempt.to_string()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .gap(px(2.0))
+                        .text_color(color)
+                        .child(status.icon())
+                        .child(detail::run_status_label(run.status)),
+                )
+                .child(
+                    div()
+                        .w(px(38.0))
+                        .flex_shrink_0()
+                        .font_family("monospace")
+                        .text_color(theme.colors.muted)
+                        .child(detail::run_exit_label(run)),
+                )
+                .child(
+                    div()
+                        .w(px(52.0))
+                        .flex_shrink_0()
+                        .text_color(theme.colors.muted)
+                        .child(duration),
+                )
+                .child(
+                    div()
+                        .w(px(72.0))
+                        .flex_shrink_0()
+                        .truncate()
+                        .text_right()
+                        .text_color(theme.colors.muted)
+                        .child(usage),
+                ),
+        );
+    if let Some(error) = &run.error {
+        row = row.child(
+            div()
+                .w_full()
+                .min_w_0()
+                .truncate()
+                .text_size(px(theme.font.xs))
+                .text_color(theme.colors.danger)
+                .child(error.clone()),
+        );
+    }
+    row
+}
+
+/// A static first-fetch placeholder. No motion (the OS "reduce motion" setting
+/// is respected; docs §3).
+fn skeleton_line(theme: &Theme, width: f32) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(theme.spacing.s2))
+        .child(
+            div()
+                .w(px(70.0))
+                .h(px(9.0))
+                .rounded(px(theme.radii.r4))
+                .bg(theme.colors.border),
+        )
+        .child(
+            div()
+                .w(px(width))
+                .h(px(9.0))
+                .rounded(px(theme.radii.r4))
+                .bg(theme.colors.border),
+        )
+}
+
+/// Whether a scroll handle is close enough to the bottom to count as the tail.
+fn at_bottom(scroll: &ScrollHandle) -> bool {
+    let max = f32::from(scroll.max_offset().height);
+    if max <= 0.0 {
+        return true;
+    }
+    let offset = -f32::from(scroll.offset().y);
+    offset >= max - FOLLOW_THRESHOLD
+}
+
+/// Whether a wheel/trackpad delta moves content up (the user is scrolling back).
+fn scrolled_up(delta: ScrollDelta) -> bool {
+    match delta {
+        ScrollDelta::Pixels(point) => f32::from(point.y) > 0.0,
+        ScrollDelta::Lines(point) => point.y > 0.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wheel_direction_maps_to_scrolling_up() {
+        assert!(scrolled_up(ScrollDelta::Lines(gpui::point(0.0, 2.0))));
+        assert!(!scrolled_up(ScrollDelta::Lines(gpui::point(0.0, -2.0))));
+        assert!(scrolled_up(ScrollDelta::Pixels(gpui::point(
+            px(0.0),
+            px(30.0)
+        ))));
+        assert!(!scrolled_up(ScrollDelta::Pixels(gpui::point(
+            px(0.0),
+            px(-30.0)
+        ))));
+    }
+
+    #[test]
+    fn every_route_has_detail_copy() {
+        for route in Route::ALL {
+            let (icon, eyebrow, title, body) = route_copy(route);
+            assert!(!icon.is_empty());
+            assert!(!eyebrow.is_empty());
+            assert!(!title.is_empty());
+            assert!(!body.is_empty());
+        }
     }
 }

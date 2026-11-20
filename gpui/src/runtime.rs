@@ -22,10 +22,15 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use async_channel::{Receiver, Sender};
-use favetto_wire::model::{AgentSessionInfo, Task};
-use favetto_wire::rpc::{EmptyParams, PingParams, PingResult, TaskIdParams, TasksListParams};
+use favetto_wire::model::{AgentSessionInfo, InputReply, Task, TaskRun};
+use favetto_wire::rpc::{
+    AgentReplyParams, AgentReplyResult, EmptyParams, PingParams, PingResult, TaskIdParams,
+    TasksEventsParams, TasksListParams,
+};
+use uuid::Uuid;
 
 use crate::config::ClientConfig;
+use crate::detail::{DetailEventsCall, DetailEventsResult};
 use crate::sse::{self, Push, SseEvent, SseStatus};
 use crate::state::ConnectionState;
 use crate::tasks::TaskAction;
@@ -54,6 +59,21 @@ pub enum Command {
         action: TaskAction,
         previous: Box<Task>,
         optimistic: Box<Task>,
+    },
+    /// Fetch `tasks.get`, `tasks.events` and `tasks.runs` for the open detail.
+    LoadTaskDetail { task_id: Uuid },
+    /// Fetch only the detail's persisted output (the Output tab's Retry).
+    LoadTask { task_id: Uuid },
+    /// Re-run the structured-event backfill (the Events tab's Retry).
+    LoadTaskEvents { task_id: Uuid },
+    /// Re-fetch the attempt table (the Runs tab's Retry).
+    LoadTaskRuns { task_id: Uuid },
+    /// Answer one blocked prompt. The request id comes from the session's
+    /// `awaiting_input` reason or the feed's `InputRequested` event.
+    Reply {
+        session_id: String,
+        request_id: String,
+        reply: InputReply,
     },
     /// Stop the worker thread.
     Shutdown,
@@ -95,6 +115,28 @@ pub enum Update {
         previous: Box<Task>,
         optimistic: Box<Task>,
         result: Result<Box<Task>, ClientError>,
+    },
+    /// `tasks.get` completed for the open detail.
+    TaskLoaded { task: Box<Task> },
+    /// `tasks.get` failed for the open detail.
+    TaskLoadFailed { task_id: Uuid, error: ClientError },
+    /// A tolerant `tasks.events` backfill completed.
+    EventsLoaded {
+        task_id: Uuid,
+        result: Box<DetailEventsResult>,
+    },
+    /// `tasks.events` failed.
+    EventsFailed { task_id: Uuid, error: ClientError },
+    /// `tasks.runs` completed.
+    RunsLoaded { task_id: Uuid, runs: Vec<TaskRun> },
+    /// `tasks.runs` failed.
+    RunsFailed { task_id: Uuid, error: ClientError },
+    /// `agents.reply` completed for one correlated request.
+    ReplyFinished {
+        session_id: String,
+        request_id: String,
+        reply: InputReply,
+        result: Result<AgentReplyResult, ClientError>,
     },
 }
 
@@ -175,6 +217,35 @@ impl Runtime {
             optimistic: Box::new(optimistic),
         });
     }
+
+    /// Load every part of one task's detail surface.
+    pub fn load_task_detail(&self, task_id: Uuid) {
+        self.send(Command::LoadTaskDetail { task_id });
+    }
+
+    /// Re-fetch the persisted output for the open detail.
+    pub fn load_task(&self, task_id: Uuid) {
+        self.send(Command::LoadTask { task_id });
+    }
+
+    /// Re-run the structured-event backfill for the open detail.
+    pub fn load_task_events(&self, task_id: Uuid) {
+        self.send(Command::LoadTaskEvents { task_id });
+    }
+
+    /// Re-fetch the attempt table for the open detail.
+    pub fn load_task_runs(&self, task_id: Uuid) {
+        self.send(Command::LoadTaskRuns { task_id });
+    }
+
+    /// Answer a blocked prompt through `agents.reply`.
+    pub fn reply(&self, session_id: String, request_id: String, reply: InputReply) {
+        self.send(Command::Reply {
+            session_id,
+            request_id,
+            reply,
+        });
+    }
 }
 
 impl Drop for Runtime {
@@ -240,6 +311,33 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
                     action,
                     *previous,
                     *optimistic,
+                );
+            }
+            Command::LoadTaskDetail { task_id } => {
+                spawn_task_load(client.clone(), updates.clone(), task_id);
+                spawn_events_load(client.clone(), updates.clone(), task_id);
+                spawn_runs_load(client.clone(), updates.clone(), task_id);
+            }
+            Command::LoadTask { task_id } => {
+                spawn_task_load(client.clone(), updates.clone(), task_id);
+            }
+            Command::LoadTaskEvents { task_id } => {
+                spawn_events_load(client.clone(), updates.clone(), task_id);
+            }
+            Command::LoadTaskRuns { task_id } => {
+                spawn_runs_load(client.clone(), updates.clone(), task_id);
+            }
+            Command::Reply {
+                session_id,
+                request_id,
+                reply,
+            } => {
+                spawn_reply(
+                    client.clone(),
+                    updates.clone(),
+                    session_id,
+                    request_id,
+                    reply,
                 );
             }
         }
@@ -326,6 +424,127 @@ fn spawn_task_action(
             action,
             previous: Box::new(previous),
             optimistic: Box::new(optimistic),
+            result,
+        });
+    });
+}
+
+/// Spawn one `tasks.get` for the detail surface.
+fn spawn_task_load(client: Arc<RpcClient>, updates: Sender<Update>, task_id: Uuid) {
+    tokio::spawn(async move {
+        let result = client.tasks_get(TaskIdParams { id: task_id }).await;
+        let update = match result {
+            Ok(task) => Update::TaskLoaded {
+                task: Box::new(task),
+            },
+            Err(error) => Update::TaskLoadFailed { task_id, error },
+        };
+        let _ = updates.try_send(update);
+    });
+}
+
+/// Spawn the structured-event backfill.
+///
+/// The daemon caps one page at 2000 events, so a long-running session is paged
+/// forward from `seq` zero. Ten pages (20 000 events) is the ceiling: the detail
+/// surface is a live view, and a run with more history than that is better
+/// served by the persisted output. The pages are merged into one update so the
+/// UI never renders a half-filled gap.
+fn spawn_events_load(client: Arc<RpcClient>, updates: Sender<Update>, task_id: Uuid) {
+    tokio::spawn(async move {
+        const PAGE: u64 = 2000;
+        const MAX_PAGES: usize = 10;
+
+        let mut session_id: Option<String> = None;
+        let mut events = Vec::new();
+        let mut ignored = 0usize;
+        let mut next_cursor = 0u64;
+        let mut after = 0u64;
+
+        for _ in 0..MAX_PAGES {
+            let page = client
+                .call::<DetailEventsCall>(TasksEventsParams {
+                    id: task_id,
+                    after: Some(after),
+                    limit: Some(PAGE),
+                })
+                .await;
+            match page {
+                Ok(page) => {
+                    if session_id.is_none() {
+                        session_id = page.session_id.clone();
+                    }
+                    ignored += page.ignored;
+                    next_cursor = next_cursor.max(page.next_cursor);
+                    let count = page.events.len();
+                    let last_seq = page.events.last().map(|event| event.seq);
+                    let cursor = page.next_cursor.max(last_seq.unwrap_or(after));
+                    events.extend(page.events);
+                    // A short page is the end; a cursor that does not advance
+                    // would otherwise page forever.
+                    if count < PAGE as usize || cursor <= after {
+                        break;
+                    }
+                    after = cursor;
+                }
+                Err(error) => {
+                    if events.is_empty() {
+                        let _ = updates.try_send(Update::EventsFailed { task_id, error });
+                        return;
+                    }
+                    // Keep the page(s) already fetched; the next open/retry can
+                    // fill the rest rather than blanking a readable feed.
+                    break;
+                }
+            }
+        }
+
+        events.sort_by_key(|event| event.seq);
+        let result = DetailEventsResult {
+            session_id,
+            events,
+            next_cursor,
+            ignored,
+        };
+        let _ = updates.try_send(Update::EventsLoaded {
+            task_id,
+            result: Box::new(result),
+        });
+    });
+}
+
+/// Spawn one `tasks.runs` fetch for the detail surface.
+fn spawn_runs_load(client: Arc<RpcClient>, updates: Sender<Update>, task_id: Uuid) {
+    tokio::spawn(async move {
+        let result = client.tasks_runs(TaskIdParams { id: task_id }).await;
+        let update = match result {
+            Ok(runs) => Update::RunsLoaded { task_id, runs },
+            Err(error) => Update::RunsFailed { task_id, error },
+        };
+        let _ = updates.try_send(update);
+    });
+}
+
+/// Spawn one `agents.reply` for a correlated prompt.
+fn spawn_reply(
+    client: Arc<RpcClient>,
+    updates: Sender<Update>,
+    session_id: String,
+    request_id: String,
+    reply: InputReply,
+) {
+    tokio::spawn(async move {
+        let result = client
+            .agents_reply(AgentReplyParams {
+                session_id: session_id.clone(),
+                request_id: request_id.clone(),
+                reply: reply.clone(),
+            })
+            .await;
+        let _ = updates.try_send(Update::ReplyFinished {
+            session_id,
+            request_id,
+            reply,
             result,
         });
     });

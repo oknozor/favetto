@@ -8,6 +8,7 @@ mod actions;
 mod app;
 mod components;
 mod config;
+mod detail;
 mod inbox;
 mod layout;
 mod palette;

@@ -1,10 +1,10 @@
 # favetto GPUI desktop client
 
-Status: **tasks (step 05)** — the list of every run: one segmented status
-filter (All / Running / Awaiting input / Failed / Succeeded) with live counts,
-a fuzzy search over task name, agent and repo, rows with status, repo, agent,
-attempt, duration and cost, and optimistic cancel/retry behind a confirmation
-dialog with a visible rollback toast. The plans live in
+Status: **task detail (step 06)** — the client's core surface: a pinned header
+with name, status, agent, repo, attempt, elapsed time, copyable session id and
+usage; three tabs (Output / Events / Runs); a structured event feed with
+grouped deltas, tool badges and usage; and a pinned permission banner that
+answers a blocked run without leaving the app. The plans live in
 `docs/design/gpui-client.md`.
 
 ## What it is
@@ -59,6 +59,33 @@ pushes. A blocked session shows up without a manual refresh; overlapping pushes
 coalesce into one RPC round trip. A refresh keeps the previous rows visible, so
 the list never flickers.
 
+Opening a run (Enter or a row click) fills the detail column. The header stays
+pinned while the tab body scrolls:
+
+- **Output** shows the persisted `tasks.get` blob as plain monospace text, with
+  a notice when the daemon truncated it. **Copy output** (and **copy** beside
+  the session id) is the clipboard path, because this GPUI build has no text
+  selection primitive.
+- **Events** backfills `tasks.events` (up to 2000 events) and appends live
+  `agent.event` pushes in `seq` order. Consecutive text/reasoning deltas become
+  one block, tool start/finish events merge into one card, usage and errors keep
+  their own rows. Unknown event kinds are skipped and counted, never fatal.
+- **Runs** is the `tasks.runs` attempt table: attempt, status, exit code,
+  duration and usage.
+
+A blocked run pins a warning banner with the request message and its options;
+**Allow once**, **Always allow** (when the agent offers it) and **Reject** map to
+`agents.reply` and are disabled while the correlated reply is in flight. A
+screen-detected prompt has no `request_id`, so the banner explains that it must
+be answered in the agent's terminal instead of guessing.
+
+**Follow tail** (in the tab bar) keeps the viewport at the newest content. A
+wheel/trackpad scroll toward the top pauses it; when live events arrive while
+pinned off the tail, the tab count and a **new events** pill appear. Clicking
+the pill (or re-enabling Follow) jumps back to live. Empty Output/Events/Runs
+states and per-tab Retry buttons are explicit; a failed read never hides an
+older feed.
+
 ## Pointing it at a daemon
 
 The connection is configured in `~/.config/favetto/gpui.toml`:
@@ -99,6 +126,11 @@ or `/events` path, and a missing scheme are all accepted.
   query-scoped counts, fuzzy matching over name/agent/repo, newest-first and
   relevance ordering, selection resolution, and the terminal/cancellable
   helpers behind `c`/`r`. Unit-tested without a window.
+- `src/detail.rs` — the pure detail model: output-envelope extraction and ANSI
+  stripping, usage/cost formatting, event-feed grouping (text, reasoning,
+  tools, usage, errors, boundaries), the permission-request resolver, and a
+  tolerant `tasks.events` decoder that skips unknown event kinds. Unit-tested
+  without a window.
 - `src/routes.rs` — the route vocabulary, labels, icons, jump hints and empty
   copy in one place.
 - `src/actions.rs` — actions plus the keymap; every shortcut is bound to an
@@ -214,3 +246,31 @@ Deviations from the plan are recorded in this file as the chain progresses
 - **Selection stays visible.** The Tasks list scrolls the highlight into view
   when ↑/↓, Home/End or PageUp/PageDown move it, without fighting a manual
   scroll (the scroll target only changes when the selected id does).
+
+### Step 06 deviations / additions
+
+- **No text selection in this GPUI build.** The pinned `gpui 0.2.2` exposes no
+  selectable-text primitive, so the Output pane is monospace plain text and the
+  **Copy output** action (plus **copy** beside the session id) is the clipboard
+  path. This is the one place the "selectable" wording cannot be met literally
+  in the current framework.
+- **Run-status labels.** `RunStatus` has two outcomes the task enum does not
+  (`interrupted`, `timed_out`); the Runs table renders those labels directly and
+  keeps `StatusKind` for the shared icon/color vocabulary.
+- **Permission banner sources.** The live `agents.list` session is authoritative
+  (it carries `request_id`, options and `allow_always`). If the roster has not
+  caught up, the last unresolved `InputRequested` in the feed is the fallback.
+  A task whose status says `awaiting_input` but has neither source still gets a
+  banner saying the prompt is not yet available, with disabled buttons.
+- **Unknown event kinds are skipped in both paths.** Live `agent.event` frames
+  decode tolerantly in `sse.rs`; the backfill uses a local `DetailEventsCall`
+  whose result drops events this client cannot parse and reports the count.
+- **Follow is viewport-driven.** A wheel/trackpad scroll up and any render that
+  finds the viewport off the tail pause following; a scroll back to the bottom
+  (or the pill/toggle) resumes it. Auto-scroll only reacts to content growth, so
+  a deliberate scroll is never yanked back.
+- **No periodic detail polling.** Opening a run loads all three parts once; a
+  terminal `task.updated` triggers one reconciling reload, and retries are
+  per-tab. The one-second clock only refreshes the elapsed label of a live run.
+- **Attempt totals are not faked.** The wire carries `attempt` but not a
+  configured retry total, so the header says `attempt n`, not `n of m`.
