@@ -124,6 +124,15 @@ struct LaunchSpec {
     cwd: Option<PathBuf>,
 }
 
+/// A resolved command line, including supervision and launch-time environment.
+struct LaunchCommand {
+    program: PathBuf,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
+    /// An agent-level cwd override, when configured.
+    cwd: Option<PathBuf>,
+}
+
 /// Everything a launch needs beyond the agent's command.
 pub struct Launch {
     /// Catalog task this session is attached to, if any.
@@ -352,6 +361,53 @@ impl AgentManager {
         Ok(())
     }
 
+    /// Resolve the executable, arguments and environment for launching `agent`.
+    ///
+    /// The process-group supervisor is applied here so every launch path (new
+    /// or load) is torn down with the daemon.
+    fn launch_command(
+        &self,
+        name: &str,
+        agent: &Agent,
+        extra_env: &BTreeMap<String, String>,
+    ) -> anyhow::Result<LaunchCommand> {
+        let mut spec = agent.launch_spec()?;
+        spec.env.extend(self.git_env(name, None)?);
+        spec.env.extend(extra_env.clone());
+
+        let mut program = spec.program.clone();
+        let mut args = spec.args.clone();
+        // Keep the daemon's process-group supervision: a daemon SIGTERM becomes
+        // a group kill, so no ACP server outlives it. If the running binary has
+        // been replaced or removed (e.g. mid `cargo install`), `current_exe()`
+        // may point at a path that no longer exists; degrade to a direct launch
+        // rather than failing every task.
+        if wrap_agent() {
+            match agent_exec_program().ok().filter(|path| is_executable(path)) {
+                Some(wrapper) => {
+                    let mut wrapped = vec![
+                        "__agent-exec".to_string(),
+                        "--".to_string(),
+                        program.to_string_lossy().into_owned(),
+                    ];
+                    wrapped.extend(args.iter().cloned());
+                    program = wrapper;
+                    args = wrapped;
+                }
+                None => tracing::warn!(
+                    "cannot locate the running favetto binary; launching agent '{name}' without \
+                     the process-group supervisor"
+                ),
+            }
+        }
+        Ok(LaunchCommand {
+            program,
+            args,
+            env: spec.env,
+            cwd: spec.cwd,
+        })
+    }
+
     /// The git environment for a launch, resolved without touching the
     /// operator's real git config.
     fn git_env(
@@ -449,37 +505,14 @@ impl AgentManager {
         agent: Arc<Agent>,
         launch: Launch,
     ) -> anyhow::Result<AgentSessionInfo> {
-        let mut spec = agent.launch_spec()?;
-        spec.env.extend(self.git_env(name, None)?);
-        spec.env.extend(launch.git_env.clone());
+        let LaunchCommand {
+            program,
+            args,
+            env,
+            cwd: spec_cwd,
+        } = self.launch_command(name, agent.as_ref(), &launch.git_env)?;
 
-        let mut program = spec.program.clone();
-        let mut args = spec.args.clone();
-        // Keep the daemon's process-group supervision: a daemon SIGTERM becomes
-        // a group kill, so no ACP server outlives it. If the running binary has
-        // been replaced or removed (e.g. mid `cargo install`), `current_exe()`
-        // may point at a path that no longer exists; degrade to a direct launch
-        // rather than failing every task.
-        if wrap_agent() {
-            match agent_exec_program().ok().filter(|path| is_executable(path)) {
-                Some(wrapper) => {
-                    let mut wrapped = vec![
-                        "__agent-exec".to_string(),
-                        "--".to_string(),
-                        program.to_string_lossy().into_owned(),
-                    ];
-                    wrapped.extend(args.iter().cloned());
-                    program = wrapper;
-                    args = wrapped;
-                }
-                None => tracing::warn!(
-                    "cannot locate the running favetto binary; launching agent '{name}' without \
-                     the process-group supervisor"
-                ),
-            }
-        }
-
-        let cwd = spec.cwd.clone().unwrap_or(launch.cwd);
+        let cwd = spec_cwd.unwrap_or(launch.cwd);
         let id = uuid::Uuid::new_v4().to_string();
 
         // The durable row exists before the agent does. Only the identity,
@@ -503,8 +536,9 @@ impl AgentManager {
             agent: name.to_string(),
             program,
             args,
-            env: spec.env,
+            env,
             cwd,
+            mode: acp::AcpSessionMode::New,
             // The task's own policy wins; the agent entry is only a default.
             policy: launch
                 .permission
@@ -557,6 +591,132 @@ impl AgentManager {
         let info = session.info();
         self.sessions.lock().insert(id, session);
         Ok(info)
+    }
+
+    /// Restore a persisted ACP session by its Favetto-local record.
+    ///
+    /// The local id stays the routing key; the agent's ACP id is sent only in
+    /// `session/load` and remains separate metadata. Loading never creates a
+    /// new session and never sends a prompt, so an unsupported or failed load
+    /// cannot masquerade as a restored conversation.
+    pub async fn load(
+        &self,
+        name: &str,
+        agent: Arc<Agent>,
+        record: AgentSessionRecord,
+    ) -> anyhow::Result<AgentSessionInfo> {
+        if record.agent != name {
+            anyhow::bail!(
+                "agent session '{}' belongs to agent '{}', not '{name}'",
+                record.id,
+                record.agent
+            );
+        }
+        let external_session_id = record.external_session_id.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "agent session '{}' has no ACP session id and cannot be loaded",
+                record.id
+            )
+        })?;
+
+        // Reattaching to a live process is not a load. Replace only a terminal
+        // entry left behind by an earlier process.
+        if let Some(existing) = self.sessions.lock().get(&record.id).cloned() {
+            if existing.running.load(Ordering::SeqCst) {
+                return Ok(existing.info());
+            }
+            self.sessions.lock().remove(&record.id);
+        }
+
+        let store = self.store.clone().ok_or_else(|| {
+            anyhow::anyhow!("agent '{name}': session history storage is not attached")
+        })?;
+        store.mark_loading(&record.id).await.map_err(|error| {
+            anyhow::anyhow!(
+                "agent '{name}': cannot mark session '{}' as loading: {error}",
+                record.id
+            )
+        })?;
+
+        let LaunchCommand {
+            program, args, env, ..
+        } = self.launch_command(name, agent.as_ref(), &BTreeMap::new())?;
+        let id = record.id.clone();
+        let binding = SessionBinding {
+            store: store.clone(),
+            id: id.clone(),
+            run_id: record.run_id.clone(),
+        };
+
+        let (mut handles, events) = match acp::spawn(acp::AcpLaunch {
+            agent: name.to_string(),
+            program,
+            args,
+            env,
+            // The session's stored working directory, not the caller's.
+            cwd: record.cwd.clone(),
+            mode: acp::AcpSessionMode::Load {
+                external_session_id: external_session_id.clone(),
+            },
+            policy: agent.config.permission.unwrap_or_default(),
+            // A load restores the conversation; it does not configure a model or
+            // submit a prompt. Follow-up prompts still flow through the manager.
+            model: None,
+            prompt: None,
+            close_after_turn: false,
+            permission_timeout: acp::PERMISSION_TIMEOUT,
+            session: Some(binding),
+        }) {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                if let Err(write) = store.mark_failed(&id, &error.to_string()).await {
+                    tracing::warn!(session = %id, error = %write, "failed to record session load failure");
+                }
+                return Err(error);
+            }
+        };
+        let Some(load) = handles.load.take() else {
+            handles.shutdown();
+            anyhow::bail!("agent '{name}': load launch did not report readiness");
+        };
+        let outcome = handles.outcome.clone();
+
+        let order = self.next_order.fetch_add(1, Ordering::SeqCst);
+        let (state_tx, _) = broadcast::channel(256);
+        let session = Arc::new(Session {
+            id: id.clone(),
+            agent: name.to_string(),
+            task_id: record.task_id.clone(),
+            running: handles.running.clone(),
+            exit_code: handles.exit_code.clone(),
+            external_session_id: handles.external_session_id.clone(),
+            headless: false,
+            last_activity: handles.last_activity.clone(),
+            awaiting_input: Arc::new(Mutex::new(None)),
+            live: Arc::new(Mutex::new(AgentLiveState {
+                activity: Some(AgentActivity::Starting),
+                usage: None,
+            })),
+            responder: handles.responder.clone(),
+            store: self.store.clone(),
+            state_tx: state_tx.clone(),
+            feed: Arc::new(Mutex::new(VecDeque::new())),
+            next_seq: Arc::new(AtomicU64::new(1)),
+            order,
+            handles,
+        });
+        // Register before awaiting the agent's acknowledgement so replay and
+        // lifecycle events have a stable owner.
+        spawn_state_task(session.clone(), self.tx.clone(), events, self.bus.clone());
+        self.sessions.lock().insert(id, session.clone());
+
+        wait_for_load(load, outcome).await?;
+        Ok(session.info())
+    }
+
+    /// A snapshot of a retained session by Favetto-local id.
+    pub fn find(&self, session_id: &str) -> Option<AgentSessionInfo> {
+        self.get(session_id).ok().map(|session| session.info())
     }
 
     /// A (re)attaching client's current view: the session plus its plain-text
@@ -684,6 +844,31 @@ impl AgentManager {
             .get(session_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("no agent session '{session_id}'"))
+    }
+}
+
+/// Wait for a load-mode ACP session to acknowledge `session/load`.
+///
+/// The runtime sends `Ok` only after the agent returned and the durable record
+/// is ready, and a message-bearing `Err` for an unsupported or failed load. If
+/// the process exits before either, report the recorded outcome rather than
+/// pretending the conversation was restored.
+async fn wait_for_load(
+    mut load: tokio::sync::watch::Receiver<Option<Result<(), String>>>,
+    outcome: Arc<Mutex<AcpOutcome>>,
+) -> anyhow::Result<()> {
+    loop {
+        match load.borrow_and_update().clone() {
+            Some(Ok(())) => return Ok(()),
+            Some(Err(error)) => return Err(anyhow::anyhow!(error)),
+            None => {}
+        }
+        if load.changed().await.is_err() {
+            let error = outcome.lock().error.clone();
+            return Err(anyhow::anyhow!(error.unwrap_or_else(|| {
+                "agent session ended before the load completed".to_string()
+            })));
+        }
     }
 }
 

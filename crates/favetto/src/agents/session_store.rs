@@ -15,7 +15,7 @@
 use chrono::Utc;
 use sqlx::SqlitePool;
 
-use crate::db::{self, AgentSessionRecord};
+use crate::db::{self, AgentSessionRecord, AgentSessionStatus};
 
 /// The durable writer attached to [`super::AgentManager`].
 #[derive(Clone)]
@@ -73,6 +73,23 @@ impl SessionStore {
                     "failed to record the ACP session id on the task run; finalization will retry"
                 ),
             }
+        }
+        Ok(())
+    }
+
+    /// Mark an existing record as being restored. `session/load` is in flight,
+    /// so the record must not be advertised as ready until it succeeds.
+    pub(crate) async fn mark_loading(&self, id: &str) -> anyhow::Result<()> {
+        let written = db::set_agent_session_status(
+            &self.pool,
+            id,
+            AgentSessionStatus::Loading,
+            None,
+            Utc::now(),
+        )
+        .await?;
+        if !written {
+            anyhow::bail!("session record '{id}' was not found while starting its load");
         }
         Ok(())
     }

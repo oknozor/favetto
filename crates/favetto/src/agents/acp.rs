@@ -24,13 +24,13 @@ use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::schema::{
-    CancelNotification, ContentBlock, EmbeddedResourceResource, InitializeRequest,
-    NewSessionRequest, PermissionOptionKind, PromptRequest, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionNotification, SessionUpdate, TextContent, ToolCall as AcpToolCall,
-    ToolCallContent as AcpToolCallContent, ToolCallLocation as AcpToolCallLocation,
-    ToolCallStatus as AcpToolCallStatus, ToolCallUpdateFields as AcpToolCallUpdateFields,
-    ToolKind as AcpToolKind,
+    AgentCapabilities, CancelNotification, ContentBlock, EmbeddedResourceResource,
+    InitializeRequest, LoadSessionRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionConfigOption, SessionId, SessionNotification, SessionUpdate,
+    TextContent, ToolCall as AcpToolCall, ToolCallContent as AcpToolCallContent,
+    ToolCallLocation as AcpToolCallLocation, ToolCallStatus as AcpToolCallStatus,
+    ToolCallUpdateFields as AcpToolCallUpdateFields, ToolKind as AcpToolKind,
 };
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::{Agent, Client, Lines};
@@ -55,6 +55,15 @@ pub(crate) const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
 /// task `running`.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Whether the initial ACP setup creates a session or restores a known one.
+#[derive(Debug, Clone)]
+pub(crate) enum AcpSessionMode {
+    /// Create a new session with `session/new`.
+    New,
+    /// Restore a session Favetto already knows by its agent-assigned ACP id.
+    Load { external_session_id: String },
+}
+
 /// What to launch and how to drive it.
 pub(crate) struct AcpLaunch {
     /// The configured agent name, used in diagnostics.
@@ -63,6 +72,8 @@ pub(crate) struct AcpLaunch {
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub cwd: PathBuf,
+    /// Create a new ACP session or load an existing one.
+    pub mode: AcpSessionMode,
     /// How permission requests that reach the client are answered.
     pub policy: PermissionPolicy,
     /// The `provider/model` the task requested, applied through the agent's
@@ -142,6 +153,14 @@ pub(crate) struct AcpHandles {
     pub running: Arc<AtomicBool>,
     pub exit_code: Arc<AtomicI32>,
     pub external_session_id: Arc<Mutex<Option<String>>>,
+    /// Capabilities advertised during `initialize`, retained for callers that
+    /// need to decide whether an operation is supported.
+    #[allow(dead_code)] // read by later session-history steps and capability-aware callers
+    pub capabilities: Arc<Mutex<Option<AgentCapabilities>>>,
+    /// Completion of a load-mode startup, when `mode` was [`AcpSessionMode::Load`].
+    /// `None` means the load has not settled yet; the receiver closes if the
+    /// server exits before reporting either way.
+    pub load: Option<tokio::sync::watch::Receiver<Option<Result<(), String>>>>,
     pub last_activity: Arc<Mutex<Instant>>,
     /// Plain-text transcript (assistant text plus tool summaries) used as the
     /// run's captured output.
@@ -226,6 +245,7 @@ pub(crate) fn spawn(
     let running = Arc::new(AtomicBool::new(true));
     let exit_code = Arc::new(AtomicI32::new(-1));
     let external_session_id = Arc::new(Mutex::new(None));
+    let capabilities = Arc::new(Mutex::new(None));
     let last_activity = Arc::new(Mutex::new(Instant::now()));
     let transcript = Arc::new(Mutex::new(String::new()));
     let outcome = Arc::new(Mutex::new(AcpOutcome::default()));
@@ -247,7 +267,12 @@ pub(crate) fn spawn(
     let permission_responder = responder.clone();
 
     let permission_events = events_tx.clone();
-    let initial_prompt = launch.prompt.clone();
+    // Loading restores a conversation; it must never submit a prompt as part of
+    // the restore, even if one was supplied to the launch descriptor.
+    let initial_prompt = match &launch.mode {
+        AcpSessionMode::New => launch.prompt.clone(),
+        AcpSessionMode::Load { .. } => None,
+    };
     let requested_model = launch.model.clone();
     let agent_name = launch.agent.clone();
     let close_after_turn = launch.close_after_turn;
@@ -261,6 +286,15 @@ pub(crate) fn spawn(
     let result_outcome = outcome.clone();
     let result_events = events_tx.clone();
     let connection_outcome = outcome.clone();
+    let capability_slot = capabilities.clone();
+    let mode = launch.mode;
+    let (load_tx, load_rx) = match &mode {
+        AcpSessionMode::Load { .. } => {
+            let (tx, rx) = tokio::sync::watch::channel(None);
+            (Some(tx), Some(rx))
+        }
+        AcpSessionMode::New => (None, None),
+    };
     let mut child = child;
     let task = tokio::spawn(async move {
         let notification_transcript = Arc::clone(&notification_transcript);
@@ -297,66 +331,150 @@ pub(crate) fn spawn(
                         .send_request(InitializeRequest::new(ProtocolVersion::V1))
                         .block_task()
                         .await?;
+                    *capability_slot.lock() = Some(init.agent_capabilities.clone());
                     tracing::debug!(
                         target: "favetto::acp",
                         agent = ?init.agent_info,
+                        load_session = init.agent_capabilities.load_session,
                         "ACP agent initialized"
                     );
 
-                    let session = connection
-                        .send_request(NewSessionRequest::new(cwd))
-                        .block_task()
-                        .await?;
-                    let session_id = session.session_id.clone();
-                    let external_session_id = session_id.0.to_string();
-                    // Record the agent's identity immediately: a task run can be
-                    // finalized (or the daemon can crash) long before the first
-                    // turn ends. A write fault aborts the session rather than
-                    // letting an untracked conversation continue.
-                    if let Some(binding) = &ready_binding {
-                        if let Err(error) = binding
-                            .store
-                            .mark_ready(
-                                &binding.id,
-                                &external_session_id,
-                                binding.run_id.as_deref(),
-                            )
-                            .await
-                        {
-                            let message = format!(
-                                "agent '{agent_name}': cannot record ACP session id: {error}"
-                            );
-                            let _ = events_tx.send(AgentStateEvent::Error {
-                                message: message.clone(),
-                            });
-                            return Err(anyhow::anyhow!(message).into());
-                        }
-                    }
-                    // Expose the id to the manager even if model selection
-                    // fails below, so a failed run still reports its identity.
-                    *session_id_slot.lock() = Some(external_session_id.clone());
-                    // A task names its model explicitly; apply it instead of
-                    // relying on the agent's last-used default (which may be
-                    // stale or unavailable on this account).
-                    let chosen_model = if let Some(wanted) = &requested_model {
-                        match apply_model(&connection, &session, wanted).await {
-                            Ok(model) => Some(model),
-                            Err(error) => {
-                                let message = format!("agent '{agent_name}': {error}");
+                    // Session setup differs only here: a new conversation is
+                    // created, while a load restores the agent's own session id.
+                    // A load never falls back to `session/new`, because a fresh
+                    // session would be presented as a restored conversation.
+                    let (session_id, external_session_id, chosen_model) = match &mode {
+                        AcpSessionMode::Load {
+                            external_session_id: known,
+                        } => {
+                            if !init.agent_capabilities.load_session {
+                                let message = format!(
+                                    "agent '{agent_name}' does not support loading ACP sessions \
+                                     (session/load); cannot restore session '{known}'"
+                                );
+                                if let Some(tx) = &load_tx {
+                                    let _ = tx.send(Some(Err(message.clone())));
+                                }
                                 let _ = events_tx.send(AgentStateEvent::Error {
                                     message: message.clone(),
                                 });
                                 return Err(anyhow::anyhow!(message).into());
                             }
+                            let loaded = connection
+                                .send_request(LoadSessionRequest::new(
+                                    SessionId::new(known.clone()),
+                                    cwd.clone(),
+                                ))
+                                .block_task()
+                                .await
+                                .map_err(|error| {
+                                    let message = format!(
+                                        "agent '{agent_name}' could not load ACP session \
+                                         '{known}': {error}"
+                                    );
+                                    if let Some(tx) = &load_tx {
+                                        let _ = tx.send(Some(Err(message.clone())));
+                                    }
+                                    let _ = events_tx.send(AgentStateEvent::Error {
+                                        message: message.clone(),
+                                    });
+                                    anyhow::anyhow!(message)
+                                })?;
+                            // The local id is the routing key; the ACP id stays
+                            // separate metadata, unchanged by the restore.
+                            if let Some(binding) = &ready_binding {
+                                if let Err(error) = binding
+                                    .store
+                                    .mark_ready(&binding.id, known, binding.run_id.as_deref())
+                                    .await
+                                {
+                                    let message = format!(
+                                        "agent '{agent_name}': cannot record loaded ACP session \
+                                         id: {error}"
+                                    );
+                                    if let Some(tx) = &load_tx {
+                                        let _ = tx.send(Some(Err(message.clone())));
+                                    }
+                                    let _ = events_tx.send(AgentStateEvent::Error {
+                                        message: message.clone(),
+                                    });
+                                    return Err(anyhow::anyhow!(message).into());
+                                }
+                            }
+                            *session_id_slot.lock() = Some(known.clone());
+                            (
+                                SessionId::new(known.clone()),
+                                known.clone(),
+                                current_model(loaded.config_options.as_deref()),
+                            )
                         }
-                    } else {
-                        current_model(&session)
+                        AcpSessionMode::New => {
+                            let session = connection
+                                .send_request(NewSessionRequest::new(cwd.clone()))
+                                .block_task()
+                                .await?;
+                            let session_id = session.session_id.clone();
+                            let external_session_id = session_id.0.to_string();
+                            // Record the agent's identity immediately: a task
+                            // run can be finalized (or the daemon can crash)
+                            // long before the first turn ends. A write fault
+                            // aborts the session rather than letting an
+                            // untracked conversation continue.
+                            if let Some(binding) = &ready_binding {
+                                if let Err(error) = binding
+                                    .store
+                                    .mark_ready(
+                                        &binding.id,
+                                        &external_session_id,
+                                        binding.run_id.as_deref(),
+                                    )
+                                    .await
+                                {
+                                    let message = format!(
+                                        "agent '{agent_name}': cannot record ACP session id: \
+                                         {error}"
+                                    );
+                                    let _ = events_tx.send(AgentStateEvent::Error {
+                                        message: message.clone(),
+                                    });
+                                    return Err(anyhow::anyhow!(message).into());
+                                }
+                            }
+                            // Expose the id to the manager even if model
+                            // selection fails below, so a failed run still
+                            // reports its identity.
+                            *session_id_slot.lock() = Some(external_session_id.clone());
+                            // A task names its model explicitly; apply it
+                            // instead of relying on the agent's last-used
+                            // default (which may be stale or unavailable on
+                            // this account).
+                            let chosen_model = if let Some(wanted) = &requested_model {
+                                match apply_model(&connection, &session, wanted).await {
+                                    Ok(model) => Some(model),
+                                    Err(error) => {
+                                        let message = format!("agent '{agent_name}': {error}");
+                                        let _ = events_tx.send(AgentStateEvent::Error {
+                                            message: message.clone(),
+                                        });
+                                        return Err(anyhow::anyhow!(message).into());
+                                    }
+                                }
+                            } else {
+                                current_model(session.config_options.as_deref())
+                            };
+                            (session_id, external_session_id, chosen_model)
+                        }
                     };
                     let _ = events_tx.send(AgentStateEvent::Session {
                         session_id: Some(external_session_id),
                         title: None,
                         model: chosen_model,
                     });
+                    // A load is only reported as restored after the agent
+                    // acknowledged it and the record is ready.
+                    if let Some(tx) = &load_tx {
+                        let _ = tx.send(Some(Ok(())));
+                    }
 
                     // A control task turns external commands into protocol
                     // notifications, so the prompt loop below stays linear.
@@ -530,6 +648,8 @@ pub(crate) fn spawn(
             running,
             exit_code,
             external_session_id,
+            capabilities,
+            load: load_rx,
             last_activity,
             transcript,
             outcome,
@@ -647,11 +767,9 @@ impl AcpResponder {
     }
 }
 
-/// The current model reported by a `session/new` response, if any.
-fn current_model(
-    session: &agent_client_protocol::v1::schema::NewSessionResponse,
-) -> Option<String> {
-    let option = model_option(session.config_options.as_deref().unwrap_or(&[]))?;
+/// The current model reported by a session setup response, if any.
+fn current_model(options: Option<&[SessionConfigOption]>) -> Option<String> {
+    let option = model_option(options.unwrap_or(&[]))?;
     let agent_client_protocol::v1::schema::SessionConfigKind::Select(select) = &option.kind else {
         return None;
     };
@@ -1677,6 +1795,7 @@ mod tests {
             args: Vec::new(),
             env: BTreeMap::new(),
             cwd: "/nonexistent/favetto-acp-cwd".into(),
+            mode: AcpSessionMode::New,
             policy: PermissionPolicy::Deny,
             prompt: None,
             close_after_turn: true,

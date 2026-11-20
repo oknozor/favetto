@@ -37,8 +37,9 @@ fn main() {
     let mut stdout = std::io::stdout();
     let mut selected_model = DEFAULT_MODEL.to_string();
     // Unique per process, so two sessions from the same run (and the durable
-    // per-agent uniqueness constraint) do not collide.
-    let session_id = format!("{SESSION_ID}-{}", std::process::id());
+    // per-agent uniqueness constraint) do not collide. A load replaces it with
+    // the stored id supplied by the client.
+    let mut session_id = format!("{SESSION_ID}-{}", std::process::id());
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         let line = line.trim();
@@ -60,7 +61,9 @@ fn main() {
                     id,
                     json!({
                         "protocolVersion": 1,
-                        "agentCapabilities": {}
+                        "agentCapabilities": {
+                            "loadSession": load_supported()
+                        }
                     }),
                 );
             }
@@ -73,6 +76,33 @@ fn main() {
                         "configOptions": config_options(&selected_model)
                     }),
                 );
+            }
+            "session/load" => {
+                let params = message.get("params");
+                let loaded = params
+                    .and_then(|params| params.get("sessionId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(&session_id)
+                    .to_string();
+                if let Some(marker) = std::env::var_os("FAKE_ACP_LOAD_MARKER") {
+                    let cwd = params
+                        .and_then(|params| params.get("cwd"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let _ = std::fs::write(marker, format!("{loaded}\n{cwd}\n"));
+                }
+                session_id = loaded;
+                if std::env::var("FAKE_ACP_LOAD_RESULT").as_deref() == Ok("error") {
+                    if let Some(id) = id {
+                        error(&mut stdout, id, -32000, "cannot load session");
+                    }
+                } else {
+                    respond(
+                        &mut stdout,
+                        id,
+                        json!({ "configOptions": config_options(&selected_model) }),
+                    );
+                }
             }
             "session/set_config_option" => {
                 let wanted = message
@@ -95,6 +125,9 @@ fn main() {
                 }
             }
             "session/prompt" => {
+                if let Some(marker) = std::env::var_os("FAKE_ACP_PROMPT_MARKER") {
+                    let _ = std::fs::write(marker, prompt_text(&message));
+                }
                 // Tests can ask the agent to report a display title, proving the
                 // daemon persists ACP title updates on the durable session row.
                 if let Some(title) = std::env::var_os("FAKE_ACP_TITLE") {
@@ -152,6 +185,15 @@ fn main() {
             }
         }
     }
+}
+
+/// Whether to advertise `session/load`. Enabled by default; tests set
+/// `FAKE_ACP_LOAD_SUPPORTED=0` to exercise the unsupported path.
+fn load_supported() -> bool {
+    !matches!(
+        std::env::var("FAKE_ACP_LOAD_SUPPORTED").as_deref(),
+        Ok("0" | "false")
+    )
 }
 
 /// The optional file gate directory, from `FAKE_ACP_GATE_DIR`.

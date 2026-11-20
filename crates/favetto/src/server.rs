@@ -1260,6 +1260,42 @@ fn workflow_state(tasks: &[WorkflowTaskView]) -> WorkflowState {
     }
 }
 
+/// Restore a persisted ACP session selected by its Favetto-local id.
+///
+/// The durable record supplies the agent and working directory; the client's
+/// id is never reinterpreted as the provider's ACP id.
+async fn load_agent(
+    state: &Arc<State>,
+    local_id: &str,
+    requested_agent: Option<&str>,
+) -> anyhow::Result<AgentSessionInfo> {
+    if let Some(existing) = state.agents.find(local_id) {
+        if existing.running {
+            return Ok(existing);
+        }
+    }
+
+    let record = db::get_agent_session(&state.db, local_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no persisted agent session '{local_id}'"))?;
+
+    if let Some(requested) = requested_agent {
+        if requested != record.agent {
+            anyhow::bail!(
+                "agent session '{local_id}' was created by agent '{}', not '{requested}'",
+                record.agent
+            );
+        }
+    }
+    if record.external_session_id.is_none() {
+        anyhow::bail!("agent session '{local_id}' has no ACP session id and cannot be loaded");
+    }
+
+    let name = record.agent.clone();
+    let agent = state.registry.get_checked(&name)?;
+    state.agents.load(&name, agent, record).await
+}
+
 /// Resolve the requested (or default) agent and spawn a PTY session.
 ///
 /// Task runs are headless (their PTY carries machine output such as JSON), so
@@ -1277,6 +1313,7 @@ async fn start_agent(
         agent: requested,
         task_id,
         prompt,
+        session_id,
         new: force_new,
         cwd,
         provider: requested_provider,
@@ -1284,6 +1321,18 @@ async fn start_agent(
         ..
     } = params;
     let force_new = force_new.unwrap_or(false);
+
+    // A known Favetto-local id restores that ACP conversation. Older clients
+    // also send a provider ACP id here as a reattach hint; that is not a local
+    // record and keeps the existing "start a new session" behavior. The load
+    // path itself never falls back to `session/new`.
+    if !force_new {
+        if let Some(candidate) = session_id.as_deref().filter(|id| !id.trim().is_empty()) {
+            if db::get_agent_session(&state.db, candidate).await?.is_some() {
+                return load_agent(state, candidate, requested.as_deref()).await;
+            }
+        }
+    }
 
     // Resolve the catalog task (if any) up front. An action task runs a built-in
     // step and has no agent, so there is no session to open.
