@@ -1,7 +1,7 @@
 agent = "opencode"
 provider = "opencode-go"
 model = "deepseek-v4.1-flash"
-worktree = false
+worktree = true
 permission = "allow"
 needs = "acp-output/04-structured-feed:succeeded"
 ---
@@ -15,6 +15,22 @@ and code syntax highlighting for the structured feed.
 - `crates/favetto-tui/src/tui/json.rs`
 - The new structured feed renderer and its tests.
 - `crates/favetto-tui/Cargo.toml` before considering a dependency.
+
+## Shared pull-request branch
+
+This task enriches the existing `feat/acp-tui-output` branch created by step 01;
+step 07 will open the single pull request containing all workflow commits.
+
+- Require `[executor] parallel = true` and `[executor] worktree = true`; if the
+  task is not running in its own clean Favetto worktree, stop before editing.
+- Fetch `origin/feat/acp-tui-output` and reset only this task's clean, generated
+  worktree branch to that remote branch before making changes. Never reset the
+  base checkout or another worktree.
+- After implementation and checks pass, create a conventional commit (for
+  example, `feat(tui): render ACP markdown and code`) and push with
+  `git push origin HEAD:refs/heads/feat/acp-tui-output`. Do not force-push.
+- Do not open a separate pull request. Report the commit hash, branch, files
+  changed, and checks for the next step.
 
 ## Goal
 
@@ -40,12 +56,12 @@ syntax-highlighted code, using existing TUI conventions where practical.
 
 ## Constraints
 
-- Work in the current checkout; preserve unrelated changes.
+- Work only in this task's generated worktree; preserve unrelated changes.
 - Do not add raw HTML or active content support.
-- Do not commit.
 
 ## Definition of done
 
 - Assistant prose renders as Markdown; code blocks are language-aware and
   highlighted where supported.
-- Relevant tests, formatting, and lint pass; report exact commands and results.
+- Relevant tests, formatting, and lint pass, and the commit is pushed to
+  `feat/acp-tui-output`; report exact commands and results.

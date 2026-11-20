@@ -1,7 +1,7 @@
 agent = "opencode"
 provider = "opencode-go"
 model = "deepseek-v4.1-flash"
-worktree = false
+worktree = true
 permission = "allow"
 needs = "acp-output/02-audit:all_finished"
 ---
@@ -16,6 +16,24 @@ ACP tool-call information through favetto's normalized event model.
 - `crates/favetto-wire/src/agent_state.rs`
 - All consumers and tests of `AgentStateEvent` (including the web feed).
 - The ACP v1 schema version and documentation used by the current adapter.
+
+## Shared pull-request branch
+
+This is the first implementation step. It and steps 04–06 must enrich the same
+branch, `feat/acp-tui-output`, which step 01 seeded from `origin/main` (excluding
+unpublished local commits such as concurrent GPUI work). The final step opens
+one pull request from that branch to `main`.
+
+- Require `[executor] parallel = true` and `[executor] worktree = true`; if the
+  task is not running in its own clean Favetto worktree, stop before editing.
+- Fetch `origin/feat/acp-tui-output` and reset only this task's clean, generated
+  worktree branch to that remote branch before making changes. Never reset the
+  base checkout or another worktree.
+- After the implementation and checks pass, create a conventional commit, for
+  example `feat(tui): preserve structured ACP tool events`, then push with
+  `git push origin HEAD:refs/heads/feat/acp-tui-output`. Do not force-push.
+- Do not open a separate pull request. Report the commit hash, shared branch,
+  files changed, and exact checks so the next step can continue the same PR.
 
 ## Goal
 
@@ -40,14 +58,13 @@ breaking existing event consumers or assuming optional ACP fields are present.
 
 ## Constraints
 
-- Work in the current checkout (`worktree = false`); preserve unrelated,
-  pre-existing changes.
+- Work only in this task's generated worktree; preserve unrelated changes.
 - Keep changes limited to ACP event normalization, its consumers required for
   compilation, and tests.
-- Do not commit.
 
 ## Definition of done
 
 - `AgentStateEvent` retains the detail needed for a useful tool card while
   remaining tolerant of missing fields.
-- Relevant tests and formatting pass; report exact commands and results.
+- Relevant tests and formatting pass, and the commit is pushed to
+  `feat/acp-tui-output`; report exact commands and results.

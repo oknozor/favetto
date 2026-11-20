@@ -1,6 +1,7 @@
 agent = "opencode"
 provider = "opencode-go"
 model = "deepseek-v4.1-flash"
+worktree = true
 ---
 
 You are a read-only specialist audit in the ACP TUI output workflow.
@@ -20,8 +21,10 @@ Focus: {{ input.focus }}
 3. Do not edit files or commit. Keep the response concise and useful to the
    implementation tasks. Unknowns should be called out explicitly.
 
-This task is intentionally independent of the other audit scopes. It may run in
-parallel with them; the implementation waits for all audits to finish.
+This task is intentionally independent of the other audit scopes. It runs
+read-only in its own Favetto worktree and may run in parallel with the other audit
+scopes; the implementation waits for all audits to finish. The workflow requires
+`[executor] parallel = true` and `[executor] worktree = true`.
 
 ## Definition of done
 

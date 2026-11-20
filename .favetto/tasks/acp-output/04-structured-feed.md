@@ -1,7 +1,7 @@
 agent = "opencode"
 provider = "opencode-go"
 model = "deepseek-v4.1-flash"
-worktree = false
+worktree = true
 permission = "allow"
 needs = "acp-output/03-event-model:succeeded"
 ---
@@ -17,6 +17,22 @@ text.
 - `crates/favetto-wire/src/agent_state.rs`
 - `web/src/components/agent_feed.rs` for interaction ideas only; do not port web
   code or alter the web experience.
+
+## Shared pull-request branch
+
+This task enriches the existing `feat/acp-tui-output` branch created by step 01;
+step 07 will open the single pull request containing all workflow commits.
+
+- Require `[executor] parallel = true` and `[executor] worktree = true`; if the
+  task is not running in its own clean Favetto worktree, stop before editing.
+- Fetch `origin/feat/acp-tui-output` and reset only this task's clean, generated
+  worktree branch to that remote branch before making changes. Never reset the
+  base checkout or another worktree.
+- After implementation and checks pass, create a conventional commit (for
+  example, `feat(tui): render structured ACP feed`) and push with
+  `git push origin HEAD:refs/heads/feat/acp-tui-output`. Do not force-push.
+- Do not open a separate pull request. Report the commit hash, branch, files
+  changed, and checks for the next step.
 
 ## Goal
 
@@ -50,12 +66,12 @@ and tool-call hierarchy, while leaving PTY-backed sessions unchanged.
 
 ## Constraints
 
-- Work in the current checkout; preserve unrelated changes.
+- Work only in this task's generated worktree; preserve unrelated changes.
 - Keep the implementation within the favetto TUI and its tests.
-- Do not commit.
 
 ## Definition of done
 
 - ACP output is a structured feed with foldable tool detail and clear status;
   PTY sessions retain their existing rendering.
-- Relevant tests and formatting pass; report exact commands and results.
+- Relevant tests and formatting pass, and the commit is pushed to
+  `feat/acp-tui-output`; report exact commands and results.

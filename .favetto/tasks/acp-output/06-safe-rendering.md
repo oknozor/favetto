@@ -1,7 +1,7 @@
 agent = "opencode"
 provider = "opencode-go"
 model = "deepseek-v4.1-flash"
-worktree = false
+worktree = true
 permission = "allow"
 needs = "acp-output/05-markdown-code:succeeded"
 ---
@@ -15,6 +15,22 @@ and polish the feed interactions.
 - `crates/favetto-tui/src/tui/term.rs`
 - The structured feed and Markdown renderer added in prior steps.
 - Existing TUI accessibility, keyboard, and test conventions.
+
+## Shared pull-request branch
+
+This task enriches the existing `feat/acp-tui-output` branch created by step 01;
+step 07 will open the single pull request containing all workflow commits.
+
+- Require `[executor] parallel = true` and `[executor] worktree = true`; if the
+  task is not running in its own clean Favetto worktree, stop before editing.
+- Fetch `origin/feat/acp-tui-output` and reset only this task's clean, generated
+  worktree branch to that remote branch before making changes. Never reset the
+  base checkout or another worktree.
+- After implementation and checks pass, create a conventional commit (for
+  example, `fix(tui): harden ACP feed rendering`) and push with
+  `git push origin HEAD:refs/heads/feat/acp-tui-output`. Do not force-push.
+- Do not open a separate pull request. Report the commit hash, branch, files
+  changed, and checks for the next step.
 
 ## Goal
 
@@ -39,12 +55,12 @@ usable in a terminal.
 
 ## Constraints
 
-- Work in the current checkout; preserve unrelated changes.
+- Work only in this task's generated worktree; preserve unrelated changes.
 - Do not execute agent-authored commands, scripts, or links.
-- Do not commit.
 
 ## Definition of done
 
 - Agent-controlled content is inert in the TUI and the feed is usable with
   keyboard navigation.
-- Relevant tests, formatting, and lint pass; report exact commands and results.
+- Relevant tests, formatting, and lint pass, and the commit is pushed to
+  `feat/acp-tui-output`; report exact commands and results.
