@@ -12,7 +12,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use favetto_core::model::{AgentBackend, AgentSessionInfo, FailureKind, Task, TaskStatus, UsagePeriod};
+use favetto_core::model::{AgentBackend, FailureKind, Task, TaskStatus, UsagePeriod};
 use favetto_core::workflow::{WorkflowInspect, WorkflowState};
 
 use super::app::{
