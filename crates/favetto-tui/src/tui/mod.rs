@@ -4,6 +4,7 @@
 mod app;
 mod clipboard;
 mod editor;
+mod feed;
 mod json;
 mod markdown;
 mod sound;

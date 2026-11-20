@@ -1,6 +1,7 @@
 use super::super::app::AgentSelection;
 use super::*;
 use ratatui::backend::TestBackend;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use std::collections::BTreeMap;
 
@@ -1437,6 +1438,8 @@ fn agent_tab_renders_structured_state_not_headless_json() {
     let mut app = App::new();
     app.tab = Tab::Agent;
     let mut headless = session("s1", "opencode", true, true);
+    // A non-ACP headless run keeps the structured state snapshot.
+    headless.backend = favetto_core::model::AgentBackend::Pty;
     headless.activity = Some(favetto_core::model::AgentActivity::Tool {
         name: "bash".to_string(),
         description: None,
@@ -1471,6 +1474,141 @@ fn agent_tab_renders_structured_state_not_headless_json() {
         !text.contains("sessionID") && !text.contains("part"),
         "raw JSON leaked into the panel: {text:?}"
     );
+}
+
+#[test]
+fn agent_tab_renders_acp_messages_thinking_and_tool_cards() {
+    use favetto_core::model::{
+        AgentStateEvent, MessageRole, ToolCallDetail, ToolCallStatus, ToolKind,
+    };
+
+    let mut app = App::new();
+    app.tab = Tab::Agent;
+    app.open_agent(session("s1", "opencode", false, true), b"");
+    app.agent_event(
+        "s1",
+        &AgentStateEvent::TextDelta {
+            role: MessageRole::Assistant,
+            text: "Here is the answer.".to_string(),
+        },
+    );
+    app.agent_event(
+        "s1",
+        &AgentStateEvent::ToolStarted {
+            id: "call-1".to_string(),
+            name: "read".to_string(),
+            input: serde_json::json!({ "path": "src/lib.rs" }),
+            detail: Some(Box::new(ToolCallDetail {
+                name: Some("read".to_string()),
+                title: Some("Read file".to_string()),
+                kind: Some(ToolKind::Read),
+                status: Some(ToolCallStatus::InProgress),
+                input: Some(serde_json::json!({ "path": "src/lib.rs" })),
+                ..Default::default()
+            })),
+        },
+    );
+    app.agent_event(
+        "s1",
+        &AgentStateEvent::ToolFinished {
+            id: "call-1".to_string(),
+            name: "read".to_string(),
+            ok: true,
+            output: Some(serde_json::json!("file contents")),
+            detail: None,
+        },
+    );
+    app.agent_event(
+        "s1",
+        &AgentStateEvent::ReasoningDelta {
+            text: "a private thought".to_string(),
+        },
+    );
+
+    let text = render_text(&mut app, 100, 30);
+    assert!(
+        text.contains("Here is the answer."),
+        "message missing: {text:?}"
+    );
+    assert!(text.contains("Read file"), "tool title missing: {text:?}");
+    assert!(text.contains("completed"), "status missing: {text:?}");
+    assert!(
+        text.contains("Thinking"),
+        "thinking header missing: {text:?}"
+    );
+    assert!(
+        text.contains("streaming…"),
+        "stream marker missing: {text:?}"
+    );
+    assert!(
+        !text.contains("file contents"),
+        "tool detail leaked folded: {text:?}"
+    );
+    assert!(
+        !text.contains("a private thought"),
+        "thought body leaked folded: {text:?}"
+    );
+
+    // Select and expand the tool: its input and output become visible.
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
+    // The trailing thought is the last foldable row; move up to the tool.
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+    let expanded = render_text(&mut app, 100, 30);
+    assert!(
+        expanded.contains("Input"),
+        "input section missing: {expanded:?}"
+    );
+    assert!(
+        expanded.contains("src/lib.rs"),
+        "input missing: {expanded:?}"
+    );
+    assert!(
+        expanded.contains("file contents"),
+        "output missing: {expanded:?}"
+    );
+}
+
+#[test]
+fn agent_tab_renders_unknown_tool_values_with_a_neutral_fallback() {
+    use favetto_core::model::{AgentStateEvent, ToolCallDetail, ToolCallStatus, ToolKind};
+
+    let mut app = App::new();
+    app.tab = Tab::Agent;
+    app.open_agent(session("s1", "opencode", false, true), b"");
+    app.agent_event(
+        "s1",
+        &AgentStateEvent::ToolStarted {
+            id: "call-1".to_string(),
+            name: "mystery".to_string(),
+            input: serde_json::json!({}),
+            detail: Some(Box::new(ToolCallDetail {
+                kind: Some(ToolKind::Other),
+                status: Some(ToolCallStatus::Unknown),
+                ..Default::default()
+            })),
+        },
+    );
+    let text = render_text(&mut app, 100, 24);
+    assert!(text.contains("mystery"), "tool name missing: {text:?}");
+    assert!(text.contains("unknown"), "neutral status missing: {text:?}");
+    assert!(text.contains('•'), "neutral kind icon missing: {text:?}");
+}
+
+#[test]
+fn agent_tab_keeps_pty_terminal_rendering() {
+    let mut app = App::new();
+    app.tab = Tab::Agent;
+    let mut pty = session("pty", "pi", false, true);
+    pty.backend = favetto_core::model::AgentBackend::Pty;
+    app.open_agent(pty, b"pty terminal output");
+    let text = render_text(&mut app, 100, 24);
+    assert!(
+        text.contains("pty terminal output"),
+        "PTY screen missing: {text:?}"
+    );
+    assert!(!text.contains("Waiting for the agent's first event"));
 }
 
 #[test]
