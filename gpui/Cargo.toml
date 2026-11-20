@@ -33,6 +33,9 @@ dirs = "7"
 toml = "0.8"
 base64 = "0.22"
 fuzzy-matcher = "0.3"
+# Cron parsing/validation and next-occurrence math. Pinned to the daemon's own
+# parser configuration so the hint and the schedule it saves cannot disagree.
+croner = "3"
 
 # Workaround for the first `cargo check`/`build` of the gpui graph:
 # `gpui 0.2.2 -> gpui_http_client -> zed-async-tar -> xattr 0.2.3` uses

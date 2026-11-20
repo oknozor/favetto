@@ -125,6 +125,7 @@ impl Route {
     }
 
     /// The one-sentence explanation shown under the empty-state title.
+    #[allow(dead_code)]
     pub fn empty_body(self) -> &'static str {
         match self {
             Route::Inbox => {

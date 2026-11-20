@@ -87,6 +87,30 @@ actions!(
         WorkflowCancelRoot,
         /// Retry the highlighted failed workflow instance (`r`).
         WorkflowRetryInstance,
+        /// Open the Schedules create sheet (`n`).
+        ScheduleNew,
+        /// Open the Schedules edit sheet for the highlighted row (`↵`).
+        ScheduleEdit,
+        /// Open the delete confirmation for the highlighted schedule (`d`).
+        ScheduleDelete,
+        /// Toggle the enabled flag in the schedule sheet (Space).
+        ScheduleToggleEnabled,
+        /// Move to the next schedule field (Tab).
+        ScheduleFieldNext,
+        /// Move to the previous schedule field (Shift+Tab).
+        ScheduleFieldPrev,
+        /// Validate and save the schedule sheet (`⌘↵` / `Ctrl+↵`).
+        ScheduleSubmit,
+        /// Move to the next Settings control (Tab).
+        SettingsFieldNext,
+        /// Move to the previous Settings control (Shift+Tab).
+        SettingsFieldPrev,
+        /// Activate the focused Settings control (Enter).
+        SettingsActivate,
+        /// Save the connection draft (`⌘↵` / `Ctrl+↵`).
+        SettingsSave,
+        /// Test the draft connection (`⌘T` / `Ctrl+T`).
+        SettingsTest,
         /// Refresh the connection and the current surface.
         Refresh,
         /// Restart the transport.
@@ -175,7 +199,7 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new(
             "enter",
             ListOpen,
-            Some("Root && !Palette && !Shortcuts && !Confirm"),
+            Some("Root && !Palette && !Shortcuts && !Confirm && !Sheet"),
         ),
         KeyBinding::new(
             "r",
@@ -284,6 +308,79 @@ pub fn bindings() -> Vec<KeyBinding> {
             "n",
             TaskConfirmReject,
             Some("Workflows && Confirm && !Palette && !Shortcuts"),
+        ),
+        KeyBinding::new(
+            "n",
+            ScheduleNew,
+            Some("Schedules && !Palette && !Shortcuts && !Sheet && !Confirm"),
+        ),
+        KeyBinding::new(
+            "d",
+            ScheduleDelete,
+            Some("Schedules && !Palette && !Shortcuts && !Sheet && !Confirm"),
+        ),
+        // Registered after the generic ListOpen so Enter opens the schedule
+        // sheet on this surface, while the other lists keep their own handler.
+        KeyBinding::new(
+            "enter",
+            ScheduleEdit,
+            Some("Schedules && !Palette && !Shortcuts && !Sheet && !Confirm"),
+        ),
+        KeyBinding::new("tab", ScheduleFieldNext, Some("Schedules && Sheet")),
+        KeyBinding::new("shift-tab", ScheduleFieldPrev, Some("Schedules && Sheet")),
+        KeyBinding::new(
+            "secondary-enter",
+            ScheduleSubmit,
+            Some("Schedules && Sheet"),
+        ),
+        // A plain Space/letter must stay available for the cron expression, so
+        // the enabled toggle uses a modifier chord (and the sheet's row click).
+        KeyBinding::new(
+            "secondary-e",
+            ScheduleToggleEnabled,
+            Some("Schedules && Sheet"),
+        ),
+        KeyBinding::new(
+            "enter",
+            TaskConfirmAccept,
+            Some("Schedules && Confirm && !Palette && !Shortcuts"),
+        ),
+        KeyBinding::new(
+            "y",
+            TaskConfirmAccept,
+            Some("Schedules && Confirm && !Palette && !Shortcuts"),
+        ),
+        KeyBinding::new(
+            "n",
+            TaskConfirmReject,
+            Some("Schedules && Confirm && !Palette && !Shortcuts"),
+        ),
+        // Settings: Tab walks the logical controls, Enter activates the focused
+        // one, and the secondary chords save/test without leaving the surface.
+        KeyBinding::new(
+            "tab",
+            SettingsFieldNext,
+            Some("Settings && !Palette && !Shortcuts"),
+        ),
+        KeyBinding::new(
+            "shift-tab",
+            SettingsFieldPrev,
+            Some("Settings && !Palette && !Shortcuts"),
+        ),
+        KeyBinding::new(
+            "enter",
+            SettingsActivate,
+            Some("Settings && !Palette && !Shortcuts"),
+        ),
+        KeyBinding::new(
+            "secondary-enter",
+            SettingsSave,
+            Some("Settings && !Palette && !Shortcuts"),
+        ),
+        KeyBinding::new(
+            "secondary-t",
+            SettingsTest,
+            Some("Settings && !Palette && !Shortcuts"),
         ),
     ]
 }
@@ -459,6 +556,65 @@ mod tests {
                     .predicate()
                     .is_some_and(|predicate| predicate.to_string().contains("Catalog"))),
                 "{action} must only fire on the Catalog surface"
+            );
+        }
+    }
+
+    #[test]
+    fn schedule_shortcuts_are_scoped_to_the_schedules_surface_and_sheet() {
+        for (action, key, needs_sheet) in [
+            ("ScheduleNew", "n", false),
+            ("ScheduleDelete", "d", false),
+            ("ScheduleEdit", "enter", false),
+            ("ScheduleSubmit", "enter", true),
+            ("ScheduleFieldNext", "tab", true),
+            ("ScheduleToggleEnabled", "e", true),
+        ] {
+            let matches: Vec<_> = bindings()
+                .into_iter()
+                .filter(|binding| {
+                    binding.action().name().ends_with(action)
+                        && binding
+                            .keystrokes()
+                            .iter()
+                            .any(|stroke| stroke.key() == key)
+                })
+                .collect();
+            assert_eq!(matches.len(), 1, "{action} must have one binding");
+            let predicate = matches[0].predicate().expect("context").to_string();
+            assert!(
+                predicate.contains("Schedules"),
+                "{action} must be scoped to Schedules"
+            );
+            let mentions_sheet = predicate.contains("Sheet") && !predicate.contains("!Sheet");
+            assert_eq!(mentions_sheet, needs_sheet, "{action} sheet scoping");
+        }
+    }
+
+    #[test]
+    fn settings_shortcuts_are_scoped_to_the_settings_surface() {
+        for (action, key) in [
+            ("SettingsFieldNext", "tab"),
+            ("SettingsActivate", "enter"),
+            ("SettingsSave", "enter"),
+            ("SettingsTest", "t"),
+        ] {
+            let matches: Vec<_> = bindings()
+                .into_iter()
+                .filter(|binding| {
+                    binding.action().name().ends_with(action)
+                        && binding
+                            .keystrokes()
+                            .iter()
+                            .any(|stroke| stroke.key() == key)
+                })
+                .collect();
+            assert_eq!(matches.len(), 1, "{action} must have one binding");
+            assert!(
+                matches[0]
+                    .predicate()
+                    .is_some_and(|predicate| predicate.to_string().contains("Settings")),
+                "{action} must be scoped to Settings"
             );
         }
     }

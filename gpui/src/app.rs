@@ -19,9 +19,11 @@ use crate::actions::{
     self, CatalogFieldNext, CatalogFieldPrev, CatalogLaunchSubmit, CatalogNewOneshot,
     CatalogSearch, CloseOverlay, GoCatalog, GoInbox, GoSchedules, GoSettings, GoTasks, GoWorkflows,
     ListDown, ListEnd, ListHome, ListOpen, ListPageDown, ListPageUp, ListUp, PaletteConfirm,
-    PaletteDown, PaletteUp, Refresh, TaskCancel, TaskConfirmAccept, TaskConfirmReject,
-    TaskFilterNext, TaskFilterPrev, TaskRetry, TaskSearch, TogglePalette, ToggleShortcuts,
-    WorkflowCancelRoot, WorkflowRetryInstance,
+    PaletteDown, PaletteUp, Refresh, ScheduleDelete, ScheduleEdit, ScheduleFieldNext,
+    ScheduleFieldPrev, ScheduleNew, ScheduleSubmit, ScheduleToggleEnabled, SettingsActivate,
+    SettingsFieldNext, SettingsFieldPrev, SettingsSave, SettingsTest, TaskCancel,
+    TaskConfirmAccept, TaskConfirmReject, TaskFilterNext, TaskFilterPrev, TaskRetry, TaskSearch,
+    TogglePalette, ToggleShortcuts, WorkflowCancelRoot, WorkflowRetryInstance,
 };
 use crate::catalog::OneShotFocus;
 use crate::components;
@@ -180,12 +182,20 @@ impl RootView {
                     state.cancel_task_confirm();
                 } else if state.workflow_confirm().is_some() {
                     state.cancel_workflow_confirm();
+                } else if state.active_route() == Route::Schedules
+                    && state.schedule_confirm().is_some()
+                {
+                    state.cancel_schedule_confirm();
                 } else if state.active_route() == Route::Tasks && state.clear_tasks_search() {
                     // Esc is consumed by the search field; a second Esc steps
                     // back from a pushed detail.
                 } else if state.active_route() == Route::Catalog && state.close_catalog_overlay() {
                     // The launch sheet, then the one-shot sheet, then the
                     // search field consume Esc in that order.
+                } else if state.active_route() == Route::Schedules && state.schedule_editor_open() {
+                    state.close_schedule_editor();
+                } else if state.active_route() == Route::Settings && state.settings_blur() {
+                    // Esc leaves the focused connection field first.
                 } else {
                     state.close_detail();
                 }
@@ -207,7 +217,7 @@ impl RootView {
     }
 
     /// Move the active list highlight. The shell keeps focus, so the list stays
-    /// one keystroke away; route guards keep Inbox and Tasks independent.
+    /// one keystroke away; route guards keep Inbox/Tasks independent.
     fn move_list(&mut self, delta: isize, cx: &mut Context<Self>) {
         let route = self.state.read(cx).active_route();
         match route {
@@ -237,7 +247,11 @@ impl RootView {
                 state.move_workflow_selection(delta);
                 cx.notify();
             }),
-            _ => {}
+            Route::Schedules => self.state.update(cx, |state, cx| {
+                state.move_schedule_selection(delta);
+                cx.notify();
+            }),
+            Route::Settings => {}
         }
     }
 
@@ -251,6 +265,16 @@ impl RootView {
                     ListJump::End => state.workflow_selection_edge(true),
                     ListJump::PageUp => state.workflow_selection_page(-1),
                     ListJump::PageDown => state.workflow_selection_page(1),
+                }
+                cx.notify();
+            });
+            return;
+        }
+        if route == Route::Schedules {
+            self.state.update(cx, |state, cx| {
+                match jump {
+                    ListJump::Home | ListJump::PageUp => state.schedule_selection_edge(false),
+                    ListJump::End | ListJump::PageDown => state.schedule_selection_edge(true),
                 }
                 cx.notify();
             });
@@ -290,7 +314,11 @@ impl RootView {
                 state.open_workflow_selected();
                 cx.notify();
             }),
-            _ => {}
+            Route::Schedules => self.state.update(cx, |state, cx| {
+                state.open_schedule_selected(cx);
+                cx.notify();
+            }),
+            Route::Settings => {}
         }
     }
 
@@ -317,6 +345,8 @@ impl RootView {
         self.state.update(cx, |state, cx| {
             if route == Route::Workflows {
                 state.accept_workflow_confirm(cx);
+            } else if route == Route::Schedules {
+                state.accept_schedule_confirm(cx);
             } else {
                 state.accept_task_confirm(cx);
             }
@@ -330,6 +360,8 @@ impl RootView {
         self.state.update(cx, |state, cx| {
             if route == Route::Workflows {
                 state.cancel_workflow_confirm();
+            } else if route == Route::Schedules {
+                state.cancel_schedule_confirm();
             } else {
                 state.cancel_task_confirm();
             }
@@ -374,6 +406,76 @@ impl RootView {
     fn cycle_catalog_form_focus(&mut self, delta: isize, cx: &mut Context<Self>) {
         self.state.update(cx, |state, cx| {
             state.cycle_catalog_form_focus(delta);
+            cx.notify();
+        });
+    }
+
+    fn new_schedule(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.open_schedule_new();
+            cx.notify();
+        });
+    }
+
+    fn edit_schedule(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.open_schedule_selected(cx);
+            cx.notify();
+        });
+    }
+
+    fn delete_schedule(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.request_schedule_delete_selected(cx);
+            cx.notify();
+        });
+    }
+
+    fn cycle_schedule_focus(&mut self, delta: isize, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.cycle_schedule_focus(delta);
+            cx.notify();
+        });
+    }
+
+    fn submit_schedule(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.submit_schedule();
+            cx.notify();
+        });
+    }
+
+    fn toggle_schedule_enabled(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.toggle_schedule_enabled();
+            cx.notify();
+        });
+    }
+
+    fn cycle_settings_focus(&mut self, delta: isize, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.settings_cycle_focus(delta);
+            cx.notify();
+        });
+    }
+
+    fn activate_settings(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.settings_activate(cx);
+            cx.notify();
+        });
+    }
+
+    fn save_settings(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.save_connection_settings(cx);
+            cx.notify();
+        });
+    }
+
+    fn test_settings(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.test_connection(cx);
             cx.notify();
         });
     }
@@ -1299,6 +1401,127 @@ impl RootView {
             .child(panel)
     }
 
+    /// The schedule-delete confirmation: names the task and cadence and keeps
+    /// the daemon's rejection attached to the dialog.
+    fn schedule_confirm_overlay(
+        &self,
+        theme: &Theme,
+        confirm: &crate::schedules::ScheduleDeleteConfirm,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let back = components::with_focus(
+            div()
+                .id("schedule-confirm-back")
+                .flex()
+                .items_center()
+                .gap(px(theme.spacing.s2))
+                .h(px(36.0))
+                .px(px(theme.spacing.s3))
+                .rounded(px(theme.radii.r4))
+                .border_1()
+                .border_color(theme.colors.border)
+                .text_size(px(theme.font.sm))
+                .text_color(theme.colors.text)
+                .cursor_pointer()
+                .child("Back")
+                .child(components::keycap(theme, "esc"))
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.dismiss_task_confirm(cx);
+                    window.focus(&this.root_focus);
+                })),
+            theme,
+        );
+
+        let accept_color = if confirm.danger() {
+            theme.colors.danger
+        } else {
+            theme.colors.accent
+        };
+        let accept = components::with_focus(
+            div()
+                .id("schedule-confirm-accept")
+                .flex()
+                .items_center()
+                .gap(px(theme.spacing.s2))
+                .h(px(40.0))
+                .px(px(theme.spacing.s4))
+                .rounded(px(theme.radii.r8))
+                .bg(Hsla::from(accept_color).opacity(0.16))
+                .text_size(px(theme.font.sm))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(accept_color)
+                .cursor_pointer()
+                .child(confirm.confirm_label())
+                .child(components::keycap(theme, "↵"))
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.accept_task_confirm(cx);
+                })),
+            theme,
+        );
+
+        let error = confirm.error.clone().map(|message| {
+            div()
+                .text_size(px(theme.font.xs))
+                .text_color(theme.colors.danger)
+                .child(message)
+        });
+
+        let panel = div()
+            .w(px(460.0))
+            .flex()
+            .flex_col()
+            .gap(px(theme.spacing.s3))
+            .p(px(theme.spacing.s4))
+            .rounded(px(theme.radii.r12))
+            .border_1()
+            .border_color(theme.colors.border)
+            .bg(theme.colors.surface)
+            .shadow_lg()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(theme.spacing.s2))
+                    .child(
+                        div()
+                            .text_size(px(theme.font.lg))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.colors.text)
+                            .child(confirm.title()),
+                    )
+                    .child(components::keycap(theme, "esc")),
+            )
+            .child(
+                div()
+                    .text_size(px(theme.font.sm))
+                    .text_color(theme.colors.text)
+                    .child(confirm.body()),
+            )
+            .when_some(error, |panel, error| panel.child(error))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(theme.spacing.s2))
+                    .pt(px(theme.spacing.s1))
+                    .child(backend_hint(theme))
+                    .child(back)
+                    .child(accept),
+            );
+
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(Hsla::from(theme.colors.bg).opacity(0.86))
+            .key_context("Confirm")
+            .child(panel)
+    }
+
     /// The self-dismissing toast above the status bar.
     fn toast_overlay(&self, theme: &Theme, toast: &Toast, cx: &mut Context<Self>) -> Div {
         let (icon, color) = match toast.kind {
@@ -1383,7 +1606,7 @@ fn shortcut_section(theme: &Theme, title: &str, rows: &[(&str, &str)]) -> Div {
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::for_appearance(window.appearance());
+        let theme = self.state.read(cx).theme(window.appearance());
         let mode = container_query(window.viewport_size().width);
         let detail_open = self.state.read(cx).is_detail_open();
         let palette_open = self.palette.is_open();
@@ -1430,10 +1653,13 @@ impl Render for RootView {
             search_active,
             confirm,
             workflow_confirm,
+            schedule_confirm,
             toast,
             catalog_search_active,
             catalog_launch_open,
             catalog_oneshot_open,
+            schedule_sheet_open,
+            settings_typing,
         ) = {
             let state = self.state.read(cx);
             (
@@ -1442,10 +1668,13 @@ impl Render for RootView {
                 state.is_tasks_search_active(),
                 state.task_confirm().cloned(),
                 state.workflow_confirm().cloned(),
+                state.schedule_confirm().cloned(),
                 state.toast().cloned(),
                 state.is_catalog_search_active(),
                 state.catalog().launch().is_some(),
                 state.catalog().oneshot().is_some(),
+                state.schedule_editor_open(),
+                state.settings().is_editing_text(),
             )
         };
         let mut key_context = String::from("Root");
@@ -1476,6 +1705,23 @@ impl Render for RootView {
             }
             if catalog_oneshot_open {
                 key_context.push_str(" Oneshot");
+            }
+        } else if route == Route::Schedules {
+            key_context.push_str(" Schedules");
+            if schedule_confirm.is_some() {
+                key_context.push_str(" Confirm");
+            }
+            if schedule_sheet_open {
+                // A sheet owns typed text (the cron expression uses spaces),
+                // so single-key shortcuts must not fire while it is open.
+                key_context.push_str(" Sheet Search");
+            }
+        } else if route == Route::Settings {
+            key_context.push_str(" Settings");
+            if settings_typing {
+                // The endpoint/token field owns typed characters; g-jumps and
+                // other single-key shortcuts must not fire mid-address.
+                key_context.push_str(" Search");
             }
         }
 
@@ -1558,6 +1804,42 @@ impl Render for RootView {
             }))
             .on_action(cx.listener(|this, _: &CatalogFieldPrev, _window, cx| {
                 this.cycle_catalog_form_focus(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ScheduleNew, _window, cx| {
+                this.new_schedule(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ScheduleEdit, _window, cx| {
+                this.edit_schedule(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ScheduleDelete, _window, cx| {
+                this.delete_schedule(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ScheduleFieldNext, _window, cx| {
+                this.cycle_schedule_focus(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ScheduleFieldPrev, _window, cx| {
+                this.cycle_schedule_focus(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ScheduleSubmit, _window, cx| {
+                this.submit_schedule(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ScheduleToggleEnabled, _window, cx| {
+                this.toggle_schedule_enabled(cx);
+            }))
+            .on_action(cx.listener(|this, _: &SettingsFieldNext, _window, cx| {
+                this.cycle_settings_focus(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SettingsFieldPrev, _window, cx| {
+                this.cycle_settings_focus(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SettingsActivate, _window, cx| {
+                this.activate_settings(cx);
+            }))
+            .on_action(cx.listener(|this, _: &SettingsSave, _window, cx| {
+                this.save_settings(cx);
+            }))
+            .on_action(cx.listener(|this, _: &SettingsTest, _window, cx| {
+                this.test_settings(cx);
             }))
             .on_action(cx.listener(|this, _: &TaskCancel, _window, cx| {
                 this.request_task_action(TaskAction::Cancel, cx);
@@ -1670,7 +1952,7 @@ impl Render for RootView {
                     {
                         return;
                     }
-                    let (task_typing, catalog_typing) = {
+                    let (task_typing, catalog_typing, schedule_typing, settings_typing) = {
                         let state = this.state.read(cx);
                         let route = state.active_route();
                         (
@@ -1680,14 +1962,20 @@ impl Render for RootView {
                             route == Route::Catalog
                                 && (state.is_catalog_search_active()
                                     || state.catalog().any_form_open()),
+                            route == Route::Schedules && state.schedule_editor_open(),
+                            route == Route::Settings && state.settings().is_editing_text(),
                         )
                     };
-                    if !task_typing && !catalog_typing {
+                    if !task_typing && !catalog_typing && !schedule_typing && !settings_typing {
                         return;
                     }
                     if keystroke.key == "backspace" {
                         this.state.update(cx, |state, cx| {
-                            if catalog_typing {
+                            if schedule_typing {
+                                state.schedule_backspace();
+                            } else if settings_typing {
+                                state.settings_backspace();
+                            } else if catalog_typing {
                                 state.catalog_backspace();
                             } else {
                                 state.backspace_tasks_query();
@@ -1703,7 +1991,11 @@ impl Render for RootView {
                         if !characters.is_empty() {
                             this.state.update(cx, |state, cx| {
                                 for character in characters {
-                                    if catalog_typing {
+                                    if schedule_typing {
+                                        state.schedule_push_char(character);
+                                    } else if settings_typing {
+                                        state.settings_push_char(character);
+                                    } else if catalog_typing {
                                         state.catalog_push_char(character);
                                     } else {
                                         state.push_tasks_query_char(character);
@@ -1734,6 +2026,9 @@ impl Render for RootView {
             }
             if let Some(confirm) = &workflow_confirm {
                 root = root.child(self.workflow_confirm_overlay(theme, confirm, cx));
+            }
+            if let Some(confirm) = &schedule_confirm {
+                root = root.child(self.schedule_confirm_overlay(theme, confirm, cx));
             }
             root
         }

@@ -19,19 +19,24 @@ use std::time::Duration;
 
 use chrono::Utc;
 use favetto_wire::model::{
-    AgentCatalogEntry, AgentSessionInfo, AgentUsage, InputReply, Task, TaskStatus,
+    AgentCatalogEntry, AgentSessionInfo, AgentUsage, EventKind, InputReply, Task, TaskStatus,
 };
 use favetto_wire::rpc::AgentEventPush;
-use gpui::{ClipboardItem, Context, Task as GpuiTask};
+use gpui::{ClipboardItem, Context, Task as GpuiTask, WindowAppearance};
 
 use crate::catalog::{AgentChoice, CatalogState, OneShotFocus};
-use crate::config::{self, ClientConfig};
+use crate::config::{self, ClientConfig, Density, ThemeChoice};
 use crate::detail::{DetailTab, PendingRequest, TaskDetail};
 use crate::inbox::{self, InboxKey, InboxRows};
 use crate::routes::Route;
 use crate::runtime::{PingSnapshot, Runtime, Update};
+use crate::schedules::{
+    self, ScheduleDeleteConfirm, ScheduleEditor, ScheduleField, SchedulesState,
+};
+use crate::settings::{SettingsActivate, SettingsFocus, SettingsState};
 use crate::sse::Push;
 use crate::tasks::{self, TaskAction, TaskFilter, TaskList};
+use crate::theme::Theme;
 use crate::transport::ClientError;
 use crate::workflow::{
     self, WorkflowCancelConfirm, WorkflowDetail, WorkflowGraphState, WorkflowRow,
@@ -236,6 +241,10 @@ pub struct ClientState {
     workflow_cancel_previous: Option<WorkflowDetail>,
     /// The prior row for each retry in flight, for a guarded rollback.
     workflow_retry_previous: HashMap<uuid::Uuid, WorkflowRow>,
+    /// The Schedules surface: rows, the edit sheet and the delete dialog.
+    schedules: SchedulesState,
+    /// The Settings draft, test result and logical focus.
+    settings: SettingsState,
     /// The daemon's repo name, derived from the `system.ping` cwd.
     repo: Option<String>,
     /// The foreground task that drains [`Runtime`] updates. Declared before the
@@ -250,6 +259,7 @@ impl ClientState {
         let config = config::load();
         let mut last_error = config.warnings.first().cloned();
         let mut snapshot_status = SnapshotStatus::Loading;
+        let settings = SettingsState::new(&config.endpoint, config.token_override());
 
         let (runtime, connection, drain) = match Runtime::spawn(config.clone()) {
             Ok(runtime) => {
@@ -315,6 +325,8 @@ impl ClientState {
             workflow_confirm: None,
             workflow_cancel_previous: None,
             workflow_retry_previous: HashMap::new(),
+            schedules: SchedulesState::default(),
+            settings,
             repo: None,
             runtime,
             drain,
@@ -338,6 +350,7 @@ impl ClientState {
                     self.ping();
                     self.refresh_snapshot();
                     self.refresh_catalog();
+                    self.refresh_schedules();
                 } else if !self.connection.is_connected()
                     && !self.has_snapshot_data()
                     && matches!(
@@ -449,12 +462,17 @@ impl ClientState {
                             self.refresh_workflow_graph();
                         }
                     }
-                    // Unknown method or event kind: counted above, ignored here
-                    // (docs step 06: never fatal).
-                    Push::Event(_)
-                    | Push::AgentExit(_)
-                    | Push::UnsupportedAgentEvent { .. }
-                    | Push::Unknown(_) => {}
+                    // A cron tick recomputes the fired schedule's next run; one
+                    // list read keeps the table's countdown honest.
+                    Push::Event(event) => {
+                        if event.kind == EventKind::CronTick
+                            && self.active_route == Route::Schedules
+                        {
+                            self.refresh_schedules();
+                        }
+                    }
+                    Push::AgentExit(_) | Push::UnsupportedAgentEvent { .. } => {}
+                    Push::Unknown(_) => {}
                 }
             }
             Update::Cursor(cursor) => self.cursor = cursor,
@@ -887,6 +905,89 @@ impl ClientState {
                 }
                 self.refresh_snapshot();
             }
+            Update::SchedulesLoaded { schedules } => {
+                self.schedules.set_entries(schedules);
+            }
+            Update::SchedulesFailed { error } => {
+                if error.is_unauthorized() {
+                    self.connection = ConnectionState::Unauthorized {
+                        token_path: self.config.token_source.label(),
+                    };
+                }
+                self.schedules.fail(error.to_string());
+            }
+            Update::ScheduleSaved { result } => {
+                match result {
+                    Ok(schedule) => {
+                        let schedule = *schedule;
+                        let label = schedule.task.clone();
+                        let next = schedule
+                            .next_run
+                            .map(schedules::short_datetime)
+                            .unwrap_or_else(|| {
+                                if schedule.enabled {
+                                    "no future run".to_string()
+                                } else {
+                                    "disabled".to_string()
+                                }
+                            });
+                        self.schedules.upsert(schedule);
+                        self.schedules.close_editor();
+                        self.show_toast(
+                            ToastKind::Success,
+                            format!("Saved schedule '{label}' — next run {next}."),
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        if error.is_unauthorized() {
+                            self.connection = ConnectionState::Unauthorized {
+                                token_path: self.config.token_source.label(),
+                            };
+                        }
+                        if let Some(editor) = self.schedules.editor_mut() {
+                            editor.submitting = false;
+                            editor.server_error =
+                                Some(format!("The daemon rejected the schedule: {error}."));
+                        }
+                    }
+                }
+                // `next_run` is daemon-computed; one list read reconciles the
+                // whole table with the response and any concurrent edit.
+                self.refresh_schedules();
+            }
+            Update::ScheduleDeleted { id, result } => match result {
+                Ok(_) => {
+                    self.schedules.remove(&id);
+                    self.schedules.close_confirm();
+                    self.show_toast(ToastKind::Success, "Deleted the schedule.".to_string(), cx);
+                    self.refresh_schedules();
+                }
+                Err(error) => {
+                    if error.is_unauthorized() {
+                        self.connection = ConnectionState::Unauthorized {
+                            token_path: self.config.token_source.label(),
+                        };
+                    }
+                    if let Some(confirm) = self.schedules.confirm_mut() {
+                        confirm.deleting = false;
+                        confirm.error = Some(format!("The daemon rejected the delete: {error}."));
+                    }
+                }
+            },
+            Update::ConnectionTestFinished {
+                endpoint,
+                result,
+                round_trip,
+            } => match result {
+                Ok(ping) => {
+                    self.settings
+                        .finish_test_ok(endpoint, round_trip.as_millis(), ping.cwd)
+                }
+                Err(error) => self
+                    .settings
+                    .finish_test_failed(endpoint, error.to_string()),
+            },
         }
     }
 
@@ -1356,6 +1457,439 @@ impl ClientState {
         );
     }
 
+    /// Ask the runtime for a fresh `schedules.list`. An older table stays
+    /// visible; only a data-less surface shows the first-fetch skeleton.
+    pub fn refresh_schedules(&mut self) {
+        match &self.runtime {
+            Some(runtime) => {
+                if !self.schedules.has_entries()
+                    && !matches!(self.schedules.status(), schedules::SchedulesStatus::Loaded)
+                {
+                    self.schedules.begin_load();
+                }
+                runtime.refresh_schedules();
+            }
+            None => self
+                .schedules
+                .fail("the transport is not running".to_string()),
+        }
+    }
+
+    /// The Schedules surface model.
+    pub fn schedules(&self) -> &SchedulesState {
+        &self.schedules
+    }
+
+    /// The selected schedule id, falling back to the first row.
+    pub fn schedule_selected_id(&self) -> Option<String> {
+        self.schedules.selected_id()
+    }
+
+    pub fn select_schedule(&mut self, id: &str) {
+        self.schedules.select(id);
+    }
+
+    pub fn move_schedule_selection(&mut self, delta: isize) {
+        self.schedules.move_selection(delta);
+    }
+
+    pub fn schedule_selection_edge(&mut self, last: bool) {
+        self.schedules.selection_edge(last);
+    }
+
+    /// Open the create sheet, preselecting the first catalog task.
+    pub fn open_schedule_new(&mut self) {
+        if !self.catalog.has_entries() {
+            self.refresh_catalog();
+        }
+        let default = self
+            .catalog
+            .entries()
+            .first()
+            .map(|entry| entry.name.clone());
+        self.schedules.open_editor(ScheduleEditor::new(default));
+    }
+
+    /// Open the edit sheet for the highlighted row.
+    pub fn open_schedule_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(schedule) = self
+            .schedules
+            .schedules()
+            .iter()
+            .find(|schedule| Some(&schedule.id) == self.schedule_selected_id().as_ref())
+            .cloned()
+        else {
+            self.show_toast(ToastKind::Info, "Select a schedule first.".to_string(), cx);
+            return;
+        };
+        self.schedules
+            .open_editor(ScheduleEditor::edit(&schedule, Utc::now()));
+    }
+
+    pub fn schedule_editor_open(&self) -> bool {
+        self.schedules.editor_open()
+    }
+
+    pub fn close_schedule_editor(&mut self) {
+        self.schedules.close_editor();
+    }
+
+    pub fn schedule_push_char(&mut self, character: char) {
+        if let Some(editor) = self.schedules.editor_mut() {
+            editor.push_char(character);
+        }
+    }
+
+    pub fn schedule_backspace(&mut self) {
+        if let Some(editor) = self.schedules.editor_mut() {
+            editor.backspace();
+        }
+    }
+
+    pub fn cycle_schedule_focus(&mut self, delta: isize) {
+        if let Some(editor) = self.schedules.editor_mut() {
+            editor.cycle_focus(delta);
+        }
+    }
+
+    /// Focus one schedule field from a click.
+    pub fn focus_schedule_field(&mut self, focus: ScheduleField) {
+        if let Some(editor) = self.schedules.editor_mut() {
+            editor.set_focus(focus);
+        }
+    }
+
+    pub fn toggle_schedule_enabled(&mut self) {
+        if let Some(editor) = self.schedules.editor_mut() {
+            editor.toggle_enabled();
+        }
+    }
+
+    pub fn select_schedule_task(&mut self, task: &str) {
+        if let Some(editor) = self.schedules.editor_mut() {
+            editor.select_task(task);
+        }
+    }
+
+    /// Validate the sheet and send `schedules.upsert`. Validation stays inline;
+    /// a daemon rejection stays attached to the sheet.
+    pub fn submit_schedule(&mut self) {
+        let now = Utc::now();
+        let Some(editor) = self.schedules.editor_mut() else {
+            return;
+        };
+        if editor.submitting {
+            return;
+        }
+        let Some((cron, task, enabled)) = editor.validate(now) else {
+            return;
+        };
+        let id = editor.id.clone();
+        let input = editor.input.clone();
+        editor.submitting = true;
+        editor.server_error = None;
+        match &self.runtime {
+            Some(runtime) => runtime.upsert_schedule(id, cron, task, Some(input), enabled),
+            None => {
+                if let Some(editor) = self.schedules.editor_mut() {
+                    editor.submitting = false;
+                    editor.server_error =
+                        Some("The transport is not running, so the schedule was not saved.".into());
+                }
+            }
+        }
+    }
+
+    /// Open the delete confirmation for one schedule.
+    pub fn request_schedule_delete(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(schedule) = self
+            .schedules
+            .schedules()
+            .iter()
+            .find(|schedule| schedule.id == id)
+            .cloned()
+        else {
+            self.show_toast(
+                ToastKind::Info,
+                "That schedule is no longer in the list.".to_string(),
+                cx,
+            );
+            return;
+        };
+        self.schedules.open_confirm(&schedule);
+    }
+
+    /// `d`: delete the highlighted schedule after confirmation.
+    pub fn request_schedule_delete_selected(&mut self, cx: &mut Context<Self>) {
+        match self.schedule_selected_id() {
+            Some(id) => self.request_schedule_delete(&id, cx),
+            None => self.show_toast(ToastKind::Info, "Select a schedule first.".to_string(), cx),
+        }
+    }
+
+    pub fn schedule_confirm(&self) -> Option<&ScheduleDeleteConfirm> {
+        self.schedules.confirm()
+    }
+
+    pub fn cancel_schedule_confirm(&mut self) {
+        self.schedules.close_confirm();
+    }
+
+    /// Confirm the delete: the dialog disables its button and the row leaves the
+    /// table when the daemon answers.
+    pub fn accept_schedule_confirm(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(confirm) = self.schedules.confirm_mut() else {
+            return false;
+        };
+        if confirm.deleting {
+            return true;
+        }
+        let id = confirm.id.clone();
+        confirm.deleting = true;
+        confirm.error = None;
+        match &self.runtime {
+            Some(runtime) => runtime.delete_schedule(id),
+            None => {
+                if let Some(confirm) = self.schedules.confirm_mut() {
+                    confirm.deleting = false;
+                    confirm.error =
+                        Some("The transport is not running, so nothing was deleted.".to_string());
+                }
+                self.show_toast(
+                    ToastKind::Error,
+                    "The transport is not running. The schedule was not deleted.".to_string(),
+                    cx,
+                );
+            }
+        }
+        true
+    }
+
+    /// The Settings draft, test result and logical focus.
+    pub fn settings(&self) -> &SettingsState {
+        &self.settings
+    }
+
+    /// The effective theme after the saved appearance preferences.
+    pub fn theme(&self, appearance: WindowAppearance) -> &'static Theme {
+        Theme::for_settings(appearance, self.config.theme, self.config.density)
+    }
+
+    pub fn theme_choice(&self) -> ThemeChoice {
+        self.config.theme
+    }
+
+    pub fn density(&self) -> Density {
+        self.config.density
+    }
+
+    pub fn settings_push_char(&mut self, character: char) {
+        self.settings.push_char(character);
+    }
+
+    pub fn settings_backspace(&mut self) {
+        self.settings.backspace();
+    }
+
+    pub fn settings_cycle_focus(&mut self, delta: isize) {
+        self.settings.cycle_focus(delta);
+    }
+
+    /// Focus one Settings control from a click.
+    pub fn focus_settings(&mut self, focus: Option<SettingsFocus>) {
+        self.settings.set_focus(focus);
+    }
+
+    /// Leave the connection field (Escape). Returns whether focus was consumed,
+    /// so Esc only falls through when Settings was not editing anything.
+    pub fn settings_blur(&mut self) -> bool {
+        if self.settings.focus().is_some() {
+            self.settings.blur();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Run the focused control's Enter action.
+    pub fn settings_activate(&mut self, cx: &mut Context<Self>) {
+        match self.settings.activate() {
+            SettingsActivate::Theme => {
+                let next = self.config.theme.cycle();
+                self.set_theme_choice(next, cx);
+            }
+            SettingsActivate::Density => {
+                let next = self.config.density.toggled();
+                self.set_density(next, cx);
+            }
+            SettingsActivate::Test => self.test_connection(cx),
+            SettingsActivate::Save => self.save_connection_settings(cx),
+            SettingsActivate::Defaults => self.use_default_settings(cx),
+            SettingsActivate::Next => self.settings.cycle_focus(1),
+        }
+    }
+
+    /// Persist and apply a theme preference. The palette switches live; a write
+    /// failure rolls the preference back and reports the exact path.
+    pub fn set_theme_choice(&mut self, choice: ThemeChoice, cx: &mut Context<Self>) {
+        if self.config.theme == choice {
+            return;
+        }
+        let previous = self.config.theme;
+        self.config.theme = choice;
+        if let Err(error) = self.persist_appearance() {
+            self.config.theme = previous;
+            let message = format!("Could not save the theme: {error}.");
+            self.settings.set_save_error(Some(message.clone()));
+            self.show_toast(ToastKind::Error, message, cx);
+        }
+    }
+
+    /// Persist and apply a density preference.
+    pub fn set_density(&mut self, density: Density, cx: &mut Context<Self>) {
+        if self.config.density == density {
+            return;
+        }
+        let previous = self.config.density;
+        self.config.density = density;
+        if let Err(error) = self.persist_appearance() {
+            self.config.density = previous;
+            let message = format!("Could not save the density: {error}.");
+            self.settings.set_save_error(Some(message.clone()));
+            self.show_toast(ToastKind::Error, message, cx);
+        }
+    }
+
+    fn persist_appearance(&self) -> std::io::Result<()> {
+        let token = self.config.token_override().map(str::to_string);
+        config::save_settings_to(
+            &self.config.config_path,
+            &self.config.endpoint,
+            token.as_deref(),
+            self.config.theme,
+            self.config.density,
+        )
+    }
+
+    /// "Test connection": ping the draft endpoint with the draft/current token
+    /// without touching the live connection. Invalid input never leaves the
+    /// form.
+    pub fn test_connection(&mut self, cx: &mut Context<Self>) {
+        let endpoint = match self.settings.normalized() {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                self.settings.set_save_error(Some(error.to_string()));
+                return;
+            }
+        };
+        if self.runtime.is_none() {
+            self.settings
+                .set_save_error(Some("The client runtime is not running.".to_string()));
+            return;
+        }
+        let token = self.settings.token_or(self.config.token.as_deref());
+        self.settings.begin_test(endpoint.clone());
+        if let Some(runtime) = &self.runtime {
+            runtime.test_connection(endpoint, token);
+        }
+        cx.notify();
+    }
+
+    /// Save the connection draft. A validation or write failure leaves the
+    /// current connection (and its runtime) untouched.
+    pub fn save_connection_settings(&mut self, cx: &mut Context<Self>) {
+        let endpoint = match self.settings.normalized() {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                self.settings.set_save_error(Some(error.to_string()));
+                return;
+            }
+        };
+        let typed = self.settings.draft_token().trim().to_string();
+        let token = (!typed.is_empty()).then_some(typed);
+        self.write_connection(&endpoint, token.as_deref(), cx, |endpoint| {
+            format!("Saved connection settings; talking to {endpoint}.")
+        });
+    }
+
+    /// "Use defaults": the local endpoint plus the shared token file.
+    pub fn use_default_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings.reset_to_defaults();
+        self.write_connection(config::DEFAULT_ENDPOINT, None, cx, |_| {
+            "Using the default endpoint and the shared token file.".to_string()
+        });
+    }
+
+    /// Write the settings file, reload it so the token source is recomputed,
+    /// and restart the transport with the new `ClientConfig`.
+    fn write_connection(
+        &mut self,
+        endpoint: &str,
+        token: Option<&str>,
+        cx: &mut Context<Self>,
+        message: impl FnOnce(&str) -> String,
+    ) {
+        let path = self.config.config_path.clone();
+        if let Err(error) = config::save_settings_to(
+            &path,
+            endpoint,
+            token,
+            self.config.theme,
+            self.config.density,
+        ) {
+            self.settings
+                .set_save_error(Some(format!("Could not write {}: {error}", path.display())));
+            return;
+        }
+
+        self.config = config::load_from(&path, &config::default_token_path());
+        let endpoint = self.config.endpoint.clone();
+        let token = self.config.token_override().map(str::to_string);
+        self.settings.set_draft(&endpoint, token.as_deref());
+        self.settings.set_save_error(None);
+        self.start_runtime(cx);
+        self.show_toast(ToastKind::Success, message(&endpoint), cx);
+    }
+
+    /// Replace the runtime after a connection change. The old worker is joined
+    /// (promptly: its SSE task is aborted on drop) and the new one starts from
+    /// `Connecting`, so the status pill never lies about the old endpoint.
+    fn start_runtime(&mut self, cx: &mut Context<Self>) {
+        self.drain = None;
+        self.runtime = None;
+        self.last_ping = None;
+        self.repo = None;
+        self.connection = ConnectionState::Connecting;
+        self.last_error = None;
+
+        match Runtime::spawn(self.config.clone()) {
+            Ok(runtime) => {
+                let updates = runtime.updates();
+                let drain = cx.spawn(async move |weak, cx| {
+                    while let Ok(update) = updates.recv().await {
+                        let alive = weak
+                            .update(cx, |this: &mut Self, cx| {
+                                this.apply(update, cx);
+                                cx.notify();
+                            })
+                            .is_ok();
+                        if !alive {
+                            break;
+                        }
+                    }
+                });
+                self.runtime = Some(runtime);
+                self.drain = Some(drain);
+            }
+            Err(message) => {
+                self.connection = ConnectionState::Disconnected {
+                    message: message.clone(),
+                };
+                self.last_error = Some(message);
+            }
+        }
+    }
+
     /// Ask the runtime for a fresh `catalog.list`. Like the task snapshot, an
     /// older list stays visible; only a data-less surface shows the skeleton.
     pub fn refresh_catalog(&mut self) {
@@ -1695,8 +2229,8 @@ impl ClientState {
     }
 
     /// Refresh the active surface: its task rows on Inbox/Tasks, the catalog
-    /// on Catalog, and always the ping (so the status bar and repo label stay
-    /// honest).
+    /// on Catalog, the schedule table on Schedules, and always the ping (so the
+    /// status bar and repo label stay honest).
     pub fn refresh_active(&mut self) {
         match self.active_route {
             Route::Inbox | Route::Tasks => self.refresh_snapshot(),
@@ -1709,7 +2243,11 @@ impl ClientState {
                     self.load_workflow_inspect(root_id);
                 }
             }
-            _ => {}
+            Route::Schedules => {
+                self.refresh_schedules();
+                self.refresh_catalog();
+            }
+            Route::Settings => self.refresh_snapshot(),
         }
         self.ping();
     }
@@ -1742,6 +2280,14 @@ impl ClientState {
             self.catalog.close_launch();
             self.catalog.close_oneshot();
         }
+        if self.active_route == Route::Schedules && route != Route::Schedules {
+            // The edit sheet and the delete dialog belong to this surface.
+            self.schedules.close_editor();
+            self.schedules.close_confirm();
+        }
+        if self.active_route == Route::Settings && route != Route::Settings {
+            self.settings.blur();
+        }
         // A confirmation is about one row on one surface; leaving the surface
         // must not leave a hidden dialog targeting it.
         self.task_confirm = None;
@@ -1761,6 +2307,13 @@ impl ClientState {
             self.refresh_snapshot();
             self.ensure_workflow_root();
             self.refresh_workflow_graph();
+        } else if route == Route::Schedules {
+            self.refresh_schedules();
+            // The create/edit sheet's task picker is the same catalog list.
+            self.refresh_catalog();
+        } else if route == Route::Settings {
+            // The Agents card is the shared roster; a visit catches it up.
+            self.refresh_snapshot();
         }
     }
 

@@ -22,12 +22,15 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use async_channel::{Receiver, Sender};
-use favetto_wire::model::{AgentCatalogEntry, AgentSessionInfo, InputReply, Task, TaskRun};
+use favetto_wire::model::{
+    AgentCatalogEntry, AgentSessionInfo, InputReply, Schedule, Task, TaskRun,
+};
 use favetto_wire::rpc::{
     AgentReplyParams, AgentReplyResult, CatalogEntry, CatalogGetParams, EmptyParams, PingParams,
-    PingResult, StartOneshotParams, StartOneshotResult, TaskIdParams, TasksEventsParams,
-    TasksListParams, TasksStartParams, WorkflowCancelResultBody, WorkflowGetResult,
-    WorkflowInspectParams, WorkflowRetryParams,
+    PingResult, ScheduleDeleteParams, ScheduleUpsertParams, SchedulesDeleteResult,
+    StartOneshotParams, StartOneshotResult, TaskIdParams, TasksEventsParams, TasksListParams,
+    TasksStartParams, WorkflowCancelResultBody, WorkflowGetResult, WorkflowInspectParams,
+    WorkflowRetryParams,
 };
 use favetto_wire::workflow::WorkflowInspect;
 use uuid::Uuid;
@@ -101,6 +104,24 @@ pub enum Command {
     CancelWorkflow { root_id: Uuid },
     /// Re-enqueue one terminal instance (`workflow.retry`).
     RetryWorkflowTask { task_id: Uuid },
+    /// Re-fetch `schedules.list` (connect, Retry, a save/delete or a cron tick).
+    RefreshSchedules,
+    /// Create or update one schedule.
+    UpsertSchedule {
+        id: Option<String>,
+        cron: String,
+        task: String,
+        input: Option<serde_json::Value>,
+        enabled: bool,
+    },
+    /// Delete one schedule by id.
+    DeleteSchedule { id: String },
+    /// Run `system.ping` against a draft endpoint/token without touching the
+    /// live connection (the Settings "Test connection" action).
+    TestConnection {
+        endpoint: String,
+        token: Option<String>,
+    },
     /// Stop the worker thread.
     Shutdown,
 }
@@ -203,6 +224,25 @@ pub enum Update {
     WorkflowRetryFinished {
         task_id: Uuid,
         result: Result<Box<Task>, ClientError>,
+    },
+    /// A fresh `schedules.list` snapshot.
+    SchedulesLoaded { schedules: Vec<Schedule> },
+    /// `schedules.list` failed.
+    SchedulesFailed { error: ClientError },
+    /// `schedules.upsert` completed; the schedule carries its computed next run.
+    ScheduleSaved {
+        result: Result<Box<Schedule>, ClientError>,
+    },
+    /// `schedules.delete` completed.
+    ScheduleDeleted {
+        id: String,
+        result: Result<SchedulesDeleteResult, ClientError>,
+    },
+    /// A draft-connection ping completed.
+    ConnectionTestFinished {
+        endpoint: String,
+        result: Result<PingResult, ClientError>,
+        round_trip: Duration,
     },
 }
 
@@ -352,6 +392,39 @@ impl Runtime {
     pub fn retry_workflow_task(&self, task_id: Uuid) {
         self.send(Command::RetryWorkflowTask { task_id });
     }
+
+    /// Ask for a fresh schedule list. Coalesced by the loader.
+    pub fn refresh_schedules(&self) {
+        self.send(Command::RefreshSchedules);
+    }
+
+    /// Create or update one schedule.
+    pub fn upsert_schedule(
+        &self,
+        id: Option<String>,
+        cron: String,
+        task: String,
+        input: Option<serde_json::Value>,
+        enabled: bool,
+    ) {
+        self.send(Command::UpsertSchedule {
+            id,
+            cron,
+            task,
+            input,
+            enabled,
+        });
+    }
+
+    /// Delete one schedule.
+    pub fn delete_schedule(&self, id: String) {
+        self.send(Command::DeleteSchedule { id });
+    }
+
+    /// Ping a draft endpoint without disturbing the live connection.
+    pub fn test_connection(&self, endpoint: String, token: Option<String>) {
+        self.send(Command::TestConnection { endpoint, token });
+    }
 }
 
 impl Drop for Runtime {
@@ -387,6 +460,8 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
     spawn_inbox_loader(client.clone(), updates.clone(), inbox_triggers);
     let (catalog_trigger, catalog_triggers) = async_channel::bounded(1);
     spawn_catalog_loader(client.clone(), updates.clone(), catalog_triggers);
+    let (schedule_trigger, schedule_triggers) = async_channel::bounded(1);
+    spawn_schedule_loader(client.clone(), updates.clone(), schedule_triggers);
 
     while let Ok(command) = commands.recv().await {
         match command {
@@ -403,6 +478,7 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
                 // reconnect whose state transition is not observed.
                 let _ = inbox_trigger.try_send(());
                 let _ = catalog_trigger.try_send(());
+                let _ = schedule_trigger.try_send(());
             }
             Command::RefreshSnapshot => {
                 // Capacity one: if a load is already queued/running, this is a
@@ -472,6 +548,32 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
             }
             Command::RetryWorkflowTask { task_id } => {
                 spawn_workflow_retry(client.clone(), updates.clone(), task_id);
+            }
+            Command::RefreshSchedules => {
+                let _ = schedule_trigger.try_send(());
+            }
+            Command::UpsertSchedule {
+                id,
+                cron,
+                task,
+                input,
+                enabled,
+            } => {
+                spawn_schedule_upsert(
+                    client.clone(),
+                    updates.clone(),
+                    id,
+                    cron,
+                    task,
+                    input,
+                    enabled,
+                );
+            }
+            Command::DeleteSchedule { id } => {
+                spawn_schedule_delete(client.clone(), updates.clone(), id);
+            }
+            Command::TestConnection { endpoint, token } => {
+                spawn_connection_test(updates.clone(), endpoint, token);
             }
         }
     }
@@ -815,6 +917,83 @@ fn spawn_workflow_retry(client: Arc<RpcClient>, updates: Sender<Update>, task_id
             .await
             .map(Box::new);
         let _ = updates.try_send(Update::WorkflowRetryFinished { task_id, result });
+    });
+}
+
+/// Drain schedule refresh triggers into one `schedules.list`, coalescing a
+/// burst of cron ticks/saves into a single round trip.
+fn spawn_schedule_loader(client: Arc<RpcClient>, updates: Sender<Update>, triggers: Receiver<()>) {
+    tokio::spawn(async move {
+        while triggers.recv().await.is_ok() {
+            while triggers.try_recv().is_ok() {}
+            let update = match client.schedules_list(EmptyParams {}).await {
+                Ok(schedules) => Update::SchedulesLoaded { schedules },
+                Err(error) => Update::SchedulesFailed { error },
+            };
+            let _ = updates.try_send(update);
+        }
+    });
+}
+
+/// Spawn one `schedules.upsert`; the daemon computes `next_run` on the result.
+fn spawn_schedule_upsert(
+    client: Arc<RpcClient>,
+    updates: Sender<Update>,
+    id: Option<String>,
+    cron: String,
+    task: String,
+    input: Option<serde_json::Value>,
+    enabled: bool,
+) {
+    tokio::spawn(async move {
+        let result = client
+            .schedules_upsert(ScheduleUpsertParams {
+                id,
+                cron,
+                task,
+                input,
+                enabled: Some(enabled),
+            })
+            .await
+            .map(Box::new);
+        let _ = updates.try_send(Update::ScheduleSaved { result });
+    });
+}
+
+/// Spawn one `schedules.delete`.
+fn spawn_schedule_delete(client: Arc<RpcClient>, updates: Sender<Update>, id: String) {
+    tokio::spawn(async move {
+        let result = client
+            .schedules_delete(ScheduleDeleteParams { id: id.clone() })
+            .await;
+        let _ = updates.try_send(Update::ScheduleDeleted { id, result });
+    });
+}
+
+/// Spawn a `system.ping` against a draft client, leaving the live connection
+/// untouched (a bad draft can never take Settings offline).
+fn spawn_connection_test(updates: Sender<Update>, endpoint: String, token: Option<String>) {
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let result = match RpcClient::from_parts(&endpoint, token.as_deref()) {
+            Ok(client) => {
+                match tokio::time::timeout(Duration::from_secs(5), client.ping(PingParams {})).await
+                {
+                    Ok(result) => result,
+                    // A silent/black-holed address must not leave "Testing…" up
+                    // forever; report the deadline like any other transport error.
+                    Err(_) => Err(ClientError::Network(
+                        "the connection test timed out after 5 s".to_string(),
+                    )),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        let _ = updates.try_send(Update::ConnectionTestFinished {
+            endpoint,
+            result,
+            round_trip: started.elapsed(),
+        });
     });
 }
 

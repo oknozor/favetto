@@ -620,7 +620,7 @@ impl TasksView {
 
 impl Render for TasksView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::for_appearance(window.appearance());
+        let theme = self.state.read(cx).theme(window.appearance());
         let (list, status, query, search_active, filter) = {
             let state = self.state.read(cx);
             (

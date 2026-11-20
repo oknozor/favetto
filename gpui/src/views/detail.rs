@@ -1260,7 +1260,7 @@ struct RunsBody<'a> {
 
 impl Render for DetailView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::for_appearance(window.appearance());
+        let theme = self.state.read(cx).theme(window.appearance());
         let narrow = container_query(window.viewport_size().width) == LayoutMode::Narrow;
         let route = self.state.read(cx).active_route();
 

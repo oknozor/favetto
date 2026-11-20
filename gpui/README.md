@@ -1,11 +1,13 @@
 # favetto GPUI desktop client
 
-Status: **task catalog (step 08)** — browse definitions grouped by repo and
+Status: **task catalog (step 09)** — browse definitions grouped by repo and
 folder, fuzzy-search names and prompts, read the raw Markdown source beside the
 list, and launch a definition through a validated `[[vars]]` sheet. The
 Workflows surface lists the roots in the current task snapshot and inspects one
 root's ready/running/failed/blocked/terminal instances, progress and catalog DAG
-source. The plans live in `docs/design/gpui-client.md`.
+source. Schedules create/edit/delete cron triggers, and Settings edits the
+daemon connection, tests it, lists the agents and applies a theme/density. The
+plans live in `docs/design/gpui-client.md`.
 
 ## What it is
 
@@ -135,6 +137,33 @@ next `task.updated` push. `workflow.get` is shown as readable DOT in a monospace
 panel with a one-line edge legend and **Copy DOT** (no Graphviz binary is
 embedded).
 
+The Schedules surface (`g s`) lists `schedules.list` as a table of enabled
+state, cron expression, task and the daemon-computed next run (absolute UTC plus
+a relative hint). `n` opens the create sheet, `↵` edits the highlighted row and
+`d` opens the delete confirmation. The sheet has a cron field with inline
+validation and a plain-language hint (five-field expressions get a zero-seconds
+field; the hint names the cadence and the next fire), a task picker from
+`catalog.list`, and an enabled toggle (`⌘E`/`Ctrl+E` or a click). `Tab`/
+`Shift+Tab` walk the fields and `⌘↵`/`Ctrl+↵` saves. A rejected save stays
+attached to the sheet; a saved row appears immediately with its `next_run`.
+Deleting names the task and cadence, and the row disappears only after the
+daemon answers.
+
+Settings (`⌘,`/`Ctrl+,`) is stacked into four cards. **Connection** edits the
+daemon address and token in place: `host:port`, `http(s)://…` and full `/rpc`
+URLs are accepted, the normalized base URL is previewed before saving, and a bad
+address shows the precise reason without touching the live connection. **Test
+connection** runs `system.ping` against the draft and reports the round-trip
+latency and daemon cwd, or the exact transport error. **Save** rewrites
+`gpui.toml` and restarts the transport; **Use defaults** restores
+`http://127.0.0.1:7878` and the shared token file. **Agents** is the read-only
+`agents.list` roster (availability, command, `acp`/`pty` backend, live sessions).
+**Appearance** switches System/Dark/Light and Comfortable/Compact live and
+persists both. **About** shows the client version, daemon cwd, endpoint, config
+path and a docs link, and states that no telemetry is collected.
+`Tab`/`Shift+Tab` walk the controls and `Enter` activates the focused one;
+`⌘↵` saves, `⌘T` tests.
+
 ## Pointing it at a daemon
 
 The connection is configured in `~/.config/favetto/gpui.toml`:
@@ -144,12 +173,19 @@ The connection is configured in `~/.config/favetto/gpui.toml`:
 endpoint = "127.0.0.1:7878"
 # Optional. Overrides the shared token file.
 # token = "…"
+# Optional: "system" (default), "dark" or "light".
+theme = "system"
+# Optional: "comfortable" (default) or "compact".
+density = "comfortable"
 ```
 
 Without a file the client uses `http://127.0.0.1:7878` and the token at
 `~/.local/share/favetto/token` (the same file the TUI and web client use).
 Endpoint input is normalized (Postel's Law): trailing slashes, a pasted `/rpc`
-or `/events` path, and a missing scheme are all accepted.
+or `/events` path, and a missing scheme are all accepted. An address that cannot
+name a host is refused with the specific reason in Settings rather than silently
+replaced. A token typed into Settings is written as an override; leaving the
+field blank keeps the shared token file.
 
 ## Architecture notes
 
@@ -183,6 +219,13 @@ or `/events` path, and a missing scheme are all accepted.
   `root_or_self`, the five runtime buckets, dependency labels joined from the
   cached task rows, `done / total` progress, optimistic cancel/retry state and
   the `workflow.get` source model. Unit-tested without a window.
+- `src/schedules.rs` — the pure Schedules model: cron normalization/validation
+  with the daemon's parser configuration, plain-language cadence and next-fire
+  hints, the sorted table, the create/edit sheet and the delete confirmation.
+  Unit-tested without a window.
+- `src/settings.rs` — the pure Settings model: the endpoint/token draft, the
+  precise normalization preview, the connection-test result and the logical
+  Tab order. Unit-tested without a window.
 - `src/detail.rs` — the pure detail model: output-envelope extraction and ANSI
   stripping, usage/cost formatting, event-feed grouping (text, reasoning,
   tools, usage, errors, boundaries), the permission-request resolver, and a
@@ -406,3 +449,39 @@ Deviations from the plan are recorded in this file as the chain progresses
   view rather than a drawn DAG; the required catalog DAG is the DOT source
   panel. A layout engine can be added behind the same `WorkflowGraph` model
   later without changing the RPCs.
+
+### Step 09 deviations / additions
+
+- **Cron validation matches the daemon.** `schedules.upsert` is registered with
+  a `Seconds::Required` parser (`dom_and_dow(true)`, UTC), so the client uses
+  the same configuration via `croner`. A five-field expression is accepted as a
+  convenience and normalized by inserting a zero-seconds field before the RPC,
+  so a saved schedule always fires on the cadence the hint describes.
+- **Density is a spacing scale, not a second layout.** Comfortable uses the
+  documented 4/8/12/16/24 scale; Compact uses 3/6/9/12/18 everywhere the theme
+  tokens are read. Fixed row/control heights stay as designed so targets never
+  drop below the accessibility minimum (docs §2, Fitts's Law).
+- **Theme/density live in `gpui.toml`.** The file now carries optional `theme`
+  and `density` keys beside `endpoint`/`token`. `System` follows the OS; Dark
+  and Light override it. Changing either applies on the next render and writes
+  the whole settings file, so an appearance edit never drops the connection
+  override (and a token sourced from the shared file is never copied into it).
+- **The daemon version is not reported.** `system.ping` carries `pong` and
+  `cwd` only; there is no `system.version`/info method in the wire API. The
+  About card therefore shows the client version, the daemon cwd and endpoint,
+  and says the daemon version is not reported rather than inventing one.
+- **A connection edit restarts the transport.** The runtime owns the SSE URL and
+  RPC client for one `ClientConfig`, so saving a new endpoint (or using defaults)
+  joins the old worker and starts a fresh one from `Connecting`. A validation or
+  file-write failure returns before that point, leaving the old connection live.
+- **A test uses a throwaway client.** "Test connection" builds a temporary
+  `RpcClient` for the draft endpoint/token and pings it; a failure never flips
+  the live status pill to Unauthorized/Disconnected.
+- **The schedule sheet owns typed text.** While it is open the key context adds
+  `Sheet Search`, so spaces in a cron expression and letters such as `r`/`n`
+  reach the field instead of refresh/jump shortcuts. The enabled toggle uses
+  `⌘E`/`Ctrl+E` (and a click) for the same reason.
+- **The cron hint is conservative.** It recognizes scalar, step and wildcard
+  time fields plus common day/weekday/month shapes; anything more complex still
+  gets the computed next fire under `Custom schedule` rather than a wrong
+  description.

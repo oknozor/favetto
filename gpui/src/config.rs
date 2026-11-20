@@ -10,7 +10,7 @@
 //! and yields one canonical base URL, so [`ClientConfig::rpc_url`] and
 //! [`ClientConfig::events_url`] can never disagree about where the daemon lives.
 
-#![allow(dead_code)] // `save` and the token-source helpers are consumed by step 09.
+#![allow(dead_code)] // The test-only helpers (`save_to`, `rpc_url`, …) keep the file format and its callers together.
 
 use std::fs;
 use std::io::ErrorKind;
@@ -25,6 +25,71 @@ pub const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:7878";
 pub const RPC_PATH: &str = "/rpc";
 /// The authenticated SSE push channel.
 pub const EVENTS_PATH: &str = "/events";
+
+/// The appearance preference stored in `gpui.toml`.
+///
+/// `System` follows the operating system and is the default, so a fresh
+/// install keeps matching the desktop environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeChoice {
+    /// Follow the operating system's light/dark appearance.
+    #[default]
+    System,
+    /// Always use the dark palette.
+    Dark,
+    /// Always use the light palette.
+    Light,
+}
+
+impl ThemeChoice {
+    /// The label shown by the Appearance controls.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::Dark => "Dark",
+            Self::Light => "Light",
+        }
+    }
+
+    /// Cycle System → Dark → Light → System (the keyboard activate action).
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::System => Self::Dark,
+            Self::Dark => Self::Light,
+            Self::Light => Self::System,
+        }
+    }
+}
+
+/// The row density preference stored in `gpui.toml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Density {
+    /// 32 px rows and the full spacing scale.
+    #[default]
+    Comfortable,
+    /// Tighter spacing for short windows and dense lists.
+    Compact,
+}
+
+impl Density {
+    /// The label shown by the Appearance controls.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Comfortable => "Comfortable",
+            Self::Compact => "Compact",
+        }
+    }
+
+    /// Toggle between the two densities.
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Comfortable => Self::Compact,
+            Self::Compact => Self::Comfortable,
+        }
+    }
+}
 
 /// Where the bearer token came from, so an `Unauthorized` state can point the
 /// user at the file to fix.
@@ -67,6 +132,10 @@ pub struct ClientConfig {
     pub token_source: TokenSource,
     /// The `gpui.toml` path that was consulted (used when saving in Settings).
     pub config_path: PathBuf,
+    /// The theme preference saved in `gpui.toml`.
+    pub theme: ThemeChoice,
+    /// The density preference saved in `gpui.toml`.
+    pub density: Density,
     /// Non-fatal problems found while loading (a malformed config or token
     /// file). The connection still starts with defaults.
     pub warnings: Vec<String>,
@@ -82,18 +151,32 @@ impl ClientConfig {
     pub fn events_url(&self) -> String {
         join_url(&self.endpoint, EVENTS_PATH)
     }
+
+    /// The token that belongs in `gpui.toml`, if any. A token read from the
+    /// shared token file is deliberately not copied into the settings file:
+    /// leaving it out keeps the file tiny and keeps the token in one place.
+    pub fn token_override(&self) -> Option<&str> {
+        match self.token_source {
+            TokenSource::ConfigFile(_) => self.token.as_deref(),
+            TokenSource::TokenFile(_) | TokenSource::Missing(_) => None,
+        }
+    }
 }
 
 /// The on-disk shape of `~/.config/favetto/gpui.toml`.
 ///
-/// Both fields are optional: a missing file, or an empty one, means "use the
-/// defaults" (the local endpoint and the shared token file).
+/// Every field is optional: a missing file, or an empty one, means "use the
+/// defaults" (the local endpoint, the shared token file and system appearance).
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct FileConfig {
     #[serde(default)]
     endpoint: Option<String>,
     #[serde(default)]
     token: Option<String>,
+    #[serde(default)]
+    theme: ThemeChoice,
+    #[serde(default)]
+    density: Density,
 }
 
 /// `~/.config/favetto/gpui.toml` (respecting `XDG_CONFIG_HOME` via `dirs`).
@@ -136,7 +219,20 @@ pub fn load_from(config_path: &Path, token_path: &Path) -> ClientConfig {
         }
     };
 
-    let endpoint = normalize_endpoint(file.endpoint.as_deref().unwrap_or_default());
+    let endpoint_input = file.endpoint.as_deref().unwrap_or_default();
+    let endpoint = match validate_endpoint(endpoint_input) {
+        Ok(endpoint) => endpoint,
+        Err(err) => {
+            if !endpoint_input.trim().is_empty() {
+                warnings.push(format!(
+                    "{}: endpoint {:?}: {err}",
+                    config_path.display(),
+                    endpoint_input
+                ));
+            }
+            DEFAULT_ENDPOINT.to_string()
+        }
+    };
 
     // A token in `gpui.toml` wins; otherwise fall back to the shared token file.
     let config_token = file
@@ -176,21 +272,43 @@ pub fn load_from(config_path: &Path, token_path: &Path) -> ClientConfig {
         token,
         token_source,
         config_path: config_path.to_path_buf(),
+        theme: file.theme,
+        density: file.density,
         warnings,
     }
 }
 
-/// Persist `endpoint` and (optionally) `token` to `gpui.toml`.
+/// Persist `endpoint` and (optionally) `token` to `gpui.toml`, keeping the
+/// default appearance.
 ///
-/// Used by the Settings surface in step 09; kept beside [`load_from`] so the
-/// file format has one owner.
+/// Used by tests and by callers that only change the connection; Settings uses
+/// [`save_settings_to`] so the appearance survives a connection edit.
 pub fn save_to(config_path: &Path, endpoint: &str, token: Option<&str>) -> std::io::Result<()> {
+    save_settings_to(
+        config_path,
+        endpoint,
+        token,
+        ThemeChoice::default(),
+        Density::default(),
+    )
+}
+
+/// Persist the complete settings file: connection plus appearance.
+pub fn save_settings_to(
+    config_path: &Path,
+    endpoint: &str,
+    token: Option<&str>,
+    theme: ThemeChoice,
+    density: Density,
+) -> std::io::Result<()> {
     let file = FileConfig {
         endpoint: Some(normalize_endpoint(endpoint)),
         token: token
             .map(str::trim)
             .filter(|t| !t.is_empty())
             .map(str::to_string),
+        theme,
+        density,
     };
     let text = toml::to_string(&file).unwrap_or_default();
     if let Some(parent) = config_path.parent() {
@@ -199,27 +317,63 @@ pub fn save_to(config_path: &Path, endpoint: &str, token: Option<&str>) -> std::
     fs::write(config_path, text)
 }
 
-/// Normalize a user-entered endpoint into a canonical base URL.
+/// A precise reason an endpoint cannot be used, so Settings can say what to fix
+/// instead of silently falling back to the default daemon (Postel's Law still
+/// accepts every common shape; it just refuses impossible ones).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EndpointError {
+    /// The field was left blank.
+    #[error("Enter a daemon address such as 127.0.0.1:7878.")]
+    Empty,
+    /// Whitespace in the middle of an address.
+    #[error("The daemon address must not contain spaces.")]
+    Whitespace,
+    /// A scheme other than `http`/`https`.
+    #[error("Only http:// and https:// are supported, not {0}://.")]
+    UnsupportedScheme(String),
+    /// Nothing that names a host.
+    #[error("Enter a host name or IP address after the scheme, such as 127.0.0.1:7878.")]
+    MissingHost,
+    /// The address includes credentials, which this client does not support.
+    #[error("Remove the username/password from the address; the token is configured separately.")]
+    Credentials,
+    /// A query string or fragment does not belong on a daemon base URL.
+    #[error("A daemon address cannot include a query string or fragment.")]
+    Query,
+    /// The URL parser could not make sense of the address.
+    #[error("{input:?} is not a valid daemon address: {reason}")]
+    Invalid {
+        /// What the user typed.
+        input: String,
+        /// The parser's explanation.
+        reason: String,
+    },
+}
+
+/// Validate and normalize a user-entered endpoint into a canonical base URL.
 ///
 /// Accepts `host:port`, `http(s)://host[:port][/path]`, a full `/rpc` or
-/// `/events` URL, surrounding whitespace, and trailing slashes. Anything that
-/// cannot name a host falls back to [`DEFAULT_ENDPOINT`] rather than failing the
-/// whole connection.
-pub fn normalize_endpoint(input: &str) -> String {
+/// `/events` URL, surrounding whitespace, and trailing slashes. Unlike
+/// [`normalize_endpoint`], an unusable address is reported precisely instead of
+/// silently falling back to the default daemon.
+pub fn validate_endpoint(input: &str) -> Result<String, EndpointError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
-        return DEFAULT_ENDPOINT.to_string();
+        return Err(EndpointError::Empty);
+    }
+    if trimmed.contains(char::is_whitespace) {
+        return Err(EndpointError::Whitespace);
     }
 
     let (scheme, rest) = match trimmed.split_once("://") {
         Some((scheme, rest)) => {
             let scheme = scheme.to_ascii_lowercase();
             if scheme != "http" && scheme != "https" {
-                return DEFAULT_ENDPOINT.to_string();
+                return Err(EndpointError::UnsupportedScheme(scheme));
             }
-            (scheme, rest)
+            (scheme, rest.to_string())
         }
-        None => ("http".to_string(), trimmed),
+        None => ("http".to_string(), trimmed.to_string()),
     };
 
     // `host:port/rpc/` → `host:port/rpc` → `host:port`.
@@ -229,11 +383,35 @@ pub fn normalize_endpoint(input: &str) -> String {
             rest = base.trim_end_matches('/').to_string();
         }
     }
-    if rest.is_empty() || rest.contains(char::is_whitespace) {
-        return DEFAULT_ENDPOINT.to_string();
+    if rest.is_empty() {
+        return Err(EndpointError::MissingHost);
     }
 
-    format!("{scheme}://{rest}")
+    let candidate = format!("{scheme}://{rest}");
+    let url = reqwest::Url::parse(&candidate).map_err(|err| EndpointError::Invalid {
+        input: trimmed.to_string(),
+        reason: err.to_string(),
+    })?;
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err(EndpointError::MissingHost);
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(EndpointError::Credentials);
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(EndpointError::Query);
+    }
+
+    Ok(format!("{scheme}://{rest}"))
+}
+
+/// Normalize a user-entered endpoint into a canonical base URL.
+///
+/// Accepts the same forms as [`validate_endpoint`]. Anything unusable falls
+/// back to [`DEFAULT_ENDPOINT`] so a malformed config file still connects to
+/// the local daemon; Settings uses [`validate_endpoint`] to show the fix first.
+pub fn normalize_endpoint(input: &str) -> String {
+    validate_endpoint(input).unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string())
 }
 
 /// `POST` target for an endpoint in any accepted form.
@@ -327,10 +505,90 @@ mod tests {
             token: None,
             token_source: TokenSource::Missing(PathBuf::from("/token")),
             config_path: PathBuf::from("/gpui.toml"),
+            theme: ThemeChoice::System,
+            density: Density::Comfortable,
             warnings: Vec::new(),
         };
         assert_eq!(config.rpc_url(), "http://host:7878/rpc");
         assert_eq!(config.events_url(), "http://host:7878/events");
+    }
+
+    #[test]
+    fn endpoint_validation_explains_each_rejection() {
+        assert_eq!(validate_endpoint("  "), Err(EndpointError::Empty));
+        assert_eq!(
+            validate_endpoint("localhost:7878 please"),
+            Err(EndpointError::Whitespace)
+        );
+        assert_eq!(
+            validate_endpoint("ftp://example.com"),
+            Err(EndpointError::UnsupportedScheme("ftp".to_string()))
+        );
+        assert!(matches!(
+            validate_endpoint("http://"),
+            Err(EndpointError::MissingHost)
+        ));
+        assert!(matches!(
+            validate_endpoint("user:pass@example.com:7878"),
+            Err(EndpointError::Credentials)
+        ));
+        assert!(matches!(
+            validate_endpoint("http://127.0.0.1:7878?token=x"),
+            Err(EndpointError::Query)
+        ));
+        assert!(matches!(
+            validate_endpoint("127.0.0.1:notaport"),
+            Err(EndpointError::Invalid { .. })
+        ));
+
+        // Every accepted form normalizes to one base URL.
+        assert_eq!(
+            validate_endpoint("127.0.0.1:7878"),
+            Ok("http://127.0.0.1:7878".to_string())
+        );
+        assert_eq!(
+            validate_endpoint("https://example.com/favetto/rpc/"),
+            Ok("https://example.com/favetto".to_string())
+        );
+    }
+
+    #[test]
+    fn theme_and_density_round_trip_through_the_config_file() {
+        let dir = temp_dir("appearance");
+        let config_path = dir.join("gpui.toml");
+        save_settings_to(
+            &config_path,
+            "127.0.0.1:7878",
+            None,
+            ThemeChoice::Dark,
+            Density::Compact,
+        )
+        .expect("save");
+
+        let config = load_from(&config_path, &dir.join("missing-token"));
+        assert_eq!(config.endpoint, DEFAULT_ENDPOINT);
+        assert_eq!(config.theme, ThemeChoice::Dark);
+        assert_eq!(config.density, Density::Compact);
+        assert!(config.token.is_none());
+        assert!(config.token_override().is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_token_from_the_shared_file_is_not_copied_into_the_settings_file() {
+        let dir = temp_dir("token-source");
+        let token_path = dir.join("token");
+        fs::write(&token_path, "shared").expect("write token");
+
+        let from_file = load_from(&dir.join("gpui.toml"), &token_path);
+        assert_eq!(from_file.token.as_deref(), Some("shared"));
+        assert_eq!(from_file.token_override(), None);
+
+        let config_path = dir.join("gpui.toml");
+        fs::write(&config_path, "token = \"override\"\n").expect("write config");
+        let from_config = load_from(&config_path, &token_path);
+        assert_eq!(from_config.token_override(), Some("override"));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

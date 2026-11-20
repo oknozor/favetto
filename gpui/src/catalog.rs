@@ -523,6 +523,12 @@ impl CatalogState {
         self.entries.len()
     }
 
+    /// The raw definitions, used by the Schedules task picker. Sorted by name
+    /// as the daemon returns them.
+    pub fn entries(&self) -> &[CatalogEntry] {
+        &self.entries
+    }
+
     /// The rows in display order, used by keyboard selection. Collapsed
     /// groups/folders are skipped, so the highlight only lands on visible rows.
     pub fn visible_names(&self) -> Vec<String> {

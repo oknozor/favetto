@@ -10,6 +10,8 @@ use std::sync::LazyLock;
 
 use gpui::{rgb, Rgba, WindowAppearance};
 
+use crate::config::{Density, ThemeChoice};
+
 /// Sidebar width in px — the default width of the navigation region.
 pub const SIDEBAR_WIDTH: f32 = 220.0;
 
@@ -27,6 +29,7 @@ pub const DETAIL_WIDTH: f32 = 360.0;
 pub const NARROW_BREAKPOINT: f32 = 1120.0;
 
 /// The spacing scale in px (docs §3): 4/8/12/16/24.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Spacing {
     /// 4px.
     pub s1: f32,
@@ -41,6 +44,7 @@ pub struct Spacing {
 }
 
 /// The radii in px (docs §3): 4/8/12.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Radii {
     /// 4px.
     pub r4: f32,
@@ -51,6 +55,7 @@ pub struct Radii {
 }
 
 /// The type scale in px (docs §3): 11/13/15/20/28.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FontScale {
     /// 11px.
     pub xs: f32,
@@ -90,6 +95,7 @@ pub struct Colors {
 }
 
 /// The two themes of the client (docs §3).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Theme {
     pub spacing: Spacing,
     pub radii: Radii,
@@ -163,13 +169,83 @@ static LIGHT: LazyLock<Theme> = LazyLock::new(|| Theme {
     },
 });
 
+/// The compact spacing scale: every step shrinks by roughly a quarter, so
+/// lists, cards and the sidebar gain room without changing the type scale.
+fn compact(mut theme: Theme) -> Theme {
+    theme.spacing = Spacing {
+        s1: 3.0,
+        s2: 6.0,
+        s3: 9.0,
+        s4: 12.0,
+        s6: 18.0,
+    };
+    theme
+}
+
+static DARK_COMPACT: LazyLock<Theme> = LazyLock::new(|| compact(*DARK));
+static LIGHT_COMPACT: LazyLock<Theme> = LazyLock::new(|| compact(*LIGHT));
+
 impl Theme {
     /// The theme following the OS appearance (docs §3: "dark/light flipped
-    /// by the OS appearance").
+    /// by the OS appearance"). Kept as the convenience entry point for tests
+    /// and future non-Settings consumers; the shell uses [`Self::for_settings`].
+    #[allow(dead_code)]
     pub fn for_appearance(appearance: WindowAppearance) -> &'static Theme {
-        match appearance {
-            WindowAppearance::Dark | WindowAppearance::VibrantDark => &DARK,
-            WindowAppearance::Light | WindowAppearance::VibrantLight => &LIGHT,
+        Self::for_settings(appearance, ThemeChoice::System, Density::Comfortable)
+    }
+
+    /// The effective theme after the Settings appearance preferences:
+    /// `System` follows the OS, `Dark`/`Light` override it, and density
+    /// selects the spacing scale. Every check is a static lookup, so a view can
+    /// call this on each render (live theme changes) without allocation.
+    pub fn for_settings(
+        appearance: WindowAppearance,
+        choice: ThemeChoice,
+        density: Density,
+    ) -> &'static Theme {
+        let dark = match choice {
+            ThemeChoice::System => {
+                matches!(
+                    appearance,
+                    WindowAppearance::Dark | WindowAppearance::VibrantDark
+                )
+            }
+            ThemeChoice::Dark => true,
+            ThemeChoice::Light => false,
+        };
+        match (dark, density) {
+            (true, Density::Comfortable) => &DARK,
+            (true, Density::Compact) => &DARK_COMPACT,
+            (false, Density::Comfortable) => &LIGHT,
+            (false, Density::Compact) => &LIGHT_COMPACT,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn appearance_preferences_override_the_os_and_compact_shrinks_spacing() {
+        let dark = Theme::for_settings(
+            WindowAppearance::Light,
+            ThemeChoice::Dark,
+            Density::Comfortable,
+        );
+        assert_eq!(dark.colors.bg, DARK.colors.bg);
+        let compact = Theme::for_settings(
+            WindowAppearance::Dark,
+            ThemeChoice::System,
+            Density::Compact,
+        );
+        assert!(compact.spacing.s4 < DARK.spacing.s4);
+        assert_eq!(compact.colors.bg, DARK.colors.bg);
+        let light = Theme::for_settings(
+            WindowAppearance::Dark,
+            ThemeChoice::Light,
+            Density::Comfortable,
+        );
+        assert_eq!(light.colors.bg, LIGHT.colors.bg);
     }
 }

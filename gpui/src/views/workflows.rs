@@ -984,7 +984,7 @@ impl WorkflowsView {
 
 impl Render for WorkflowsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::for_appearance(window.appearance());
+        let theme = self.state.read(cx).theme(window.appearance());
         let (roots, selected, detail, graph) = {
             let state = self.state.read(cx);
             (
