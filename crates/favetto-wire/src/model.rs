@@ -10,7 +10,8 @@ use crate::rpc::{push, Notification};
 
 pub use crate::agent_state::{
     AgentActivity, AgentStateEvent, AgentUsage, IdleOutcome, InputReply, InputRequest, RunSummary,
-    ToolCall, UsageBucket, UsagePeriod, UsageStats, UsageTotals,
+    ToolCall, ToolCallDetail, ToolCallStatus, ToolContent, ToolKind, ToolLocation, UsageBucket,
+    UsagePeriod, UsageStats, UsageTotals,
 };
 
 /// Lifecycle of a single task.

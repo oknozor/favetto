@@ -15,7 +15,7 @@
 //! deliberately stricter than ACP's `stop_reason`: see [`AcpOutcome::succeeded`].
 
 use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -24,9 +24,13 @@ use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::schema::{
-    CancelNotification, ContentBlock, InitializeRequest, NewSessionRequest, PermissionOptionKind,
-    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, SessionUpdate, TextContent, ToolCallStatus,
+    CancelNotification, ContentBlock, EmbeddedResourceResource, InitializeRequest,
+    NewSessionRequest, PermissionOptionKind, PromptRequest, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionNotification, SessionUpdate, TextContent, ToolCall as AcpToolCall,
+    ToolCallContent as AcpToolCallContent, ToolCallLocation as AcpToolCallLocation,
+    ToolCallStatus as AcpToolCallStatus, ToolCallUpdateFields as AcpToolCallUpdateFields,
+    ToolKind as AcpToolKind,
 };
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::{Agent, Client, Lines};
@@ -38,6 +42,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use favetto_core::model::{
     AgentStateEvent, AwaitingInputKind, InputReply, InputRequest, MessageRole, PermissionPolicy,
+    ToolCallDetail, ToolCallStatus, ToolContent, ToolKind, ToolLocation,
 };
 
 /// Deadline for an `ask`-policy permission answered by a remote client.
@@ -220,6 +225,7 @@ pub(crate) fn spawn(
     let last_activity = Arc::new(Mutex::new(Instant::now()));
     let transcript = Arc::new(Mutex::new(String::new()));
     let outcome = Arc::new(Mutex::new(AcpOutcome::default()));
+    let tools = Arc::new(Mutex::new(ToolTracker::default()));
 
     let responder = Arc::new(AcpResponder {
         policy: launch.policy,
@@ -233,6 +239,7 @@ pub(crate) fn spawn(
     let notification_events = events_tx.clone();
     let notification_transcript = transcript.clone();
     let notification_outcome = outcome.clone();
+    let notification_tools = tools.clone();
     let permission_responder = responder.clone();
 
     let permission_events = events_tx.clone();
@@ -259,6 +266,7 @@ pub(crate) fn spawn(
                         &notification.update,
                         &notification_transcript,
                         &notification_outcome,
+                        &notification_tools,
                     );
                     for event in mapped {
                         let _ = notification_events.send(event);
@@ -677,12 +685,126 @@ async fn apply_model(
     Ok(applied)
 }
 
+/// Cumulative per-session tool-call state.
+///
+/// ACP `ToolCallUpdate` fields are a patch: omitted fields keep their previous
+/// value, while `content`/`locations` replace the whole collection. Keeping the
+/// merged snapshot here lets every emitted event carry the full picture and
+/// makes sparse updates (including updates that arrive before their start)
+/// harmless.
+#[derive(Default)]
+struct ToolTracker {
+    calls: HashMap<String, ToolCallDetail>,
+    failed: HashSet<String>,
+}
+
+impl ToolTracker {
+    /// Fold a tool-call start into the call's snapshot; returns whether this
+    /// call id was seen for the first time.
+    fn start(&mut self, tool: &AcpToolCall) -> (bool, ToolCallDetail) {
+        let id = tool.tool_call_id.0.to_string();
+        let is_new = !self.calls.contains_key(&id);
+        let detail = self.calls.entry(id).or_default();
+        merge_start(detail, tool);
+        (is_new, detail.clone())
+    }
+
+    /// Fold a sparse update into the call's snapshot; returns whether this
+    /// call id was seen for the first time.
+    fn update(&mut self, id: &str, fields: &AcpToolCallUpdateFields) -> (bool, ToolCallDetail) {
+        let is_new = !self.calls.contains_key(id);
+        let detail = self.calls.entry(id.to_string()).or_default();
+        merge_update(detail, fields);
+        (is_new, detail.clone())
+    }
+
+    /// Record a failure once per call id; returns whether it was the first.
+    fn count_failure(&mut self, id: &str) -> bool {
+        self.failed.insert(id.to_string())
+    }
+}
+
+/// Merge a (possibly out-of-order) start into an existing snapshot.
+///
+/// A start's title is always present and authoritative. Its kind/status have
+/// protocol defaults (`other`/`pending`) that are indistinguishable from
+/// "absent", so they must not downgrade a more specific kind or a terminal
+/// status supplied by an update that arrived first.
+fn merge_start(detail: &mut ToolCallDetail, tool: &AcpToolCall) {
+    detail.title = Some(tool.title.clone());
+    if let Some(name) = &tool.name {
+        detail.name = Some(name.clone());
+    }
+    let kind = tool_kind(tool.kind);
+    if detail.kind.is_none() || kind != ToolKind::Other {
+        detail.kind = Some(kind);
+    }
+    // A start's status has a protocol default (`pending`) that cannot be told
+    // apart from "absent", so it may only fill a gap. A late start must never
+    // downgrade an in-progress or terminal status learned from an update.
+    if detail.status.is_none() {
+        detail.status = Some(tool_status(tool.status));
+    }
+    if let Some(input) = &tool.raw_input {
+        detail.input = Some(input.clone());
+    }
+    if let Some(output) = &tool.raw_output {
+        detail.output = Some(output.clone());
+    }
+    let content: Vec<ToolContent> = tool.content.iter().filter_map(tool_content).collect();
+    if !content.is_empty() {
+        detail.content = content;
+    }
+    if !tool.locations.is_empty() {
+        detail.locations = tool.locations.iter().map(tool_location).collect();
+    }
+}
+
+/// Apply ACP patch semantics to a snapshot: `None` leaves a field unchanged;
+/// present `content`/`locations` replace the collection, including with empty.
+fn merge_update(detail: &mut ToolCallDetail, fields: &AcpToolCallUpdateFields) {
+    if let Some(name) = &fields.name {
+        detail.name = Some(name.clone());
+    }
+    if let Some(title) = &fields.title {
+        detail.title = Some(title.clone());
+    }
+    if let Some(kind) = fields.kind {
+        detail.kind = Some(tool_kind(kind));
+    }
+    if let Some(status) = fields.status {
+        detail.status = Some(tool_status(status));
+    }
+    if let Some(input) = &fields.raw_input {
+        detail.input = Some(input.clone());
+    }
+    if let Some(output) = &fields.raw_output {
+        detail.output = Some(output.clone());
+    }
+    if let Some(content) = &fields.content {
+        detail.content = content.iter().filter_map(tool_content).collect();
+    }
+    if let Some(locations) = &fields.locations {
+        detail.locations = locations.iter().map(tool_location).collect();
+    }
+}
+
+/// The display name for a tool, falling back from programmatic name to title.
+fn tool_name(detail: &ToolCallDetail) -> String {
+    detail
+        .name
+        .clone()
+        .or_else(|| detail.title.clone())
+        .unwrap_or_else(|| "tool".to_string())
+}
+
 /// Map one ACP update into normalized events, folding text into `transcript`
 /// and counts into `outcome`.
 fn map_update(
     update: &SessionUpdate,
     transcript: &Mutex<String>,
     outcome: &Mutex<AcpOutcome>,
+    tools: &Mutex<ToolTracker>,
 ) -> Vec<AgentStateEvent> {
     match update {
         SessionUpdate::UserMessageChunk(chunk) => content_text(&chunk.content)
@@ -720,49 +842,65 @@ fn map_update(
                 tool.name.as_deref().unwrap_or(&tool.title),
                 tool.title
             ));
-            {
-                let mut state = outcome.lock();
-                state.tool_calls += 1;
+            let id = tool.tool_call_id.0.to_string();
+            let (is_new, failed_now, detail) = {
+                let mut tracker = tools.lock();
+                let (is_new, detail) = tracker.start(tool);
+                let failed_now =
+                    detail.status == Some(ToolCallStatus::Failed) && tracker.count_failure(&id);
+                (is_new, failed_now, detail)
+            };
+            if is_new {
+                outcome.lock().tool_calls += 1;
+            }
+            if failed_now {
+                outcome.lock().failed_tools += 1;
             }
             vec![AgentStateEvent::ToolStarted {
-                id: tool.tool_call_id.0.to_string(),
-                name: tool.name.clone().unwrap_or_else(|| tool.title.clone()),
-                input: tool.raw_input.clone().unwrap_or(serde_json::Value::Null),
+                id,
+                name: tool_name(&detail),
+                input: detail.input.clone().unwrap_or(serde_json::Value::Null),
+                detail: Some(Box::new(detail)),
             }]
         }
         SessionUpdate::ToolCallUpdate(update) => {
             let id = update.tool_call_id.0.to_string();
-            let name = update
-                .fields
-                .name
-                .clone()
-                .or_else(|| update.fields.title.clone())
-                .unwrap_or_else(|| "tool".to_string());
+            let (is_new, failed_now, detail) = {
+                let mut tracker = tools.lock();
+                let (is_new, detail) = tracker.update(&id, &update.fields);
+                let failed_now =
+                    detail.status == Some(ToolCallStatus::Failed) && tracker.count_failure(&id);
+                (is_new, failed_now, detail)
+            };
+            if is_new {
+                outcome.lock().tool_calls += 1;
+            }
+            if failed_now {
+                outcome.lock().failed_tools += 1;
+            }
+
             match update.fields.status {
-                Some(ToolCallStatus::Completed) => vec![AgentStateEvent::ToolFinished {
+                Some(AcpToolCallStatus::Completed) => vec![AgentStateEvent::ToolFinished {
+                    name: tool_name(&detail),
                     id,
-                    name,
                     ok: true,
-                    output: update.fields.raw_output.clone(),
+                    output: detail.output.clone(),
+                    detail: Some(Box::new(detail)),
                 }],
-                Some(ToolCallStatus::Failed) => {
-                    {
-                        let mut state = outcome.lock();
-                        state.failed_tools += 1;
-                    }
-                    vec![AgentStateEvent::ToolFinished {
-                        id,
-                        name,
-                        ok: false,
-                        output: update.fields.raw_output.clone(),
-                    }]
-                }
+                Some(AcpToolCallStatus::Failed) => vec![AgentStateEvent::ToolFinished {
+                    name: tool_name(&detail),
+                    id,
+                    ok: false,
+                    output: detail.output.clone(),
+                    detail: Some(Box::new(detail)),
+                }],
                 _ => vec![AgentStateEvent::ToolUpdated {
                     id,
                     partial: serde_json::json!({
                         "title": update.fields.title,
                         "kind": update.fields.kind,
                     }),
+                    detail: Some(Box::new(detail)),
                 }],
             }
         }
@@ -797,6 +935,98 @@ fn content_text(block: &ContentBlock) -> Option<&str> {
     match block {
         ContentBlock::Text(text) => Some(&text.text),
         _ => None,
+    }
+}
+
+/// Normalize an ACP tool kind. A future/unknown kind maps to `Other`.
+fn tool_kind(kind: AcpToolKind) -> ToolKind {
+    match kind {
+        AcpToolKind::Read => ToolKind::Read,
+        AcpToolKind::Edit => ToolKind::Edit,
+        AcpToolKind::Delete => ToolKind::Delete,
+        AcpToolKind::Move => ToolKind::Move,
+        AcpToolKind::Search => ToolKind::Search,
+        AcpToolKind::Execute => ToolKind::Execute,
+        AcpToolKind::Think => ToolKind::Think,
+        AcpToolKind::Fetch => ToolKind::Fetch,
+        AcpToolKind::SwitchMode => ToolKind::SwitchMode,
+        _ => ToolKind::Other,
+    }
+}
+
+/// Normalize an ACP tool status. A future/unknown status maps to `Unknown`.
+fn tool_status(status: AcpToolCallStatus) -> ToolCallStatus {
+    match status {
+        AcpToolCallStatus::Pending => ToolCallStatus::Pending,
+        AcpToolCallStatus::InProgress => ToolCallStatus::InProgress,
+        AcpToolCallStatus::Completed => ToolCallStatus::Completed,
+        AcpToolCallStatus::Failed => ToolCallStatus::Failed,
+        _ => ToolCallStatus::Unknown,
+    }
+}
+
+/// Normalize one structured tool result, dropping binary payloads.
+fn tool_content(content: &AcpToolCallContent) -> Option<ToolContent> {
+    match content {
+        AcpToolCallContent::Content(content) => content_block(&content.content),
+        AcpToolCallContent::Diff(diff) => Some(ToolContent::Diff {
+            path: diff.path.to_string_lossy().into_owned(),
+            old_text: diff.old_text.clone(),
+            new_text: diff.new_text.clone(),
+        }),
+        AcpToolCallContent::Terminal(terminal) => Some(ToolContent::Terminal {
+            terminal_id: terminal.terminal_id.0.to_string(),
+        }),
+        _ => None,
+    }
+}
+
+/// Normalize one ACP content block. Images, audio and blobs keep metadata only:
+/// the daemon never decodes or forwards their base64 payloads.
+fn content_block(block: &ContentBlock) -> Option<ToolContent> {
+    match block {
+        ContentBlock::Text(text) => Some(ToolContent::Text {
+            text: text.text.clone(),
+        }),
+        ContentBlock::Image(image) => Some(ToolContent::Image {
+            mime_type: image.mime_type.clone(),
+            uri: image.uri.clone(),
+        }),
+        ContentBlock::Audio(audio) => Some(ToolContent::Audio {
+            mime_type: audio.mime_type.clone(),
+        }),
+        ContentBlock::ResourceLink(link) => Some(ToolContent::ResourceLink {
+            uri: link.uri.clone(),
+            name: link.name.clone(),
+            mime_type: link.mime_type.clone(),
+            title: link.title.clone(),
+            description: link.description.clone(),
+            size: link.size,
+        }),
+        ContentBlock::Resource(resource) => match &resource.resource {
+            EmbeddedResourceResource::TextResourceContents(text) => Some(ToolContent::Resource {
+                uri: text.uri.clone(),
+                mime_type: text.mime_type.clone(),
+                text: Some(text.text.clone()),
+                binary: false,
+            }),
+            EmbeddedResourceResource::BlobResourceContents(blob) => Some(ToolContent::Resource {
+                uri: blob.uri.clone(),
+                mime_type: blob.mime_type.clone(),
+                text: None,
+                binary: true,
+            }),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Normalize a file location touched by a tool call.
+fn tool_location(location: &AcpToolCallLocation) -> ToolLocation {
+    ToolLocation {
+        path: location.path.to_string_lossy().into_owned(),
+        line: location.line,
     }
 }
 
@@ -854,17 +1084,99 @@ where
 mod tests {
     use super::*;
     use agent_client_protocol::v1::schema::{
-        ContentChunk, ToolCall, ToolCallId, ToolCallUpdateFields,
+        Content, ContentChunk, Diff, ImageContent, Terminal, TextResourceContents, ToolCall,
+        ToolCallId, ToolCallLocation, ToolCallUpdate, ToolCallUpdateFields,
     };
+
+    /// A `map_update` fixture with isolated transcript/outcome/tool state.
+    struct Harness {
+        transcript: Mutex<String>,
+        outcome: Mutex<AcpOutcome>,
+        tools: Mutex<ToolTracker>,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            Self {
+                transcript: Mutex::new(String::new()),
+                outcome: Mutex::new(AcpOutcome::default()),
+                tools: Mutex::new(ToolTracker::default()),
+            }
+        }
+
+        fn map(&self, update: &SessionUpdate) -> Vec<AgentStateEvent> {
+            map_update(update, &self.transcript, &self.outcome, &self.tools)
+        }
+    }
+
+    fn update(fields: ToolCallUpdateFields) -> SessionUpdate {
+        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            agent_client_protocol::v1::schema::ToolCallId::new("call_1"),
+            fields,
+        ))
+    }
+
+    fn started(events: &[AgentStateEvent]) -> (&str, &str, &serde_json::Value, &ToolCallDetail) {
+        match &events[0] {
+            AgentStateEvent::ToolStarted {
+                id,
+                name,
+                input,
+                detail,
+                ..
+            } => (
+                id,
+                name,
+                input,
+                detail.as_deref().expect("tool start carries detail"),
+            ),
+            other => panic!("expected ToolStarted, got {other:?}"),
+        }
+    }
+
+    fn updated(events: &[AgentStateEvent]) -> (&str, &ToolCallDetail) {
+        match &events[0] {
+            AgentStateEvent::ToolUpdated { id, detail, .. } => {
+                (id, detail.as_deref().expect("tool update carries detail"))
+            }
+            other => panic!("expected ToolUpdated, got {other:?}"),
+        }
+    }
+
+    fn finished(
+        events: &[AgentStateEvent],
+    ) -> (
+        &str,
+        &str,
+        bool,
+        &Option<serde_json::Value>,
+        &ToolCallDetail,
+    ) {
+        match &events[0] {
+            AgentStateEvent::ToolFinished {
+                id,
+                name,
+                ok,
+                output,
+                detail,
+            } => (
+                id,
+                name,
+                *ok,
+                output,
+                detail.as_deref().expect("tool finish carries detail"),
+            ),
+            other => panic!("expected ToolFinished, got {other:?}"),
+        }
+    }
 
     #[test]
     fn assistant_text_is_folded_into_the_transcript_and_outcome() {
-        let transcript = Mutex::new(String::new());
-        let outcome = Mutex::new(AcpOutcome::default());
+        let harness = Harness::new();
         let update = SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
             TextContent::new("pong"),
         )));
-        let events = map_update(&update, &transcript, &outcome);
+        let events = harness.map(&update);
         assert_eq!(
             events,
             vec![AgentStateEvent::TextDelta {
@@ -872,37 +1184,438 @@ mod tests {
                 text: "pong".to_string()
             }]
         );
-        assert_eq!(&*transcript.lock(), "pong");
-        assert_eq!(outcome.lock().assistant_text, "pong");
+        assert_eq!(&*harness.transcript.lock(), "pong");
+        assert_eq!(harness.outcome.lock().assistant_text, "pong");
     }
 
     #[test]
-    fn tool_updates_report_start_and_finish_with_failure_counts() {
-        let transcript = Mutex::new(String::new());
-        let outcome = Mutex::new(AcpOutcome::default());
+    fn tool_start_preserves_kind_status_title_input_output_content_and_locations() {
+        let harness = Harness::new();
         let call = SessionUpdate::ToolCall(
-            ToolCall::new(ToolCallId::new("call_1"), "write hello.txt")
-                .name("write")
-                .raw_input(serde_json::json!({ "path": "hello.txt" })),
+            ToolCall::new(
+                agent_client_protocol::v1::schema::ToolCallId::new("call_1"),
+                "Run tests",
+            )
+            .name("bash")
+            .kind(AcpToolKind::Execute)
+            .status(AcpToolCallStatus::InProgress)
+            .raw_input(serde_json::json!({ "command": "cargo test" }))
+            .raw_output(serde_json::json!({ "exit": 0 }))
+            .content(vec![
+                AcpToolCallContent::Content(Content::new(ContentBlock::Text(TextContent::new(
+                    "done",
+                )))),
+                AcpToolCallContent::Diff(Diff::new("src/lib.rs", "new body").old_text("old body")),
+                AcpToolCallContent::Terminal(Terminal::new("term_1")),
+            ])
+            .locations(vec![ToolCallLocation::new("src/lib.rs").line(7)]),
         );
-        let started = map_update(&call, &transcript, &outcome);
+        let events = harness.map(&call);
+        let (id, name, input, detail) = started(&events);
+        assert_eq!(id, "call_1");
+        assert_eq!(name, "bash");
+        assert_eq!(input, &serde_json::json!({ "command": "cargo test" }));
+        assert_eq!(detail.name.as_deref(), Some("bash"));
+        assert_eq!(detail.title.as_deref(), Some("Run tests"));
+        assert_eq!(detail.kind, Some(ToolKind::Execute));
+        assert_eq!(detail.status, Some(ToolCallStatus::InProgress));
+        assert_eq!(
+            detail.input,
+            Some(serde_json::json!({ "command": "cargo test" }))
+        );
+        assert_eq!(detail.output, Some(serde_json::json!({ "exit": 0 })));
+        assert_eq!(
+            detail.locations,
+            vec![ToolLocation {
+                path: "src/lib.rs".to_string(),
+                line: Some(7)
+            }]
+        );
         assert!(matches!(
-            &started[0],
-            AgentStateEvent::ToolStarted { id, name, .. } if id == "call_1" && name == "write"
+            &detail.content[0],
+            ToolContent::Text { text } if text == "done"
+        ));
+        assert!(matches!(
+            &detail.content[1],
+            ToolContent::Diff { path, old_text, new_text }
+                if path == "src/lib.rs" && old_text.as_deref() == Some("old body") && new_text == "new body"
+        ));
+        assert!(matches!(
+            &detail.content[2],
+            ToolContent::Terminal { terminal_id } if terminal_id == "term_1"
+        ));
+        assert_eq!(harness.outcome.lock().tool_calls, 1);
+        assert_eq!(harness.outcome.lock().failed_tools, 0);
+    }
+
+    #[test]
+    fn title_only_start_falls_back_to_title_and_stays_sparse() {
+        let harness = Harness::new();
+        let call = SessionUpdate::ToolCall(ToolCall::new(
+            agent_client_protocol::v1::schema::ToolCallId::new("call_1"),
+            "Read a file",
+        ));
+        let events = harness.map(&call);
+        let (id, name, input, detail) = started(&events);
+        assert_eq!(id, "call_1");
+        assert_eq!(name, "Read a file");
+        assert_eq!(input, &serde_json::Value::Null);
+        assert_eq!(detail.name, None);
+        assert_eq!(detail.title.as_deref(), Some("Read a file"));
+        assert_eq!(detail.kind, Some(ToolKind::Other));
+        assert_eq!(detail.status, Some(ToolCallStatus::Pending));
+        assert_eq!(detail.input, None);
+        assert!(detail.content.is_empty());
+        assert!(detail.locations.is_empty());
+        assert_eq!(harness.outcome.lock().tool_calls, 1);
+    }
+
+    #[test]
+    fn sparse_update_keeps_prior_input_metadata_and_content() {
+        let harness = Harness::new();
+        let call = SessionUpdate::ToolCall(
+            ToolCall::new(
+                agent_client_protocol::v1::schema::ToolCallId::new("call_1"),
+                "Read a",
+            )
+            .name("read")
+            .kind(AcpToolKind::Read)
+            .raw_input(serde_json::json!({ "path": "a" }))
+            .content(vec![AcpToolCallContent::Content(Content::new(
+                ContentBlock::Text(TextContent::new("first")),
+            ))]),
+        );
+        harness.map(&call);
+
+        let events = harness.map(&update(
+            ToolCallUpdateFields::default()
+                .title("Reading a")
+                .status(AcpToolCallStatus::InProgress),
+        ));
+        let (id, detail) = updated(&events);
+        assert_eq!(id, "call_1");
+        assert_eq!(detail.name.as_deref(), Some("read"));
+        assert_eq!(detail.title.as_deref(), Some("Reading a"));
+        assert_eq!(detail.kind, Some(ToolKind::Read));
+        assert_eq!(detail.status, Some(ToolCallStatus::InProgress));
+        assert_eq!(detail.input, Some(serde_json::json!({ "path": "a" })));
+        assert!(matches!(
+            &detail.content[0],
+            ToolContent::Text { text } if text == "first"
+        ));
+        assert_eq!(harness.outcome.lock().tool_calls, 1);
+        assert_eq!(harness.outcome.lock().failed_tools, 0);
+    }
+
+    #[test]
+    fn streaming_update_exposes_partial_output_without_finishing() {
+        let harness = Harness::new();
+        harness.map(&SessionUpdate::ToolCall(
+            ToolCall::new(
+                agent_client_protocol::v1::schema::ToolCallId::new("call_1"),
+                "Bash",
+            )
+            .name("bash"),
         ));
 
-        let failed =
-            SessionUpdate::ToolCallUpdate(agent_client_protocol::v1::schema::ToolCallUpdate::new(
-                ToolCallId::new("call_1"),
-                ToolCallUpdateFields::default().status(ToolCallStatus::Failed),
-            ));
-        let finished = map_update(&failed, &transcript, &outcome);
-        assert!(matches!(
-            &finished[0],
-            AgentStateEvent::ToolFinished { ok: false, .. }
+        let events = harness.map(&update(
+            ToolCallUpdateFields::default()
+                .status(AcpToolCallStatus::InProgress)
+                .raw_output(serde_json::json!({ "chunk": "a" }))
+                .locations(vec![ToolCallLocation::new("a.txt").line(1)]),
         ));
-        assert_eq!(outcome.lock().failed_tools, 1);
-        assert_eq!(outcome.lock().tool_calls, 1);
+        let (id, detail) = updated(&events);
+        assert_eq!(id, "call_1");
+        assert_eq!(detail.status, Some(ToolCallStatus::InProgress));
+        assert_eq!(detail.output, Some(serde_json::json!({ "chunk": "a" })));
+        assert_eq!(
+            detail.locations,
+            vec![ToolLocation {
+                path: "a.txt".to_string(),
+                line: Some(1)
+            }]
+        );
+        assert_eq!(harness.outcome.lock().failed_tools, 0);
+
+        // A later update replaces (never merges) the locations collection.
+        let replaced = harness.map(&update(
+            ToolCallUpdateFields::default().locations(vec![ToolCallLocation::new("b.txt")]),
+        ));
+        assert_eq!(
+            updated(&replaced).1.locations,
+            vec![ToolLocation {
+                path: "b.txt".to_string(),
+                line: None
+            }]
+        );
+    }
+
+    #[test]
+    fn empty_content_update_clears_but_absent_content_keeps_it() {
+        let harness = Harness::new();
+        let call = SessionUpdate::ToolCall(
+            ToolCall::new(
+                agent_client_protocol::v1::schema::ToolCallId::new("call_1"),
+                "Read a",
+            )
+            .content(vec![AcpToolCallContent::Content(Content::new(
+                ContentBlock::Text(TextContent::new("first")),
+            ))]),
+        );
+        harness.map(&call);
+
+        let kept = harness.map(&update(ToolCallUpdateFields::default().title("renamed")));
+        assert_eq!(updated(&kept).1.content.len(), 1);
+
+        let cleared = harness.map(&update(ToolCallUpdateFields::default().content(Vec::new())));
+        assert!(updated(&cleared).1.content.is_empty());
+    }
+
+    #[test]
+    fn status_only_completion_keeps_start_name_and_output() {
+        let harness = Harness::new();
+        let call = SessionUpdate::ToolCall(
+            ToolCall::new(
+                agent_client_protocol::v1::schema::ToolCallId::new("call_1"),
+                "Write hello",
+            )
+            .name("write")
+            .raw_output(serde_json::json!({ "bytes": 5 })),
+        );
+        harness.map(&call);
+
+        let events = harness.map(&update(
+            ToolCallUpdateFields::default().status(AcpToolCallStatus::Completed),
+        ));
+        let (id, name, ok, output, detail) = finished(&events);
+        assert_eq!(id, "call_1");
+        assert_eq!(name, "write");
+        assert!(ok);
+        assert_eq!(output, &Some(serde_json::json!({ "bytes": 5 })));
+        assert_eq!(detail.status, Some(ToolCallStatus::Completed));
+        assert_eq!(detail.output, Some(serde_json::json!({ "bytes": 5 })));
+    }
+
+    #[test]
+    fn completion_preserves_diff_terminal_and_resource_metadata() {
+        let harness = Harness::new();
+        harness.map(&SessionUpdate::ToolCall(ToolCall::new(
+            agent_client_protocol::v1::schema::ToolCallId::new("call_1"),
+            "Edit",
+        )));
+
+        let events = harness.map(&update(
+            ToolCallUpdateFields::default()
+                .status(AcpToolCallStatus::Completed)
+                .content(vec![
+                    AcpToolCallContent::Diff(Diff::new("/tmp/a.rs", "new").old_text("old")),
+                    AcpToolCallContent::Terminal(Terminal::new("term_9")),
+                    AcpToolCallContent::Content(Content::new(ContentBlock::Image(
+                        ImageContent::new("base64-payload", "image/png").uri("file:///tmp/a.png"),
+                    ))),
+                    AcpToolCallContent::Content(Content::new(ContentBlock::Resource(
+                        agent_client_protocol::v1::schema::EmbeddedResource::new(
+                            EmbeddedResourceResource::TextResourceContents(
+                                TextResourceContents::new("body", "file:///tmp/a.txt"),
+                            ),
+                        ),
+                    ))),
+                ]),
+        ));
+        let (_, _, ok, _, detail) = finished(&events);
+        assert!(ok);
+        assert_eq!(detail.content.len(), 4);
+        assert!(matches!(
+            &detail.content[0],
+            ToolContent::Diff { path, old_text, new_text }
+                if path == "/tmp/a.rs" && old_text.as_deref() == Some("old") && new_text == "new"
+        ));
+        assert!(matches!(
+            &detail.content[1],
+            ToolContent::Terminal { terminal_id } if terminal_id == "term_9"
+        ));
+        // Binary payloads are metadata-only; the base64 body is never forwarded.
+        assert!(matches!(
+            &detail.content[2],
+            ToolContent::Image { mime_type, uri }
+                if mime_type == "image/png" && uri.as_deref() == Some("file:///tmp/a.png")
+        ));
+        assert!(matches!(
+            &detail.content[3],
+            ToolContent::Resource { uri, text, binary, .. }
+                if uri == "file:///tmp/a.txt" && text.as_deref() == Some("body") && !binary
+        ));
+    }
+
+    #[test]
+    fn interleaved_tool_ids_do_not_cross_talk() {
+        let harness = Harness::new();
+        harness.map(&SessionUpdate::ToolCall(
+            ToolCall::new(
+                agent_client_protocol::v1::schema::ToolCallId::new("c1"),
+                "Read a",
+            )
+            .name("read")
+            .raw_input(serde_json::json!({ "path": "a" })),
+        ));
+        harness.map(&SessionUpdate::ToolCall(
+            ToolCall::new(
+                agent_client_protocol::v1::schema::ToolCallId::new("c2"),
+                "Write b",
+            )
+            .name("write")
+            .raw_input(serde_json::json!({ "path": "b" })),
+        ));
+
+        let update_c2 = harness.map(&SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            agent_client_protocol::v1::schema::ToolCallId::new("c2"),
+            ToolCallUpdateFields::default()
+                .title("Writing b")
+                .raw_output(serde_json::json!({ "bytes": 1 })),
+        )));
+        assert_eq!(updated(&update_c2).0, "c2");
+        assert_eq!(
+            updated(&update_c2).1.input,
+            Some(serde_json::json!({ "path": "b" }))
+        );
+
+        let finish_c1 = harness.map(&SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            agent_client_protocol::v1::schema::ToolCallId::new("c1"),
+            ToolCallUpdateFields::default()
+                .status(AcpToolCallStatus::Completed)
+                .raw_output(serde_json::json!({ "text": "contents" })),
+        )));
+        let (id, name, ok, output, detail) = finished(&finish_c1);
+        assert_eq!(id, "c1");
+        assert_eq!(name, "read");
+        assert!(ok);
+        assert_eq!(output, &Some(serde_json::json!({ "text": "contents" })));
+        assert_eq!(detail.input, Some(serde_json::json!({ "path": "a" })));
+
+        let finish_c2 = harness.map(&SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            agent_client_protocol::v1::schema::ToolCallId::new("c2"),
+            ToolCallUpdateFields::default().status(AcpToolCallStatus::Failed),
+        )));
+        let (id, name, ok, output, detail) = finished(&finish_c2);
+        assert_eq!(id, "c2");
+        assert_eq!(name, "write");
+        assert!(!ok);
+        assert_eq!(output, &Some(serde_json::json!({ "bytes": 1 })));
+        assert_eq!(detail.title.as_deref(), Some("Writing b"));
+        assert_eq!(harness.outcome.lock().tool_calls, 2);
+        assert_eq!(harness.outcome.lock().failed_tools, 1);
+    }
+
+    #[test]
+    fn finish_before_start_is_correlated_and_not_reset_by_the_late_start() {
+        let harness = Harness::new();
+        let early = harness.map(&update(
+            ToolCallUpdateFields::default()
+                .title("Run tests")
+                .status(AcpToolCallStatus::Completed)
+                .raw_output(serde_json::json!("ok"))
+                .content(vec![AcpToolCallContent::Content(Content::new(
+                    ContentBlock::Text(TextContent::new("ok")),
+                ))]),
+        ));
+        let (id, name, ok, output, detail) = finished(&early);
+        assert_eq!(id, "call_1");
+        assert_eq!(name, "Run tests");
+        assert!(ok);
+        assert_eq!(output, &Some(serde_json::json!("ok")));
+        assert_eq!(detail.status, Some(ToolCallStatus::Completed));
+        assert_eq!(harness.outcome.lock().tool_calls, 1);
+
+        let late = harness.map(&SessionUpdate::ToolCall(
+            ToolCall::new(
+                agent_client_protocol::v1::schema::ToolCallId::new("call_1"),
+                "cargo test",
+            )
+            .name("bash")
+            .raw_input(serde_json::json!({ "command": "cargo test" })),
+        ));
+        let (_, name, input, detail) = started(&late);
+        assert_eq!(name, "bash");
+        assert_eq!(input, &serde_json::json!({ "command": "cargo test" }));
+        // The late start must not downgrade the terminal status or erase output.
+        assert_eq!(detail.status, Some(ToolCallStatus::Completed));
+        assert_eq!(detail.output, Some(serde_json::json!("ok")));
+        assert_eq!(detail.title.as_deref(), Some("cargo test"));
+        assert_eq!(harness.outcome.lock().tool_calls, 1);
+        assert_eq!(harness.outcome.lock().failed_tools, 0);
+    }
+
+    #[test]
+    fn a_late_start_does_not_downgrade_an_in_progress_status() {
+        let harness = Harness::new();
+        harness.map(&update(
+            ToolCallUpdateFields::default().status(AcpToolCallStatus::InProgress),
+        ));
+        let late = harness.map(&SessionUpdate::ToolCall(ToolCall::new(
+            agent_client_protocol::v1::schema::ToolCallId::new("call_1"),
+            "Read",
+        )));
+        assert_eq!(started(&late).3.status, Some(ToolCallStatus::InProgress));
+        assert_eq!(harness.outcome.lock().tool_calls, 1);
+    }
+
+    #[test]
+    fn input_from_an_early_update_survives_a_later_start() {
+        let harness = Harness::new();
+        let early = harness.map(&update(
+            ToolCallUpdateFields::default().raw_input(serde_json::json!({ "path": "early" })),
+        ));
+        assert_eq!(
+            updated(&early).1.input,
+            Some(serde_json::json!({ "path": "early" }))
+        );
+
+        let late = harness.map(&SessionUpdate::ToolCall(ToolCall::new(
+            agent_client_protocol::v1::schema::ToolCallId::new("call_1"),
+            "Read",
+        )));
+        let (_, _, input, detail) = started(&late);
+        assert_eq!(input, &serde_json::json!({ "path": "early" }));
+        assert_eq!(detail.input, Some(serde_json::json!({ "path": "early" })));
+        assert_eq!(harness.outcome.lock().tool_calls, 1);
+    }
+
+    #[test]
+    fn duplicate_starts_and_failures_are_counted_once() {
+        let harness = Harness::new();
+        let call = SessionUpdate::ToolCall(
+            ToolCall::new(
+                agent_client_protocol::v1::schema::ToolCallId::new("call_1"),
+                "Write",
+            )
+            .name("write"),
+        );
+        harness.map(&call);
+        harness.map(&call);
+        let failed = update(ToolCallUpdateFields::default().status(AcpToolCallStatus::Failed));
+        harness.map(&failed);
+        harness.map(&failed);
+
+        assert_eq!(harness.outcome.lock().tool_calls, 1);
+        assert_eq!(harness.outcome.lock().failed_tools, 1);
+    }
+
+    #[test]
+    fn initial_failed_start_is_counted_as_one_failed_call() {
+        let harness = Harness::new();
+        let call = SessionUpdate::ToolCall(
+            ToolCall::new(
+                agent_client_protocol::v1::schema::ToolCallId::new("call_1"),
+                "Write",
+            )
+            .name("write")
+            .status(AcpToolCallStatus::Failed),
+        );
+        let events = harness.map(&call);
+        assert_eq!(started(&events).3.status, Some(ToolCallStatus::Failed));
+        harness.map(&call);
+        assert_eq!(harness.outcome.lock().tool_calls, 1);
+        assert_eq!(harness.outcome.lock().failed_tools, 1);
     }
 
     #[tokio::test]

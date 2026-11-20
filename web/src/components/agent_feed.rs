@@ -263,14 +263,16 @@ pub fn feed_item(event: &AgentStateEvent) -> Option<FeedItem> {
             // run and clears the flag on the event that closes it.
             streaming: true,
         }),
-        AgentStateEvent::ToolStarted { id, name, input } => Some(FeedItem::Tool {
+        AgentStateEvent::ToolStarted {
+            id, name, input, ..
+        } => Some(FeedItem::Tool {
             id: id.clone(),
             name: name.clone(),
             input: input.clone(),
             status: ToolStatus::Running,
             output: None,
         }),
-        AgentStateEvent::ToolUpdated { id, partial } => Some(FeedItem::Tool {
+        AgentStateEvent::ToolUpdated { id, partial, .. } => Some(FeedItem::Tool {
             id: id.clone(),
             name: String::new(),
             input: serde_json::Value::Null,
@@ -282,6 +284,7 @@ pub fn feed_item(event: &AgentStateEvent) -> Option<FeedItem> {
             name,
             ok,
             output,
+            ..
         } => Some(FeedItem::Tool {
             id: id.clone(),
             name: name.clone(),
@@ -340,7 +343,9 @@ pub fn build_feed(events: &[AgentEventPush]) -> Vec<FeedItem> {
                     streaming: true,
                 }),
             },
-            AgentStateEvent::ToolStarted { id, name, input } => {
+            AgentStateEvent::ToolStarted {
+                id, name, input, ..
+            } => {
                 tools.insert(id.clone(), items.len());
                 items.push(FeedItem::Tool {
                     id: id.clone(),
@@ -350,7 +355,7 @@ pub fn build_feed(events: &[AgentEventPush]) -> Vec<FeedItem> {
                     output: None,
                 });
             }
-            AgentStateEvent::ToolUpdated { id, partial } => {
+            AgentStateEvent::ToolUpdated { id, partial, .. } => {
                 if let Some(&index) = tools.get(id) {
                     if let FeedItem::Tool { output, .. } = &mut items[index] {
                         *output = Some(partial.clone());
@@ -371,6 +376,7 @@ pub fn build_feed(events: &[AgentEventPush]) -> Vec<FeedItem> {
                 name,
                 ok,
                 output,
+                ..
             } => {
                 let status = if *ok {
                     ToolStatus::Ok
@@ -937,6 +943,7 @@ mod tests {
                 id: "c1".to_string(),
                 name: "read".to_string(),
                 input: serde_json::json!({}),
+                detail: None,
             }),
             Some(FeedItem::Tool {
                 status: ToolStatus::Running,
@@ -947,6 +954,7 @@ mod tests {
             feed_item(&AgentStateEvent::ToolUpdated {
                 id: "c1".to_string(),
                 partial: serde_json::json!("x"),
+                detail: None,
             }),
             Some(FeedItem::Tool {
                 status: ToolStatus::Running,
@@ -959,6 +967,7 @@ mod tests {
                 name: "read".to_string(),
                 ok: false,
                 output: None,
+                detail: None,
             }),
             Some(FeedItem::Tool {
                 status: ToolStatus::Error,
@@ -1025,6 +1034,7 @@ mod tests {
                     id: "c1".to_string(),
                     name: "read".to_string(),
                     input: serde_json::json!({ "path": "a" }),
+                    detail: None,
                 },
             ),
             push(
@@ -1032,6 +1042,7 @@ mod tests {
                 AgentStateEvent::ToolUpdated {
                     id: "c1".to_string(),
                     partial: serde_json::json!("partial"),
+                    detail: None,
                 },
             ),
             push(
@@ -1041,6 +1052,7 @@ mod tests {
                     name: "read".to_string(),
                     ok: true,
                     output: Some(serde_json::json!("done")),
+                    detail: None,
                 },
             ),
         ];
@@ -1188,6 +1200,7 @@ mod tests {
                     input: serde_json::json!({ "path": "a" }),
                     ok: true,
                     output: Some(serde_json::json!("contents")),
+                    detail: None,
                 },
                 ToolCall {
                     id: "c2".to_string(),
@@ -1195,6 +1208,7 @@ mod tests {
                     input: serde_json::json!("rm -rf /"),
                     ok: false,
                     output: None,
+                    detail: None,
                 },
             ],
             usage: AgentUsage {
