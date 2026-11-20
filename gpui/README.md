@@ -207,7 +207,10 @@ Deviations from the plan are recorded in this file as the chain progresses
   and Backspace through GPUI key events (`key_char`); full IME marked-text
   handling via `EntityInputHandler` is still deferred.
 - **Live RPC check.** The typed `tasks.cancel` / `tasks.retry` request encoding
-  is unit-tested, and both endpoints were exercised against the running daemon
-  with an unknown id: they return structured RPC errors, the path that drives
-  the toast and rollback. A real cancel/retry exercise is part of the step-11
-  live smoke run.
+  is unit-tested. Against the running daemon, an unknown id returns a structured
+  RPC error (the path behind the toast and rollback), and a scratch
+  unknown-name task exercised both success paths: `tasks.retry` returned it to
+  `pending`, and `tasks.cancel` then returned it `cancelled`.
+- **Selection stays visible.** The Tasks list scrolls the highlight into view
+  when ↑/↓, Home/End or PageUp/PageDown move it, without fighting a manual
+  scroll (the scroll target only changes when the selected id does).
