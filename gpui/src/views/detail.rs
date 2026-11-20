@@ -19,7 +19,7 @@ use chrono::Utc;
 use favetto_wire::model::{AgentUsage, InputReply, MessageRole, Task, TaskRun};
 use gpui::{
     div, prelude::*, px, AnyElement, Context, Div, Entity, FocusHandle, Hsla, IntoElement, Render,
-    ScrollDelta, ScrollHandle, ScrollWheelEvent, Stateful, Window,
+    ScrollHandle, ScrollWheelEvent, Stateful, Window,
 };
 
 use crate::components;
@@ -117,74 +117,45 @@ impl DetailView {
         .detach();
     }
 
-    fn pause_follow(&mut self, cx: &mut Context<Self>) {
-        if self.state.read(cx).detail_follow() {
-            self.state.update(cx, |state, cx| {
-                state.set_detail_follow(false);
-                cx.notify();
+    /// Settle the follow state from the post-scroll viewport.
+    ///
+    /// The check is deferred to the end of the effect cycle, after the scroll
+    /// container has applied the wheel delta, so it is independent of the
+    /// platform's wheel direction and of listener ordering. It also catches
+    /// scrollbar drags and keyboard scrolling, which never emit a wheel event.
+    fn sync_follow(&self, handle: ScrollHandle, cx: &mut Context<Self>) {
+        let state = self.state.clone();
+        cx.defer(move |cx| {
+            let at_bottom = at_bottom(&handle);
+            state.update(cx, |state, cx| {
+                let follow = state.detail_follow();
+                if at_bottom && !follow {
+                    state.set_detail_follow(true);
+                    cx.notify();
+                } else if !at_bottom && follow {
+                    state.set_detail_follow(false);
+                    cx.notify();
+                }
             });
-        }
-    }
-
-    /// Pause following if a render finds the viewport off the tail. This catches
-    /// scrollbar drags and scroll keys, which do not emit a wheel event.
-    fn watch_bottom(&self, handle: ScrollHandle, cx: &mut Context<Self>) {
-        let state = self.state.clone();
-        cx.defer(move |cx| {
-            if !at_bottom(&handle) {
-                state.update(cx, |state, cx| {
-                    if state.detail_follow() {
-                        state.set_detail_follow(false);
-                        cx.notify();
-                    }
-                });
-            }
-        });
-    }
-
-    /// Re-arm following when a downward wheel comes to rest at the bottom.
-    fn resume_if_at_bottom(&self, handle: ScrollHandle, cx: &mut Context<Self>) {
-        let state = self.state.clone();
-        cx.defer(move |cx| {
-            if at_bottom(&handle) {
-                state.update(cx, |state, cx| {
-                    if !state.detail_follow() {
-                        state.set_detail_follow(true);
-                        cx.notify();
-                    }
-                });
-            }
         });
     }
 
     fn on_events_wheel(
         &mut self,
-        event: &ScrollWheelEvent,
+        _event: &ScrollWheelEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if scrolled_up(event.delta) {
-            if f32::from(self.events_scroll.max_offset().height) > 0.0 {
-                self.pause_follow(cx);
-            }
-        } else {
-            self.resume_if_at_bottom(self.events_scroll.clone(), cx);
-        }
+        self.sync_follow(self.events_scroll.clone(), cx);
     }
 
     fn on_output_wheel(
         &mut self,
-        event: &ScrollWheelEvent,
+        _event: &ScrollWheelEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if scrolled_up(event.delta) {
-            if f32::from(self.output_scroll.max_offset().height) > 0.0 {
-                self.pause_follow(cx);
-            }
-        } else {
-            self.resume_if_at_bottom(self.output_scroll.clone(), cx);
-        }
+        self.sync_follow(self.output_scroll.clone(), cx);
     }
 
     fn follow_toggle(&self, theme: &Theme, follow: bool, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -1001,7 +972,7 @@ impl DetailView {
             self.output_scroll.scroll_to_bottom();
         }
         self.output_rendered = text.len();
-        self.watch_bottom(self.output_scroll.clone(), cx);
+        self.sync_follow(self.output_scroll.clone(), cx);
 
         div()
             .id("detail-output-scroll")
@@ -1101,7 +1072,7 @@ impl DetailView {
             self.events_scroll.scroll_to_bottom();
         }
         self.events_rendered = event_count;
-        self.watch_bottom(self.events_scroll.clone(), cx);
+        self.sync_follow(self.events_scroll.clone(), cx);
 
         let pill = (new_events > 0).then(|| {
             components::with_focus(
@@ -1890,31 +1861,9 @@ fn at_bottom(scroll: &ScrollHandle) -> bool {
     offset >= max - FOLLOW_THRESHOLD
 }
 
-/// Whether a wheel/trackpad delta moves content up (the user is scrolling back).
-fn scrolled_up(delta: ScrollDelta) -> bool {
-    match delta {
-        ScrollDelta::Pixels(point) => f32::from(point.y) > 0.0,
-        ScrollDelta::Lines(point) => point.y > 0.0,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn wheel_direction_maps_to_scrolling_up() {
-        assert!(scrolled_up(ScrollDelta::Lines(gpui::point(0.0, 2.0))));
-        assert!(!scrolled_up(ScrollDelta::Lines(gpui::point(0.0, -2.0))));
-        assert!(scrolled_up(ScrollDelta::Pixels(gpui::point(
-            px(0.0),
-            px(30.0)
-        ))));
-        assert!(!scrolled_up(ScrollDelta::Pixels(gpui::point(
-            px(0.0),
-            px(-30.0)
-        ))));
-    }
 
     #[test]
     fn every_route_has_detail_copy() {
