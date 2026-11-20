@@ -344,6 +344,14 @@ offered: `task_finished` is the single completion signal, so subscribing to it
 never double-notifies alongside `task_completed` / `task_failed`. The selection
 is persisted locally and restored on restart.
 
+**Settings → Agent sessions** lists the ACP sessions Favetto created
+(`agents.history`) with their title, agent, directory, update time and lifecycle.
+An ended, loadable row has a **Load** button that requests `agents.load` with the
+Favetto-local session id; loading, ready, failed and cannot-load states are shown
+inline. This restores the provider's own conversation and never starts a fresh
+session. Sessions created outside Favetto are not imported: ACP `session/list`
+is not implemented.
+
 ### Soft keyboard
 
 The soft keyboard overlays the WebView instead of resizing it. Focusing a field

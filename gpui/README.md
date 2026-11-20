@@ -170,7 +170,11 @@ connection** runs `system.ping` against the draft and reports the round-trip
 latency and daemon cwd, or the exact transport error. **Save** rewrites
 `gpui.toml` and restarts the transport; **Use defaults** restores
 `http://127.0.0.1:7878` and the shared token file. **Agents** is the read-only
-`agents.list` roster (availability, command, `acp`/`pty` backend, live sessions).
+`agents.list` roster (availability, command, `acp`/`pty` backend, live sessions)
+plus **Past sessions** from `agents.history`: active, ended, loading, failed and
+cannot-load rows are labelled, and a loadable row restores the provider's
+conversation through `agents.load` by Favetto-local id. A load never starts a
+fresh session; progress and errors are shown inline and as a toast.
 **Appearance** switches System/Dark/Light and Comfortable/Compact live and
 persists both. **About** shows the client version, daemon cwd, endpoint, config
 path and a docs link, and states that no telemetry is collected.
@@ -552,7 +556,7 @@ under keyboard-only use, failure, long lists and reduced-motion preferences.
 | Catalog | skeleton | no definitions vs no search matches | full error panel / banner + preview error with **Copy error** + Retry |
 | Workflows | root-list skeleton + inspect skeleton | no roots vs root without instances | root-list error and inspect error with **Copy error** + Retry; a stale snapshot keeps the older roots |
 | Schedules | skeleton | empty trigger state | table error panel / banner + **Copy error** + Retry; sheet and delete rejections stay attached and copyable |
-| Settings | agent roster loading line | explicit no-agents copy | connection pill + token path, reconnect/copyable connection notice, roster error with Retry, copyable test/save errors |
+| Settings | agent roster/session-history loading line | explicit no-agents / no-persisted-sessions copy | connection pill + token path, reconnect/copyable connection notice, roster error with Retry, copyable test/save errors; past-session load failures stay inline and retryable |
 
 No view renders a bare network error or a blank panel: each failure has a title,
 the daemon/transport message, a next action and a copy control. Network and

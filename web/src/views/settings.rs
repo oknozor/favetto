@@ -11,9 +11,12 @@
 //! `/pair`.
 
 use dioxus::prelude::*;
-use favetto_wire::model::{EventKind, NotificationRecord};
+use favetto_wire::model::{
+    AgentSessionHistoryEntry, AgentSessionState, EventKind, NotificationRecord,
+};
 use favetto_wire::rpc::{
-    HookUpsertParams, NotificationTestParams, NotificationsListParams, PingParams,
+    AgentsHistoryParams, HookUpsertParams, NotificationTestParams, NotificationsListParams,
+    PingParams, SessionIdParams,
 };
 
 use crate::app::Route;
@@ -133,6 +136,7 @@ pub fn Settings() -> Element {
         main { id: "favetto-app", class: "settings-view",
             h1 { "Settings" }
             SessionSection {}
+            AgentSessionsSection {}
             AppNotificationsSection {}
             NotificationsSection {}
             HooksSection {}
@@ -197,6 +201,206 @@ fn SessionSection() -> Element {
                 "Disconnect"
             }
         }
+    }
+}
+
+/// Favetto-created ACP sessions and loading a past one by its local id.
+///
+/// The daemon owns the durable session store; this card consumes
+/// `agents.history` and asks for `agents.load` by Favetto-local id. A failed or
+/// unsupported restore is shown inline and never starts a fresh session.
+#[component]
+fn AgentSessionsSection() -> Element {
+    let state = use_context::<AppState>();
+    let reload = use_signal(|| 0u64);
+    let mut busy = use_signal(|| Option::<String>::None);
+    // `(local id, ok, message)` for the most recent load on this page.
+    let mut outcome = use_signal(|| Option::<(String, bool, String)>::None);
+
+    let history = use_resource(move || {
+        let base = (state.daemon_url)();
+        let token = (state.token)();
+        let _ = reload();
+        async move {
+            RpcClient::new(base)
+                .with_token(token)
+                .agents_history(AgentsHistoryParams { limit: Some(50) })
+                .await
+                .map_err(|err| err.to_string())
+        }
+    });
+
+    let rows: Vec<AgentSessionHistoryEntry> = match history() {
+        Some(Ok(list)) => list,
+        _ => Vec::new(),
+    };
+
+    rsx! {
+        section { class: "settings-section",
+            h2 { "Agent sessions" }
+            p { class: "settings-hint",
+                "These are ACP sessions Favetto created. Loading a past session restores the agent's own conversation by Favetto-local id; it never starts a new session. Sessions created outside Favetto are not imported (ACP session/list is not implemented)."
+            }
+            match history() {
+                None => rsx! { p { class: "loading", "Loading session history…" } },
+                Some(Err(err)) => rsx! {
+                    div { class: "error-panel", "Could not load session history: {err}" }
+                },
+                Some(Ok(_)) => rsx! {
+                    if rows.is_empty() {
+                        p { class: "empty-state", "No persisted agent sessions yet." }
+                    } else {
+                        table { class: "settings-table",
+                            thead {
+                                tr {
+                                    th { "Session" }
+                                    th { "Agent" }
+                                    th { "Directory" }
+                                    th { "Updated" }
+                                    th { "State" }
+                                    th { "Action" }
+                                }
+                            }
+                            tbody {
+                                for entry in rows {
+                                    {
+                                        let id = entry.id.clone();
+                                        let latest = outcome();
+                                        let (row_state, detail, can_load, action) = if busy().as_deref() == Some(id.as_str()) {
+                                            ("loading".to_string(), None, false, "")
+                                        } else if let Some((outcome_id, ok, message)) = &latest {
+                                            if outcome_id == &id && *ok {
+                                                ("ready".to_string(), None, false, "")
+                                            } else if outcome_id == &id {
+                                                (
+                                                    "failed".to_string(),
+                                                    Some(message.clone()),
+                                                    entry.state == AgentSessionState::Ended && entry.loadable,
+                                                    "Retry load",
+                                                )
+                                            } else {
+                                                history_row_state(&entry)
+                                            }
+                                        } else {
+                                            history_row_state(&entry)
+                                        };
+                                        let title = entry
+                                            .title
+                                            .clone()
+                                            .unwrap_or_else(|| format!("session {}", id.chars().take(8).collect::<String>()));
+                                        let updated = entry.updated_at.format("%Y-%m-%d %H:%M").to_string();
+                                        let load_id = id.clone();
+                                        let on_load = move |_| {
+                                            busy.set(Some(load_id.clone()));
+                                            outcome.set(None);
+                                            let session_id = load_id.clone();
+                                            let mut busy = busy;
+                                            let mut outcome = outcome;
+                                            let mut reload = reload;
+                                            spawn(async move {
+                                                let result = client(state)
+                                                    .agents_load(SessionIdParams {
+                                                        session_id: session_id.clone(),
+                                                    })
+                                                    .await;
+                                                match result {
+                                                    Ok(attached) => {
+                                                        let label = attached
+                                                            .session
+                                                            .id
+                                                            .chars()
+                                                            .take(8)
+                                                            .collect::<String>();
+                                                        outcome.set(Some((
+                                                            session_id.clone(),
+                                                            true,
+                                                            format!("Restored and attached session {label}."),
+                                                        )));
+                                                    }
+                                                    Err(err) => {
+                                                        outcome.set(Some((
+                                                            session_id.clone(),
+                                                            false,
+                                                            format!("Could not load the session: {err}"),
+                                                        )));
+                                                    }
+                                                }
+                                                busy.set(None);
+                                                reload.set(reload() + 1);
+                                            });
+                                        };
+                                        rsx! {
+                                            tr { key: "{id}",
+                                                td {
+                                                    div { class: "session-title", "{title}" }
+                                                    code { class: "session-id", "{id}" }
+                                                }
+                                                td { "{entry.agent}" }
+                                                td {
+                                                    code { class: "session-cwd", "{entry.cwd.display()}" }
+                                                }
+                                                td { "{updated}" }
+                                                td {
+                                                    span {
+                                                        class: match row_state.as_str() {
+                                                            "ready" | "active" => "status-badge status-succeeded",
+                                                            "failed" | "cannot load" => "status-badge status-failed",
+                                                            _ => "status-badge",
+                                                        },
+                                                        "{row_state}"
+                                                    }
+                                                    if let Some(detail) = detail {
+                                                        div { class: "session-error", "{detail}" }
+                                                    }
+                                                }
+                                                td {
+                                                    if can_load {
+                                                        button {
+                                                            class: "btn",
+                                                            disabled: busy().is_some(),
+                                                            onclick: on_load,
+                                                            "{action}"
+                                                        }
+                                                    } else if row_state == "active" {
+                                                        span { class: "settings-hint", "live" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+            if let Some((_, ok, message)) = outcome() {
+                span {
+                    class: if ok { "settings-success" } else { "spawn-error" },
+                    role: "status",
+                    "{message}"
+                }
+            }
+        }
+    }
+}
+
+/// The inline state/action for one `agents.history` row, before any load made
+/// from this page is considered.
+fn history_row_state(
+    entry: &AgentSessionHistoryEntry,
+) -> (String, Option<String>, bool, &'static str) {
+    match entry.state {
+        AgentSessionState::Active => ("active".to_string(), None, false, ""),
+        AgentSessionState::Loading => ("loading".to_string(), None, false, ""),
+        AgentSessionState::Failed => ("failed".to_string(), entry.load_error.clone(), false, ""),
+        AgentSessionState::Ended if entry.loadable => ("ended".to_string(), None, true, "Load"),
+        AgentSessionState::Ended => (
+            "cannot load".to_string(),
+            entry.load_error.clone(),
+            false,
+            "",
+        ),
     }
 }
 
@@ -587,6 +791,67 @@ mod tests {
         assert_eq!(channel_target_label("log"), None);
         assert_eq!(channel_target_label("webhook"), Some("Webhook URL"));
         assert_eq!(channel_target_label("ntfy"), Some("Topic"));
+    }
+
+    #[test]
+    fn history_rows_distinguish_active_failed_unsupported_and_loadable() {
+        let entry = |state, loadable, error: Option<&str>| {
+            serde_json::from_value::<AgentSessionHistoryEntry>(serde_json::json!({
+                "id": "local-1",
+                "agent": "opencode",
+                "title": "Past session",
+                "cwd": "/work",
+                "state": match state {
+                    AgentSessionState::Active => "active",
+                    AgentSessionState::Loading => "loading",
+                    AgentSessionState::Ended => "ended",
+                    AgentSessionState::Failed => "failed",
+                },
+                "loadable": loadable,
+                "load_error": error,
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+            }))
+            .unwrap()
+        };
+
+        let (label, detail, can_load, action) =
+            history_row_state(&entry(AgentSessionState::Active, false, None));
+        assert_eq!(label, "active");
+        assert!(detail.is_none());
+        assert!(!can_load);
+        assert_eq!(action, "");
+
+        let (label, detail, can_load, action) =
+            history_row_state(&entry(AgentSessionState::Ended, true, None));
+        assert_eq!(label, "ended");
+        assert!(detail.is_none());
+        assert!(can_load);
+        assert_eq!(action, "Load");
+
+        let (label, detail, can_load, _) = history_row_state(&entry(
+            AgentSessionState::Failed,
+            false,
+            Some("load failed"),
+        ));
+        assert_eq!(label, "failed");
+        assert_eq!(detail.as_deref(), Some("load failed"));
+        assert!(!can_load);
+
+        let (label, detail, can_load, _) = history_row_state(&entry(
+            AgentSessionState::Ended,
+            false,
+            Some("no ACP session id"),
+        ));
+        assert_eq!(label, "cannot load");
+        assert_eq!(detail.as_deref(), Some("no ACP session id"));
+        assert!(!can_load);
+    }
+
+    #[test]
+    fn agent_sessions_section_mounts_with_state() {
+        let mut dom = VirtualDom::new(|| with_state(|| rsx! { AgentSessionsSection {} }));
+        dom.rebuild_in_place();
     }
 
     fn with_state(view: fn() -> Element) -> Element {

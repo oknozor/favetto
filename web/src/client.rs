@@ -222,6 +222,10 @@ typed_calls! {
     events_subscribe => EventsSubscribeCall,
     /// `agents.list`.
     agents_list => AgentsListCall,
+    /// `agents.history`.
+    agents_history => AgentsHistoryCall,
+    /// `agents.load`.
+    agents_load => AgentsLoadCall,
     /// `agents.start`.
     agents_start => AgentsStartCall,
     /// `agents.prompt`.
@@ -536,6 +540,36 @@ mod tests {
                     request.params["reply"],
                     serde_json::json!({ "reply": "once" })
                 );
+            }
+            other => panic!("expected a request frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_history_and_load_use_the_favetto_local_id() {
+        let bytes =
+            encode_request::<AgentsHistoryCall>(12, &AgentsHistoryParams { limit: Some(25) })
+                .unwrap();
+        let frame: Frame = rmp_serde::from_slice(&bytes).unwrap();
+        match frame {
+            Frame::Request(request) => {
+                assert_eq!(request.id, 12);
+                assert_eq!(request.method, method::AGENTS_HISTORY);
+                assert_eq!(request.params["limit"], 25);
+            }
+            other => panic!("expected a request frame, got {other:?}"),
+        }
+
+        let params = SessionIdParams {
+            session_id: "local-past".to_string(),
+        };
+        let bytes = encode_request::<AgentsLoadCall>(13, &params).unwrap();
+        let frame: Frame = rmp_serde::from_slice(&bytes).unwrap();
+        match frame {
+            Frame::Request(request) => {
+                assert_eq!(request.id, 13);
+                assert_eq!(request.method, method::AGENTS_LOAD);
+                assert_eq!(request.params["session_id"], "local-past");
             }
             other => panic!("expected a request frame, got {other:?}"),
         }

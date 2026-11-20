@@ -12,16 +12,14 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use favetto_core::model::{
-    AgentBackend, AgentSessionInfo, FailureKind, Task, TaskStatus, UsagePeriod,
-};
+use favetto_core::model::{AgentBackend, AgentSessionInfo, FailureKind, Task, TaskStatus, UsagePeriod};
 use favetto_core::workflow::{WorkflowInspect, WorkflowState};
 
 use super::app::{
     activity_cell, cost_cell, format_activity, repo_label, table_rows_area, task_display_name,
     task_repo, token_cell, App, CatalogRow, ClickAction, ClickRegion, ConfirmPrompt, ConnState,
-    Form, ListGeometry, MenuAction, MenuEntry, Popup, ReplyPrompt, Tab, TaskPickerRow,
-    TaskVarsForm, ThemeChoice, Wizard, WizardStep,
+    Form, ListGeometry, MenuAction, MenuEntry, Popup, ReplyPrompt, SessionPickerEntry, Tab,
+    TaskPickerRow, TaskVarsForm, ThemeChoice, Wizard, WizardStep,
 };
 use super::text_buffer::TextBuffer;
 use super::theme::{RaisedLevel, Theme};
@@ -644,7 +642,7 @@ fn draw_leader_hint(frame: &mut Frame, theme: Theme) {
 fn draw_sessions_picker(
     frame: &mut Frame,
     selected: usize,
-    sessions: &[AgentSessionInfo],
+    sessions: &[SessionPickerEntry],
     theme: Theme,
 ) {
     let area = frame.area();
@@ -659,18 +657,24 @@ fn draw_sessions_picker(
             } else {
                 Style::default()
             };
-            let state = match (s.headless, s.running) {
-                (true, true) => "headless",
-                (true, false) => "headless · finished",
-                (false, true) => "running",
-                (false, false) => "stopped",
-            };
-            let task = s
-                .task_id
-                .as_deref()
-                .map(|t| format!(" · task {}", short_str(t)))
-                .unwrap_or_default();
-            let mut detail = String::new();
+            let label = s.title.as_deref().unwrap_or_else(|| {
+                if s.id.is_empty() {
+                    "untitled session"
+                } else {
+                    &s.id
+                }
+            });
+            let mut detail = format!(" · {}", s.agent);
+            if let Some(cwd) = &s.cwd {
+                detail.push_str(&format!(
+                    " · {}",
+                    truncate_ellipsis(&cwd.display().to_string(), 44)
+                ));
+            }
+            detail.push_str(&format!(" · {}", s.state_label()));
+            if s.headless {
+                detail.push_str(" · headless");
+            }
             if let Some(activity) = &s.activity {
                 detail.push_str(&format!(" · {}", format_activity(activity)));
             }
@@ -682,8 +686,11 @@ fn draw_sessions_picker(
                     detail.push_str(&format!(" · {}", cost_cell(Some(usage))));
                 }
             }
+            if let Some(reason) = &s.detail {
+                detail.push_str(&format!(" · {}", truncate_ellipsis(reason, 52)));
+            }
             ListItem::new(Line::from(Span::styled(
-                format!(" {} · {state}{task}{detail} ", s.agent),
+                format!(" {label}{detail} "),
                 style,
             )))
         })
@@ -2343,7 +2350,12 @@ fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
         app.agent_resize = Some((rows, cols));
     }
 
-    let title: Line = if app.agent_session_id.is_none() {
+    let title: Line = if let Some(loading) = &app.agent_loading {
+        Line::from(Span::styled(
+            format!(" Agent — restoring session {}… ", short_str(loading)),
+            Style::default().fg(theme.warning()),
+        ))
+    } else if app.agent_session_id.is_none() {
         Line::from(Span::raw(" Agent — no session (Enter on a task) "))
     } else {
         let name = app.agent_name.as_deref().unwrap_or("agent");
@@ -2374,8 +2386,13 @@ fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     frame.render_widget(block, area);
 
     if app.agent_session_id.is_none() || inner_area.width == 0 || inner_area.height == 0 {
+        let hint = if app.agent_loading.is_some() {
+            "Restoring the selected persisted session from the agent; its replay appears only after `session/load` succeeds."
+        } else {
+            "The embedded agent terminal appears here. Select a task and press Enter to launch the configured agent, or Ctrl+O to switch between live and past sessions."
+        };
         let hint = Paragraph::new(Line::from(Span::styled(
-            "The embedded agent terminal appears here. Select a task and press Enter to launch the configured agent, or Ctrl+O to switch between running sessions.",
+            hint,
             Style::default().fg(theme.muted()),
         )))
         .wrap(Wrap { trim: true });

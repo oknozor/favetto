@@ -248,6 +248,10 @@ typed_calls! {
     catalog_get => CatalogGetCall,
     /// `agents.list`.
     agents_list => AgentsListCall,
+    /// `agents.history`.
+    agents_history => AgentsHistoryCall,
+    /// `agents.load`.
+    agents_load => AgentsLoadCall,
     /// `agents.reply`.
     agents_reply => AgentsReplyCall,
     /// `workflow.get`.
@@ -359,6 +363,40 @@ mod tests {
                 }
                 other => panic!("expected a request frame, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn agent_history_and_load_requests_use_the_favetto_local_id() {
+        let history =
+            encode_request::<AgentsHistoryCall>(20, &AgentsHistoryParams { limit: Some(25) })
+                .expect("encode history");
+        let load = encode_request::<AgentsLoadCall>(
+            21,
+            &SessionIdParams {
+                session_id: "local-past".to_string(),
+            },
+        )
+        .expect("encode load");
+
+        let frame: Frame = rmp_serde::from_slice(&history).expect("decode history");
+        match frame {
+            Frame::Request(request) => {
+                assert_eq!(request.method, method::AGENTS_HISTORY);
+                assert_eq!(request.params["limit"], 25);
+                assert!(request.params.get("agent").is_none());
+            }
+            other => panic!("expected a request frame, got {other:?}"),
+        }
+
+        let frame: Frame = rmp_serde::from_slice(&load).expect("decode load");
+        match frame {
+            Frame::Request(request) => {
+                assert_eq!(request.method, method::AGENTS_LOAD);
+                // The routing key is the Favetto-local id, not a provider id.
+                assert_eq!(request.params["session_id"], "local-past");
+            }
+            other => panic!("expected a request frame, got {other:?}"),
         }
     }
 

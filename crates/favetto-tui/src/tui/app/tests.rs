@@ -436,8 +436,8 @@ fn ctrl_o_is_forwarded_to_captured_agent() {
 fn session_picker_attaches_the_selected_session() {
     let mut app = App::new();
     app.open_sessions(vec![
-        agent_session("a", false, true, false),
-        agent_session("b", true, true, false),
+        SessionPickerEntry::from_live(&agent_session("a", false, true, false), None),
+        SessionPickerEntry::from_live(&agent_session("b", true, true, false), None),
     ]);
     assert!(matches!(app.popup, Popup::Sessions { selected: 0, .. }));
 
@@ -447,6 +447,129 @@ fn session_picker_attaches_the_selected_session() {
         _ => panic!("expected AttachSession"),
     }
     assert!(matches!(app.popup, Popup::None));
+}
+
+/// A persisted-history fixture with the fields the picker reads.
+fn history_entry(
+    id: &str,
+    state: favetto_core::model::AgentSessionState,
+    loadable: bool,
+    error: Option<&str>,
+) -> favetto_core::model::AgentSessionHistoryEntry {
+    let now = Utc::now();
+    favetto_core::model::AgentSessionHistoryEntry {
+        id: id.to_string(),
+        agent: "opencode".to_string(),
+        title: Some("Past session".to_string()),
+        cwd: std::path::PathBuf::from("/work"),
+        task_id: None,
+        state,
+        loadable,
+        load_error: error.map(str::to_string),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+#[test]
+fn session_picker_loads_a_persisted_session_by_local_id() {
+    let mut app = App::new();
+    app.open_sessions(vec![
+        SessionPickerEntry::from_history(&history_entry(
+            "local-past",
+            favetto_core::model::AgentSessionState::Ended,
+            true,
+            None,
+        )),
+        SessionPickerEntry::from_history(&history_entry(
+            "local-unsupported",
+            favetto_core::model::AgentSessionState::Ended,
+            false,
+            Some("no ACP session id was recorded"),
+        )),
+    ]);
+
+    match app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())) {
+        UiAction::LoadSession(id) => assert_eq!(id, "local-past"),
+        _ => panic!("expected LoadSession"),
+    }
+    assert!(matches!(app.popup, Popup::None));
+}
+
+#[test]
+fn session_picker_explains_an_unloadable_past_session() {
+    let mut app = App::new();
+    app.open_sessions(vec![SessionPickerEntry::from_history(&history_entry(
+        "local-unsupported",
+        favetto_core::model::AgentSessionState::Ended,
+        false,
+        Some("no ACP session id was recorded"),
+    ))]);
+
+    assert!(matches!(
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())),
+        UiAction::None
+    ));
+    // The picker closes and the reason is visible in the status bar; no fresh
+    // session is started.
+    assert!(matches!(app.popup, Popup::None));
+    assert!(app
+        .agent_error
+        .as_deref()
+        .is_some_and(|error| error.contains("no ACP session id")));
+}
+
+#[test]
+fn session_picker_marks_failed_and_loading_rows_inert() {
+    for (state, error, needle) in [
+        (
+            favetto_core::model::AgentSessionState::Failed,
+            Some("agent could not load ACP session"),
+            "could not load",
+        ),
+        (
+            favetto_core::model::AgentSessionState::Loading,
+            None,
+            "still loading",
+        ),
+    ] {
+        let mut app = App::new();
+        app.open_sessions(vec![SessionPickerEntry::from_history(&history_entry(
+            "local-row",
+            state,
+            false,
+            error,
+        ))]);
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())),
+            UiAction::None
+        ));
+        assert!(matches!(app.popup, Popup::None));
+        assert!(
+            app.agent_error
+                .as_deref()
+                .is_some_and(|message| message.contains(needle)),
+            "{state:?}: {:?}",
+            app.agent_error
+        );
+    }
+}
+
+#[test]
+fn beginning_a_load_shows_progress_and_success_clears_it() {
+    let mut app = App::new();
+    app.begin_session_load("local-past");
+    assert_eq!(app.agent_loading.as_deref(), Some("local-past"));
+    assert_eq!(app.tab, Tab::Agent);
+    assert!(app.agent_session_id.is_none());
+
+    app.open_agent(agent_session("local-past", false, true, false), b"");
+    assert!(app.agent_loading.is_none());
+    assert_eq!(app.agent_session_id.as_deref(), Some("local-past"));
+
+    app.begin_session_load("local-other");
+    app.finish_session_load();
+    assert!(app.agent_loading.is_none());
 }
 
 #[test]

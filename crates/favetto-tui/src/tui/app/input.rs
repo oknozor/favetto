@@ -671,16 +671,32 @@ impl App {
                 UiAction::None
             }
             KeyCode::Enter => {
-                let sid = match &self.popup {
-                    Popup::Sessions { selected, sessions } => {
-                        sessions.get(*selected).map(|s| s.id.clone())
-                    }
+                let entry = match &self.popup {
+                    Popup::Sessions { selected, sessions } => sessions.get(*selected).cloned(),
                     _ => None,
                 };
-                match sid {
-                    Some(sid) => {
+                match entry {
+                    Some(entry)
+                        if matches!(
+                            entry.action,
+                            SessionPickerAction::Attach | SessionPickerAction::Load
+                        ) =>
+                    {
                         self.popup = Popup::None;
-                        UiAction::AttachSession(sid)
+                        self.agent_error = None;
+                        match entry.action {
+                            SessionPickerAction::Attach => UiAction::AttachSession(entry.id),
+                            SessionPickerAction::Load => UiAction::LoadSession(entry.id),
+                            SessionPickerAction::None => UiAction::None,
+                        }
+                    }
+                    Some(entry) => {
+                        // A loading/failed/unsupported row never falls back to a
+                        // fresh session; close the picker so the reason is visible
+                        // in the status bar.
+                        self.popup = Popup::None;
+                        self.agent_error = entry.blocked_reason();
+                        UiAction::None
                     }
                     None => UiAction::None,
                 }

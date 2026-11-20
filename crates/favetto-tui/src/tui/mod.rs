@@ -16,6 +16,7 @@ mod theme;
 mod ui;
 mod workflow_view;
 
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,8 +39,8 @@ use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 
 use favetto_core::model::{
-    AgentCatalogEntry, AgentSessionInfo, Event, NotificationRecord, RepoInfo, Schedule, Task,
-    UsageStats,
+    AgentCatalogEntry, AgentSessionHistoryEntry, AgentSessionInfo, Event, NotificationRecord,
+    RepoInfo, Schedule, Task, UsageStats,
 };
 use favetto_core::rpc::{method, ConfigValidateResult};
 use favetto_core::workflow::WorkflowInspect;
@@ -49,7 +50,9 @@ use uuid::Uuid;
 use crate::cli::TuiArgs;
 use crate::client::{normalize_ws_url, pair_http_base, Client, Transport};
 use crate::config::FavettoConfig;
-use app::{App, CatalogEntry, ConnState, Popup, UiAction, DOCS_URL};
+use app::{
+    App, CatalogEntry, ConnState, Popup, SessionPickerEntry, SessionPickerState, UiAction, DOCS_URL,
+};
 use sound::{CliSound, SoundPlayer};
 
 /// Outcome of a connected session: the user quit, or the link dropped.
@@ -876,6 +879,9 @@ async fn run_session(
                             UiAction::AttachSession(session_id) => {
                                 attach_session(client, app, session_id).await;
                             }
+                            UiAction::LoadSession(session_id) => {
+                                load_session(client, app, session_id).await;
+                            }
                             UiAction::AgentInput(bytes) => {
                                 send_agent_input(client, app, &bytes).await;
                             }
@@ -1120,10 +1126,14 @@ fn apply_agent_response(app: &mut App, resp: favetto_core::rpc::Response) {
                 .unwrap_or_default();
             match session {
                 Some(session) => app.open_agent(session, &frame),
-                None => agent_request_failed(app, "agent response", "malformed session"),
+                None => {
+                    app.finish_session_load();
+                    agent_request_failed(app, "agent response", "malformed session");
+                }
             }
         }
         None => {
+            app.finish_session_load();
             let message = resp
                 .error
                 .as_ref()
@@ -1161,24 +1171,63 @@ async fn fetch_agents(client: &Client, app: &mut App) {
     }
 }
 
-/// Fetch `agents.list` and open the Ctrl+O session picker, flattening every
-/// configured agent's live and retained sessions.
+/// Merge live `agents.list` sessions and persisted `agents.history` records into
+/// the Ctrl+O picker rows.
+///
+/// Live/retained sessions come first so they keep the existing in-process
+/// `agents.attach` behavior. Persisted rows not currently live are load targets;
+/// a row is never synthesized as a fresh session.
+fn merge_session_picker(
+    agents: Vec<AgentCatalogEntry>,
+    history: Vec<AgentSessionHistoryEntry>,
+) -> Vec<SessionPickerEntry> {
+    let titles: HashMap<String, String> = history
+        .iter()
+        .filter_map(|entry| entry.title.clone().map(|title| (entry.id.clone(), title)))
+        .collect();
+    let live: Vec<AgentSessionInfo> = agents.into_iter().flat_map(|a| a.sessions).collect();
+    let live_ids: HashSet<String> = live.iter().map(|s| s.id.clone()).collect();
+
+    let mut rows: Vec<SessionPickerEntry> = live
+        .iter()
+        .map(|session| SessionPickerEntry::from_live(session, titles.get(&session.id).cloned()))
+        .collect();
+    rows.extend(
+        history
+            .iter()
+            .filter(|entry| !live_ids.contains(&entry.id))
+            .map(SessionPickerEntry::from_history),
+    );
+    // Active sessions are the most likely target; keep their relative order and
+    // put them before past rows. Everything else keeps history's newest-first
+    // order.
+    rows.sort_by_key(|row| match row.state {
+        SessionPickerState::Active => 0,
+        SessionPickerState::Loading => 1,
+        _ => 2,
+    });
+    rows
+}
+
+/// Fetch live sessions (`agents.list`) and persisted history (`agents.history`)
+/// for the Ctrl+O picker. History is optional: an older daemon without the
+/// method still gets a working live-session picker.
 async fn fetch_sessions(client: &Client, app: &mut App) {
-    match client
+    let list = client
         .request(method::AGENTS_LIST, serde_json::json!({}))
-        .await
-    {
+        .await;
+    let history = client
+        .request(method::AGENTS_HISTORY, serde_json::json!({ "limit": 100 }))
+        .await;
+
+    let agents = match list {
         Ok(resp) => match resp.result {
             Some(v) => match serde_json::from_value::<Vec<AgentCatalogEntry>>(v) {
-                Ok(agents) => {
-                    let sessions: Vec<AgentSessionInfo> = agents
-                        .into_iter()
-                        .flat_map(|agent| agent.sessions)
-                        .collect();
-                    app.set_agent_sessions(sessions.clone());
-                    app.open_sessions(sessions);
+                Ok(agents) => agents,
+                Err(e) => {
+                    agent_request_failed(app, "agents.list", &e.to_string());
+                    return;
                 }
-                Err(e) => agent_request_failed(app, "agents.list", &e.to_string()),
             },
             None => {
                 let message = resp
@@ -1187,10 +1236,46 @@ async fn fetch_sessions(client: &Client, app: &mut App) {
                     .map(|e| e.message.clone())
                     .unwrap_or_else(|| "agents.list failed".to_string());
                 agent_request_failed(app, "agents.list", &message);
+                return;
             }
         },
-        Err(e) => agent_request_failed(app, "agents.list", &e.to_string()),
-    }
+        Err(e) => {
+            agent_request_failed(app, "agents.list", &e.to_string());
+            return;
+        }
+    };
+
+    let history = match history {
+        Ok(resp) => match resp.result {
+            Some(v) => {
+                serde_json::from_value::<Vec<AgentSessionHistoryEntry>>(v).unwrap_or_else(|e| {
+                    app.logs.push_back(format!("agents.history: {e}"));
+                    Vec::new()
+                })
+            }
+            None => {
+                // Older daemons do not know `agents.history`; the live list still
+                // works, so this is a log line rather than a blocking error.
+                if let Some(error) = resp.error {
+                    app.logs
+                        .push_back(format!("agents.history unavailable: {}", error.message));
+                }
+                Vec::new()
+            }
+        },
+        Err(e) => {
+            app.logs.push_back(format!("agents.history failed: {e}"));
+            Vec::new()
+        }
+    };
+
+    let live_sessions: Vec<AgentSessionInfo> = agents
+        .iter()
+        .flat_map(|agent| agent.sessions.iter().cloned())
+        .collect();
+    let sessions = merge_session_picker(agents, history);
+    app.set_agent_sessions(live_sessions);
+    app.open_sessions(sessions);
 }
 
 /// Fetch `agents.list` and cache every live/retained session so the Tasks table
@@ -1227,6 +1312,28 @@ async fn attach_session(client: &Client, app: &mut App, session_id: String) {
     {
         Ok(resp) => apply_agent_response(app, resp),
         Err(e) => agent_request_failed(app, "agents.attach", &e.to_string()),
+    }
+}
+
+/// Restore a persisted session by its Favetto-local id (`agents.load`).
+///
+/// The daemon resolves the provider ACP id from its durable record. A failure —
+/// including an agent that does not support `session/load` — is reported as an
+/// error; the client never falls back to starting a new session.
+async fn load_session(client: &Client, app: &mut App, session_id: String) {
+    app.begin_session_load(&session_id);
+    match client
+        .request(
+            method::AGENTS_LOAD,
+            serde_json::json!({ "session_id": session_id }),
+        )
+        .await
+    {
+        Ok(resp) => apply_agent_response(app, resp),
+        Err(e) => {
+            app.finish_session_load();
+            agent_request_failed(app, "agents.load", &e.to_string());
+        }
     }
 }
 
@@ -1794,6 +1901,60 @@ mod tests {
         .expect("daemon-backed input must not wait out the backoff");
 
         assert!(matches!(outcome, PumpOutcome::Reconnect));
+    }
+
+    #[test]
+    fn session_picker_merge_prefers_live_attach_and_lists_past_loads() {
+        let live = AgentSessionInfo {
+            id: "local-live".to_string(),
+            agent: "opencode".to_string(),
+            backend: favetto_core::model::AgentBackend::Acp,
+            task_id: None,
+            running: true,
+            headless: false,
+            session_id: None,
+            awaiting_input: None,
+            activity: None,
+            usage: None,
+            load_state: Default::default(),
+            load_error: None,
+        };
+        let agents = vec![AgentCatalogEntry {
+            name: "opencode".to_string(),
+            display_name: "OpenCode".to_string(),
+            command: "opencode".to_string(),
+            default: true,
+            available: true,
+            capabilities: Default::default(),
+            sessions: vec![live],
+        }];
+        let now = chrono::Utc::now();
+        let past = AgentSessionHistoryEntry {
+            id: "local-past".to_string(),
+            agent: "opencode".to_string(),
+            title: Some("Fix the widget".to_string()),
+            cwd: PathBuf::from("/work"),
+            task_id: None,
+            state: favetto_core::model::AgentSessionState::Ended,
+            loadable: true,
+            load_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut duplicate = past.clone();
+        duplicate.id = "local-live".to_string();
+        duplicate.title = Some("Live title".to_string());
+        duplicate.state = favetto_core::model::AgentSessionState::Active;
+
+        let rows = merge_session_picker(agents, vec![past, duplicate]);
+        assert_eq!(rows.len(), 2, "a live session is not listed twice");
+        assert_eq!(rows[0].id, "local-live");
+        assert_eq!(rows[0].title.as_deref(), Some("Live title"));
+        assert_eq!(rows[0].action, app::SessionPickerAction::Attach);
+        assert_eq!(rows[1].id, "local-past");
+        assert_eq!(rows[1].state, SessionPickerState::Ended);
+        assert_eq!(rows[1].action, app::SessionPickerAction::Load);
+        assert_eq!(rows[1].cwd.as_deref(), Some(std::path::Path::new("/work")));
     }
 
     #[test]

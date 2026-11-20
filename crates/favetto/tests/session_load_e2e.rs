@@ -331,10 +331,7 @@ async fn load_replays_history_in_order_before_it_is_ready() {
         let local = local.clone();
         tokio::spawn(async move {
             client
-                .request(
-                    method::AGENTS_START,
-                    json!({ "agent": "replay", "session_id": local }),
-                )
+                .request(method::AGENTS_LOAD, json!({ "session_id": local }))
                 .await
                 .unwrap()
         })
@@ -358,7 +355,7 @@ async fn load_replays_history_in_order_before_it_is_ready() {
     assert_eq!(during_seq, 0, "no replay events have a sequence yet");
 
     std::fs::write(daemon.root.join("replay-gate/load-release"), b"").unwrap();
-    let loaded = result(load.await.expect("load task"), method::AGENTS_START);
+    let loaded = result(load.await.expect("load task"), method::AGENTS_LOAD);
     assert_eq!(loaded["session"]["load_state"], "ready");
     assert!(
         loaded["session"].get("load_error").is_none(),
@@ -432,10 +429,7 @@ async fn failed_load_discards_its_partial_replay() {
         let local = local.clone();
         tokio::spawn(async move {
             client
-                .request(
-                    method::AGENTS_START,
-                    json!({ "agent": "replay-bad", "session_id": local }),
-                )
+                .request(method::AGENTS_LOAD, json!({ "session_id": local }))
                 .await
                 .unwrap()
         })
@@ -494,19 +488,33 @@ async fn persisted_sessions_load_only_when_the_agent_supports_it() {
     let (local, external) = start_session(&client, &pool, &daemon, "echo").await;
     close_session(&client, &pool, &local).await;
 
-    let loaded = result(
+    let history = result(
         client
-            .request(
-                method::AGENTS_START,
-                json!({
-                    "agent": "echo",
-                    "session_id": local,
-                    "cwd": "/nonexistent/favetto-load-cwd",
-                }),
-            )
+            .request(method::AGENTS_HISTORY, json!({ "limit": 10 }))
             .await
             .unwrap(),
-        method::AGENTS_START,
+        method::AGENTS_HISTORY,
+    );
+    let rows = history.as_array().expect("history rows");
+    let row = rows
+        .iter()
+        .find(|row| row["id"] == json!(local))
+        .expect("the closed session is discoverable");
+    assert_eq!(row["agent"], "echo");
+    assert_eq!(row["state"], "ended");
+    assert_eq!(row["loadable"], true);
+    assert_eq!(row["cwd"], json!(daemon.work()));
+    assert!(
+        !history.to_string().contains(&external),
+        "history must not expose the provider ACP id: {history}"
+    );
+
+    let loaded = result(
+        client
+            .request(method::AGENTS_LOAD, json!({ "session_id": local }))
+            .await
+            .unwrap(),
+        method::AGENTS_LOAD,
     );
     assert_eq!(
         loaded["session"]["id"], local,

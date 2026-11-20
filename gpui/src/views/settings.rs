@@ -11,6 +11,7 @@ use gpui::{
 };
 
 use crate::components;
+use crate::sessions::SessionRowState;
 use crate::settings::{latency_label, ConnectionTest, SettingsFocus};
 use crate::state::{ClientState, ConnectionState, SnapshotStatus};
 use crate::theme::Theme;
@@ -526,12 +527,19 @@ impl SettingsView {
     }
 
     fn agents_card(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
-        let (agents, status, has_snapshot) = {
+        let (agents, status, has_snapshot, history_rows) = {
             let state = self.state.read(cx);
+            let history = state.session_history();
+            let rows = history
+                .entries()
+                .iter()
+                .map(|entry| (entry.clone(), history.state(entry), history.can_load(entry)))
+                .collect::<Vec<_>>();
             (
                 state.agent_roster().to_vec(),
                 state.snapshot_status().clone(),
                 state.has_snapshot_data(),
+                rows,
             )
         };
         let notice: Option<Div> = match &status {
@@ -714,6 +722,150 @@ impl SettingsView {
                 .collect()
         };
 
+        let history_items: Vec<_> = if history_rows.is_empty() {
+            vec![div()
+                .text_size(px(theme.font.sm))
+                .text_color(theme.colors.muted)
+                .child(
+                    "No persisted sessions yet. Past ACP sessions created by Favetto appear here after they end.",
+                )
+                .into_any_element()]
+        } else {
+            history_rows
+                .iter()
+                .enumerate()
+                .map(|(index, (entry, row_state, can_load))| {
+                    let title = entry.title.clone().unwrap_or_else(|| {
+                        format!("session {}", &entry.id[..entry.id.len().min(8)])
+                    });
+                    let detail = row_state
+                        .detail()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| entry.cwd.display().to_string());
+                    let (dot, color) = match row_state {
+                        SessionRowState::Active => ("●", theme.colors.success),
+                        SessionRowState::Loading => ("◐", theme.colors.warning),
+                        SessionRowState::Ready => ("●", theme.colors.success),
+                        SessionRowState::Ended => ("○", theme.colors.muted),
+                        SessionRowState::Failed(_) | SessionRowState::Unsupported(_) => {
+                            ("○", theme.colors.danger)
+                        }
+                    };
+                    let action = if *can_load {
+                        let label = if matches!(row_state, SessionRowState::Failed(_)) {
+                            "Retry load"
+                        } else {
+                            "Load"
+                        };
+                        let load_id = entry.id.clone();
+                        div()
+                            .id(("settings-session-load", index))
+                            .h(px(theme.controls.min))
+                            .px(px(theme.spacing.s3))
+                            .flex()
+                            .items_center()
+                            .rounded(px(theme.radii.r8))
+                            .bg(Hsla::from(theme.colors.accent).opacity(0.16))
+                            .text_size(px(theme.font.sm))
+                            .text_color(theme.colors.accent)
+                            .cursor_pointer()
+                            .child(label)
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.state.update(cx, |state, cx| {
+                                    state.load_session(&load_id, cx);
+                                    cx.notify();
+                                });
+                            }))
+                            .into_any_element()
+                    } else {
+                        div()
+                            .text_size(px(theme.font.xs))
+                            .text_color(theme.colors.muted)
+                            .child(match row_state {
+                                SessionRowState::Active => "live".to_string(),
+                                SessionRowState::Loading => "loading…".to_string(),
+                                SessionRowState::Ready => "loaded".to_string(),
+                                _ => String::new(),
+                            })
+                            .into_any_element()
+                    };
+
+                    div()
+                        .id(("settings-session", index))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .px(px(theme.spacing.s2))
+                        .py(px(theme.spacing.s1))
+                        .border_b_1()
+                        .border_color(theme.colors.border)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(theme.spacing.s3))
+                                .child(
+                                    div()
+                                        .w(px(170.0))
+                                        .flex_shrink_0()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(theme.font.sm))
+                                        .text_color(theme.colors.text)
+                                        .child(title),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(120.0))
+                                        .flex_shrink_0()
+                                        .truncate()
+                                        .font_family("monospace")
+                                        .text_size(px(theme.font.xs))
+                                        .text_color(theme.colors.muted)
+                                        .child(entry.agent.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(theme.font.xs))
+                                        .text_color(theme.colors.muted)
+                                        .child(detail),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(92.0))
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(theme.spacing.s1))
+                                        .text_size(px(theme.font.xs))
+                                        .text_color(color)
+                                        .child(dot)
+                                        .child(
+                                            div()
+                                                .text_color(theme.colors.text)
+                                                .child(row_state.label()),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(96.0))
+                                        .flex_shrink_0()
+                                        .text_size(px(theme.font.xs))
+                                        .text_color(theme.colors.muted)
+                                        .child(
+                                            entry.updated_at.format("%Y-%m-%d %H:%M").to_string(),
+                                        ),
+                                )
+                                .child(div().w(px(96.0)).flex_shrink_0().child(action)),
+                        )
+                        .into_any_element()
+                })
+                .collect()
+        };
+
         card(theme)
             .child(components::section_label(theme, "AGENTS"))
             .child(hint(
@@ -738,6 +890,36 @@ impl SettingsView {
                     .child(div().w(px(76.0)).child("SESSIONS")),
             )
             .child(div().flex().flex_col().children(rows))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme.spacing.s1))
+                    .pt(px(theme.spacing.s3))
+                    .child(components::section_label(theme, "PAST SESSIONS"))
+                    .child(hint(
+                        theme,
+                        "Loading a past session restores the agent's own conversation by Favetto-local id; it never starts a fresh session. Only sessions Favetto created are listed.",
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(theme.spacing.s3))
+                            .px(px(theme.spacing.s2))
+                            .py(px(2.0))
+                            .text_size(px(theme.font.xs))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.colors.muted)
+                            .child(div().w(px(170.0)).child("TITLE"))
+                            .child(div().w(px(120.0)).child("AGENT"))
+                            .child(div().flex_1().child("DIRECTORY / DETAIL"))
+                            .child(div().w(px(92.0)).child("STATE"))
+                            .child(div().w(px(96.0)).child("UPDATED"))
+                            .child(div().w(px(96.0)).child("ACTION")),
+                    )
+                    .child(div().flex().flex_col().children(history_items)),
+            )
     }
 
     fn appearance_card(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {

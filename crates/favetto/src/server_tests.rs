@@ -42,6 +42,9 @@ async fn test_state_with_config(
         crate::tasks::load_catalog(tasks_dir).unwrap(),
     ));
     let scheduler = tokio_cron_scheduler::JobScheduler::new().await.unwrap();
+    // Use the same registry construction as the daemon, so a test config that
+    // adds an agent can actually resolve it from `agents.history`/`agents.load`.
+    let registry = crate::agents::AgentRegistry::from_config(&config).unwrap();
     let config = Arc::new(config);
     Arc::new(State::new(StateInit {
         db: pool,
@@ -49,7 +52,7 @@ async fn test_state_with_config(
         token: favetto_core::auth::Token::generate(),
         webhooks: crate::webhooks::WebhookSecrets::from_config(&config),
         agents: crate::agents::AgentManager::new(),
-        registry: crate::agents::AgentRegistry::default(),
+        registry,
         config,
         config_path: dir.join("config.toml"),
         data_dir: dir.to_path_buf(),
@@ -1066,6 +1069,182 @@ fn should_attach_to_live_allows_awaiting_headless_session() {
     assert!(!should_attach_to_live(&live_session(false, false, false)));
 }
 
+/// Build a real-command agent entry so history loadability does not depend on
+/// the host's PATH.
+fn available_agent_config() -> crate::config::FavettoConfig {
+    let mut config = crate::config::FavettoConfig::default();
+    config.agents.insert(
+        "opencode".to_string(),
+        crate::config::AgentConfig {
+            command: "/bin/true".to_string(),
+            ..Default::default()
+        },
+    );
+    config
+}
+
+#[tokio::test]
+async fn agents_history_lists_persisted_metadata_and_loadability() {
+    let dir = temp_dir("agents-history");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state_with_config(&dir, &tasks_dir, available_agent_config()).await;
+    let now = Utc::now();
+
+    let mut ready =
+        crate::db::AgentSessionRecord::loading("local-ready", "opencode", dir.join("work"), now);
+    ready.external_session_id = Some("provider-acp-secret".to_string());
+    ready.status = crate::db::AgentSessionStatus::Ready;
+    ready.title = Some("Fix the widget".to_string());
+    crate::db::insert_agent_session(&state.db, &ready)
+        .await
+        .unwrap();
+
+    let mut failed =
+        crate::db::AgentSessionRecord::loading("local-failed", "opencode", dir.join("work"), now);
+    failed.status = crate::db::AgentSessionStatus::Failed;
+    failed.error = Some("agent could not load ACP session".to_string());
+    crate::db::insert_agent_session(&state.db, &failed)
+        .await
+        .unwrap();
+
+    let mut unlinked =
+        crate::db::AgentSessionRecord::loading("local-no-id", "opencode", dir.join("work"), now);
+    unlinked.status = crate::db::AgentSessionStatus::Ended;
+    crate::db::insert_agent_session(&state.db, &unlinked)
+        .await
+        .unwrap();
+
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 1,
+            method: method::AGENTS_HISTORY.to_string(),
+            params: serde_json::json!({ "limit": 10 }),
+        },
+    )
+    .await;
+    let history = resp.result.expect("agents.history result");
+    let rows = history.as_array().expect("history array");
+    assert_eq!(rows.len(), 3);
+
+    // The provider ACP id is never a client routing key and never leaves the
+    // daemon in the history payload.
+    assert!(
+        !history.to_string().contains("provider-acp-secret"),
+        "history must not expose the provider ACP id"
+    );
+
+    let by_id = |id: &str| {
+        rows.iter()
+            .find(|row| row["id"] == serde_json::json!(id))
+            .unwrap_or_else(|| panic!("missing history row {id}"))
+    };
+    let ready = by_id("local-ready");
+    assert_eq!(ready["agent"], "opencode");
+    assert_eq!(ready["title"], "Fix the widget");
+    assert_eq!(ready["cwd"], serde_json::json!(dir.join("work")));
+    assert_eq!(ready["state"], "ended");
+    assert_eq!(ready["loadable"], true);
+    assert!(ready.get("load_error").is_none());
+
+    let failed = by_id("local-failed");
+    assert_eq!(failed["state"], "failed");
+    assert_eq!(failed["loadable"], false);
+    assert!(
+        failed["load_error"]
+            .as_str()
+            .is_some_and(|message| message.contains("could not load")),
+        "a failed restore keeps its reason: {failed:?}"
+    );
+
+    let unlinked = by_id("local-no-id");
+    assert_eq!(unlinked["state"], "ended");
+    assert_eq!(unlinked["loadable"], false);
+    assert!(unlinked["load_error"]
+        .as_str()
+        .is_some_and(|message| message.contains("no ACP session id")));
+
+    // `agents.list` keeps its existing shape and live-session semantics: a
+    // persisted-only record does not masquerade as a live session there.
+    let list = dispatch(
+        &state,
+        Request {
+            id: 2,
+            method: method::AGENTS_LIST.to_string(),
+            params: serde_json::json!({}),
+        },
+    )
+    .await;
+    let agents = list.result.expect("agents.list result");
+    assert!(
+        agents
+            .as_array()
+            .expect("agent catalog")
+            .iter()
+            .all(|agent| agent["sessions"].as_array().is_some_and(Vec::is_empty)),
+        "persisted history must not be folded into agents.list: {agents}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn agents_load_routes_only_by_favetto_local_id() {
+    let dir = temp_dir("agents-load-routing");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state_with_config(&dir, &tasks_dir, available_agent_config()).await;
+    let now = Utc::now();
+
+    let mut ready =
+        crate::db::AgentSessionRecord::loading("local-ready", "opencode", dir.join("work"), now);
+    ready.external_session_id = Some("provider-acp-secret".to_string());
+    ready.status = crate::db::AgentSessionStatus::Ready;
+    crate::db::insert_agent_session(&state.db, &ready)
+        .await
+        .unwrap();
+
+    // A provider ACP id is not a local record: `agents.load` must refuse it
+    // rather than guess or start a fresh session.
+    let error = load_agent(&state, "provider-acp-secret", None)
+        .await
+        .expect_err("provider ids are not local routing keys");
+    assert!(
+        error.to_string().contains("no persisted agent session"),
+        "{error}"
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(4);
+    let subscribed: Attached = Arc::new(Mutex::new(HashSet::new()));
+    let live_task: LiveTask = Arc::new(Mutex::new(None));
+    handle_request(
+        &state,
+        &tx,
+        &subscribed,
+        &live_task,
+        Request {
+            id: 9,
+            method: method::AGENTS_LOAD.to_string(),
+            params: serde_json::json!({ "session_id": "missing-local" }),
+        },
+    )
+    .await;
+    let frame = rx.recv().await.expect("a response frame");
+    let error = match frame {
+        Frame::Response(resp) => resp.error.expect("unknown id must error"),
+        other => panic!("expected a response, got {other:?}"),
+    };
+    assert_eq!(error.code, error_code::INVALID_PARAMS);
+    assert!(
+        error.message.contains("no persisted agent session"),
+        "{error:?}"
+    );
+    assert!(subscribed.lock().is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[cfg(unix)]
 /// The panel session must inherit the catalog task's `provider`/`model`, so
 /// an interactive reattach uses the same route as the headless run.
@@ -1600,7 +1779,11 @@ async fn handle_request_rejects_malformed_special_params() {
     let subscribed: Attached = Arc::new(Mutex::new(HashSet::new()));
     let live_task: LiveTask = Arc::new(Mutex::new(None));
 
-    for (id, method) in [(1u64, method::AGENTS_ATTACH), (2u64, method::AGENTS_CLOSE)] {
+    for (id, method) in [
+        (1u64, method::AGENTS_ATTACH),
+        (2u64, method::AGENTS_CLOSE),
+        (3u64, method::AGENTS_LOAD),
+    ] {
         handle_request(
             &state,
             &tx,

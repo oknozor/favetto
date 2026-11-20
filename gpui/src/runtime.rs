@@ -23,14 +23,15 @@ use std::time::{Duration, Instant};
 
 use async_channel::{Receiver, Sender};
 use favetto_wire::model::{
-    AgentCatalogEntry, AgentSessionInfo, InputReply, Schedule, Task, TaskRun,
+    AgentCatalogEntry, AgentSessionHistoryEntry, AgentSessionInfo, InputReply, Schedule, Task,
+    TaskRun,
 };
 use favetto_wire::rpc::{
-    AgentReplyParams, AgentReplyResult, CatalogEntry, CatalogGetParams, EmptyParams, PingParams,
-    PingResult, ScheduleDeleteParams, ScheduleUpsertParams, SchedulesDeleteResult,
-    StartOneshotParams, StartOneshotResult, TaskIdParams, TasksEventsParams, TasksListParams,
-    TasksStartParams, WorkflowCancelResultBody, WorkflowGetResult, WorkflowInspectParams,
-    WorkflowRetryParams,
+    AgentReplyParams, AgentReplyResult, AgentsHistoryParams, CatalogEntry, CatalogGetParams,
+    EmptyParams, PingParams, PingResult, ScheduleDeleteParams, ScheduleUpsertParams,
+    SchedulesDeleteResult, SessionIdParams, StartOneshotParams, StartOneshotResult, TaskIdParams,
+    TasksEventsParams, TasksListParams, TasksStartParams, WorkflowCancelResultBody,
+    WorkflowGetResult, WorkflowInspectParams, WorkflowRetryParams,
 };
 use favetto_wire::workflow::WorkflowInspect;
 use uuid::Uuid;
@@ -54,9 +55,9 @@ pub enum Command {
     Ping,
     /// Drop the SSE stream, start a fresh one, and re-validate the connection.
     Reconnect,
-    /// Re-fetch `tasks.list` and `agents.list` for the Inbox and Tasks views.
-    /// Loads coalesce, so a burst of pushes costs one round trip, not one per
-    /// frame.
+    /// Re-fetch `tasks.list`, `agents.list` and `agents.history` for the Inbox,
+    /// Tasks and Settings views. Loads coalesce, so a burst of pushes costs one
+    /// round trip, not one per frame.
     RefreshSnapshot,
     /// Re-fetch `catalog.list` (connect, Retry or a `catalog.updated` push).
     RefreshCatalog,
@@ -96,6 +97,8 @@ pub enum Command {
         request_id: String,
         reply: InputReply,
     },
+    /// Restore a persisted ACP session by its Favetto-local id (`agents.load`).
+    LoadAgentSession { session_id: String },
     /// Fetch one root's runtime workflow graph (`workflow.inspect`).
     LoadWorkflowInspect { root_id: Uuid },
     /// Fetch the catalog DAG source (`workflow.get`).
@@ -152,6 +155,8 @@ pub enum Update {
         sessions: Vec<AgentSessionInfo>,
         /// The agent roster, used by the one-shot picker.
         agents: Vec<AgentCatalogEntry>,
+        /// Durable Favetto-created ACP sessions for the Settings Agents card.
+        history: Vec<AgentSessionHistoryEntry>,
     },
     /// The Inbox/Tasks fetch failed (`tasks.list` is required; a failing agents
     /// list keeps the task rows and drops the session overlay).
@@ -203,6 +208,11 @@ pub enum Update {
         request_id: String,
         reply: InputReply,
         result: Result<AgentReplyResult, ClientError>,
+    },
+    /// `agents.load` completed for the Favetto-local session id.
+    AgentSessionLoaded {
+        session_id: String,
+        result: Result<Box<AgentSessionInfo>, ClientError>,
     },
     /// `workflow.inspect` completed for one root.
     WorkflowInspectLoaded {
@@ -373,6 +383,11 @@ impl Runtime {
         });
     }
 
+    /// Restore a persisted session by its Favetto-local id.
+    pub fn load_agent_session(&self, session_id: String) {
+        self.send(Command::LoadAgentSession { session_id });
+    }
+
     /// Fetch one root's runtime workflow view.
     pub fn load_workflow_inspect(&self, root_id: Uuid) {
         self.send(Command::LoadWorkflowInspect { root_id });
@@ -537,6 +552,9 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
                     reply,
                 );
             }
+            Command::LoadAgentSession { session_id } => {
+                spawn_agent_load(client.clone(), updates.clone(), session_id);
+            }
             Command::LoadWorkflowInspect { root_id } => {
                 spawn_workflow_inspect(client.clone(), updates.clone(), root_id);
             }
@@ -685,13 +703,15 @@ fn spawn_inbox_loader(client: Arc<RpcClient>, updates: Sender<Update>, triggers:
             // Fold every trigger already waiting into this load.
             while triggers.try_recv().is_ok() {}
 
-            // The two reads are independent; run them concurrently so the
-            // snapshot lands within one UI tick on a local daemon.
-            let (tasks, agents) = tokio::join!(
+            // The reads are independent; run them concurrently so the snapshot
+            // lands within one UI tick on a local daemon. History is additive:
+            // an older daemon without `agents.history` keeps the rest working.
+            let (tasks, agents, history) = tokio::join!(
                 client.tasks_list(TasksListParams {
                     limit: Some(TASK_LIST_LIMIT),
                 }),
-                client.agents_list(EmptyParams {})
+                client.agents_list(EmptyParams {}),
+                client.agents_history(AgentsHistoryParams { limit: Some(100) })
             );
 
             let update = match tasks {
@@ -709,10 +729,12 @@ fn spawn_inbox_loader(client: Arc<RpcClient>, updates: Sender<Update>, triggers:
                         }
                         Err(_) => (Vec::new(), Vec::new()),
                     };
+                    let history = history.unwrap_or_default();
                     Update::SnapshotLoaded {
                         tasks,
                         sessions,
                         agents,
+                        history,
                     }
                 }
                 Err(error) => Update::SnapshotFailed { error },
@@ -866,6 +888,20 @@ fn spawn_reply(
             reply,
             result,
         });
+    });
+}
+
+/// Spawn one `agents.load` for a persisted session identified by its
+/// Favetto-local id.
+fn spawn_agent_load(client: Arc<RpcClient>, updates: Sender<Update>, session_id: String) {
+    tokio::spawn(async move {
+        let result = client
+            .agents_load(SessionIdParams {
+                session_id: session_id.clone(),
+            })
+            .await
+            .map(|attached| Box::new(attached.session));
+        let _ = updates.try_send(Update::AgentSessionLoaded { session_id, result });
     });
 }
 

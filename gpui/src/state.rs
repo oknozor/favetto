@@ -35,6 +35,7 @@ use crate::runtime::{PingSnapshot, Runtime, Update};
 use crate::schedules::{
     self, ScheduleDeleteConfirm, ScheduleEditor, ScheduleField, SchedulesState,
 };
+use crate::sessions::SessionHistory;
 use crate::settings::{SettingsActivate, SettingsFocus, SettingsState};
 use crate::sse::Push;
 use crate::tasks::{self, TaskAction, TaskFilter, TaskList};
@@ -219,6 +220,8 @@ pub struct ClientState {
     derived: RefCell<DerivedSnapshot>,
     /// The configured agent roster (the one-shot picker).
     agents: Vec<AgentCatalogEntry>,
+    /// Durable Favetto-created ACP sessions plus this client's load state.
+    session_history: SessionHistory,
     /// The Catalog surface: entries, filter, preview and the launch sheets.
     catalog: CatalogState,
     /// First-fetch skeleton / error state for the shared task snapshot.
@@ -328,6 +331,7 @@ impl ClientState {
             snapshot_revision: 0,
             derived: RefCell::new(DerivedSnapshot::default()),
             agents: Vec::new(),
+            session_history: SessionHistory::default(),
             catalog: CatalogState::default(),
             snapshot_status: snapshot_status.clone(),
             inbox_selected: None,
@@ -506,10 +510,12 @@ impl ClientState {
                 tasks,
                 sessions,
                 agents,
+                history,
             } => {
                 self.tasks = tasks;
                 self.sessions = sessions;
                 self.agents = agents;
+                self.session_history.set_entries(history);
                 self.touch_snapshot();
                 self.snapshot_status = SnapshotStatus::Loaded;
                 // The Workflows root list is derived from this same snapshot,
@@ -726,6 +732,35 @@ impl ClientState {
                 }
                 // The daemon also pushes `agent.state`; one reconciling load
                 // keeps the banner's request text in step.
+                self.refresh_snapshot();
+            }
+            Update::AgentSessionLoaded { session_id, result } => {
+                match result {
+                    Ok(session) => {
+                        let label = format!(
+                            "Loaded session '{}' ({session_id}).",
+                            session.id.chars().take(8).collect::<String>()
+                        );
+                        self.session_history.finish_load(&session_id, Ok(*session));
+                        self.show_toast(ToastKind::Success, label, cx);
+                    }
+                    Err(error) => {
+                        if error.is_unauthorized() {
+                            self.connection = ConnectionState::Unauthorized {
+                                token_path: self.config.token_source.label(),
+                            };
+                        }
+                        self.session_history
+                            .finish_load(&session_id, Err(error.to_string()));
+                        self.show_toast(
+                            ToastKind::Error,
+                            format!("Could not load session '{session_id}': {error}."),
+                            cx,
+                        );
+                    }
+                }
+                // The load changes the live roster (`agents.list`) and the
+                // durable lifecycle (`agents.history`); reconcile both.
                 self.refresh_snapshot();
             }
             Update::TaskActionFinished {
@@ -2011,6 +2046,40 @@ impl ClientState {
     /// The configured agent roster, for the one-shot picker.
     pub fn agent_roster(&self) -> &[AgentCatalogEntry] {
         &self.agents
+    }
+
+    /// Persisted-session history and this client's load state.
+    pub fn session_history(&self) -> &SessionHistory {
+        &self.session_history
+    }
+
+    /// Request `agents.load` for a persisted session by its Favetto-local id.
+    ///
+    /// The row must still be loadable; an unsupported/failed row is never
+    /// turned into a fresh session. Progress and errors live in
+    /// [`SessionHistory`] and the toast.
+    pub fn load_session(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.session_history.begin_load(id) {
+            self.show_toast(
+                ToastKind::Error,
+                "That session cannot be loaded. Only ended, loadable sessions can be restored."
+                    .to_string(),
+                cx,
+            );
+            return;
+        }
+        match &self.runtime {
+            Some(runtime) => runtime.load_agent_session(id.to_string()),
+            None => {
+                self.session_history
+                    .finish_load(id, Err("the transport is not running".to_string()));
+                self.show_toast(
+                    ToastKind::Error,
+                    "The transport is not running, so the session was not loaded.".to_string(),
+                    cx,
+                );
+            }
+        }
     }
 
     /// Highlight a catalog row and load its preview when it changed.

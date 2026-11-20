@@ -1,5 +1,6 @@
 //! Domain model types shared across the daemon and TUI client.
 
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
@@ -663,6 +664,67 @@ pub struct AgentSessionInfo {
     pub load_error: Option<String>,
 }
 
+/// The lifecycle of a persisted ACP session, as shown by `agents.history`.
+///
+/// This is display state, not a routing key. The Favetto-local [`id`] is the
+/// only id a client sends back to `agents.load`; the agent's own ACP session id
+/// stays private to the daemon.
+///
+/// [`id`]: AgentSessionHistoryEntry::id
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSessionState {
+    /// A live ACP process is attached to this session.
+    #[default]
+    Active,
+    /// A persisted conversation is being restored (`session/load` in flight).
+    Loading,
+    /// The session has ended (or outlived a daemon restart) and may be loaded.
+    Ended,
+    /// The launch, load, or the agent itself failed.
+    Failed,
+}
+
+/// One Favetto-created ACP session in the durable history, as returned by
+/// `agents.history`.
+///
+/// The id is Favetto's local routing key and is deliberately not the agent's
+/// ACP session id. A row is only `loadable` when the daemon recorded the ACP id
+/// needed for `session/load` and the owning agent is still configured and
+/// available. When it is not loadable, `load_error` explains why (an
+/// unsupported/expired session, or a recorded failure).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AgentSessionHistoryEntry {
+    /// Favetto-local id; the only routing key accepted by `agents.load`.
+    pub id: String,
+    /// Configured `[agents.<name>]` key that owns the session.
+    pub agent: String,
+    /// Display title reported by the agent, when it reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Working directory the session was created in.
+    pub cwd: PathBuf,
+    /// Catalog task this session belongs to, if task-backed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// Current lifecycle/load state.
+    pub state: AgentSessionState,
+    /// Whether `agents.load` can restore this session right now.
+    #[serde(default)]
+    pub loadable: bool,
+    /// Why the session cannot be loaded, or the last restore/launch failure.
+    ///
+    /// `None` for a loadable session and for an active/live row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_error: Option<String>,
+    /// When the session record was created.
+    pub created_at: DateTime<Utc>,
+    /// When the record last changed (a load or close updates it).
+    pub updated_at: DateTime<Utc>,
+}
+
 /// What an external agent CLI can do, so the daemon and TUI can adapt without
 /// hard-coding a specific CLI's behaviour.
 ///
@@ -815,6 +877,48 @@ pub struct NotificationRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_session_history_round_trips_and_omits_the_provider_id() {
+        let entry = AgentSessionHistoryEntry {
+            id: "local-1".to_string(),
+            agent: "opencode".to_string(),
+            title: Some("Fix the widget".to_string()),
+            cwd: PathBuf::from("/work"),
+            task_id: Some("task-1".to_string()),
+            state: AgentSessionState::Ended,
+            loadable: true,
+            load_error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["id"], "local-1");
+        assert_eq!(json["state"], "ended");
+        assert_eq!(json["loadable"], true);
+        assert!(json.get("load_error").is_none());
+        // Only the Favetto-local id is present; there is no provider-id field.
+        assert!(json.get("session_id").is_none());
+        let back: AgentSessionHistoryEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(back, entry);
+
+        // Additive fields default on a lean payload from a newer/older producer.
+        let lean: AgentSessionHistoryEntry = serde_json::from_str(
+            r#"{
+                "id": "local-2",
+                "agent": "pi",
+                "cwd": "/work",
+                "state": "failed",
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(lean.title, None);
+        assert_eq!(lean.task_id, None);
+        assert!(!lean.loadable);
+        assert_eq!(lean.load_error, None);
+    }
 
     #[test]
     fn agent_catalog_entry_round_trips_capabilities() {

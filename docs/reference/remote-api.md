@@ -46,7 +46,9 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | `events.tail` | Tail persisted events. |
 | `events.subscribe` | (Re)subscribe to the live event stream; accepts `last_event_id` to replay missed events before switching to live delivery. |
 | `agents.list` | List configured external agents and live agent sessions, including each agent's `available` flag and capability flags. |
+| `agents.history` | List the durable ACP sessions Favetto created, by Favetto-local id, with title, working directory, timestamps, lifecycle and loadability. Never lists sessions created outside Favetto. |
 | `agents.start` | Start an external agent session (optionally attached to a task). |
+| `agents.load` | Load a persisted ACP session by its Favetto-local id (`session_id`). The provider's ACP id is resolved from the durable record; an unsupported or failed restore is an error and never starts a fresh session. |
 | `agents.prompt` | Send a follow-up prompt to a structured (ACP) agent session. |
 | `agents.cancel` | Interrupt the in-flight turn of a structured (ACP) agent session. |
 | `agents.attach` | Attach to a session: returns the session and a replay of its output. |
@@ -301,6 +303,7 @@ Start a one-shot task from an inline definition (not added to the catalog) and o
 | `task` | Task | — | yes |  |
 | `session` | AgentSessionInfo | — | yes |  |
 | `data` | string | — | yes | Base64-encoded `vt100` screen frame. |
+| `seq` | integer | `0` | no | See [`AgentAttachResult::seq`]. |
 
 ### `catalog.list`
 
@@ -565,6 +568,20 @@ object
 
 AgentCatalogEntry[]
 
+### `agents.history`
+
+List the durable ACP sessions Favetto created, by Favetto-local id, with title, working directory, timestamps, lifecycle and loadability. Never lists sessions created outside Favetto.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `limit` | integer (optional) | null | no |  |
+
+**Response**
+
+AgentSessionHistoryEntry[]
+
 ### `agents.start`
 
 Start an external agent session (optionally attached to a task).
@@ -590,6 +607,25 @@ Start an external agent session (optionally attached to a task).
 |-------|------|---------|----------|-------------|
 | `session` | AgentSessionInfo | — | yes |  |
 | `data` | string | — | yes | Base64-encoded `vt100` screen frame. |
+| `seq` | integer | `0` | no | The last normalized-event sequence already folded into `data`. A client that also consumes `agent.event` / `tasks.events` can resume strictly after this cursor without replaying text that the snapshot already contains. Older payloads omit it and decode as `0`. |
+
+### `agents.load`
+
+Load a persisted ACP session by its Favetto-local id (`session_id`). The provider's ACP id is resolved from the durable record; an unsupported or failed restore is an error and never starts a fresh session.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `session_id` | string | — | yes |  |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `session` | AgentSessionInfo | — | yes |  |
+| `data` | string | — | yes | Base64-encoded `vt100` screen frame. |
+| `seq` | integer | `0` | no | The last normalized-event sequence already folded into `data`. A client that also consumes `agent.event` / `tasks.events` can resume strictly after this cursor without replaying text that the snapshot already contains. Older payloads omit it and decode as `0`. |
 
 ### `agents.prompt`
 
@@ -640,6 +676,7 @@ Attach to a session: returns the session and a replay of its output.
 |-------|------|---------|----------|-------------|
 | `session` | AgentSessionInfo | — | yes |  |
 | `data` | string | — | yes | Base64-encoded `vt100` screen frame. |
+| `seq` | integer | `0` | no | The last normalized-event sequence already folded into `data`. A client that also consumes `agent.event` / `tasks.events` can resume strictly after this cursor without replaying text that the snapshot already contains. Older payloads omit it and decode as `0`. |
 
 ### `agents.close`
 

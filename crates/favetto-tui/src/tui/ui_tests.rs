@@ -5,7 +5,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use std::collections::BTreeMap;
 
-use favetto_core::model::AgentCapabilities;
+use favetto_core::model::{AgentCapabilities, AgentSessionInfo};
 
 fn session(id: &str, agent: &str, headless: bool, running: bool) -> AgentSessionInfo {
     AgentSessionInfo {
@@ -22,6 +22,11 @@ fn session(id: &str, agent: &str, headless: bool, running: bool) -> AgentSession
         load_state: Default::default(),
         load_error: None,
     }
+}
+
+/// A Ctrl+O picker row built from the live-session fixture above.
+fn picker(id: &str, agent: &str, headless: bool, running: bool) -> SessionPickerEntry {
+    SessionPickerEntry::from_live(&session(id, agent, headless, running), None)
 }
 
 /// Every built-in palette, so render tests exercise all colour paths.
@@ -130,8 +135,8 @@ fn all_popups_render_without_panic() {
             Popup::Sessions {
                 selected: 0,
                 sessions: vec![
-                    session("s1", "opencode", false, true),
-                    session("s2", "pi", true, false),
+                    picker("s1", "opencode", false, true),
+                    picker("s2", "pi", true, false),
                 ],
             },
             Popup::Reply(ReplyPrompt::new(
@@ -1286,8 +1291,8 @@ fn status_bar_surfaces_agent_errors() {
 fn session_picker_renders_each_session() {
     let mut app = App::new();
     app.open_sessions(vec![
-        session("s1", "opencode", false, true),
-        session("s2", "pi", true, false),
+        picker("s1", "opencode", false, true),
+        picker("s2", "pi", true, false),
     ]);
     let text = render_text(&mut app, 100, 24);
     assert!(text.contains("Ctrl+O"), "picker title missing: {text:?}");
@@ -1302,7 +1307,7 @@ fn session_picker_renders_each_session() {
 #[test]
 fn session_picker_renders_activity_and_usage() {
     let mut app = App::new();
-    let mut agent = session("s1", "opencode", false, true);
+    let mut agent = picker("s1", "opencode", false, true);
     agent.activity = Some(favetto_core::model::AgentActivity::Waiting {
         request: favetto_core::model::InputRequest {
             id: "perm_1".to_string(),

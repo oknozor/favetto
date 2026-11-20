@@ -147,8 +147,20 @@ pub mod method {
     pub const EVENTS_SUBSCRIBE: &str = "events.subscribe";
     /// List configured external agents and live agent sessions.
     pub const AGENTS_LIST: &str = "agents.list";
+    /// List the durable ACP sessions Favetto created, by Favetto-local id.
+    ///
+    /// Additive: older daemons do not know it, and clients should fall back to
+    /// `agents.list` when it fails. It never lists sessions created outside
+    /// Favetto (ACP `session/list` is not implemented).
+    pub const AGENTS_HISTORY: &str = "agents.history";
     /// Start an external agent session (optionally attached to a task).
     pub const AGENTS_START: &str = "agents.start";
+    /// Load a persisted ACP session by its Favetto-local id.
+    ///
+    /// The provider ACP id is never accepted here: the daemon resolves it from
+    /// the durable record. A load never falls back to `session/new`, so an
+    /// unsupported or failed restore is reported as an error.
+    pub const AGENTS_LOAD: &str = "agents.load";
     /// Send a follow-up prompt to a structured (ACP) session.
     pub const AGENTS_PROMPT: &str = "agents.prompt";
     /// Interrupt the in-flight turn of a structured (ACP) session.
@@ -294,8 +306,20 @@ pub const CLIENT_METHODS: &[(&str, &str)] = &[
          agent's `available` flag and capability flags.",
     ),
     (
+        method::AGENTS_HISTORY,
+        "List the durable ACP sessions Favetto created, by Favetto-local id, with \
+         title, working directory, timestamps, lifecycle and loadability. Never \
+         lists sessions created outside Favetto.",
+    ),
+    (
         method::AGENTS_START,
         "Start an external agent session (optionally attached to a task).",
+    ),
+    (
+        method::AGENTS_LOAD,
+        "Load a persisted ACP session by its Favetto-local id (`session_id`). The \
+         provider's ACP id is resolved from the durable record; an unsupported or \
+         failed restore is an error and never starts a fresh session.",
     ),
     (
         method::AGENTS_PROMPT,
@@ -501,7 +525,9 @@ mod tests {
             method::EVENTS_TAIL,
             method::EVENTS_SUBSCRIBE,
             method::AGENTS_LIST,
+            method::AGENTS_HISTORY,
             method::AGENTS_START,
+            method::AGENTS_LOAD,
             method::AGENTS_PROMPT,
             method::AGENTS_CANCEL,
             method::AGENTS_ATTACH,

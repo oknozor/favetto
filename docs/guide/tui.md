@@ -58,7 +58,7 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 | Global | `Ctrl+X` `R` | add repo |
 | Global | `Ctrl+X` `t` | change theme |
 | Global | `Ctrl+X` `h` | open docs in the browser |
-| Global | `Ctrl+O` | pick a live/retained agent session |
+| Global | `Ctrl+O` | pick a live or past agent session |
 | Global | `?` | open/close help |
 | Global | `w` | open/close the workflow graph |
 | Global | `M` | mute/unmute sound |
@@ -135,17 +135,35 @@ status bar.
 
 ## Agent session picker
 
-Press **Ctrl+O** to list every live and retained agent session on the daemon
-(`agents.list`) and hop between concurrent runs — for example an `opencode` task
-and a `pi` task running at the same time. `↑`/`↓` moves the selection, **Enter**
-attaches the Agent panel to the chosen session (`agents.attach`), and `Esc` (or
-`Ctrl+O` again) closes the picker. Each row shows the session's agent, whether it
-is running or finished, and whether it is a headless run. `Ctrl+O` is forwarded to
-the agent while the panel has keyboard capture, like the other favetto keys.
+Press **Ctrl+O** to list every live agent session on the daemon
+(`agents.list`) **and** the ACP sessions Favetto created (`agents.history`) so
+you can hop between concurrent runs or reopen a past conversation.
+`↑`/`↓` moves the selection, **Enter** opens the chosen row, and `Esc` (or
+`Ctrl+O` again) closes the picker. Each row shows its title (when the agent
+reported one), agent, working directory, lifecycle state, and activity/usage
+for live sessions.
+
+- **Active** rows reattach the Agent panel to the in-process session
+  (`agents.attach`). Retained sessions whose process has exited still attach to
+  their in-process transcript rather than loading.
+- **Ended** rows that are loadable restore the provider's conversation with
+  `agents.load`, addressed by the **Favetto-local session id** (the provider ACP
+  id is never the routing key). The Agent tab shows a restoring status while the
+  replay is in flight; the transcript appears only after the load succeeds.
+- **Loading**, **failed**, and **cannot load** rows explain themselves in the
+  status bar and do nothing. Selecting a past session never starts a fresh
+  session, even when the agent does not support ACP `session/load`.
+
+`Ctrl+O` is forwarded to the agent while the panel has keyboard capture, like
+the other favetto keys.
 
 If accepting the picker or opening a task fails, the error is shown in the status
 bar (the same place the connection state and counts live) rather than only in the
 internal log ring.
+
+Only Favetto-created sessions are listed; importing arbitrary provider sessions
+via ACP `session/list` is out of scope. The web Settings page exposes the same
+history and load action through `agents.history` / `agents.load`.
 
 ## Copy agent output
 

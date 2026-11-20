@@ -26,8 +26,8 @@ use crate::agent_state::{
     AgentActivity, AgentStateEvent, AgentUsage, InputReply, UsagePeriod, UsageStats,
 };
 use crate::model::{
-    AgentCatalogEntry, AgentSessionInfo, Event, NotificationRecord, RepoInfo, Schedule, Task,
-    TaskRun,
+    AgentCatalogEntry, AgentSessionHistoryEntry, AgentSessionInfo, Event, NotificationRecord,
+    RepoInfo, Schedule, Task, TaskRun,
 };
 use crate::task_var::TaskVar;
 use crate::workflow::{WorkflowCancelResult, WorkflowCreateResult, WorkflowGraph, WorkflowInspect};
@@ -421,6 +421,26 @@ pub struct EventsSubscribeResult {
 
 /// `agents.list` result: configured agents plus their live sessions.
 pub type AgentsListResult = Vec<AgentCatalogEntry>;
+
+/// `agents.history` params. `limit` defaults to 50 and caps at 500.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AgentsHistoryParams {
+    #[serde(default, deserialize_with = "lenient")]
+    pub limit: Option<u64>,
+}
+
+/// `agents.history` result: Favetto-created persisted sessions, most recently
+/// updated first. Each row is keyed by the Favetto-local id; the provider's ACP
+/// id is never exposed.
+pub type AgentsHistoryResult = Vec<AgentSessionHistoryEntry>;
+
+/// `agents.load` params: the Favetto-local id of a persisted session.
+///
+/// Despite the field name, this is **not** an agent/provider session id. The
+/// daemon resolves the provider ACP id from its durable record and `session/load`
+/// never falls back to creating a fresh session.
+pub type AgentLoadParams = SessionIdParams;
 
 /// `agents.start` params. `rows`/`cols` default to 24/80, `new` to false.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -838,8 +858,12 @@ rpc_calls! {
     EventsSubscribeCall => method::EVENTS_SUBSCRIBE, EventsSubscribeParams, EventsSubscribeResult;
     /// Typed call for `agents.list`.
     AgentsListCall => method::AGENTS_LIST, EmptyParams, AgentsListResult;
+    /// Typed call for `agents.history`.
+    AgentsHistoryCall => method::AGENTS_HISTORY, AgentsHistoryParams, AgentsHistoryResult;
     /// Typed call for `agents.start`.
     AgentsStartCall => method::AGENTS_START, StartAgentParams, AgentAttachResult;
+    /// Typed call for `agents.load`.
+    AgentsLoadCall => method::AGENTS_LOAD, AgentLoadParams, AgentAttachResult;
     /// Typed call for `agents.prompt`.
     AgentsPromptCall => method::AGENTS_PROMPT, AgentPromptParams, AgentPromptResult;
     /// Typed call for `agents.cancel`.
@@ -1016,8 +1040,18 @@ pub const CLIENT_CALLS: &[RpcCallSpec] = &[
         result_schema: schema_of::<AgentsListResult>,
     },
     RpcCallSpec {
+        method: method::AGENTS_HISTORY,
+        params_schema: schema_of::<AgentsHistoryParams>,
+        result_schema: schema_of::<AgentsHistoryResult>,
+    },
+    RpcCallSpec {
         method: method::AGENTS_START,
         params_schema: schema_of::<StartAgentParams>,
+        result_schema: schema_of::<AgentAttachResult>,
+    },
+    RpcCallSpec {
+        method: method::AGENTS_LOAD,
+        params_schema: schema_of::<AgentLoadParams>,
         result_schema: schema_of::<AgentAttachResult>,
     },
     RpcCallSpec {

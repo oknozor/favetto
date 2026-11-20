@@ -105,13 +105,51 @@ While a session waits on a permission request, `agents.list` reports its
 `awaiting_input` and the Agent panel shows the request. The task row itself stays
 `running` until the turn ends; answering with `agents.reply` resumes the turn.
 
+## Session history
+
+Favetto records a durable row for every ACP session it creates. The row keeps
+Favetto's **local session id**, the configured agent, the working directory, an
+optional task link, the agent-reported title, timestamps and lifecycle. The
+agent's own ACP session id is stored separately and only the daemon uses it.
+
+There are two different ways to reopen a session, and they are not
+interchangeable:
+
+- **Reattach** (`agents.attach`) is for a session whose ACP process is still
+  alive in the daemon — or a retained in-process transcript. It never starts or
+  loads another process, and keeps the existing Agent-panel behavior.
+- **Load** (`agents.load`) restores an ended, provider-persisted session by its
+  **Favetto-local id**. The daemon looks up the recorded ACP id and asks the
+  agent for `session/load`; the history replay is applied before the session is
+  reported ready. A load never sends a prompt and never falls back to
+  `session/new`.
+
+The TUI's **Ctrl+O** picker lists both kinds. A live row attaches; an ended,
+loadable row previews its local id, agent, title, directory and state, then
+loads when selected. Rows that are loading, failed, or cannot be loaded explain
+why and do nothing rather than opening a blank session. The web Settings page
+and the desktop **Settings → Agents → Past sessions** card use the same
+`agents.history` / `agents.load` contract.
+
+Only sessions **created by Favetto** are listed. Importing arbitrary sessions
+from a provider via ACP `session/list` is out of scope; whether a past session is
+loadable also depends on the agent advertising the ACP `loadSession`
+capability. An unsupported capability or agent error is reported as a failed
+restore, with the session still listed.
+
+Conversation transcript ownership stays with the ACP agent. Favetto stores
+metadata only; the bounded, prunable task output/event feed is not a transcript
+and is never used as one when loading a past session.
+
 ## Current limitations
 
 - Model selection uses the agent's ACP **model config option**: a task's
   `provider`/`model` is sent as `provider/model` and the run fails with a clear
   error if the agent does not offer it. The provider catalog
   (`providers.list`) is still empty, so the UI has no model picker.
-- Sessions are not resumed across daemon restarts; ACP's optional
-  `session/load` is not wired up yet.
+- Sessions can be restored across daemon restarts only when both Favetto's
+  durable record and the agent's own persisted session survive, and the agent
+  advertises ACP `loadSession`. A session created entirely outside Favetto is
+  not discoverable or importable.
 - The provider catalog (`providers.list`) is empty: ACP agents expose model
   choices through session options rather than a catalog.

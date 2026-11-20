@@ -17,6 +17,7 @@ mod palette;
 mod routes;
 mod runtime;
 mod schedules;
+mod sessions;
 mod settings;
 mod sse;
 mod state;

@@ -14,9 +14,10 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use favetto_core::model::{
-    AgentActivity, AgentBackend, AgentCapabilities, AgentCatalogEntry, AgentSessionInfo,
-    AgentStateEvent, AgentUsage, AwaitingInputKind, Event, EventKind, InputReply, InputRequest,
-    MessageRole, NotificationRecord, RepoInfo, Schedule, Task, TaskStatus, UsagePeriod, UsageStats,
+    AgentActivity, AgentBackend, AgentCapabilities, AgentCatalogEntry, AgentSessionHistoryEntry,
+    AgentSessionInfo, AgentSessionState, AgentStateEvent, AgentUsage, AwaitingInputKind, Event,
+    EventKind, InputReply, InputRequest, MessageRole, NotificationRecord, RepoInfo, Schedule, Task,
+    TaskStatus, UsagePeriod, UsageStats,
 };
 use favetto_core::rpc::{method, push, Notification};
 use favetto_core::workflow::WorkflowInspect;
@@ -104,6 +105,9 @@ pub enum UiAction {
     ActivateRepo(Option<String>),
     /// Attach the Agent panel to an existing session id (`agents.attach`).
     AttachSession(String),
+    /// Load a persisted session by its Favetto-local id (`agents.load`). Never
+    /// starts a fresh ACP session when the restore is unsupported or fails.
+    LoadSession(String),
     /// Forward raw keystrokes to the active agent session.
     AgentInput(Vec<u8>),
     /// Start a catalog task by name (runs headlessly through the configured agent).
@@ -157,6 +161,161 @@ pub enum UiAction {
     CopySelection(String),
 }
 
+/// The lifecycle shown for one Ctrl+O row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionPickerState {
+    /// A live process is available to attach to.
+    Active,
+    /// A restore is in flight; it cannot be selected yet.
+    Loading,
+    /// The session ended (or outlived a daemon restart) and may be loaded.
+    Ended,
+    /// Launch, load, or the agent failed.
+    Failed,
+    /// The record cannot be loaded (no ACP id, or the agent is unavailable).
+    Unsupported,
+}
+
+/// What Enter does for one Ctrl+O row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionPickerAction {
+    /// Reattach in-process (`agents.attach`).
+    Attach,
+    /// Restore a persisted provider session by Favetto-local id (`agents.load`).
+    Load,
+    /// Nothing is launchable; the row explains why.
+    None,
+}
+
+/// One row of the Ctrl+O picker, merged from `agents.list` (live sessions) and
+/// `agents.history` (persisted sessions).
+#[derive(Debug, Clone)]
+pub struct SessionPickerEntry {
+    /// Favetto-local id. This, never the provider ACP id, is the routing key.
+    pub id: String,
+    pub agent: String,
+    pub title: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub state: SessionPickerState,
+    pub action: SessionPickerAction,
+    /// A failure/unsupported reason shown inline and in the status bar.
+    pub detail: Option<String>,
+    /// Whether a live session is an unattended headless run.
+    pub headless: bool,
+    /// Live activity/usage, when `agents.list` reported them.
+    pub activity: Option<AgentActivity>,
+    pub usage: Option<AgentUsage>,
+}
+
+impl SessionPickerEntry {
+    /// A live/retained session from `agents.list`. A retained (non-running)
+    /// session is still attached in-process rather than loaded, preserving the
+    /// existing `agents.attach` semantics.
+    pub fn from_live(session: &AgentSessionInfo, title: Option<String>) -> Self {
+        let (state, action, detail) =
+            if session.load_state == favetto_core::model::AgentLoadState::Failed {
+                (
+                    SessionPickerState::Failed,
+                    SessionPickerAction::None,
+                    session.load_error.clone(),
+                )
+            } else if session.load_state == favetto_core::model::AgentLoadState::Loading {
+                (SessionPickerState::Loading, SessionPickerAction::None, None)
+            } else if session.running {
+                (
+                    SessionPickerState::Active,
+                    SessionPickerAction::Attach,
+                    None,
+                )
+            } else {
+                (SessionPickerState::Ended, SessionPickerAction::Attach, None)
+            };
+        Self {
+            id: session.id.clone(),
+            agent: session.agent.clone(),
+            title,
+            cwd: None,
+            state,
+            action,
+            detail,
+            headless: session.headless,
+            activity: session.activity.clone(),
+            usage: session.usage.clone(),
+        }
+    }
+
+    /// A persisted record from `agents.history`.
+    pub fn from_history(entry: &AgentSessionHistoryEntry) -> Self {
+        let (state, action, detail) = match entry.state {
+            AgentSessionState::Active => (
+                SessionPickerState::Active,
+                SessionPickerAction::Attach,
+                None,
+            ),
+            AgentSessionState::Loading => {
+                (SessionPickerState::Loading, SessionPickerAction::None, None)
+            }
+            AgentSessionState::Ended if entry.loadable => {
+                (SessionPickerState::Ended, SessionPickerAction::Load, None)
+            }
+            AgentSessionState::Ended => (
+                SessionPickerState::Unsupported,
+                SessionPickerAction::None,
+                entry.load_error.clone(),
+            ),
+            AgentSessionState::Failed => (
+                SessionPickerState::Failed,
+                SessionPickerAction::None,
+                entry.load_error.clone(),
+            ),
+        };
+        Self {
+            id: entry.id.clone(),
+            agent: entry.agent.clone(),
+            title: entry.title.clone(),
+            cwd: Some(entry.cwd.clone()),
+            state,
+            action,
+            detail,
+            headless: false,
+            activity: None,
+            usage: None,
+        }
+    }
+
+    /// The short state label shown in the picker.
+    pub fn state_label(&self) -> &'static str {
+        match self.state {
+            SessionPickerState::Active => "active",
+            SessionPickerState::Loading => "loading",
+            SessionPickerState::Ended => "ended",
+            SessionPickerState::Failed => "failed",
+            SessionPickerState::Unsupported => "cannot load",
+        }
+    }
+
+    /// Why Enter cannot act on this row, if it cannot.
+    pub fn blocked_reason(&self) -> Option<String> {
+        match self.action {
+            SessionPickerAction::None => {
+                Some(self.detail.clone().unwrap_or_else(|| match self.state {
+                    SessionPickerState::Loading => {
+                        "this session is still loading; wait for it to finish".to_string()
+                    }
+                    SessionPickerState::Failed => {
+                        "this session failed and cannot be loaded".to_string()
+                    }
+                    SessionPickerState::Unsupported => {
+                        "this session cannot be restored".to_string()
+                    }
+                    _ => "this session cannot be opened".to_string(),
+                }))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// The Ctrl+P popup: either the top-level menu, a step-by-step form, the
 /// one-shot wizard, or the `?` keybinding reference.
 pub enum Popup {
@@ -182,11 +341,11 @@ pub enum Popup {
     /// Live runtime workflow inspector (`workflow.inspect`), opened with `i` on
     /// the Tasks tab for the selected task's root.
     WorkflowRuntime(WorkflowRuntime),
-    /// The Ctrl+O session picker: the daemon's live/retained agent sessions,
-    /// listed so the Agent panel can hop between concurrent runs.
+    /// The Ctrl+O session picker: live sessions from `agents.list` plus
+    /// persisted Favetto-created sessions from `agents.history`.
     Sessions {
         selected: usize,
-        sessions: Vec<AgentSessionInfo>,
+        sessions: Vec<SessionPickerEntry>,
     },
     /// The Ctrl+R reply prompt: answer a session's structured input request
     /// (`AgentActivity::Waiting { request }`) through `agents.reply`.
@@ -914,9 +1073,13 @@ pub struct App {
     pub agent_feed_follow: bool,
     /// Stable id of the selected foldable feed row (a thought or tool card).
     pub agent_feed_selected: Option<u64>,
-    /// The last `agents.start` / `agents.attach` / `tasks.get` error, shown in the
-    /// status bar.
+    /// The last `agents.start` / `agents.attach` / `agents.load` / `tasks.get`
+    /// error, shown in the status bar.
     pub agent_error: Option<String>,
+    /// The Favetto-local id of a persisted session being restored through
+    /// `agents.load`, shown on the Agent tab while the replay is in flight.
+    /// `None` when no restore is in progress.
+    pub agent_loading: Option<String>,
     /// The last task-command error (`tasks.cancel` / `tasks.retry` /
     /// `workflow.cancel`), shown in the status bar. Cleared by a later success.
     pub notice: Option<String>,
@@ -1050,6 +1213,7 @@ impl App {
             agent_feed_follow: true,
             agent_feed_selected: None,
             agent_error: None,
+            agent_loading: None,
             notice: None,
             agent_selection: None,
             copy_notice: None,
@@ -1863,6 +2027,7 @@ impl App {
         self.agent_backend = backend;
         self.agent_status = status;
         self.agent_error = None;
+        self.agent_loading = None;
         self.agent_selection = None;
         // The embedded agent owns the keyboard as soon as the panel is opened,
         // unless the PTY (or ACP turn) is read-only.
@@ -1884,7 +2049,7 @@ impl App {
 
     /// Replace the popup with the Ctrl+O agent-session picker. An empty list is
     /// reported in the status bar rather than opening an empty overlay.
-    pub fn open_sessions(&mut self, sessions: Vec<AgentSessionInfo>) {
+    pub fn open_sessions(&mut self, sessions: Vec<SessionPickerEntry>) {
         if sessions.is_empty() {
             self.popup = Popup::None;
             self.agent_error = Some("no agent sessions to switch to".to_string());
@@ -1894,6 +2059,20 @@ impl App {
             selected: 0,
             sessions,
         };
+    }
+
+    /// Show that a persisted session is being restored, without clearing the
+    /// currently open session (a failed restore leaves it intact). The Agent tab
+    /// renders the progress; `open_agent` clears it on success.
+    pub fn begin_session_load(&mut self, session_id: &str) {
+        self.agent_error = None;
+        self.agent_loading = Some(session_id.to_string());
+        self.tab = Tab::Agent;
+    }
+
+    /// Clear the restore-in-progress indicator (success or failure).
+    pub fn finish_session_load(&mut self) {
+        self.agent_loading = None;
     }
 
     /// Replace the cached `agents.list` sessions (the Activity/Usage source for

@@ -22,7 +22,8 @@ use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
 use favetto_core::model::{
-    AgentCatalogEntry, AgentSessionInfo, EventKind, Failure, FailureKind, Task, TaskStatus,
+    AgentCatalogEntry, AgentSessionHistoryEntry, AgentSessionInfo, AgentSessionState, EventKind,
+    Failure, FailureKind, Task, TaskStatus,
 };
 use favetto_core::rpc::messages::*;
 use favetto_core::rpc::{method, push, Frame, Notification, Request, Response, RpcError};
@@ -285,6 +286,35 @@ async fn handle_request(
                     )
                 }
                 Err(e) => Response::error(id, RpcError::Internal(e.to_string())),
+            },
+            Err(error) => Response::error(id, error),
+        };
+        let _ = out_tx.send(Frame::Response(resp)).await;
+        return;
+    }
+
+    // `agents.load` restores a persisted session by its Favetto-local id and
+    // subscribes this connection, like `agents.start`. The provider ACP id is
+    // never accepted here, and a failed restore is reported instead of opening
+    // a fresh session.
+    if req.method == method::AGENTS_LOAD {
+        let resp = match parse_params::<AgentLoadParams>(&req.method, &req.params) {
+            Ok(p) => match load_agent(state, &p.session_id, None).await {
+                Ok(session) => match state.agents.attach(&session.id) {
+                    Ok((session, data, seq)) => {
+                        subscribed.lock().insert(session.id.clone());
+                        Response::ok(
+                            id,
+                            encode(AgentAttachResult {
+                                session,
+                                data: base64::engine::general_purpose::STANDARD.encode(&data),
+                                seq,
+                            }),
+                        )
+                    }
+                    Err(e) => Response::error(id, RpcError::Internal(e.to_string())),
+                },
+                Err(e) => Response::error(id, RpcError::InvalidParams(e.to_string())),
             },
             Err(error) => Response::error(id, error),
         };
@@ -641,6 +671,15 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
                 events,
                 next_cursor,
             })
+        }
+
+        method::AGENTS_HISTORY => {
+            let p: AgentsHistoryParams = parse_params(&req.method, &req.params)?;
+            let limit = p.limit.unwrap_or(50).min(500) as i64;
+            match list_agent_history(state, limit).await {
+                Ok(history) => to_value(history),
+                Err(e) => Err(RpcError::Internal(e.to_string())),
+            }
         }
 
         method::AGENTS_LIST => {
@@ -1260,6 +1299,83 @@ fn workflow_state(tasks: &[WorkflowTaskView]) -> WorkflowState {
     } else {
         WorkflowState::Succeeded
     }
+}
+
+/// List Favetto-created ACP sessions for `agents.history`.
+///
+/// Durable records supply identity and display metadata; the live session map
+/// supplies the current process state when one exists. A record is only marked
+/// `loadable` when the stored provider ACP id is present, the record did not
+/// fail, and its configured agent is still available. The provider id itself is
+/// never sent to clients.
+async fn list_agent_history(
+    state: &Arc<State>,
+    limit: i64,
+) -> anyhow::Result<Vec<AgentSessionHistoryEntry>> {
+    let records = db::list_agent_sessions(&state.db, limit).await?;
+    let live: HashMap<String, AgentSessionInfo> = state
+        .agents
+        .sessions()
+        .into_iter()
+        .map(|session| (session.id.clone(), session))
+        .collect();
+
+    Ok(records
+        .into_iter()
+        .map(|record| {
+            let live = live.get(&record.id);
+            let session_state = match live {
+                Some(info) => match info.load_state {
+                    favetto_core::model::AgentLoadState::Failed => AgentSessionState::Failed,
+                    favetto_core::model::AgentLoadState::Loading => AgentSessionState::Loading,
+                    favetto_core::model::AgentLoadState::Ready if info.running => {
+                        AgentSessionState::Active
+                    }
+                    favetto_core::model::AgentLoadState::Ready => AgentSessionState::Ended,
+                },
+                None => match record.status {
+                    db::AgentSessionStatus::Loading => AgentSessionState::Loading,
+                    db::AgentSessionStatus::Ready | db::AgentSessionStatus::Ended => {
+                        AgentSessionState::Ended
+                    }
+                    db::AgentSessionStatus::Failed => AgentSessionState::Failed,
+                },
+            };
+
+            let mut loadable = false;
+            let mut load_error = live.and_then(|info| info.load_error.clone());
+            if session_state == AgentSessionState::Failed {
+                load_error = load_error
+                    .or_else(|| record.error.clone())
+                    .or_else(|| Some("the session failed before it could be loaded".to_string()));
+            } else if session_state == AgentSessionState::Ended {
+                if record.external_session_id.is_none() {
+                    load_error = Some(
+                        "no ACP session id was recorded, so this session cannot be restored"
+                            .to_string(),
+                    );
+                } else {
+                    match state.registry.get_checked(&record.agent) {
+                        Ok(_) => loadable = true,
+                        Err(error) => load_error = Some(error.to_string()),
+                    }
+                }
+            }
+
+            AgentSessionHistoryEntry {
+                id: record.id,
+                agent: record.agent,
+                title: record.title,
+                cwd: record.cwd,
+                task_id: record.task_id,
+                state: session_state,
+                loadable,
+                load_error,
+                created_at: record.created_at,
+                updated_at: record.updated_at,
+            }
+        })
+        .collect())
 }
 
 /// Restore a persisted ACP session selected by its Favetto-local id.
