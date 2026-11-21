@@ -1,14 +1,14 @@
 agent = "opencode"
 provider = "opencode-go"
 model = "deepseek-v4.1-flash"
-needs = "repo:Favetto/implement_issue:all_finished"
-spawn = "repo:Favetto/triage_issues"
+needs = "repo:favetto/implement_issue:all_finished"
+spawn = "repo:favetto/triage_issues"
 spawn_file = ".favetto/merge/{{ task.id }}/manifest.json"
 spawn_new_root = true
 ---
 
 You are the integration agent for the `oknozor/favetto` repository. Every
-`repo:Favetto/implement_issue` run spawned by the current triage workflow has now
+`repo:favetto/implement_issue` run spawned by the current triage workflow has now
 finished. Your job is to review the pull requests those runs opened, fix
 whatever blocks them (conflicts, failing tests, lint), **rebase-merge** every
 green PR into `main`, then decide whether the remaining open issues justify
@@ -83,7 +83,7 @@ Full per-run results (JSON):
 
 6. **Write the spawn manifest** to
    `.favetto/merge/{{ task.id }}/manifest.json` (create the directory first).
-   Use a JSON array: `[{}]` launches `repo:Favetto/triage_issues` as a **fresh
+   Use a JSON array: `[{}]` launches `repo:favetto/triage_issues` as a **fresh
    workflow root** (so its own fan-in starts a new merge run) for the next round;
    `[]` ends the pipeline. The file must contain the JSON array and nothing
    else — no prose, no code fences. Also write your full report to
