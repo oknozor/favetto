@@ -62,14 +62,19 @@ fn main() {
                     }
                     continue;
                 }
+                let mut capabilities = json!({
+                    "loadSession": load_supported()
+                });
+                let provider = provider_capabilities();
+                if !provider.as_object().is_some_and(|object| object.is_empty()) {
+                    capabilities["sessionCapabilities"] = provider;
+                }
                 respond(
                     &mut stdout,
                     id,
                     json!({
                         "protocolVersion": 1,
-                        "agentCapabilities": {
-                            "loadSession": load_supported()
-                        }
+                        "agentCapabilities": capabilities
                     }),
                 );
             }
@@ -147,6 +152,84 @@ fn main() {
                         id,
                         json!({ "configOptions": config_options(&selected_model) }),
                     );
+                }
+            }
+            "session/list" => {
+                let params = message.get("params");
+                let filter = params
+                    .and_then(|params| params.get("cwd"))
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from);
+                let offset = params
+                    .and_then(|params| params.get("cursor"))
+                    .and_then(Value::as_str)
+                    .and_then(|cursor| cursor.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let page_size = list_page_size();
+                let mut sessions = Vec::new();
+                for index in offset..list_count() {
+                    let cwd = provider_cwd(index);
+                    if let Some(filter) = &filter {
+                        if &cwd != filter {
+                            continue;
+                        }
+                    }
+                    if sessions.len() >= page_size {
+                        break;
+                    }
+                    sessions.push(json!({
+                        "sessionId": provider_session_id(index),
+                        "cwd": cwd,
+                        "title": format!("Provider session {}", index + 1),
+                        "updatedAt": format!("2026-11-2{}T10:00:00Z", index % 10),
+                    }));
+                }
+                let next = if offset + page_size < list_count() {
+                    json!(format!("{}", offset + page_size))
+                } else {
+                    Value::Null
+                };
+                let mut result = json!({ "sessions": sessions });
+                if !next.is_null() {
+                    result["nextCursor"] = next;
+                }
+                respond(&mut stdout, id, result);
+            }
+            "session/resume" => {
+                let resumed = message
+                    .get("params")
+                    .and_then(|params| params.get("sessionId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(&session_id)
+                    .to_string();
+                session_id = resumed;
+                if std::env::var("FAKE_ACP_RESUME_RESULT").as_deref() == Ok("error") {
+                    if let Some(id) = id {
+                        error(&mut stdout, id, -32000, "cannot resume session");
+                    }
+                } else {
+                    respond(
+                        &mut stdout,
+                        id,
+                        json!({ "configOptions": config_options(&selected_model) }),
+                    );
+                }
+            }
+            "session/delete" => {
+                let deleted = message
+                    .get("params")
+                    .and_then(|params| params.get("sessionId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if std::env::var("FAKE_ACP_DELETE_RESULT").as_deref() == Ok("error") {
+                    if let Some(id) = id {
+                        error(&mut stdout, id, -32000, "cannot delete session");
+                    }
+                } else {
+                    if let Some(marker) = std::env::var_os("FAKE_ACP_DELETE_MARKER") {
+                        let _ = std::fs::write(marker, deleted);
+                    }
+                    respond(&mut stdout, id, json!({}));
                 }
             }
             "session/set_config_option" => {
@@ -239,6 +322,50 @@ fn load_supported() -> bool {
         std::env::var("FAKE_ACP_LOAD_SUPPORTED").as_deref(),
         Ok("0" | "false")
     )
+}
+
+/// The provider-session capabilities this fake advertises. All are off by
+/// default so existing tests exercise the unsupported paths.
+fn provider_capabilities() -> Value {
+    let mut capabilities = serde_json::Map::new();
+    if env_flag("FAKE_ACP_LIST_SUPPORTED") {
+        capabilities.insert("list".to_string(), json!({}));
+    }
+    if env_flag("FAKE_ACP_DELETE_SUPPORTED") {
+        capabilities.insert("delete".to_string(), json!({}));
+    }
+    if env_flag("FAKE_ACP_RESUME_SUPPORTED") {
+        capabilities.insert("resume".to_string(), json!({}));
+    }
+    Value::Object(capabilities)
+}
+
+fn env_flag(name: &str) -> bool {
+    !matches!(std::env::var(name).as_deref(), Ok("0" | "false")) && std::env::var_os(name).is_some()
+}
+
+fn list_count() -> usize {
+    std::env::var("FAKE_ACP_LIST_COUNT")
+        .ok()
+        .and_then(|count| count.parse().ok())
+        .unwrap_or(3)
+}
+
+fn list_page_size() -> usize {
+    std::env::var("FAKE_ACP_LIST_PAGE_SIZE")
+        .ok()
+        .and_then(|size| size.parse().ok())
+        .unwrap_or(2)
+}
+
+fn provider_session_id(index: usize) -> String {
+    format!("provider-ses-{index}")
+}
+
+fn provider_cwd(index: usize) -> std::path::PathBuf {
+    std::env::var_os("FAKE_ACP_PROVIDER_CWD")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/tmp/favetto-provider-{}", index % 2)))
 }
 
 /// The optional file gate directory, from `FAKE_ACP_GATE_DIR`.

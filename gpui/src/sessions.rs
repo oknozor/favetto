@@ -10,7 +10,10 @@
 use std::collections::HashMap;
 
 use base64::Engine;
-use favetto_wire::model::{AgentSessionHistoryEntry, AgentSessionInfo, AgentSessionState};
+use favetto_wire::model::{
+    AgentSessionHistoryEntry, AgentSessionInfo, AgentSessionState, ProviderSessionEntry,
+    ProviderSessionsResult,
+};
 use favetto_wire::rpc::AgentAttachResult;
 
 /// How much of a restored transcript the Settings card renders. The agent owns
@@ -27,6 +30,9 @@ pub enum SessionRowState {
     Loading,
     /// The session ended and can be loaded.
     Ended,
+    /// Provider-owned history that has not been imported yet; it is resumable
+    /// when the agent advertises load/resume.
+    Provider,
     /// This client loaded the session successfully in the current snapshot.
     Ready,
     /// A load failed, with the daemon's or transport's message.
@@ -42,6 +48,7 @@ impl SessionRowState {
             Self::Active => "active",
             Self::Loading => "loading",
             Self::Ended => "ended",
+            Self::Provider => "provider",
             Self::Ready => "ready",
             Self::Failed(_) => "failed",
             Self::Unsupported(_) => "cannot load",
@@ -74,6 +81,27 @@ enum LoadRequest {
 pub struct SessionHistory {
     entries: Vec<AgentSessionHistoryEntry>,
     loads: HashMap<String, LoadRequest>,
+    /// Per-agent provider-session pages from `agents.provider_sessions`.
+    provider: Vec<ProviderSessionsResult>,
+    /// Provider resume/delete state keyed by `(agent, provider session id)`.
+    provider_actions: HashMap<(String, String), ProviderAction>,
+}
+
+/// One provider-row action made from this client.
+#[derive(Debug, Clone, PartialEq)]
+enum ProviderAction {
+    Resuming,
+    Ready {
+        session: Box<AgentSessionInfo>,
+        transcript: String,
+    },
+    Deleting,
+    Deleted,
+    Failed(String),
+}
+
+fn provider_key(agent: &str, session_id: &str) -> (String, String) {
+    (agent.to_string(), session_id.to_string())
 }
 
 impl SessionHistory {
@@ -90,6 +118,191 @@ impl SessionHistory {
     /// The current history rows, newest-updated first as the daemon returns them.
     pub fn entries(&self) -> &[AgentSessionHistoryEntry] {
         &self.entries
+    }
+
+    /// Replace the provider-session snapshot, retaining action state for rows
+    /// that are still listed. Provider rows are never merged into `entries`.
+    pub fn set_provider_snapshot(&mut self, provider: Vec<ProviderSessionsResult>) {
+        let live: std::collections::HashSet<(String, String)> = provider
+            .iter()
+            .flat_map(|result| {
+                result
+                    .sessions
+                    .iter()
+                    .map(|entry| provider_key(&entry.agent, &entry.session_id))
+            })
+            .collect();
+        self.provider_actions.retain(|key, _| live.contains(key));
+        self.provider = provider;
+    }
+
+    /// Per-agent provider history and capability notices.
+    pub fn provider_results(&self) -> &[ProviderSessionsResult] {
+        &self.provider
+    }
+
+    /// Find a provider row by its agent and ACP id.
+    pub fn provider_entry(&self, agent: &str, session_id: &str) -> Option<&ProviderSessionEntry> {
+        self.provider
+            .iter()
+            .find(|result| result.agent == agent)
+            .and_then(|result| {
+                result
+                    .sessions
+                    .iter()
+                    .find(|entry| entry.session_id == session_id)
+            })
+    }
+
+    /// The capability flags for one agent's provider history.
+    pub fn provider_capabilities(&self, agent: &str) -> (bool, bool) {
+        self.provider
+            .iter()
+            .find(|result| result.agent == agent)
+            .map(|result| (result.can_resume, result.can_delete))
+            .unwrap_or((false, false))
+    }
+
+    /// The effective display state of one provider-owned row.
+    pub fn provider_state(&self, entry: &ProviderSessionEntry) -> SessionRowState {
+        let key = provider_key(&entry.agent, &entry.session_id);
+        match self.provider_actions.get(&key) {
+            Some(ProviderAction::Resuming) | Some(ProviderAction::Deleting) => {
+                return SessionRowState::Loading;
+            }
+            Some(ProviderAction::Ready { .. }) => return SessionRowState::Ready,
+            Some(ProviderAction::Deleted) => {
+                return SessionRowState::Unsupported(
+                    "the provider session was deleted".to_string(),
+                );
+            }
+            Some(ProviderAction::Failed(message)) => {
+                return SessionRowState::Failed(message.clone());
+            }
+            None => {}
+        }
+        let (can_resume, _) = self.provider_capabilities(&entry.agent);
+        if can_resume {
+            SessionRowState::Provider
+        } else {
+            SessionRowState::Unsupported(format!(
+                "agent '{}' does not advertise ACP session/load or session/resume",
+                entry.agent
+            ))
+        }
+    }
+
+    /// Whether this row can be resumed right now.
+    pub fn can_resume_provider(&self, entry: &ProviderSessionEntry) -> bool {
+        let (can_resume, _) = self.provider_capabilities(&entry.agent);
+        if !can_resume {
+            return false;
+        }
+        !matches!(
+            self.provider_actions
+                .get(&provider_key(&entry.agent, &entry.session_id)),
+            Some(ProviderAction::Resuming)
+                | Some(ProviderAction::Ready { .. })
+                | Some(ProviderAction::Deleting)
+        )
+    }
+
+    /// Whether this row can be deleted right now.
+    pub fn can_delete_provider(&self, entry: &ProviderSessionEntry) -> bool {
+        let (_, can_delete) = self.provider_capabilities(&entry.agent);
+        can_delete
+            && !matches!(
+                self.provider_actions
+                    .get(&provider_key(&entry.agent, &entry.session_id)),
+                Some(ProviderAction::Resuming)
+                    | Some(ProviderAction::Deleting)
+                    | Some(ProviderAction::Deleted)
+            )
+    }
+
+    /// Start a provider resume; returns `false` when the row is not resumable.
+    pub fn begin_provider_resume(&mut self, agent: &str, session_id: &str) -> bool {
+        let Some(entry) = self.provider_entry(agent, session_id) else {
+            return false;
+        };
+        if !self.can_resume_provider(entry) {
+            return false;
+        }
+        self.provider_actions
+            .insert(provider_key(agent, session_id), ProviderAction::Resuming);
+        true
+    }
+
+    /// Record a completed `agents.provider_resume`.
+    pub fn finish_provider_resume(
+        &mut self,
+        agent: &str,
+        session_id: &str,
+        result: Result<AgentAttachResult, String>,
+    ) {
+        let action = match result {
+            Ok(attached) => {
+                match base64::engine::general_purpose::STANDARD.decode(&attached.data) {
+                    Ok(bytes) => match String::from_utf8(bytes) {
+                        Ok(transcript) => ProviderAction::Ready {
+                            session: Box::new(attached.session),
+                            transcript,
+                        },
+                        Err(_) => ProviderAction::Failed(
+                            "the daemon returned a transcript that is not valid UTF-8".to_string(),
+                        ),
+                    },
+                    Err(_) => ProviderAction::Failed(
+                        "the daemon returned an unreadable session transcript".to_string(),
+                    ),
+                }
+            }
+            Err(message) => ProviderAction::Failed(message),
+        };
+        self.provider_actions
+            .insert(provider_key(agent, session_id), action);
+    }
+
+    /// Start a provider delete; returns `false` when unsupported or in flight.
+    pub fn begin_provider_delete(&mut self, agent: &str, session_id: &str) -> bool {
+        let Some(entry) = self.provider_entry(agent, session_id) else {
+            return false;
+        };
+        if !self.can_delete_provider(entry) {
+            return false;
+        }
+        self.provider_actions
+            .insert(provider_key(agent, session_id), ProviderAction::Deleting);
+        true
+    }
+
+    /// Record a completed `agents.provider_delete`.
+    pub fn finish_provider_delete(
+        &mut self,
+        agent: &str,
+        session_id: &str,
+        result: Result<(), String>,
+    ) {
+        let action = match result {
+            Ok(()) => ProviderAction::Deleted,
+            Err(message) => ProviderAction::Failed(message),
+        };
+        self.provider_actions
+            .insert(provider_key(agent, session_id), action);
+    }
+
+    /// The provider-resume replay for a row, when it succeeded.
+    pub fn provider_transcript(&self, agent: &str, session_id: &str) -> Option<&str> {
+        match self.provider_actions.get(&provider_key(agent, session_id)) {
+            Some(ProviderAction::Ready { transcript, .. }) => Some(transcript),
+            _ => None,
+        }
+    }
+
+    /// A bounded, display-only provider transcript preview.
+    pub fn provider_transcript_preview(&self, agent: &str, session_id: &str) -> Option<String> {
+        self.provider_transcript(agent, session_id)
+            .map(preview_transcript)
     }
 
     /// The effective state of one row.
@@ -451,6 +664,105 @@ mod tests {
         // ended, loadable row can be retried.
         assert!(history.can_load(&history.entries()[0]));
         assert!(history.begin_load("local-past"));
+    }
+
+    fn provider(id: &str) -> favetto_wire::model::ProviderSessionEntry {
+        favetto_wire::model::ProviderSessionEntry {
+            agent: "opencode".to_string(),
+            session_id: id.to_string(),
+            cwd: std::path::PathBuf::from("/work"),
+            title: Some(format!("provider {id}")),
+            updated_at: None,
+            local_session_id: None,
+        }
+    }
+
+    fn provider_result(can_resume: bool, can_delete: bool) -> ProviderSessionsResult {
+        ProviderSessionsResult {
+            agent: "opencode".to_string(),
+            supported: true,
+            can_resume,
+            can_delete,
+            sessions: vec![provider("provider-1")],
+            next_cursor: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn provider_rows_are_gated_and_import_only_on_resume() {
+        let mut history = SessionHistory::default();
+        history.set_provider_snapshot(vec![provider_result(true, true)]);
+        let entry = history
+            .provider_entry("opencode", "provider-1")
+            .unwrap()
+            .clone();
+
+        assert!(history.can_resume_provider(&entry));
+        assert!(history.can_delete_provider(&entry));
+        assert_eq!(history.provider_state(&entry), SessionRowState::Provider);
+
+        assert!(history.begin_provider_resume("opencode", "provider-1"));
+        assert_eq!(history.provider_state(&entry), SessionRowState::Loading);
+        assert!(!history.begin_provider_delete("opencode", "provider-1"));
+
+        // A session/resume path has no replay: readiness is still real, but the
+        // provider text stays empty rather than pretending the load replayed.
+        history.finish_provider_resume(
+            "opencode",
+            "provider-1",
+            Ok(AgentAttachResult {
+                session: session("local-imported"),
+                data: String::new(),
+                seq: 0,
+            }),
+        );
+        assert_eq!(history.provider_state(&entry), SessionRowState::Ready);
+        assert_eq!(
+            history.provider_transcript("opencode", "provider-1"),
+            Some("")
+        );
+        assert!(!history.can_resume_provider(&entry));
+    }
+
+    #[test]
+    fn provider_capabilities_hide_unsupported_actions() {
+        let mut history = SessionHistory::default();
+        history.set_provider_snapshot(vec![provider_result(false, false)]);
+        let entry = history
+            .provider_entry("opencode", "provider-1")
+            .unwrap()
+            .clone();
+
+        assert!(!history.can_resume_provider(&entry));
+        assert!(!history.can_delete_provider(&entry));
+        assert!(matches!(
+            history.provider_state(&entry),
+            SessionRowState::Unsupported(_)
+        ));
+        assert!(!history.begin_provider_resume("opencode", "provider-1"));
+        assert!(!history.begin_provider_delete("opencode", "provider-1"));
+    }
+
+    #[test]
+    fn a_provider_delete_is_distinct_from_the_local_record() {
+        let mut history = SessionHistory::default();
+        history.set_provider_snapshot(vec![provider_result(true, true)]);
+        history.set_entries(vec![entry("local-past", AgentSessionState::Ended, true)]);
+        let entry = history
+            .provider_entry("opencode", "provider-1")
+            .unwrap()
+            .clone();
+
+        assert!(history.begin_provider_delete("opencode", "provider-1"));
+        history.finish_provider_delete("opencode", "provider-1", Ok(()));
+        assert!(matches!(
+            history.provider_state(&entry),
+            SessionRowState::Unsupported(_)
+        ));
+        // Favetto's own durable row is untouched.
+        assert_eq!(history.entries().len(), 1);
+        assert!(history.can_load(&history.entries()[0]));
     }
 
     #[test]

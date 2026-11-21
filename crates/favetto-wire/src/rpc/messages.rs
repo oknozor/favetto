@@ -27,7 +27,7 @@ use crate::agent_state::{
 };
 use crate::model::{
     AgentCatalogEntry, AgentSessionHistoryEntry, AgentSessionInfo, Event, NotificationRecord,
-    RepoInfo, Schedule, Task, TaskRun,
+    ProviderSessionsResult, RepoInfo, Schedule, Task, TaskRun,
 };
 use crate::task_var::TaskVar;
 use crate::workflow::{WorkflowCancelResult, WorkflowCreateResult, WorkflowGraph, WorkflowInspect};
@@ -543,6 +543,65 @@ pub struct AgentReplyResult {
     pub replied: bool,
 }
 
+/// `agents.provider_sessions` params: provider-owned history for one agent.
+///
+/// When `agent` is absent every available ACP agent is queried and one result
+/// per agent is returned. `cwd` filters the provider's own `session/list`;
+/// `cursor` is the opaque token from a previous page. Cursors are scoped to one
+/// agent, so pagination requires an explicit `agent`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProviderSessionsParams {
+    #[serde(default, deserialize_with = "lenient")]
+    pub agent: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub cwd: Option<PathBuf>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub cursor: Option<String>,
+}
+
+/// `agents.provider_sessions` result: one page (or one unsupported/error notice)
+/// per queried agent.
+pub type ProviderSessionsListResult = Vec<ProviderSessionsResult>;
+
+/// `agents.provider_resume` params: resume a provider-owned session.
+///
+/// `session_id` is the provider's ACP id and is only accepted by this call. The
+/// daemon imports the session into a Favetto-local record and returns that
+/// record's id; subsequent RPCs use the local id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProviderResumeParams {
+    #[serde(default, deserialize_with = "lenient")]
+    pub agent: Option<String>,
+    /// The provider's ACP session id. This is not a Favetto-local routing key.
+    pub provider_session_id: String,
+    /// Working directory to resume in. Defaults to the provider session's
+    /// listed directory when omitted.
+    #[serde(default, deserialize_with = "lenient")]
+    pub cwd: Option<PathBuf>,
+}
+
+/// `agents.provider_delete` params: delete a provider-owned session.
+///
+/// This deletes the provider's transcript through ACP `session/delete`; it never
+/// deletes Favetto-local metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProviderDeleteParams {
+    #[serde(default, deserialize_with = "lenient")]
+    pub agent: Option<String>,
+    /// The provider's ACP session id. This is not a Favetto-local routing key.
+    pub provider_session_id: String,
+}
+
+/// `agents.provider_delete` result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProviderDeleteResult {
+    pub deleted: bool,
+}
+
 // ---------------------------------------------------------------------------
 // providers
 // ---------------------------------------------------------------------------
@@ -874,6 +933,12 @@ rpc_calls! {
     AgentsCloseCall => method::AGENTS_CLOSE, SessionIdParams, AgentCloseResult;
     /// Typed call for `agents.reply`.
     AgentsReplyCall => method::AGENTS_REPLY, AgentReplyParams, AgentReplyResult;
+    /// Typed call for `agents.provider_sessions`.
+    AgentsProviderSessionsCall => method::AGENTS_PROVIDER_SESSIONS, ProviderSessionsParams, ProviderSessionsListResult;
+    /// Typed call for `agents.provider_resume`.
+    AgentsProviderResumeCall => method::AGENTS_PROVIDER_RESUME, ProviderResumeParams, AgentAttachResult;
+    /// Typed call for `agents.provider_delete`.
+    AgentsProviderDeleteCall => method::AGENTS_PROVIDER_DELETE, ProviderDeleteParams, ProviderDeleteResult;
     /// Typed call for `providers.list`.
     ProvidersListCall => method::PROVIDERS_LIST, ProvidersListParams, ProvidersListResult;
     /// Typed call for `schedules.list`.
@@ -1078,6 +1143,21 @@ pub const CLIENT_CALLS: &[RpcCallSpec] = &[
         method: method::AGENTS_REPLY,
         params_schema: schema_of::<AgentReplyParams>,
         result_schema: schema_of::<AgentReplyResult>,
+    },
+    RpcCallSpec {
+        method: method::AGENTS_PROVIDER_SESSIONS,
+        params_schema: schema_of::<ProviderSessionsParams>,
+        result_schema: schema_of::<ProviderSessionsListResult>,
+    },
+    RpcCallSpec {
+        method: method::AGENTS_PROVIDER_RESUME,
+        params_schema: schema_of::<ProviderResumeParams>,
+        result_schema: schema_of::<AgentAttachResult>,
+    },
+    RpcCallSpec {
+        method: method::AGENTS_PROVIDER_DELETE,
+        params_schema: schema_of::<ProviderDeleteParams>,
+        result_schema: schema_of::<ProviderDeleteResult>,
     },
     RpcCallSpec {
         method: method::PROVIDERS_LIST,

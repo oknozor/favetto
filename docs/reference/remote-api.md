@@ -54,6 +54,9 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | `agents.attach` | Attach to a session: returns the session and a replay of its output. |
 | `agents.close` | Terminate a session. |
 | `agents.reply` | Answer a structured input request on a session's state channel. |
+| `agents.provider_sessions` | List provider-owned ACP sessions through the agent's advertised `session/list`, with cwd filtering and opaque cursor pagination. Distinct from `agents.history`: rows may never have been created by Favetto. Unsupported agents return `supported: false` and a reason. |
+| `agents.provider_resume` | Resume a provider-owned ACP session by its provider ACP id. Prefers `session/load` (with replay) when advertised, then `session/resume`; imports the session into a Favetto-local record and returns that local id for all subsequent calls. |
+| `agents.provider_delete` | Delete a provider-owned ACP session through the advertised `session/delete`. Only the provider transcript is deleted; Favetto-local metadata is untouched. |
 | `providers.list` | List configured providers and their available models. |
 | `schedules.list` | List cron schedules, with the next occurrence (`next_run`, UTC) computed for enabled entries. |
 | `schedules.upsert` | Create or update a cron schedule. |
@@ -711,6 +714,59 @@ Answer a structured input request on a session's state channel.
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
 | `replied` | boolean | — | yes |  |
+
+### `agents.provider_sessions`
+
+List provider-owned ACP sessions through the agent's advertised `session/list`, with cwd filtering and opaque cursor pagination. Distinct from `agents.history`: rows may never have been created by Favetto. Unsupported agents return `supported: false` and a reason.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `agent` | string (optional) | null | no |  |
+| `cwd` | string (optional) | null | no |  |
+| `cursor` | string (optional) | null | no |  |
+
+**Response**
+
+ProviderSessionsResult[]
+
+### `agents.provider_resume`
+
+Resume a provider-owned ACP session by its provider ACP id. Prefers `session/load` (with replay) when advertised, then `session/resume`; imports the session into a Favetto-local record and returns that local id for all subsequent calls.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `agent` | string (optional) | null | no |  |
+| `provider_session_id` | string | — | yes | The provider's ACP session id. This is not a Favetto-local routing key. |
+| `cwd` | string (optional) | null | no | Working directory to resume in. Defaults to the provider session's listed directory when omitted. |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `session` | AgentSessionInfo | — | yes |  |
+| `data` | string | — | yes | Base64-encoded `vt100` screen frame. |
+| `seq` | integer | `0` | no | The last normalized-event sequence already folded into `data`. A client that also consumes `agent.event` / `tasks.events` can resume strictly after this cursor without replaying text that the snapshot already contains. Older payloads omit it and decode as `0`. |
+
+### `agents.provider_delete`
+
+Delete a provider-owned ACP session through the advertised `session/delete`. Only the provider transcript is deleted; Favetto-local metadata is untouched.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `agent` | string (optional) | null | no |  |
+| `provider_session_id` | string | — | yes | The provider's ACP session id. This is not a Favetto-local routing key. |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `deleted` | boolean | — | yes |  |
 
 ### `providers.list`
 

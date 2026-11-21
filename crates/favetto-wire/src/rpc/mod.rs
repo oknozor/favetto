@@ -171,6 +171,15 @@ pub mod method {
     pub const AGENTS_CLOSE: &str = "agents.close";
     /// Answer a structured input request on a session's state channel.
     pub const AGENTS_REPLY: &str = "agents.reply";
+    /// List provider-owned ACP sessions through the agent's advertised
+    /// `session/list`, distinct from Favetto's durable `agents.history` rows.
+    pub const AGENTS_PROVIDER_SESSIONS: &str = "agents.provider_sessions";
+    /// Resume a provider-owned ACP session by the provider's own session id,
+    /// preferring `session/load` and falling back to `session/resume`.
+    pub const AGENTS_PROVIDER_RESUME: &str = "agents.provider_resume";
+    /// Delete a provider-owned ACP session through `session/delete`; Favetto's
+    /// local metadata is left untouched.
+    pub const AGENTS_PROVIDER_DELETE: &str = "agents.provider_delete";
     /// List configured providers and their available models.
     pub const PROVIDERS_LIST: &str = "providers.list";
     /// List cron schedules.
@@ -337,6 +346,26 @@ pub const CLIENT_METHODS: &[(&str, &str)] = &[
     (
         method::AGENTS_REPLY,
         "Answer a structured input request on a session's state channel.",
+    ),
+    (
+        method::AGENTS_PROVIDER_SESSIONS,
+        "List provider-owned ACP sessions through the agent's advertised \
+         `session/list`, with cwd filtering and opaque cursor pagination. \
+         Distinct from `agents.history`: rows may never have been created by \
+         Favetto. Unsupported agents return `supported: false` and a reason.",
+    ),
+    (
+        method::AGENTS_PROVIDER_RESUME,
+        "Resume a provider-owned ACP session by its provider ACP id. Prefers \
+         `session/load` (with replay) when advertised, then `session/resume`; \
+         imports the session into a Favetto-local record and returns that local \
+         id for all subsequent calls.",
+    ),
+    (
+        method::AGENTS_PROVIDER_DELETE,
+        "Delete a provider-owned ACP session through the advertised \
+         `session/delete`. Only the provider transcript is deleted; Favetto-local \
+         metadata is untouched.",
     ),
     (
         method::PROVIDERS_LIST,
@@ -533,6 +562,9 @@ mod tests {
             method::AGENTS_ATTACH,
             method::AGENTS_CLOSE,
             method::AGENTS_REPLY,
+            method::AGENTS_PROVIDER_SESSIONS,
+            method::AGENTS_PROVIDER_RESUME,
+            method::AGENTS_PROVIDER_DELETE,
             method::PROVIDERS_LIST,
             method::SCHEDULES_LIST,
             method::SCHEDULES_UPSERT,

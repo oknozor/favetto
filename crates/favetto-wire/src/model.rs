@@ -725,6 +725,68 @@ pub struct AgentSessionHistoryEntry {
     pub updated_at: DateTime<Utc>,
 }
 
+/// One provider-owned (ACP) session discovered through `session/list`.
+///
+/// Provider history is deliberately separate from Favetto's durable
+/// [`AgentSessionHistoryEntry`] records: a provider row may never have been seen
+/// by Favetto. `session_id` is the provider's own ACP id and is only accepted by
+/// the provider-specific RPCs (`agents.provider_resume` /
+/// `agents.provider_delete`), never by `agents.load` or `agents.attach`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProviderSessionEntry {
+    /// Configured `[agents.<name>]` key that owns the provider session.
+    pub agent: String,
+    /// The agent's ACP session id.
+    pub session_id: String,
+    /// Working directory reported by the provider.
+    pub cwd: PathBuf,
+    /// Display title reported by the provider, when it reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Provider-reported last-activity timestamp (ISO 8601), when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    /// The Favetto-local record already imported for this provider session, if
+    /// any. When present, resume reuses that local row instead of creating a
+    /// duplicate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_session_id: Option<String>,
+}
+
+/// One configured agent's provider-session page, as returned by
+/// `agents.provider_sessions`.
+///
+/// `supported` is the `sessionCapabilities.list` advertisement. `sessions` is
+/// empty when list is unsupported or the provider failed; `error` explains why.
+/// `can_resume` covers `loadSession` or `sessionCapabilities.resume`, and
+/// `can_delete` covers `sessionCapabilities.delete`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProviderSessionsResult {
+    /// Configured agent key these sessions belong to.
+    pub agent: String,
+    /// Whether the agent advertised ACP `session/list`.
+    #[serde(default)]
+    pub supported: bool,
+    /// Whether provider sessions can be restored (`session/load` or
+    /// `session/resume`).
+    #[serde(default)]
+    pub can_resume: bool,
+    /// Whether the agent advertised ACP `session/delete`.
+    #[serde(default)]
+    pub can_delete: bool,
+    /// This page's provider sessions.
+    #[serde(default)]
+    pub sessions: Vec<ProviderSessionEntry>,
+    /// Opaque cursor for the next page, when the provider reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Why listing failed or is unsupported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// What an external agent CLI can do, so the daemon and TUI can adapt without
 /// hard-coding a specific CLI's behaviour.
 ///
@@ -1615,6 +1677,45 @@ mod tests {
         };
         let json = serde_json::to_value(&ready).unwrap();
         assert!(json.get("load_error").is_none());
+    }
+
+    #[test]
+    fn provider_sessions_round_trip_and_keep_the_agent_scope() {
+        let result = ProviderSessionsResult {
+            agent: "opencode".to_string(),
+            supported: true,
+            can_resume: true,
+            can_delete: false,
+            sessions: vec![ProviderSessionEntry {
+                agent: "opencode".to_string(),
+                session_id: "provider-ses-1".to_string(),
+                cwd: PathBuf::from("/work"),
+                title: Some("Provider session".to_string()),
+                updated_at: Some("2026-11-21T10:00:00Z".to_string()),
+                local_session_id: Some("local-1".to_string()),
+            }],
+            next_cursor: Some("cursor-2".to_string()),
+            error: None,
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["agent"], "opencode");
+        assert_eq!(json["supported"], true);
+        assert_eq!(json["can_resume"], true);
+        assert_eq!(json["can_delete"], false);
+        assert_eq!(json["sessions"][0]["session_id"], "provider-ses-1");
+        assert_eq!(json["sessions"][0]["agent"], "opencode");
+        assert_eq!(json["next_cursor"], "cursor-2");
+        let back: ProviderSessionsResult = serde_json::from_value(json).unwrap();
+        assert_eq!(back, result);
+
+        // Capability and paging fields are additive for older producers.
+        let lean: ProviderSessionsResult =
+            serde_json::from_str(r#"{"agent":"pi","sessions":[]}"#).unwrap();
+        assert!(!lean.supported);
+        assert!(!lean.can_resume);
+        assert!(!lean.can_delete);
+        assert!(lean.next_cursor.is_none());
+        assert!(lean.error.is_none());
     }
 
     #[test]

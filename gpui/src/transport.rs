@@ -254,6 +254,12 @@ typed_calls! {
     agents_load => AgentsLoadCall,
     /// `agents.reply`.
     agents_reply => AgentsReplyCall,
+    /// `agents.provider_sessions`.
+    agents_provider_sessions => AgentsProviderSessionsCall,
+    /// `agents.provider_resume`.
+    agents_provider_resume => AgentsProviderResumeCall,
+    /// `agents.provider_delete`.
+    agents_provider_delete => AgentsProviderDeleteCall,
     /// `workflow.get`.
     workflow_get => WorkflowGetCall,
     /// `workflow.inspect`.

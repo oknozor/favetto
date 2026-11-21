@@ -104,6 +104,16 @@ impl SessionStore {
         Ok(())
     }
 
+    /// The local record already imported for a provider session, keyed by the
+    /// configured agent and the provider's own ACP id.
+    pub(crate) async fn find_by_external(
+        &self,
+        agent: &str,
+        external_session_id: &str,
+    ) -> anyhow::Result<Option<AgentSessionRecord>> {
+        db::get_agent_session_by_external(&self.pool, agent, external_session_id).await
+    }
+
     /// Mark the session closed, keeping the row for history.
     pub(crate) async fn mark_ended(&self, id: &str) -> anyhow::Result<()> {
         if !db::close_agent_session(&self.pool, id, Utc::now()).await? {

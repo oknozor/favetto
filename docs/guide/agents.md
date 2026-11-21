@@ -142,13 +142,40 @@ replayed transcript across reconnects, and accepts follow-up prompts. Loading a
 session does not send a prompt, run its linked task, create a new run, or change
 an interrupted run's status.
 
-Only sessions **created by Favetto** are listed. Importing arbitrary sessions
-from a provider via ACP `session/list` is out of scope; whether a past session is
-loadable also depends on the agent advertising the ACP `loadSession`
-capability. An unsupported capability, an agent-reported `session/load` error,
-or an initialization failure is reported as a failed restore, with the session
-still listed and any partial replay discarded. A failed restore can be retried
-from the clients; it never falls back to a fresh session.
+`agents.history` lists only sessions **created by Favetto**. Provider-owned
+history is separate and is queried from the agent itself with ACP
+`session/list` through `agents.provider_sessions`; the daemon only issues that
+request when the agent advertises `sessionCapabilities.list`. It supports the
+provider's `cwd` filter and opaque cursor pagination. A provider result is never
+merged into Favetto's durable records.
+
+A provider session is imported into a durable Favetto record **only when it is
+resumed**. `agents.provider_resume` takes the configured agent and the provider's
+own ACP session id, prefers `session/load` when `loadSession` is advertised (so
+the replay is applied before readiness), and otherwise uses `session/resume`
+when the agent advertises `sessionCapabilities.resume`. The result carries the
+new Favetto-local id; all later `agents.attach`, `agents.load`, prompts and
+closes use that local id. Resuming the same provider session again reuses its
+imported local record instead of creating a duplicate.
+
+Provider transcript deletion is capability gated too: `agents.provider_delete`
+calls ACP `session/delete` only when `sessionCapabilities.delete` is advertised.
+It deletes the provider transcript only — Favetto's local metadata is a distinct
+lifecycle and stays in `agents.history`. Deleting an active provider transcript
+is refused; close its local session first.
+
+The TUI **Ctrl+O** picker and the desktop **Settings → Agents → Past sessions**
+card show both local and provider rows. Provider rows are labelled `provider`;
+they can be resumed when load/resume is advertised and deleted (Ctrl+D in the
+TUI) when delete is advertised. Unsupported actions are absent or disabled with
+an inline explanation.
+
+Whether a local past session is loadable also depends on the agent advertising
+the ACP `loadSession` capability. An unsupported capability, an agent-reported
+`session/load` error, or an initialization failure is reported as a failed
+restore, with the session still listed and any partial replay discarded. A
+failed restore can be retried from the clients; it never falls back to a fresh
+session.
 
 Conversation transcript ownership stays with the ACP agent. Favetto stores
 metadata only; the bounded, prunable task output/event feed is not a transcript

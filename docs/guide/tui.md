@@ -161,9 +161,12 @@ If accepting the picker or opening a task fails, the error is shown in the statu
 bar (the same place the connection state and counts live) rather than only in the
 internal log ring.
 
-Only Favetto-created sessions are listed; importing arbitrary provider sessions
-via ACP `session/list` is out of scope. The web Settings page exposes the same
-history and load action through `agents.history` / `agents.load`.
+The picker merges Favetto-created sessions (`agents.history` / `agents.load`) with
+provider-owned sessions from the agent's advertised ACP `session/list`.
+Provider rows are labelled `provider`; type to filter by title, agent or
+directory. Resuming one imports it into a Favetto-local record, and `Ctrl+D`
+deletes a provider transcript only when the agent advertises `session/delete`.
+Unsupported agents show an inline explanation instead of an action.
 
 ## Copy agent output
 

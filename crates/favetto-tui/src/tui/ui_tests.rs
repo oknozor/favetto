@@ -138,6 +138,7 @@ fn all_popups_render_without_panic() {
                     picker("s1", "opencode", false, true),
                     picker("s2", "pi", true, false),
                 ],
+                filter: TextBuffer::default(),
             },
             Popup::Reply(ReplyPrompt::new(
                 "s1".to_string(),
