@@ -42,8 +42,18 @@ impl DaemonHarness {
     /// Spawn a daemon, retrying if the ephemeral port is stolen before the
     /// daemon binds it (the child then exits and its scratch dir is removed).
     fn spawn() -> Self {
+        Self::spawn_with(|_| Vec::new())
+    }
+
+    /// Spawn a daemon whose fake agent receives additional environment
+    /// variables, computed from the scratch root so tests can point the agent
+    /// at marker files inside it.
+    fn spawn_with<F>(agent_env: F) -> Self
+    where
+        F: Fn(&Path) -> Vec<(String, String)>,
+    {
         for _ in 0..8 {
-            let mut daemon = Self::try_spawn();
+            let mut daemon = Self::try_spawn(&agent_env);
             if daemon.wait_bound() {
                 return daemon;
             }
@@ -74,7 +84,10 @@ impl DaemonHarness {
 
     /// Create a scratch workspace with a fake echo agent and a one-task catalog,
     /// then spawn `favetto daemon` against it.
-    fn try_spawn() -> Self {
+    fn try_spawn<F>(agent_env: &F) -> Self
+    where
+        F: Fn(&Path) -> Vec<(String, String)>,
+    {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -96,13 +109,17 @@ impl DaemonHarness {
         )
         .unwrap();
 
+        let env_lines: String = agent_env(&root)
+            .iter()
+            .map(|(key, value)| format!("{key} = {value:?}\n"))
+            .collect();
         let config_path = root.join("config.toml");
         std::fs::write(
             &config_path,
             format!(
                 "[agent]\ndefault = \"echo\"\n\n\
                  [agents.echo]\ncommand = {:?}\nargs = []\n\
-                 [agents.echo.env]\nFAKE_ACP_IGNORE_CLOSE = \"1\"\n",
+                 [agents.echo.env]\n{env_lines}",
                 agent
             ),
         )
@@ -265,6 +282,138 @@ impl WireClient {
             }
         }
     }
+}
+
+/// Point the fake agent at per-daemon close and PID markers.
+fn marker_env(root: &Path) -> Vec<(String, String)> {
+    vec![
+        (
+            "FAKE_ACP_CLOSE_MARKER".to_string(),
+            root.join("close-marker").to_string_lossy().into_owned(),
+        ),
+        (
+            "FAKE_ACP_PID_MARKER".to_string(),
+            root.join("agent-pid").to_string_lossy().into_owned(),
+        ),
+    ]
+}
+
+/// Start the catalog's echo task, wait for it to finish, and return its row.
+async fn run_echo_task(daemon: &DaemonHarness) -> serde_json::Value {
+    wait_for_unix_socket(daemon.socket(), daemon).await;
+    let mut client = WireClient::connect(daemon.socket()).await;
+    let started = client
+        .request(
+            method::TASKS_START,
+            serde_json::json!({ "name": "echo_task" }),
+        )
+        .await;
+    assert!(
+        started.error.is_none(),
+        "tasks.start failed: {:?}",
+        started.error
+    );
+    let task_id = started.result.expect("tasks.start result")["id"]
+        .as_str()
+        .expect("task id")
+        .to_string();
+    let finished = client
+        .notification(|n| {
+            n.method == push::EVENT
+                && n.params["kind"] == "task_finished"
+                && n.params["payload"]["name"] == "echo_task"
+        })
+        .await;
+    assert_eq!(
+        finished.params["payload"]["success"],
+        serde_json::json!(true),
+        "the fake echo agent should have succeeded: {finished:?}"
+    );
+    client
+        .request(method::TASKS_GET, serde_json::json!({ "id": task_id }))
+        .await
+        .result
+        .expect("tasks.get result")
+}
+
+/// Wait for the fake agent to write its PID, then for the process to be gone.
+/// `running` is cleared before the supervisor reaps the child, so this polls.
+async fn wait_for_agent_exit(daemon: &DaemonHarness) {
+    let pid_path = daemon.root.join("agent-pid");
+    let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+    let pid = loop {
+        if let Ok(text) = std::fs::read_to_string(&pid_path) {
+            if let Ok(pid) = text.trim().parse::<u32>() {
+                break pid;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the fake agent never wrote its PID to {}",
+            pid_path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    loop {
+        // SAFETY: signal 0 only probes whether the process still exists.
+        let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+        if !alive {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fake ACP agent {pid} survived session teardown\n--- daemon log ---\n{}",
+            daemon.log()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+async fn acp_session_close_is_sent_when_advertised() {
+    let daemon = DaemonHarness::spawn_with(marker_env);
+    let task = run_echo_task(&daemon).await;
+    assert_eq!(task["status"], "succeeded");
+    assert!(
+        daemon.root.join("close-marker").exists(),
+        "an agent that advertises session/close should receive it\n--- daemon log ---\n{}",
+        daemon.log()
+    );
+    wait_for_agent_exit(&daemon).await;
+}
+
+#[tokio::test]
+async fn acp_session_close_is_not_sent_when_not_advertised() {
+    let daemon = DaemonHarness::spawn_with(|root| {
+        let mut env = marker_env(root);
+        env.push(("FAKE_ACP_CLOSE_ADVERTISED".to_string(), "0".to_string()));
+        env
+    });
+    let task = run_echo_task(&daemon).await;
+    assert_eq!(task["status"], "succeeded");
+    assert!(
+        !daemon.root.join("close-marker").exists(),
+        "session/close must not be sent without an advertised capability\n--- daemon log ---\n{}",
+        daemon.log()
+    );
+    wait_for_agent_exit(&daemon).await;
+}
+
+#[tokio::test]
+async fn acp_session_close_times_out_without_blocking_teardown() {
+    let daemon = DaemonHarness::spawn_with(|root| {
+        let mut env = marker_env(root);
+        env.push(("FAKE_ACP_IGNORE_CLOSE".to_string(), "1".to_string()));
+        env
+    });
+    let task = run_echo_task(&daemon).await;
+    assert_eq!(task["status"], "succeeded");
+    assert!(
+        daemon.root.join("close-marker").exists(),
+        "an advertised close should still be attempted before timing out\n--- daemon log ---\n{}",
+        daemon.log()
+    );
+    wait_for_agent_exit(&daemon).await;
 }
 
 #[tokio::test]

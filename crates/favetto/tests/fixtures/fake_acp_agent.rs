@@ -3,7 +3,8 @@
 //! It implements just enough of the protocol for one prompt turn: `initialize`,
 //! `session/new`, `session/prompt` (echoing the prompt back as an assistant
 //! message) and `session/close`. Every request is answered synchronously so the
-//! tests are not timing-dependent.
+//! tests are not timing-dependent, except where an environment variable asks it
+//! to model an unresponsive close or omit the optional close capability.
 //!
 //! This is a test fixture, not a real agent. It is compiled as a `[[bin]]` so the
 //! daemon can launch it exactly like any other ACP server.
@@ -40,6 +41,9 @@ fn main() {
     // per-agent uniqueness constraint) do not collide. A load replaces it with
     // the stored id supplied by the client.
     let mut session_id = format!("{SESSION_ID}-{}", std::process::id());
+    if let Some(marker) = std::env::var_os("FAKE_ACP_PID_MARKER") {
+        let _ = std::fs::write(marker, std::process::id().to_string());
+    }
     let mut lines = stdin.lock().lines();
     let mut prompt_turn = 0u32;
     while let Some(Ok(line)) = lines.next() {
@@ -63,14 +67,18 @@ fn main() {
                     }
                     continue;
                 }
+                let mut capabilities = json!({
+                    "loadSession": load_supported()
+                });
+                if close_advertised() {
+                    capabilities["sessionCapabilities"] = json!({ "close": {} });
+                }
                 respond(
                     &mut stdout,
                     id,
                     json!({
                         "protocolVersion": 1,
-                        "agentCapabilities": {
-                            "loadSession": load_supported()
-                        }
+                        "agentCapabilities": capabilities
                     }),
                 );
             }
@@ -183,7 +191,12 @@ fn main() {
                 );
             }
             "session/close" => {
-                // Simulate agents that ignore the optional close request.
+                // Record that the optional request arrived, even when this fake
+                // is configured to ignore it.
+                if let Some(marker) = std::env::var_os("FAKE_ACP_CLOSE_MARKER") {
+                    let _ = std::fs::write(marker, b"session/close\n");
+                }
+                // Simulate agents that advertise close but never answer it.
                 if std::env::var_os("FAKE_ACP_IGNORE_CLOSE").is_none() {
                     respond(&mut stdout, id, json!({}));
                 }
@@ -364,6 +377,16 @@ fn record(line: &str) {
 fn load_supported() -> bool {
     !matches!(
         std::env::var("FAKE_ACP_LOAD_SUPPORTED").as_deref(),
+        Ok("0" | "false")
+    )
+}
+
+/// Whether to advertise `sessionCapabilities.close`. Enabled by default; tests
+/// set `FAKE_ACP_CLOSE_ADVERTISED=0` to model an agent that omits the optional
+/// capability entirely.
+fn close_advertised() -> bool {
+    !matches!(
+        std::env::var("FAKE_ACP_CLOSE_ADVERTISED").as_deref(),
         Ok("0" | "false")
     )
 }
