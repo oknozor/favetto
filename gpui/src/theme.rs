@@ -122,6 +122,20 @@ pub struct Colors {
     pub success: Rgba,
 }
 
+/// Code-highlighting colors for fenced blocks (Zed-like, accessible on each
+/// theme's surface). Views never use literal colours for syntax.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SyntaxColors {
+    pub keyword: Rgba,
+    pub string: Rgba,
+    pub number: Rgba,
+    pub comment: Rgba,
+    pub type_name: Rgba,
+    pub function: Rgba,
+    pub key: Rgba,
+    pub punctuation: Rgba,
+}
+
 /// Control heights in px. Compact density changes spacing, never these values:
 /// a target below [`MIN_TARGET`] would break Fitts's Law (docs §2).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -142,6 +156,7 @@ pub struct Theme {
     pub font: FontScale,
     pub controls: Controls,
     pub colors: Colors,
+    pub syntax: SyntaxColors,
 }
 
 static DARK: LazyLock<Theme> = LazyLock::new(|| Theme {
@@ -179,6 +194,16 @@ static DARK: LazyLock<Theme> = LazyLock::new(|| Theme {
         warning: rgb(0xFF9F0A),
         danger: rgb(0xFF453A),
         success: rgb(0x30D158),
+    },
+    syntax: SyntaxColors {
+        keyword: rgb(0xC678DD),
+        string: rgb(0x98C379),
+        number: rgb(0xD19A66),
+        comment: rgb(0x7F848E),
+        type_name: rgb(0xE5C07B),
+        function: rgb(0x61AFEF),
+        key: rgb(0xE06C75),
+        punctuation: rgb(0xABB2BF),
     },
 });
 
@@ -218,6 +243,16 @@ static LIGHT: LazyLock<Theme> = LazyLock::new(|| Theme {
         danger: rgb(0xFF3B30),
         success: rgb(0x34C759),
     },
+    syntax: SyntaxColors {
+        keyword: rgb(0xA626A4),
+        string: rgb(0x50A14F),
+        number: rgb(0x986801),
+        comment: rgb(0xA0A1A7),
+        type_name: rgb(0xC18401),
+        function: rgb(0x4078F2),
+        key: rgb(0xE45649),
+        punctuation: rgb(0x383A42),
+    },
 });
 
 /// The compact spacing scale: every step shrinks by roughly a quarter, so
@@ -237,6 +272,16 @@ static DARK_COMPACT: LazyLock<Theme> = LazyLock::new(|| compact(*DARK));
 static LIGHT_COMPACT: LazyLock<Theme> = LazyLock::new(|| compact(*LIGHT));
 
 impl Theme {
+    /// Narrow-detail-column heading scale (docs §3 type scale).
+    pub fn markdown_heading_size(&self, level: u8) -> f32 {
+        match level {
+            1 => self.font.lg,
+            2 => self.font.base,
+            3 | 4 => self.font.sm,
+            _ => self.font.xs,
+        }
+    }
+
     /// The theme following the OS appearance (docs §3: "dark/light flipped
     /// by the OS appearance"). Kept as the convenience entry point for tests
     /// and future non-Settings consumers; the shell uses [`Self::for_settings`].
@@ -301,5 +346,39 @@ mod tests {
             Density::Comfortable,
         );
         assert_eq!(light.colors.bg, LIGHT.colors.bg);
+    }
+
+    #[test]
+    fn syntax_palettes_differ_between_dark_and_light() {
+        assert_ne!(DARK.syntax.keyword, LIGHT.syntax.keyword);
+        assert_ne!(DARK.syntax.string, LIGHT.syntax.string);
+        assert_ne!(DARK.syntax.comment, LIGHT.syntax.comment);
+    }
+
+    #[test]
+    fn markdown_heading_sizes_are_non_increasing() {
+        let sizes: Vec<f32> = (1..=6)
+            .map(|level| DARK.markdown_heading_size(level))
+            .collect();
+        assert!(sizes[0] > sizes[1], "h1 must be larger than h2");
+        assert!(sizes[0] > DARK.font.base, "h1 must exceed body text");
+        assert!(sizes.windows(2).all(|pair| pair[0] >= pair[1]));
+    }
+
+    #[test]
+    fn compact_only_shrinks_spacing() {
+        let compact = Theme::for_settings(
+            WindowAppearance::Dark,
+            ThemeChoice::System,
+            Density::Compact,
+        );
+        assert!(compact.spacing.s2 < DARK.spacing.s2);
+        assert_eq!(compact.syntax, DARK.syntax);
+        for level in 1..=6 {
+            assert_eq!(
+                compact.markdown_heading_size(level),
+                DARK.markdown_heading_size(level)
+            );
+        }
     }
 }

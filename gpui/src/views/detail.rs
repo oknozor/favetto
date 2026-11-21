@@ -13,14 +13,17 @@
 //! The aggregation and feed grouping live in [`crate::detail`] (pure and
 //! unit-tested); this file only paints them.
 
+use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
 
 use chrono::Utc;
 use favetto_wire::model::{AgentUsage, InputReply, MessageRole, Task, TaskRun};
 use gpui::{
-    div, list, prelude::*, px, AnyElement, Context, Div, Entity, FocusHandle, Hsla, IntoElement,
-    ListAlignment, ListState, Render, ScrollHandle, ScrollWheelEvent, Stateful, Window,
+    div, list, prelude::*, px, AnyElement, Context, Div, ElementId, Entity, FocusHandle, FontStyle,
+    FontWeight, Hsla, InteractiveText, IntoElement, ListAlignment, ListState, Render, ScrollHandle,
+    ScrollWheelEvent, Stateful, StrikethroughStyle, StyledText, TextRun, TextStyle, UnderlineStyle,
+    Window,
 };
 use uuid::Uuid;
 
@@ -30,6 +33,8 @@ use crate::detail::{
 };
 use crate::inbox::{self, StatusKind};
 use crate::layout::{container_query, LayoutMode};
+use crate::markdown::syntax::{self, TokenKind};
+use crate::markdown::{self, Align, Block, Inline, MarkdownDoc};
 use crate::state::ClientState;
 use crate::tasks;
 use crate::theme::Theme;
@@ -62,8 +67,12 @@ pub struct DetailView {
     /// Virtualized feed state: only the visible window is measured/painted.
     events_list: ListState,
     /// The grouped feed, rebuilt only when the event revision changes.
-    events_feed: Rc<Vec<FeedItem>>,
+    events_feed: Rc<Vec<FeedRow>>,
     events_feed_key: Option<(Uuid, u64)>,
+    /// Parsed Markdown for the message/reasoning rows, keyed by content and
+    /// kept across feed revisions until a row disappears.
+    markdown: markdown::MarkdownCache,
+    markdown_task: Option<Uuid>,
     /// The content length at the last tail scroll, so auto-follow only reacts to
     /// growth (and never fights a deliberate scroll).
     output_rendered: usize,
@@ -111,6 +120,8 @@ impl DetailView {
             events_list,
             events_feed: Rc::new(Vec::new()),
             events_feed_key: None,
+            markdown: markdown::MarkdownCache::default(),
+            markdown_task: None,
             output_rendered: 0,
         };
         view.start_clock(cx);
@@ -1053,7 +1064,7 @@ impl DetailView {
         task_id: Uuid,
         revision: u64,
         cx: &mut Context<Self>,
-    ) -> Rc<Vec<FeedItem>> {
+    ) -> Rc<Vec<FeedRow>> {
         let key = (task_id, revision);
         if self.events_feed_key != Some(key) {
             let feed = {
@@ -1064,7 +1075,28 @@ impl DetailView {
                     .map(TaskDetail::feed)
                     .unwrap_or_default()
             };
-            self.events_feed = Rc::new(feed);
+
+            if self.markdown_task != Some(task_id) {
+                self.markdown = markdown::MarkdownCache::default();
+                self.markdown_task = Some(task_id);
+            }
+            self.markdown.begin_refresh();
+            let markdown = &mut self.markdown;
+            let rows = feed
+                .into_iter()
+                .map(|item| {
+                    let body = match &item {
+                        FeedItem::Message { text, .. } | FeedItem::Reasoning { text, .. } => {
+                            Some(markdown.doc(text))
+                        }
+                        _ => None,
+                    };
+                    FeedRow { item, body }
+                })
+                .collect();
+            self.markdown.end_refresh();
+
+            self.events_feed = Rc::new(rows);
             self.events_feed_key = Some(key);
 
             let follow = self.state.read(cx).detail_follow();
@@ -1140,14 +1172,15 @@ impl DetailView {
 
         let list_theme = *theme;
         let list_feed = feed.clone();
-        let list = list(self.events_list.clone(), move |index, _window, _cx| {
-            let Some(item) = list_feed.get(index) else {
+        let list = list(self.events_list.clone(), move |index, window, _cx| {
+            let Some(row) = list_feed.get(index) else {
                 return div().into_any_element();
             };
+            let base = window.text_style();
             div()
                 .px(px(list_theme.spacing.s3))
                 .pb(px(list_theme.spacing.s2))
-                .child(feed_item(&list_theme, item))
+                .child(feed_item(&list_theme, &base, index, row))
                 .into_any_element()
         })
         .flex_1()
@@ -1311,12 +1344,18 @@ struct ErrorBody<'a> {
 
 /// Everything the Events tab body needs, extracted from the state in one go.
 struct EventsBody {
-    feed: Rc<Vec<FeedItem>>,
+    feed: Rc<Vec<FeedRow>>,
     loading: bool,
     loaded: bool,
     error: Option<String>,
     session: Option<String>,
     ignored: usize,
+}
+
+/// One rendered feed row plus the parsed Markdown for prose/reasoning items.
+struct FeedRow {
+    item: FeedItem,
+    body: Option<Rc<MarkdownDoc>>,
 }
 
 /// Everything the Runs tab body needs, extracted from the state in one go.
@@ -1539,51 +1578,59 @@ fn outcome_label(outcome: favetto_wire::model::IdleOutcome) -> &'static str {
 }
 
 /// One feed item. Message and reasoning blocks can be long, so the text wraps
-/// inside the narrow detail column; nothing here interprets ANSI.
-fn feed_item(theme: &Theme, item: &FeedItem) -> Div {
-    match item {
-        FeedItem::Message { role, text } => div()
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .child(
-                div()
-                    .text_size(px(theme.font.xs))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(match role {
-                        MessageRole::Assistant => theme.colors.accent,
-                        MessageRole::User => theme.colors.success,
-                        MessageRole::System | MessageRole::Tool => theme.colors.muted,
-                    })
-                    .child(role_label(*role)),
-            )
-            .child(
-                div()
+/// inside the narrow detail column; nothing here interprets ANSI. Prose and
+/// reasoning bodies render as Markdown, while every other row keeps its
+/// existing card/row treatment.
+fn feed_item(theme: &Theme, base: &TextStyle, index: usize, row: &FeedRow) -> Div {
+    match &row.item {
+        FeedItem::Message { role, text } => {
+            let header = div()
+                .text_size(px(theme.font.xs))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(match role {
+                    MessageRole::Assistant => theme.colors.accent,
+                    MessageRole::User => theme.colors.success,
+                    MessageRole::System | MessageRole::Tool => theme.colors.muted,
+                })
+                .child(role_label(*role));
+            let body = match row.body.as_deref() {
+                Some(doc) => markdown_body(theme, base, Some(doc), Tone::Prose, index),
+                None => div()
                     .text_size(px(theme.font.sm))
                     .text_color(theme.colors.text)
                     .child(text.clone()),
-            ),
-        FeedItem::Reasoning { text, streaming } => div()
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(theme.spacing.s1))
-                    .text_size(px(theme.font.xs))
-                    .text_color(theme.colors.muted)
-                    .child("reasoning")
-                    .when(*streaming, |row| row.child("…")),
-            )
-            .child(
-                div()
+            };
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(header)
+                .child(body)
+        }
+        FeedItem::Reasoning { text, streaming } => {
+            let header = div()
+                .flex()
+                .items_center()
+                .gap(px(theme.spacing.s1))
+                .text_size(px(theme.font.xs))
+                .text_color(theme.colors.muted)
+                .child("reasoning")
+                .when(*streaming, |row| row.child("…"));
+            let body = match row.body.as_deref() {
+                Some(doc) => markdown_body(theme, base, Some(doc), Tone::Reasoning, index),
+                None => div()
                     .text_size(px(theme.font.sm))
                     .text_color(theme.colors.muted)
                     .italic()
                     .child(text.clone()),
-            ),
+            };
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(header)
+                .child(body)
+        }
         FeedItem::Tool {
             name,
             input,
@@ -1749,6 +1796,482 @@ fn feed_item(theme: &Theme, item: &FeedItem) -> Div {
     }
 }
 
+/// Which visual treatment a Markdown body uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tone {
+    Prose,
+    Reasoning,
+}
+
+/// How many element ids each feed row may consume before the next row starts.
+const MARKDOWN_ROW_STRIDE: u64 = 100_000;
+
+fn markdown_body(
+    theme: &Theme,
+    base: &TextStyle,
+    doc: Option<&MarkdownDoc>,
+    tone: Tone,
+    row: usize,
+) -> Div {
+    let mut ids = row as u64 * MARKDOWN_ROW_STRIDE;
+    match doc {
+        Some(doc) => render_blocks(theme, base, &doc.blocks, tone, 0, &mut ids),
+        None => div(),
+    }
+}
+
+fn render_blocks(
+    theme: &Theme,
+    base: &TextStyle,
+    blocks: &[Block],
+    tone: Tone,
+    depth: usize,
+    ids: &mut u64,
+) -> Div {
+    let mut column = div().flex().flex_col().gap(px(theme.spacing.s2)).min_w_0();
+    for block in blocks {
+        column = column.child(render_block(theme, base, block, tone, depth, ids));
+    }
+    column
+}
+
+fn render_block(
+    theme: &Theme,
+    base: &TextStyle,
+    block: &Block,
+    tone: Tone,
+    depth: usize,
+    ids: &mut u64,
+) -> Div {
+    match block {
+        Block::Heading { level, content } => {
+            let (size, weight, color) = heading_style(theme, *level);
+            let mut heading = div().min_w_0().child(prose_colored(
+                theme, base, content, tone, size, weight, color, ids,
+            ));
+            if *level <= 2 {
+                heading = heading.pt(px(theme.spacing.s1));
+            }
+            heading
+        }
+        Block::Paragraph(content) => div().min_w_0().child(prose(
+            theme,
+            base,
+            content,
+            tone,
+            theme.font.sm,
+            base.font_weight,
+            ids,
+        )),
+        Block::Code { language, code } => render_code_block(theme, base, language, code),
+        Block::List {
+            ordered,
+            start,
+            items,
+        } => render_list(theme, base, *ordered, *start, items, tone, depth, ids),
+        Block::Quote(blocks) => div()
+            .flex()
+            .flex_col()
+            .min_w_0()
+            .pl(px(theme.spacing.s2))
+            .border_l_2()
+            .border_color(theme.colors.border)
+            .child(render_blocks(
+                theme,
+                base,
+                blocks,
+                Tone::Reasoning,
+                depth + 1,
+                ids,
+            )),
+        Block::Rule => div()
+            .w_full()
+            .py(px(theme.spacing.s1))
+            .child(div().w_full().h(px(1.0)).bg(theme.colors.border)),
+        Block::Table { align, head, rows } => {
+            render_table(theme, base, align, head, rows, tone, depth, ids)
+        }
+    }
+}
+
+fn heading_style(theme: &Theme, level: u8) -> (f32, FontWeight, Hsla) {
+    let weight = match level {
+        1 | 2 => FontWeight::BOLD,
+        3 | 5 => FontWeight::SEMIBOLD,
+        _ => FontWeight::MEDIUM,
+    };
+    let color = if level >= 5 {
+        Hsla::from(theme.colors.muted)
+    } else {
+        Hsla::from(theme.colors.text)
+    };
+    (theme.markdown_heading_size(level), weight, color)
+}
+
+fn prose(
+    theme: &Theme,
+    base: &TextStyle,
+    content: &[Inline],
+    tone: Tone,
+    size: f32,
+    weight: FontWeight,
+    ids: &mut u64,
+) -> AnyElement {
+    let color = match tone {
+        Tone::Prose => Hsla::from(theme.colors.text),
+        Tone::Reasoning => Hsla::from(theme.colors.muted),
+    };
+    prose_colored(theme, base, content, tone, size, weight, color, ids)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prose_colored(
+    theme: &Theme,
+    base: &TextStyle,
+    content: &[Inline],
+    tone: Tone,
+    size: f32,
+    weight: FontWeight,
+    color: Hsla,
+    ids: &mut u64,
+) -> AnyElement {
+    let inline = markdown::flatten(content);
+    let id = *ids;
+    *ids = (*ids).wrapping_add(1);
+    inline_styled(theme, base, &inline, tone, size, weight, color, id)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inline_styled(
+    theme: &Theme,
+    base: &TextStyle,
+    inline: &markdown::InlineText,
+    tone: Tone,
+    size: f32,
+    weight: FontWeight,
+    color: Hsla,
+    id: u64,
+) -> AnyElement {
+    let (runs, links) = inline_runs(theme, base, inline, tone, size, weight, color);
+    let styled = StyledText::new(inline.text.clone()).with_runs(runs);
+    if links.is_empty() {
+        return div()
+            .min_w_0()
+            .whitespace_normal()
+            .child(styled)
+            .into_any_element();
+    }
+
+    let ranges: Vec<Range<usize>> = links.iter().map(|(range, _)| range.clone()).collect();
+    let urls: Vec<String> = links.into_iter().map(|(_, url)| url).collect();
+    let text = InteractiveText::new(ElementId::NamedInteger("md-prose".into(), id), styled)
+        .on_click(ranges, move |index, _window, cx| {
+            if let Some(url) = urls.get(index) {
+                cx.open_url(url);
+            }
+        });
+    div()
+        .min_w_0()
+        .whitespace_normal()
+        .child(text)
+        .into_any_element()
+}
+
+fn inline_runs(
+    theme: &Theme,
+    base: &TextStyle,
+    inline: &markdown::InlineText,
+    tone: Tone,
+    size: f32,
+    weight: FontWeight,
+    color: Hsla,
+) -> (Vec<TextRun>, Vec<(Range<usize>, String)>) {
+    let mut runs = Vec::new();
+    let mut links = Vec::new();
+    let mut cursor = 0usize;
+
+    for span in &inline.spans {
+        if span.range.start > cursor {
+            runs.push(
+                base_style(base, tone, size, weight, color).to_run(span.range.start - cursor),
+            );
+        }
+        let start = span.range.start.max(cursor);
+        let end = span.range.end.max(start);
+        cursor = end;
+
+        let mut style = base_style(base, tone, size, weight, color);
+        if span.style.code {
+            style.font_family = "monospace".into();
+            style.background_color = Some(Hsla::from(theme.colors.border).opacity(0.35));
+        }
+        if span.style.strong {
+            style.font_weight = FontWeight::SEMIBOLD;
+        }
+        if span.style.emphasis {
+            style.font_style = FontStyle::Italic;
+        }
+        if span.style.strike {
+            style.strikethrough = Some(StrikethroughStyle {
+                thickness: px(1.0),
+                color: Some(Hsla::from(theme.colors.muted)),
+            });
+        }
+        if let Some(url) = &span.style.link {
+            style.color = Hsla::from(theme.colors.accent);
+            style.underline = Some(UnderlineStyle {
+                thickness: px(1.0),
+                color: Some(Hsla::from(theme.colors.accent)),
+                wavy: false,
+            });
+            if is_openable(url) {
+                links.push((start..end, url.clone()));
+            }
+        }
+        runs.push(style.to_run(end - start));
+    }
+
+    if cursor < inline.text.len() {
+        runs.push(base_style(base, tone, size, weight, color).to_run(inline.text.len() - cursor));
+    }
+    if runs.is_empty() && !inline.text.is_empty() {
+        runs.push(base_style(base, tone, size, weight, color).to_run(inline.text.len()));
+    }
+    debug_assert_eq!(
+        runs.iter().map(|run| run.len).sum::<usize>(),
+        inline.text.len()
+    );
+    (runs, links)
+}
+
+fn base_style(
+    base: &TextStyle,
+    tone: Tone,
+    size: f32,
+    weight: FontWeight,
+    color: Hsla,
+) -> TextStyle {
+    let mut style = base.clone();
+    style.font_size = px(size).into();
+    style.font_weight = weight;
+    style.color = color;
+    if matches!(tone, Tone::Reasoning) {
+        style.font_style = FontStyle::Italic;
+    }
+    style
+}
+
+fn is_openable(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+fn render_code_block(theme: &Theme, base: &TextStyle, language: &str, code: &str) -> Div {
+    let mut container = div()
+        .flex()
+        .flex_col()
+        .min_w_0()
+        .overflow_hidden()
+        .rounded(px(theme.radii.r4))
+        .border_1()
+        .border_color(Hsla::from(theme.colors.border).opacity(0.45))
+        .bg(Hsla::from(theme.colors.border).opacity(0.12));
+
+    let label = syntax::language_name(language);
+    if !label.is_empty() {
+        container = container.child(
+            div()
+                .px(px(theme.spacing.s2))
+                .py(px(theme.spacing.s1))
+                .border_b_1()
+                .border_color(Hsla::from(theme.colors.border).opacity(0.35))
+                .font_family("monospace")
+                .text_size(px(theme.font.xs))
+                .text_color(theme.colors.muted)
+                .child(label),
+        );
+    }
+
+    let tokens = syntax::highlight(language, code);
+    let mut text = String::new();
+    let mut runs = Vec::new();
+    for token in tokens {
+        let mut style = base.clone();
+        style.font_family = "monospace".into();
+        style.font_size = px(theme.font.xs).into();
+        style.color = Hsla::from(syntax_color(theme, token.kind));
+        text.push_str(&token.text);
+        runs.push(style.to_run(token.text.len()));
+    }
+
+    if !text.is_empty() {
+        container = container.child(
+            div()
+                .min_w_0()
+                .whitespace_normal()
+                .p(px(theme.spacing.s2))
+                .child(StyledText::new(text).with_runs(runs)),
+        );
+    }
+    container
+}
+
+fn syntax_color(theme: &Theme, kind: TokenKind) -> gpui::Rgba {
+    match kind {
+        TokenKind::Plain => theme.colors.text,
+        TokenKind::Keyword => theme.syntax.keyword,
+        TokenKind::String => theme.syntax.string,
+        TokenKind::Number => theme.syntax.number,
+        TokenKind::Comment => theme.syntax.comment,
+        TokenKind::Type => theme.syntax.type_name,
+        TokenKind::Function => theme.syntax.function,
+        TokenKind::Key => theme.syntax.key,
+        TokenKind::Operator | TokenKind::Punctuation => theme.syntax.punctuation,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_list(
+    theme: &Theme,
+    base: &TextStyle,
+    ordered: bool,
+    start: u64,
+    items: &[markdown::ListItem],
+    tone: Tone,
+    depth: usize,
+    ids: &mut u64,
+) -> Div {
+    let mut column = div().flex().flex_col().gap(px(theme.spacing.s1)).min_w_0();
+    if depth > 0 {
+        column = column.pl(px(theme.spacing.s3));
+    }
+
+    for (offset, item) in items.iter().enumerate() {
+        let (marker, color) = match item.task {
+            Some(true) => ("☑".to_string(), theme.colors.accent),
+            Some(false) => ("☐".to_string(), theme.colors.accent),
+            None if ordered => (format!("{}.", start + offset as u64), theme.colors.muted),
+            None => ("•".to_string(), theme.colors.muted),
+        };
+        let content = if item.blocks.is_empty() {
+            div()
+        } else {
+            render_blocks(theme, base, &item.blocks, tone, depth + 1, ids)
+        };
+        column = column.child(
+            div()
+                .flex()
+                .items_start()
+                .gap(px(theme.spacing.s2))
+                .min_w_0()
+                .child(
+                    div()
+                        .w(px(18.0))
+                        .flex_shrink_0()
+                        .text_size(px(theme.font.sm))
+                        .text_color(color)
+                        .child(marker),
+                )
+                .child(div().flex_1().min_w_0().child(content)),
+        );
+    }
+    column
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_table(
+    theme: &Theme,
+    base: &TextStyle,
+    align: &[Align],
+    head: &[Vec<Inline>],
+    rows: &[Vec<Vec<Inline>>],
+    tone: Tone,
+    depth: usize,
+    ids: &mut u64,
+) -> Div {
+    let border = Hsla::from(theme.colors.border).opacity(0.45);
+    let mut container = div()
+        .flex()
+        .flex_col()
+        .min_w_0()
+        .overflow_hidden()
+        .rounded(px(theme.radii.r4))
+        .border_1()
+        .border_color(border);
+
+    if !head.is_empty() {
+        container = container.child(render_table_row(
+            theme, base, head, align, tone, depth, ids, true,
+        ));
+    }
+    for (index, row) in rows.iter().enumerate() {
+        let mut rendered = render_table_row(theme, base, row, align, tone, depth, ids, false);
+        if index > 0 || !head.is_empty() {
+            rendered = rendered
+                .border_t_1()
+                .border_color(Hsla::from(theme.colors.border).opacity(0.35));
+        }
+        container = container.child(rendered);
+    }
+    container
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_table_row(
+    theme: &Theme,
+    base: &TextStyle,
+    cells: &[Vec<Inline>],
+    align: &[Align],
+    tone: Tone,
+    _depth: usize,
+    ids: &mut u64,
+    header: bool,
+) -> Div {
+    let mut row = div()
+        .flex()
+        .w_full()
+        .min_w_0()
+        .when(header, |row| row.bg(theme.colors.surface));
+    let last = cells.len().saturating_sub(1);
+    for (index, cell) in cells.iter().enumerate() {
+        let alignment = align.get(index).copied().unwrap_or(Align::None);
+        let content = if cell.is_empty() {
+            div().into_any_element()
+        } else {
+            let color = if header {
+                Hsla::from(theme.colors.text)
+            } else if matches!(tone, Tone::Reasoning) {
+                Hsla::from(theme.colors.muted)
+            } else {
+                Hsla::from(theme.colors.text)
+            };
+            let weight = if header {
+                FontWeight::SEMIBOLD
+            } else {
+                base.font_weight
+            };
+            prose_colored(theme, base, cell, tone, theme.font.xs, weight, color, ids)
+        };
+        let mut cell = div()
+            .flex_1()
+            .min_w_0()
+            .px(px(theme.spacing.s1))
+            .py(px(2.0))
+            .when(index < last, |cell| {
+                cell.border_r_1()
+                    .border_color(Hsla::from(theme.colors.border).opacity(0.35))
+            })
+            .child(content);
+        cell = match alignment {
+            Align::Center => cell.text_center(),
+            Align::Right => cell.text_right(),
+            Align::Left | Align::None => cell.text_left(),
+        };
+        row = row.child(cell);
+    }
+    row
+}
+
 fn runs_header(theme: &Theme) -> Div {
     div()
         .flex()
@@ -1892,4 +2415,106 @@ fn at_bottom(scroll: &ScrollHandle) -> bool {
     }
     let offset = -f32::from(scroll.offset().y);
     offset >= max - FOLLOW_THRESHOLD
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn theme() -> &'static Theme {
+        Theme::for_appearance(gpui::WindowAppearance::Dark)
+    }
+
+    fn inline_of(source: &str) -> markdown::InlineText {
+        match markdown::parse(source).blocks.into_iter().next() {
+            Some(Block::Paragraph(content)) => markdown::flatten(&content),
+            other => panic!("expected paragraph, got {other:?}"),
+        }
+    }
+
+    fn runs_of(source: &str) -> (Vec<TextRun>, Vec<(Range<usize>, String)>) {
+        let theme = theme();
+        inline_runs(
+            theme,
+            &TextStyle::default(),
+            &inline_of(source),
+            Tone::Prose,
+            theme.font.sm,
+            FontWeight::NORMAL,
+            Hsla::from(theme.colors.text),
+        )
+    }
+
+    #[test]
+    fn inline_runs_apply_strong_emphasis_strike_and_code() {
+        let (bold, _) = runs_of("**bold**");
+        assert_eq!(bold.len(), 1);
+        assert_eq!(bold[0].font.weight, FontWeight::SEMIBOLD);
+
+        let (italic, _) = runs_of("*italic*");
+        assert_eq!(italic[0].font.style, FontStyle::Italic);
+
+        let (strike, _) = runs_of("~~gone~~");
+        assert!(strike[0].strikethrough.is_some());
+
+        let (code, _) = runs_of("`code`");
+        assert_eq!(code[0].font.family.as_ref(), "monospace");
+        assert!(code[0].background_color.is_some());
+    }
+
+    #[test]
+    fn inline_runs_expose_openable_links() {
+        let (runs, links) = runs_of("[docs](https://example.com)");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].1, "https://example.com");
+        let theme = theme();
+        assert_eq!(runs[0].color, Hsla::from(theme.colors.accent));
+        assert!(runs[0].underline.is_some());
+        assert_eq!(runs.iter().map(|run| run.len).sum::<usize>(), "docs".len());
+    }
+
+    #[test]
+    fn only_http_and_https_links_open() {
+        assert!(is_openable("http://example.com"));
+        assert!(is_openable("https://example.com/a?b=c"));
+        assert!(!is_openable("file:///etc/passwd"));
+        assert!(!is_openable("javascript:alert(1)"));
+        assert!(!is_openable("/relative/path"));
+    }
+
+    #[test]
+    fn headings_follow_the_documented_scale_and_weights() {
+        let theme = theme();
+        let expected = [
+            FontWeight::BOLD,
+            FontWeight::BOLD,
+            FontWeight::SEMIBOLD,
+            FontWeight::MEDIUM,
+            FontWeight::SEMIBOLD,
+            FontWeight::MEDIUM,
+        ];
+        for (index, weight) in expected.into_iter().enumerate() {
+            let level = index as u8 + 1;
+            let (size, actual, _) = heading_style(theme, level);
+            assert_eq!(size, theme.markdown_heading_size(level));
+            assert_eq!(actual, weight);
+        }
+        assert_eq!(heading_style(theme, 5).2, Hsla::from(theme.colors.muted));
+        assert_eq!(heading_style(theme, 1).2, Hsla::from(theme.colors.text));
+    }
+
+    #[test]
+    fn feed_item_falls_back_to_raw_text_without_a_parsed_body() {
+        let row = FeedRow {
+            item: FeedItem::Message {
+                role: MessageRole::Assistant,
+                text: "raw **markdown** source".to_string(),
+            },
+            body: None,
+        };
+        // Constructing the row must not panic; the fallback child carries the
+        // raw source so a missing cache entry can never blank the message.
+        let _ = feed_item(theme(), &TextStyle::default(), 0, &row);
+        assert!(row.body.is_none());
+    }
 }
