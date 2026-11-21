@@ -118,26 +118,16 @@ These are framework or current-scope limits, not regressions from this pass:
   `awaiting_input` run at the time (Failed 99, Awaiting input 0). The banner and
   exact `request_id` correlation remain covered by the `detail` model tests and
   the step-10 keyboard pass (`src/detail.rs`, `src/views/detail.rs`).
-- **The top-bar repo label can disagree with the daemon's active repo.** It is
-  derived from the `system.ping` cwd basename (`repo: okno` here), while
-  `repos.list` reported `favetto` as active. See the follow-up below.
 
 ## Follow-up work
 
-1. **Show the active repo, not the daemon cwd basename.** The top bar uses
-   `repo_name(&result.cwd)` in `src/state.rs` (`Update::Ping`). The daemon
-   already exposes `repos.list` with an `active` field, but the GPUI transport
-   has no wrapper for it (`src/transport.rs`). Either add a `repos.list` read and
-   use its active name, or relabel the field as the daemon cwd to avoid the
-   mismatch. This was visible in both the top bar and Settings (daemon cwd
-   `/home/okno`).
-2. **Exercise a real permission reply when one exists.** The model path is
+1. **Exercise a real permission reply when one exists.** The model path is
    tested, but a live `awaiting_input` session would confirm the banner, the
    disabled-in-flight state and the `agents.reply` round trip end to end
    (`src/state.rs::reply_to_pending`, `src/views/detail.rs::banner`).
-3. **Revisit list virtualization for Workflows/Schedules** if those surfaces
+2. **Revisit list virtualization for Workflows/Schedules** if those surfaces
    routinely exceed the 500-row snapshot; the same lazy-window approach used by
    Tasks and Events applies (`src/views/tasks.rs`, `src/views/detail.rs`).
-4. **Keep this check repeatable.** The commands and the disposable-daemon setup
+3. **Keep this check repeatable.** The commands and the disposable-daemon setup
    above assume a live local daemon; a future verification step could wrap the
    stop/restart portion in a script under `gpui/` without changing the client.

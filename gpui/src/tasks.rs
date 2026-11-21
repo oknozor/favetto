@@ -20,6 +20,7 @@ use fuzzy_matcher::FuzzyMatcher;
 use uuid::Uuid;
 
 use crate::inbox::{self, StatusKind};
+use crate::repos::repo_visible;
 
 /// A task command that needs explicit confirmation before the RPC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,12 +218,14 @@ impl TaskList {
 /// agent and the repo; every whitespace-separated term must match at least one
 /// field. An empty query keeps the daemon's newest-first order. The filter is
 /// applied after matching, so the counts stay search-scoped and always agree
-/// with the rows a segment shows.
+/// with the rows a segment shows. `active_repo` applies the TUI's visibility
+/// rule first, so the totals describe the rows in scope.
 pub fn build(
     tasks: &[Task],
     sessions: &[AgentSessionInfo],
     query: &str,
     filter: TaskFilter,
+    active_repo: Option<&str>,
     now: DateTime<Utc>,
 ) -> TaskList {
     let mut agents: HashMap<&str, &str> = HashMap::new();
@@ -247,9 +250,14 @@ pub fn build(
 
     let mut counts = [0usize; TaskFilter::COUNT];
     let mut matched = 0usize;
+    let mut total = 0usize;
     let mut scored: Vec<(i64, TaskRow)> = Vec::new();
 
     for task in tasks {
+        if !repo_visible(active_repo, inbox::task_repo(&task.name)) {
+            continue;
+        }
+        total += 1;
         let key = task.id.to_string();
         let repo = inbox::task_repo(&task.name).map(str::to_string);
         let name = inbox::task_display_name(&task.name).to_string();
@@ -311,7 +319,7 @@ pub fn build(
     TaskList {
         rows,
         counts,
-        total: tasks.len(),
+        total,
         matched,
     }
 }
@@ -412,14 +420,14 @@ mod tests {
     fn filter_counts_match_the_rows_each_segment_shows() {
         let tasks = fixture();
         let now = at(0);
-        let all = build(&tasks, &[], "", TaskFilter::All, now);
+        let all = build(&tasks, &[], "", TaskFilter::All, None, now);
         assert_eq!(all.total, 6);
         assert_eq!(all.matched, 6);
         assert_eq!(all.counts, [6, 1, 1, 1, 2]);
         assert_eq!(all.rows.len(), 6);
 
         for filter in TaskFilter::ALL {
-            let list = build(&tasks, &[], "", filter, now);
+            let list = build(&tasks, &[], "", filter, None, now);
             let expected = list.counts[filter.index()];
             assert_eq!(
                 list.rows.len(),
@@ -432,6 +440,25 @@ mod tests {
     }
 
     #[test]
+    fn the_active_repo_scopes_rows_and_totals() {
+        let tasks = fixture();
+        let scoped = build(&tasks, &[], "", TaskFilter::All, Some("web"), at(0));
+        assert_eq!(scoped.total, 2, "only the active repo's rows count");
+        assert_eq!(scoped.counts, [2, 0, 1, 1, 0]);
+        assert!(scoped
+            .rows
+            .iter()
+            .all(|row| row.repo.as_deref() == Some("web")));
+
+        let global = build(&tasks, &[], "", TaskFilter::All, Some("missing"), at(0));
+        assert_eq!(global.total, 0);
+        assert!(global.is_truly_empty());
+
+        let all = build(&tasks, &[], "", TaskFilter::All, None, at(0));
+        assert_eq!(all.total, tasks.len());
+    }
+
+    #[test]
     fn search_matches_name_agent_repo_and_multiple_terms() {
         let tasks = fixture();
         let sessions = vec![
@@ -439,7 +466,7 @@ mod tests {
             session("s2", Some(Uuid::from_u128(4)), "claude"),
         ];
         let now = at(0);
-        let query = |query: &str| build(&tasks, &sessions, query, TaskFilter::All, now).rows;
+        let query = |query: &str| build(&tasks, &sessions, query, TaskFilter::All, None, now).rows;
 
         let triage = query("triage");
         assert_eq!(triage.len(), 1);
@@ -467,7 +494,7 @@ mod tests {
             task(1, "repo:favetto/alpha", TaskStatus::Failed, at(-10)),
             task(2, "repo:favetto/alpha-two", TaskStatus::Succeeded, at(-5)),
         ];
-        let list = build(&tasks, &[], "alpha", TaskFilter::Failed, at(0));
+        let list = build(&tasks, &[], "alpha", TaskFilter::Failed, None, at(0));
         assert_eq!(list.matched, 2);
         assert_eq!(list.counts, [2, 0, 0, 1, 1]);
         assert_eq!(list.rows.len(), 1);
@@ -475,18 +502,18 @@ mod tests {
         assert_eq!(list.rows[0].name, "alpha");
 
         // The All segment keeps both, so the filter is genuinely preserved.
-        let all = build(&tasks, &[], "alpha", TaskFilter::All, at(0));
+        let all = build(&tasks, &[], "alpha", TaskFilter::All, None, at(0));
         assert_eq!(all.rows.len(), 2);
     }
 
     #[test]
     fn filtered_empty_is_distinct_from_truly_empty() {
-        let empty = build(&[], &[], "", TaskFilter::All, at(0));
+        let empty = build(&[], &[], "", TaskFilter::All, None, at(0));
         assert!(empty.is_truly_empty());
         assert!(!empty.is_filtered_empty());
 
         let tasks = fixture();
-        let unmatched = build(&tasks, &[], "zzz-not-a-run", TaskFilter::All, at(0));
+        let unmatched = build(&tasks, &[], "zzz-not-a-run", TaskFilter::All, None, at(0));
         assert!(!unmatched.is_truly_empty());
         assert!(unmatched.is_filtered_empty());
         assert_eq!(unmatched.matched, 0);
@@ -495,7 +522,7 @@ mod tests {
 
     #[test]
     fn rows_are_newest_first_without_a_query() {
-        let list = build(&fixture(), &[], "", TaskFilter::All, at(0));
+        let list = build(&fixture(), &[], "", TaskFilter::All, None, at(0));
         let ids: Vec<_> = list.rows.iter().map(|row| row.id).collect();
         assert_eq!(ids.first(), Some(&Uuid::from_u128(6)));
         assert_eq!(ids.last(), Some(&Uuid::from_u128(1)));
@@ -513,19 +540,19 @@ mod tests {
             task(2, "two", TaskStatus::Succeeded, at(-20)),
             task(3, "three", TaskStatus::Succeeded, at(-10)),
         ];
-        let list = build(&tasks, &[], "", TaskFilter::All, now);
+        let list = build(&tasks, &[], "", TaskFilter::All, None, now);
         let two = Uuid::from_u128(2);
         assert_eq!(list.selected_id(Some(two), 0), Some(two));
         assert_eq!(list.resolve_index(Some(two), 0), Some(1));
 
         let without_two: Vec<_> = tasks.into_iter().filter(|task| task.id != two).collect();
-        let list = build(&without_two, &[], "", TaskFilter::All, now);
+        let list = build(&without_two, &[], "", TaskFilter::All, None, now);
         // The id is gone: keep the index, clamped to the new list.
         assert_eq!(list.resolve_index(Some(two), 1), Some(1));
         assert_eq!(list.resolve_index(Some(two), 999), Some(1));
         assert_eq!(list.resolve_index(None, 999), Some(1));
 
-        let empty = build(&[], &[], "", TaskFilter::All, now);
+        let empty = build(&[], &[], "", TaskFilter::All, None, now);
         assert_eq!(empty.selected_id(Some(two), 1), None);
     }
 
@@ -561,7 +588,7 @@ mod tests {
             session("s1", Some(Uuid::from_u128(1)), ""),
             session("s2", Some(Uuid::from_u128(2)), "agent/with spaces ⚙"),
         ];
-        let list = build(&tasks, &sessions, "agent", TaskFilter::All, at(0));
+        let list = build(&tasks, &sessions, "agent", TaskFilter::All, None, at(0));
         assert_eq!(list.rows.len(), 1);
         assert_eq!(list.rows[0].agent.as_deref(), Some("agent/with spaces ⚙"));
         assert_eq!(list.rows[0].status_kind(), StatusKind::Running);
@@ -583,7 +610,7 @@ mod tests {
             ..AgentUsage::default()
         });
 
-        let list = build(&[running], &[first, second], "", TaskFilter::All, now);
+        let list = build(&[running], &[first, second], "", TaskFilter::All, None, now);
         let row = list.rows.first().expect("row");
         assert_eq!(row.cost_usd, Some(0.02));
         assert_eq!(inbox::format_cost(row.cost_usd).as_deref(), Some("$0.02"));

@@ -21,6 +21,8 @@ pub enum CommandKind {
     Reconnect,
     /// Ask the daemon for a fresh `system.ping` round trip.
     Refresh,
+    /// Open the searchable repository switcher.
+    SwitchRepo,
 }
 
 /// One row in the palette.
@@ -39,7 +41,7 @@ pub struct Command {
 }
 
 /// The palette's commands, in canonical (Serial Position) order.
-pub const COMMANDS: [Command; 8] = [
+pub const COMMANDS: [Command; 9] = [
     Command {
         id: "nav-inbox",
         label: "Go to Inbox",
@@ -81,6 +83,13 @@ pub const COMMANDS: [Command; 8] = [
         keywords: "settings preferences configuration connection token appearance agents",
         shortcut: None,
         kind: CommandKind::Navigate(Route::Settings),
+    },
+    Command {
+        id: "switch-repo",
+        label: "Switch repository",
+        keywords: "repo repository workspace switch active change",
+        shortcut: None,
+        kind: CommandKind::SwitchRepo,
     },
     Command {
         id: "reconnect",
@@ -276,6 +285,8 @@ mod tests {
             ("workflows", "nav-workflows"),
             ("schedules", "nav-schedules"),
             ("settings", "open-settings"),
+            ("repo", "switch-repo"),
+            ("switch repo", "switch-repo"),
         ] {
             let palette = palette_with(query);
             let first = palette.filtered().first().map(|command| command.id);
@@ -370,6 +381,10 @@ mod tests {
             palette.activate(),
             Some(CommandKind::Navigate(Route::Catalog))
         );
+
+        let mut palette = palette_with("switch repository");
+        assert_eq!(palette.activate(), Some(CommandKind::SwitchRepo));
+        assert!(palette.is_recent("switch-repo"));
     }
 
     #[test]

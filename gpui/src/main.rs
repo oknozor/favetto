@@ -15,6 +15,7 @@ mod layout;
 mod markdown;
 mod motion;
 mod palette;
+mod repos;
 mod routes;
 mod runtime;
 mod schedules;

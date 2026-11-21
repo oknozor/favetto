@@ -20,17 +20,18 @@ use crate::actions::{
     CatalogLaunchSubmit, CatalogNewOneshot, CatalogSearch, CatalogToggleFolder, CloseOverlay,
     FocusNext, FocusPrev, GoCatalog, GoInbox, GoSchedules, GoSettings, GoTasks, GoWorkflows,
     ListDown, ListEnd, ListHome, ListOpen, ListPageDown, ListPageUp, ListUp, PaletteConfirm,
-    PaletteDown, PaletteUp, Refresh, ScheduleDelete, ScheduleEdit, ScheduleFieldNext,
-    ScheduleFieldPrev, ScheduleNew, ScheduleSubmit, ScheduleToggleEnabled, SettingsActivate,
-    SettingsFieldNext, SettingsFieldPrev, SettingsSave, SettingsTest, TaskCancel,
-    TaskConfirmAccept, TaskConfirmReject, TaskFilterNext, TaskFilterPrev, TaskRetry, TaskSearch,
-    TogglePalette, ToggleShortcuts, WorkflowCancelRoot, WorkflowRetryInstance, WorkflowRootNext,
-    WorkflowRootPrev,
+    PaletteDown, PaletteUp, Refresh, RepoPickerConfirm, RepoPickerDown, RepoPickerUp,
+    ScheduleDelete, ScheduleEdit, ScheduleFieldNext, ScheduleFieldPrev, ScheduleNew,
+    ScheduleSubmit, ScheduleToggleEnabled, SettingsActivate, SettingsFieldNext, SettingsFieldPrev,
+    SettingsSave, SettingsTest, TaskCancel, TaskConfirmAccept, TaskConfirmReject, TaskFilterNext,
+    TaskFilterPrev, TaskRetry, TaskSearch, TogglePalette, ToggleShortcuts, WorkflowCancelRoot,
+    WorkflowRetryInstance, WorkflowRootNext, WorkflowRootPrev,
 };
 use crate::catalog::OneShotFocus;
 use crate::components;
 use crate::layout::{clamp_detail_width, container_query, LayoutMode};
 use crate::palette::{CommandKind, CommandPalette};
+use crate::repos::RepoOption;
 use crate::routes::Route;
 use crate::schedules::ScheduleField;
 use crate::state::{ClientState, TaskConfirm, Toast, ToastKind};
@@ -94,6 +95,9 @@ pub struct RootView {
     nav_focus: Vec<FocusHandle>,
     palette_focus: FocusHandle,
     palette_button_focus: FocusHandle,
+    repo_button_focus: FocusHandle,
+    repo_picker_focus: FocusHandle,
+    repo_picker_was_open: bool,
     settings_button_focus: FocusHandle,
     shortcuts_button_focus: FocusHandle,
     reconnect_button_focus: FocusHandle,
@@ -138,7 +142,9 @@ impl RootView {
         let root_focus = cx.focus_handle();
         let palette_focus = cx.focus_handle().tab_index(100).tab_stop(true);
         let palette_button_focus = cx.focus_handle().tab_index(1).tab_stop(true);
-        let settings_button_focus = cx.focus_handle().tab_index(2).tab_stop(true);
+        let repo_button_focus = cx.focus_handle().tab_index(2).tab_stop(true);
+        let repo_picker_focus = cx.focus_handle().tab_index(100).tab_stop(true);
+        let settings_button_focus = cx.focus_handle().tab_index(3).tab_stop(true);
         let nav_focus = Route::ALL
             .iter()
             .map(|route| {
@@ -168,6 +174,9 @@ impl RootView {
             nav_focus,
             palette_focus,
             palette_button_focus,
+            repo_button_focus,
+            repo_picker_focus,
+            repo_picker_was_open: false,
             settings_button_focus,
             shortcuts_button_focus,
             reconnect_button_focus,
@@ -184,6 +193,7 @@ impl RootView {
 
     fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
         self.state.update(cx, |state, cx| {
+            state.close_repo_picker();
             state.navigate(route);
             cx.notify();
         });
@@ -196,6 +206,7 @@ impl RootView {
         self.shortcuts_open = false;
         self.state.update(cx, |state, cx| {
             state.cancel_task_confirm();
+            state.close_repo_picker();
             cx.notify();
         });
         self.palette.open();
@@ -215,6 +226,7 @@ impl RootView {
             self.palette.close();
             self.state.update(cx, |state, cx| {
                 state.cancel_task_confirm();
+                state.close_repo_picker();
                 cx.notify();
             });
             window.focus(&self.shortcuts_close_focus);
@@ -222,6 +234,46 @@ impl RootView {
             window.focus(&self.root_focus);
         }
         cx.notify();
+    }
+
+    /// Open the searchable repository switcher (the top-bar button or palette).
+    fn open_repo_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.palette.close();
+        self.shortcuts_open = false;
+        self.state.update(cx, |state, cx| {
+            state.cancel_task_confirm();
+            state.cancel_workflow_confirm();
+            if state.active_route() == Route::Schedules {
+                state.cancel_schedule_confirm();
+            }
+            state.open_repo_picker();
+            cx.notify();
+        });
+        window.focus(&self.repo_picker_focus);
+        cx.notify();
+    }
+
+    fn close_repo_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.close_repo_picker();
+            cx.notify();
+        });
+        window.focus(&self.repo_button_focus);
+        cx.notify();
+    }
+
+    fn move_repo_picker(&mut self, delta: isize, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.move_repo_picker_selection(delta);
+            cx.notify();
+        });
+    }
+
+    fn accept_repo_picker(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.activate_repo_selected();
+            cx.notify();
+        });
     }
 
     /// Escape closes the topmost overlay; with no overlay it clears the Tasks
@@ -233,6 +285,8 @@ impl RootView {
             self.shortcuts_open = false;
             window.focus(&self.root_focus);
             cx.notify();
+        } else if self.state.read(cx).repo_picker_open() {
+            self.close_repo_picker(window, cx);
         } else {
             self.state.update(cx, |state, cx| {
                 if state.task_confirm().is_some() {
@@ -588,6 +642,9 @@ impl RootView {
                     cx.notify();
                 });
             }
+            CommandKind::SwitchRepo => {
+                self.open_repo_picker(window, cx);
+            }
         }
         cx.notify();
     }
@@ -613,8 +670,30 @@ impl RootView {
     fn top_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let (repo, connection) = {
             let state = self.state.read(cx);
-            (state.repo_label().to_string(), state.connection().clone())
+            (state.repo_label(), state.connection().clone())
         };
+
+        let repo_button = components::with_focus(
+            div()
+                .id("switch-repo")
+                .h(px(32.0))
+                .px(px(theme.spacing.s2))
+                .flex()
+                .items_center()
+                .gap(px(theme.spacing.s1))
+                .rounded(px(theme.radii.r4))
+                .bg(theme.colors.surface)
+                .text_size(px(theme.font.xs))
+                .text_color(theme.colors.text)
+                .cursor_pointer()
+                .track_focus(&self.repo_button_focus)
+                .child(div().min_w_0().truncate().child(repo))
+                .child(div().text_color(theme.colors.muted).child("▾"))
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.open_repo_picker(window, cx);
+                })),
+            theme,
+        );
 
         let palette_button = components::with_focus(
             div()
@@ -685,22 +764,7 @@ impl RootView {
                             .child("favetto"),
                     )
                     .child(div().w(px(1.0)).h(px(20.0)).bg(theme.colors.border))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(theme.spacing.s1))
-                            .text_size(px(theme.font.xs))
-                            .text_color(theme.colors.muted)
-                            .child("repo:")
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_color(theme.colors.text)
-                                    .child(repo),
-                            ),
-                    ),
+                    .child(repo_button),
             )
             .child(
                 div()
@@ -1669,6 +1733,227 @@ impl RootView {
             .child(panel)
     }
 
+    /// The searchable repository switcher, modelled on the TUI Ctrl+P picker
+    /// and the web switcher. The global row is always first; unavailable
+    /// checkouts stay visible but inert and marked `(missing)`.
+    fn repo_overlay(&self, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let (entries, selected, filter, error, submitting) = {
+            let state = self.state.read(cx);
+            let picker = state.repo_picker();
+            (
+                state.repo_picker_entries(),
+                picker.selected(),
+                picker.filter().to_string(),
+                picker.error().map(str::to_string),
+                picker.is_submitting(),
+            )
+        };
+        let focused = self.repo_picker_focus.is_focused(window);
+        let no_matches = !filter.trim().is_empty() && entries.len() == 1;
+
+        let input = div()
+            .id("repo-picker-input")
+            .flex()
+            .items_center()
+            .gap(px(theme.spacing.s2))
+            .h(px(48.0))
+            .px(px(theme.spacing.s3))
+            .border_2()
+            .border_color(if focused {
+                theme.colors.accent
+            } else {
+                theme.colors.border
+            })
+            .track_focus(&self.repo_picker_focus)
+            .cursor_text()
+            .on_click(cx.listener(|this, _event, window, _cx| {
+                window.focus(&this.repo_picker_focus);
+            }))
+            .child(
+                div()
+                    .text_color(theme.colors.accent)
+                    .text_size(px(theme.font.base))
+                    .child("⌕"),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(theme.font.base))
+                            .text_color(if filter.is_empty() {
+                                theme.colors.muted
+                            } else {
+                                theme.colors.text
+                            })
+                            .child(if filter.is_empty() {
+                                "Search repositories by name or path…".to_string()
+                            } else {
+                                filter.clone()
+                            }),
+                    )
+                    .when(focused, |text| {
+                        text.child(div().text_color(theme.colors.accent).child("▌"))
+                    }),
+            )
+            .child(components::keycap(theme, "esc"));
+
+        let rows: Vec<AnyElement> = entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, option)| {
+                let is_selected = index == selected;
+                let RepoOption {
+                    name,
+                    label,
+                    selectable,
+                    active,
+                } = option;
+                let mut row = div()
+                    .id(("repo-picker-row", index))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(theme.spacing.s3))
+                    .h(px(38.0))
+                    .px(px(theme.spacing.s2))
+                    .rounded(px(theme.radii.r4))
+                    .border_2()
+                    .border_color(if is_selected {
+                        theme.colors.accent
+                    } else {
+                        theme.colors.surface
+                    })
+                    .when(is_selected, |row| {
+                        row.bg(Hsla::from(theme.colors.accent).opacity(0.12))
+                    })
+                    .text_size(px(theme.font.sm))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(if selectable {
+                                theme.colors.text
+                            } else {
+                                theme.colors.muted
+                            })
+                            .child(label),
+                    )
+                    .when(active, |row| {
+                        row.child(
+                            div()
+                                .text_size(px(theme.font.xs))
+                                .text_color(theme.colors.accent)
+                                .child("active"),
+                        )
+                    });
+                if !selectable {
+                    row = row.opacity(0.6);
+                } else if !submitting {
+                    row = row
+                        .cursor_pointer()
+                        .when(!is_selected, |row| {
+                            row.hover(|style| style.bg(theme.colors.bg))
+                        })
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            this.state.update(cx, |state, cx| {
+                                state.select_repo_picker_row(index);
+                                state.activate_repo(name.clone());
+                                cx.notify();
+                            });
+                        }));
+                }
+                row.into_any_element()
+            })
+            .collect();
+
+        let empty = no_matches.then(|| {
+            div()
+                .px(px(theme.spacing.s3))
+                .py(px(theme.spacing.s2))
+                .text_size(px(theme.font.sm))
+                .text_color(theme.colors.muted)
+                .child("No repositories match.")
+        });
+
+        let error = error.map(|message| {
+            div()
+                .px(px(theme.spacing.s3))
+                .py(px(theme.spacing.s2))
+                .rounded(px(theme.radii.r4))
+                .bg(Hsla::from(theme.colors.danger).opacity(0.12))
+                .text_size(px(theme.font.xs))
+                .text_color(theme.colors.danger)
+                .child(message)
+        });
+
+        let footer_hint = if submitting {
+            "Switching…".to_string()
+        } else {
+            "↑↓ move · ↵ switch · esc close".to_string()
+        };
+
+        let panel = div()
+            .w(px(520.0))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .rounded(px(theme.radii.r12))
+            .border_1()
+            .border_color(theme.colors.border)
+            .bg(theme.colors.surface)
+            .shadow_lg()
+            .child(input)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .p(px(theme.spacing.s2))
+                    .when_some(empty, |list, empty| list.child(empty))
+                    .children(rows),
+            )
+            .when_some(error, |panel, error| {
+                panel.child(
+                    div()
+                        .px(px(theme.spacing.s2))
+                        .pb(px(theme.spacing.s2))
+                        .child(error),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(theme.spacing.s3))
+                    .px(px(theme.spacing.s3))
+                    .py(px(theme.spacing.s2))
+                    .border_t_1()
+                    .border_color(theme.colors.border)
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.muted)
+                    .child(footer_hint)
+                    .child("global clears the active repo"),
+            );
+
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .pt(px(96.0))
+            .bg(Hsla::from(theme.colors.bg).opacity(0.86))
+            .key_context("RepoPicker")
+            .child(panel)
+    }
+
     /// The self-dismissing toast above the status bar.
     fn toast_overlay(&self, theme: &Theme, toast: &Toast, cx: &mut Context<Self>) -> AnyElement {
         let (icon, color) = match toast.kind {
@@ -1853,6 +2138,18 @@ impl Render for RootView {
         let detail_open = self.state.read(cx).is_detail_open() && route.shows_detail();
         let palette_open = self.palette.is_open();
         let shortcuts_open = self.shortcuts_open;
+        let repo_picker_open = self.state.read(cx).repo_picker_open();
+        // An activation response closes the modal asynchronously; return focus
+        // once it is gone, unless another overlay already took it.
+        if self.repo_picker_was_open
+            && !repo_picker_open
+            && !palette_open
+            && !shortcuts_open
+            && window.focused(cx).as_ref() != Some(&self.root_focus)
+        {
+            window.focus(&self.repo_button_focus);
+        }
+        self.repo_picker_was_open = repo_picker_open;
 
         let sidebar = self.sidebar(theme, cx);
         let top_bar = self.top_bar(theme, cx);
@@ -1969,6 +2266,11 @@ impl Render for RootView {
                 // other single-key shortcuts must not fire mid-address.
                 key_context.push_str(" Search");
             }
+        }
+        if repo_picker_open {
+            // The modal owns the keyboard; `Search` keeps typed text from
+            // triggering the global single-key shortcuts.
+            key_context.push_str(" RepoPicker Search");
         }
 
         let root = shell_root()
@@ -2166,6 +2468,15 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &PaletteConfirm, window, cx| {
                 this.select_palette(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &RepoPickerUp, _window, cx| {
+                this.move_repo_picker(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &RepoPickerDown, _window, cx| {
+                this.move_repo_picker(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &RepoPickerConfirm, _window, cx| {
+                this.accept_repo_picker(cx);
+            }))
             .on_key_down(
                 cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
                     let keystroke = &event.keystroke;
@@ -2193,6 +2504,35 @@ impl Render for RootView {
                     }
 
                     if this.shortcuts_open {
+                        return;
+                    }
+
+                    if this.state.read(cx).repo_picker_open() {
+                        if keystroke.modifiers.control
+                            || keystroke.modifiers.platform
+                            || keystroke.modifiers.alt
+                        {
+                            return;
+                        }
+                        if keystroke.key == "backspace" {
+                            this.state.update(cx, |state, cx| {
+                                state.repo_picker_backspace();
+                                cx.notify();
+                            });
+                            cx.stop_propagation();
+                            cx.notify();
+                            return;
+                        }
+                        if let Some(text) = &keystroke.key_char {
+                            this.state.update(cx, |state, cx| {
+                                for character in text.chars() {
+                                    state.repo_picker_push_char(character);
+                                }
+                                cx.notify();
+                            });
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
                         return;
                     }
 
@@ -2300,6 +2640,9 @@ impl Render for RootView {
             let mut root = root;
             if let Some(toast) = &toast {
                 root = root.child(self.toast_overlay(theme, toast, cx));
+            }
+            if repo_picker_open {
+                root = root.child(self.repo_overlay(theme, window, cx));
             }
             if let Some(confirm) = &confirm {
                 root = root.child(self.confirm_overlay(theme, confirm, cx));

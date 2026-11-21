@@ -47,6 +47,12 @@ actions!(
         PaletteUp,
         /// Move the palette selection down.
         PaletteDown,
+        /// Move the repository picker selection up.
+        RepoPickerUp,
+        /// Move the repository picker selection down.
+        RepoPickerDown,
+        /// Activate the highlighted repository (or the global row).
+        RepoPickerConfirm,
         /// Activate the focused sidebar entry.
         ActivateNav,
         /// Move the active list highlight up.
@@ -422,6 +428,14 @@ pub fn bindings() -> Vec<KeyBinding> {
             SettingsTest,
             Some("Settings && !Palette && !Shortcuts"),
         ),
+        // The repository picker owns the keyboard while it is open. These are
+        // registered last so they win over the generic list bindings; the
+        // `Search` context keeps typed text from reaching `g`/`r`/`?`.
+        KeyBinding::new("up", RepoPickerUp, Some("RepoPicker")),
+        KeyBinding::new("down", RepoPickerDown, Some("RepoPicker")),
+        KeyBinding::new("tab", RepoPickerDown, Some("RepoPicker")),
+        KeyBinding::new("shift-tab", RepoPickerUp, Some("RepoPicker")),
+        KeyBinding::new("enter", RepoPickerConfirm, Some("RepoPicker")),
     ]
 }
 
@@ -637,6 +651,51 @@ mod tests {
             let mentions_sheet = predicate.contains("Sheet") && !predicate.contains("!Sheet");
             assert_eq!(mentions_sheet, needs_sheet, "{action} sheet scoping");
         }
+    }
+
+    #[test]
+    fn repo_picker_shortcuts_are_scoped_to_the_picker() {
+        for (action, key) in [
+            ("RepoPickerUp", "up"),
+            ("RepoPickerDown", "down"),
+            ("RepoPickerConfirm", "enter"),
+        ] {
+            let matches: Vec<_> = bindings()
+                .into_iter()
+                .filter(|binding| {
+                    binding.action().name().ends_with(action)
+                        && binding
+                            .keystrokes()
+                            .iter()
+                            .any(|stroke| stroke.key() == key)
+                })
+                .collect();
+            assert_eq!(matches.len(), 1, "{action} must have one binding");
+            assert!(
+                matches[0]
+                    .predicate()
+                    .is_some_and(|predicate| predicate.to_string().contains("RepoPicker")),
+                "{action} must only fire in the repository picker"
+            );
+        }
+        // Registered after the generic list bindings so it wins inside the modal.
+        let order: Vec<_> = bindings()
+            .iter()
+            .filter(|binding| binding.keystrokes().iter().any(|key| key.key() == "enter"))
+            .map(|binding| {
+                binding
+                    .action()
+                    .name()
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        let list_open = order.iter().position(|name| name == "ListOpen");
+        let repo_confirm = order.iter().position(|name| name == "RepoPickerConfirm");
+        assert!(list_open.is_some() && repo_confirm.is_some());
+        assert!(repo_confirm > list_open);
     }
 
     #[test]

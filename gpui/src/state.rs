@@ -15,13 +15,13 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
 use chrono::Utc;
 use favetto_wire::model::{
-    AgentCatalogEntry, AgentSessionInfo, AgentUsage, EventKind, InputReply, Task, TaskStatus,
+    AgentCatalogEntry, AgentSessionInfo, AgentUsage, EventKind, InputReply, RepoInfo, Task,
+    TaskStatus,
 };
 use favetto_wire::rpc::AgentEventPush;
 use gpui::{ClipboardItem, Context, Task as GpuiTask, WindowAppearance};
@@ -30,6 +30,7 @@ use crate::catalog::{AgentChoice, CatalogState, OneShotFocus};
 use crate::config::{self, ClientConfig, Density, ThemeChoice};
 use crate::detail::{DetailTab, PendingRequest, TaskDetail};
 use crate::inbox::{self, InboxKey, InboxRows};
+use crate::repos::{self, RepoPicker};
 use crate::routes::Route;
 use crate::runtime::{PingSnapshot, Runtime, Update};
 use crate::schedules::{
@@ -271,8 +272,15 @@ pub struct ClientState {
     schedules: SchedulesState,
     /// The Settings draft, test result and logical focus.
     settings: SettingsState,
-    /// The daemon's repo name, derived from the `system.ping` cwd.
-    repo: Option<String>,
+    /// The known-repos registry from `repos.list`.
+    repos: Vec<RepoInfo>,
+    /// The daemon-wide active repo name; `None` is the global view.
+    active_repo: Option<String>,
+    /// Whether `repos.list` has answered at least once, so the label can say
+    /// `global` rather than `—`.
+    repos_loaded: bool,
+    /// The searchable switcher's transient state.
+    repo_picker: RepoPicker,
     /// The foreground task that drains [`Runtime`] updates. Declared before the
     /// runtime so dropping the entity cancels the drain first.
     drain: Option<GpuiTask<()>>,
@@ -356,7 +364,10 @@ impl ClientState {
             workflow_retry_previous: HashMap::new(),
             schedules: SchedulesState::default(),
             settings,
-            repo: None,
+            repos: Vec::new(),
+            active_repo: None,
+            repos_loaded: false,
+            repo_picker: RepoPicker::default(),
             runtime,
             drain,
         };
@@ -380,6 +391,7 @@ impl ClientState {
                     self.refresh_snapshot();
                     self.refresh_catalog();
                     self.refresh_schedules();
+                    self.refresh_repos();
                 } else if !self.connection.is_connected()
                     && !self.has_snapshot_data()
                     && matches!(
@@ -410,9 +422,6 @@ impl ClientState {
                     self.connection = ConnectionState::Unauthorized {
                         token_path: self.config.token_source.label(),
                     };
-                }
-                if let Ok(result) = &snapshot.result {
-                    self.repo = repo_name(&result.cwd);
                 }
                 self.last_ping = Some(snapshot);
             }
@@ -486,6 +495,9 @@ impl ClientState {
                     Push::CatalogUpdated => {
                         self.catalog.invalidate_preview();
                         self.refresh_catalog();
+                        // `repos.add`/`remove`/`activate` all publish this push,
+                        // so another client's switch reaches the bar and scope.
+                        self.refresh_repos();
                         // The DAG source is derived from the same catalog.
                         if self.active_route == Route::Workflows || self.workflow_graph.loaded {
                             self.refresh_workflow_graph();
@@ -1040,6 +1052,33 @@ impl ClientState {
                         confirm.deleting = false;
                         confirm.error = Some(format!("The daemon rejected the delete: {error}."));
                     }
+                }
+            },
+            Update::ReposLoaded { result } => match result {
+                Ok(result) => self.set_repos(result.repos, result.active),
+                Err(error) => {
+                    if error.is_unauthorized() {
+                        self.connection = ConnectionState::Unauthorized {
+                            token_path: self.config.token_source.label(),
+                        };
+                    } else {
+                        self.last_error = Some(format!("Could not load repositories: {error}."));
+                    }
+                }
+            },
+            Update::RepoActivated { result } => match result {
+                Ok(result) => {
+                    self.set_repos(result.repos, result.active);
+                    self.repo_picker.close();
+                }
+                Err(error) => {
+                    if error.is_unauthorized() {
+                        self.connection = ConnectionState::Unauthorized {
+                            token_path: self.config.token_source.label(),
+                        };
+                    }
+                    self.repo_picker
+                        .fail(format!("The daemon rejected the switch: {error}."));
                 }
             },
             Update::ConnectionTestFinished {
@@ -1971,7 +2010,12 @@ impl ClientState {
         self.drain = None;
         self.runtime = None;
         self.last_ping = None;
-        self.repo = None;
+        self.repos.clear();
+        self.active_repo = None;
+        self.repos_loaded = false;
+        self.repo_picker.close();
+        self.catalog.set_active_repo(None);
+        self.touch_snapshot();
         self.connection = ConnectionState::Connecting;
         self.last_error = None;
 
@@ -2491,10 +2535,158 @@ impl ClientState {
         self.detail_open = false;
     }
 
-    /// The active repo name shown in the top bar. Until the first successful
-    /// `system.ping` the daemon has not told us where it runs.
-    pub fn repo_label(&self) -> &str {
-        self.repo.as_deref().unwrap_or("—")
+    /// Ask the runtime for a fresh `repos.list`. An older registry stays visible
+    /// on failure, so the bar never falls back to the daemon cwd.
+    pub fn refresh_repos(&mut self) {
+        match &self.runtime {
+            Some(runtime) => runtime.refresh_repos(),
+            None => {
+                self.last_error = Some("the transport is not running".to_string());
+            }
+        }
+    }
+
+    /// Store a fresh registry and active repo (`repos.list` / `repos.activate`).
+    ///
+    /// The active repo scopes Tasks, Inbox and Catalog, so a change invalidates
+    /// the memoized lists, re-clamps their selections and drops a catalog
+    /// preview that is no longer in scope.
+    fn set_repos(&mut self, repos: Vec<RepoInfo>, active: Option<String>) {
+        let active_changed = self.active_repo != active;
+        self.repos = repos;
+        self.active_repo = active;
+        self.repos_loaded = true;
+        self.catalog.set_active_repo(self.active_repo.clone());
+        self.repo_picker.clamp_selection(&self.repos);
+        if active_changed {
+            self.touch_snapshot();
+            self.clamp_list_selections();
+            // The in-scope selection may have moved; fetch its preview without
+            // waiting for a catalog reload.
+            self.ensure_catalog_preview();
+        }
+    }
+
+    /// Keep a row highlight inside the active repo when a switch hides it.
+    fn clamp_list_selections(&mut self) {
+        let inbox = self.inbox_rows();
+        if self
+            .inbox_selected
+            .as_ref()
+            .is_some_and(|key| !inbox.keys().contains(key))
+        {
+            self.inbox_selected = None;
+        }
+        let tasks = self.task_list();
+        if self
+            .tasks_selected
+            .is_some_and(|id| tasks.position(id).is_none())
+        {
+            self.tasks_selected = None;
+            self.tasks_selected_index = 0;
+        }
+        self.tasks_selected_index = self
+            .tasks_selected_index
+            .min(tasks.rows.len().saturating_sub(1));
+    }
+
+    /// The top-bar label for the daemon-wide active repo. It is derived from
+    /// `repos.list`, never from the daemon cwd.
+    pub fn repo_label(&self) -> String {
+        repos::active_repo_label(self.active_repo.as_deref(), self.repos_loaded)
+    }
+
+    /// Whether a task/event row is in scope for the active repo.
+    pub fn repo_visible(&self, repo: Option<&str>) -> bool {
+        repos::repo_visible(self.active_repo.as_deref(), repo)
+    }
+
+    /// Whether a catalog entry is in scope (active repo plus globals).
+    pub fn catalog_visible(&self, repo: Option<&str>) -> bool {
+        repos::catalog_visible(self.active_repo.as_deref(), repo)
+    }
+
+    /// The known-repos registry, newest daemon order preserved.
+    pub fn repos(&self) -> &[RepoInfo] {
+        &self.repos
+    }
+
+    /// The daemon-wide active repo name, if any.
+    pub fn active_repo(&self) -> Option<&str> {
+        self.active_repo.as_deref()
+    }
+
+    /// The repo picker's transient state.
+    pub fn repo_picker(&self) -> &RepoPicker {
+        &self.repo_picker
+    }
+
+    pub fn repo_picker_open(&self) -> bool {
+        self.repo_picker.is_open()
+    }
+
+    /// Open the searchable switcher, preserving the daemon registry.
+    pub fn open_repo_picker(&mut self) {
+        self.repo_picker.open(&self.repos);
+        if self.repos.is_empty() && !self.repos_loaded {
+            self.refresh_repos();
+        }
+    }
+
+    pub fn close_repo_picker(&mut self) {
+        self.repo_picker.close();
+    }
+
+    /// The filtered picker rows (always with the leading global row).
+    pub fn repo_picker_entries(&self) -> Vec<repos::RepoOption> {
+        self.repo_picker.entries(&self.repos)
+    }
+
+    pub fn move_repo_picker_selection(&mut self, delta: isize) {
+        self.repo_picker.move_selection(delta, &self.repos);
+    }
+
+    pub fn select_repo_picker_row(&mut self, index: usize) {
+        self.repo_picker.select(index, &self.repos);
+    }
+
+    pub fn repo_picker_push_char(&mut self, character: char) {
+        self.repo_picker.push_char(character, &self.repos);
+    }
+
+    pub fn repo_picker_backspace(&mut self) {
+        self.repo_picker.backspace(&self.repos);
+    }
+
+    /// Enter on the picker: activate the highlighted repo, or explain why an
+    /// unavailable checkout cannot be selected instead of silently doing nothing.
+    pub fn activate_repo_selected(&mut self) {
+        let Some(option) = self.repo_picker.selected_option(&self.repos) else {
+            return;
+        };
+        if !option.selectable {
+            let name = option.name.unwrap_or_else(|| "global".to_string());
+            self.repo_picker.fail(format!(
+                "'{name}' is not available on the daemon host. It is marked (missing)."
+            ));
+            return;
+        }
+        self.activate_repo(option.name);
+    }
+
+    /// Send `repos.activate` (`None` clears the active repo). The modal stays
+    /// open while the call is in flight so a rejection can be shown inline.
+    pub fn activate_repo(&mut self, name: Option<String>) {
+        if self.repo_picker.is_submitting() {
+            return;
+        }
+        self.repo_picker.begin_submit();
+        match &self.runtime {
+            Some(runtime) => runtime.activate_repo(name),
+            None => self.repo_picker.fail(
+                "The transport is not running, so the repository was not switched.".to_string(),
+            ),
+        }
     }
 
     /// The current Needs you + Recent groups, derived from the latest snapshot.
@@ -2508,7 +2700,12 @@ impl ClientState {
                 return rows.clone();
             }
         }
-        let rows = Rc::new(inbox::build(&self.tasks, &self.sessions, Utc::now()));
+        let rows = Rc::new(inbox::build(
+            &self.tasks,
+            &self.sessions,
+            self.active_repo.as_deref(),
+            Utc::now(),
+        ));
         derived.revision = self.snapshot_revision;
         derived.inbox = Some(rows.clone());
         rows
@@ -2592,6 +2789,7 @@ impl ClientState {
             &self.sessions,
             &self.tasks_query,
             self.tasks_filter,
+            self.active_repo.as_deref(),
             Utc::now(),
         ));
         derived.task_revision = self.snapshot_revision;
@@ -3346,15 +3544,6 @@ fn short_id(id: uuid::Uuid) -> String {
     value.chars().take(8).collect()
 }
 
-/// The repo name the top bar shows: the final component of the daemon's cwd.
-fn repo_name(cwd: &str) -> Option<String> {
-    Path::new(cwd)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-}
-
 /// The success toast for one answered prompt, in the user's terms.
 fn reply_done_message(reply: &InputReply) -> String {
     match reply {
@@ -3395,14 +3584,6 @@ mod tests {
 
         assert!(ConnectionState::Connected.is_connected());
         assert!(!ConnectionState::Connecting.is_connected());
-    }
-
-    #[test]
-    fn repo_name_is_the_daemon_cwd_basename() {
-        assert_eq!(repo_name("/code/favetto"), Some("favetto".to_string()));
-        assert_eq!(repo_name("/code/favetto/"), Some("favetto".to_string()));
-        assert_eq!(repo_name("/"), None);
-        assert_eq!(repo_name(""), None);
     }
 
     #[test]

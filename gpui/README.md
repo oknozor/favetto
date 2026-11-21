@@ -37,9 +37,16 @@ cargo run
 ```
 
 The window opens titled **"favetto"** (default 1280×800, minimum 900×600). With
-the daemon running locally, the top bar shows the repo name and the connection
-pill (**● Connected**), and the status bar shows the endpoint, ping round-trip
-and live event cursor. Stopping the daemon flips the pill to
+the daemon running locally, the top bar shows the daemon's active repo
+(`repos.list`, or `repo: global` when none is active) and the connection pill
+(**● Connected**), and the status bar shows the endpoint, ping round-trip and
+live event cursor. Clicking the repo label (or running **Switch repository** in
+the command palette) opens a searchable picker with a leading `global` row, the
+known repos filtered by name or path, the active marker and a `(missing)` suffix
+for unavailable checkouts. Selecting a row calls `repos.activate` and updates
+the bar and lists immediately; a switch made by another client arrives through
+`catalog.updated`. Tasks/Inbox show only the active repo's rows, while Catalog
+also keeps global definitions visible, matching the TUI. Stopping the daemon flips the pill to
 **◌ Reconnecting (n)**; restarting recovers automatically. A rejected token
 shows **● Unauthorized** together with the token file path to fix, and the
 Reconnect action retries after the token/test daemon is corrected.
@@ -220,7 +227,7 @@ field blank keeps the shared token file.
 - `src/config.rs` — config/token loading and endpoint normalization.
 - `src/transport.rs` — typed `RpcClient` over `favetto-wire` frames, bearer auth,
   and one wrapper per method used by the client (`system.ping`, tasks, catalog,
-  agents, workflows, schedules, `events.subscribe`). 401 becomes
+  agents, workflows, schedules, repos, `events.subscribe`). 401 becomes
   `ClientError::Unauthorized`; malformed frames become typed protocol errors.
 - `src/sse.rs` — incremental SSE parser (id/event/data/retry, CRLF, multi-line
   data, UTF-8 split across chunks), monotonic cursor, exponential backoff, and a
@@ -231,9 +238,13 @@ field blank keeps the shared token file.
   folds updates in and calls `cx.notify()`. It also owns the active route, the
   pushed-detail flag, the shared task snapshot (tasks + sessions + agent
   roster), the Inbox selection, the Tasks filter/query/selection, the Catalog
-  model, the confirmation dialog and the toast. Inbox/Tasks derivations are
-  memoized on a snapshot revision and shared with `Rc`; action errors use one
-  `copy_text` clipboard path.
+  model, the repo registry/active-repo scope, the confirmation dialog and the
+  toast. Inbox/Tasks derivations are memoized on a snapshot revision and shared
+  with `Rc`; action errors use one `copy_text` clipboard path.
+- `src/repos.rs` — the pure repo model: `repos.list` registry, active-repo
+  label, Tasks/Inbox vs Catalog scoping, and the searchable picker (global row,
+  active marker, `(missing)` repos, keyboard selection). Unit-tested without a
+  window.
 - `src/catalog.rs` — the pure Catalog model: repo/folder grouping, fuzzy
   name+prompt filtering, session-scoped collapse keys, preview state, and the
   launch/one-shot forms with required/type/choice validation. Unit-tested

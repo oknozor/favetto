@@ -17,6 +17,8 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use serde_json::{Map, Value};
 
+use crate::repos::catalog_visible;
+
 /// The first-fetch state of `catalog.list`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum CatalogStatus {
@@ -315,6 +317,9 @@ pub struct CatalogState {
     preview: Option<CatalogPreview>,
     launch: Option<LaunchForm>,
     oneshot: Option<OneShotForm>,
+    /// The daemon-wide active repo. The Catalog shows its local entries plus
+    /// global ones, matching the TUI's `catalog_visible`.
+    active_repo: Option<String>,
 }
 
 impl CatalogState {
@@ -337,6 +342,23 @@ impl CatalogState {
         self.status = CatalogStatus::Loaded;
         self.ensure_selection();
         self.preview_needed()
+    }
+
+    /// Apply the daemon-wide active repo. The selection is re-clamped and a
+    /// cached preview for a now-hidden definition is dropped.
+    pub fn set_active_repo(&mut self, active: Option<String>) {
+        let changed = self.active_repo != active;
+        self.active_repo = active;
+        if changed {
+            self.preview = None;
+        }
+        self.ensure_selection();
+    }
+
+    /// Whether an entry is in scope for the active repo (its own entries plus
+    /// global ones; everything with no active repo).
+    fn entry_in_scope(&self, entry: &CatalogEntry) -> bool {
+        catalog_visible(self.active_repo.as_deref(), entry.repo.as_deref())
     }
 
     /// Show the skeleton only while a load is in flight and no older list
@@ -478,6 +500,7 @@ impl CatalogState {
         let mut views: Vec<CatalogEntryView> = self
             .entries
             .iter()
+            .filter(|entry| self.entry_in_scope(entry))
             .filter(|entry| query.is_empty() || fuzzy_score(entry, query, &matcher).is_some())
             .map(CatalogEntryView::new)
             .collect();
@@ -538,6 +561,7 @@ impl CatalogState {
         let query = self.query.trim();
         self.entries
             .iter()
+            .filter(|entry| self.entry_in_scope(entry))
             .filter(|entry| query.is_empty() || fuzzy_score(entry, query, &matcher).is_some())
             .map(CatalogEntryView::new)
             .collect()
@@ -549,7 +573,10 @@ impl CatalogState {
     }
 
     pub fn total_count(&self) -> usize {
-        self.entries.len()
+        self.entries
+            .iter()
+            .filter(|entry| self.entry_in_scope(entry))
+            .count()
     }
 
     /// The raw definitions, used by the Schedules task picker. Sorted by name
@@ -955,6 +982,43 @@ mod tests {
             .unwrap();
         assert_eq!(gpui.entries.len(), 2);
         assert_eq!(gpui.entries[0].label, "gpui/01-scaffold");
+    }
+
+    #[test]
+    fn the_active_repo_keeps_local_and_global_entries_and_drops_stale_selection() {
+        let mut state = CatalogState {
+            entries: vec![
+                entry("repo:favetto/triage", Some("favetto"), "sort", vec![]),
+                entry("repo:web/release", Some("web"), "ship", vec![]),
+                entry("global/hello", None, "say hi", vec![]),
+            ],
+            status: CatalogStatus::Loaded,
+            ..CatalogState::default()
+        };
+        state.select("repo:web/release");
+        state.set_active_repo(Some("favetto".to_string()));
+
+        let groups = state.groups();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].key, "repo:favetto");
+        assert_eq!(groups[1].key, "global");
+        assert_eq!(state.total_count(), 2);
+        assert_eq!(state.matched_count(), 2);
+        assert_eq!(state.selected(), Some("repo:favetto/triage"));
+        assert!(state.preview().is_none());
+
+        state.select("repo:favetto/triage");
+        state.set_active_repo(Some("web".to_string()));
+        assert_eq!(state.groups().len(), 2);
+        assert_eq!(
+            state.selected(),
+            Some("repo:web/release"),
+            "a hidden selection is re-clamped after a switch"
+        );
+
+        state.set_active_repo(None);
+        assert_eq!(state.groups().len(), 3);
+        assert_eq!(state.total_count(), 3);
     }
 
     #[test]

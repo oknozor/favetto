@@ -28,10 +28,11 @@ use favetto_wire::model::{
 };
 use favetto_wire::rpc::{
     AgentAttachResult, AgentReplyParams, AgentReplyResult, AgentsHistoryParams, CatalogEntry,
-    CatalogGetParams, EmptyParams, PingParams, PingResult, ScheduleDeleteParams,
-    ScheduleUpsertParams, SchedulesDeleteResult, SessionIdParams, StartOneshotParams,
-    StartOneshotResult, TaskIdParams, TasksEventsParams, TasksListParams, TasksStartParams,
-    WorkflowCancelResultBody, WorkflowGetResult, WorkflowInspectParams, WorkflowRetryParams,
+    CatalogGetParams, EmptyParams, PingParams, PingResult, ReposActivateParams, ReposListResult,
+    ScheduleDeleteParams, ScheduleUpsertParams, SchedulesDeleteResult, SessionIdParams,
+    StartOneshotParams, StartOneshotResult, TaskIdParams, TasksEventsParams, TasksListParams,
+    TasksStartParams, WorkflowCancelResultBody, WorkflowGetResult, WorkflowInspectParams,
+    WorkflowRetryParams,
 };
 use favetto_wire::workflow::WorkflowInspect;
 use uuid::Uuid;
@@ -119,6 +120,11 @@ pub enum Command {
     },
     /// Delete one schedule by id.
     DeleteSchedule { id: String },
+    /// Re-fetch `repos.list` (connect, a manual refresh or a `catalog.updated`
+    /// push from another client's add/remove/activate).
+    RefreshRepos,
+    /// Activate one repo (`repos.activate`), or clear it for the global view.
+    ActivateRepo { name: Option<String> },
     /// Run `system.ping` against a draft endpoint/token without touching the
     /// live connection (the Settings "Test connection" action).
     TestConnection {
@@ -247,6 +253,14 @@ pub enum Update {
     ScheduleDeleted {
         id: String,
         result: Result<SchedulesDeleteResult, ClientError>,
+    },
+    /// A fresh `repos.list` registry (also fetched after `catalog.updated`).
+    ReposLoaded {
+        result: Result<ReposListResult, ClientError>,
+    },
+    /// `repos.activate` completed; the result is the updated registry.
+    RepoActivated {
+        result: Result<ReposListResult, ClientError>,
     },
     /// A draft-connection ping completed.
     ConnectionTestFinished {
@@ -436,6 +450,16 @@ impl Runtime {
         self.send(Command::DeleteSchedule { id });
     }
 
+    /// Ask for a fresh repo registry. Coalesced by the loader.
+    pub fn refresh_repos(&self) {
+        self.send(Command::RefreshRepos);
+    }
+
+    /// Activate one repo, or clear the active repo for the global view.
+    pub fn activate_repo(&self, name: Option<String>) {
+        self.send(Command::ActivateRepo { name });
+    }
+
     /// Ping a draft endpoint without disturbing the live connection.
     pub fn test_connection(&self, endpoint: String, token: Option<String>) {
         self.send(Command::TestConnection { endpoint, token });
@@ -477,6 +501,11 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
     spawn_catalog_loader(client.clone(), updates.clone(), catalog_triggers);
     let (schedule_trigger, schedule_triggers) = async_channel::bounded(1);
     spawn_schedule_loader(client.clone(), updates.clone(), schedule_triggers);
+    let (repo_trigger, repo_triggers) = async_channel::bounded(1);
+    spawn_repo_loader(client.clone(), updates.clone(), repo_triggers);
+    // Fill the top-bar label as soon as the worker can reach the daemon; the
+    // Connected transition also asks, and the queue coalesces the two.
+    let _ = repo_trigger.try_send(());
 
     while let Ok(command) = commands.recv().await {
         match command {
@@ -494,6 +523,7 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
                 let _ = inbox_trigger.try_send(());
                 let _ = catalog_trigger.try_send(());
                 let _ = schedule_trigger.try_send(());
+                let _ = repo_trigger.try_send(());
             }
             Command::RefreshSnapshot => {
                 // Capacity one: if a load is already queued/running, this is a
@@ -589,6 +619,12 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
             }
             Command::DeleteSchedule { id } => {
                 spawn_schedule_delete(client.clone(), updates.clone(), id);
+            }
+            Command::RefreshRepos => {
+                let _ = repo_trigger.try_send(());
+            }
+            Command::ActivateRepo { name } => {
+                spawn_repo_activate(client.clone(), updates.clone(), name);
             }
             Command::TestConnection { endpoint, token } => {
                 spawn_connection_test(updates.clone(), endpoint, token);
@@ -1003,6 +1039,27 @@ fn spawn_schedule_delete(client: Arc<RpcClient>, updates: Sender<Update>, id: St
             .schedules_delete(ScheduleDeleteParams { id: id.clone() })
             .await;
         let _ = updates.try_send(Update::ScheduleDeleted { id, result });
+    });
+}
+
+/// Drain repo refresh triggers into one `repos.list`, coalescing a burst of
+/// `catalog.updated` pushes from other clients into a single round trip.
+fn spawn_repo_loader(client: Arc<RpcClient>, updates: Sender<Update>, triggers: Receiver<()>) {
+    tokio::spawn(async move {
+        while triggers.recv().await.is_ok() {
+            while triggers.try_recv().is_ok() {}
+            let result = client.repos_list(EmptyParams {}).await;
+            let _ = updates.try_send(Update::ReposLoaded { result });
+        }
+    });
+}
+
+/// Spawn one `repos.activate`; the result carries the updated registry so the
+/// bar and picker update without a reload.
+fn spawn_repo_activate(client: Arc<RpcClient>, updates: Sender<Update>, name: Option<String>) {
+    tokio::spawn(async move {
+        let result = client.repos_activate(ReposActivateParams { name }).await;
+        let _ = updates.try_send(Update::RepoActivated { result });
     });
 }
 
