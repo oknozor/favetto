@@ -26,12 +26,12 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::schema::{
     AgentCapabilities, AvailableCommand as AcpAvailableCommand,
     AvailableCommandInput as AcpAvailableCommandInput, CancelNotification, ContentBlock,
-    EmbeddedResourceResource, InitializeRequest, LoadSessionRequest, NewSessionRequest,
-    PermissionOptionKind, PlanEntry as AcpPlanEntry, PlanEntryPriority as AcpPlanPriority,
-    PlanEntryStatus as AcpPlanStatus, PromptRequest, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionConfigId as AcpSessionConfigId, SessionConfigKind as AcpSessionConfigKind,
-    SessionConfigOption as AcpSessionConfigOption,
+    DeleteSessionRequest, EmbeddedResourceResource, InitializeRequest, ListSessionsRequest,
+    LoadSessionRequest, NewSessionRequest, PermissionOptionKind, PlanEntry as AcpPlanEntry,
+    PlanEntryPriority as AcpPlanPriority, PlanEntryStatus as AcpPlanStatus, PromptRequest,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigId as AcpSessionConfigId,
+    SessionConfigKind as AcpSessionConfigKind, SessionConfigOption as AcpSessionConfigOption,
     SessionConfigOptionCategory as AcpSessionConfigCategory,
     SessionConfigOptionValue as AcpSessionConfigValue,
     SessionConfigSelectOptions as AcpSelectOptions,
@@ -80,6 +80,53 @@ pub(crate) enum AcpSessionMode {
     New,
     /// Restore a session Favetto already knows by its agent-assigned ACP id.
     Load { external_session_id: String },
+    /// Resume a provider-owned session discovered through `session/list`.
+    ///
+    /// The method is negotiated after `initialize`: `session/load` is preferred
+    /// because it replays the transcript, with `session/resume` as the fallback
+    /// for agents that can resume but cannot load. Both keep the provider ACP id
+    /// separate from the Favetto-local routing id.
+    ProviderResume { external_session_id: String },
+}
+
+impl AcpSessionMode {
+    /// Whether this mode restores an existing provider conversation.
+    fn is_restore(&self) -> bool {
+        !matches!(self, AcpSessionMode::New)
+    }
+}
+
+/// The provider session metadata returned by one `session/list` page.
+#[derive(Debug, Clone)]
+pub(crate) struct AcpProviderSession {
+    pub session_id: String,
+    pub cwd: PathBuf,
+    pub title: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+/// One `session/list` page plus the capabilities needed to gate actions.
+#[derive(Debug)]
+pub(crate) struct AcpProviderList {
+    /// Whether the agent advertised `sessionCapabilities.list`.
+    pub supported: bool,
+    pub sessions: Vec<AcpProviderSession>,
+    pub next_cursor: Option<String>,
+    pub capabilities: AgentCapabilities,
+}
+
+/// A short-lived ACP connection used for provider history operations.
+pub(crate) struct AcpProviderLaunch {
+    pub agent: String,
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    /// The process working directory.
+    pub cwd: PathBuf,
+    /// Optional `cwd` filter passed to `session/list`.
+    pub filter_cwd: Option<PathBuf>,
+    /// Opaque cursor from a previous page.
+    pub cursor: Option<String>,
 }
 
 /// What to launch and how to drive it.
@@ -350,45 +397,47 @@ impl AcpHandles {
     }
 }
 
-/// Spawn an ACP server and drive one session.
-///
-/// Returns as soon as the child is running: initialization, session creation and
-/// the initial prompt happen in the background, and their failures surface as
-/// state events plus a non-zero exit code. This matches the PTY backend, whose
-/// `start` is also synchronous.
-pub(crate) fn spawn(
-    launch: AcpLaunch,
-) -> anyhow::Result<(AcpHandles, mpsc::UnboundedReceiver<AcpEvent>)> {
-    if tokio::runtime::Handle::try_current().is_err() {
-        anyhow::bail!("ACP sessions require the daemon's async runtime");
-    }
+/// A spawned ACP server with its protocol pipes.
+struct AcpProcess {
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    stdout: tokio::process::ChildStdout,
+}
 
-    // A missing working directory makes `execve` fail with ENOENT too, which
-    // would otherwise be reported as if the program were missing. Name the
-    // directory explicitly: a stale repo/cwd is the usual cause.
-    if !launch.cwd.is_dir() {
+/// Spawn one ACP server process.
+///
+/// A missing working directory makes `execve` fail with ENOENT too, which would
+/// otherwise be reported as if the program were missing; name the directory
+/// explicitly because a stale repo/cwd is the usual cause.
+fn spawn_process(
+    agent: &str,
+    program: &std::path::Path,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: &std::path::Path,
+) -> anyhow::Result<AcpProcess> {
+    if !cwd.is_dir() {
         anyhow::bail!(
-            "agent '{}': working directory '{}' does not exist or is not a directory;              check the task's `cwd`/repo path",
-            launch.agent,
-            launch.cwd.display()
+            "agent '{agent}': working directory '{}' does not exist or is not a directory; \
+             check the task's `cwd`/repo path",
+            cwd.display()
         );
     }
 
-    let mut command = tokio::process::Command::new(&launch.program);
+    let mut command = tokio::process::Command::new(program);
     command
-        .args(&launch.args)
-        .envs(&launch.env)
-        .current_dir(&launch.cwd)
+        .args(args)
+        .envs(env)
+        .current_dir(cwd)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     let mut child = command.spawn().map_err(|e| {
         anyhow::anyhow!(
-            "agent '{}': cannot launch ACP server '{}' in '{}': {e}",
-            launch.agent,
-            launch.program.display(),
-            launch.cwd.display()
+            "agent '{agent}': cannot launch ACP server '{}' in '{}': {e}",
+            program.display(),
+            cwd.display()
         )
     })?;
     let stdin = child
@@ -407,6 +456,43 @@ pub(crate) fn spawn(
             }
         });
     }
+    Ok(AcpProcess {
+        child,
+        stdin,
+        stdout,
+    })
+}
+
+/// Kill and reap a one-shot operation's server.
+async fn finish_process(mut child: tokio::process::Child) {
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
+/// Spawn an ACP server and drive one session.
+///
+/// Returns as soon as the child is running: initialization, session creation and
+/// the initial prompt happen in the background, and their failures surface as
+/// state events plus a non-zero exit code. This matches the PTY backend, whose
+/// `start` is also synchronous.
+pub(crate) fn spawn(
+    launch: AcpLaunch,
+) -> anyhow::Result<(AcpHandles, mpsc::UnboundedReceiver<AcpEvent>)> {
+    if tokio::runtime::Handle::try_current().is_err() {
+        anyhow::bail!("ACP sessions require the daemon's async runtime");
+    }
+
+    let AcpProcess {
+        child,
+        stdin,
+        stdout,
+    } = spawn_process(
+        &launch.agent,
+        &launch.program,
+        &launch.args,
+        &launch.env,
+        &launch.cwd,
+    )?;
 
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     let (prompts_tx, mut prompts_rx) = mpsc::unbounded_channel();
@@ -446,7 +532,7 @@ pub(crate) fn spawn(
     // the restore, even if one was supplied to the launch descriptor.
     let initial_prompt = match &launch.mode {
         AcpSessionMode::New => launch.prompt.clone(),
-        AcpSessionMode::Load { .. } => None,
+        AcpSessionMode::Load { .. } | AcpSessionMode::ProviderResume { .. } => None,
     };
     let requested_model = launch.model.clone();
     let agent_name = launch.agent.clone();
@@ -468,7 +554,7 @@ pub(crate) fn spawn(
     let control_responder = responder.clone();
     let mode = launch.mode;
     let (load_tx, load_rx) = match &mode {
-        AcpSessionMode::Load { .. } => {
+        AcpSessionMode::Load { .. } | AcpSessionMode::ProviderResume { .. } => {
             let (tx, rx) = tokio::sync::watch::channel(None);
             (Some(tx), Some(rx))
         }
@@ -476,9 +562,13 @@ pub(crate) fn spawn(
     };
     // A load's replay arrives before `session/load` returns. Hold it until the
     // response proves the restore succeeded, so a failure cannot expose a
-    // partial transcript.
+    // partial transcript. A provider resume prefers `session/load` and falls
+    // back to `session/resume`, so it uses the same gate; the resume path
+    // simply has no buffered replay to release.
     let replay_gate = match &mode {
-        AcpSessionMode::Load { .. } => Some(Arc::new(Mutex::new(ReplayGate::new()))),
+        AcpSessionMode::Load { .. } | AcpSessionMode::ProviderResume { .. } => {
+            Some(Arc::new(Mutex::new(ReplayGate::new())))
+        }
         AcpSessionMode::New => None,
     };
     // The terminal error path must be able to fail the load even when setup
@@ -489,10 +579,9 @@ pub(crate) fn spawn(
     let failure_replay = replay_gate.clone();
     let notification_replay = replay_gate.clone();
     let mut child = child;
-    let task =
-        tokio::spawn(async move {
-            let notification_transcript = Arc::clone(&notification_transcript);
-            let result = Client
+    let task = tokio::spawn(async move {
+        let notification_transcript = Arc::clone(&notification_transcript);
+        let result = Client
             .v1()
             .on_receive_notification(
                 async move |notification: SessionNotification, _cx| {
@@ -643,6 +732,121 @@ pub(crate) fn spawn(
                                 normalized_config_options(loaded.config_options.as_deref()),
                                 loaded.modes.as_ref().map(normalized_modes),
                             )
+                        }
+                        AcpSessionMode::ProviderResume {
+                            external_session_id: known,
+                        } => {
+                            // Prefer `session/load`: it replays the transcript.
+                            // `session/resume` is the v1 fallback for agents that
+                            // advertise resume without load.
+                            if init.agent_capabilities.load_session {
+                                let loaded = connection
+                                    .send_request(LoadSessionRequest::new(
+                                        SessionId::new(known.clone()),
+                                        cwd.clone(),
+                                    ))
+                                    .block_task()
+                                    .await
+                                    .map_err(|error| {
+                                        let message = format!(
+                                            "agent '{agent_name}' could not load provider session \
+                                             '{known}': {error}"
+                                        );
+                                        fail_load(&lifecycle, &load_tx, &message);
+                                        let _ = events_tx.send(AcpEvent::State(
+                                            AgentStateEvent::Error {
+                                                message: message.clone(),
+                                            },
+                                        ));
+                                        anyhow::anyhow!(message)
+                                    })?;
+                                if let Some(binding) = &ready_binding {
+                                    if let Err(error) = binding
+                                        .store
+                                        .mark_ready(&binding.id, known, binding.run_id.as_deref())
+                                        .await
+                                    {
+                                        let message = format!(
+                                            "agent '{agent_name}': cannot record resumed provider \
+                                             session id: {error}"
+                                        );
+                                        fail_load(&lifecycle, &load_tx, &message);
+                                        let _ = events_tx.send(AcpEvent::State(
+                                            AgentStateEvent::Error {
+                                                message: message.clone(),
+                                            },
+                                        ));
+                                        return Err(anyhow::anyhow!(message).into());
+                                    }
+                                }
+                                *session_id_slot.lock() = Some(known.clone());
+                                (
+                                    SessionId::new(known.clone()),
+                                    known.clone(),
+                                    current_model(loaded.config_options.as_deref()),
+                                    normalized_config_options(loaded.config_options.as_deref()),
+                                    loaded.modes.as_ref().map(normalized_modes),
+                                )
+                            } else if init.agent_capabilities.session_capabilities.resume.is_some() {
+                                let resumed = connection
+                                    .send_request(ResumeSessionRequest::new(
+                                        SessionId::new(known.clone()),
+                                        cwd.clone(),
+                                    ))
+                                    .block_task()
+                                    .await
+                                    .map_err(|error| {
+                                        let message = format!(
+                                            "agent '{agent_name}' could not resume provider session \
+                                             '{known}': {error}"
+                                        );
+                                        fail_load(&lifecycle, &load_tx, &message);
+                                        let _ = events_tx.send(AcpEvent::State(
+                                            AgentStateEvent::Error {
+                                                message: message.clone(),
+                                            },
+                                        ));
+                                        anyhow::anyhow!(message)
+                                    })?;
+                                if let Some(binding) = &ready_binding {
+                                    if let Err(error) = binding
+                                        .store
+                                        .mark_ready(&binding.id, known, binding.run_id.as_deref())
+                                        .await
+                                    {
+                                        let message = format!(
+                                            "agent '{agent_name}': cannot record resumed provider \
+                                             session id: {error}"
+                                        );
+                                        fail_load(&lifecycle, &load_tx, &message);
+                                        let _ = events_tx.send(AcpEvent::State(
+                                            AgentStateEvent::Error {
+                                                message: message.clone(),
+                                            },
+                                        ));
+                                        return Err(anyhow::anyhow!(message).into());
+                                    }
+                                }
+                                *session_id_slot.lock() = Some(known.clone());
+                                (
+                                    SessionId::new(known.clone()),
+                                    known.clone(),
+                                    current_model(resumed.config_options.as_deref()),
+                                    normalized_config_options(resumed.config_options.as_deref()),
+                                    resumed.modes.as_ref().map(normalized_modes),
+                                )
+                            } else {
+                                let message = format!(
+                                    "agent '{agent_name}' cannot resume provider session \
+                                     '{known}': neither session/load nor session/resume is \
+                                     supported"
+                                );
+                                fail_load(&lifecycle, &load_tx, &message);
+                                let _ = events_tx.send(AcpEvent::State(AgentStateEvent::Error {
+                                    message: message.clone(),
+                                }));
+                                return Err(anyhow::anyhow!(message).into());
+                            }
                         }
                         AcpSessionMode::New => {
                             let session = connection
@@ -961,58 +1165,58 @@ pub(crate) fn spawn(
             )
             .await;
 
-            match result {
-                Ok(()) => {
-                    if exit_task.load(Ordering::SeqCst) < 0 {
-                        exit_task.store(0, Ordering::SeqCst);
-                    }
-                }
-                Err(error) => {
-                    let message = error.to_string();
-                    // Setup can fail before reaching the explicit load branches
-                    // (initialize, transport, registration). A load that has not
-                    // succeeded must expose the failure, not a partial transcript.
-                    if matches!(failure_mode, AcpSessionMode::Load { .. }) {
-                        if let Some(replay) = &failure_replay {
-                            replay.lock().discard();
-                        }
-                        fail_load(&failure_lifecycle, &failure_load_tx, &message);
-                    }
-                    {
-                        let mut state = result_outcome.lock();
-                        if state.error.is_none() {
-                            state.error = Some(message.clone());
-                        }
-                    }
-                    let _ = result_events.send(AcpEvent::State(AgentStateEvent::Error { message }));
-                    exit_task.store(1, Ordering::SeqCst);
+        match result {
+            Ok(()) => {
+                if exit_task.load(Ordering::SeqCst) < 0 {
+                    exit_task.store(0, Ordering::SeqCst);
                 }
             }
-            // Record the terminal state before the session reports itself stopped, so
-            // a waiter (and the headless executor) never observes a finished session
-            // without its durable outcome. The row itself is kept for history.
-            if let Some(binding) = &end_binding {
-                let error = result_outcome.lock().error.clone();
-                let recorded = match error.as_deref() {
-                    Some(error) => binding.store.mark_failed(&binding.id, error).await,
-                    None => binding.store.mark_ended(&binding.id).await,
-                };
-                if let Err(write) = recorded {
-                    tracing::warn!(
-                        target: "favetto::acp",
-                        session = %binding.id,
-                        error = %write,
-                        "failed to record the terminal session state"
-                    );
+            Err(error) => {
+                let message = error.to_string();
+                // Setup can fail before reaching the explicit load branches
+                // (initialize, transport, registration). A load that has not
+                // succeeded must expose the failure, not a partial transcript.
+                if failure_mode.is_restore() {
+                    if let Some(replay) = &failure_replay {
+                        replay.lock().discard();
+                    }
+                    fail_load(&failure_lifecycle, &failure_load_tx, &message);
                 }
+                {
+                    let mut state = result_outcome.lock();
+                    if state.error.is_none() {
+                        state.error = Some(message.clone());
+                    }
+                }
+                let _ = result_events.send(AcpEvent::State(AgentStateEvent::Error { message }));
+                exit_task.store(1, Ordering::SeqCst);
             }
-            running_task.store(false, Ordering::SeqCst);
-            // Kill and reap the server: a clean `close_session` normally ends it,
-            // but a stuck or crashed server must not outlive the daemon or become a
-            // zombie.
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        });
+        }
+        // Record the terminal state before the session reports itself stopped, so
+        // a waiter (and the headless executor) never observes a finished session
+        // without its durable outcome. The row itself is kept for history.
+        if let Some(binding) = &end_binding {
+            let error = result_outcome.lock().error.clone();
+            let recorded = match error.as_deref() {
+                Some(error) => binding.store.mark_failed(&binding.id, error).await,
+                None => binding.store.mark_ended(&binding.id).await,
+            };
+            if let Err(write) = recorded {
+                tracing::warn!(
+                    target: "favetto::acp",
+                    session = %binding.id,
+                    error = %write,
+                    "failed to record the terminal session state"
+                );
+            }
+        }
+        running_task.store(false, Ordering::SeqCst);
+        // Kill and reap the server: a clean `close_session` normally ends it,
+        // but a stuck or crashed server must not outlive the daemon or become a
+        // zombie.
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    });
 
     Ok((
         AcpHandles {
@@ -1031,6 +1235,134 @@ pub(crate) fn spawn(
         },
         events_rx,
     ))
+}
+
+/// List one page of provider-owned sessions through the advertised
+/// `session/list`.
+///
+/// A short-lived ACP connection is launched for the operation: provider history
+/// is queried only from the agent itself, never inferred from Favetto's durable
+/// records. An agent without `sessionCapabilities.list` returns
+/// `supported: false` rather than receiving an unadvertised request.
+pub(crate) async fn list_provider_sessions(
+    launch: AcpProviderLaunch,
+) -> anyhow::Result<AcpProviderList> {
+    let AcpProcess {
+        child,
+        stdin,
+        stdout,
+    } = spawn_process(
+        &launch.agent,
+        &launch.program,
+        &launch.args,
+        &launch.env,
+        &launch.cwd,
+    )?;
+    let transport = Lines::new(sink_from_stdin(stdin), lossy_lines(stdout.compat()));
+    let filter_cwd = launch.filter_cwd;
+    let cursor = launch.cursor;
+
+    let result = Client
+        .v1()
+        .connect_with(
+            transport,
+            move |connection: ConnectionTo<Agent>| async move {
+                let init = connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let capabilities = init.agent_capabilities;
+                if capabilities.session_capabilities.list.is_none() {
+                    return Ok(AcpProviderList {
+                        supported: false,
+                        sessions: Vec::new(),
+                        next_cursor: None,
+                        capabilities,
+                    });
+                }
+                let mut request = ListSessionsRequest::new();
+                if let Some(cwd) = filter_cwd {
+                    request = request.cwd(cwd);
+                }
+                if let Some(cursor) = cursor {
+                    request = request.cursor(cursor);
+                }
+                let response = connection.send_request(request).block_task().await?;
+                let sessions = response
+                    .sessions
+                    .into_iter()
+                    .map(|session| AcpProviderSession {
+                        session_id: session.session_id.0.to_string(),
+                        cwd: session.cwd,
+                        title: session.title,
+                        updated_at: session.updated_at,
+                    })
+                    .collect();
+                Ok(AcpProviderList {
+                    supported: true,
+                    sessions,
+                    next_cursor: response.next_cursor,
+                    capabilities,
+                })
+            },
+        )
+        .await;
+    finish_process(child).await;
+    result.map_err(|error| anyhow::anyhow!(error))
+}
+
+/// Delete a provider-owned session through the advertised `session/delete`.
+///
+/// This removes only the provider transcript. Favetto-local metadata remains a
+/// separate lifecycle and is not touched here.
+pub(crate) async fn delete_provider_session(
+    launch: AcpProviderLaunch,
+    session_id: String,
+) -> anyhow::Result<()> {
+    let AcpProcess {
+        child,
+        stdin,
+        stdout,
+    } = spawn_process(
+        &launch.agent,
+        &launch.program,
+        &launch.args,
+        &launch.env,
+        &launch.cwd,
+    )?;
+    let transport = Lines::new(sink_from_stdin(stdin), lossy_lines(stdout.compat()));
+    let agent = launch.agent;
+
+    let result = Client
+        .v1()
+        .connect_with(
+            transport,
+            move |connection: ConnectionTo<Agent>| async move {
+                let init = connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                if init
+                    .agent_capabilities
+                    .session_capabilities
+                    .delete
+                    .is_none()
+                {
+                    return Err(anyhow::anyhow!(
+                        "agent '{agent}' does not support deleting ACP sessions (session/delete)"
+                    )
+                    .into());
+                }
+                connection
+                    .send_request(DeleteSessionRequest::new(SessionId::new(session_id)))
+                    .block_task()
+                    .await?;
+                Ok(())
+            },
+        )
+        .await;
+    finish_process(child).await;
+    result.map_err(|error| anyhow::anyhow!(error))
 }
 
 /// Answers permission requests according to the session's policy.
@@ -2815,6 +3147,19 @@ mod tests {
         assert!(error.contains("working directory"), "{error}");
         assert!(error.contains("/nonexistent/favetto-acp-cwd"), "{error}");
         assert!(error.contains("'demo'"), "{error}");
+    }
+
+    #[test]
+    fn only_restore_modes_use_the_load_gate() {
+        assert!(!AcpSessionMode::New.is_restore());
+        assert!(AcpSessionMode::Load {
+            external_session_id: "provider-1".to_string()
+        }
+        .is_restore());
+        assert!(AcpSessionMode::ProviderResume {
+            external_session_id: "provider-1".to_string()
+        }
+        .is_restore());
     }
 
     #[test]

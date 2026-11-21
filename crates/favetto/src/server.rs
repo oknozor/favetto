@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use favetto_core::model::{
     AgentCatalogEntry, AgentSessionHistoryEntry, AgentSessionInfo, AgentSessionState, EventKind,
-    Failure, FailureKind, Task, TaskStatus,
+    Failure, FailureKind, ProviderSessionsResult, Task, TaskStatus,
 };
 use favetto_core::rpc::messages::*;
 use favetto_core::rpc::{method, push, Frame, Notification, Request, Response, RpcError};
@@ -316,6 +316,42 @@ async fn handle_request(
     if req.method == method::AGENTS_LOAD {
         let resp = match parse_params::<AgentLoadParams>(&req.method, &req.params) {
             Ok(p) => match load_agent(state, &p.session_id, None).await {
+                Ok(session) => match state.agents.attach(&session.id) {
+                    Ok(AttachedAgent {
+                        session,
+                        data,
+                        seq,
+                        plan,
+                        commands,
+                    }) => {
+                        subscribed.lock().insert(session.id.clone());
+                        Response::ok(
+                            id,
+                            encode(AgentAttachResult {
+                                session,
+                                data: base64::engine::general_purpose::STANDARD.encode(&data),
+                                seq,
+                                plan,
+                                commands,
+                            }),
+                        )
+                    }
+                    Err(e) => Response::error(id, RpcError::Internal(e.to_string())),
+                },
+                Err(e) => Response::error(id, RpcError::InvalidParams(e.to_string())),
+            },
+            Err(error) => Response::error(id, error),
+        };
+        let _ = out_tx.send(Frame::Response(resp)).await;
+        return;
+    }
+
+    // `agents.provider_resume` restores a provider-owned session by its ACP id,
+    // imports it into a Favetto-local record, and subscribes this connection.
+    // The local id in the result is the only routing key for follow-up calls.
+    if req.method == method::AGENTS_PROVIDER_RESUME {
+        let resp = match parse_params::<ProviderResumeParams>(&req.method, &req.params) {
+            Ok(p) => match resume_provider_session(state, p).await {
                 Ok(session) => match state.agents.attach(&session.id) {
                     Ok(AttachedAgent {
                         session,
@@ -703,6 +739,22 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
             let limit = p.limit.unwrap_or(50).min(500) as i64;
             match list_agent_history(state, limit).await {
                 Ok(history) => to_value(history),
+                Err(e) => Err(RpcError::Internal(e.to_string())),
+            }
+        }
+
+        method::AGENTS_PROVIDER_SESSIONS => {
+            let p: ProviderSessionsParams = parse_params(&req.method, &req.params)?;
+            match provider_sessions(state, p).await {
+                Ok(results) => to_value(results),
+                Err(e) => Err(RpcError::Internal(e.to_string())),
+            }
+        }
+
+        method::AGENTS_PROVIDER_DELETE => {
+            let p: ProviderDeleteParams = parse_params(&req.method, &req.params)?;
+            match delete_provider_session(state, p).await {
+                Ok(()) => to_value(ProviderDeleteResult { deleted: true }),
                 Err(e) => Err(RpcError::Internal(e.to_string())),
             }
         }
@@ -1465,6 +1517,99 @@ async fn load_agent(
     let name = record.agent.clone();
     let agent = state.registry.get_checked(&name)?;
     state.agents.load(&name, agent, record).await
+}
+
+/// Resolve a configured agent, either by name or the daemon default.
+fn resolve_agent(
+    state: &Arc<State>,
+    requested: Option<&str>,
+) -> anyhow::Result<(String, Arc<crate::agents::Agent>)> {
+    match requested {
+        Some(name) => Ok((name.to_string(), state.registry.get_checked(name)?)),
+        None => {
+            let agent = state
+                .registry
+                .default_agent()
+                .ok_or_else(|| anyhow::anyhow!("no default agent is configured"))?;
+            Ok((agent.descriptor().id.clone(), agent))
+        }
+    }
+}
+
+/// List provider-owned sessions through ACP `session/list`.
+///
+/// With no `agent`, every available configured agent is queried independently.
+/// Each result keeps its own capability flags, cursor and error so one
+/// unsupported or broken agent cannot hide the others. Provider history is never
+/// merged into Favetto's durable `agents.history` records.
+async fn provider_sessions(
+    state: &Arc<State>,
+    params: ProviderSessionsParams,
+) -> anyhow::Result<Vec<ProviderSessionsResult>> {
+    if params.agent.is_none() && params.cursor.is_some() {
+        anyhow::bail!("a provider session cursor requires an explicit agent");
+    }
+
+    let names: Vec<(String, Arc<crate::agents::Agent>)> = match params.agent.as_deref() {
+        Some(name) => vec![resolve_agent(state, Some(name))?],
+        None => {
+            let mut names = Vec::new();
+            for descriptor in state.registry.descriptors() {
+                if !descriptor.available {
+                    continue;
+                }
+                if let Ok(agent) = state.registry.get_checked(&descriptor.id) {
+                    names.push((descriptor.id.clone(), agent));
+                }
+            }
+            names
+        }
+    };
+
+    let mut results = Vec::with_capacity(names.len());
+    for (name, agent) in names {
+        match state
+            .agents
+            .provider_sessions(&name, agent, params.cwd.clone(), params.cursor.clone())
+            .await
+        {
+            Ok(result) => results.push(result),
+            Err(error) => results.push(ProviderSessionsResult {
+                agent: name,
+                supported: false,
+                can_resume: false,
+                can_delete: false,
+                sessions: Vec::new(),
+                next_cursor: None,
+                error: Some(error.to_string()),
+            }),
+        }
+    }
+    Ok(results)
+}
+
+/// Resume a provider-owned session by its provider ACP id.
+async fn resume_provider_session(
+    state: &Arc<State>,
+    params: ProviderResumeParams,
+) -> anyhow::Result<AgentSessionInfo> {
+    let (name, agent) = resolve_agent(state, params.agent.as_deref())?;
+    state
+        .agents
+        .resume_provider(&name, agent, &params.provider_session_id, params.cwd)
+        .await
+}
+
+/// Delete a provider-owned session through ACP `session/delete`.
+async fn delete_provider_session(
+    state: &Arc<State>,
+    params: ProviderDeleteParams,
+) -> anyhow::Result<()> {
+    let (name, agent) = resolve_agent(state, params.agent.as_deref())?;
+    state
+        .agents
+        .delete_provider_session(&name, agent, &params.provider_session_id)
+        .await
 }
 
 /// Resolve the requested (or default) agent and, when the task has a live ACP

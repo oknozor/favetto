@@ -349,8 +349,9 @@ is persisted locally and restored on restart.
 An ended, loadable row has a **Load** button that requests `agents.load` with the
 Favetto-local session id; loading, ready, failed and cannot-load states are shown
 inline. This restores the provider's own conversation and never starts a fresh
-session. Sessions created outside Favetto are not imported: ACP `session/list`
-is not implemented.
+session. This page lists only Favetto-created rows; provider-owned history is
+available through `agents.provider_sessions` and is integrated into the TUI
+Ctrl+O picker and the desktop Past sessions card.
 
 ### Soft keyboard
 
