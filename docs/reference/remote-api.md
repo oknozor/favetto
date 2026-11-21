@@ -54,6 +54,9 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | `agents.attach` | Attach to a session: returns the session and a replay of its output. |
 | `agents.close` | Terminate a session. |
 | `agents.reply` | Answer a structured input request on a session's state channel. |
+| `agents.options` | Read a live ACP session's advertised config options and session modes. The returned snapshot is the same one `agents.list` exposes. |
+| `agents.set_option` | Change one config option advertised by a live ACP session. The daemon validates the option id and value against that session's current snapshot and rejects values the agent did not offer. |
+| `agents.set_mode` | Switch a live ACP session to one of its advertised modes. Unknown mode ids are rejected; the result carries the reconciled mode/option snapshot. |
 | `providers.list` | List configured providers and their available models. |
 | `schedules.list` | List cron schedules, with the next occurrence (`next_run`, UTC) computed for enabled entries. |
 | `schedules.upsert` | Create or update a cron schedule. |
@@ -719,6 +722,63 @@ Answer a structured input request on a session's state channel.
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
 | `replied` | boolean | — | yes |  |
+
+### `agents.options`
+
+Read a live ACP session's advertised config options and session modes. The returned snapshot is the same one `agents.list` exposes.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `session_id` | string | — | yes |  |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `session_id` | string | — | yes |  |
+| `config_options` | SessionConfigOption[] | `[]` | no |  |
+| `modes` | SessionModes (optional) | — | no |  |
+
+### `agents.set_option`
+
+Change one config option advertised by a live ACP session. The daemon validates the option id and value against that session's current snapshot and rejects values the agent did not offer.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `session_id` | string | — | yes |  |
+| `option_id` | string | — | yes |  |
+| `value` | SessionConfigValue | — | yes |  |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `session_id` | string | — | yes |  |
+| `config_options` | SessionConfigOption[] | `[]` | no |  |
+| `modes` | SessionModes (optional) | — | no |  |
+
+### `agents.set_mode`
+
+Switch a live ACP session to one of its advertised modes. Unknown mode ids are rejected; the result carries the reconciled mode/option snapshot.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `session_id` | string | — | yes |  |
+| `mode_id` | string | — | yes |  |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `session_id` | string | — | yes |  |
+| `config_options` | SessionConfigOption[] | `[]` | no |  |
+| `modes` | SessionModes (optional) | — | no |  |
 
 ### `providers.list`
 

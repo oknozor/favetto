@@ -21,7 +21,7 @@ use std::time::Duration;
 use chrono::Utc;
 use favetto_wire::model::{
     AgentCatalogEntry, AgentCommand, AgentPlanEntry, AgentSessionInfo, AgentUsage, EventKind,
-    InputReply, RepoInfo, Task, TaskStatus,
+    InputReply, RepoInfo, SessionConfigOption, SessionConfigValue, SessionModes, Task, TaskStatus,
 };
 use favetto_wire::rpc::AgentEventPush;
 use gpui::{ClipboardItem, Context, Task as GpuiTask, WindowAppearance};
@@ -928,6 +928,43 @@ impl ClientState {
                 // durable lifecycle (`agents.history`); reconcile both.
                 self.refresh_snapshot();
             }
+            Update::AgentOptionsChanged { session_id, result } => match result {
+                Ok(snapshot) => {
+                    if let Some(session) = self
+                        .sessions
+                        .iter_mut()
+                        .find(|session| session.id == snapshot.session_id)
+                    {
+                        session.config_options = snapshot.config_options;
+                        session.modes = snapshot.modes;
+                    } else if let Some(session) = self
+                        .sessions
+                        .iter_mut()
+                        .find(|session| session.id == session_id)
+                    {
+                        session.config_options = snapshot.config_options;
+                        session.modes = snapshot.modes;
+                    }
+                    self.touch_snapshot();
+                    self.show_toast(
+                        ToastKind::Success,
+                        "Session options updated.".to_string(),
+                        cx,
+                    );
+                }
+                Err(error) => {
+                    if error.is_unauthorized() {
+                        self.connection = ConnectionState::Unauthorized {
+                            token_path: self.config.token_source.label(),
+                        };
+                    }
+                    self.show_toast(
+                        ToastKind::Error,
+                        format!("Could not change session options: {error}."),
+                        cx,
+                    );
+                }
+            },
             Update::TaskActionFinished {
                 action,
                 previous,
@@ -3464,6 +3501,68 @@ impl ClientState {
             .max_by_key(|session| (session.running, session.id.as_str()))
             .map(|session| session.id.clone())
             .or_else(|| detail.events_session.clone())
+    }
+
+    /// The live/retained session snapshot backing the open detail's option bar.
+    pub fn detail_session_options(
+        &self,
+    ) -> Option<(String, Vec<SessionConfigOption>, Option<SessionModes>)> {
+        let session_id = self.detail_agent_session_id()?;
+        self.sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .map(|session| {
+                (
+                    session.id.clone(),
+                    session.config_options.clone(),
+                    session.modes.clone(),
+                )
+            })
+    }
+
+    /// Change one advertised option on the open detail's session.
+    pub fn set_detail_session_option(
+        &mut self,
+        option_id: String,
+        value: SessionConfigValue,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session_id) = self.detail_agent_session_id() else {
+            self.show_toast(
+                ToastKind::Info,
+                "No live agent session is attached to this run.".to_string(),
+                cx,
+            );
+            return;
+        };
+        match &self.runtime {
+            Some(runtime) => runtime.set_agent_option(session_id, option_id, value),
+            None => self.show_toast(
+                ToastKind::Error,
+                "The daemon connection is not available.".to_string(),
+                cx,
+            ),
+        }
+    }
+
+    /// Switch the open detail's session to an advertised mode.
+    pub fn set_detail_session_mode(&mut self, mode_id: String, cx: &mut Context<Self>) {
+        let Some(session_id) = self.detail_agent_session_id() else {
+            self.show_toast(
+                ToastKind::Info,
+                "No live agent session is attached to this run.".to_string(),
+                cx,
+            );
+            return;
+        };
+        match &self.runtime {
+            Some(runtime) => runtime.set_agent_mode(session_id, mode_id),
+            None => self.show_toast(
+                ToastKind::Error,
+                "The daemon connection is not available.".to_string(),
+                cx,
+            ),
+        }
     }
 
     /// Whether an `agents.cancel` round trip is in flight (or the cancelled turn

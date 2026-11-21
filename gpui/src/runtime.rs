@@ -23,17 +23,17 @@ use std::time::{Duration, Instant};
 
 use async_channel::{Receiver, Sender};
 use favetto_wire::model::{
-    AgentCatalogEntry, AgentSessionHistoryEntry, AgentSessionInfo, InputReply, Schedule, Task,
-    TaskRun,
+    AgentCatalogEntry, AgentSessionHistoryEntry, AgentSessionInfo, InputReply, Schedule,
+    SessionConfigValue, Task, TaskRun,
 };
 use favetto_wire::rpc::{
-    AgentAttachResult, AgentCancelParams, AgentCancelResult, AgentPromptParams, AgentPromptResult,
-    AgentReplyParams, AgentReplyResult, AgentsHistoryParams, CatalogEntry, CatalogGetParams,
-    EmptyParams, PingParams, PingResult, ReposActivateParams, ReposListResult,
-    ScheduleDeleteParams, ScheduleUpsertParams, SchedulesDeleteResult, SessionIdParams,
-    StartOneshotParams, StartOneshotResult, TaskIdParams, TasksEventsParams, TasksListParams,
-    TasksStartParams, WorkflowCancelResultBody, WorkflowGetResult, WorkflowInspectParams,
-    WorkflowRetryParams,
+    AgentAttachResult, AgentCancelParams, AgentCancelResult, AgentOptionsResult, AgentPromptParams,
+    AgentPromptResult, AgentReplyParams, AgentReplyResult, AgentSetModeParams,
+    AgentSetOptionParams, AgentsHistoryParams, CatalogEntry, CatalogGetParams, EmptyParams,
+    PingParams, PingResult, ReposActivateParams, ReposListResult, ScheduleDeleteParams,
+    ScheduleUpsertParams, SchedulesDeleteResult, SessionIdParams, StartOneshotParams,
+    StartOneshotResult, TaskIdParams, TasksEventsParams, TasksListParams, TasksStartParams,
+    WorkflowCancelResultBody, WorkflowGetResult, WorkflowInspectParams, WorkflowRetryParams,
 };
 use favetto_wire::workflow::WorkflowInspect;
 use uuid::Uuid;
@@ -106,6 +106,14 @@ pub enum Command {
     Prompt { session_id: String, prompt: String },
     /// Restore a persisted ACP session by its Favetto-local id (`agents.load`).
     LoadAgentSession { session_id: String },
+    /// Change one advertised ACP config option (`agents.set_option`).
+    SetAgentOption {
+        session_id: String,
+        option_id: String,
+        value: SessionConfigValue,
+    },
+    /// Switch a live ACP session to an advertised mode (`agents.set_mode`).
+    SetAgentMode { session_id: String, mode_id: String },
     /// Fetch one root's runtime workflow graph (`workflow.inspect`).
     LoadWorkflowInspect { root_id: Uuid },
     /// Fetch the catalog DAG source (`workflow.get`).
@@ -236,6 +244,11 @@ pub enum Update {
     AgentSessionLoaded {
         session_id: String,
         result: Result<Box<AgentAttachResult>, ClientError>,
+    },
+    /// `agents.set_option` / `agents.set_mode` completed for one session.
+    AgentOptionsChanged {
+        session_id: String,
+        result: Result<Box<AgentOptionsResult>, ClientError>,
     },
     /// `workflow.inspect` completed for one root.
     WorkflowInspectLoaded {
@@ -429,6 +442,28 @@ impl Runtime {
         self.send(Command::LoadAgentSession { session_id });
     }
 
+    /// Change one advertised ACP config option.
+    pub fn set_agent_option(
+        &self,
+        session_id: String,
+        option_id: String,
+        value: SessionConfigValue,
+    ) {
+        self.send(Command::SetAgentOption {
+            session_id,
+            option_id,
+            value,
+        });
+    }
+
+    /// Switch a live ACP session to an advertised mode.
+    pub fn set_agent_mode(&self, session_id: String, mode_id: String) {
+        self.send(Command::SetAgentMode {
+            session_id,
+            mode_id,
+        });
+    }
+
     /// Fetch one root's runtime workflow view.
     pub fn load_workflow_inspect(&self, root_id: Uuid) {
         self.send(Command::LoadWorkflowInspect { root_id });
@@ -617,6 +652,25 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
             }
             Command::LoadAgentSession { session_id } => {
                 spawn_agent_load(client.clone(), updates.clone(), session_id);
+            }
+            Command::SetAgentOption {
+                session_id,
+                option_id,
+                value,
+            } => {
+                spawn_agent_set_option(
+                    client.clone(),
+                    updates.clone(),
+                    session_id,
+                    option_id,
+                    value,
+                );
+            }
+            Command::SetAgentMode {
+                session_id,
+                mode_id,
+            } => {
+                spawn_agent_set_mode(client.clone(), updates.clone(), session_id, mode_id);
             }
             Command::LoadWorkflowInspect { root_id } => {
                 spawn_workflow_inspect(client.clone(), updates.clone(), root_id);
@@ -1015,6 +1069,46 @@ fn spawn_agent_load(client: Arc<RpcClient>, updates: Sender<Update>, session_id:
             .await
             .map(Box::new);
         let _ = updates.try_send(Update::AgentSessionLoaded { session_id, result });
+    });
+}
+
+/// Spawn one `agents.set_option` for the live session.
+fn spawn_agent_set_option(
+    client: Arc<RpcClient>,
+    updates: Sender<Update>,
+    session_id: String,
+    option_id: String,
+    value: SessionConfigValue,
+) {
+    tokio::spawn(async move {
+        let result = client
+            .agents_set_option(AgentSetOptionParams {
+                session_id: session_id.clone(),
+                option_id,
+                value,
+            })
+            .await
+            .map(Box::new);
+        let _ = updates.try_send(Update::AgentOptionsChanged { session_id, result });
+    });
+}
+
+/// Spawn one `agents.set_mode` for the live session.
+fn spawn_agent_set_mode(
+    client: Arc<RpcClient>,
+    updates: Sender<Update>,
+    session_id: String,
+    mode_id: String,
+) {
+    tokio::spawn(async move {
+        let result = client
+            .agents_set_mode(AgentSetModeParams {
+                session_id: session_id.clone(),
+                mode_id,
+            })
+            .await
+            .map(Box::new);
+        let _ = updates.try_send(Update::AgentOptionsChanged { session_id, result });
     });
 }
 

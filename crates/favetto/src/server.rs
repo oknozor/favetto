@@ -786,6 +786,34 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
             }
         }
 
+        method::AGENTS_OPTIONS => {
+            let p: AgentOptionsParams = parse_params(&req.method, &req.params)?;
+            match state.agents.options(&p.session_id) {
+                Ok(options) => to_value(options),
+                Err(e) => Err(RpcError::Internal(e.to_string())),
+            }
+        }
+
+        method::AGENTS_SET_OPTION => {
+            let p: AgentSetOptionParams = parse_params(&req.method, &req.params)?;
+            match state
+                .agents
+                .set_config_option(&p.session_id, &p.option_id, p.value)
+                .await
+            {
+                Ok(options) => to_value(options),
+                Err(e) => Err(RpcError::Internal(e.to_string())),
+            }
+        }
+
+        method::AGENTS_SET_MODE => {
+            let p: AgentSetModeParams = parse_params(&req.method, &req.params)?;
+            match state.agents.set_mode(&p.session_id, &p.mode_id).await {
+                Ok(options) => to_value(options),
+                Err(e) => Err(RpcError::Internal(e.to_string())),
+            }
+        }
+
         method::SCHEDULES_LIST => match db::list_schedules(&state.db).await {
             Ok(mut schedules) => {
                 let now = chrono::Utc::now();

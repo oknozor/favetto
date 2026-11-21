@@ -12,8 +12,10 @@ use crate::rpc::{push, Notification};
 pub use crate::agent_state::{
     AgentActivity, AgentCommand, AgentCost, AgentPlanEntry, AgentPlanPriority, AgentPlanStatus,
     AgentStateEvent, AgentUsage, ContentRole, IdleOutcome, InputReply, InputRequest,
-    MessageContent, RunSummary, ToolCall, ToolCallDetail, ToolCallStatus, ToolContent, ToolKind,
-    ToolLocation, UsageBucket, UsagePeriod, UsageStats, UsageTotals,
+    MessageContent, RunSummary, SessionConfigChoice, SessionConfigChoices, SessionConfigGroup,
+    SessionConfigKind, SessionConfigOption, SessionConfigValue, SessionMode, SessionModes,
+    ToolCall, ToolCallDetail, ToolCallStatus, ToolContent, ToolKind, ToolLocation, UsageBucket,
+    UsagePeriod, UsageStats, UsageTotals,
 };
 
 /// Lifecycle of a single task.
@@ -663,6 +665,14 @@ pub struct AgentSessionInfo {
     /// Why a restore failed, when `load_state` is `failed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_error: Option<String>,
+    /// The complete ACP session config-option snapshot advertised by the agent.
+    /// Replaced wholesale by `config_option_update`; an empty list means the
+    /// live session offers no general options.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_options: Vec<SessionConfigOption>,
+    /// The session's mode state, when the agent advertises modes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modes: Option<SessionModes>,
 }
 
 /// The lifecycle of a persisted ACP session, as shown by `agents.history`.
@@ -1539,6 +1549,8 @@ mod tests {
                 cost_usd: Some(0.02),
                 ..Default::default()
             }),
+            config_options: Vec::new(),
+            modes: None,
             ..legacy
         };
         let json = serde_json::to_value(&live).unwrap();
@@ -1581,6 +1593,8 @@ mod tests {
                 usage: None,
                 load_state: state,
                 load_error: (state == AgentLoadState::Failed).then(|| "boom".to_string()),
+                config_options: Vec::new(),
+                modes: None,
             };
             let json = serde_json::to_value(&info).unwrap();
             assert_eq!(json["load_state"], serde_json::json!(state));
@@ -1604,6 +1618,8 @@ mod tests {
             usage: None,
             load_state: AgentLoadState::Failed,
             load_error: Some("cannot load session".to_string()),
+            config_options: Vec::new(),
+            modes: None,
         };
         let json = serde_json::to_value(&failed).unwrap();
         assert_eq!(json["load_state"], "failed");
@@ -1612,6 +1628,8 @@ mod tests {
         let ready = AgentSessionInfo {
             load_state: AgentLoadState::Ready,
             load_error: None,
+            config_options: Vec::new(),
+            modes: None,
             ..failed
         };
         let json = serde_json::to_value(&ready).unwrap();
@@ -1635,6 +1653,8 @@ mod tests {
                 options: Vec::new(),
                 allow_always: false,
             }),
+            config_options: Vec::new(),
+            modes: None,
             ..legacy
         };
         let json = serde_json::to_value(&with_reason).unwrap();

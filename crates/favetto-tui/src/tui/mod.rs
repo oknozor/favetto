@@ -938,6 +938,16 @@ async fn run_session(
                             UiAction::Reply { session_id, request_id, reply } => {
                                 send_agent_reply(client, app, session_id, request_id, reply).await;
                             }
+                            UiAction::SetSessionOption {
+                                session_id,
+                                option_id,
+                                value,
+                            } => {
+                                send_agent_option(client, app, session_id, option_id, value).await;
+                            }
+                            UiAction::SetSessionMode { session_id, mode_id } => {
+                                send_agent_mode(client, app, session_id, mode_id).await;
+                            }
                             UiAction::CancelTurn(session_id) => {
                                 cancel_agent_turn(client, app, session_id).await;
                             }
@@ -1531,6 +1541,78 @@ async fn send_agent_reply(
     fetch_agent_sessions(client, app).await;
 }
 
+/// Change one advertised session config option (`agents.set_option`) and adopt
+/// the complete reconciled snapshot the daemon returns.
+async fn send_agent_option(
+    client: &Client,
+    app: &mut App,
+    session_id: String,
+    option_id: String,
+    value: favetto_core::model::SessionConfigValue,
+) {
+    let params = serde_json::json!({
+        "session_id": session_id,
+        "option_id": option_id,
+        "value": value,
+    });
+    apply_session_options_response(
+        client,
+        app,
+        method::AGENTS_SET_OPTION,
+        "agents.set_option",
+        params,
+    )
+    .await;
+}
+
+/// Switch the attached ACP session to an advertised mode (`agents.set_mode`).
+async fn send_agent_mode(client: &Client, app: &mut App, session_id: String, mode_id: String) {
+    let params = serde_json::json!({ "session_id": session_id, "mode_id": mode_id });
+    apply_session_options_response(
+        client,
+        app,
+        method::AGENTS_SET_MODE,
+        "agents.set_mode",
+        params,
+    )
+    .await;
+}
+
+async fn apply_session_options_response(
+    client: &Client,
+    app: &mut App,
+    method: &'static str,
+    label: &str,
+    params: serde_json::Value,
+) {
+    match client.request(method, params).await {
+        Ok(resp) => match resp.result {
+            Some(value) => {
+                match serde_json::from_value::<favetto_core::rpc::AgentOptionsResult>(value) {
+                    Ok(snapshot) => {
+                        app.seed_agent_options(snapshot.config_options, snapshot.modes);
+                        app.agent_error = None;
+                        app.logs.push_back(format!("{label}: ok"));
+                    }
+                    Err(error) => {
+                        app.agent_error = Some(format!("{label}: malformed response: {error}"));
+                    }
+                }
+            }
+            None => {
+                let message = resp
+                    .error
+                    .as_ref()
+                    .map(|error| error.message.clone())
+                    .unwrap_or_else(|| format!("{label} failed"));
+                app.agent_error = Some(message);
+            }
+        },
+        Err(error) => app.agent_error = Some(error.to_string()),
+    }
+    fetch_agent_sessions(client, app).await;
+}
+
 /// Interrupt the attached ACP session's in-flight turn (`agents.cancel`).
 ///
 /// This is distinct from `tasks.cancel`: the task stays alive and a follow-up
@@ -2026,6 +2108,9 @@ mod tests {
             usage: None,
             load_state: Default::default(),
             load_error: None,
+
+            config_options: Vec::new(),
+            modes: None,
         };
         let agents = vec![AgentCatalogEntry {
             name: "opencode".to_string(),

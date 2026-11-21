@@ -19,7 +19,8 @@ use super::app::{
     activity_cell, cost_cell, format_activity, repo_label, table_rows_area, task_display_name,
     task_repo, token_cell, App, CatalogRow, ClickAction, ClickRegion, ConfirmPrompt, ConnState,
     Form, LaunchFailure, ListGeometry, MenuAction, MenuEntry, Popup, ReplyPrompt,
-    SessionPickerEntry, Tab, TaskPickerRow, TaskVarsForm, ThemeChoice, Wizard, WizardStep,
+    SessionOptionRowKind, SessionOptionsPopup, SessionPickerEntry, Tab, TaskPickerRow,
+    TaskVarsForm, ThemeChoice, Wizard, WizardStep,
 };
 use super::text_buffer::TextBuffer;
 use super::theme::{RaisedLevel, Theme};
@@ -221,6 +222,7 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
         Popup::Sessions { selected, sessions } => {
             draw_sessions_picker(frame, *selected, sessions, theme)
         }
+        Popup::SessionOptions(popup) => draw_session_options(frame, popup, theme),
         Popup::Reply(prompt) => draw_reply(frame, prompt, theme),
         Popup::Confirm(prompt) => {
             draw_confirm(frame, prompt, theme);
@@ -644,6 +646,67 @@ fn draw_leader_hint(frame: &mut Frame, theme: Theme) {
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     frame.render_widget(Paragraph::new(rows), inner);
+}
+
+/// Draw the Ctrl+S session-options picker. Every row shows the current value;
+/// select and mode rows advertise the arrows, and read-only rows are visibly
+/// muted so they cannot be mistaken for a supported change.
+fn draw_session_options(frame: &mut Frame, popup: &SessionOptionsPopup, theme: Theme) {
+    let area = frame.area();
+    let height = (popup.rows.len() as u16)
+        .saturating_add(2)
+        .min(area.height.saturating_sub(2))
+        .max(3);
+    let rect = centered_rect(area, 76, height);
+
+    let items: Vec<ListItem> = popup
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let selected = index == popup.selected;
+            let row_style = if selected {
+                theme.selected()
+            } else {
+                Style::default()
+            };
+            let (value, value_style) = match row.kind {
+                SessionOptionRowKind::ReadOnly => {
+                    (row.display(), Style::default().fg(theme.muted()))
+                }
+                _ => (
+                    format!("◀ {} ▶", row.display()),
+                    Style::default().fg(theme.accent()),
+                ),
+            };
+            let mut spans = vec![
+                Span::styled(format!(" {:<18}", row.label), row_style),
+                Span::styled(value, row_style.patch(value_style)),
+            ];
+            if let Some(detail) = &row.detail {
+                if matches!(row.kind, SessionOptionRowKind::ReadOnly) {
+                    spans.push(Span::styled(
+                        format!(" · {}", truncate_ellipsis(detail, 42)),
+                        Style::default().fg(theme.muted()),
+                    ));
+                }
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(" Ctrl+S — Session options ")
+                .style(theme.dialog_style())
+                .border_style(theme.focused()),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+    draw_dialog_shell(frame, rect, theme);
+    frame.render_widget(list, rect);
 }
 
 /// Draw the Ctrl+O session picker: one row per live/retained agent session,
@@ -1416,6 +1479,11 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ),
             ("(agent prompt) `/`", "show advertised slash commands"),
             ("(agent prompt) Tab / ↑↓", "complete or select a command"),
+            ("(favetto focus) Ctrl+S", "session options and modes"),
+            (
+                "(session options) ↑ / ↓, ← / →, Enter",
+                "pick an option/value; Enter applies it",
+            ),
             ("(favetto focus) Ctrl+O", "switch to another session"),
             (
                 "(ACP, favetto focus) Ctrl+C",
@@ -2485,7 +2553,7 @@ fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
             spans.push(throbber_span(theme, &app.throbber_state));
         }
         spans.push(Span::raw(format!(
-            "{name} · {state}{extra} · Ctrl+O sessions · Ctrl+N new · Ctrl+Q leave "
+            "{name} · {state}{extra} · Ctrl+S options · Ctrl+O sessions · Ctrl+N new · Ctrl+Q leave "
         )));
         Line::from(spans)
     };

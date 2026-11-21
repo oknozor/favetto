@@ -17,7 +17,9 @@ use favetto_core::model::{
     AgentActivity, AgentBackend, AgentCapabilities, AgentCatalogEntry, AgentCommand,
     AgentPlanEntry, AgentSessionHistoryEntry, AgentSessionInfo, AgentSessionState, AgentStateEvent,
     AgentUsage, AwaitingInputKind, Event, EventKind, FailureKind, InputReply, InputRequest,
-    MessageRole, NotificationRecord, RepoInfo, Schedule, Task, TaskStatus, UsagePeriod, UsageStats,
+    MessageRole, NotificationRecord, RepoInfo, Schedule, SessionConfigChoices, SessionConfigKind,
+    SessionConfigOption, SessionConfigValue, SessionModes, Task, TaskStatus, UsagePeriod,
+    UsageStats,
 };
 use favetto_core::rpc::{method, push, AgentEventPush, Notification};
 use favetto_core::workflow::WorkflowInspect;
@@ -151,6 +153,17 @@ pub enum UiAction {
         session_id: String,
         request_id: String,
         reply: InputReply,
+    },
+    /// Change one advertised ACP config option (`agents.set_option`).
+    SetSessionOption {
+        session_id: String,
+        option_id: String,
+        value: SessionConfigValue,
+    },
+    /// Switch the attached ACP session to an advertised mode (`agents.set_mode`).
+    SetSessionMode {
+        session_id: String,
+        mode_id: String,
     },
     /// Cancel or retry a task, or cancel a whole workflow root, over RPC. The
     /// daemon pushes `task.updated` for every change, so the client never
@@ -349,6 +362,9 @@ pub enum Popup {
         selected: usize,
         sessions: Vec<SessionPickerEntry>,
     },
+    /// The Ctrl+S session options picker: advertised config selectors and modes
+    /// for the active ACP session.
+    SessionOptions(SessionOptionsPopup),
     /// The Ctrl+R reply prompt: answer a session's structured input request
     /// (`AgentActivity::Waiting { request }`) through `agents.reply`.
     Reply(ReplyPrompt),
@@ -391,6 +407,160 @@ pub enum Popup {
         path: String,
         errors: Vec<String>,
     },
+}
+
+/// What Enter does for one session-options row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionOptionRowKind {
+    /// A select config option, keyed by its advertised id.
+    Select(String),
+    /// A boolean config option, keyed by its advertised id.
+    Boolean(String),
+    /// The session's advertised mode set.
+    Mode,
+    /// A read-only option detail (unknown kind or no offered values).
+    ReadOnly,
+}
+
+/// One row of the Ctrl+S session-options picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionOptionRow {
+    pub label: String,
+    pub kind: SessionOptionRowKind,
+    /// Value ids and display labels, in the order the agent advertised them.
+    pub choices: Vec<(String, String)>,
+    /// Index into `choices` currently highlighted for this row.
+    pub choice: usize,
+    /// Additional read-only context (description/category).
+    pub detail: Option<String>,
+}
+
+impl SessionOptionRow {
+    pub(crate) fn selected_value(&self) -> Option<&str> {
+        self.choices
+            .get(self.choice)
+            .map(|(value, _)| value.as_str())
+    }
+
+    pub(crate) fn display(&self) -> String {
+        match self.choices.get(self.choice) {
+            Some((_, label)) => label.clone(),
+            None => self.detail.clone().unwrap_or_else(|| "—".to_string()),
+        }
+    }
+}
+
+/// A snapshot of the active session's selectors, opened with Ctrl+S.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionOptionsPopup {
+    pub selected: usize,
+    pub rows: Vec<SessionOptionRow>,
+}
+
+impl SessionOptionsPopup {
+    /// Build the picker from the live snapshot. Returns `None` when there is
+    /// nothing the agent advertised.
+    pub fn new(options: &[SessionConfigOption], modes: Option<&SessionModes>) -> Option<Self> {
+        let mut rows = Vec::new();
+        if let Some(modes) = modes.filter(|modes| !modes.available_modes.is_empty()) {
+            let choices: Vec<(String, String)> = modes
+                .available_modes
+                .iter()
+                .map(|mode| (mode.id.clone(), mode.name.clone()))
+                .collect();
+            let choice = modes
+                .available_modes
+                .iter()
+                .position(|mode| mode.id == modes.current_mode_id)
+                .unwrap_or(0);
+            rows.push(SessionOptionRow {
+                label: "Mode".to_string(),
+                kind: SessionOptionRowKind::Mode,
+                choices,
+                choice,
+                detail: Some(format!("current: {}", modes.current_mode_id)),
+            });
+        }
+        for option in options {
+            let category = option
+                .category
+                .as_ref()
+                .map(|category| format!(" · {category}"))
+                .unwrap_or_default();
+            match &option.kind {
+                SessionConfigKind::Select {
+                    current_value,
+                    choices,
+                } => {
+                    let values = flattened_choices(choices);
+                    let choice = values
+                        .iter()
+                        .position(|(value, _)| value == current_value)
+                        .unwrap_or(0);
+                    let kind = if values.is_empty() {
+                        SessionOptionRowKind::ReadOnly
+                    } else {
+                        SessionOptionRowKind::Select(option.id.clone())
+                    };
+                    rows.push(SessionOptionRow {
+                        label: format!("{}{category}", option.name),
+                        kind,
+                        choices: values,
+                        choice,
+                        detail: option.description.clone(),
+                    });
+                }
+                SessionConfigKind::Boolean { current_value } => rows.push(SessionOptionRow {
+                    label: format!("{}{category}", option.name),
+                    kind: SessionOptionRowKind::Boolean(option.id.clone()),
+                    choices: vec![
+                        ("false".to_string(), "off".to_string()),
+                        ("true".to_string(), "on".to_string()),
+                    ],
+                    choice: usize::from(*current_value),
+                    detail: option.description.clone(),
+                }),
+                SessionConfigKind::Other => rows.push(SessionOptionRow {
+                    label: format!("{}{category}", option.name),
+                    kind: SessionOptionRowKind::ReadOnly,
+                    choices: Vec::new(),
+                    choice: 0,
+                    detail: option.description.clone().or_else(|| {
+                        Some("this option type is not supported by this client".into())
+                    }),
+                }),
+            }
+        }
+        (!rows.is_empty()).then_some(Self { selected: 0, rows })
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.rows.is_empty() {
+            return;
+        }
+        self.selected =
+            (self.selected as isize + delta).clamp(0, self.rows.len() as isize - 1) as usize;
+    }
+
+    fn cycle_value(&mut self, delta: isize) -> bool {
+        let Some(row) = self.rows.get_mut(self.selected) else {
+            return false;
+        };
+        if row.choices.is_empty() {
+            return false;
+        }
+        let len = row.choices.len() as isize;
+        row.choice = (row.choice as isize + delta).rem_euclid(len) as usize;
+        true
+    }
+}
+
+fn flattened_choices(choices: &SessionConfigChoices) -> Vec<(String, String)> {
+    choices
+        .all()
+        .into_iter()
+        .map(|choice| (choice.value.clone(), choice.name.clone()))
+        .collect()
 }
 
 /// One row of the theme picker: a non-selectable section header, or a choice
@@ -1138,6 +1308,10 @@ pub struct App {
     pub agent_plan: Vec<AgentPlanEntry>,
     /// The active ACP session's advertised slash commands.
     pub agent_commands: Vec<AgentCommand>,
+    /// The active ACP session's complete config-option snapshot.
+    pub agent_config_options: Vec<SessionConfigOption>,
+    /// The active ACP session's advertised modes, when it supports them.
+    pub agent_modes: Option<SessionModes>,
     /// Index into the filtered command matches while composing `/…`.
     pub agent_command_selected: Option<usize>,
     /// The last `agents.start` / `agents.attach` / `agents.load` / `tasks.get`
@@ -1282,6 +1456,8 @@ impl App {
             agent_feed_cursor: 0,
             agent_plan: Vec::new(),
             agent_commands: Vec::new(),
+            agent_config_options: Vec::new(),
+            agent_modes: None,
             agent_command_selected: None,
             agent_error: None,
             agent_loading: None,
@@ -2148,6 +2324,8 @@ impl App {
     /// panel has no interactive view is rendered as a structured state view, so
     /// its raw JSON event stream is never shown.
     pub fn open_agent(&mut self, session: AgentSessionInfo, frame: &[u8]) {
+        let config_options = session.config_options.clone();
+        let modes = session.modes.clone();
         // Cache the session so its activity/usage show in the Tasks table and the
         // Ctrl+R reply sees the latest prompt without waiting for an `agents.list`.
         self.agent_sessions
@@ -2180,7 +2358,9 @@ impl App {
             self.agent_feed_cursor = 0;
             self.agent_prompt.clear();
             self.clear_agent_plan();
+            self.clear_agent_options();
         }
+        self.seed_agent_options(config_options, modes);
         // An ACP attach payload is a plain transcript, not a terminal frame; it
         // must never be parsed as terminal control input. Live events seed the
         // feed instead.
@@ -2262,6 +2442,34 @@ impl App {
         self.agent_plan.clear();
         self.agent_commands.clear();
         self.agent_command_selected = None;
+    }
+
+    /// Replace the active session's config-option and mode snapshots.
+    pub fn seed_agent_options(
+        &mut self,
+        options: Vec<SessionConfigOption>,
+        modes: Option<SessionModes>,
+    ) {
+        self.agent_config_options = options;
+        self.agent_modes = modes;
+    }
+
+    fn clear_agent_options(&mut self) {
+        self.agent_config_options.clear();
+        self.agent_modes = None;
+    }
+
+    /// Open the Ctrl+S session-options picker for the active ACP session.
+    pub fn open_session_options(&mut self) -> bool {
+        let Some(popup) =
+            SessionOptionsPopup::new(&self.agent_config_options, self.agent_modes.as_ref())
+        else {
+            self.agent_error =
+                Some("this session does not advertise config options or modes".to_string());
+            return false;
+        };
+        self.popup = Popup::SessionOptions(popup);
+        true
     }
 
     /// The prefix being completed, when the prompt is a bare `/prefix` token.
@@ -2482,6 +2690,20 @@ impl App {
                     self.agent_command_selected = self
                         .agent_command_selected
                         .filter(|selected| *selected < count);
+                    return;
+                }
+                AgentStateEvent::ConfigOptions { options } => {
+                    self.agent_config_options = options.clone();
+                    return;
+                }
+                AgentStateEvent::Modes { modes } => {
+                    self.agent_modes = Some(modes.clone());
+                    return;
+                }
+                AgentStateEvent::CurrentMode { mode_id } => {
+                    if let Some(modes) = self.agent_modes.as_mut() {
+                        modes.current_mode_id = mode_id.clone();
+                    }
                     return;
                 }
                 _ => {}

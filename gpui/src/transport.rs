@@ -258,6 +258,12 @@ typed_calls! {
     agents_reply => AgentsReplyCall,
     /// `agents.cancel`.
     agents_cancel => AgentsCancelCall,
+    /// `agents.options`.
+    agents_options => AgentsOptionsCall,
+    /// `agents.set_option`.
+    agents_set_option => AgentsSetOptionCall,
+    /// `agents.set_mode`.
+    agents_set_mode => AgentsSetModeCall,
     /// `workflow.get`.
     workflow_get => WorkflowGetCall,
     /// `workflow.inspect`.

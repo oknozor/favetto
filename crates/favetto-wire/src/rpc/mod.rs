@@ -171,6 +171,12 @@ pub mod method {
     pub const AGENTS_CLOSE: &str = "agents.close";
     /// Answer a structured input request on a session's state channel.
     pub const AGENTS_REPLY: &str = "agents.reply";
+    /// Read a live session's advertised ACP config options and modes.
+    pub const AGENTS_OPTIONS: &str = "agents.options";
+    /// Change one config option advertised by a live ACP session.
+    pub const AGENTS_SET_OPTION: &str = "agents.set_option";
+    /// Switch a live ACP session to one of its advertised modes.
+    pub const AGENTS_SET_MODE: &str = "agents.set_mode";
     /// List configured providers and their available models.
     pub const PROVIDERS_LIST: &str = "providers.list";
     /// List cron schedules.
@@ -338,6 +344,22 @@ pub const CLIENT_METHODS: &[(&str, &str)] = &[
     (
         method::AGENTS_REPLY,
         "Answer a structured input request on a session's state channel.",
+    ),
+    (
+        method::AGENTS_OPTIONS,
+        "Read a live ACP session's advertised config options and session modes. \
+         The returned snapshot is the same one `agents.list` exposes.",
+    ),
+    (
+        method::AGENTS_SET_OPTION,
+        "Change one config option advertised by a live ACP session. The daemon \
+         validates the option id and value against that session's current snapshot \
+         and rejects values the agent did not offer.",
+    ),
+    (
+        method::AGENTS_SET_MODE,
+        "Switch a live ACP session to one of its advertised modes. Unknown mode ids \
+         are rejected; the result carries the reconciled mode/option snapshot.",
     ),
     (
         method::PROVIDERS_LIST,
@@ -534,6 +556,9 @@ mod tests {
             method::AGENTS_ATTACH,
             method::AGENTS_CLOSE,
             method::AGENTS_REPLY,
+            method::AGENTS_OPTIONS,
+            method::AGENTS_SET_OPTION,
+            method::AGENTS_SET_MODE,
             method::PROVIDERS_LIST,
             method::SCHEDULES_LIST,
             method::SCHEDULES_UPSERT,

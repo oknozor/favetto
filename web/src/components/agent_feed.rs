@@ -332,6 +332,12 @@ pub fn feed_item(event: &AgentStateEvent) -> Option<FeedItem> {
         AgentStateEvent::Error { message } => Some(FeedItem::Error {
             message: message.clone(),
         }),
+        // Session bookkeeping shown by dedicated controls, not the transcript.
+        AgentStateEvent::Plan { .. }
+        | AgentStateEvent::AvailableCommands { .. }
+        | AgentStateEvent::ConfigOptions { .. }
+        | AgentStateEvent::Modes { .. }
+        | AgentStateEvent::CurrentMode { .. } => None,
     }
 }
 

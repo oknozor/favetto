@@ -434,7 +434,11 @@ pub fn build_feed(events: &[AgentEventPush]) -> Vec<FeedItem> {
             }
             AgentStateEvent::Usage { usage, .. } => items.push(FeedItem::Usage(usage.clone())),
             AgentStateEvent::Title { title } => items.push(FeedItem::Title(title.clone())),
-            AgentStateEvent::Plan { .. } | AgentStateEvent::AvailableCommands { .. } => {}
+            AgentStateEvent::Plan { .. }
+            | AgentStateEvent::AvailableCommands { .. }
+            | AgentStateEvent::ConfigOptions { .. }
+            | AgentStateEvent::Modes { .. }
+            | AgentStateEvent::CurrentMode { .. } => {}
             AgentStateEvent::Idle { outcome } => {
                 for index in pending_inputs.drain().map(|(_, index)| index) {
                     if let FeedItem::InputRequest { resolved, .. } = &mut items[index] {
@@ -1618,6 +1622,9 @@ mod tests {
             usage: None,
             load_state: Default::default(),
             load_error: None,
+
+            config_options: Vec::new(),
+            modes: None,
         };
         let pending = detail
             .pending_request(std::slice::from_ref(&session))

@@ -84,6 +84,26 @@ impl App {
             }
         }
 
+        // Ctrl+S opens the active ACP session's option/mode picker while favetto
+        // (not the agent) owns the keyboard. The agent's own Ctrl+S keeps being
+        // forwarded when it captures input.
+        if ctrl && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')) {
+            return match self.popup {
+                Popup::SessionOptions(_) => {
+                    self.popup = Popup::None;
+                    UiAction::None
+                }
+                Popup::None if self.tab == Tab::Agent && !self.agent_capture => {
+                    self.open_session_options();
+                    UiAction::None
+                }
+                Popup::None if self.tab == Tab::Agent && self.agent_capture => {
+                    self.forward_agent_key(&key)
+                }
+                _ => UiAction::None,
+            };
+        }
+
         // A popup owns the keyboard while it is open.
         match &self.popup {
             Popup::Form(_) => return self.handle_form_key(key),
@@ -94,6 +114,7 @@ impl App {
             Popup::Workflow { .. } => return self.handle_workflow_key(key.code),
             Popup::WorkflowRuntime(_) => return self.handle_workflow_runtime_key(key.code),
             Popup::Sessions { .. } => return self.handle_sessions_key(key.code),
+            Popup::SessionOptions(_) => return self.handle_session_options_key(key.code),
             Popup::Reply(_) => return self.handle_reply_key(key),
             Popup::Confirm(_) => return self.handle_confirm_key(key.code),
             Popup::TaskError { .. } => return self.handle_task_error_key(key.code),
@@ -733,6 +754,84 @@ impl App {
                         self.popup = Popup::None;
                         self.agent_error = entry.blocked_reason();
                         UiAction::None
+                    }
+                    None => UiAction::None,
+                }
+            }
+            _ => UiAction::None,
+        }
+    }
+
+    /// Keys while the Ctrl+S session-options picker is open: Up/Down move between
+    /// options, Left/Right cycle the advertised values, Enter applies one, Esc
+    /// (or Ctrl+S) closes. Read-only rows never dispatch a change.
+    pub(super) fn handle_session_options_key(&mut self, code: KeyCode) -> UiAction {
+        match code {
+            KeyCode::Esc => {
+                self.popup = Popup::None;
+                UiAction::None
+            }
+            KeyCode::Up => {
+                if let Popup::SessionOptions(popup) = &mut self.popup {
+                    popup.move_selection(-1);
+                }
+                UiAction::None
+            }
+            KeyCode::Down => {
+                if let Popup::SessionOptions(popup) = &mut self.popup {
+                    popup.move_selection(1);
+                }
+                UiAction::None
+            }
+            KeyCode::Left => {
+                if let Popup::SessionOptions(popup) = &mut self.popup {
+                    popup.cycle_value(-1);
+                }
+                UiAction::None
+            }
+            KeyCode::Right => {
+                if let Popup::SessionOptions(popup) = &mut self.popup {
+                    popup.cycle_value(1);
+                }
+                UiAction::None
+            }
+            KeyCode::Enter => {
+                let session_id = self.agent_session_id.clone();
+                let action = match (&self.popup, session_id) {
+                    (Popup::SessionOptions(popup), Some(session_id)) => {
+                        popup.rows.get(popup.selected).and_then(|row| {
+                            let value = row.selected_value()?.to_string();
+                            match &row.kind {
+                                SessionOptionRowKind::Select(option_id) => {
+                                    Some(UiAction::SetSessionOption {
+                                        session_id,
+                                        option_id: option_id.clone(),
+                                        value: SessionConfigValue::ValueId { value },
+                                    })
+                                }
+                                SessionOptionRowKind::Boolean(option_id) => {
+                                    Some(UiAction::SetSessionOption {
+                                        session_id,
+                                        option_id: option_id.clone(),
+                                        value: SessionConfigValue::Boolean {
+                                            value: value == "true",
+                                        },
+                                    })
+                                }
+                                SessionOptionRowKind::Mode => Some(UiAction::SetSessionMode {
+                                    session_id,
+                                    mode_id: value,
+                                }),
+                                SessionOptionRowKind::ReadOnly => None,
+                            }
+                        })
+                    }
+                    _ => None,
+                };
+                match action {
+                    Some(action) => {
+                        self.popup = Popup::None;
+                        action
                     }
                     None => UiAction::None,
                 }

@@ -717,3 +717,224 @@ async fn websocket_remote_attach_accepts_a_base_url() {
     );
     assert!(resp.result.is_some(), "tasks.list returned no result");
 }
+
+/// Session setup preserves the complete ACP config-option/mode snapshot and the
+/// daemon rejects changes the live agent did not advertise.
+#[tokio::test]
+async fn session_options_and_modes_are_exposed_validated_and_changed() {
+    let daemon = DaemonHarness::spawn();
+    wait_for_unix_socket(daemon.socket(), &daemon).await;
+    let mut client = WireClient::connect(daemon.socket()).await;
+
+    let started = client
+        .request(method::AGENTS_START, serde_json::json!({ "agent": "echo" }))
+        .await;
+    assert!(
+        started.error.is_none(),
+        "agents.start failed: {:?}",
+        started.error
+    );
+    let session_id = started.result.expect("agents.start result")["session"]["id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    // The session starts asynchronously; poll until setup has published its
+    // initial options/modes.
+    let options = loop {
+        let response = client
+            .request(
+                method::AGENTS_OPTIONS,
+                serde_json::json!({ "session_id": session_id }),
+            )
+            .await;
+        assert!(
+            response.error.is_none(),
+            "agents.options failed: {:?}",
+            response.error
+        );
+        let result = response.result.expect("agents.options result");
+        if result["config_options"]
+            .as_array()
+            .is_some_and(|options| !options.is_empty())
+        {
+            break result;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    assert_eq!(options["config_options"][0]["id"], "model");
+    assert_eq!(options["config_options"][0]["category"], "model");
+    assert_eq!(options["config_options"][1]["category"], "thought_level");
+    assert_eq!(options["modes"]["current_mode_id"], "build");
+    assert_eq!(options["modes"]["available_modes"][1]["id"], "plan");
+
+    // A select value the agent advertised is applied and the full snapshot is
+    // reconciled, including the other options.
+    let changed = client
+        .request(
+            method::AGENTS_SET_OPTION,
+            serde_json::json!({
+                "session_id": session_id,
+                "option_id": "thought",
+                "value": { "type": "value_id", "value": "high" }
+            }),
+        )
+        .await;
+    assert!(
+        changed.error.is_none(),
+        "agents.set_option failed: {:?}",
+        changed.error
+    );
+    let changed = changed.result.expect("agents.set_option result");
+    assert_eq!(
+        changed["config_options"][1]["kind"]["current_value"],
+        "high"
+    );
+    assert_eq!(
+        changed["config_options"][0]["kind"]["current_value"],
+        "fake/model-a"
+    );
+
+    // Boolean options are typed too.
+    let boolean = client
+        .request(
+            method::AGENTS_SET_OPTION,
+            serde_json::json!({
+                "session_id": session_id,
+                "option_id": "fast",
+                "value": { "type": "boolean", "value": true }
+            }),
+        )
+        .await;
+    assert!(
+        boolean.error.is_none(),
+        "boolean set failed: {:?}",
+        boolean.error
+    );
+    assert_eq!(
+        boolean.result.expect("boolean result")["config_options"][2]["kind"]["current_value"],
+        true
+    );
+
+    // Stale/unknown option ids and unadvertised values are rejected before the
+    // agent is called.
+    for params in [
+        serde_json::json!({
+            "session_id": session_id,
+            "option_id": "stale",
+            "value": { "type": "value_id", "value": "high" }
+        }),
+        serde_json::json!({
+            "session_id": session_id,
+            "option_id": "thought",
+            "value": { "type": "value_id", "value": "impossible" }
+        }),
+        serde_json::json!({
+            "session_id": session_id,
+            "option_id": "fast",
+            "value": { "type": "value_id", "value": "true" }
+        }),
+    ] {
+        let response = client.request(method::AGENTS_SET_OPTION, params).await;
+        assert!(response.error.is_some(), "unadvertised value was accepted");
+    }
+
+    // Modes are validated from the same advertised set and update the snapshot.
+    let changed_mode = client
+        .request(
+            method::AGENTS_SET_MODE,
+            serde_json::json!({ "session_id": session_id, "mode_id": "plan" }),
+        )
+        .await;
+    assert!(
+        changed_mode.error.is_none(),
+        "agents.set_mode failed: {:?}",
+        changed_mode.error
+    );
+    assert_eq!(
+        changed_mode.result.expect("set_mode result")["modes"]["current_mode_id"],
+        "plan"
+    );
+
+    let rejected = client
+        .request(
+            method::AGENTS_SET_MODE,
+            serde_json::json!({ "session_id": session_id, "mode_id": "not-a-mode" }),
+        )
+        .await;
+    assert!(
+        rejected.error.is_some(),
+        "an unadvertised mode was accepted"
+    );
+}
+
+/// Agent-initiated `config_option_update` and `current_mode_update` notifications
+/// replace the session snapshot rather than being ignored.
+#[tokio::test]
+async fn agent_side_config_and_mode_updates_replace_the_session_snapshot() {
+    let update = serde_json::json!([{
+        "id": "live",
+        "name": "Live option",
+        "category": "vendor_custom",
+        "type": "select",
+        "currentValue": "one",
+        "options": [
+            { "value": "one", "name": "One" },
+            { "value": "two", "name": "Two" }
+        ]
+    }]);
+    let daemon = DaemonHarness::spawn_with(move |_| {
+        vec![
+            ("FAKE_ACP_CONFIG_UPDATE".to_string(), update.to_string()),
+            ("FAKE_ACP_CURRENT_MODE".to_string(), "plan".to_string()),
+        ]
+    });
+    wait_for_unix_socket(daemon.socket(), &daemon).await;
+    let mut client = WireClient::connect(daemon.socket()).await;
+
+    let started = client
+        .request(
+            method::AGENTS_START,
+            serde_json::json!({ "agent": "echo", "prompt": "go" }),
+        )
+        .await;
+    assert!(
+        started.error.is_none(),
+        "agents.start failed: {:?}",
+        started.error
+    );
+    let session_id = started.result.expect("agents.start result")["session"]["id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let options = loop {
+        let response = client
+            .request(
+                method::AGENTS_OPTIONS,
+                serde_json::json!({ "session_id": session_id }),
+            )
+            .await;
+        assert!(
+            response.error.is_none(),
+            "agents.options failed: {:?}",
+            response.error
+        );
+        let result = response.result.expect("agents.options result");
+        if result["config_options"]
+            .as_array()
+            .is_some_and(|options| options.len() == 1)
+        {
+            break result;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    assert_eq!(options["config_options"][0]["id"], "live");
+    assert_eq!(
+        options["config_options"][0]["category"], "vendor_custom",
+        "unknown categories are preserved"
+    );
+    assert_eq!(options["modes"]["current_mode_id"], "plan");
+}

@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::agent_state::{
     AgentActivity, AgentCommand, AgentPlanEntry, AgentStateEvent, AgentUsage, InputReply,
-    UsagePeriod, UsageStats,
+    SessionConfigOption, SessionConfigValue, SessionModes, UsagePeriod, UsageStats,
 };
 use crate::model::{
     AgentCatalogEntry, AgentSessionHistoryEntry, AgentSessionInfo, Event, NotificationRecord,
@@ -564,6 +564,38 @@ pub struct AgentReplyResult {
     pub replied: bool,
 }
 
+/// `agents.options` params: read one live session's advertised selectors.
+pub type AgentOptionsParams = SessionIdParams;
+
+/// `agents.options` / `agents.set_option` / `agents.set_mode` result: the
+/// complete post-change snapshot for the session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AgentOptionsResult {
+    pub session_id: String,
+    #[serde(default)]
+    pub config_options: Vec<SessionConfigOption>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modes: Option<SessionModes>,
+}
+
+/// `agents.set_option` params: change one advertised config option.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AgentSetOptionParams {
+    pub session_id: String,
+    pub option_id: String,
+    pub value: SessionConfigValue,
+}
+
+/// `agents.set_mode` params: switch to one advertised mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AgentSetModeParams {
+    pub session_id: String,
+    pub mode_id: String,
+}
+
 // ---------------------------------------------------------------------------
 // providers
 // ---------------------------------------------------------------------------
@@ -895,6 +927,12 @@ rpc_calls! {
     AgentsCloseCall => method::AGENTS_CLOSE, SessionIdParams, AgentCloseResult;
     /// Typed call for `agents.reply`.
     AgentsReplyCall => method::AGENTS_REPLY, AgentReplyParams, AgentReplyResult;
+    /// Typed call for `agents.options`.
+    AgentsOptionsCall => method::AGENTS_OPTIONS, AgentOptionsParams, AgentOptionsResult;
+    /// Typed call for `agents.set_option`.
+    AgentsSetOptionCall => method::AGENTS_SET_OPTION, AgentSetOptionParams, AgentOptionsResult;
+    /// Typed call for `agents.set_mode`.
+    AgentsSetModeCall => method::AGENTS_SET_MODE, AgentSetModeParams, AgentOptionsResult;
     /// Typed call for `providers.list`.
     ProvidersListCall => method::PROVIDERS_LIST, ProvidersListParams, ProvidersListResult;
     /// Typed call for `schedules.list`.
@@ -1099,6 +1137,21 @@ pub const CLIENT_CALLS: &[RpcCallSpec] = &[
         method: method::AGENTS_REPLY,
         params_schema: schema_of::<AgentReplyParams>,
         result_schema: schema_of::<AgentReplyResult>,
+    },
+    RpcCallSpec {
+        method: method::AGENTS_OPTIONS,
+        params_schema: schema_of::<AgentOptionsParams>,
+        result_schema: schema_of::<AgentOptionsResult>,
+    },
+    RpcCallSpec {
+        method: method::AGENTS_SET_OPTION,
+        params_schema: schema_of::<AgentSetOptionParams>,
+        result_schema: schema_of::<AgentOptionsResult>,
+    },
+    RpcCallSpec {
+        method: method::AGENTS_SET_MODE,
+        params_schema: schema_of::<AgentSetModeParams>,
+        result_schema: schema_of::<AgentOptionsResult>,
     },
     RpcCallSpec {
         method: method::PROVIDERS_LIST,

@@ -1043,6 +1043,8 @@ fn live_session(running: bool, headless: bool, awaiting: bool) -> AgentSessionIn
         usage: None,
         load_state: Default::default(),
         load_error: None,
+        config_options: Vec::new(),
+        modes: None,
     }
 }
 

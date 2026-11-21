@@ -542,6 +542,8 @@ mod tests {
             usage: None,
             load_state: Default::default(),
             load_error: None,
+            config_options: Vec::new(),
+            modes: None,
         }
     }
 

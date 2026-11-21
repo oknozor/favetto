@@ -727,6 +727,162 @@ pub struct AgentCommand {
     pub input_hint: Option<String>,
 }
 
+/// One value offered by a select-style session config option.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionConfigChoice {
+    /// Stable value id sent back to the agent.
+    pub value: String,
+    /// Human-readable label.
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// A group of choices under a select option.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionConfigGroup {
+    /// Stable group id.
+    pub id: String,
+    /// Human-readable group label.
+    pub name: String,
+    #[serde(default)]
+    pub options: Vec<SessionConfigChoice>,
+}
+
+/// The choices a select option advertises, grouped or flat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionConfigChoices {
+    Ungrouped {
+        #[serde(default)]
+        options: Vec<SessionConfigChoice>,
+    },
+    Grouped {
+        #[serde(default)]
+        groups: Vec<SessionConfigGroup>,
+    },
+}
+
+impl SessionConfigChoices {
+    /// Every choice in display order, flattening groups.
+    pub fn all(&self) -> Vec<&SessionConfigChoice> {
+        match self {
+            Self::Ungrouped { options } => options.iter().collect(),
+            Self::Grouped { groups } => groups
+                .iter()
+                .flat_map(|group| group.options.iter())
+                .collect(),
+        }
+    }
+
+    /// Every advertised value id.
+    pub fn values(&self) -> Vec<&str> {
+        self.all()
+            .into_iter()
+            .map(|choice| choice.value.as_str())
+            .collect()
+    }
+}
+
+/// The type-specific payload of a session config option.
+///
+/// Unknown option types from a newer agent are kept as [`Other`](Self::Other)
+/// so the rest of the snapshot (including unknown categories) survives intact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionConfigKind {
+    Select {
+        current_value: String,
+        choices: SessionConfigChoices,
+    },
+    Boolean {
+        current_value: bool,
+    },
+    Other,
+}
+
+impl SessionConfigKind {
+    /// Whether `value` is one this option currently advertises.
+    pub fn accepts(&self, value: &SessionConfigValue) -> bool {
+        match (self, value) {
+            (Self::Select { choices, .. }, SessionConfigValue::ValueId { value }) => {
+                choices.values().iter().any(|offered| *offered == value)
+            }
+            (Self::Boolean { .. }, SessionConfigValue::Boolean { .. }) => true,
+            _ => false,
+        }
+    }
+
+    /// Every value id a select option offers (empty for other kinds).
+    pub fn values(&self) -> Vec<&str> {
+        match self {
+            Self::Select { choices, .. } => choices.values(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// One selector advertised by the live ACP session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionConfigOption {
+    /// Stable option id used by the set RPC.
+    pub id: String,
+    /// Human-readable label.
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// ACP category (`model`, `mode`, `thought_level`, or an agent's custom
+    /// value). Kept as a string so unknown categories are not discarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    pub kind: SessionConfigKind,
+}
+
+/// A value sent to `session/set_config_option`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionConfigValue {
+    Boolean { value: bool },
+    ValueId { value: String },
+}
+
+/// One mode a session can operate in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionMode {
+    /// Stable mode id used by the set RPC.
+    pub id: String,
+    /// Human-readable label.
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// The complete mode state advertised at session setup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionModes {
+    pub current_mode_id: String,
+    #[serde(default)]
+    pub available_modes: Vec<SessionMode>,
+}
+
+impl SessionModes {
+    /// Every advertised mode id.
+    pub fn values(&self) -> Vec<&str> {
+        self.available_modes
+            .iter()
+            .map(|mode| mode.id.as_str())
+            .collect()
+    }
+}
+
 /// How a run or turn ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -828,6 +984,17 @@ pub enum AgentStateEvent {
         #[serde(default)]
         commands: Vec<AgentCommand>,
     },
+    /// The agent's complete current session config options. Replaces any
+    /// previous snapshot; an empty list clears it.
+    ConfigOptions {
+        #[serde(default)]
+        options: Vec<SessionConfigOption>,
+    },
+    /// The session's complete mode state, reported at setup. Replaces any
+    /// previous snapshot.
+    Modes { modes: SessionModes },
+    /// The agent switched the current mode. The available list is unchanged.
+    CurrentMode { mode_id: String },
     /// The session became idle (turn/run boundary).
     Idle { outcome: IdleOutcome },
     /// A session-level error.
@@ -1100,6 +1267,120 @@ mod tests {
                 }],
             }
         );
+    }
+
+    #[test]
+    fn session_options_and_modes_round_trip_and_preserve_unknowns() {
+        let options = vec![
+            SessionConfigOption {
+                id: "model".to_string(),
+                name: "Model".to_string(),
+                description: Some("Model selector".to_string()),
+                category: Some("model".to_string()),
+                kind: SessionConfigKind::Select {
+                    current_value: "provider/a".to_string(),
+                    choices: SessionConfigChoices::Grouped {
+                        groups: vec![SessionConfigGroup {
+                            id: "provider".to_string(),
+                            name: "Provider".to_string(),
+                            options: vec![SessionConfigChoice {
+                                value: "provider/a".to_string(),
+                                name: "A".to_string(),
+                                description: None,
+                            }],
+                        }],
+                    },
+                },
+            },
+            SessionConfigOption {
+                id: "future".to_string(),
+                name: "Future".to_string(),
+                description: None,
+                category: Some("agent_custom".to_string()),
+                kind: SessionConfigKind::Other,
+            },
+        ];
+        let event = AgentStateEvent::ConfigOptions {
+            options: options.clone(),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["event"], "config_options");
+        assert_eq!(json["options"][0]["category"], "model");
+        assert_eq!(json["options"][1]["category"], "agent_custom");
+        assert_eq!(json["options"][1]["kind"]["type"], "other");
+        assert_eq!(
+            serde_json::from_value::<AgentStateEvent>(json).unwrap(),
+            event
+        );
+
+        let modes = SessionModes {
+            current_mode_id: "build".to_string(),
+            available_modes: vec![
+                SessionMode {
+                    id: "build".to_string(),
+                    name: "Build".to_string(),
+                    description: None,
+                },
+                SessionMode {
+                    id: "plan".to_string(),
+                    name: "Plan".to_string(),
+                    description: Some("Read-only planning".to_string()),
+                },
+            ],
+        };
+        let event = AgentStateEvent::Modes {
+            modes: modes.clone(),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["event"], "modes");
+        assert_eq!(json["modes"]["current_mode_id"], "build");
+        assert_eq!(
+            serde_json::from_value::<AgentStateEvent>(json).unwrap(),
+            event
+        );
+
+        let event = AgentStateEvent::CurrentMode {
+            mode_id: "plan".to_string(),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "event": "current_mode", "mode_id": "plan" })
+        );
+        assert_eq!(
+            serde_json::from_value::<AgentStateEvent>(json).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn config_values_are_validated_against_the_advertised_kind() {
+        let select = SessionConfigKind::Select {
+            current_value: "a".to_string(),
+            choices: SessionConfigChoices::Ungrouped {
+                options: vec![SessionConfigChoice {
+                    value: "a".to_string(),
+                    name: "A".to_string(),
+                    description: None,
+                }],
+            },
+        };
+        assert!(select.accepts(&SessionConfigValue::ValueId {
+            value: "a".to_string()
+        }));
+        assert!(!select.accepts(&SessionConfigValue::ValueId {
+            value: "b".to_string()
+        }));
+        assert!(!select.accepts(&SessionConfigValue::Boolean { value: true }));
+
+        let boolean = SessionConfigKind::Boolean {
+            current_value: false,
+        };
+        assert!(boolean.accepts(&SessionConfigValue::Boolean { value: true }));
+        assert!(!boolean.accepts(&SessionConfigValue::ValueId {
+            value: "a".to_string()
+        }));
+        assert!(SessionConfigKind::Other.values().is_empty());
     }
 
     #[test]

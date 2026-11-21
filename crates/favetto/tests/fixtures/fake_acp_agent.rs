@@ -17,26 +17,62 @@ use serde_json::{json, Value};
 
 const SESSION_ID: &str = "ses_fake_acp";
 const DEFAULT_MODEL: &str = "fake/model-a";
+const DEFAULT_THOUGHT: &str = "medium";
 
-/// The model options this fake agent advertises.
-fn config_options(current: &str) -> Value {
-    json!([{
-        "id": "model",
-        "name": "Model",
-        "category": "model",
-        "type": "select",
-        "currentValue": current,
-        "options": [
-            { "value": "fake/model-a", "name": "Fake Model A" },
-            { "value": "fake/model-b", "name": "Fake Model B" }
+/// The config options this fake agent advertises.
+fn config_options(current_model: &str, current_thought: &str) -> Value {
+    json!([
+        {
+            "id": "model",
+            "name": "Model",
+            "category": "model",
+            "type": "select",
+            "currentValue": current_model,
+            "options": [
+                { "value": "fake/model-a", "name": "Fake Model A" },
+                { "value": "fake/model-b", "name": "Fake Model B" }
+            ]
+        },
+        {
+            "id": "thought",
+            "name": "Thought level",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": current_thought,
+            "options": [
+                { "value": "low", "name": "Low" },
+                { "value": "medium", "name": "Medium" },
+                { "value": "high", "name": "High" }
+            ]
+        },
+        {
+            "id": "fast",
+            "name": "Fast mode",
+            "category": "speed",
+            "type": "boolean",
+            "currentValue": false
+        }
+    ])
+}
+
+/// The modes this fake agent advertises.
+fn session_modes(current: &str) -> Value {
+    json!({
+        "currentModeId": current,
+        "availableModes": [
+            { "id": "build", "name": "Build" },
+            { "id": "plan", "name": "Plan" }
         ]
-    }])
+    })
 }
 
 fn main() {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     let mut selected_model = DEFAULT_MODEL.to_string();
+    let mut selected_thought = DEFAULT_THOUGHT.to_string();
+    let mut selected_fast = false;
+    let mut current_mode = "build".to_string();
     // Unique per process, so two sessions from the same run (and the durable
     // per-agent uniqueness constraint) do not collide. A load replaces it with
     // the stored id supplied by the client.
@@ -88,7 +124,8 @@ fn main() {
                     id,
                     json!({
                         "sessionId": session_id.clone(),
-                        "configOptions": config_options(&selected_model)
+                        "configOptions": config_options(&selected_model, &selected_thought),
+                        "modes": session_modes(&current_mode)
                     }),
                 );
             }
@@ -154,28 +191,73 @@ fn main() {
                     respond(
                         &mut stdout,
                         id,
-                        json!({ "configOptions": config_options(&selected_model) }),
+                        json!({
+                            "configOptions": config_options(&selected_model, &selected_thought),
+                            "modes": session_modes(&current_mode)
+                        }),
                     );
                 }
             }
             "session/set_config_option" => {
+                let params = message.get("params");
+                let config_id = params
+                    .and_then(|params| params.get("configId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let value = params.and_then(|params| params.get("value"));
+                let accepted = match config_id {
+                    "model" => {
+                        let wanted = value.and_then(Value::as_str).unwrap_or_default();
+                        if wanted == "fake/model-a" || wanted == "fake/model-b" {
+                            selected_model = wanted.to_string();
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    "thought" => {
+                        let wanted = value.and_then(Value::as_str).unwrap_or_default();
+                        if ["low", "medium", "high"].contains(&wanted) {
+                            selected_thought = wanted.to_string();
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    "fast" => {
+                        if let Some(wanted) = value.and_then(Value::as_bool) {
+                            selected_fast = wanted;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                };
+                if accepted {
+                    let mut options = config_options(&selected_model, &selected_thought);
+                    if let Some(fast) = options.as_array_mut().and_then(|options| {
+                        options.iter_mut().find(|option| option["id"] == "fast")
+                    }) {
+                        fast["currentValue"] = json!(selected_fast);
+                    }
+                    respond(&mut stdout, id, json!({ "configOptions": options }));
+                } else if let Some(id) = id {
+                    error(&mut stdout, id, -32602, "unknown config option or value");
+                }
+            }
+            "session/set_mode" => {
                 let wanted = message
                     .get("params")
-                    .and_then(|params| params.get("value"))
+                    .and_then(|params| params.get("modeId"))
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                if wanted == "fake/model-a" || wanted == "fake/model-b" {
-                    selected_model = wanted;
-                    respond(
-                        &mut stdout,
-                        id,
-                        json!({ "configOptions": config_options(&selected_model) }),
-                    );
-                } else {
-                    if let Some(id) = id {
-                        error(&mut stdout, id, -32602, "unknown model");
-                    }
+                if wanted == "build" || wanted == "plan" {
+                    current_mode = wanted;
+                    respond(&mut stdout, id, json!({}));
+                } else if let Some(id) = id {
+                    error(&mut stdout, id, -32602, "unknown mode");
                 }
             }
             "session/prompt" => {
@@ -284,6 +366,34 @@ fn run_prompt<B: BufRead>(
                 }),
             );
         }
+    }
+    // Optional config/mode update notifications, so tests can prove the daemon
+    // maps `config_option_update` and `current_mode_update` without a live agent.
+    if let Ok(options) = std::env::var("FAKE_ACP_CONFIG_UPDATE") {
+        if let Ok(options) = serde_json::from_str::<Value>(&options) {
+            notify(
+                stdout,
+                json!({
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "config_option_update",
+                        "configOptions": options
+                    }
+                }),
+            );
+        }
+    }
+    if let Ok(mode) = std::env::var("FAKE_ACP_CURRENT_MODE") {
+        notify(
+            stdout,
+            json!({
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "current_mode_update",
+                    "currentModeId": mode
+                }
+            }),
+        );
     }
     // Tests can make the turn block deterministically: create
     // `$FAKE_ACP_GATE_DIR/agent-ready`, then wait for `agent-release` before
