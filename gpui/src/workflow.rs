@@ -21,6 +21,7 @@ use favetto_wire::workflow::{WorkflowInspect, WorkflowState};
 use uuid::Uuid;
 
 use crate::inbox::{self, StatusKind};
+use crate::launch;
 use crate::tasks;
 
 /// One of the five sections of a root's runtime inspect.
@@ -142,6 +143,9 @@ pub struct WorkflowRoot {
     pub active: usize,
     /// Failed instances.
     pub failed: usize,
+    /// Spawned children that failed before their agent started under a
+    /// succeeded parent (the persistent launch-failure warning).
+    pub launch_failures: usize,
     /// The newest instance's creation time, the list's sort key.
     pub newest: DateTime<Utc>,
 }
@@ -525,6 +529,10 @@ pub fn roots(tasks: &[Task]) -> Vec<WorkflowRoot> {
     for task in tasks {
         groups.entry(task.root_or_self()).or_default().push(task);
     }
+    let mut launch_counts: HashMap<Uuid, usize> = HashMap::new();
+    for failure in launch::launch_failures(tasks) {
+        *launch_counts.entry(failure.root_id).or_insert(0) += 1;
+    }
 
     let mut roots: Vec<WorkflowRoot> = groups
         .into_iter()
@@ -575,6 +583,7 @@ pub fn roots(tasks: &[Task]) -> Vec<WorkflowRoot> {
                     .iter()
                     .filter(|row| row.status == TaskStatus::Failed)
                     .count(),
+                launch_failures: launch_counts.get(&root_id).copied().unwrap_or(0),
                 newest,
             }
         })
@@ -762,6 +771,27 @@ mod tests {
         assert_eq!(roots[0].state, WorkflowState::Failed);
         assert_eq!(roots[1].root_id, older.id);
         assert_eq!(roots[1].state, WorkflowState::Succeeded);
+    }
+
+    #[test]
+    fn roots_count_launch_failures_under_the_succeeded_parent() {
+        use favetto_wire::model::{Failure, FailureKind};
+
+        let (root, mut parent, mut child) = two_step();
+        parent.finished_at = Some(at(0));
+        child.status = TaskStatus::Failed;
+        child.created_at = at(1);
+        child.error = Some("task not found in the catalog".to_string());
+        child.failure = Some(Failure::new(
+            FailureKind::InvalidInput,
+            "task not found in the catalog",
+        ));
+        child.parent_id = Some(root);
+
+        let roots = roots(&[parent, child]);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].launch_failures, 1);
+        assert_eq!(roots[0].failed, 1);
     }
 
     #[test]

@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::components;
 use crate::inbox::{self, StatusKind};
+use crate::launch::{self, LaunchFailure};
 use crate::routes::Route;
 use crate::state::{ClientState, SnapshotStatus};
 use crate::tasks::{TaskFilter, TaskList, TaskRow};
@@ -449,6 +450,47 @@ impl TasksView {
             .child(self.retry_button(theme, cx))
     }
 
+    /// A persistent warning derived from the task rows, not a toast: a succeeded
+    /// parent whose spawned work never launched stays visible across refreshes.
+    fn launch_banner(&self, theme: &Theme, failures: &[LaunchFailure]) -> Div {
+        let lines = launch::banner_lines(failures);
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .px(px(theme.spacing.s3))
+            .py(px(theme.spacing.s2))
+            .rounded(px(theme.radii.r4))
+            .border_1()
+            .border_color(Hsla::from(theme.colors.danger).opacity(0.45))
+            .bg(Hsla::from(theme.colors.danger).opacity(0.10))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s2))
+                    .child(
+                        div()
+                            .text_color(theme.colors.danger)
+                            .text_size(px(theme.font.xs))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child("SPAWN FAILED"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(theme.font.xs))
+                            .text_color(theme.colors.muted)
+                            .child("the parent succeeded, but its spawned work did not start"),
+                    ),
+            )
+            .children(lines.into_iter().map(|line| {
+                div()
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.text)
+                    .child(line)
+            }))
+    }
+
     fn filtered_empty(
         &self,
         theme: &Theme,
@@ -651,7 +693,7 @@ fn task_row(
 impl Render for TasksView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.state.read(cx).theme(window.appearance());
-        let (list, status, query, search_active, filter) = {
+        let (list, status, query, search_active, filter, launch_failures) = {
             let state = self.state.read(cx);
             (
                 state.task_list(),
@@ -659,6 +701,7 @@ impl Render for TasksView {
                 state.tasks_query().to_string(),
                 state.is_tasks_search_active(),
                 state.tasks_filter(),
+                state.launch_failures(),
             )
         };
         let selected = self.state.read(cx).selected_tasks_id();
@@ -773,6 +816,9 @@ impl Render for TasksView {
         if let SnapshotStatus::Failed { message } = &status {
             list_header = list_header.child(self.error_banner(theme, message, cx));
         }
+        if !launch_failures.is_empty() {
+            list_header = list_header.child(self.launch_banner(theme, &launch_failures));
+        }
         if show_rows {
             list_header = list_header.child(
                 div()
@@ -797,7 +843,10 @@ impl Render for TasksView {
             .bg(theme.colors.bg)
             .child(self.header(theme))
             .child(self.controls(theme, &list, &query, search_active, filter, cx));
-        if show_rows || matches!(&status, SnapshotStatus::Failed { .. }) {
+        if show_rows
+            || !launch_failures.is_empty()
+            || matches!(&status, SnapshotStatus::Failed { .. })
+        {
             root = root.child(list_header);
         }
         root.child(scroll)

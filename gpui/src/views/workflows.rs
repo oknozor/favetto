@@ -17,6 +17,7 @@ use gpui::{
 
 use crate::components;
 use crate::inbox::StatusKind;
+use crate::launch::{self, LaunchFailure};
 use crate::routes::Route;
 use crate::state::{ClientState, SnapshotStatus};
 use crate::theme::Theme;
@@ -259,6 +260,15 @@ impl WorkflowsView {
                                         .text_size(px(theme.font.xs))
                                         .text_color(theme.colors.danger)
                                         .child(format!("{} failed", root.failed)),
+                                )
+                            })
+                            .when(root.launch_failures > 0, |line| {
+                                line.child(
+                                    div()
+                                        .text_size(px(theme.font.xs))
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(theme.colors.danger)
+                                        .child(format!("⚠ {} spawn failed", root.launch_failures)),
                                 )
                             }),
                     )
@@ -574,6 +584,49 @@ impl WorkflowsView {
                          Children it spawns or unblocks appear here as they are created.",
                     ),
             )
+    }
+
+    /// The persistent spawn-failure warning for the selected root. It is derived
+    /// from the task rows, so a refresh or reconnect cannot lose it.
+    fn launch_banner(&self, theme: &Theme, failures: &[LaunchFailure]) -> Div {
+        let lines = launch::banner_lines(failures);
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .mx(px(theme.spacing.s3))
+            .mt(px(theme.spacing.s2))
+            .px(px(theme.spacing.s3))
+            .py(px(theme.spacing.s2))
+            .rounded(px(theme.radii.r4))
+            .border_1()
+            .border_color(Hsla::from(theme.colors.danger).opacity(0.45))
+            .bg(Hsla::from(theme.colors.danger).opacity(0.10))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s2))
+                    .child(
+                        div()
+                            .text_color(theme.colors.danger)
+                            .text_size(px(theme.font.xs))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child("SPAWN FAILED"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(theme.font.xs))
+                            .text_color(theme.colors.muted)
+                            .child("the parent succeeded, but its spawned work did not start"),
+                    ),
+            )
+            .children(lines.into_iter().map(|line| {
+                div()
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.text)
+                    .child(line)
+            }))
     }
 
     fn error_banner(&self, theme: &Theme, message: &str, cx: &mut Context<Self>) -> Div {
@@ -1135,7 +1188,7 @@ impl WorkflowsView {
 impl Render for WorkflowsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.state.read(cx).theme(window.appearance());
-        let (roots, selected, detail, graph, snapshot_status, has_snapshot) = {
+        let (roots, selected, detail, graph, snapshot_status, has_snapshot, launch_failures) = {
             let state = self.state.read(cx);
             (
                 state.workflow_roots(),
@@ -1144,6 +1197,7 @@ impl Render for WorkflowsView {
                 state.workflow_graph().clone(),
                 state.snapshot_status().clone(),
                 state.has_snapshot_data(),
+                state.launch_failures(),
             )
         };
 
@@ -1185,6 +1239,11 @@ impl Render for WorkflowsView {
                             .child(self.missing_detail(theme, cx)),
                     );
             };
+            let root_launch_failures: Vec<LaunchFailure> = launch_failures
+                .iter()
+                .filter(|failure| failure.root_id == detail.root_id)
+                .cloned()
+                .collect();
             let mut column = div()
                 .flex_1()
                 .min_w_0()
@@ -1194,6 +1253,9 @@ impl Render for WorkflowsView {
                 .child(self.detail_header(theme, &detail, cx));
             if detail.direct_start {
                 column = column.child(self.direct_start_banner(theme));
+            }
+            if !root_launch_failures.is_empty() {
+                column = column.child(self.launch_banner(theme, &root_launch_failures));
             }
             if let Some(error) = &detail.error {
                 column = column.child(self.error_banner(theme, error, cx));

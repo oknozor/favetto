@@ -30,6 +30,7 @@ use crate::catalog::{AgentChoice, CatalogState, OneShotFocus};
 use crate::config::{self, ClientConfig, Density, ThemeChoice};
 use crate::detail::{DetailTab, PendingRequest, TaskDetail};
 use crate::inbox::{self, InboxKey, InboxRows};
+use crate::launch::{self, LaunchFailure};
 use crate::repos::{self, RepoPicker};
 use crate::routes::Route;
 use crate::runtime::{PingSnapshot, Runtime, Update};
@@ -195,6 +196,7 @@ struct DerivedSnapshot {
     task_query: String,
     task_filter: TaskFilter,
     tasks: Option<Rc<TaskList>>,
+    launch: Option<Rc<Vec<LaunchFailure>>>,
 }
 
 /// The single client entity.
@@ -2888,6 +2890,24 @@ impl ClientState {
         derived.task_filter = self.tasks_filter;
         derived.tasks = Some(list.clone());
         list
+    }
+
+    /// Every launch failure in the latest snapshot, derived from the task rows.
+    ///
+    /// Memoized with the rest of the snapshot derivations: the Tasks and
+    /// Workflows banners must survive a refresh or a reconnect without relying
+    /// on a transient event, and must never re-derive 500 rows per frame.
+    pub fn launch_failures(&self) -> Rc<Vec<LaunchFailure>> {
+        let mut derived = self.derived.borrow_mut();
+        if derived.revision == self.snapshot_revision {
+            if let Some(failures) = &derived.launch {
+                return failures.clone();
+            }
+        }
+        let failures = Rc::new(launch::launch_failures(&self.tasks));
+        derived.revision = self.snapshot_revision;
+        derived.launch = Some(failures.clone());
+        failures
     }
 
     /// Note that the task/session snapshot changed so the next read rebuilds

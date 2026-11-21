@@ -20,6 +20,7 @@ use favetto_wire::model::{
 };
 use uuid::Uuid;
 
+use crate::launch;
 use crate::repos::repo_visible;
 
 /// How far back a failure still counts as "needs you".
@@ -228,6 +229,10 @@ pub fn build(
     }
 
     let cutoff = now - chrono::Duration::hours(FAILED_WINDOW_HOURS);
+    let launch_by_task: HashMap<Uuid, launch::LaunchFailure> = launch::launch_failures(tasks)
+        .into_iter()
+        .map(|failure| (failure.task_id, failure))
+        .collect();
     let mut needs = Vec::new();
     let mut needs_task_ids = HashSet::new();
 
@@ -259,19 +264,29 @@ pub fn build(
             }
             TaskStatus::Failed => {
                 let since = task.finished_at.unwrap_or(task.created_at);
-                if since >= cutoff {
+                let launch_failure = launch_by_task.get(&task.id);
+                // A launch failure is a broken workflow, not a transient run
+                // failure: keep it in Needs you regardless of the 24h window.
+                if launch_failure.is_some() || since >= cutoff {
                     needs.push(NeedsRow {
                         key: InboxKey::Task(task.id),
                         status: StatusKind::Failed,
-                        task_name: task_display_name(&task.name).to_string(),
+                        // The full `repo:<namespace>/<task>` target keeps a
+                        // casing mismatch visible; display names strip it.
+                        task_name: launch_failure
+                            .map(|failure| failure.target.clone())
+                            .unwrap_or_else(|| task_display_name(&task.name).to_string()),
                         agent,
                         attempt: Some(task.attempt),
                         since,
-                        detail: task
-                            .error
-                            .as_ref()
-                            .map(|error| error.trim().to_string())
-                            .filter(|error| !error.is_empty()),
+                        detail: launch_failure
+                            .map(launch::LaunchFailure::detail)
+                            .or_else(|| {
+                                task.error
+                                    .as_ref()
+                                    .map(|error| error.trim().to_string())
+                                    .filter(|error| !error.is_empty())
+                            }),
                         detail_is_permission: false,
                     });
                     needs_task_ids.insert(task.id);
@@ -483,7 +498,7 @@ pub fn task_duration(task: &Task, now: DateTime<Utc>) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use favetto_wire::model::{AgentUsage, AwaitingInputReason};
+    use favetto_wire::model::{AgentUsage, AwaitingInputReason, Failure, FailureKind};
 
     fn at(offset_minutes: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp")
@@ -595,6 +610,45 @@ mod tests {
         assert_eq!(rows.recent.len(), 2);
         assert_eq!(rows.recent[0].task_id, fresh_id);
         assert_eq!(rows.recent[1].task_id, old_id);
+    }
+
+    /// A launch failure is a broken workflow, not a transient run failure: it
+    /// stays in Needs you past the 24h window with the full target and parent.
+    #[test]
+    fn launch_failures_stay_in_needs_you_past_the_window() {
+        let now = at(0);
+        let mut parent = task(
+            1,
+            "repo:favetto/triage_issues",
+            TaskStatus::Succeeded,
+            at(-4_000),
+        );
+        parent.finished_at = Some(at(-3_999));
+        let mut child = task(2, "repo:Favetto/plan_issue", TaskStatus::Failed, at(-3_998));
+        child.parent_id = Some(parent.id);
+        child.root_id = Some(parent.id);
+        child.finished_at = Some(at(-(FAILED_WINDOW_HOURS * 60 + 5)));
+        child.error = Some("task 'repo:Favetto/plan_issue' not found in the catalog".to_string());
+        child.failure = Some(Failure::new(
+            FailureKind::InvalidInput,
+            "task 'repo:Favetto/plan_issue' not found in the catalog",
+        ));
+
+        let rows = build(&[parent, child], &[], None, now);
+        assert!(rows
+            .needs
+            .iter()
+            .any(|row| row.key.task_id() == Some(Uuid::from_u128(2))));
+        let row = rows
+            .needs
+            .iter()
+            .find(|row| row.key.task_id() == Some(Uuid::from_u128(2)))
+            .unwrap();
+        assert_eq!(row.task_name, "repo:Favetto/plan_issue");
+        let detail = row.detail.as_deref().unwrap();
+        assert!(detail.contains("repo:Favetto/plan_issue"));
+        assert!(detail.contains("not found in the catalog"));
+        assert!(detail.contains("which succeeded"));
     }
 
     #[test]

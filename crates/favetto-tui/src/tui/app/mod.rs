@@ -16,8 +16,8 @@ use uuid::Uuid;
 use favetto_core::model::{
     AgentActivity, AgentBackend, AgentCapabilities, AgentCatalogEntry, AgentSessionHistoryEntry,
     AgentSessionInfo, AgentSessionState, AgentStateEvent, AgentUsage, AwaitingInputKind, Event,
-    EventKind, InputReply, InputRequest, MessageRole, NotificationRecord, RepoInfo, Schedule, Task,
-    TaskStatus, UsagePeriod, UsageStats,
+    EventKind, FailureKind, InputReply, InputRequest, MessageRole, NotificationRecord, RepoInfo,
+    Schedule, Task, TaskStatus, UsagePeriod, UsageStats,
 };
 use favetto_core::rpc::{method, push, AgentEventPush, Notification};
 use favetto_core::workflow::WorkflowInspect;
@@ -892,6 +892,62 @@ pub fn task_display_name(name: &str) -> &str {
     favetto_core::tasks::display_name(name)
 }
 
+/// A spawned child that failed before its agent started, under a parent that
+/// succeeded.
+///
+/// Derived from task rows (never from a transient event), so the warning
+/// survives a refresh, a reconnect and a repo switch. The target keeps its full
+/// `repo:<namespace>/<task>` spelling because a casing mismatch is exactly the
+/// failure the surfaces must make visible.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaunchFailure {
+    /// The failed child's task id.
+    pub task_id: Uuid,
+    /// The parent that spawned it.
+    pub parent_id: Uuid,
+    /// The workflow root it belongs to.
+    pub root_id: Uuid,
+    /// The full failed target, casing preserved.
+    pub target: String,
+    /// The full parent name.
+    pub parent: String,
+    /// The full workflow-root name.
+    pub root: String,
+    /// The human-readable reason.
+    pub reason: String,
+    /// The typed failure kind, when present.
+    pub kind: Option<FailureKind>,
+}
+
+impl LaunchFailure {
+    /// The complete warning sentence used by banners and the result popup.
+    pub fn detail(&self) -> String {
+        format!(
+            "{} did not start: {} (spawned by '{}', which succeeded)",
+            self.target, self.reason, self.parent
+        )
+    }
+
+    /// A compact status-bar line.
+    pub fn short(&self) -> String {
+        format!("{} — {}", self.target, self.reason)
+    }
+}
+
+/// Whether a typed failure happened before an agent launch. Ordinary agent/run
+/// failures keep their existing treatment.
+fn is_launch_failure(task: &Task) -> bool {
+    match task.failure.as_ref() {
+        Some(failure) => matches!(
+            failure.kind,
+            FailureKind::InvalidInput | FailureKind::Infrastructure | FailureKind::Unknown
+        ),
+        // Rows written before typed failures existed are kept visible: a failed
+        // child of a succeeded parent is the silent fan-out we must surface.
+        None => true,
+    }
+}
+
 /// A favetto-side text selection in the Agent panel, in grid coordinates
 /// `(row, col)` relative to [`App::agent_area`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1531,6 +1587,101 @@ impl App {
             .iter()
             .filter(|e| self.repo_visible(self.event_repo(e).as_deref()))
             .collect()
+    }
+
+    /// Every launch failure in the current task snapshot.
+    ///
+    /// The derivation deliberately reads `self.tasks` rather than
+    /// [`App::visible_tasks`]: a child enqueued under a casing-mismatched repo
+    /// (`repo:Favetto/...`) is filtered out of the table by exact repo scoping,
+    /// yet its failure must still appear under the succeeded parent. A failure
+    /// is scoped by its workflow root, not by the child's own namespace.
+    pub fn launch_failures(&self) -> Vec<LaunchFailure> {
+        let by_id: HashMap<Uuid, &Task> = self.tasks.iter().map(|task| (task.id, task)).collect();
+        let mut failures: Vec<LaunchFailure> = self
+            .tasks
+            .iter()
+            .filter_map(|task| {
+                if task.status != TaskStatus::Failed || !is_launch_failure(task) {
+                    return None;
+                }
+                let parent = by_id.get(&task.parent_id?)?;
+                if parent.status != TaskStatus::Succeeded {
+                    return None;
+                }
+                // A retried parent re-spawns the same targets. Ignore failures
+                // from an earlier attempt so a healthy retry is not warned about.
+                if let Some(finished_at) = parent.finished_at {
+                    if task.created_at < finished_at {
+                        return None;
+                    }
+                }
+                let root_id = task.root_or_self();
+                let root = by_id.get(&root_id).copied().unwrap_or(parent);
+                // Scope by the root (the parent's namespace), never by the
+                // child's, so a casing mismatch cannot hide the warning.
+                if !self.repo_visible(task_repo(&root.name)) {
+                    return None;
+                }
+                let reason = task
+                    .error
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|error| !error.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        task.failure
+                            .as_ref()
+                            .map(|failure| failure.message.trim())
+                            .filter(|message| !message.is_empty())
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| "launch failed".to_string());
+                Some(LaunchFailure {
+                    task_id: task.id,
+                    parent_id: parent.id,
+                    root_id,
+                    target: task.name.clone(),
+                    parent: parent.name.clone(),
+                    root: root.name.clone(),
+                    reason,
+                    kind: task.failure.as_ref().map(|failure| failure.kind),
+                })
+            })
+            .collect();
+        failures.sort_by(|left, right| {
+            let left_created = by_id.get(&left.task_id).map(|task| task.created_at);
+            let right_created = by_id.get(&right.task_id).map(|task| task.created_at);
+            right_created
+                .cmp(&left_created)
+                .then_with(|| right.task_id.cmp(&left.task_id))
+        });
+        failures
+    }
+
+    /// The one-line warning for the status bar, naming the target and the first
+    /// reason, and counting any remaining failures.
+    pub fn launch_failure_notice(&self) -> Option<String> {
+        let failures = self.launch_failures();
+        let first = failures.first()?;
+        if failures.len() == 1 {
+            Some(format!("spawn launch failed: {}", first.detail()))
+        } else {
+            Some(format!(
+                "{} spawn launches failed — {} and {} more",
+                failures.len(),
+                first.short(),
+                failures.len() - 1
+            ))
+        }
+    }
+
+    /// The launch failure for one task, if it is one. Used by the result popup to
+    /// name the full target and reason.
+    pub fn launch_failure_for(&self, task_id: Uuid) -> Option<LaunchFailure> {
+        self.launch_failures()
+            .into_iter()
+            .find(|failure| failure.task_id == task_id)
     }
 
     /// Clamp the Tasks, Events and Catalog list selections to the currently
