@@ -36,8 +36,10 @@ the desktop app without relearning the product.
   most (what needs me, what ran) are first; configuration is last.
 - **Three regions** — navigation, working list, detail — use the **Law of
   Common Region** and **Law of Proximity** to keep related controls inside one
-  visual boundary. On narrow windows the detail becomes a pushed page instead of
-  a third column (GPUI `container_query`).
+  visual boundary. The detail column belongs to the run lists (Inbox and Tasks);
+  Catalog, Workflows, Schedules and Settings use the full width. On narrow
+  windows the detail becomes a pushed page instead of a third column (GPUI
+  `container_query`).
 - **One primary action per view** (**Hick's Law**, **Choice Overload**). Inbox
   rows: *open*. Task detail: *answer permission* when blocked, otherwise
   *cancel/retry*. Everything else lives behind the command palette or a menu.

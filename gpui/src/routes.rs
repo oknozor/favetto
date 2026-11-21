@@ -90,6 +90,15 @@ impl Route {
         }
     }
 
+    /// Whether the wide layout reserves the run-detail column for this surface.
+    ///
+    /// Only Inbox and Tasks list runs, so only they have something for the
+    /// detail column to show. Catalog, Workflows, Schedules and Settings own
+    /// their full body and would leave the column as dead space.
+    pub fn shows_detail(self) -> bool {
+        matches!(self, Route::Inbox | Route::Tasks)
+    }
+
     /// Position in [`Route::ALL`], used for stable element ids and tab order.
     pub fn index(self) -> usize {
         match self {
@@ -204,5 +213,23 @@ mod tests {
         assert_eq!(Route::Schedules.shortcut(), "g s");
         assert_eq!(Route::Settings.shortcut(), "Mod+,");
         assert_ne!(Route::Schedules.shortcut(), Route::Settings.shortcut());
+    }
+
+    #[test]
+    fn only_the_run_lists_reserve_the_detail_column() {
+        assert!(Route::Inbox.shows_detail());
+        assert!(Route::Tasks.shows_detail());
+        for route in [
+            Route::Catalog,
+            Route::Workflows,
+            Route::Schedules,
+            Route::Settings,
+        ] {
+            assert!(
+                !route.shows_detail(),
+                "{} has no run detail to show",
+                route.label()
+            );
+        }
     }
 }
