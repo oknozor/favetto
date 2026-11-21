@@ -476,10 +476,16 @@ pub(crate) fn spawn(
                         .block_task()
                         .await?;
                     *capability_slot.lock() = Some(init.agent_capabilities.clone());
+                    // `session/close` is optional. Only call it when the agent
+                    // advertised `sessionCapabilities.close`; process teardown
+                    // below is the cleanup path otherwise.
+                    let close_supported =
+                        init.agent_capabilities.session_capabilities.close.is_some();
                     tracing::debug!(
                         target: "favetto::acp",
                         agent = ?init.agent_info,
                         load_session = init.agent_capabilities.load_session,
+                        close_supported,
                         "ACP agent initialized"
                     );
 
@@ -781,20 +787,30 @@ pub(crate) fn spawn(
                         }
                     }
 
-                    // Closing is best-effort. `session/close` is not part of the
-                    // v1 session capabilities every agent advertises, and an
-                    // agent that ignores it never answers: awaiting it would
-                    // hold the session `running` forever after the final turn.
-                    let close = connection
-                        .send_request(agent_client_protocol::v1::schema::CloseSessionRequest::new(
-                            session_id,
-                        ))
-                        .block_task();
-                    if tokio::time::timeout(CLOSE_TIMEOUT, close).await.is_err() {
+                    // Closing is best-effort and optional in ACP v1: only ask
+                    // when the agent advertised support. Even then an agent may
+                    // ignore the request, so bound the wait; the child process
+                    // is killed and reaped below regardless.
+                    if close_supported {
+                        let close = connection
+                            .send_request(
+                                agent_client_protocol::v1::schema::CloseSessionRequest::new(
+                                    session_id,
+                                ),
+                            )
+                            .block_task();
+                        if tokio::time::timeout(CLOSE_TIMEOUT, close).await.is_err() {
+                            tracing::debug!(
+                                target: "favetto::acp",
+                                agent = %agent_name,
+                                "agent did not acknowledge session/close; ending the session anyway"
+                            );
+                        }
+                    } else {
                         tracing::debug!(
                             target: "favetto::acp",
                             agent = %agent_name,
-                            "agent did not acknowledge session/close; ending the session anyway"
+                            "agent does not advertise session/close; ending the session without it"
                         );
                     }
                     Ok(())
