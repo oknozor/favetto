@@ -333,7 +333,9 @@ pub fn build_feed(events: &[AgentEventPush]) -> Vec<FeedItem> {
                     streaming: true,
                 }),
             },
-            AgentStateEvent::ToolStarted { id, name, input } => {
+            AgentStateEvent::ToolStarted {
+                id, name, input, ..
+            } => {
                 tools.insert(id.as_str(), items.len());
                 items.push(FeedItem::Tool {
                     id: id.clone(),
@@ -343,7 +345,7 @@ pub fn build_feed(events: &[AgentEventPush]) -> Vec<FeedItem> {
                     output: None,
                 });
             }
-            AgentStateEvent::ToolUpdated { id, partial } => {
+            AgentStateEvent::ToolUpdated { id, partial, .. } => {
                 if let Some(&index) = tools.get(id.as_str()) {
                     if let FeedItem::Tool { output, .. } = &mut items[index] {
                         *output = Some(partial.clone());
@@ -364,6 +366,7 @@ pub fn build_feed(events: &[AgentEventPush]) -> Vec<FeedItem> {
                 name,
                 ok,
                 output,
+                ..
             } => {
                 let status = if *ok {
                     ToolStatus::Ok
@@ -1046,6 +1049,7 @@ mod tests {
                     id: "c1".into(),
                     name: "bash".into(),
                     input: serde_json::json!({ "command": "ls" }),
+                    detail: None,
                 },
             ),
             push(
@@ -1055,6 +1059,7 @@ mod tests {
                     name: "bash".into(),
                     ok: true,
                     output: Some(serde_json::json!("a.txt")),
+                    detail: None,
                 },
             ),
             push(
