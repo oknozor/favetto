@@ -117,7 +117,10 @@ interchangeable:
 
 - **Reattach** (`agents.attach`) is for a session whose ACP process is still
   alive in the daemon — or a retained in-process transcript. It never starts or
-  loads another process, and keeps the existing Agent-panel behavior.
+  loads another process, and keeps the existing Agent-panel behavior. Opening a
+  running task follows the same rule: `agents.start` returns the task's live
+  session (including an ordinary headless run) instead of creating a duplicate,
+  and the client backfills its feed with `tasks.events`.
 - **Load** (`agents.load`) restores an ended, provider-persisted session by its
   **Favetto-local id**. The daemon looks up the recorded ACP id and asks the
   agent for `session/load`; the history replay is applied before the session is

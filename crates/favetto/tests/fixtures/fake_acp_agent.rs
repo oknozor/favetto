@@ -173,6 +173,15 @@ fn main() {
                 if let Some(marker) = std::env::var_os("FAKE_ACP_PROMPT_MARKER") {
                     let _ = std::fs::write(marker, prompt_text(&message));
                 }
+                // Optional append-free counter, so a test can prove a turn was
+                // submitted exactly once across attach/backfill paths.
+                if let Some(marker) = std::env::var_os("FAKE_ACP_PROMPT_COUNT") {
+                    let count = std::fs::read_to_string(&marker)
+                        .ok()
+                        .and_then(|text| text.trim().parse::<u64>().ok())
+                        .unwrap_or_default();
+                    let _ = std::fs::write(marker, (count + 1).to_string());
+                }
                 // Tests can ask the agent to report a display title, proving the
                 // daemon persists ACP title updates on the durable session row.
                 if let Some(title) = std::env::var_os("FAKE_ACP_TITLE") {

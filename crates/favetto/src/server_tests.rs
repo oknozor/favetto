@@ -1023,15 +1023,6 @@ fn oneshot_task() -> Task {
     }
 }
 
-#[cfg(unix)]
-#[cfg(unix)]
-/// `finish_oneshot` emits the same enriched `TaskFinished` payload as the
-/// executor, so the event shape does not depend on how a task was run.
-#[cfg(unix)]
-#[cfg(unix)]
-/// A title persisted mid-run by the watcher must survive `finish_oneshot`
-/// when the exit-time lookup finds nothing.
-#[cfg(unix)]
 fn live_session(running: bool, headless: bool, awaiting: bool) -> AgentSessionInfo {
     AgentSessionInfo {
         id: "s1".to_string(),
@@ -1056,12 +1047,12 @@ fn live_session(running: bool, headless: bool, awaiting: bool) -> AgentSessionIn
 }
 
 #[test]
-fn should_attach_to_live_allows_awaiting_headless_session() {
+fn should_attach_to_live_attaches_every_running_session() {
     // Live interactive TUI: attach.
     assert!(should_attach_to_live(&live_session(true, false, false)));
-    // Running headless without a prompt: this check declines; `start_agent`
-    // opens a concurrent attach (or a structured view) instead of the PTY.
-    assert!(!should_attach_to_live(&live_session(true, true, false)));
+    // A live headless ACP run has an in-process feed, so attach instead of
+    // seeding a duplicate; the client decides whether it is writable.
+    assert!(should_attach_to_live(&live_session(true, true, false)));
     // Headless but blocked on the user: attach so keystrokes reach it.
     assert!(should_attach_to_live(&live_session(true, true, true)));
     // Exited sessions are never attached.
@@ -1370,26 +1361,6 @@ async fn tasks_start_marks_the_task_interactive_only_when_requested() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Opening the panel on a live unattended run must not seed a duplicate
-/// session (and re-submit the prompt) for the same task: it attaches to the
-/// retained headless PTY (read-only, from the client's point of view).
-#[cfg(unix)]
-/// A resumable agent **without** `concurrent_attach` whose headless run is still
-/// writing its session must not be resumed concurrently: `start_agent` attaches
-/// the retained PTY instead. Once the run is gone, a persisted session id resumes
-/// the interactive TUI.
-#[cfg(unix)]
-/// An agent with `concurrent_attach` (opencode) attaches a **new interactive
-/// session** to a live headless run's agent session, leaving the run itself
-/// running in the background — the panel never gets the machine PTY.
-#[cfg(unix)]
-/// Regression for issue #91: resuming a run's session launches the agent in
-/// the run's worktree (recreating a reclaimed one), not the daemon's cwd, so
-/// an agent whose session store is per-project can reopen the session.
-#[cfg(unix)]
-/// Opening the panel on a finished non-resume headless run replays its final
-/// screen instead of seeding a duplicate interactive session.
-#[cfg(unix)]
 #[tokio::test]
 async fn tasks_list_omits_output_and_honours_limit_and_get_returns_it() {
     let dir = temp_dir("tasks-list-get");

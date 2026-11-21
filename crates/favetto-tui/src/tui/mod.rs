@@ -42,7 +42,7 @@ use favetto_core::model::{
     AgentCatalogEntry, AgentSessionHistoryEntry, AgentSessionInfo, Event, NotificationRecord,
     RepoInfo, Schedule, Task, UsageStats,
 };
-use favetto_core::rpc::{method, ConfigValidateResult};
+use favetto_core::rpc::{method, ConfigValidateResult, TasksEventsResult};
 use favetto_core::workflow::WorkflowInspect;
 use favetto_providers::Provider;
 use uuid::Uuid;
@@ -1079,7 +1079,7 @@ async fn open_agent(client: &Client, app: &mut App, task_id: String, force_new: 
     }
 
     match client.request(method::AGENTS_START, params).await {
-        Ok(resp) => apply_agent_response(app, resp),
+        Ok(resp) => adopt_agent_response(client, app, resp).await,
         Err(e) => agent_request_failed(app, "agents.start", &e.to_string()),
     }
 }
@@ -1112,7 +1112,10 @@ async fn open_task_result(client: &Client, app: &mut App, task_id: String) {
 
 /// Apply an `agents.start` / `tasks.start_oneshot` response: open the returned
 /// session (with its current frame) in the Agent panel.
-fn apply_agent_response(app: &mut App, resp: favetto_core::rpc::Response) {
+fn apply_agent_response(
+    app: &mut App,
+    resp: favetto_core::rpc::Response,
+) -> Option<AgentSessionInfo> {
     match resp.result {
         Some(v) => {
             let session = v
@@ -1125,10 +1128,14 @@ fn apply_agent_response(app: &mut App, resp: favetto_core::rpc::Response) {
                 .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
                 .unwrap_or_default();
             match session {
-                Some(session) => app.open_agent(session, &frame),
+                Some(session) => {
+                    app.open_agent(session.clone(), &frame);
+                    Some(session)
+                }
                 None => {
                     app.finish_session_load();
                     agent_request_failed(app, "agent response", "malformed session");
+                    None
                 }
             }
         }
@@ -1140,7 +1147,59 @@ fn apply_agent_response(app: &mut App, resp: favetto_core::rpc::Response) {
                 .map(|e| e.message.clone())
                 .unwrap_or_else(|| "agent request failed".to_string());
             agent_request_failed(app, "agent", &message);
+            None
         }
+    }
+}
+
+/// Open an agent response, then replay the adopted session's existing feed.
+///
+/// `agent.event` pushes are non-durable and an ACP session may have streamed
+/// events before the panel opened, so a task-backed session is backfilled from
+/// `tasks.events` once. The feed cursor deduplicates this with any live pushes
+/// that were queued while the request was in flight.
+async fn adopt_agent_response(client: &Client, app: &mut App, resp: favetto_core::rpc::Response) {
+    let Some(session) = apply_agent_response(app, resp) else {
+        return;
+    };
+    let Some(task_id) = session.task_id.as_deref() else {
+        return;
+    };
+    if session.backend != favetto_core::model::AgentBackend::Acp {
+        return;
+    }
+    let Ok(task_id) = Uuid::parse_str(task_id) else {
+        return;
+    };
+    let response = match client
+        .request(
+            method::TASKS_EVENTS,
+            serde_json::json!({ "id": task_id, "after": 0, "limit": 2000 }),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            app.logs.push_back(format!("tasks.events failed: {e}"));
+            return;
+        }
+    };
+    let Some(value) = response.result else {
+        if let Some(error) = response.error {
+            app.logs
+                .push_back(format!("tasks.events unavailable: {}", error.message));
+        }
+        return;
+    };
+    match serde_json::from_value::<TasksEventsResult>(value) {
+        Ok(result) => {
+            // `tasks.events` resolves the task's most recent session; only fold
+            // it when that is the one the panel just adopted.
+            if result.session_id.as_deref() == Some(session.id.as_str()) {
+                app.apply_agent_backfill(&session.id, &result.events, result.next_cursor);
+            }
+        }
+        Err(e) => app.logs.push_back(format!("tasks.events: {e}")),
     }
 }
 
@@ -1310,7 +1369,7 @@ async fn attach_session(client: &Client, app: &mut App, session_id: String) {
         )
         .await
     {
-        Ok(resp) => apply_agent_response(app, resp),
+        Ok(resp) => adopt_agent_response(client, app, resp).await,
         Err(e) => agent_request_failed(app, "agents.attach", &e.to_string()),
     }
 }
@@ -1329,7 +1388,7 @@ async fn load_session(client: &Client, app: &mut App, session_id: String) {
         )
         .await
     {
-        Ok(resp) => apply_agent_response(app, resp),
+        Ok(resp) => adopt_agent_response(client, app, resp).await,
         Err(e) => {
             app.finish_session_load();
             agent_request_failed(app, "agents.load", &e.to_string());
@@ -1382,7 +1441,7 @@ async fn start_oneshot(
         "cols": cols,
     });
     match client.request(method::TASKS_START_ONESHOT, params).await {
-        Ok(resp) => apply_agent_response(app, resp),
+        Ok(resp) => adopt_agent_response(client, app, resp).await,
         Err(e) => app.logs.push_back(format!("start one-shot failed: {e}")),
     }
     refresh_lists(client, app).await;
@@ -1807,7 +1866,7 @@ mod tests {
             1,
             favetto_core::rpc::RpcError::Internal("task is already running headless".to_string()),
         );
-        apply_agent_response(&mut app, resp);
+        assert!(apply_agent_response(&mut app, resp).is_none());
         assert_eq!(
             app.agent_error.as_deref(),
             Some("task is already running headless")

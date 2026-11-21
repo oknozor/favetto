@@ -1414,15 +1414,14 @@ async fn load_agent(
     state.agents.load(&name, agent, record).await
 }
 
-/// Resolve the requested (or default) agent and spawn a PTY session.
+/// Resolve the requested (or default) agent and, when the task has a live ACP
+/// session, attach to that same session instead of launching a duplicate.
 ///
-/// Task runs are headless (their PTY carries machine output such as JSON), so
-/// the panel is **never** shown that machine PTY. A live interactive session is
-/// attached directly; a live headless run is either concurrently attached to a
-/// real interactive session (when the agent supports it, e.g. opencode through
-/// its managed server) or handed back for the client to render as a structured
-/// state view. Once a run has exited and a session id is known, the agent's
-/// `resume_args` open a real interactive TUI.
+/// ACP sessions keep their normalized event feed in-process, so an ordinary
+/// headless run is attachable too: the client renders the feed read-only until
+/// the run is awaiting input. A persisted-session load only happens after this
+/// live check, because a running task's row may still carry the previous
+/// attempt's session id.
 async fn start_agent(
     state: &Arc<State>,
     params: StartAgentParams,
@@ -1439,6 +1438,21 @@ async fn start_agent(
         ..
     } = params;
     let force_new = force_new.unwrap_or(false);
+
+    // The task's live session is authoritative while a run is in flight. This
+    // must precede the persisted-session load below: during a run the task row
+    // may still point at an earlier attempt, while the current ACP session only
+    // lives in the daemon's in-memory registry.
+    if !force_new {
+        if let Some(existing) = task_id
+            .as_deref()
+            .and_then(|tid| state.agents.find_latest_by_task(tid))
+        {
+            if should_attach_to_live(&existing) {
+                return Ok(existing);
+            }
+        }
+    }
 
     // A known Favetto-local id restores that ACP conversation. Older clients
     // also send a provider ACP id here as a reattach hint; that is not a local
@@ -1496,17 +1510,6 @@ async fn start_agent(
     let provider = requested_provider.or(task_provider);
     let model = requested_model.or(task_model);
 
-    if !force_new {
-        if let Some(existing) = task_id
-            .as_deref()
-            .and_then(|tid| state.agents.find_latest_by_task(tid))
-        {
-            if should_attach_to_live(&existing) {
-                return Ok(existing);
-            }
-        }
-    }
-
     let cwd = cwd
         .filter(|path| !path.as_os_str().is_empty())
         .or_else(|| std::env::current_dir().ok())
@@ -1531,10 +1534,11 @@ async fn start_agent(
 }
 
 /// Whether the daemon should reattach to an existing session rather than launch
-/// a fresh one: any live interactive TUI, or a live headless run that is blocked
-/// waiting for the user (so keystrokes can answer the prompt).
+/// a fresh one. Every live ACP session has an in-process feed, so even an
+/// ordinary headless run is attachable (the client renders it read-only unless
+/// it is awaiting input).
 fn should_attach_to_live(info: &AgentSessionInfo) -> bool {
-    info.running && (!info.headless || info.awaiting_input.is_some())
+    info.running
 }
 
 /// The persisted task row plus the catalog definition backing it, by task id.

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use favetto_core::rpc::method;
+use favetto_core::rpc::{method, TasksEventsResult};
 use favetto_tui::client::{Client, Transport};
 use serde_json::json;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -57,8 +57,11 @@ impl Daemon {
             format!(
                 "[agent]\ndefault = \"echo\"\n\n\
                  [agents.echo]\ncommand = {:?}\nargs = []\n\
-                 [agents.echo.env]\nFAKE_ACP_GATE_DIR = {:?}\nFAKE_ACP_TITLE = \"Echo session\"\n",
-                agent, root
+                 [agents.echo.env]\nFAKE_ACP_GATE_DIR = {:?}\nFAKE_ACP_TITLE = \"Echo session\"\n\
+                 FAKE_ACP_PROMPT_COUNT = {:?}\n",
+                agent,
+                root,
+                root.join("prompt-count")
             ),
         )
         .unwrap();
@@ -136,6 +139,28 @@ async fn wait_for_file(path: &Path) {
     }
 }
 
+/// Wait until the fake agent has submitted `expected` prompt turns. A freshly
+/// spawned session may send its prompt just after `agents.start` returns.
+async fn wait_for_prompt_count(path: &Path, expected: u64) {
+    let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let count = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .unwrap_or_default();
+        if count == expected {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "{} reached {count} prompts, expected {expected}",
+                path.display()
+            );
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 async fn open_db(path: &Path) -> SqlitePool {
     SqlitePoolOptions::new()
         .max_connections(1)
@@ -171,6 +196,44 @@ async fn session_row(pool: &SqlitePool, id: &str) -> Option<SessionRow> {
         title: row.get("title"),
         status: row.get("status"),
     })
+}
+
+/// The latest durable session attached to `task_id`, waiting for the row to
+/// carry the agent's ACP id.
+async fn wait_for_task_session(pool: &SqlitePool, task_id: &str) -> SessionRow {
+    let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let row = sqlx::query(
+            "SELECT id FROM agent_sessions WHERE task_id = ?
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        if let Some(row) = row {
+            let id: String = row.get("id");
+            if let Some(row) = session_row(pool, &id).await {
+                if row.external_session_id.is_some() && row.status == "ready" {
+                    return row;
+                }
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no ready session for task {task_id}"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+async fn task_session_count(pool: &SqlitePool, task_id: &str) -> i64 {
+    sqlx::query("SELECT COUNT(*) AS n FROM agent_sessions WHERE task_id = ?")
+        .bind(task_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .get("n")
 }
 
 async fn wait_for_session<F>(pool: &SqlitePool, id: &str, mut ready: F) -> SessionRow
@@ -398,4 +461,151 @@ async fn every_launch_path_records_durable_session_metadata() {
     assert!(session_row(&pool, &interactive).await.is_some());
     assert!(session_row(&pool, &oneshot_session).await.is_some());
     assert!(session_row(&pool, &session_id).await.is_some());
+}
+
+/// Opening a task whose ACP run is still live must attach to that same session,
+/// replay its feed, and never submit the task prompt a second time. `new: true`
+/// remains the explicit way to start another session.
+#[tokio::test]
+async fn opening_a_live_headless_task_attaches_instead_of_duplicating() {
+    let daemon = Daemon::spawn();
+    wait_for_socket(&daemon.socket, &daemon).await;
+    let client = Client::connect(Transport::Unix(daemon.socket.clone()))
+        .await
+        .expect("connect to the daemon");
+    let pool = open_db(&daemon.db_path()).await;
+
+    let started = result(
+        client
+            .request(method::TASKS_START, json!({ "name": "echo_task" }))
+            .await
+            .unwrap(),
+        method::TASKS_START,
+    );
+    let task_id = started["id"].as_str().unwrap().to_string();
+    wait_for_file(&daemon.root.join("agent-ready")).await;
+
+    let original = wait_for_task_session(&pool, &task_id).await;
+    let original_acp = original.external_session_id.clone().unwrap();
+    assert!(original.run_id.is_some(), "the live run is linked");
+    let prompt_count = daemon.root.join("prompt-count");
+    wait_for_prompt_count(&prompt_count, 1).await;
+
+    // The live feed is already available before the panel opens.
+    let feed = result(
+        client
+            .request(
+                method::TASKS_EVENTS,
+                json!({ "id": task_id, "after": 0, "limit": 2000 }),
+            )
+            .await
+            .unwrap(),
+        method::TASKS_EVENTS,
+    );
+    let feed: TasksEventsResult = serde_json::from_value(feed).expect("tasks.events result");
+    assert_eq!(feed.session_id.as_deref(), Some(original.id.as_str()));
+    assert!(!feed.events.is_empty(), "the live session has a feed");
+    assert!(feed
+        .events
+        .iter()
+        .all(|event| event.session_id == original.id));
+    assert!(feed.next_cursor > 0);
+
+    // Simulate a task row still carrying an earlier attempt's persisted session
+    // id: the live run must win before any `agents.load` is attempted.
+    sqlx::query(
+        "INSERT INTO agent_sessions
+            (id, agent, external_session_id, cwd, task_id, run_id, title, status, error,
+             created_at, updated_at)
+         VALUES (?, 'echo', ?, ?, NULL, NULL, NULL, 'ended', NULL,
+                 strftime('%s','now') * 1000, strftime('%s','now') * 1000)",
+    )
+    .bind("persisted-before-live")
+    .bind("ses_persisted_before_live")
+    .bind(daemon.root.to_string_lossy().into_owned())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE tasks SET session_id = ? WHERE id = ?")
+        .bind("persisted-before-live")
+        .bind(&task_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Opening the task (even with the row's stale `session_id`, and no `new`)
+    // must hand back the live run rather than loading the persisted session.
+    let attached = result(
+        client
+            .request(
+                method::AGENTS_START,
+                json!({ "task_id": task_id, "session_id": "persisted-before-live" }),
+            )
+            .await
+            .unwrap(),
+        method::AGENTS_START,
+    );
+    let session = &attached["session"];
+    assert_eq!(session["id"].as_str(), Some(original.id.as_str()));
+    assert_eq!(session["headless"], json!(true));
+    assert_eq!(session["running"], json!(true));
+
+    // No second ACP session or prompt was created.
+    assert_eq!(task_session_count(&pool, &task_id).await, 1);
+    let row = session_row(&pool, &original.id).await.unwrap();
+    assert_eq!(
+        row.external_session_id.as_deref(),
+        Some(original_acp.as_str())
+    );
+    wait_for_prompt_count(&prompt_count, 1).await;
+    assert_eq!(
+        std::fs::read_to_string(&prompt_count).unwrap().trim(),
+        "1",
+        "attaching must not submit the task prompt again"
+    );
+
+    let agents = result(
+        client
+            .request(method::AGENTS_LIST, json!({}))
+            .await
+            .unwrap(),
+        method::AGENTS_LIST,
+    );
+    let listed: Vec<serde_json::Value> = agents
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|agent| agent["sessions"].as_array().cloned().unwrap_or_default())
+        .filter(|session| session["task_id"].as_str() == Some(task_id.as_str()))
+        .collect();
+    assert_eq!(
+        listed.len(),
+        1,
+        "agents.list gained a duplicate row: {listed:?}"
+    );
+
+    // `new: true` deliberately starts another session (and submits its prompt).
+    let fresh = result(
+        client
+            .request(
+                method::AGENTS_START,
+                json!({ "task_id": task_id, "new": true }),
+            )
+            .await
+            .unwrap(),
+        method::AGENTS_START,
+    );
+    assert_ne!(fresh["session"]["id"].as_str(), Some(original.id.as_str()));
+    assert_eq!(fresh["session"]["headless"], json!(false));
+    assert_eq!(task_session_count(&pool, &task_id).await, 2);
+    wait_for_prompt_count(&prompt_count, 2).await;
+
+    // Release both turns and confirm the original task still completes.
+    std::fs::write(daemon.root.join("agent-release"), b"release").unwrap();
+    wait_for_task(&pool, &task_id, "succeeded").await;
+    let ended = wait_for_status(&pool, &original.id, "ended").await;
+    assert_eq!(
+        ended.external_session_id.as_deref(),
+        Some(original_acp.as_str())
+    );
 }

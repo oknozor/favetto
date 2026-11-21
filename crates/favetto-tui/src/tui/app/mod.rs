@@ -19,7 +19,7 @@ use favetto_core::model::{
     EventKind, InputReply, InputRequest, MessageRole, NotificationRecord, RepoInfo, Schedule, Task,
     TaskStatus, UsagePeriod, UsageStats,
 };
-use favetto_core::rpc::{method, push, Notification};
+use favetto_core::rpc::{method, push, AgentEventPush, Notification};
 use favetto_core::workflow::WorkflowInspect;
 use favetto_providers::Provider;
 
@@ -1073,6 +1073,9 @@ pub struct App {
     pub agent_feed_follow: bool,
     /// Stable id of the selected foldable feed row (a thought or tool card).
     pub agent_feed_selected: Option<u64>,
+    /// The last `agent.event` / `tasks.events` sequence folded into the feed.
+    /// Live pushes and a backfill overlap, so this deduplicates them.
+    pub agent_feed_cursor: u64,
     /// The last `agents.start` / `agents.attach` / `agents.load` / `tasks.get`
     /// error, shown in the status bar.
     pub agent_error: Option<String>,
@@ -1212,6 +1215,7 @@ impl App {
             agent_feed_max_scroll: 0,
             agent_feed_follow: true,
             agent_feed_selected: None,
+            agent_feed_cursor: 0,
             agent_error: None,
             agent_loading: None,
             notice: None,
@@ -2011,6 +2015,7 @@ impl App {
             self.agent_feed_max_scroll = 0;
             self.agent_feed_follow = true;
             self.agent_feed_selected = None;
+            self.agent_feed_cursor = 0;
         }
         // An ACP attach payload is a plain transcript, not a terminal frame; it
         // must never be parsed as terminal control input. Live events seed the
@@ -2173,8 +2178,43 @@ impl App {
     /// the ordered feed; PTY sessions keep their existing terminal-transcript
     /// behavior.
     pub fn agent_event(&mut self, session_id: &str, event: &AgentStateEvent) {
+        self.fold_agent_event(session_id, None, event);
+    }
+
+    /// Fold one live `agent.event` push, deduplicating by its per-session `seq`.
+    pub fn agent_event_seq(&mut self, session_id: &str, seq: u64, event: &AgentStateEvent) {
+        self.fold_agent_event(session_id, Some(seq), event);
+    }
+
+    /// Fold a `tasks.events` backfill into the active session's feed. The feed's
+    /// cursor makes overlapping live pushes and a replay apply exactly once.
+    pub fn apply_agent_backfill(
+        &mut self,
+        session_id: &str,
+        events: &[AgentEventPush],
+        next_cursor: u64,
+    ) {
         if self.agent_session_id.as_deref() != Some(session_id) {
             return;
+        }
+        for push in events {
+            if push.session_id == session_id {
+                self.fold_agent_event(session_id, Some(push.seq), &push.event);
+            }
+        }
+        if self.agent_session_id.as_deref() == Some(session_id) {
+            self.agent_feed_cursor = self.agent_feed_cursor.max(next_cursor);
+        }
+    }
+
+    fn fold_agent_event(&mut self, session_id: &str, seq: Option<u64>, event: &AgentStateEvent) {
+        if self.agent_session_id.as_deref() != Some(session_id) {
+            return;
+        }
+        if let Some(seq) = seq {
+            if seq <= self.agent_feed_cursor {
+                return;
+            }
         }
         if self.agent_backend == AgentBackend::Acp {
             self.agent_feed.apply(event);
@@ -2184,36 +2224,38 @@ impl App {
                     self.agent_feed_selected = None;
                 }
             }
-            return;
-        }
-
-        let mut text = String::new();
-        match event {
-            AgentStateEvent::TextDelta { role, text: delta } => match role {
-                MessageRole::User => {
-                    text.push_str("\r\n> ");
-                    text.push_str(delta);
+        } else {
+            let mut text = String::new();
+            match event {
+                AgentStateEvent::TextDelta { role, text: delta } => match role {
+                    MessageRole::User => {
+                        text.push_str("\r\n> ");
+                        text.push_str(delta);
+                    }
+                    _ => text.push_str(delta),
+                },
+                AgentStateEvent::ReasoningDelta { text: delta } => text.push_str(delta),
+                AgentStateEvent::ToolStarted { name, .. } => {
+                    text.push_str(&format!("\r\n[tool] {name}\r\n"));
                 }
-                _ => text.push_str(delta),
-            },
-            AgentStateEvent::ReasoningDelta { text: delta } => text.push_str(delta),
-            AgentStateEvent::ToolStarted { name, .. } => {
-                text.push_str(&format!("\r\n[tool] {name}\r\n"));
+                AgentStateEvent::ToolFinished { name, ok, .. } => {
+                    text.push_str(&format!(
+                        "\r\n[tool] {name} {}\r\n",
+                        if *ok { "ok" } else { "failed" }
+                    ));
+                }
+                AgentStateEvent::Error { message } => {
+                    text.push_str(&format!("\r\n[error] {message}\r\n"));
+                }
+                AgentStateEvent::Idle { .. } => text.push_str("\r\n"),
+                _ => {}
             }
-            AgentStateEvent::ToolFinished { name, ok, .. } => {
-                text.push_str(&format!(
-                    "\r\n[tool] {name} {}\r\n",
-                    if *ok { "ok" } else { "failed" }
-                ));
+            if !text.is_empty() {
+                self.term.process(text.replace('\n', "\r\n").as_bytes());
             }
-            AgentStateEvent::Error { message } => {
-                text.push_str(&format!("\r\n[error] {message}\r\n"));
-            }
-            AgentStateEvent::Idle { .. } => text.push_str("\r\n"),
-            _ => {}
         }
-        if !text.is_empty() {
-            self.term.process(text.replace('\n', "\r\n").as_bytes());
+        if let Some(seq) = seq {
+            self.agent_feed_cursor = seq;
         }
     }
 
@@ -2901,13 +2943,18 @@ impl App {
             }
             push::AGENT_EVENT => {
                 let sid = n.params.get("session_id").and_then(|v| v.as_str());
+                let seq = n.params.get("seq").and_then(|v| v.as_u64());
                 let event = n
                     .params
                     .get("event")
                     .cloned()
                     .and_then(|v| serde_json::from_value::<AgentStateEvent>(v).ok());
                 if let (Some(sid), Some(event)) = (sid, event) {
-                    self.agent_event(sid, &event);
+                    match seq {
+                        Some(seq) => self.agent_event_seq(sid, seq, &event),
+                        // Older daemons omitted `seq`; keep their ordering as-is.
+                        None => self.agent_event(sid, &event),
+                    }
                 }
             }
             push::AGENT_EXIT => {

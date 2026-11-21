@@ -153,7 +153,7 @@ pub mod method {
     /// `agents.list` when it fails. It never lists sessions created outside
     /// Favetto (ACP `session/list` is not implemented).
     pub const AGENTS_HISTORY: &str = "agents.history";
-    /// Start an external agent session (optionally attached to a task).
+    /// Start an external agent session, or attach to a task's live session.
     pub const AGENTS_START: &str = "agents.start";
     /// Load a persisted ACP session by its Favetto-local id.
     ///
@@ -313,7 +313,8 @@ pub const CLIENT_METHODS: &[(&str, &str)] = &[
     ),
     (
         method::AGENTS_START,
-        "Start an external agent session (optionally attached to a task).",
+        "Start an external agent session, or attach to the task's existing live \
+         session. `new` forces a fresh session.",
     ),
     (
         method::AGENTS_LOAD,

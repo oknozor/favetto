@@ -3,6 +3,7 @@ use chrono::Utc;
 use favetto_core::model::{
     AgentActivity, AgentUsage, AwaitingInputKind, EventKind, InputReply, InputRequest, TaskStatus,
 };
+use favetto_core::rpc::AgentEventPush;
 
 use crate::tasks::VarType;
 
@@ -291,6 +292,86 @@ fn open_agent_clears_a_previous_error() {
     app.agent_error = Some("boom".to_string());
     app.open_agent(agent_session("s4", false, true, false), b"");
     assert!(app.agent_error.is_none());
+}
+
+fn feed_event(session_id: &str, seq: u64, message: &str) -> AgentEventPush {
+    AgentEventPush {
+        session_id: session_id.to_string(),
+        task_id: None,
+        seq,
+        event: AgentStateEvent::Error {
+            message: message.to_string(),
+        },
+    }
+}
+
+#[test]
+fn agent_backfill_seeds_the_feed_and_dedupes_live_events() {
+    let mut app = App::new();
+    let session = agent_session("s1", true, true, false);
+    app.open_agent(session.clone(), b"");
+    assert!(app.agent_feed.is_empty());
+    assert!(app.agent_read_only, "an ordinary headless run is read-only");
+
+    app.apply_agent_backfill(
+        "s1",
+        &[feed_event("s1", 1, "one"), feed_event("s1", 2, "two")],
+        2,
+    );
+    assert_eq!(app.agent_feed.len(), 2);
+
+    // A live push already covered by the backfill is ignored; the next one is
+    // folded normally.
+    app.agent_event_seq(
+        "s1",
+        2,
+        &AgentStateEvent::Error {
+            message: "duplicate".to_string(),
+        },
+    );
+    assert_eq!(app.agent_feed.len(), 2);
+    app.agent_event_seq(
+        "s1",
+        3,
+        &AgentStateEvent::Error {
+            message: "three".to_string(),
+        },
+    );
+    assert_eq!(app.agent_feed.len(), 3);
+
+    // Re-opening the same live session keeps the backfilled feed.
+    app.open_agent(session, b"");
+    assert_eq!(app.agent_feed.len(), 3);
+}
+
+#[test]
+fn agent_backfill_ignores_other_sessions_and_resets_on_a_new_one() {
+    let mut app = App::new();
+    app.open_agent(agent_session("old", true, true, false), b"");
+    app.apply_agent_backfill("old", &[feed_event("old", 4, "kept")], 4);
+    assert_eq!(app.agent_feed.len(), 1);
+
+    app.apply_agent_backfill("other", &[feed_event("other", 9, "wrong")], 9);
+    assert_eq!(
+        app.agent_feed.len(),
+        1,
+        "another session cannot seed this feed"
+    );
+
+    app.open_agent(agent_session("new", true, true, false), b"");
+    assert!(app.agent_feed.is_empty());
+    app.agent_event_seq(
+        "new",
+        1,
+        &AgentStateEvent::Error {
+            message: "fresh".to_string(),
+        },
+    );
+    assert_eq!(
+        app.agent_feed.len(),
+        1,
+        "the cursor resets for a new session"
+    );
 }
 
 #[test]
