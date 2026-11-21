@@ -1376,6 +1376,10 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ),
             ("(favetto focus) Ctrl+O", "switch to another session"),
             (
+                "(ACP, favetto focus) Ctrl+C",
+                "interrupt the current agent turn",
+            ),
+            (
                 "(pending prompt) Ctrl+R",
                 "answer the agent's permission/dialog prompt",
             ),
@@ -2709,7 +2713,12 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
         if agent_focused {
             "[Ctrl+Y] favetto keys".to_string()
         } else {
-            "[Ctrl+Y] agent keys  [Ctrl+O] sessions  [Ctrl+Q] leave  [?] help".to_string()
+            let mut hint = "[Ctrl+Y] agent keys  [Ctrl+O] sessions  [Ctrl+Q] leave".to_string();
+            if app.agent_backend == AgentBackend::Acp && app.agent_running {
+                hint.push_str("  [Ctrl+C] interrupt");
+            }
+            hint.push_str("  [?] help");
+            hint
         }
     } else if app.tab == Tab::Tasks {
         "[↑↓] select  [Enter] agent  [c] cancel  [r] retry  [C] cancel root".to_string()

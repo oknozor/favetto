@@ -254,6 +254,8 @@ typed_calls! {
     agents_load => AgentsLoadCall,
     /// `agents.reply`.
     agents_reply => AgentsReplyCall,
+    /// `agents.cancel`.
+    agents_cancel => AgentsCancelCall,
     /// `workflow.get`.
     workflow_get => WorkflowGetCall,
     /// `workflow.inspect`.
@@ -546,6 +548,23 @@ mod tests {
                     request.params["reply"],
                     serde_json::json!({ "reply": "once" })
                 );
+            }
+            other => panic!("expected a request frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_cancel_request_uses_the_favetto_local_session_id() {
+        let params = AgentCancelParams {
+            session_id: "local-live".to_string(),
+        };
+        let bytes = encode_request::<AgentsCancelCall>(5, &params).expect("encode");
+        let frame: Frame = rmp_serde::from_slice(&bytes).expect("decode frame");
+        match frame {
+            Frame::Request(request) => {
+                assert_eq!(request.id, 5);
+                assert_eq!(request.method, method::AGENTS_CANCEL);
+                assert_eq!(request.params["session_id"], "local-live");
             }
             other => panic!("expected a request frame, got {other:?}"),
         }
