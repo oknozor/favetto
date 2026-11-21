@@ -300,7 +300,7 @@ pub fn feed_item(event: &AgentStateEvent) -> Option<FeedItem> {
             Some(FeedItem::InputRequest(request.clone()))
         }
         AgentStateEvent::InputResolved { .. } => None,
-        AgentStateEvent::Usage { usage } => Some(FeedItem::Usage(usage.clone())),
+        AgentStateEvent::Usage { usage, .. } => Some(FeedItem::Usage(usage.clone())),
         AgentStateEvent::Title { title } => Some(FeedItem::Title(title.clone())),
         AgentStateEvent::Idle { outcome } => Some(FeedItem::Boundary(*outcome)),
         AgentStateEvent::Error { message } => Some(FeedItem::Error {
@@ -775,8 +775,8 @@ fn FeedRow(
         }
         FeedItem::Usage(usage) => {
             let cost = usage
-                .cost_usd
-                .map(|cost| format!(" · ${cost:.4}"))
+                .reported_cost()
+                .map(|cost| format!(" · {}", cost.display()))
                 .unwrap_or_default();
             rsx! {
                 div { class: "feed-item feed-usage",
@@ -982,7 +982,8 @@ mod tests {
         );
         assert!(matches!(
             feed_item(&AgentStateEvent::Usage {
-                usage: AgentUsage::default()
+                usage: AgentUsage::default(),
+                snapshot: false
             }),
             Some(FeedItem::Usage(_))
         ));

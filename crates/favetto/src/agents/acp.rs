@@ -1402,9 +1402,16 @@ fn map_update(
                 ..Default::default()
             };
             if let Some(cost) = &usage.cost {
-                reported.cost_usd = Some(cost.amount);
+                reported.set_cost(Some(favetto_core::model::AgentCost::new(
+                    cost.amount,
+                    cost.currency.clone(),
+                )));
             }
-            vec![AgentStateEvent::Usage { usage: reported }]
+            // ACP reports the session's current cumulative state, not a delta.
+            vec![AgentStateEvent::Usage {
+                usage: reported,
+                snapshot: true,
+            }]
         }
         SessionUpdate::SessionInfoUpdate(info) => info
             .title
@@ -1575,8 +1582,8 @@ where
 mod tests {
     use super::*;
     use agent_client_protocol::v1::schema::{
-        Content, ContentChunk, Diff, ImageContent, Terminal, TextResourceContents, ToolCall,
-        ToolCallId, ToolCallLocation, ToolCallUpdate, ToolCallUpdateFields,
+        Content, ContentChunk, Cost, Diff, ImageContent, Terminal, TextResourceContents, ToolCall,
+        ToolCallId, ToolCallLocation, ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
     };
 
     /// A `map_update` fixture with isolated transcript/outcome/tool state.
@@ -1677,6 +1684,42 @@ mod tests {
         );
         assert_eq!(&*harness.transcript.lock(), "pong");
         assert_eq!(harness.outcome.lock().assistant_text, "pong");
+    }
+
+    #[test]
+    fn usage_updates_are_cumulative_snapshots_with_currency() {
+        let harness = Harness::new();
+
+        let first = harness.map(&SessionUpdate::UsageUpdate(
+            UsageUpdate::new(1_000, 200_000).cost(Cost::new(0.01, "USD")),
+        ));
+        let second = harness.map(&SessionUpdate::UsageUpdate(
+            UsageUpdate::new(2_000, 200_000).cost(Cost::new(0.02, "credits")),
+        ));
+
+        match (&first[0], &second[0]) {
+            (
+                AgentStateEvent::Usage {
+                    usage: first,
+                    snapshot: true,
+                },
+                AgentStateEvent::Usage {
+                    usage: second,
+                    snapshot: true,
+                },
+            ) => {
+                assert_eq!(first.context_used, Some(1_000));
+                assert_eq!(first.context_size, Some(200_000));
+                assert_eq!(first.cost_usd, Some(0.01));
+                assert_eq!(
+                    second.reported_cost(),
+                    Some(favetto_core::model::AgentCost::new(0.02, "credits"))
+                );
+                assert_eq!(second.cost_usd, None);
+                assert_eq!(second.context_used, Some(2_000));
+            }
+            other => panic!("expected usage snapshots, got {other:?}"),
+        }
     }
 
     #[test]

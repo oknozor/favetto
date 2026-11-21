@@ -678,7 +678,7 @@ fn task_row(
                 .text_color(theme.colors.muted)
                 .child(inbox::format_duration(row.duration)),
         )
-        .when_some(inbox::format_cost(row.cost_usd), |line, cost| {
+        .when_some(inbox::format_cost(row.cost.as_ref()), |line, cost| {
             line.child(
                 div()
                     .flex_shrink_0()

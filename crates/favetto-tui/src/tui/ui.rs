@@ -691,7 +691,7 @@ fn draw_sessions_picker(
                 if !usage.is_empty() {
                     detail.push_str(&format!(" · {}", token_cell(Some(usage))));
                 }
-                if usage.cost_usd.is_some() {
+                if usage.reported_cost().is_some() {
                     detail.push_str(&format!(" · {}", cost_cell(Some(usage))));
                 }
             }
@@ -2353,7 +2353,7 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
         Constraint::Length(9),  // DURATION — `1h20m`
     ];
     let header = Row::new(vec![
-        "ID", "TASK", "KIND", "REPO", "SESSION", "STATUS", "ACTIVITY", "TOKEN", "$COST", "STARTED",
+        "ID", "TASK", "KIND", "REPO", "SESSION", "STATUS", "ACTIVITY", "TOKEN", "COST", "STARTED",
         "DURATION",
     ])
     .style(theme.table_header());

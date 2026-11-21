@@ -76,6 +76,69 @@ pub enum InputReply {
     Cancelled,
 }
 
+/// A cost amount with the unit the agent reported it in.
+///
+/// ACP's `cost.currency` is an ISO 4217 code for money (`"USD"`, `"EUR"`, …) or
+/// another unit such as `"credits"`. Keeping the unit alongside the amount is
+/// what stops a non-USD value from being rendered as dollars.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AgentCost {
+    pub amount: f64,
+    /// ISO 4217 currency code or another agent-defined unit.
+    pub currency: String,
+}
+
+impl AgentCost {
+    /// The ISO code treated as the legacy dollar amount.
+    pub const USD: &'static str = "USD";
+
+    pub fn new(amount: f64, currency: impl Into<String>) -> Self {
+        Self {
+            amount,
+            currency: currency.into(),
+        }
+    }
+
+    /// A dollar amount, for adapters and legacy records that only report USD.
+    pub fn usd(amount: f64) -> Self {
+        Self::new(amount, Self::USD)
+    }
+
+    /// Whether this amount is denominated in USD.
+    pub fn is_usd(&self) -> bool {
+        self.currency.eq_ignore_ascii_case(Self::USD)
+    }
+
+    /// Add a same-unit amount. Returns `false` without changing `self` when the
+    /// units differ, because there is no exchange rate to apply.
+    pub fn merge(&mut self, other: &AgentCost) -> bool {
+        if !self.currency.eq_ignore_ascii_case(&other.currency) {
+            return false;
+        }
+        self.amount += other.amount;
+        true
+    }
+
+    /// Render the amount with an explicit unit: `$0.0123` for USD and
+    /// `2.5000 credits` (or `1.5000 EUR`) for anything else.
+    pub fn display(&self) -> String {
+        if !self.amount.is_finite() {
+            return "—".to_string();
+        }
+        if self.is_usd() {
+            format!("${:.4}", self.amount)
+        } else {
+            let unit = self.currency.trim();
+            if unit.is_empty() {
+                format!("{:.4}", self.amount)
+            } else {
+                format!("{:.4} {unit}", self.amount)
+            }
+        }
+    }
+}
+
 /// Token/cost usage reported by an agent for a turn or a whole run.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -90,8 +153,15 @@ pub struct AgentUsage {
     pub cache_read_tokens: u64,
     #[serde(default)]
     pub cache_write_tokens: u64,
+    /// Legacy USD-only cost field. New payloads also carry [`Self::cost`], and
+    /// this field stays populated for USD amounts so older clients and stored
+    /// records keep rendering correctly. It is `None` for non-USD amounts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    /// Currency-qualified cost, when the agent reports one. Preferred over
+    /// [`Self::cost_usd`] because it preserves non-USD units.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<AgentCost>,
     /// Tokens currently in the model's context, when the agent reports a context
     /// window rather than per-step token counts (ACP's `usage_update`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,14 +173,25 @@ pub struct AgentUsage {
 
 impl AgentUsage {
     /// Fold `other` into `self` (per-step usage summed into a run total).
+    ///
+    /// This is the additive path: use [`Self::replace`] for an agent snapshot
+    /// whose values are already cumulative.
     pub fn merge(&mut self, other: &AgentUsage) {
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
         self.reasoning_tokens += other.reasoning_tokens;
         self.cache_read_tokens += other.cache_read_tokens;
         self.cache_write_tokens += other.cache_write_tokens;
-        if let Some(cost) = other.cost_usd {
-            *self.cost_usd.get_or_insert(0.0) += cost;
+        if let Some(other_cost) = other.reported_cost() {
+            match self.reported_cost() {
+                None => self.set_cost(Some(other_cost)),
+                Some(mut cost) => {
+                    if cost.merge(&other_cost) {
+                        self.set_cost(Some(cost));
+                    }
+                    // Different units cannot be summed; keep the known cost.
+                }
+            }
         }
         // A context snapshot is state, not a per-step total: keep the latest.
         if let Some(used) = other.context_used {
@@ -121,6 +202,29 @@ impl AgentUsage {
         }
     }
 
+    /// Replace this usage with a cumulative agent snapshot.
+    pub fn replace(&mut self, other: &AgentUsage) {
+        *self = other.clone();
+    }
+
+    /// The cost reported by the agent, preferring the currency-aware field and
+    /// falling back to the legacy USD amount on older payloads.
+    pub fn reported_cost(&self) -> Option<AgentCost> {
+        self.cost
+            .clone()
+            .or_else(|| self.cost_usd.map(AgentCost::usd))
+    }
+
+    /// Set the reported cost, synchronizing the legacy USD field so payloads
+    /// stay readable by older clients. Non-USD amounts clear `cost_usd`.
+    pub fn set_cost(&mut self, cost: Option<AgentCost>) {
+        self.cost_usd = cost
+            .as_ref()
+            .filter(|cost| cost.is_usd())
+            .map(|cost| cost.amount);
+        self.cost = cost;
+    }
+
     /// Whether nothing has been reported (all counters zero, no cost).
     pub fn is_empty(&self) -> bool {
         self.input_tokens == 0
@@ -129,6 +233,7 @@ impl AgentUsage {
             && self.cache_read_tokens == 0
             && self.cache_write_tokens == 0
             && self.cost_usd.is_none()
+            && self.cost.is_none()
             && self.context_used.is_none()
             && self.context_size.is_none()
     }
@@ -218,8 +323,8 @@ pub struct UsageBucket {
     pub start: DateTime<Utc>,
     /// Exclusive bucket end (UTC).
     pub end: DateTime<Utc>,
-    /// Token/cost totals for the bucket. `cost_usd` is `None` when no run in the
-    /// bucket reported a cost.
+    /// Token/cost totals for the bucket. Aggregated cost is USD-only (the
+    /// legacy `cost_usd` column); non-USD run costs are not mixed into it.
     pub usage: AgentUsage,
     /// Number of finished runs whose `finished_at` fell in the bucket.
     pub runs: u64,
@@ -510,8 +615,14 @@ pub enum AgentStateEvent {
     InputRequested { request: InputRequest },
     /// A previously requested input was answered (or dismissed).
     InputResolved { id: String },
-    /// Token/cost usage for a step.
-    Usage { usage: AgentUsage },
+    /// Token/cost usage for a step or a cumulative session snapshot.
+    Usage {
+        usage: AgentUsage,
+        /// When true, `usage` is the agent's current cumulative state (ACP's
+        /// `usage_update`) and folds by replacement rather than addition.
+        #[serde(default, skip_serializing_if = "is_false")]
+        snapshot: bool,
+    },
     /// The session's title changed.
     Title { title: String },
     /// The session became idle (turn/run boundary).
@@ -579,9 +690,77 @@ mod tests {
         assert_eq!(total.input_tokens, 15);
         assert_eq!(total.output_tokens, 2);
         assert_eq!(total.cost_usd, Some(0.75));
+        assert_eq!(total.reported_cost(), Some(AgentCost::usd(0.75)));
 
         assert!(AgentUsage::default().is_empty());
         assert!(!total.is_empty());
+    }
+
+    #[test]
+    fn agent_usage_replaces_cumulative_snapshots() {
+        let mut usage = AgentUsage::default();
+        usage.replace(&AgentUsage {
+            context_used: Some(1_000),
+            context_size: Some(200_000),
+            cost: Some(AgentCost::usd(0.01)),
+            ..Default::default()
+        });
+        usage.replace(&AgentUsage {
+            context_used: Some(2_000),
+            context_size: Some(200_000),
+            cost: Some(AgentCost::usd(0.02)),
+            ..Default::default()
+        });
+        assert_eq!(usage.reported_cost(), Some(AgentCost::usd(0.02)));
+        assert_eq!(usage.context_used, Some(2_000));
+    }
+
+    #[test]
+    fn agent_cost_preserves_non_usd_units_and_merges_same_units() {
+        let cost = AgentCost::new(0.5, "credits");
+        assert!(!cost.is_usd());
+        assert_eq!(cost.display(), "0.5000 credits");
+
+        let mut total = cost.clone();
+        assert!(total.merge(&AgentCost::new(0.25, "Credits")));
+        assert_eq!(total.amount, 0.75);
+        assert!(!total.merge(&AgentCost::usd(0.5)));
+        assert_eq!(total.amount, 0.75);
+
+        let mut usage = AgentUsage::default();
+        usage.set_cost(Some(AgentCost::new(0.5, "credits")));
+        assert_eq!(usage.cost_usd, None);
+        assert_eq!(usage.reported_cost(), Some(AgentCost::new(0.5, "credits")));
+
+        usage.set_cost(Some(AgentCost::usd(0.25)));
+        assert_eq!(usage.cost_usd, Some(0.25));
+        assert_eq!(usage.cost, Some(AgentCost::usd(0.25)));
+    }
+
+    #[test]
+    fn legacy_cost_usd_payload_decodes_as_a_usd_cost() {
+        let usage: AgentUsage =
+            serde_json::from_value(serde_json::json!({ "input_tokens": 4, "cost_usd": 0.125 }))
+                .unwrap();
+        assert_eq!(usage.cost, None);
+        assert_eq!(usage.cost_usd, Some(0.125));
+        assert_eq!(usage.reported_cost(), Some(AgentCost::usd(0.125)));
+    }
+
+    #[test]
+    fn non_usd_cost_round_trips_without_polluting_cost_usd() {
+        let usage = AgentUsage {
+            cost: Some(AgentCost::new(0.75, "credits")),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&usage).unwrap();
+        assert_eq!(json["cost"]["amount"], 0.75);
+        assert_eq!(json["cost"]["currency"], "credits");
+        assert!(json.get("cost_usd").is_none());
+
+        let back: AgentUsage = serde_json::from_value(json).unwrap();
+        assert_eq!(back.reported_cost(), Some(AgentCost::new(0.75, "credits")));
+        assert_eq!(back.cost_usd, None);
     }
 
     #[test]
@@ -691,6 +870,7 @@ mod tests {
             },
             AgentStateEvent::Usage {
                 usage: AgentUsage::default(),
+                snapshot: true,
             },
             AgentStateEvent::Idle {
                 outcome: IdleOutcome::Interrupted,
@@ -704,6 +884,37 @@ mod tests {
             let back: AgentStateEvent = serde_json::from_value(json).unwrap();
             assert_eq!(back, event);
         }
+    }
+
+    #[test]
+    fn usage_event_without_snapshot_decodes_as_an_incremental_step() {
+        let event: AgentStateEvent = serde_json::from_value(serde_json::json!({
+            "event": "usage",
+            "usage": { "input_tokens": 2, "cost_usd": 0.01 }
+        }))
+        .unwrap();
+        assert_eq!(
+            event,
+            AgentStateEvent::Usage {
+                usage: AgentUsage {
+                    input_tokens: 2,
+                    cost_usd: Some(0.01),
+                    ..Default::default()
+                },
+                snapshot: false,
+            }
+        );
+
+        let snapshot: AgentStateEvent = serde_json::from_value(serde_json::json!({
+            "event": "usage",
+            "snapshot": true,
+            "usage": { "cost": { "amount": 0.02, "currency": "USD" } }
+        }))
+        .unwrap();
+        assert!(matches!(
+            snapshot,
+            AgentStateEvent::Usage { snapshot: true, .. }
+        ));
     }
 
     #[test]
@@ -896,6 +1107,7 @@ mod tests {
             cache_read_tokens: 7,
             cache_write_tokens: 2,
             cost_usd: Some(0.25),
+            cost: None,
             context_used: None,
             context_size: None,
         };

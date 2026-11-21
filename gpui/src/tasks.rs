@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use favetto_wire::model::{AgentSessionInfo, Task, TaskStatus};
+use favetto_wire::model::{AgentCost, AgentSessionInfo, Task, TaskStatus};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use uuid::Uuid;
@@ -149,8 +149,9 @@ pub struct TaskRow {
     pub attempt: u32,
     /// Live elapsed for a running task, total for a finished one.
     pub duration: Option<Duration>,
-    /// Usage cost summed from the task's live sessions, when reported.
-    pub cost_usd: Option<f64>,
+    /// Usage cost summed from the task's live sessions, when reported. Sums
+    /// only same-unit amounts and keeps the reported currency.
+    pub cost: Option<AgentCost>,
     /// Creation time, the tie-break for the newest-first order.
     pub created_at: DateTime<Utc>,
 }
@@ -229,7 +230,7 @@ pub fn build(
     now: DateTime<Utc>,
 ) -> TaskList {
     let mut agents: HashMap<&str, &str> = HashMap::new();
-    let mut costs: HashMap<&str, f64> = HashMap::new();
+    let mut costs: HashMap<&str, AgentCost> = HashMap::new();
     for session in sessions {
         let Some(task_id) = session.task_id.as_deref() else {
             continue;
@@ -238,10 +239,17 @@ pub fn build(
         if let Some(cost) = session
             .usage
             .as_ref()
-            .and_then(|usage| usage.cost_usd)
-            .filter(|cost| cost.is_finite())
+            .and_then(|usage| usage.reported_cost())
+            .filter(|cost| cost.amount.is_finite())
         {
-            *costs.entry(task_id).or_insert(0.0) += cost;
+            match costs.entry(task_id) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().merge(&cost);
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(cost);
+                }
+            }
         }
     }
 
@@ -287,10 +295,7 @@ pub fn build(
                 agent,
                 attempt: task.attempt,
                 duration: inbox::task_duration(task, now),
-                cost_usd: costs
-                    .get(key.as_str())
-                    .copied()
-                    .filter(|cost| cost.is_finite()),
+                cost: costs.get(key.as_str()).cloned(),
                 created_at: task.created_at,
             },
         ));
@@ -612,9 +617,32 @@ mod tests {
 
         let list = build(&[running], &[first, second], "", TaskFilter::All, None, now);
         let row = list.rows.first().expect("row");
-        assert_eq!(row.cost_usd, Some(0.02));
-        assert_eq!(inbox::format_cost(row.cost_usd).as_deref(), Some("$0.02"));
+        assert_eq!(row.cost, Some(AgentCost::usd(0.02)));
+        assert_eq!(
+            inbox::format_cost(row.cost.as_ref()).as_deref(),
+            Some("$0.0200")
+        );
         assert_eq!(row.duration, Some(Duration::from_secs(10 * 60)));
+    }
+
+    #[test]
+    fn non_usd_usage_cost_keeps_its_unit() {
+        let now = at(0);
+        let mut running = task(7, "repo:favetto/credits", TaskStatus::Running, at(-10));
+        running.started_at = Some(at(-10));
+        let mut session = session("s7", Some(running.id), "opencode");
+        session.usage = Some(AgentUsage {
+            cost: Some(AgentCost::new(2.5, "credits")),
+            ..AgentUsage::default()
+        });
+
+        let list = build(&[running], &[session], "", TaskFilter::All, None, now);
+        let row = list.rows.first().expect("row");
+        assert_eq!(row.cost, Some(AgentCost::new(2.5, "credits")));
+        assert_eq!(
+            inbox::format_cost(row.cost.as_ref()).as_deref(),
+            Some("2.5000 credits")
+        );
     }
 
     #[test]

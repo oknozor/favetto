@@ -1035,11 +1035,19 @@ fn activity_token_and_cost_cells_render_compactly() {
         cache_read_tokens: 0,
         cache_write_tokens: 0,
         cost_usd: Some(0.5),
+        cost: None,
         context_used: None,
         context_size: None,
     };
     assert_eq!(token_cell(Some(&usage)), "1.5k/20 tok");
     assert_eq!(cost_cell(Some(&usage)), "$0.5000");
+
+    let credits = AgentUsage {
+        cost: Some(favetto_core::model::AgentCost::new(2.5, "credits")),
+        ..Default::default()
+    };
+    assert_eq!(cost_cell(Some(&credits)), "2.5000 credits");
+    assert_eq!(credits.cost_usd, None);
 }
 
 fn event(id: i64, kind: EventKind, payload: serde_json::Value) -> Event {
