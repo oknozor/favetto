@@ -104,6 +104,17 @@ fn main() {
                     }
                     continue;
                 }
+                if let Some(marker) = std::env::var_os("FAKE_ACP_INIT_RECORD") {
+                    let capabilities = message
+                        .get("params")
+                        .and_then(|params| params.get("clientCapabilities"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let _ = std::fs::write(
+                        marker,
+                        serde_json::to_vec_pretty(&capabilities).unwrap_or_default(),
+                    );
+                }
                 let mut capabilities = json!({
                     "loadSession": load_supported()
                 });
@@ -541,6 +552,10 @@ fn run_prompt<B: BufRead>(
         }
     }
 
+    if let Ok(schema) = std::env::var("FAKE_ACP_ELICITATION_SCHEMA") {
+        run_elicitation(stdout, lines, session_id, prompt_turn, &schema);
+    }
+
     if std::env::var_os("FAKE_ACP_PERMISSION").is_some() {
         let permission_id = format!("perm-{}-{prompt_turn}", std::process::id());
         record("permission");
@@ -600,6 +615,104 @@ fn run_prompt<B: BufRead>(
 
     emit_echo(stdout, session_id, message, selected_model);
     respond(stdout, id, json!({ "stopReason": "end_turn" }));
+}
+
+/// Send one `elicitation/create` and record the client's ACP response.
+///
+/// The recorded file is a JSON object with a `responses` array, so a test can
+/// prove that a duplicate reply never reached the agent. A JSON-RPC error is
+/// recorded with its code and message instead of being mistaken for a decline.
+fn run_elicitation<B: BufRead>(
+    stdout: &mut std::io::Stdout,
+    lines: &mut std::io::Lines<B>,
+    session_id: &str,
+    prompt_turn: u32,
+    schema: &str,
+) {
+    let request_id = format!("elic-{}-{prompt_turn}", std::process::id());
+    let mode = std::env::var("FAKE_ACP_ELICITATION_MODE").unwrap_or_else(|_| "form".to_string());
+    let message = std::env::var("FAKE_ACP_ELICITATION_MESSAGE")
+        .unwrap_or_else(|_| "Please fill in the form".to_string());
+    let mut params = json!({
+        "sessionId": session_id,
+        "message": message,
+        "mode": mode,
+    });
+    if mode == "url" {
+        params["elicitationId"] = json!(format!("url-elic-{prompt_turn}"));
+        params["url"] = json!("https://example.com/consent");
+    } else {
+        match serde_json::from_str::<Value>(schema) {
+            Ok(schema) => params["requestedSchema"] = schema,
+            Err(error) => {
+                params["requestedSchema"] = json!({ "type": "object", "properties": {} });
+                record_elicitation(json!({ "fixture_error": error.to_string() }));
+            }
+        }
+    }
+    write_json(
+        stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "elicitation/create",
+            "params": params,
+        }),
+    );
+
+    loop {
+        let Some(Ok(line)) = lines.next() else {
+            return;
+        };
+        let Ok(incoming) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if incoming.get("method").and_then(Value::as_str) == Some("session/cancel") {
+            record_cancel();
+            continue;
+        }
+        if incoming.get("id") != Some(&Value::String(request_id.clone())) {
+            continue;
+        }
+        if let Some(error) = incoming.get("error") {
+            record_elicitation(json!({
+                "error": {
+                    "code": error.get("code").cloned().unwrap_or(Value::Null),
+                    "message": error.get("message").cloned().unwrap_or(Value::Null),
+                    "data": error.get("data").cloned().unwrap_or(Value::Null),
+                }
+            }));
+        } else {
+            let action = incoming
+                .pointer("/result/action")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let content = incoming
+                .pointer("/result/content")
+                .cloned()
+                .unwrap_or(Value::Null);
+            record_elicitation(json!({ "action": action, "content": content }));
+        }
+        break;
+    }
+}
+
+/// Append one elicitation response to `FAKE_ACP_ELICITATION_RECORD`.
+fn record_elicitation(value: Value) {
+    let Some(marker) = std::env::var_os("FAKE_ACP_ELICITATION_RECORD") else {
+        return;
+    };
+    let mut responses = std::fs::read_to_string(&marker)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| value.get("responses").and_then(Value::as_array).cloned())
+        .unwrap_or_default();
+    responses.push(value);
+    let record = json!({ "responses": responses, "count": responses.len() });
+    let _ = std::fs::write(
+        marker,
+        serde_json::to_vec_pretty(&record).unwrap_or_default(),
+    );
 }
 
 /// Emit the deterministic assistant message used by the tests.

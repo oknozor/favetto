@@ -256,6 +256,8 @@ typed_calls! {
     agents_prompt => AgentsPromptCall,
     /// `agents.reply`.
     agents_reply => AgentsReplyCall,
+    /// `agents.reply_elicitation`.
+    agents_reply_elicitation => AgentsReplyElicitationCall,
     /// `agents.cancel`.
     agents_cancel => AgentsCancelCall,
     /// `agents.options`.
@@ -299,6 +301,7 @@ typed_calls! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use favetto_wire::elicitation::ElicitationReply;
     use favetto_wire::model::InputReply;
 
     fn response_bytes(id: RequestId, result: Result<serde_json::Value, (i32, &str)>) -> Vec<u8> {
@@ -565,6 +568,30 @@ mod tests {
                 assert_eq!(
                     request.params["reply"],
                     serde_json::json!({ "reply": "once" })
+                );
+            }
+            other => panic!("expected a request frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_elicitation_reply_routes_to_the_dedicated_method() {
+        let params = AgentElicitationReplyParams {
+            session_id: "sess-1".to_string(),
+            request_id: "elic-1".to_string(),
+            reply: ElicitationReply::Decline,
+        };
+        let bytes = encode_request::<AgentsReplyElicitationCall>(8, &params).expect("encode");
+        let frame: Frame = rmp_serde::from_slice(&bytes).expect("decode frame");
+        match frame {
+            Frame::Request(request) => {
+                assert_eq!(request.id, 8);
+                assert_eq!(request.method, method::AGENTS_REPLY_ELICITATION);
+                assert_eq!(request.params["session_id"], "sess-1");
+                assert_eq!(request.params["request_id"], "elic-1");
+                assert_eq!(
+                    request.params["reply"],
+                    serde_json::json!({ "action": "decline" })
                 );
             }
             other => panic!("expected a request frame, got {other:?}"),

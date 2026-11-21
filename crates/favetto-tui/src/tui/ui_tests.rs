@@ -180,6 +180,7 @@ fn all_popups_render_without_panic() {
                     message: "Allow bash?".to_string(),
                     options: vec!["Allow once".to_string(), "Reject".to_string()],
                     allow_always: true,
+                    form: None,
                 },
             )),
             Popup::Confirm(ConfirmPrompt {
@@ -1490,6 +1491,7 @@ fn session_picker_renders_activity_and_usage() {
             message: "Allow?".to_string(),
             options: Vec::new(),
             allow_always: false,
+            form: None,
         },
     });
     agent.usage = Some(favetto_core::model::AgentUsage {
@@ -1551,6 +1553,7 @@ fn reply_popup_renders_message_and_options() {
         message: "Allow bash to run tests?".to_string(),
         options: vec!["Allow once".to_string(), "Reject".to_string()],
         allow_always: true,
+        form: None,
     };
     app.popup = Popup::Reply(ReplyPrompt::new("s1".to_string(), request));
 
@@ -1562,6 +1565,71 @@ fn reply_popup_renders_message_and_options() {
     );
     assert!(text.contains("Allow once"), "option missing: {text:?}");
     assert!(text.contains("Reject"), "option missing: {text:?}");
+}
+
+#[test]
+fn elicitation_popup_renders_editing_and_review_without_values_in_the_feed() {
+    use favetto_core::elicitation::{
+        ElicitationField, ElicitationFieldKind, ElicitationForm, ElicitationRequest,
+    };
+
+    let request = ElicitationRequest {
+        id: "acp-elic-1".to_string(),
+        agent: "codex".to_string(),
+        tool_call_id: None,
+        message: "Configure the deployment".to_string(),
+        form: ElicitationForm {
+            title: Some("Deploy".to_string()),
+            description: Some("Review before sending".to_string()),
+            fields: vec![
+                ElicitationField {
+                    name: "name".to_string(),
+                    title: Some("Name".to_string()),
+                    description: None,
+                    required: true,
+                    kind: ElicitationFieldKind::String {
+                        default: Some("api".to_string()),
+                        min_length: None,
+                        max_length: None,
+                        format: None,
+                    },
+                },
+                ElicitationField {
+                    name: "tls".to_string(),
+                    title: Some("TLS".to_string()),
+                    description: None,
+                    required: false,
+                    kind: ElicitationFieldKind::Boolean {
+                        default: Some(true),
+                    },
+                },
+            ],
+        },
+    };
+    let mut prompt = ElicitationPrompt::new("s1".to_string(), request);
+    let mut app = App::new();
+    app.popup = Popup::Elicitation(prompt.clone());
+    let text = render_text(&mut app, 100, 30);
+    assert!(
+        text.contains("requested by codex"),
+        "agent missing: {text:?}"
+    );
+    assert!(text.contains("Name"), "field missing: {text:?}");
+    assert!(
+        text.contains("Review before sending"),
+        "description missing: {text:?}"
+    );
+
+    prompt.stage = ElicitationStage::Review;
+    app.popup = Popup::Elicitation(prompt);
+    let text = render_text(&mut app, 100, 30);
+    assert!(
+        text.contains("Review before sending"),
+        "review missing: {text:?}"
+    );
+    assert!(text.contains("Submit"), "submit missing: {text:?}");
+    assert!(text.contains("Decline"), "decline missing: {text:?}");
+    assert!(text.contains("Cancel"), "cancel missing: {text:?}");
 }
 
 #[test]
@@ -1592,6 +1660,7 @@ fn status_bar_hints_ctrl_r_for_a_pending_prompt() {
             message: "Allow?".to_string(),
             options: Vec::new(),
             allow_always: false,
+            form: None,
         },
     });
     app.set_agent_sessions(vec![agent]);

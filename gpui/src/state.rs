@@ -19,6 +19,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use chrono::Utc;
+use favetto_wire::elicitation::ElicitationReply;
 use favetto_wire::model::{
     AgentAuthState, AgentAuthStatus, AgentCatalogEntry, AgentCommand, AgentPlanEntry,
     AgentSessionInfo, AgentUsage, EventKind, InputReply, RepoInfo, SessionConfigOption,
@@ -29,7 +30,7 @@ use gpui::{ClipboardItem, Context, Task as GpuiTask, WindowAppearance};
 
 use crate::catalog::{AgentChoice, CatalogState, OneShotFocus};
 use crate::config::{self, ClientConfig, Density, ThemeChoice};
-use crate::detail::{DetailTab, PendingRequest, TaskDetail};
+use crate::detail::{DetailTab, PendingElicitation, PendingRequest, TaskDetail};
 use crate::inbox::{self, InboxKey, InboxRows};
 use crate::launch::{self, LaunchFailure};
 use crate::repos::{self, RepoPicker};
@@ -484,8 +485,10 @@ impl ClientState {
                     // authoritative source).
                     Push::AgentEvent(event) => {
                         if self.event_belongs_to_open_task(event) {
+                            let sessions = self.sessions.clone();
                             if let Some(detail) = &mut self.detail {
                                 detail.push_event(event.clone());
+                                detail.sync_elicitation(&sessions);
                             }
                         }
                         // The cancelled turn's Idle event is the final feedback
@@ -582,6 +585,10 @@ impl ClientState {
                             cx,
                         );
                     }
+                }
+                let sessions = self.sessions.clone();
+                if let Some(detail) = self.detail.as_mut() {
+                    detail.sync_elicitation(&sessions);
                 }
                 // The Workflows root list is derived from this same snapshot,
                 // so a recovered daemon fills it without another RPC. The open
@@ -710,6 +717,7 @@ impl ClientState {
                 }
             }
             Update::EventsLoaded { task_id, result } => {
+                let sessions = self.sessions.clone();
                 if let Some(detail) = self.detail.as_mut() {
                     if detail.task_id == task_id {
                         let result = *result;
@@ -721,6 +729,7 @@ impl ClientState {
                             result.commands,
                             result.ignored,
                         );
+                        detail.sync_elicitation(&sessions);
                     }
                 }
             }
@@ -799,6 +808,52 @@ impl ClientState {
                 }
                 // The daemon also pushes `agent.state`; one reconciling load
                 // keeps the banner's request text in step.
+                self.refresh_snapshot();
+            }
+            Update::ElicitationReplyFinished {
+                request_id,
+                reply,
+                result,
+                ..
+            } => {
+                if let Some(detail) = self.detail.as_mut() {
+                    if detail.elicitation_pending.as_deref() == Some(request_id.as_str()) {
+                        detail.elicitation_pending = None;
+                    }
+                }
+                match result {
+                    Ok(result) if result.replied => {
+                        if let Some(detail) = self.detail.as_mut() {
+                            if detail
+                                .elicitation
+                                .as_ref()
+                                .map(|form| form.request.id.as_str())
+                                == Some(request_id.as_str())
+                            {
+                                detail.elicitation = None;
+                            }
+                            detail.answered_elicitation = Some(request_id);
+                        }
+                        self.show_toast(ToastKind::Success, elicitation_done_message(&reply), cx);
+                    }
+                    Ok(_) => self.show_toast(
+                        ToastKind::Error,
+                        "The daemon did not accept the form. It is still open.".to_string(),
+                        cx,
+                    ),
+                    Err(error) => {
+                        if error.is_unauthorized() {
+                            self.connection = ConnectionState::Unauthorized {
+                                token_path: self.config.token_source.label(),
+                            };
+                        }
+                        self.show_toast(
+                            ToastKind::Error,
+                            format!("Could not answer the form: {error}."),
+                            cx,
+                        );
+                    }
+                }
                 self.refresh_snapshot();
             }
             Update::TurnCancelFinished { session_id, result } => match result {
@@ -3712,6 +3767,134 @@ impl ClientState {
         self.detail.as_ref()?.pending_request(&self.sessions)
     }
 
+    /// The pending ACP form, if the open run has one.
+    pub fn detail_pending_elicitation(&self) -> Option<PendingElicitation> {
+        self.detail.as_ref()?.pending_elicitation(&self.sessions)
+    }
+
+    /// The editable form state for the open elicitation.
+    pub fn detail_elicitation(&self) -> Option<&crate::elicitation::ElicitationFormState> {
+        self.detail.as_ref()?.elicitation.as_ref()
+    }
+
+    /// Mutable access for the modal's keyboard actions.
+    pub fn detail_elicitation_mut(
+        &mut self,
+    ) -> Option<&mut crate::elicitation::ElicitationFormState> {
+        self.detail.as_mut()?.elicitation.as_mut()
+    }
+
+    /// Move focus to the next form field.
+    pub fn elicitation_next(&mut self) {
+        if let Some(form) = self.detail_elicitation_mut() {
+            form.move_next();
+        }
+    }
+
+    /// Move focus to the previous form field.
+    pub fn elicitation_prev(&mut self) {
+        if let Some(form) = self.detail_elicitation_mut() {
+            form.move_prev();
+        }
+    }
+
+    /// Adjust an enum or boolean control.
+    pub fn elicitation_adjust(&mut self, backwards: bool) {
+        if let Some(form) = self.detail_elicitation_mut() {
+            form.toggle_or_cycle(backwards);
+        }
+    }
+
+    /// Toggle a boolean or cycle an enum.
+    pub fn elicitation_toggle(&mut self) {
+        if let Some(form) = self.detail_elicitation_mut() {
+            form.toggle_or_cycle(false);
+        }
+    }
+
+    /// Validate into review, or submit the reviewed form.
+    pub fn elicitation_confirm(&mut self, cx: &mut Context<Self>) {
+        let reply = {
+            let Some(form) = self.detail_elicitation_mut() else {
+                return;
+            };
+            if form.stage == crate::elicitation::ElicitationStage::Review {
+                form.accept_reply()
+                    .ok()
+                    .map(|reply| (form.session_id.clone(), form.request.id.clone(), reply))
+            } else {
+                form.review();
+                None
+            }
+        };
+        if let Some((session_id, request_id, reply)) = reply {
+            self.reply_to_elicitation(session_id, request_id, reply, cx);
+        }
+    }
+
+    /// Decline the form without accepting any values.
+    pub fn elicitation_decline(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self.detail_elicitation_mut() else {
+            return;
+        };
+        let session_id = form.session_id.clone();
+        let request_id = form.request.id.clone();
+        let reply = form.decline();
+        self.reply_to_elicitation(session_id, request_id, reply, cx);
+    }
+
+    /// Cancel the form without accepting any values.
+    pub fn elicitation_cancel(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self.detail_elicitation_mut() else {
+            return;
+        };
+        let session_id = form.session_id.clone();
+        let request_id = form.request.id.clone();
+        let reply = form.cancel();
+        self.reply_to_elicitation(session_id, request_id, reply, cx);
+    }
+
+    /// Return from review to editing.
+    pub fn elicitation_edit(&mut self) {
+        if let Some(form) = self.detail_elicitation_mut() {
+            form.stage = crate::elicitation::ElicitationStage::Editing;
+        }
+    }
+
+    /// Send one explicit accept/decline/cancel form reply. Duplicate clicks and
+    /// key presses are ignored while the first reply is in flight.
+    pub fn reply_to_elicitation(
+        &mut self,
+        session_id: String,
+        request_id: String,
+        reply: ElicitationReply,
+        cx: &mut Context<Self>,
+    ) {
+        let already_pending = self
+            .detail
+            .as_ref()
+            .is_some_and(|detail| detail.elicitation_pending.is_some());
+        if already_pending {
+            return;
+        }
+        if let Some(detail) = self.detail.as_mut() {
+            detail.elicitation_pending = Some(request_id.clone());
+        }
+        match &self.runtime {
+            Some(runtime) => runtime.reply_elicitation(session_id, request_id, reply),
+            None => {
+                if let Some(detail) = self.detail.as_mut() {
+                    detail.elicitation_pending = None;
+                }
+                self.show_toast(
+                    ToastKind::Error,
+                    "The transport is not running, so the form was not sent.".to_string(),
+                    cx,
+                );
+            }
+        }
+    }
+
     /// The agent that owns the selected run, from the live session or the most
     /// recent attempt (the task row itself carries no agent).
     pub fn detail_agent(&self) -> Option<String> {
@@ -4305,6 +4488,16 @@ impl ClientState {
 fn short_id(id: uuid::Uuid) -> String {
     let value = id.to_string();
     value.chars().take(8).collect()
+}
+
+/// The success toast for one answered form, in the user's terms. It never
+/// includes a submitted value.
+fn elicitation_done_message(reply: &ElicitationReply) -> String {
+    match reply {
+        ElicitationReply::Accept { .. } => "Sent the requested form to the agent.".to_string(),
+        ElicitationReply::Decline => "Declined the agent's form.".to_string(),
+        ElicitationReply::Cancel => "Cancelled the agent's form.".to_string(),
+    }
 }
 
 /// The success toast for one answered prompt, in the user's terms.

@@ -21,9 +21,9 @@ use favetto_core::workflow::{WorkflowInspect, WorkflowState};
 use super::app::{
     activity_cell, cost_cell, format_activity, repo_label, table_rows_area, task_display_name,
     task_repo, token_cell, App, AuthPrompt, CatalogRow, ClickAction, ClickRegion, ConfirmPrompt,
-    ConnState, Form, LaunchFailure, ListGeometry, MenuAction, MenuEntry, Popup, ReplyPrompt,
-    SessionOptionRowKind, SessionOptionsPopup, SessionPickerEntry, Tab, TaskPickerRow,
-    TaskVarsForm, ThemeChoice, Wizard, WizardStep,
+    ConnState, ElicitationPrompt, ElicitationStage, Form, LaunchFailure, ListGeometry, MenuAction,
+    MenuEntry, Popup, ReplyPrompt, SessionOptionRowKind, SessionOptionsPopup, SessionPickerEntry,
+    Tab, TaskPickerRow, TaskVarsForm, ThemeChoice, Wizard, WizardStep,
 };
 use super::text_buffer::TextBuffer;
 use super::theme::{RaisedLevel, Theme};
@@ -236,6 +236,7 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
         Popup::Sessions { .. } => {}
         Popup::SessionOptions(popup) => draw_session_options(frame, popup, theme),
         Popup::Reply(prompt) => draw_reply(frame, prompt, theme),
+        Popup::Elicitation(prompt) => draw_elicitation(frame, prompt, theme),
         Popup::Auth(prompt) => draw_auth(frame, prompt, theme),
         Popup::Confirm(prompt) => {
             draw_confirm(frame, prompt, theme);
@@ -937,6 +938,119 @@ fn draw_reply(frame: &mut Frame, prompt: &ReplyPrompt, theme: Theme) {
             area,
             width_pct: 60,
             title: " Ctrl+R — reply ".to_string(),
+            content,
+            footer,
+            focus_line: 0,
+            theme,
+        },
+    );
+}
+
+/// Draw the Ctrl+R ACP form: agent identity, the request message, editable
+/// fields, then a review screen with explicit submit/decline/cancel actions.
+fn draw_elicitation(frame: &mut Frame, prompt: &ElicitationPrompt, theme: Theme) {
+    let area = frame.area();
+    let mut content: Vec<Line<'static>> = Vec::new();
+    content.push(Line::from(Span::styled(
+        format!(
+            "requested by {} · session {}",
+            prompt.request.agent,
+            short_str(&prompt.session_id)
+        ),
+        Style::default().fg(theme.muted()),
+    )));
+    content.push(Line::from(""));
+    for line in prompt.request.message.lines() {
+        content.push(Line::from(line.to_string()));
+    }
+    if let Some(title) = &prompt.request.form.title {
+        content.push(Line::from(Span::styled(
+            title.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+    }
+    if let Some(description) = &prompt.request.form.description {
+        content.push(Line::from(Span::styled(
+            description.clone(),
+            Style::default().fg(theme.muted()),
+        )));
+    }
+    content.push(Line::from(""));
+
+    match prompt.stage {
+        ElicitationStage::Editing => {
+            for (index, field) in prompt.fields().iter().enumerate() {
+                let label = ElicitationPrompt::field_label(field);
+                let required = if field.required { " *" } else { "" };
+                let style = if index == prompt.current {
+                    theme.selected()
+                } else {
+                    Style::default()
+                };
+                content.push(Line::from(Span::styled(
+                    format!("{label}{required}"),
+                    style.add_modifier(Modifier::BOLD),
+                )));
+                if let Some(description) = &field.description {
+                    content.push(Line::from(Span::styled(
+                        format!("  {description}"),
+                        Style::default().fg(theme.muted()),
+                    )));
+                }
+                let marker = if index == prompt.current { "> " } else { "  " };
+                content.push(Line::from(Span::styled(
+                    format!("{marker}[{}]", prompt.display_value(index)),
+                    style,
+                )));
+            }
+        }
+        ElicitationStage::Review => {
+            content.push(Line::from(Span::styled(
+                "Review before sending",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            for (index, field) in prompt.fields().iter().enumerate() {
+                content.push(Line::from(format!(
+                    "{}: {}",
+                    ElicitationPrompt::field_label(field),
+                    prompt.display_value(index)
+                )));
+            }
+            content.push(Line::from(""));
+            for (index, label) in ["Submit", "Decline", "Cancel"].iter().enumerate() {
+                let style = if index == prompt.review_selected {
+                    theme.selected()
+                } else {
+                    Style::default()
+                };
+                content.push(Line::from(Span::styled(format!("  {label} "), style)));
+            }
+        }
+    }
+    if let Some(error) = &prompt.error {
+        content.push(Line::from(""));
+        content.push(Line::from(Span::styled(
+            error.clone(),
+            Style::default().fg(theme.danger()),
+        )));
+    }
+
+    let footer = vec![Line::from(Span::styled(
+        match prompt.stage {
+            ElicitationStage::Editing => {
+                "Tab/↑/↓ field · ←/→ enum/bool · Enter review · Esc cancel"
+            }
+            ElicitationStage::Review => "Enter submit · d decline · e edit · Esc cancel",
+        },
+        Style::default().fg(theme.muted()),
+    ))];
+
+    draw_growing_popup(
+        frame,
+        GrowingPopup {
+            area,
+            width_pct: 70,
+            title: " Ctrl+R — form ".to_string(),
             content,
             footer,
             focus_line: 0,

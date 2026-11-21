@@ -22,20 +22,22 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use async_channel::{Receiver, Sender};
+use favetto_wire::elicitation::ElicitationReply;
 use favetto_wire::model::{
     AgentCatalogEntry, AgentSessionHistoryEntry, AgentSessionInfo, InputReply,
     ProviderSessionsResult, Schedule, SessionConfigValue, Task, TaskRun,
 };
 use favetto_wire::rpc::{
     AgentAttachResult, AgentAuthenticateParams, AgentAuthenticateResult, AgentCancelParams,
-    AgentCancelResult, AgentLogoutParams, AgentLogoutResult, AgentOptionsResult, AgentPromptParams,
-    AgentPromptResult, AgentReplyParams, AgentReplyResult, AgentSetModeParams,
-    AgentSetOptionParams, AgentsHistoryParams, CatalogEntry, CatalogGetParams, EmptyParams,
-    PingParams, PingResult, ProviderDeleteParams, ProviderResumeParams, ProviderSessionsParams,
-    ReposActivateParams, ReposListResult, ScheduleDeleteParams, ScheduleUpsertParams,
-    SchedulesDeleteResult, SessionIdParams, StartOneshotParams, StartOneshotResult, TaskIdParams,
-    TasksEventsParams, TasksListParams, TasksStartParams, WorkflowCancelResultBody,
-    WorkflowGetResult, WorkflowInspectParams, WorkflowRetryParams,
+    AgentCancelResult, AgentElicitationReplyParams, AgentElicitationReplyResult, AgentLogoutParams,
+    AgentLogoutResult, AgentOptionsResult, AgentPromptParams, AgentPromptResult, AgentReplyParams,
+    AgentReplyResult, AgentSetModeParams, AgentSetOptionParams, AgentsHistoryParams, CatalogEntry,
+    CatalogGetParams, EmptyParams, PingParams, PingResult, ProviderDeleteParams,
+    ProviderResumeParams, ProviderSessionsParams, ReposActivateParams, ReposListResult,
+    ScheduleDeleteParams, ScheduleUpsertParams, SchedulesDeleteResult, SessionIdParams,
+    StartOneshotParams, StartOneshotResult, TaskIdParams, TasksEventsParams, TasksListParams,
+    TasksStartParams, WorkflowCancelResultBody, WorkflowGetResult, WorkflowInspectParams,
+    WorkflowRetryParams,
 };
 use favetto_wire::workflow::WorkflowInspect;
 use uuid::Uuid;
@@ -104,6 +106,12 @@ pub enum Command {
         session_id: String,
         request_id: String,
         reply: InputReply,
+    },
+    /// Answer one ACP form elicitation (`agents.reply_elicitation`).
+    ElicitationReply {
+        session_id: String,
+        request_id: String,
+        reply: ElicitationReply,
     },
     /// Interrupt the in-flight turn of one live agent session (`agents.cancel`).
     CancelTurn { session_id: String },
@@ -249,6 +257,13 @@ pub enum Update {
         request_id: String,
         reply: InputReply,
         result: Result<AgentReplyResult, ClientError>,
+    },
+    /// `agents.reply_elicitation` completed for one correlated request.
+    ElicitationReplyFinished {
+        session_id: String,
+        request_id: String,
+        reply: ElicitationReply,
+        result: Result<AgentElicitationReplyResult, ClientError>,
     },
     /// `agents.cancel` completed for the live session.
     TurnCancelFinished {
@@ -469,6 +484,20 @@ impl Runtime {
     /// Answer a blocked prompt through `agents.reply`.
     pub fn reply(&self, session_id: String, request_id: String, reply: InputReply) {
         self.send(Command::Reply {
+            session_id,
+            request_id,
+            reply,
+        });
+    }
+
+    /// Answer one ACP form elicitation through `agents.reply_elicitation`.
+    pub fn reply_elicitation(
+        &self,
+        session_id: String,
+        request_id: String,
+        reply: ElicitationReply,
+    ) {
+        self.send(Command::ElicitationReply {
             session_id,
             request_id,
             reply,
@@ -725,6 +754,19 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
                 reply,
             } => {
                 spawn_reply(
+                    client.clone(),
+                    updates.clone(),
+                    session_id,
+                    request_id,
+                    reply,
+                );
+            }
+            Command::ElicitationReply {
+                session_id,
+                request_id,
+                reply,
+            } => {
+                spawn_elicitation_reply(
                     client.clone(),
                     updates.clone(),
                     session_id,
@@ -1218,6 +1260,31 @@ fn spawn_reply(
             })
             .await;
         let _ = updates.try_send(Update::ReplyFinished {
+            session_id,
+            request_id,
+            reply,
+            result,
+        });
+    });
+}
+
+/// Spawn one `agents.reply_elicitation` for a correlated form.
+fn spawn_elicitation_reply(
+    client: Arc<RpcClient>,
+    updates: Sender<Update>,
+    session_id: String,
+    request_id: String,
+    reply: ElicitationReply,
+) {
+    tokio::spawn(async move {
+        let result = client
+            .agents_reply_elicitation(AgentElicitationReplyParams {
+                session_id: session_id.clone(),
+                request_id: request_id.clone(),
+                reply: reply.clone(),
+            })
+            .await;
+        let _ = updates.try_send(Update::ElicitationReplyFinished {
             session_id,
             request_id,
             reply,

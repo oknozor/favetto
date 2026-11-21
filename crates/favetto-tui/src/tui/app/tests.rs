@@ -203,6 +203,7 @@ fn session_with_backend(
             request_id: None,
             options: Vec::new(),
             allow_always: false,
+            form: None,
         }),
         activity: None,
         usage: None,
@@ -879,6 +880,7 @@ fn permission_request(options: Vec<&str>, allow_always: bool) -> InputRequest {
         message: "Allow bash?".to_string(),
         options: options.into_iter().map(str::to_string).collect(),
         allow_always,
+        form: None,
     }
 }
 
@@ -1096,6 +1098,67 @@ fn ctrl_r_opens_reply_only_with_a_structured_request() {
 }
 
 #[test]
+fn ctrl_r_opens_a_form_for_an_elicitation_request() {
+    use favetto_core::elicitation::{ElicitationField, ElicitationFieldKind, ElicitationForm};
+
+    let mut app = App::new();
+    let mut session = agent_session("s1", false, true, true);
+    session.activity = Some(AgentActivity::Waiting {
+        request: InputRequest {
+            id: "acp-elic-1".to_string(),
+            kind: AwaitingInputKind::Elicitation,
+            message: "Fill in".to_string(),
+            options: Vec::new(),
+            allow_always: false,
+            form: Some(ElicitationForm {
+                title: Some("Details".to_string()),
+                description: None,
+                fields: vec![ElicitationField {
+                    name: "name".to_string(),
+                    title: Some("Name".to_string()),
+                    description: None,
+                    required: true,
+                    kind: ElicitationFieldKind::String {
+                        default: Some("api".to_string()),
+                        min_length: None,
+                        max_length: None,
+                        format: None,
+                    },
+                }],
+            }),
+        },
+    });
+    app.set_agent_sessions(vec![session]);
+    app.agent_session_id = Some("s1".to_string());
+
+    app.handle_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    let Popup::Elicitation(prompt) = &app.popup else {
+        panic!("expected an elicitation form");
+    };
+    assert_eq!(prompt.request.agent, "demo");
+    assert_eq!(prompt.display_value(0), "api");
+
+    // Enter validates and opens the review stage; Enter there submits.
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
+    assert!(matches!(
+        &app.popup,
+        Popup::Elicitation(prompt) if prompt.stage == ElicitationStage::Review
+    ));
+    match app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())) {
+        UiAction::ElicitationReply {
+            request_id, reply, ..
+        } => {
+            assert_eq!(request_id, "acp-elic-1");
+            assert!(matches!(reply, ElicitationReply::Accept { .. }));
+        }
+        _ => panic!("expected ElicitationReply"),
+    }
+    // The submitted value is not written to the prompt/log fields.
+    assert!(app.agent_prompt.is_empty());
+    assert!(app.logs.iter().all(|line| !line.contains("api")));
+}
+
+#[test]
 fn ctrl_r_uses_the_structured_awaiting_input_fallback() {
     let mut app = App::new();
     let mut session = agent_session("s1", false, true, true);
@@ -1154,6 +1217,7 @@ fn reply_for_is_kind_aware() {
         message: "Proceed?".to_string(),
         options: vec!["Yes".to_string(), "No".to_string()],
         allow_always: false,
+        form: None,
     };
     assert_eq!(
         reply_for(&confirmation, 0, ""),
@@ -1170,6 +1234,7 @@ fn reply_for_is_kind_aware() {
         message: "Pick".to_string(),
         options: vec!["A".to_string(), "B".to_string()],
         allow_always: false,
+        form: None,
     };
     assert_eq!(
         reply_for(&choice, 1, ""),
@@ -1199,6 +1264,7 @@ fn reply_popup_free_form_types_a_value() {
         message: "Your name?".to_string(),
         options: Vec::new(),
         allow_always: false,
+        form: None,
     };
     app.set_agent_sessions(vec![waiting_session("s1", request)]);
     app.agent_session_id = Some("s1".to_string());

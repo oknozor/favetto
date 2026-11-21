@@ -43,6 +43,7 @@ hmac = "0.13"
 http = "1"
 libc = "0.2"
 parking_lot = "0.12"
+thiserror = "2"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 schemars = { version = "1", features = ["derive"] }
 serde = { workspace = true }

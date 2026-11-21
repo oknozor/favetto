@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use favetto_wire::elicitation::ElicitationRequest;
 use favetto_wire::model::{
     AgentCommand, AgentPlanEntry, AgentSessionInfo, AgentStateEvent, AgentUsage, AwaitingInputKind,
     ContentRole, IdleOutcome, InputRequest, MessageContent, MessageRole, RunStatus, Task, TaskRun,
@@ -296,6 +297,11 @@ pub enum FeedItem {
         request: InputRequest,
         resolved: bool,
     },
+    /// An ACP form request; `resolved` once a matching resolve/idle arrived.
+    Elicitation {
+        request: ElicitationRequest,
+        resolved: bool,
+    },
     /// The agent reported its session identity/title.
     Session { title: Option<String> },
     /// The session's title changed.
@@ -313,6 +319,7 @@ pub fn build_feed(events: &[AgentEventPush]) -> Vec<FeedItem> {
     let mut items: Vec<FeedItem> = Vec::new();
     let mut tools: HashMap<&str, usize> = HashMap::new();
     let mut pending_inputs: HashMap<&str, usize> = HashMap::new();
+    let mut pending_elicitations: HashMap<&str, usize> = HashMap::new();
 
     for push in events {
         if !matches!(&push.event, AgentStateEvent::ReasoningDelta { .. }) {
@@ -432,6 +439,20 @@ pub fn build_feed(events: &[AgentEventPush]) -> Vec<FeedItem> {
                     }
                 }
             }
+            AgentStateEvent::ElicitationRequested { request } => {
+                pending_elicitations.insert(request.id.as_str(), items.len());
+                items.push(FeedItem::Elicitation {
+                    request: request.clone(),
+                    resolved: false,
+                });
+            }
+            AgentStateEvent::ElicitationResolved { id, .. } => {
+                if let Some(index) = pending_elicitations.remove(id.as_str()) {
+                    if let FeedItem::Elicitation { resolved, .. } = &mut items[index] {
+                        *resolved = true;
+                    }
+                }
+            }
             AgentStateEvent::Usage { usage, .. } => items.push(FeedItem::Usage(usage.clone())),
             AgentStateEvent::Title { title } => items.push(FeedItem::Title(title.clone())),
             // Auth progress is rendered by the detail's pinned banner, which
@@ -446,6 +467,11 @@ pub fn build_feed(events: &[AgentEventPush]) -> Vec<FeedItem> {
             AgentStateEvent::Idle { outcome } => {
                 for index in pending_inputs.drain().map(|(_, index)| index) {
                     if let FeedItem::InputRequest { resolved, .. } = &mut items[index] {
+                        *resolved = true;
+                    }
+                }
+                for index in pending_elicitations.drain().map(|(_, index)| index) {
+                    if let FeedItem::Elicitation { resolved, .. } = &mut items[index] {
                         *resolved = true;
                     }
                 }
@@ -559,9 +585,17 @@ impl PendingRequest {
             AwaitingInputKind::Confirmation => "confirmation",
             AwaitingInputKind::Choice => "choice",
             AwaitingInputKind::Pinentry => "passphrase",
+            AwaitingInputKind::Elicitation => "form",
             AwaitingInputKind::Other => "input",
         }
     }
+}
+
+/// A pending ACP form elicitation, ready for the modal.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingElicitation {
+    pub session_id: String,
+    pub request: ElicitationRequest,
 }
 
 /// The client's per-task detail state. One lives on [`crate::state::ClientState`]
@@ -609,6 +643,12 @@ pub struct TaskDetail {
     pub new_events: u64,
     /// The request id with an in-flight `agents.reply`.
     pub reply_pending: Option<String>,
+    /// The edited form for the current elicitation request.
+    pub elicitation: Option<crate::elicitation::ElicitationFormState>,
+    /// The elicitation request id with an in-flight `agents.reply_elicitation`.
+    pub elicitation_pending: Option<String>,
+    /// The elicitation id most recently answered, hidden until a new one arrives.
+    pub answered_elicitation: Option<String>,
     /// The live session id whose turn has an in-flight/cancelling
     /// `agents.cancel`. Cleared when the turn reports idle or the RPC fails.
     pub turn_cancel_pending: Option<String>,
@@ -654,6 +694,9 @@ impl TaskDetail {
             follow: true,
             new_events: 0,
             reply_pending: None,
+            elicitation: None,
+            elicitation_pending: None,
+            answered_elicitation: None,
             turn_cancel_pending: None,
             answered_request: None,
             plan: None,
@@ -972,6 +1015,88 @@ impl TaskDetail {
         }
 
         None
+    }
+
+    /// The latest unresolved ACP form request in the feed.
+    fn latest_unresolved_elicitation(&self) -> Option<(&str, &ElicitationRequest)> {
+        let mut pending: Option<(&str, &ElicitationRequest)> = None;
+        for push in &self.events {
+            match &push.event {
+                AgentStateEvent::ElicitationRequested { request } => {
+                    pending = Some((push.session_id.as_str(), request));
+                }
+                AgentStateEvent::ElicitationResolved { id, .. } => {
+                    if pending.is_some_and(|(_, request)| request.id == *id) {
+                        pending = None;
+                    }
+                }
+                AgentStateEvent::Idle { .. } => pending = None,
+                _ => {}
+            }
+        }
+        pending
+    }
+
+    /// The pending form, preferring the live roster's `awaiting_input` and
+    /// falling back to the feed. The agent identity comes from the request.
+    pub fn pending_elicitation(&self, sessions: &[AgentSessionInfo]) -> Option<PendingElicitation> {
+        if self.is_terminal() {
+            return None;
+        }
+        let task_id = self.task_id.to_string();
+        if let Some(session) = sessions
+            .iter()
+            .find(|session| session.task_id.as_deref() == Some(task_id.as_str()))
+        {
+            if let Some(reason) = &session.awaiting_input {
+                if reason.kind == AwaitingInputKind::Elicitation {
+                    let form = reason.form.clone()?;
+                    let request_id = reason.request_id.clone()?;
+                    if self.answered_elicitation.as_deref() == Some(request_id.as_str()) {
+                        return None;
+                    }
+                    return Some(PendingElicitation {
+                        session_id: session.id.clone(),
+                        request: ElicitationRequest {
+                            id: request_id,
+                            agent: session.agent.clone(),
+                            tool_call_id: None,
+                            message: reason.message.clone(),
+                            form,
+                        },
+                    });
+                }
+            }
+        }
+        let (session_id, request) = self.latest_unresolved_elicitation()?;
+        if self.answered_elicitation.as_deref() == Some(request.id.as_str()) {
+            return None;
+        }
+        Some(PendingElicitation {
+            session_id: session_id.to_string(),
+            request: request.clone(),
+        })
+    }
+
+    /// Create the editable form once a pending request appears, and clear it
+    /// only when the same request resolves.
+    pub fn sync_elicitation(&mut self, sessions: &[AgentSessionInfo]) {
+        let pending = self.pending_elicitation(sessions);
+        match pending {
+            Some(pending) => {
+                let same = self
+                    .elicitation
+                    .as_ref()
+                    .is_some_and(|form| form.request.id == pending.request.id);
+                if !same {
+                    self.elicitation = Some(crate::elicitation::ElicitationFormState::new(
+                        pending.session_id,
+                        pending.request,
+                    ));
+                }
+            }
+            None => self.elicitation = None,
+        }
     }
 
     /// The request id with an in-flight reply, when it matches `request_id`.
@@ -1625,6 +1750,7 @@ mod tests {
             message: "Allow?".to_string(),
             options: vec!["yes".to_string()],
             allow_always: true,
+            form: None,
         };
         let session = AgentSessionInfo {
             id: "ses_1".to_string(),
@@ -1640,6 +1766,7 @@ mod tests {
                 request_id: Some(request.id.clone()),
                 options: request.options.clone(),
                 allow_always: request.allow_always,
+                form: None,
             }),
             activity: None,
             usage: None,
@@ -1748,6 +1875,79 @@ mod tests {
         assert_eq!(result.ignored, 1);
         assert_eq!(result.next_cursor, 9);
         assert_eq!(result.session_id.as_deref(), Some("ses_1"));
+    }
+
+    #[test]
+    fn elicitation_feed_and_pending_follow_the_matching_request_id() {
+        let request = ElicitationRequest {
+            id: "acp-elic-1".to_string(),
+            agent: "codex".to_string(),
+            tool_call_id: None,
+            message: "Fill in".to_string(),
+            form: favetto_wire::elicitation::ElicitationForm {
+                title: Some("Details".to_string()),
+                description: None,
+                fields: Vec::new(),
+            },
+        };
+        let mut detail = TaskDetail::new(Uuid::from_u128(7));
+        detail.set_task(task(TaskStatus::AwaitingInput));
+        detail.push_event(push(
+            1,
+            AgentStateEvent::ElicitationRequested {
+                request: request.clone(),
+            },
+        ));
+        let feed = build_feed(&detail.events);
+        assert!(matches!(
+            &feed[0],
+            FeedItem::Elicitation { request: shown, resolved: false } if shown.id == "acp-elic-1"
+        ));
+        let pending = detail
+            .pending_elicitation(&[])
+            .expect("feed fallback pending");
+        assert_eq!(pending.request, request);
+        detail.sync_elicitation(&[]);
+        assert_eq!(
+            detail
+                .elicitation
+                .as_ref()
+                .map(|form| form.request.id.as_str()),
+            Some("acp-elic-1")
+        );
+
+        // A different id must not clear the open form.
+        detail.push_event(push(
+            2,
+            AgentStateEvent::ElicitationResolved {
+                id: "other".to_string(),
+                outcome: favetto_wire::elicitation::ElicitationOutcome::Cancelled,
+            },
+        ));
+        detail.sync_elicitation(&[]);
+        assert!(detail.elicitation.is_some());
+        assert!(matches!(
+            &build_feed(&detail.events)[0],
+            FeedItem::Elicitation {
+                resolved: false,
+                ..
+            }
+        ));
+
+        detail.push_event(push(
+            3,
+            AgentStateEvent::ElicitationResolved {
+                id: "acp-elic-1".to_string(),
+                outcome: favetto_wire::elicitation::ElicitationOutcome::Declined,
+            },
+        ));
+        detail.sync_elicitation(&[]);
+        assert!(detail.elicitation.is_none());
+        assert!(detail.pending_elicitation(&[]).is_none());
+        assert!(matches!(
+            &build_feed(&detail.events)[0],
+            FeedItem::Elicitation { resolved: true, .. }
+        ));
     }
 
     #[test]

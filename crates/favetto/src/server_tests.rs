@@ -1038,6 +1038,7 @@ fn live_session(running: bool, headless: bool, awaiting: bool) -> AgentSessionIn
             request_id: None,
             options: Vec::new(),
             allow_always: false,
+            form: None,
         }),
         activity: None,
         usage: None,
@@ -1734,6 +1735,8 @@ proptest! {
         let _: Result<ScheduleUpsertParams, _> = parse_params(method::SCHEDULES_UPSERT, &value);
         let _: Result<HookUpsertParams, _> = parse_params(method::HOOKS_UPSERT, &value);
         let _: Result<AgentReplyParams, _> = parse_params(method::AGENTS_REPLY, &value);
+        let _: Result<AgentElicitationReplyParams, _> =
+            parse_params(method::AGENTS_REPLY_ELICITATION, &value);
         let _: Result<NotificationTestParams, _> = parse_params(method::NOTIFICATIONS_TEST, &value);
         let _: Result<SessionIdParams, _> = parse_params(method::AGENTS_ATTACH, &value);
     }

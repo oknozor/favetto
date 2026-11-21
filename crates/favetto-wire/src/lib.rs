@@ -6,6 +6,7 @@
 //! existing import path.
 
 pub mod agent_state;
+pub mod elicitation;
 pub mod model;
 pub mod rpc;
 pub mod task_var;

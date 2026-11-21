@@ -141,6 +141,24 @@ actions!(
         DetailPromptNext,
         /// Move the command completion up (↑).
         DetailPromptPrev,
+        /// Move to the next ACP form field (Tab / ↓).
+        ElicitationNext,
+        /// Move to the previous ACP form field (Shift+Tab / ↑).
+        ElicitationPrev,
+        /// Move an enum/boolean control backwards (←).
+        ElicitationLeft,
+        /// Move an enum/boolean control forwards (→).
+        ElicitationRight,
+        /// Toggle a boolean or cycle an enum (Space).
+        ElicitationToggle,
+        /// Validate, review, or submit the ACP form (Enter).
+        ElicitationConfirm,
+        /// Decline the ACP form (d).
+        ElicitationDecline,
+        /// Return from review to editing (e).
+        ElicitationEdit,
+        /// Cancel the ACP form (Esc).
+        ElicitationCancel,
         /// Refresh the connection and the current surface.
         Refresh,
         /// Restart the transport.
@@ -479,6 +497,19 @@ pub fn bindings() -> Vec<KeyBinding> {
             CloseOverlay,
             Some("Root && DetailPrompt && !Palette && !Shortcuts"),
         ),
+        // ACP form modal. Registered last so its keys win over the generic
+        // shell bindings while the form owns the keyboard.
+        KeyBinding::new("tab", ElicitationNext, Some("Root && Elicitation")),
+        KeyBinding::new("down", ElicitationNext, Some("Root && Elicitation")),
+        KeyBinding::new("shift-tab", ElicitationPrev, Some("Root && Elicitation")),
+        KeyBinding::new("up", ElicitationPrev, Some("Root && Elicitation")),
+        KeyBinding::new("left", ElicitationLeft, Some("Root && Elicitation")),
+        KeyBinding::new("right", ElicitationRight, Some("Root && Elicitation")),
+        KeyBinding::new("space", ElicitationToggle, Some("Root && Elicitation")),
+        KeyBinding::new("enter", ElicitationConfirm, Some("Root && Elicitation")),
+        KeyBinding::new("d", ElicitationDecline, Some("Root && Elicitation")),
+        KeyBinding::new("e", ElicitationEdit, Some("Root && Elicitation")),
+        KeyBinding::new("escape", ElicitationCancel, Some("Root && Elicitation")),
     ]
 }
 

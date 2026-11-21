@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use std::str::FromStr;
 
+use crate::elicitation::{ElicitationForm, ElicitationOutcome, ElicitationRequest};
 use crate::model::{AgentAuthState, AwaitingInputKind, MessageRole};
 
 /// What an agent is doing right now (coarse, for the task list / picker).
@@ -55,6 +56,9 @@ pub struct InputRequest {
     /// Whether an "always" / "remember" answer is offered.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_always: bool,
+    /// The form to render for a form elicitation request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form: Option<ElicitationForm>,
 }
 
 /// The answer to an [`InputRequest`].
@@ -962,6 +966,13 @@ pub enum AgentStateEvent {
     InputRequested { request: InputRequest },
     /// A previously requested input was answered (or dismissed).
     InputResolved { id: String },
+    /// An ACP agent requested structured form input.
+    ElicitationRequested { request: ElicitationRequest },
+    /// A previously requested elicitation reached a terminal outcome.
+    ElicitationResolved {
+        id: String,
+        outcome: ElicitationOutcome,
+    },
     /// Token/cost usage for a step or a cumulative session snapshot.
     Usage {
         usage: AgentUsage,
@@ -1422,6 +1433,23 @@ mod tests {
                 output: None,
                 detail: None,
             },
+            AgentStateEvent::ElicitationRequested {
+                request: crate::elicitation::ElicitationRequest {
+                    id: "acp-elic-1".to_string(),
+                    agent: "codex".to_string(),
+                    tool_call_id: None,
+                    message: "Please fill this in".to_string(),
+                    form: crate::elicitation::ElicitationForm {
+                        title: Some("Details".to_string()),
+                        description: None,
+                        fields: Vec::new(),
+                    },
+                },
+            },
+            AgentStateEvent::ElicitationResolved {
+                id: "acp-elic-1".to_string(),
+                outcome: crate::elicitation::ElicitationOutcome::Declined,
+            },
             AgentStateEvent::Usage {
                 usage: AgentUsage::default(),
                 snapshot: true,
@@ -1680,10 +1708,12 @@ mod tests {
             message: "Allow?".to_string(),
             options: vec!["Allow once".to_string(), "Reject".to_string()],
             allow_always: true,
+            form: None,
         };
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["allow_always"], true);
         assert_eq!(json["options"][1], "Reject");
+        assert!(json.get("form").is_none());
         let back: InputRequest = serde_json::from_value(json).unwrap();
         assert_eq!(back, request);
 
@@ -1691,11 +1721,26 @@ mod tests {
         let lean = serde_json::to_value(InputRequest {
             options: Vec::new(),
             allow_always: false,
-            ..request
+            ..request.clone()
         })
         .unwrap();
         assert!(lean.get("options").is_none());
         assert!(lean.get("allow_always").is_none());
+
+        // Permissions never carry a form; a form request round-trips one.
+        let form = crate::elicitation::ElicitationForm {
+            title: Some("Details".to_string()),
+            description: None,
+            fields: Vec::new(),
+        };
+        let with_form = InputRequest {
+            kind: AwaitingInputKind::Elicitation,
+            form: Some(form.clone()),
+            ..request
+        };
+        let json = serde_json::to_value(&with_form).unwrap();
+        let back: InputRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(back.form, Some(form));
 
         for reply in [
             InputReply::Once,
@@ -1730,6 +1775,7 @@ mod tests {
                     message: "Allow?".to_string(),
                     options: Vec::new(),
                     allow_always: false,
+                    form: None,
                 },
             },
             AgentActivity::Idle,

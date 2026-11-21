@@ -180,6 +180,10 @@ pub fn input_reply_for(
         AwaitingInputKind::Choice | AwaitingInputKind::Pinentry | AwaitingInputKind::Other => {
             InputReply::Value { value: label }
         }
+        // Forms use the dedicated `agents.reply_elicitation` path. The web
+        // client is display-only until it grows a full form; never invent an
+        // acceptance from a stray free-text reply.
+        AwaitingInputKind::Elicitation => InputReply::Cancelled,
     }
 }
 
@@ -484,6 +488,7 @@ fn AwaitingInputCard(
     let options = card.options.clone();
     let allow_always = card.allow_always;
     let screen_detected = card.request_id.is_none();
+    let is_elicitation = card.kind == AwaitingInputKind::Elicitation;
     let badge = format!("status-badge status-{}", status.as_str());
 
     // Stable handle so every control can submit without cloning the card.
@@ -519,7 +524,11 @@ fn AwaitingInputCard(
                 }
             }
             p { class: "awaiting-prompt", "{message}" }
-            if screen_detected {
+            if is_elicitation {
+                p { class: "awaiting-hint",
+                    "Answer this form in the desktop or TUI client. The web client is read-only for forms."
+                }
+            } else if screen_detected {
                 p { class: "awaiting-hint",
                     "This prompt was detected from the terminal; answer it from the agent's terminal."
                 }
@@ -638,6 +647,7 @@ mod tests {
             request_id: request_id.map(str::to_string),
             options: options.into_iter().map(str::to_string).collect(),
             allow_always,
+            form: None,
         }
     }
 

@@ -12,6 +12,7 @@
 use std::collections::{HashMap, HashSet};
 
 use dioxus::prelude::*;
+use favetto_wire::elicitation::ElicitationRequest;
 use favetto_wire::model::{
     AgentStateEvent, AgentUsage, ContentRole, IdleOutcome, InputRequest, MessageContent,
     MessageRole, RunSummary,
@@ -258,6 +259,11 @@ pub enum FeedItem {
     Boundary(IdleOutcome),
     /// A prompt the agent is blocked on.
     InputRequest(InputRequest),
+    /// An ACP form request, rendered read-only in the web client.
+    Elicitation {
+        request: ElicitationRequest,
+        resolved: bool,
+    },
     /// The agent reported (or changed) its session identity/title.
     Session { title: Option<String> },
     /// The session's title changed.
@@ -326,6 +332,11 @@ pub fn feed_item(event: &AgentStateEvent) -> Option<FeedItem> {
             Some(FeedItem::InputRequest(request.clone()))
         }
         AgentStateEvent::InputResolved { .. } => None,
+        AgentStateEvent::ElicitationRequested { request } => Some(FeedItem::Elicitation {
+            request: request.clone(),
+            resolved: false,
+        }),
+        AgentStateEvent::ElicitationResolved { .. } => None,
         AgentStateEvent::Usage { usage, .. } => Some(FeedItem::Usage(usage.clone())),
         AgentStateEvent::Title { title } => Some(FeedItem::Title(title.clone())),
         AgentStateEvent::Idle { outcome } => Some(FeedItem::Boundary(*outcome)),
@@ -360,6 +371,7 @@ pub fn build_feed(events: &[AgentEventPush]) -> Vec<FeedItem> {
     let mut items: Vec<FeedItem> = Vec::new();
     let mut tools: HashMap<String, usize> = HashMap::new();
     let mut pending_input: Option<(usize, String)> = None;
+    let mut pending_elicitation: Option<(usize, String)> = None;
     let mut resolved: HashSet<usize> = HashSet::new();
 
     for push in events {
@@ -452,8 +464,27 @@ pub fn build_feed(events: &[AgentEventPush]) -> Vec<FeedItem> {
                     }
                 }
             }
+            AgentStateEvent::ElicitationRequested { request } => {
+                let index = items.len();
+                pending_elicitation = Some((index, request.id.clone()));
+                items.push(FeedItem::Elicitation {
+                    request: request.clone(),
+                    resolved: false,
+                });
+            }
+            AgentStateEvent::ElicitationResolved { id, .. } => {
+                if let Some((index, pending)) = &pending_elicitation {
+                    if pending == id {
+                        resolved.insert(*index);
+                        pending_elicitation = None;
+                    }
+                }
+            }
             AgentStateEvent::Idle { outcome } => {
                 if let Some((index, _)) = pending_input.take() {
+                    resolved.insert(index);
+                }
+                if let Some((index, _)) = pending_elicitation.take() {
                     resolved.insert(index);
                 }
                 items.push(FeedItem::Boundary(*outcome));
@@ -851,6 +882,24 @@ fn FeedRow(
             };
             rsx! { InlinePrompt { card, busy, toast, refresh } }
         }
+        FeedItem::Elicitation { request, .. } => {
+            let fields = request
+                .form
+                .fields
+                .iter()
+                .map(|field| field.title.clone().unwrap_or_else(|| field.name.clone()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            rsx! {
+                div { class: "feed-item feed-prompt awaiting-card",
+                    div { class: "awaiting-title", "Form requested by {request.agent}" }
+                    p { class: "awaiting-message", "{request.message}" }
+                    p { class: "awaiting-hint",
+                        "Fields: {fields}. Answer this form in the desktop or TUI client."
+                    }
+                }
+            }
+        }
         FeedItem::Session { title } => {
             let label = title.unwrap_or_else(|| "session started".to_string());
             rsx! {
@@ -964,6 +1013,7 @@ mod tests {
             message: "Allow?".to_string(),
             options: vec!["once".to_string()],
             allow_always: true,
+            form: None,
         };
         assert_eq!(
             feed_item(&AgentStateEvent::TextDelta {
@@ -1193,6 +1243,7 @@ mod tests {
             message: "Allow?".to_string(),
             options: Vec::new(),
             allow_always: false,
+            form: None,
         };
         let events = vec![
             push(

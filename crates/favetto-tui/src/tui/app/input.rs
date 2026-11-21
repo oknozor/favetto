@@ -78,6 +78,10 @@ impl App {
             && matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R'))
             && matches!(self.popup, Popup::None)
         {
+            if let Some((session_id, request)) = self.pending_elicitation() {
+                self.popup = Popup::Elicitation(ElicitationPrompt::new(session_id, request));
+                return UiAction::None;
+            }
             if let Some((session_id, request)) = self.pending_request() {
                 self.popup = Popup::Reply(ReplyPrompt::new(session_id, request));
                 return UiAction::None;
@@ -128,6 +132,7 @@ impl App {
             Popup::Sessions { .. } => return self.handle_sessions_key(key),
             Popup::SessionOptions(_) => return self.handle_session_options_key(key.code),
             Popup::Reply(_) => return self.handle_reply_key(key),
+            Popup::Elicitation(_) => return self.handle_elicitation_key(key),
             Popup::Auth(_) => return self.handle_auth_key(key.code),
             Popup::Confirm(_) => return self.handle_confirm_key(key.code),
             Popup::TaskError { .. } => return self.handle_task_error_key(key.code),
@@ -1087,6 +1092,49 @@ impl App {
             _ => {}
         }
         UiAction::None
+    }
+
+    /// Keys while the ACP elicitation form is open.
+    ///
+    /// Editing validates into a review screen; review requires an explicit
+    /// submit, decline or cancel. Esc always maps to cancel, never accept.
+    pub(super) fn handle_elicitation_key(&mut self, key: KeyEvent) -> UiAction {
+        let Popup::Elicitation(prompt) = &mut self.popup else {
+            return UiAction::None;
+        };
+        match prompt.stage {
+            ElicitationStage::Editing => match prompt.edit_key(key) {
+                super::elicitation::EditOutcome::Review | super::elicitation::EditOutcome::None => {
+                    UiAction::None
+                }
+                super::elicitation::EditOutcome::Cancel => {
+                    let (session_id, request_id, reply) = (
+                        prompt.session_id.clone(),
+                        prompt.request.id.clone(),
+                        prompt.cancel_reply(),
+                    );
+                    self.popup = Popup::None;
+                    UiAction::ElicitationReply {
+                        session_id,
+                        request_id,
+                        reply,
+                    }
+                }
+            },
+            ElicitationStage::Review => match prompt.review_key(key) {
+                super::elicitation::ReviewOutcome::Reply(reply) => {
+                    let session_id = prompt.session_id.clone();
+                    let request_id = prompt.request.id.clone();
+                    self.popup = Popup::None;
+                    UiAction::ElicitationReply {
+                        session_id,
+                        request_id,
+                        reply,
+                    }
+                }
+                super::elicitation::ReviewOutcome::None => UiAction::None,
+            },
+        }
     }
 
     /// Keys while the confirmation popup is open (`c` cancel / `C` cancel root /

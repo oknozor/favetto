@@ -35,6 +35,7 @@ use crate::components;
 use crate::detail::{
     self, DetailTab, FeedItem, OutputText, PendingRequest, TaskDetail, ToolStatus,
 };
+use crate::elicitation::ElicitationStage;
 use crate::inbox::{self, StatusKind};
 use crate::layout::{container_query, LayoutMode};
 use crate::markdown::syntax::{self, TokenKind};
@@ -2091,6 +2092,10 @@ impl Render for DetailView {
                 .is_some_and(|detail| detail.reply_in_flight(request.request_id.as_deref()));
             self.banner(theme, request, in_flight, cx)
         });
+        let elicitation = self.state.read(cx).detail_elicitation().cloned();
+        let elicitation_modal = elicitation
+            .as_ref()
+            .map(|form| self.elicitation_modal(theme, form, cx));
         let tabs = self.tabs(theme, tab, new_events, follow, cx);
         let current_attempt = task.attempt;
 
@@ -2202,10 +2207,230 @@ impl Render for DetailView {
             .when_some(banner, |detail, banner| detail.child(banner))
             .child(tabs)
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))
+            .when_some(elicitation_modal, |detail, modal| detail.child(modal))
     }
 }
 
 impl DetailView {
+    /// The accessible ACP form modal: agent identity, labelled controls, review
+    /// and explicit submit/decline/cancel actions.
+    fn elicitation_modal(
+        &self,
+        theme: &Theme,
+        form: &crate::elicitation::ElicitationFormState,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut panel = div()
+            .w(px(620.0))
+            .max_h(px(620.0))
+            .flex()
+            .flex_col()
+            .gap(px(theme.spacing.s2))
+            .p(px(theme.spacing.s3))
+            .rounded(px(theme.radii.r8))
+            .border_1()
+            .border_color(theme.colors.border)
+            .bg(theme.colors.surface);
+        panel = panel
+            .child(components::section_label(theme, "AGENT FORM"))
+            .child(
+                div()
+                    .text_size(px(theme.font.sm))
+                    .text_color(theme.colors.text)
+                    .child(format!("requested by {}", form.request.agent)),
+            )
+            .child(
+                div()
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.muted)
+                    .child(form.request.message.clone()),
+            );
+        if let Some(title) = &form.request.form.title {
+            panel = panel.child(
+                div()
+                    .text_size(px(theme.font.sm))
+                    .text_color(theme.colors.text)
+                    .child(title.clone()),
+            );
+        }
+        if let Some(description) = &form.request.form.description {
+            panel = panel.child(
+                div()
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.muted)
+                    .child(description.clone()),
+            );
+        }
+
+        match form.stage {
+            ElicitationStage::Editing => {
+                for (index, field) in form.fields().iter().enumerate() {
+                    let selected = index == form.current;
+                    let mut row = div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .p(px(theme.spacing.s1))
+                        .rounded(px(theme.radii.r4))
+                        .when(selected, |row| {
+                            row.border_1()
+                                .border_color(theme.colors.accent)
+                                .bg(Hsla::from(theme.colors.accent).opacity(0.08))
+                        });
+                    row = row.child(
+                        div()
+                            .text_size(px(theme.font.xs))
+                            .text_color(if selected {
+                                theme.colors.accent
+                            } else {
+                                theme.colors.muted
+                            })
+                            .child(format!(
+                                "{}{}",
+                                crate::elicitation::ElicitationFormState::field_label(field),
+                                if field.required { " *" } else { "" }
+                            )),
+                    );
+                    if let Some(description) = &field.description {
+                        row = row.child(
+                            div()
+                                .text_size(px(theme.font.xs))
+                                .text_color(theme.colors.muted)
+                                .child(description.clone()),
+                        );
+                    }
+                    row = row.child(
+                        div()
+                            .text_size(px(theme.font.sm))
+                            .text_color(theme.colors.text)
+                            .child(form.display_value(index)),
+                    );
+                    panel = panel.child(row);
+                }
+            }
+            ElicitationStage::Review => {
+                panel = panel.child(
+                    div()
+                        .text_size(px(theme.font.sm))
+                        .text_color(theme.colors.text)
+                        .child("Review before sending"),
+                );
+                for (index, field) in form.fields().iter().enumerate() {
+                    let label =
+                        crate::elicitation::ElicitationFormState::field_label(field).to_string();
+                    let value = form.display_value(index);
+                    panel = panel.child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .gap(px(theme.spacing.s2))
+                            .text_size(px(theme.font.xs))
+                            .child(div().text_color(theme.colors.muted).child(label))
+                            .child(div().text_color(theme.colors.text).child(value)),
+                    );
+                }
+            }
+        }
+        if let Some(error) = &form.error {
+            panel = panel.child(
+                div()
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.danger)
+                    .child(error.clone()),
+            );
+        }
+
+        let mut actions = div().flex().items_center().gap(px(theme.spacing.s2));
+        if form.stage == ElicitationStage::Review {
+            actions = actions.child(self.action_button(
+                theme,
+                "elicitation-submit",
+                "Submit",
+                false,
+                &self.reply_once_focus,
+                cx.listener(|this, _event, _window, cx| {
+                    this.state.update(cx, |state, cx| {
+                        state.elicitation_confirm(cx);
+                        cx.notify();
+                    });
+                }),
+            ));
+            actions = actions.child(self.action_button(
+                theme,
+                "elicitation-decline",
+                "Decline",
+                true,
+                &self.reply_reject_focus,
+                cx.listener(|this, _event, _window, cx| {
+                    this.state.update(cx, |state, cx| {
+                        state.elicitation_decline(cx);
+                        cx.notify();
+                    });
+                }),
+            ));
+            actions = actions.child(self.action_button(
+                theme,
+                "elicitation-edit",
+                "Edit",
+                false,
+                &self.reply_always_focus,
+                cx.listener(|this, _event, _window, cx| {
+                    this.state.update(cx, |state, cx| {
+                        state.elicitation_edit();
+                        cx.notify();
+                    });
+                }),
+            ));
+        } else {
+            actions = actions.child(self.action_button(
+                theme,
+                "elicitation-review",
+                "Review",
+                false,
+                &self.reply_once_focus,
+                cx.listener(|this, _event, _window, cx| {
+                    this.state.update(cx, |state, cx| {
+                        state.elicitation_confirm(cx);
+                        cx.notify();
+                    });
+                }),
+            ));
+        }
+        actions = actions.child(self.action_button(
+            theme,
+            "elicitation-cancel",
+            "Cancel",
+            true,
+            &self.cancel_focus,
+            cx.listener(|this, _event, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.elicitation_cancel(cx);
+                    cx.notify();
+                });
+            }),
+        ));
+        panel = panel.child(
+            div()
+                .text_size(px(theme.font.xs))
+                .text_color(theme.colors.muted)
+                .child(
+                    "Tab/arrows move · Enter validates/reviews · Esc cancels. Values are sent only \
+                     to the agent.",
+                ),
+        );
+        panel = panel.child(actions);
+
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(Hsla::from(theme.colors.bg).opacity(0.86))
+            .child(panel)
+            .into_any_element()
+    }
+
     /// The title strip shown before a run is selected.
     fn plain_route_header(&self, theme: &Theme, narrow: bool, cx: &mut Context<Self>) -> Div {
         div()
@@ -2546,6 +2771,43 @@ fn feed_item(theme: &Theme, base: &TextStyle, index: usize, row: &FeedRow) -> Di
                     .child(format!(
                         "{} · {}",
                         if *resolved { "answered" } else { "waiting" },
+                        request.message
+                    )),
+            ),
+        FeedItem::Elicitation { request, resolved } => div()
+            .flex()
+            .items_start()
+            .gap(px(theme.spacing.s1))
+            .px(px(theme.spacing.s2))
+            .py(px(theme.spacing.s1))
+            .rounded(px(theme.radii.r4))
+            .border_1()
+            .border_color(Hsla::from(theme.colors.accent).opacity(0.4))
+            .bg(Hsla::from(theme.colors.accent).opacity(0.08))
+            .child(
+                div()
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.accent)
+                    .child(if *resolved { "✓" } else { "▤" }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(theme.font.xs))
+                    .text_color(if *resolved {
+                        theme.colors.muted
+                    } else {
+                        theme.colors.text
+                    })
+                    .child(format!(
+                        "{} · {} · {}",
+                        request.agent,
+                        if *resolved {
+                            "answered"
+                        } else {
+                            "form requested"
+                        },
                         request.message
                     )),
             ),
