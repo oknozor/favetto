@@ -47,7 +47,7 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | `events.subscribe` | (Re)subscribe to the live event stream; accepts `last_event_id` to replay missed events before switching to live delivery. |
 | `agents.list` | List configured external agents and live agent sessions, including each agent's `available` flag and capability flags. |
 | `agents.history` | List the durable ACP sessions Favetto created, by Favetto-local id, with title, working directory, timestamps, lifecycle and loadability. Never lists sessions created outside Favetto. |
-| `agents.start` | Start an external agent session (optionally attached to a task). |
+| `agents.start` | Start an external agent session, or attach to the task's existing live session. `new` forces a fresh session. |
 | `agents.load` | Load a persisted ACP session by its Favetto-local id (`session_id`). The provider's ACP id is resolved from the durable record; an unsupported or failed restore is an error and never starts a fresh session. |
 | `agents.prompt` | Send a follow-up prompt to a structured (ACP) agent session. |
 | `agents.cancel` | Interrupt the in-flight turn of a structured (ACP) agent session. |
@@ -584,7 +584,7 @@ AgentSessionHistoryEntry[]
 
 ### `agents.start`
 
-Start an external agent session (optionally attached to a task).
+Start an external agent session, or attach to the task's existing live session. `new` forces a fresh session.
 
 **Request**
 
