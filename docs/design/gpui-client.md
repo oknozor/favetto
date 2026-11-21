@@ -39,7 +39,8 @@ the desktop app without relearning the product.
   visual boundary. The detail column belongs to the run lists (Inbox and Tasks);
   Catalog, Workflows, Schedules and Settings use the full width. On narrow
   windows the detail becomes a pushed page instead of a third column (GPUI
-  `container_query`).
+  `container_query`); on wide windows the detail/list boundary is a resizable
+  divider, session-scoped and clamped.
 - **One primary action per view** (**Hick's Law**, **Choice Overload**). Inbox
   rows: *open*. Task detail: *answer permission* when blocked, otherwise
   *cancel/retry*. Everything else lives behind the command palette or a menu.
