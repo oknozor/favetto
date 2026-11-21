@@ -92,6 +92,11 @@ pinned while the tab body scrolls:
 - **Runs** is the `tasks.runs` attempt table: attempt, status, exit code,
   duration and usage.
 
+On wide windows, the detail column's left edge is an invisible 8 px resize
+handle with a column-resize cursor. Dragging it clamps the width to 280–720 px
+and to the space left by the sidebar and a 360 px working-list floor. The width
+lasts for the session; the narrow pushed page is unchanged.
+
 A blocked run pins a warning banner with the request message and its options;
 **Allow once**, **Always allow** (when the agent offers it) and **Reject** map to
 `agents.reply` and are disabled while the correlated reply is in flight. A
@@ -263,7 +268,7 @@ field blank keeps the shared token file.
 - `src/palette.rs` — pure command-palette model: fuzzy filtering, wrapping
   selection, recents and command execution kinds (unit-tested without a window).
 - `src/layout.rs` — the responsive breakpoint helper (the container-query
-  equivalent for this GPUI version).
+  equivalent for this GPUI version) and the detail-width clamp helper.
 - `src/motion.rs` — OS reduced-motion detection (GTK settings plus
   `FAVETTO_REDUCE_MOTION`/`GTK_ENABLE_ANIMATIONS`). The only decorative motion
   is the toast fade; everything else changes state immediately.

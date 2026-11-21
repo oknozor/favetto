@@ -12,7 +12,7 @@
 
 use gpui::{
     div, prelude::*, px, Animation, AnimationExt, AnyElement, Context, Div, Entity, FocusHandle,
-    Hsla, IntoElement, Render, Stateful, Window,
+    Hsla, IntoElement, MouseButton, Render, Stateful, Window,
 };
 
 use crate::actions::{
@@ -29,13 +29,15 @@ use crate::actions::{
 };
 use crate::catalog::OneShotFocus;
 use crate::components;
-use crate::layout::{container_query, LayoutMode};
+use crate::layout::{clamp_detail_width, container_query, LayoutMode};
 use crate::palette::{CommandKind, CommandPalette};
 use crate::routes::Route;
 use crate::schedules::ScheduleField;
 use crate::state::{ClientState, TaskConfirm, Toast, ToastKind};
 use crate::tasks::TaskAction;
-use crate::theme::{Theme, DETAIL_WIDTH, SIDEBAR_WIDTH, STATUS_BAR_HEIGHT, TOP_BAR_HEIGHT};
+use crate::theme::{
+    Theme, DETAIL_RESIZE_HANDLE, DETAIL_WIDTH, SIDEBAR_WIDTH, STATUS_BAR_HEIGHT, TOP_BAR_HEIGHT,
+};
 use crate::views::{
     CatalogView, DetailView, InboxView, SchedulesView, SettingsView, TasksView, WorkflowsView,
 };
@@ -47,6 +49,28 @@ enum ListJump {
     End,
     PageUp,
     PageDown,
+}
+
+/// Pointer and width captured when a detail-resize drag starts.
+#[derive(Clone, Copy)]
+struct DetailResizeStart {
+    pointer_x: f32,
+    width: f32,
+}
+
+/// Marker payload for the detail-resize drag; no data is needed because the
+/// start state lives in `DetailResizeStart`.
+#[derive(Clone, Copy)]
+struct DetailResizeDrag;
+
+/// Zero-sized drag preview. `on_drag` requires a view to render while dragging;
+/// a resize has no ghost, so this renders nothing.
+struct DetailResizePreview;
+
+impl Render for DetailResizePreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().w(px(0.0)).h(px(0.0))
+    }
 }
 
 /// The route entities, created once with the shell.
@@ -79,6 +103,8 @@ pub struct RootView {
     confirm_copy_focus: FocusHandle,
     toast_copy_focus: FocusHandle,
     shortcuts_close_focus: FocusHandle,
+    detail_width: f32,
+    detail_resize: Option<DetailResizeStart>,
 }
 
 /// The full-window frame every route lives in.
@@ -151,6 +177,8 @@ impl RootView {
             confirm_copy_focus,
             toast_copy_focus,
             shortcuts_close_focus,
+            detail_width: DETAIL_WIDTH,
+            detail_resize: None,
         }
     }
 
@@ -1728,6 +1756,60 @@ impl RootView {
                 .into_any_element()
         }
     }
+
+    /// The invisible 8 px hit area on the detail column's left border. Drag
+    /// moves are handled by `on_drag_move` so the width keeps following the
+    /// pointer after it leaves the handle.
+    fn detail_resize_handle(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("detail-resize")
+            .absolute()
+            .left(px(-(DETAIL_RESIZE_HANDLE / 2.0)))
+            .top_0()
+            .h_full()
+            .w(px(DETAIL_RESIZE_HANDLE))
+            .cursor_col_resize()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseDownEvent, _window, _cx| {
+                    this.detail_resize = Some(DetailResizeStart {
+                        pointer_x: f32::from(event.position.x),
+                        width: this.detail_width,
+                    });
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, _cx| {
+                    this.detail_resize = None;
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, _cx| {
+                    this.detail_resize = None;
+                }),
+            )
+            .on_drag(DetailResizeDrag, |_drag, _offset, _window, cx| {
+                cx.new(|_| DetailResizePreview)
+            })
+            .on_drag_move::<DetailResizeDrag>(cx.listener(
+                |this, event: &gpui::DragMoveEvent<DetailResizeDrag>, window, cx| {
+                    let Some(start) = this.detail_resize else {
+                        return;
+                    };
+                    let pointer_x = f32::from(event.event.position.x);
+                    let desired = start.width + (start.pointer_x - pointer_x);
+                    let viewport_width = f32::from(window.viewport_size().width);
+                    let width = clamp_detail_width(desired, viewport_width);
+                    if width != this.detail_width {
+                        this.detail_width = width;
+                        cx.notify();
+                    }
+                },
+            ))
+            .into_any_element()
+    }
 }
 
 /// A tiny hint in the confirmation footer (kept out of the title row so the
@@ -1759,6 +1841,14 @@ impl Render for RootView {
         let theme = self.state.read(cx).theme(window.appearance());
         let mode = container_query(window.viewport_size().width);
         let route = self.state.read(cx).active_route();
+        let viewport_width = f32::from(window.viewport_size().width);
+        let detail_width = if mode == LayoutMode::Wide {
+            let clamped = clamp_detail_width(self.detail_width, viewport_width);
+            self.detail_width = clamped;
+            clamped
+        } else {
+            self.detail_width
+        };
         // Only the run lists have a detail page to push or a column to fill.
         let detail_open = self.state.read(cx).is_detail_open() && route.shows_detail();
         let palette_open = self.palette.is_open();
@@ -1792,11 +1882,13 @@ impl Render for RootView {
                 .when(route.shows_detail(), |body| {
                     body.child(
                         div()
-                            .w(px(DETAIL_WIDTH))
+                            .relative()
+                            .w(px(detail_width))
                             .flex_shrink_0()
                             .border_l_1()
                             .border_color(theme.colors.border)
-                            .child(detail),
+                            .child(detail)
+                            .child(self.detail_resize_handle(cx)),
                     )
                 }),
         };
