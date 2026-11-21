@@ -19,8 +19,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use favetto_wire::model::{
-    AgentSessionInfo, AgentStateEvent, AgentUsage, AwaitingInputKind, ContentRole, IdleOutcome,
-    InputRequest, MessageContent, MessageRole, RunStatus, Task, TaskRun, TaskStatus,
+    AgentCommand, AgentPlanEntry, AgentSessionInfo, AgentStateEvent, AgentUsage, AwaitingInputKind,
+    ContentRole, IdleOutcome, InputRequest, MessageContent, MessageRole, RunStatus, Task, TaskRun,
+    TaskStatus,
 };
 use favetto_wire::rpc::{AgentEventPush, RpcCall, TasksEventsParams};
 use serde::{Deserialize, Serialize};
@@ -431,10 +432,9 @@ pub fn build_feed(events: &[AgentEventPush]) -> Vec<FeedItem> {
                     }
                 }
             }
-            AgentStateEvent::Usage { usage, .. } => {
-                items.push(FeedItem::Usage(usage.clone()))
-            }
+            AgentStateEvent::Usage { usage, .. } => items.push(FeedItem::Usage(usage.clone())),
             AgentStateEvent::Title { title } => items.push(FeedItem::Title(title.clone())),
+            AgentStateEvent::Plan { .. } | AgentStateEvent::AvailableCommands { .. } => {}
             AgentStateEvent::Idle { outcome } => {
                 for index in pending_inputs.drain().map(|(_, index)| index) {
                     if let FeedItem::InputRequest { resolved, .. } = &mut items[index] {
@@ -606,6 +606,20 @@ pub struct TaskDetail {
     pub turn_cancel_pending: Option<String>,
     /// The request id most recently answered, hidden until a new request arrives.
     pub answered_request: Option<String>,
+    /// The current execution plan snapshot from `tasks.events`/live updates.
+    pub plan: Option<Vec<AgentPlanEntry>>,
+    /// The current advertised command snapshot.
+    pub commands: Option<Vec<AgentCommand>>,
+    /// The follow-up prompt draft.
+    pub prompt: String,
+    /// The highlighted command completion in the prompt.
+    pub prompt_selected: Option<usize>,
+    /// Whether an `agents.prompt` is in flight.
+    pub prompt_sending: bool,
+    /// Whether the follow-up composer is open and owns the keyboard.
+    pub prompt_open: bool,
+    /// The last prompt-send failure.
+    pub prompt_error: Option<String>,
 }
 
 impl TaskDetail {
@@ -634,6 +648,13 @@ impl TaskDetail {
             reply_pending: None,
             turn_cancel_pending: None,
             answered_request: None,
+            plan: None,
+            commands: None,
+            prompt: String::new(),
+            prompt_selected: None,
+            prompt_sending: false,
+            prompt_open: false,
+            prompt_error: None,
         }
     }
 
@@ -675,6 +696,13 @@ impl TaskDetail {
             self.answered_request = None;
             self.reply_pending = None;
             self.turn_cancel_pending = None;
+            self.plan = None;
+            self.commands = None;
+            self.prompt.clear();
+            self.prompt_selected = None;
+            self.prompt_sending = false;
+            self.prompt_open = false;
+            self.prompt_error = None;
         } else if task.output.is_none() {
             if let Some(existing) = &self.task {
                 task.output = existing.output.clone();
@@ -696,6 +724,8 @@ impl TaskDetail {
         session_id: Option<String>,
         events: Vec<AgentEventPush>,
         next_cursor: u64,
+        plan: Option<Vec<AgentPlanEntry>>,
+        commands: Option<Vec<AgentCommand>>,
         ignored: usize,
     ) {
         let mut merged: HashMap<(String, u64), AgentEventPush> = HashMap::new();
@@ -713,6 +743,43 @@ impl TaskDetail {
         }
         let mut events: Vec<AgentEventPush> = merged.into_values().collect();
         events.sort_by_key(|event| (event.seq, event.session_id.clone()));
+
+        // The snapshot is the state at `next_cursor`. Replay only later live
+        // events so a plan clearing event trimmed from the retained feed cannot
+        // be undone by an older plan event that is still in the window. When an
+        // older daemon omits the snapshot, derive it from the whole window.
+        let mut live_plan = plan;
+        let mut live_commands = commands;
+        for event in &events {
+            match &event.event {
+                AgentStateEvent::Plan { entries } if event.seq > next_cursor => {
+                    live_plan = Some(entries.clone());
+                }
+                AgentStateEvent::AvailableCommands { commands } if event.seq > next_cursor => {
+                    live_commands = Some(commands.clone());
+                }
+                _ => {}
+            }
+        }
+        // An older daemon omits the snapshot fields; derive them from the whole
+        // retained window instead.
+        if live_plan.is_none() {
+            for event in &events {
+                if let AgentStateEvent::Plan { entries } = &event.event {
+                    live_plan = Some(entries.clone());
+                }
+            }
+        }
+        if live_commands.is_none() {
+            for event in &events {
+                if let AgentStateEvent::AvailableCommands { commands } = &event.event {
+                    live_commands = Some(commands.clone());
+                }
+            }
+        }
+        self.plan = live_plan;
+        self.commands = live_commands;
+
         self.events = events;
         self.trim_events();
         self.events_revision = self.events_revision.wrapping_add(1);
@@ -746,6 +813,13 @@ impl TaskDetail {
         self.events_cursor = self.events_cursor.max(push.seq);
         if self.events_session.is_none() {
             self.events_session = Some(push.session_id.clone());
+        }
+        match &push.event {
+            AgentStateEvent::Plan { entries } => self.plan = Some(entries.clone()),
+            AgentStateEvent::AvailableCommands { commands } => {
+                self.commands = Some(commands.clone())
+            }
+            _ => {}
         }
         self.events.push(push);
         // The daemon sends live events in order, but a reconnect can replay a
@@ -900,6 +974,101 @@ impl TaskDetail {
             _ => false,
         }
     }
+
+    /// The current plan, falling back to the last matching event for payloads
+    /// from a daemon that predates the explicit snapshot field.
+    pub fn plan(&self) -> Vec<AgentPlanEntry> {
+        if let Some(plan) = &self.plan {
+            return plan.clone();
+        }
+        self.events
+            .iter()
+            .rev()
+            .find_map(|push| match &push.event {
+                AgentStateEvent::Plan { entries } => Some(entries.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// The current advertised commands, with the same event fallback as
+    /// [`Self::plan`].
+    pub fn commands(&self) -> Vec<AgentCommand> {
+        if let Some(commands) = &self.commands {
+            return commands.clone();
+        }
+        self.events
+            .iter()
+            .rev()
+            .find_map(|push| match &push.event {
+                AgentStateEvent::AvailableCommands { commands } => Some(commands.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// The `/prefix` currently being completed, only for a bare first token.
+    pub fn command_query(&self) -> Option<&str> {
+        let rest = self.prompt.strip_prefix('/')?;
+        if rest.chars().any(char::is_whitespace) {
+            return None;
+        }
+        Some(rest)
+    }
+
+    /// Advertised commands matching the current query, in advertised order.
+    pub fn command_matches(&self) -> Vec<&AgentCommand> {
+        let Some(query) = self.command_query() else {
+            return Vec::new();
+        };
+        let Some(commands) = &self.commands else {
+            return Vec::new();
+        };
+        commands
+            .iter()
+            .filter(|command| command.name.starts_with(query))
+            .collect()
+    }
+
+    /// Move the highlighted completion by `delta`, clamped to the matches.
+    pub fn move_command(&mut self, delta: isize) -> bool {
+        let count = self.command_matches().len();
+        if count == 0 {
+            self.prompt_selected = None;
+            return false;
+        }
+        let current = self.prompt_selected.unwrap_or(0).min(count - 1);
+        let next = (current as isize + delta).clamp(0, count as isize - 1);
+        self.prompt_selected = Some(next as usize);
+        true
+    }
+
+    /// Accept the highlighted (or first) command into the draft. Only an
+    /// explicit accept rewrites the prompt; unknown text is never altered.
+    pub fn complete_command(&mut self) -> bool {
+        let name = self
+            .command_matches()
+            .get(self.prompt_selected.unwrap_or(0))
+            .map(|command| command.name.clone());
+        let Some(name) = name else {
+            return false;
+        };
+        self.prompt = format!("/{name} ");
+        self.prompt_selected = None;
+        true
+    }
+
+    /// The exact matched command's input hint, when present.
+    #[allow(dead_code)] // Kept on the pure model for parity with the TUI; the view reads it inline.
+    pub fn command_hint(&self) -> Option<&str> {
+        let rest = self.prompt.strip_prefix('/')?;
+        let name = rest.split_whitespace().next().unwrap_or_default();
+        self.commands
+            .as_ref()?
+            .iter()
+            .find(|command| command.name == name)
+            .and_then(|command| command.input_hint.as_deref())
+    }
 }
 
 /// A `tasks.events` result that skips event kinds this client does not know.
@@ -916,6 +1085,10 @@ pub struct DetailEventsResult {
     pub events: Vec<AgentEventPush>,
     /// The daemon's backfill cursor.
     pub next_cursor: u64,
+    /// The session's current plan at `next_cursor`, when the daemon sent one.
+    pub plan: Option<Vec<AgentPlanEntry>>,
+    /// The session's current advertised commands at `next_cursor`.
+    pub commands: Option<Vec<AgentCommand>>,
     /// How many events were skipped because their kind is unknown.
     pub ignored: usize,
 }
@@ -933,6 +1106,10 @@ impl<'de> Deserialize<'de> for DetailEventsResult {
             events: Vec<serde_json::Value>,
             #[serde(default)]
             next_cursor: u64,
+            #[serde(default)]
+            plan: Option<Vec<AgentPlanEntry>>,
+            #[serde(default)]
+            commands: Option<Vec<AgentCommand>>,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -948,6 +1125,8 @@ impl<'de> Deserialize<'de> for DetailEventsResult {
             session_id: raw.session_id,
             events,
             next_cursor: raw.next_cursor,
+            plan: raw.plan,
+            commands: raw.commands,
             ignored,
         })
     }
@@ -1245,6 +1424,8 @@ mod tests {
                 text(3, MessageRole::Assistant, "durable"),
             ],
             3,
+            None,
+            None,
             2,
         );
         assert_eq!(detail.events.len(), 2);
@@ -1259,6 +1440,152 @@ mod tests {
         assert_eq!(detail.events_ignored, 2);
         assert!(detail.events_loaded);
         assert!(detail.events_error.is_none());
+    }
+
+    #[test]
+    fn merge_events_applies_the_snapshot_then_only_later_live_events() {
+        let mut detail = TaskDetail::new(Uuid::from_u128(7));
+        let old = push(
+            2,
+            AgentStateEvent::Plan {
+                entries: vec![AgentPlanEntry {
+                    content: "old".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        // The daemon's snapshot is already cleared at next_cursor, so an older
+        // plan event still in the retained window must not resurrect it.
+        detail.push_event(push(
+            10,
+            AgentStateEvent::TextDelta {
+                role: MessageRole::Assistant,
+                text: "after".to_string(),
+            },
+        ));
+        detail.merge_events(
+            Some("ses_1".to_string()),
+            vec![old.clone()],
+            8,
+            Some(Vec::new()),
+            Some(Vec::new()),
+            0,
+        );
+        assert!(detail.plan().is_empty());
+
+        // A later live plan (seq > next_cursor) beats the older snapshot.
+        let mut detail = TaskDetail::new(Uuid::from_u128(7));
+        detail.push_event(old);
+        detail.push_event(push(
+            12,
+            AgentStateEvent::Plan {
+                entries: vec![AgentPlanEntry {
+                    content: "live".to_string(),
+                    ..Default::default()
+                }],
+            },
+        ));
+        detail.merge_events(
+            Some("ses_1".to_string()),
+            Vec::new(),
+            8,
+            Some(vec![AgentPlanEntry {
+                content: "snapshot".to_string(),
+                ..Default::default()
+            }]),
+            None,
+            0,
+        );
+        assert_eq!(detail.plan()[0].content, "live");
+    }
+
+    #[test]
+    fn plan_and_command_updates_replace_whole_lists() {
+        let mut detail = TaskDetail::new(Uuid::from_u128(7));
+        detail.push_event(push(
+            1,
+            AgentStateEvent::Plan {
+                entries: vec![AgentPlanEntry {
+                    content: "first".to_string(),
+                    ..Default::default()
+                }],
+            },
+        ));
+        detail.push_event(push(
+            2,
+            AgentStateEvent::Plan {
+                entries: vec![
+                    AgentPlanEntry {
+                        content: "second".to_string(),
+                        ..Default::default()
+                    },
+                    AgentPlanEntry {
+                        content: "third".to_string(),
+                        ..Default::default()
+                    },
+                ],
+            },
+        ));
+        assert_eq!(detail.plan().len(), 2);
+        assert_eq!(detail.plan()[0].content, "second");
+
+        detail.push_event(push(
+            3,
+            AgentStateEvent::AvailableCommands {
+                commands: vec![AgentCommand {
+                    name: "web".to_string(),
+                    description: "Search".to_string(),
+                    input_hint: Some("query".to_string()),
+                }],
+            },
+        ));
+        assert_eq!(detail.commands().len(), 1);
+        detail.push_event(push(
+            4,
+            AgentStateEvent::AvailableCommands {
+                commands: Vec::new(),
+            },
+        ));
+        assert!(detail.commands().is_empty(), "an empty list clears");
+    }
+
+    #[test]
+    fn command_completion_is_explicit_and_never_rewrites_unknown_text() {
+        let mut detail = TaskDetail::new(Uuid::from_u128(7));
+        detail.commands = Some(vec![
+            AgentCommand {
+                name: "web".to_string(),
+                description: "Search".to_string(),
+                input_hint: Some("query".to_string()),
+            },
+            AgentCommand {
+                name: "test".to_string(),
+                description: "Run tests".to_string(),
+                input_hint: None,
+            },
+        ]);
+
+        detail.prompt = "/w".to_string();
+        assert_eq!(detail.command_query(), Some("w"));
+        assert_eq!(detail.command_matches().len(), 1);
+        assert!(detail.complete_command());
+        assert_eq!(detail.prompt, "/web ");
+        assert_eq!(detail.command_hint(), Some("query"));
+
+        detail.prompt = "/nope arg".to_string();
+        assert!(!detail.complete_command());
+        assert_eq!(
+            detail.prompt, "/nope arg",
+            "unknown commands stay ordinary prompt text"
+        );
+
+        detail.prompt = "/t".to_string();
+        assert!(detail.complete_command());
+        assert_eq!(detail.prompt, "/test ");
+        detail.prompt.push('x');
+        detail.prompt_selected = Some(0);
+        detail.prompt.pop();
+        assert_eq!(detail.prompt, "/test ");
     }
 
     #[test]

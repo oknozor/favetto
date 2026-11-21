@@ -1720,6 +1720,73 @@ fn agent_tab_renders_acp_messages_thinking_and_tool_cards() {
 }
 
 #[test]
+fn agent_tab_renders_the_plan_checklist_and_command_composer() {
+    use favetto_core::model::{
+        AgentCommand, AgentPlanEntry, AgentPlanPriority, AgentPlanStatus, AgentStateEvent,
+    };
+
+    let mut app = App::new();
+    app.tab = Tab::Agent;
+    app.open_agent(session("s1", "opencode", false, true), b"");
+    app.agent_event(
+        "s1",
+        &AgentStateEvent::Plan {
+            entries: vec![
+                AgentPlanEntry {
+                    content: "Read the issue".to_string(),
+                    priority: AgentPlanPriority::High,
+                    status: AgentPlanStatus::Completed,
+                },
+                AgentPlanEntry {
+                    content: "Write the fix".to_string(),
+                    priority: AgentPlanPriority::Medium,
+                    status: AgentPlanStatus::InProgress,
+                },
+                AgentPlanEntry {
+                    content: "Run tests".to_string(),
+                    priority: AgentPlanPriority::Low,
+                    status: AgentPlanStatus::Pending,
+                },
+            ],
+        },
+    );
+    app.agent_event(
+        "s1",
+        &AgentStateEvent::AvailableCommands {
+            commands: vec![
+                AgentCommand {
+                    name: "web".to_string(),
+                    description: "Search the web".to_string(),
+                    input_hint: Some("query".to_string()),
+                },
+                AgentCommand {
+                    name: "test".to_string(),
+                    description: "Run tests".to_string(),
+                    input_hint: None,
+                },
+            ],
+        },
+    );
+    app.agent_prompt = "/web".to_string();
+
+    let text = render_text(&mut app, 100, 32);
+    assert!(text.contains("Plan · 1/3"), "plan header missing: {text:?}");
+    assert!(text.contains("[x] Read the issue"), "completed row missing");
+    assert!(text.contains("(!)"), "high priority marker missing");
+    assert!(
+        text.contains("[>] Write the fix"),
+        "in-progress row missing"
+    );
+    assert!(text.contains("[ ] Run tests"), "pending row missing");
+    assert!(text.contains("/web"), "command completion missing");
+    assert!(
+        text.contains("Search the web"),
+        "command description missing"
+    );
+    assert!(text.contains("query"), "input hint missing");
+}
+
+#[test]
 fn agent_feed_keyboard_selection_is_visible_without_colour() {
     use favetto_core::model::AgentStateEvent;
 

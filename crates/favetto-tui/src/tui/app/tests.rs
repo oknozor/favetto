@@ -1,8 +1,8 @@
 use super::*;
 use chrono::Utc;
 use favetto_core::model::{
-    AgentActivity, AgentUsage, AwaitingInputKind, EventKind, Failure, FailureKind, InputReply,
-    InputRequest, TaskStatus,
+    AgentActivity, AgentCommand, AgentPlanEntry, AgentPlanPriority, AgentPlanStatus, AgentUsage,
+    AwaitingInputKind, EventKind, Failure, FailureKind, InputReply, InputRequest, TaskStatus,
 };
 use favetto_core::rpc::AgentEventPush;
 
@@ -476,6 +476,117 @@ fn acp_feed_folds_the_selected_tool_from_the_keyboard() {
     );
     assert_eq!(app.agent_feed.tool_expanded("call-1"), Some(true));
     assert_eq!(app.agent_feed.len(), 1, "no duplicate card on finish");
+}
+
+#[test]
+fn acp_plan_and_commands_replace_state_not_feed_rows() {
+    let mut app = App::new();
+    app.open_agent(agent_session("s1", false, true, false), b"");
+    app.agent_event(
+        "s1",
+        &AgentStateEvent::Plan {
+            entries: vec![AgentPlanEntry {
+                content: "first".to_string(),
+                priority: AgentPlanPriority::High,
+                status: AgentPlanStatus::Completed,
+            }],
+        },
+    );
+    app.agent_event(
+        "s1",
+        &AgentStateEvent::Plan {
+            entries: vec![
+                AgentPlanEntry {
+                    content: "second".to_string(),
+                    priority: AgentPlanPriority::Medium,
+                    status: AgentPlanStatus::InProgress,
+                },
+                AgentPlanEntry {
+                    content: "third".to_string(),
+                    priority: AgentPlanPriority::Low,
+                    status: AgentPlanStatus::Pending,
+                },
+            ],
+        },
+    );
+    assert_eq!(app.agent_plan.len(), 2, "a plan update replaces the list");
+    assert_eq!(app.agent_plan[0].content, "second");
+    assert_eq!(app.agent_feed.len(), 0, "plans are state, not feed rows");
+
+    app.agent_event(
+        "s1",
+        &AgentStateEvent::AvailableCommands {
+            commands: vec![command("web", Some("query")), command("test", None)],
+        },
+    );
+    assert_eq!(app.agent_commands.len(), 2);
+    app.agent_event(
+        "s1",
+        &AgentStateEvent::AvailableCommands {
+            commands: Vec::new(),
+        },
+    );
+    assert!(app.agent_commands.is_empty());
+    assert_eq!(app.agent_feed.len(), 0);
+}
+
+#[test]
+fn acp_command_completion_filters_completes_and_keeps_unknown_text() {
+    let mut app = App::new();
+    app.open_agent(agent_session("s1", false, true, false), b"");
+    app.agent_commands = vec![command("web", Some("query")), command("test", None)];
+
+    app.agent_prompt = "/w".to_string();
+    assert_eq!(app.agent_command_query(), Some("w"));
+    assert_eq!(app.agent_command_matches().len(), 1);
+    assert!(app.complete_agent_command());
+    assert_eq!(app.agent_prompt, "/web ");
+    assert_eq!(app.agent_command_hint(), Some("query"));
+
+    app.agent_prompt = "/nope arg".to_string();
+    app.reset_agent_command_selection();
+    assert!(!app.complete_agent_command());
+    assert_eq!(
+        app.agent_prompt, "/nope arg",
+        "unknown commands remain ordinary prompt text"
+    );
+
+    app.agent_prompt = "/".to_string();
+    assert_eq!(app.agent_command_matches().len(), 2);
+    app.move_agent_command(1);
+    assert!(app.complete_agent_command());
+    assert_eq!(app.agent_prompt, "/test ");
+}
+
+#[test]
+fn acp_attach_seed_replaces_plan_and_commands() {
+    let mut app = App::new();
+    app.open_agent(agent_session("s1", false, true, false), b"");
+    app.seed_agent_plan(
+        vec![AgentPlanEntry {
+            content: "seed".to_string(),
+            ..Default::default()
+        }],
+        vec![command("web", None)],
+    );
+    assert_eq!(app.agent_plan[0].content, "seed");
+    assert_eq!(app.agent_commands[0].name, "web");
+
+    app.agent_event(
+        "s1",
+        &AgentStateEvent::Plan {
+            entries: Vec::new(),
+        },
+    );
+    assert!(app.agent_plan.is_empty(), "a later live event replaces it");
+}
+
+fn command(name: &str, hint: Option<&str>) -> AgentCommand {
+    AgentCommand {
+        name: name.to_string(),
+        description: format!("{name} command"),
+        input_hint: hint.map(str::to_string),
+    }
 }
 
 #[test]

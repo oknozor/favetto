@@ -131,6 +131,16 @@ actions!(
         SettingsSave,
         /// Test the draft connection (`⌘T` / `Ctrl+T`).
         SettingsTest,
+        /// Focus the task detail's follow-up prompt composer (`m`).
+        DetailReply,
+        /// Send the follow-up prompt (`↵` inside the composer).
+        DetailPromptSend,
+        /// Accept the highlighted slash-command completion (Tab).
+        DetailPromptComplete,
+        /// Move the command completion down (↓).
+        DetailPromptNext,
+        /// Move the command completion up (↑).
+        DetailPromptPrev,
         /// Refresh the connection and the current surface.
         Refresh,
         /// Restart the transport.
@@ -436,6 +446,39 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("tab", RepoPickerDown, Some("RepoPicker")),
         KeyBinding::new("shift-tab", RepoPickerUp, Some("RepoPicker")),
         KeyBinding::new("enter", RepoPickerConfirm, Some("RepoPicker")),
+        // Detail follow-up composer. `m` opens it from a detail-capable surface;
+        // the prompt-scoped bindings are registered last so they win over list
+        // navigation and generic Enter while the composer owns the keyboard.
+        KeyBinding::new(
+            "m",
+            DetailReply,
+            Some("Root && !Palette && !Shortcuts && !Search && !Confirm && !Sheet"),
+        ),
+        KeyBinding::new(
+            "enter",
+            DetailPromptSend,
+            Some("Root && DetailPrompt && !Palette && !Shortcuts"),
+        ),
+        KeyBinding::new(
+            "tab",
+            DetailPromptComplete,
+            Some("Root && DetailPrompt && !Palette && !Shortcuts"),
+        ),
+        KeyBinding::new(
+            "up",
+            DetailPromptPrev,
+            Some("Root && DetailPrompt && !Palette && !Shortcuts"),
+        ),
+        KeyBinding::new(
+            "down",
+            DetailPromptNext,
+            Some("Root && DetailPrompt && !Palette && !Shortcuts"),
+        ),
+        KeyBinding::new(
+            "escape",
+            CloseOverlay,
+            Some("Root && DetailPrompt && !Palette && !Shortcuts"),
+        ),
     ]
 }
 

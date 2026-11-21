@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::agent_state::{
-    AgentActivity, AgentStateEvent, AgentUsage, InputReply, UsagePeriod, UsageStats,
+    AgentActivity, AgentCommand, AgentPlanEntry, AgentStateEvent, AgentUsage, InputReply,
+    UsagePeriod, UsageStats,
 };
 use crate::model::{
     AgentCatalogEntry, AgentSessionHistoryEntry, AgentSessionInfo, Event, NotificationRecord,
@@ -144,6 +145,15 @@ pub struct TasksEventsResult {
     pub session_id: Option<String>,
     pub events: Vec<AgentEventPush>,
     pub next_cursor: u64,
+    /// The session's current plan at `next_cursor`, when it has one. `None`
+    /// means there is no structured session; `Some(empty)` means the agent
+    /// explicitly cleared the plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<Vec<AgentPlanEntry>>,
+    /// The session's current command list at `next_cursor`, with the same
+    /// `None`/empty distinction as [`Self::plan`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commands: Option<Vec<AgentCommand>>,
 }
 
 /// `tasks.cancel` result: the cancelled task, with `output` omitted.
@@ -486,6 +496,13 @@ pub struct AgentAttachResult {
     /// contains. Older payloads omit it and decode as `0`.
     #[serde(default)]
     pub seq: u64,
+    /// The session's current execution plan at [`Self::seq`]. Empty when the
+    /// agent has not reported one; an empty list is also a valid cleared plan.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plan: Vec<AgentPlanEntry>,
+    /// The session's current advertised slash commands at [`Self::seq`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<AgentCommand>,
 }
 
 /// `agents.prompt` params: a follow-up prompt for a structured (ACP) session.
@@ -1293,10 +1310,29 @@ mod tests {
             session_id: Some("sess-1".to_string()),
             events: vec![push],
             next_cursor: 3,
+            plan: Some(vec![AgentPlanEntry {
+                content: "step".to_string(),
+                ..Default::default()
+            }]),
+            commands: Some(vec![AgentCommand {
+                name: "web".to_string(),
+                description: "Search".to_string(),
+                input_hint: Some("query".to_string()),
+            }]),
         };
         let json = serde_json::to_value(&result).unwrap();
         let back: TasksEventsResult = serde_json::from_value(json).unwrap();
         assert_eq!(back, result);
+
+        // A legacy payload has no plan/commands fields and keeps the
+        // "no structured session" distinction.
+        let legacy: TasksEventsResult = serde_json::from_value(serde_json::json!({
+            "events": [],
+            "next_cursor": 0
+        }))
+        .unwrap();
+        assert_eq!(legacy.plan, None);
+        assert_eq!(legacy.commands, None);
 
         // `after`/`limit` accept missing or ill-typed values.
         let p: TasksEventsParams =
@@ -1324,16 +1360,31 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(legacy.seq, 0);
+        assert!(legacy.plan.is_empty());
+        assert!(legacy.commands.is_empty());
         assert_eq!(legacy.session.id, "s1");
 
         let current = AgentAttachResult {
             seq: 7,
+            plan: vec![AgentPlanEntry {
+                content: "step".to_string(),
+                ..Default::default()
+            }],
+            commands: vec![AgentCommand {
+                name: "test".to_string(),
+                description: "Run tests".to_string(),
+                input_hint: None,
+            }],
             ..legacy.clone()
         };
         let json = serde_json::to_value(&current).unwrap();
         assert_eq!(json["seq"], 7);
+        assert_eq!(json["plan"][0]["content"], "step");
+        assert_eq!(json["commands"][0]["name"], "test");
         let back: AgentAttachResult = serde_json::from_value(json).unwrap();
         assert_eq!(back.seq, 7);
+        assert_eq!(back.plan, current.plan);
+        assert_eq!(back.commands, current.commands);
         assert_eq!(back.session.load_state, crate::model::AgentLoadState::Ready);
     }
 

@@ -442,4 +442,6 @@ deterministically instead of relying on the agent's last-used default.
 
 Remaining follow-ups (tracked in the guide's "Current limitations"):
 `session/load` resume, a provider/model catalog for the UI picker, and richer
-plan/mode updates in the normalized event model.
+session modes plus identified/Markdown plan operations in the normalized event
+model. Baseline v1 plan checklists and advertised slash commands are already
+normalized and rendered in both clients.

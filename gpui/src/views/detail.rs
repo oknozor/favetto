@@ -18,7 +18,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use chrono::Utc;
-use favetto_wire::model::{AgentUsage, ContentRole, InputReply, MessageRole, Task, TaskRun};
+use favetto_wire::model::{
+    AgentCommand, AgentPlanEntry, AgentPlanStatus, AgentUsage, ContentRole, InputReply,
+    MessageRole, Task, TaskRun,
+};
 use gpui::{
     div, list, prelude::*, px, AnyElement, Context, Div, ElementId, Entity, FocusHandle, FontStyle,
     FontWeight, Hsla, InteractiveText, IntoElement, ListAlignment, ListState, Render, ScrollHandle,
@@ -1186,11 +1189,19 @@ impl DetailView {
             error: events_error,
             session,
             ignored,
+            plan,
+            commands,
+            prompt,
+            prompt_selected,
+            prompt_open,
+            prompt_sending,
+            prompt_error,
         } = data;
-        if loading && feed.is_empty() && !loaded {
+        let has_plan = !plan.is_empty();
+        if loading && feed.is_empty() && !loaded && !has_plan && !prompt_open {
             return self.loading(theme, "EVENTS");
         }
-        if feed.is_empty() && events_error.is_some() {
+        if feed.is_empty() && events_error.is_some() && !has_plan && !prompt_open {
             return self.error_body(
                 theme,
                 ErrorBody {
@@ -1209,7 +1220,7 @@ impl DetailView {
                 cx,
             );
         }
-        if feed.is_empty() {
+        if feed.is_empty() && !has_plan && !prompt_open {
             if ignored > 0 {
                 return self.empty_body(
                     theme,
@@ -1288,7 +1299,25 @@ impl DetailView {
             )
         });
 
+        let plan_card = has_plan.then(|| self.plan_card(theme, &plan));
+        let composer = prompt_open.then(|| {
+            self.prompt_composer(
+                theme,
+                PromptBody {
+                    commands: &commands,
+                    prompt: &prompt,
+                    selected: prompt_selected,
+                    sending: prompt_sending,
+                    error: prompt_error.as_deref(),
+                },
+                cx,
+            )
+        });
+
         let mut container = div().relative().flex_1().min_h_0().flex().flex_col();
+        if let Some(plan) = plan_card {
+            container = container.child(plan);
+        }
         if let Some(message) = events_error {
             container = container.child(
                 div()
@@ -1310,15 +1339,219 @@ impl DetailView {
                     )),
             );
         }
-        container.child(list).when_some(pill, |container, pill| {
-            container.child(
+        container
+            .child(list)
+            .when_some(pill, |container, pill| {
+                container.child(
+                    div()
+                        .absolute()
+                        .right(px(theme.spacing.s3))
+                        .bottom(px(theme.spacing.s3))
+                        .child(pill),
+                )
+            })
+            .when_some(composer, |container, composer| container.child(composer))
+    }
+
+    /// A compact plan card above the Events feed.
+    fn plan_card(&self, theme: &Theme, plan: &[AgentPlanEntry]) -> Div {
+        const MAX_PLAN_ROWS: usize = 12;
+        let completed = plan
+            .iter()
+            .filter(|entry| entry.status == AgentPlanStatus::Completed)
+            .count();
+        let mut card = div()
+            .mx(px(theme.spacing.s3))
+            .mt(px(theme.spacing.s2))
+            .p(px(theme.spacing.s2))
+            .rounded(px(theme.radii.r4))
+            .border_1()
+            .border_color(theme.colors.border)
+            .bg(theme.colors.bg)
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(
                 div()
-                    .absolute()
-                    .right(px(theme.spacing.s3))
-                    .bottom(px(theme.spacing.s3))
-                    .child(pill),
-            )
-        })
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s2))
+                    .text_size(px(theme.font.xs))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.colors.accent)
+                    .child("PLAN")
+                    .child(
+                        div()
+                            .text_color(theme.colors.muted)
+                            .child(format!("· {completed}/{}", plan.len())),
+                    ),
+            );
+        for entry in plan.iter().take(MAX_PLAN_ROWS) {
+            let (glyph, color) = match entry.status {
+                AgentPlanStatus::Completed => ("[x]", theme.colors.success),
+                AgentPlanStatus::InProgress => ("[>]", theme.colors.accent),
+                AgentPlanStatus::Pending => ("[ ]", theme.colors.text),
+                AgentPlanStatus::Unknown => ("[?]", theme.colors.muted),
+            };
+            let content = detail::strip_ansi(&entry.content).replace(['\n', '\r'], " ");
+            let priority = match entry.priority {
+                favetto_wire::model::AgentPlanPriority::High => " (!)",
+                _ => "",
+            };
+            card = card.child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(px(theme.spacing.s1))
+                    .text_size(px(theme.font.sm))
+                    .child(div().text_color(color).child(glyph))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_color(theme.colors.text)
+                            .child(format!("{content}{priority}")),
+                    ),
+            );
+        }
+        if plan.len() > MAX_PLAN_ROWS {
+            card = card.child(
+                div()
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.muted)
+                    .child(format!("… {} more", plan.len() - MAX_PLAN_ROWS)),
+            );
+        }
+        card
+    }
+
+    /// The follow-up prompt composer, including slash-command completion.
+    fn prompt_composer(&self, theme: &Theme, data: PromptBody<'_>, cx: &mut Context<Self>) -> Div {
+        let PromptBody {
+            commands,
+            prompt,
+            selected,
+            sending,
+            error,
+        } = data;
+        let query = prompt
+            .strip_prefix('/')
+            .filter(|rest| !rest.chars().any(char::is_whitespace));
+        let matches: Vec<(usize, &AgentCommand)> = match query {
+            Some(query) => commands
+                .iter()
+                .enumerate()
+                .filter(|(_, command)| command.name.starts_with(query))
+                .take(5)
+                .collect(),
+            None => Vec::new(),
+        };
+        let exact = prompt
+            .strip_prefix('/')
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|name| commands.iter().find(|command| command.name == name));
+        let hint = exact.and_then(|command| command.input_hint.as_deref());
+
+        let mut composer = div()
+            .m(px(theme.spacing.s3))
+            .mt(px(theme.spacing.s2))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(
+                div()
+                    .id("detail-prompt")
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s1))
+                    .px(px(theme.spacing.s2))
+                    .py(px(theme.spacing.s1))
+                    .rounded(px(theme.radii.r4))
+                    .border_1()
+                    .border_color(theme.colors.accent)
+                    .bg(theme.colors.bg)
+                    .text_size(px(theme.font.sm))
+                    .child(div().text_color(theme.colors.accent).child(if sending {
+                        "…"
+                    } else {
+                        ">"
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_color(if prompt.is_empty() {
+                                theme.colors.muted
+                            } else {
+                                theme.colors.text
+                            })
+                            .child(if prompt.is_empty() {
+                                "Type a message, or / for commands".to_string()
+                            } else {
+                                prompt.to_string()
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(theme.font.xs))
+                            .text_color(theme.colors.muted)
+                            .child("↵ send · tab complete · esc close"),
+                    ),
+            );
+        for (index, command) in matches {
+            let active = selected.unwrap_or(0) == index;
+            let row = div()
+                .id(("detail-command", index))
+                .flex()
+                .items_center()
+                .gap(px(theme.spacing.s2))
+                .px(px(theme.spacing.s2))
+                .py(px(2.0))
+                .rounded(px(theme.radii.r4))
+                .cursor_pointer()
+                .when(active, |row| row.bg(theme.colors.bg))
+                .text_size(px(theme.font.sm))
+                .child(
+                    div()
+                        .text_color(if active {
+                            theme.colors.accent
+                        } else {
+                            theme.colors.text
+                        })
+                        .child(format!("/{}", command.name)),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .text_color(theme.colors.muted)
+                        .child(detail::strip_ansi(&command.description)),
+                );
+            composer =
+                composer.child(row.on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.state.update(cx, |state, cx| {
+                        state.detail_prompt_choose_command(index);
+                        cx.notify();
+                    });
+                })));
+        }
+        if let Some(hint) = hint {
+            composer = composer.child(
+                div()
+                    .px(px(theme.spacing.s2))
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.muted)
+                    .child(detail::strip_ansi(hint)),
+            );
+        }
+        if let Some(error) = error {
+            composer = composer.child(
+                div()
+                    .px(px(theme.spacing.s2))
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.danger)
+                    .child(error.to_string()),
+            );
+        }
+        composer
     }
 
     fn runs_body(
@@ -1418,6 +1651,22 @@ struct EventsBody {
     error: Option<String>,
     session: Option<String>,
     ignored: usize,
+    plan: Vec<AgentPlanEntry>,
+    commands: Vec<AgentCommand>,
+    prompt: String,
+    prompt_selected: Option<usize>,
+    prompt_open: bool,
+    prompt_sending: bool,
+    prompt_error: Option<String>,
+}
+
+/// The follow-up composer's view data.
+struct PromptBody<'a> {
+    commands: &'a [AgentCommand],
+    prompt: &'a str,
+    selected: Option<usize>,
+    sending: bool,
+    error: Option<&'a str>,
 }
 
 /// One rendered feed row plus the parsed Markdown for prose/reasoning items.
@@ -1508,7 +1757,21 @@ impl Render for DetailView {
                 self.output_body(theme, output, loading, error, terminal, cx)
             }
             DetailTab::Events => {
-                let (revision, loading, loaded, error, session, ignored) = {
+                let (
+                    revision,
+                    loading,
+                    loaded,
+                    error,
+                    session,
+                    ignored,
+                    plan,
+                    commands,
+                    prompt,
+                    prompt_selected,
+                    prompt_open,
+                    prompt_sending,
+                    prompt_error,
+                ) = {
                     let state = self.state.read(cx);
                     let detail = state.detail();
                     (
@@ -1518,6 +1781,15 @@ impl Render for DetailView {
                         detail.and_then(|detail| detail.events_error.clone()),
                         detail.and_then(|detail| detail.events_session.clone()),
                         detail.map(|detail| detail.events_ignored).unwrap_or(0),
+                        state.detail_plan(),
+                        state.detail_commands(),
+                        detail
+                            .map(|detail| detail.prompt.clone())
+                            .unwrap_or_default(),
+                        detail.and_then(|detail| detail.prompt_selected),
+                        detail.is_some_and(|detail| detail.prompt_open),
+                        detail.is_some_and(|detail| detail.prompt_sending),
+                        detail.and_then(|detail| detail.prompt_error.clone()),
                     )
                 };
                 let feed = self.feed_for(task.id, revision, cx);
@@ -1530,6 +1802,13 @@ impl Render for DetailView {
                         error,
                         session,
                         ignored,
+                        plan,
+                        commands,
+                        prompt,
+                        prompt_selected,
+                        prompt_open,
+                        prompt_sending,
+                        prompt_error,
                     },
                     cx,
                 )

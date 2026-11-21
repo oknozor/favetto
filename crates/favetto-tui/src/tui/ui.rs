@@ -23,7 +23,7 @@ use super::app::{
 };
 use super::text_buffer::TextBuffer;
 use super::theme::{RaisedLevel, Theme};
-use super::{json, markdown};
+use super::{feed::plan_lines, json, markdown};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     app.click_regions.clear();
@@ -1414,6 +1414,8 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
                 "(ACP, favetto focus) PageUp / PageDown",
                 "scroll the feed; Home/End jump to the ends",
             ),
+            ("(agent prompt) `/`", "show advertised slash commands"),
+            ("(agent prompt) Tab / ↑↓", "complete or select a command"),
             ("(favetto focus) Ctrl+O", "switch to another session"),
             (
                 "(ACP, favetto focus) Ctrl+C",
@@ -2513,7 +2515,7 @@ fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     // no interactive view keeps its structured state snapshot, never the raw
     // machine-output PTY (JSON event stream).
     if app.agent_backend == AgentBackend::Acp {
-        draw_agent_feed(frame, app, inner_area, theme);
+        draw_acp_agent(frame, app, inner_area, theme);
         return;
     }
     if app.agent_structured {
@@ -2566,6 +2568,117 @@ fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     // Draw the terminal cursor when the application shows one and it is visible.
     if !hide_cursor && cursor_row < inner_area.height && cursor_col < inner_area.width {
         frame.set_cursor_position((inner_area.x + cursor_col, inner_area.y + cursor_row));
+    }
+}
+
+/// The ACP Agent panel: an optional replaceable plan checklist, the event feed,
+/// and (when the session accepts prompts) the slash-command-aware composer.
+fn draw_acp_agent(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let composing = app.agent_capture && !app.agent_read_only;
+    let plan = if app.agent_plan.is_empty() {
+        Vec::new()
+    } else {
+        plan_lines(&app.agent_plan, &theme)
+    };
+    let plan_height = if plan.is_empty() {
+        0
+    } else {
+        (plan.len() as u16 + 1).min(area.height.saturating_sub(1))
+    };
+
+    let matches: Vec<(String, String, Option<String>)> = app
+        .agent_command_matches()
+        .into_iter()
+        .take(5)
+        .map(|command| {
+            (
+                command.name.clone(),
+                command.description.clone(),
+                command.input_hint.clone(),
+            )
+        })
+        .collect();
+    let listing = composing && app.agent_command_query().is_some() && !matches.is_empty();
+    let hint = if composing {
+        app.agent_command_hint().map(str::to_string)
+    } else {
+        None
+    };
+    let composer_height = if composing {
+        1 + if listing {
+            (matches.len() as u16).min(5) + u16::from(hint.is_some())
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    let chunks = Layout::vertical([
+        Constraint::Length(plan_height),
+        Constraint::Min(1),
+        Constraint::Length(composer_height),
+    ])
+    .split(area);
+
+    if !plan.is_empty() {
+        frame.render_widget(Paragraph::new(plan), chunks[0]);
+    }
+    draw_agent_feed(frame, app, chunks[1], theme);
+
+    if !composing {
+        return;
+    }
+    let prompt = &app.agent_prompt;
+    let prompt_line = if prompt.is_empty() {
+        Line::from(Span::styled(
+            "> Type a message, or / for commands",
+            Style::default().fg(theme.muted()),
+        ))
+    } else {
+        Line::from(vec![
+            Span::styled("> ", Style::default().fg(theme.accent())),
+            Span::styled(prompt.clone(), Style::default().fg(theme.fg())),
+        ])
+    };
+    let mut lines = vec![prompt_line];
+    if listing {
+        let selected = app.agent_command_selected.unwrap_or(0);
+        for (index, (name, description, _)) in matches.iter().enumerate() {
+            let marker = if index == selected { "▸ " } else { "  " };
+            let style = if index == selected {
+                Style::default()
+                    .fg(theme.accent())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.fg())
+            };
+            lines.push(Line::from(vec![
+                Span::styled(marker, style),
+                Span::styled(format!("/{name}"), style),
+                Span::styled(
+                    format!("  {description}"),
+                    Style::default().fg(theme.muted()),
+                ),
+            ]));
+        }
+        if let Some(hint) = &hint {
+            lines.push(Line::from(Span::styled(
+                format!("  {hint}"),
+                Style::default().fg(theme.muted()),
+            )));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), chunks[2]);
+
+    // Place the cursor at the end of the composed prompt.
+    let cursor_x = chunks[2].x + 2 + prompt.chars().count() as u16;
+    let cursor_y = chunks[2].y;
+    if cursor_x < area.x + area.width && cursor_y < area.y + area.height {
+        frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
 

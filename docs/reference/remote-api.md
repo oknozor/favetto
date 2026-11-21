@@ -182,6 +182,8 @@ Backfill a task's normalized agent-event feed from its session's bounded ring bu
 | `session_id` | string (optional) | — | no |  |
 | `events` | AgentEventPush[] | — | yes |  |
 | `next_cursor` | integer | — | yes |  |
+| `plan` | AgentPlanEntry[] (optional) | — | no | The session's current plan at `next_cursor`, when it has one. `None` means there is no structured session; `Some(empty)` means the agent explicitly cleared the plan. |
+| `commands` | AgentCommand[] (optional) | — | no | The session's current command list at `next_cursor`, with the same `None`/empty distinction as [`Self::plan`]. |
 
 ### `tasks.cancel`
 
@@ -608,6 +610,8 @@ Start an external agent session, or attach to the task's existing live session. 
 | `session` | AgentSessionInfo | — | yes |  |
 | `data` | string | — | yes | Base64-encoded `vt100` screen frame. |
 | `seq` | integer | `0` | no | The last normalized-event sequence already folded into `data`. A client that also consumes `agent.event` / `tasks.events` can resume strictly after this cursor without replaying text that the snapshot already contains. Older payloads omit it and decode as `0`. |
+| `plan` | AgentPlanEntry[] | — | no | The session's current execution plan at [`Self::seq`]. Empty when the agent has not reported one; an empty list is also a valid cleared plan. |
+| `commands` | AgentCommand[] | — | no | The session's current advertised slash commands at [`Self::seq`]. |
 
 ### `agents.load`
 
@@ -626,6 +630,8 @@ Load a persisted ACP session by its Favetto-local id (`session_id`). The provide
 | `session` | AgentSessionInfo | — | yes |  |
 | `data` | string | — | yes | Base64-encoded `vt100` screen frame. |
 | `seq` | integer | `0` | no | The last normalized-event sequence already folded into `data`. A client that also consumes `agent.event` / `tasks.events` can resume strictly after this cursor without replaying text that the snapshot already contains. Older payloads omit it and decode as `0`. |
+| `plan` | AgentPlanEntry[] | — | no | The session's current execution plan at [`Self::seq`]. Empty when the agent has not reported one; an empty list is also a valid cleared plan. |
+| `commands` | AgentCommand[] | — | no | The session's current advertised slash commands at [`Self::seq`]. |
 
 ### `agents.prompt`
 
@@ -677,6 +683,8 @@ Attach to a session: returns the session and a replay of its output.
 | `session` | AgentSessionInfo | — | yes |  |
 | `data` | string | — | yes | Base64-encoded `vt100` screen frame. |
 | `seq` | integer | `0` | no | The last normalized-event sequence already folded into `data`. A client that also consumes `agent.event` / `tasks.events` can resume strictly after this cursor without replaying text that the snapshot already contains. Older payloads omit it and decode as `0`. |
+| `plan` | AgentPlanEntry[] | — | no | The session's current execution plan at [`Self::seq`]. Empty when the agent has not reported one; an empty list is also a valid cleared plan. |
+| `commands` | AgentCommand[] | — | no | The session's current advertised slash commands at [`Self::seq`]. |
 
 ### `agents.close`
 

@@ -21,8 +21,9 @@ use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 
 use favetto_core::model::{
-    AgentActivity, AgentBackend, AgentCapabilities, AgentLoadState, AgentSessionInfo,
-    AgentStateEvent, AgentUsage, AwaitingInputReason, ContentRole, InputReply, PermissionPolicy,
+    AgentActivity, AgentBackend, AgentCapabilities, AgentCommand, AgentLoadState, AgentPlanEntry,
+    AgentSessionInfo, AgentStateEvent, AgentUsage, AwaitingInputReason, ContentRole, InputReply,
+    PermissionPolicy,
 };
 use favetto_core::rpc::AgentEventPush;
 
@@ -194,7 +195,7 @@ pub enum AgentEvent {
     /// The session's folded live state changed (activity/usage).
     State {
         session_id: String,
-        live: AgentLiveState,
+        live: Box<AgentLiveState>,
     },
 }
 
@@ -215,6 +216,32 @@ pub struct AgentLiveState {
     pub activity: Option<AgentActivity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<AgentUsage>,
+    /// The latest complete plan reported by the agent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plan: Vec<AgentPlanEntry>,
+    /// The latest complete advertised command list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<AgentCommand>,
+}
+
+/// A (re)attaching client's complete snapshot of one session.
+#[derive(Debug, Clone)]
+pub struct AttachedAgent {
+    pub session: AgentSessionInfo,
+    pub data: Vec<u8>,
+    pub seq: u64,
+    pub plan: Vec<AgentPlanEntry>,
+    pub commands: Vec<AgentCommand>,
+}
+
+/// The backfill feed for a task, including the current plan/command snapshot.
+#[derive(Debug, Clone)]
+pub struct TaskFeed {
+    pub session_id: Option<String>,
+    pub events: Vec<AgentEventPush>,
+    pub next_cursor: u64,
+    pub plan: Option<Vec<AgentPlanEntry>>,
+    pub commands: Option<Vec<AgentCommand>>,
 }
 
 impl AgentLiveState {
@@ -256,6 +283,8 @@ impl AgentLiveState {
                 Some(live) if !snapshot => live.merge(usage),
                 _ => self.usage = Some(usage.clone()),
             },
+            AgentStateEvent::Plan { entries } => self.plan = entries.clone(),
+            AgentStateEvent::AvailableCommands { commands } => self.commands = commands.clone(),
             AgentStateEvent::Error { .. } => {}
             AgentStateEvent::Session { .. } | AgentStateEvent::Title { .. } => {}
         }
@@ -501,38 +530,50 @@ impl AgentManager {
     }
 
     /// The backfill feed for `task_id`'s most recent session.
-    pub fn events_for_task(
-        &self,
-        task_id: &str,
-        after: u64,
-        limit: usize,
-    ) -> (Option<String>, Vec<AgentEventPush>, u64) {
+    pub fn events_for_task(&self, task_id: &str, after: u64, limit: usize) -> TaskFeed {
         let sessions = self.sessions.lock();
         let Some(session) = sessions
             .values()
             .filter(|s| s.task_id.as_deref() == Some(task_id))
             .max_by_key(|s| s.order)
         else {
-            return (None, Vec::new(), after);
+            return TaskFeed {
+                session_id: None,
+                events: Vec::new(),
+                next_cursor: after,
+                plan: None,
+                commands: None,
+            };
         };
         let session_id = session.id.clone();
-        let feed = session.feed.lock();
-        let mut events: Vec<AgentEventPush> = feed
-            .iter()
-            .filter(|(seq, _)| *seq > after)
-            .map(|(seq, event)| AgentEventPush {
-                session_id: session_id.clone(),
-                task_id: session.task_id.clone(),
-                seq: *seq,
-                event: event.clone(),
-            })
-            .collect();
-        if events.len() > limit {
-            let excess = events.len() - limit;
-            events.drain(0..excess);
+        let (events, next_cursor) = {
+            let feed = session.feed.lock();
+            let mut events: Vec<AgentEventPush> = feed
+                .iter()
+                .filter(|(seq, _)| *seq > after)
+                .map(|(seq, event)| AgentEventPush {
+                    session_id: session_id.clone(),
+                    task_id: session.task_id.clone(),
+                    seq: *seq,
+                    event: event.clone(),
+                })
+                .collect();
+            if events.len() > limit {
+                let excess = events.len() - limit;
+                events.drain(0..excess);
+            }
+            let next_cursor = events.last().map_or(after, |event| event.seq);
+            (events, next_cursor)
+        };
+        // Read `live` only after releasing the feed lock.
+        let live = session.live.lock();
+        TaskFeed {
+            session_id: Some(session_id),
+            events,
+            next_cursor,
+            plan: Some(live.plan.clone()),
+            commands: Some(live.commands.clone()),
         }
-        let next_cursor = events.last().map_or(after, |event| event.seq);
-        (Some(session_id), events, next_cursor)
     }
 
     /// Whether a live interactive session is attached to `task_id`.
@@ -628,6 +669,8 @@ impl AgentManager {
             live: Arc::new(Mutex::new(AgentLiveState {
                 activity: Some(AgentActivity::Starting),
                 usage: None,
+                plan: Vec::new(),
+                commands: Vec::new(),
             })),
             lifecycle: Arc::new(Mutex::new(SessionLifecycle::ready())),
             responder: handles.responder.clone(),
@@ -754,6 +797,8 @@ impl AgentManager {
             live: Arc::new(Mutex::new(AgentLiveState {
                 activity: Some(AgentActivity::Starting),
                 usage: None,
+                plan: Vec::new(),
+                commands: Vec::new(),
             })),
             lifecycle: lifecycle.clone(),
             responder: handles.responder.clone(),
@@ -794,7 +839,7 @@ impl AgentManager {
     /// transcript, and the last event sequence folded into that transcript.
     /// Clients render structured `agent.event` updates for the live
     /// conversation; events after `seq` are the part not yet in this snapshot.
-    pub fn attach(&self, session_id: &str) -> anyhow::Result<(AgentSessionInfo, Vec<u8>, u64)> {
+    pub fn attach(&self, session_id: &str) -> anyhow::Result<AttachedAgent> {
         let session = self.get(session_id)?;
         // Take the cursor before the transcript: every event up to it is
         // included below. A completed restore is applied before readiness, so
@@ -809,7 +854,17 @@ impl AgentManager {
             .lock()
             .replace('\n', "\r\n")
             .into_bytes();
-        Ok((session.info(), frame, seq))
+        // The live snapshot is read after the cursor: applying a later event
+        // only ever replaces the plan/commands wholesale, so either copy is
+        // consistent at `seq`.
+        let live = session.live.lock().clone();
+        Ok(AttachedAgent {
+            session: session.info(),
+            data: frame,
+            seq,
+            plan: live.plan,
+            commands: live.commands,
+        })
     }
 
     /// Wait for a session to stop running (the turn ended and the session
@@ -1068,7 +1123,7 @@ fn spawn_state_task(
             let live = session.live.lock().clone();
             let _ = tx.send(AgentEvent::State {
                 session_id: session.id.clone(),
-                live,
+                live: Box::new(live),
             });
         }
         // The event stream only closes when the ACP runtime ends.
@@ -1102,6 +1157,79 @@ mod content_block_state_tests {
             content: MessageContent::Unknown,
         });
         assert_eq!(live.activity, Some(AgentActivity::Thinking));
+    }
+}
+
+#[cfg(test)]
+mod plan_state_tests {
+    use super::*;
+    use favetto_core::model::{AgentPlanPriority, AgentPlanStatus};
+
+    fn entry(content: &str) -> AgentPlanEntry {
+        AgentPlanEntry {
+            content: content.to_string(),
+            priority: AgentPlanPriority::Medium,
+            status: AgentPlanStatus::Pending,
+        }
+    }
+
+    fn command(name: &str) -> AgentCommand {
+        AgentCommand {
+            name: name.to_string(),
+            description: "desc".to_string(),
+            input_hint: None,
+        }
+    }
+
+    #[test]
+    fn plan_and_command_updates_replace_previous_lists() {
+        let mut live = AgentLiveState::default();
+        live.apply(&AgentStateEvent::Plan {
+            entries: vec![entry("first")],
+        });
+        live.apply(&AgentStateEvent::Plan {
+            entries: vec![entry("second"), entry("third")],
+        });
+        assert_eq!(live.plan, vec![entry("second"), entry("third")]);
+
+        live.apply(&AgentStateEvent::AvailableCommands {
+            commands: vec![command("web")],
+        });
+        live.apply(&AgentStateEvent::AvailableCommands {
+            commands: vec![command("test"), command("plan")],
+        });
+        assert_eq!(
+            live.commands,
+            vec![command("test"), command("plan")],
+            "a command update replaces the whole advertised list"
+        );
+
+        // Non-plan events leave both snapshots untouched.
+        live.apply(&AgentStateEvent::TextDelta {
+            role: favetto_core::model::MessageRole::Assistant,
+            text: "hello".to_string(),
+        });
+        assert_eq!(live.plan.len(), 2);
+        assert_eq!(live.commands.len(), 2);
+    }
+
+    #[test]
+    fn empty_plan_and_command_updates_clear_the_snapshot() {
+        let mut live = AgentLiveState::default();
+        live.apply(&AgentStateEvent::Plan {
+            entries: vec![entry("step")],
+        });
+        live.apply(&AgentStateEvent::AvailableCommands {
+            commands: vec![command("web")],
+        });
+        live.apply(&AgentStateEvent::Plan {
+            entries: Vec::new(),
+        });
+        live.apply(&AgentStateEvent::AvailableCommands {
+            commands: Vec::new(),
+        });
+        assert!(live.plan.is_empty());
+        assert!(live.commands.is_empty());
     }
 }
 

@@ -39,8 +39,8 @@ use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 
 use favetto_core::model::{
-    AgentCatalogEntry, AgentSessionHistoryEntry, AgentSessionInfo, Event, NotificationRecord,
-    RepoInfo, Schedule, Task, UsageStats,
+    AgentCatalogEntry, AgentCommand, AgentPlanEntry, AgentSessionHistoryEntry, AgentSessionInfo,
+    Event, NotificationRecord, RepoInfo, Schedule, Task, UsageStats,
 };
 use favetto_core::rpc::{method, ConfigValidateResult, TasksEventsResult};
 use favetto_core::workflow::WorkflowInspect;
@@ -1130,9 +1130,20 @@ fn apply_agent_response(
                 .and_then(|d| d.as_str())
                 .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
                 .unwrap_or_default();
+            let plan = v
+                .get("plan")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<Vec<AgentPlanEntry>>(value).ok())
+                .unwrap_or_default();
+            let commands = v
+                .get("commands")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<Vec<AgentCommand>>(value).ok())
+                .unwrap_or_default();
             match session {
                 Some(session) => {
                     app.open_agent(session.clone(), &frame);
+                    app.seed_agent_plan(plan, commands);
                     Some(session)
                 }
                 None => {
@@ -1461,6 +1472,7 @@ async fn send_agent_input(client: &Client, app: &mut App, bytes: &[u8]) {
         match byte {
             b'\r' | b'\n' => {
                 let prompt = std::mem::take(&mut app.agent_prompt);
+                app.reset_agent_command_selection();
                 if prompt.trim().is_empty() {
                     continue;
                 }
@@ -1477,11 +1489,11 @@ async fn send_agent_input(client: &Client, app: &mut App, bytes: &[u8]) {
             }
             0x7f | 0x08 => {
                 app.agent_prompt.pop();
-                app.agent_status = format!("> {}", app.agent_prompt);
+                app.reset_agent_command_selection();
             }
             b if b.is_ascii_graphic() || *b == b' ' => {
                 app.agent_prompt.push(*b as char);
-                app.agent_status = format!("> {}", app.agent_prompt);
+                app.reset_agent_command_selection();
             }
             _ => {}
         }
