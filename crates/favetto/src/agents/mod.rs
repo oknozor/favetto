@@ -712,6 +712,7 @@ impl AgentManager {
             prompt: launch.prompt,
             close_after_turn: launch.headless,
             permission_timeout: acp::PERMISSION_TIMEOUT,
+            setup_timeout: acp::setup_timeout(),
             session: binding,
             start_gate: None,
             lifecycle: None,
@@ -932,6 +933,7 @@ impl AgentManager {
             prompt: None,
             close_after_turn: false,
             permission_timeout: acp::PERMISSION_TIMEOUT,
+            setup_timeout: acp::setup_timeout(),
             session: Some(binding),
             start_gate: Some(start_rx),
             lifecycle: Some(lifecycle.clone()),
@@ -1572,6 +1574,10 @@ fn spawn_state_task(
                     let _ = applied.send(());
                     continue;
                 }
+                acp::AcpEvent::Exited { code } => {
+                    publish_session_exit(&session, &tx, code);
+                    return;
+                }
             };
             {
                 let mut live = session.live.lock();
@@ -1668,11 +1674,32 @@ fn spawn_state_task(
                 live: Box::new(live),
             });
         }
-        // The event stream only closes when the ACP runtime ends.
-        let _ = tx.send(AgentEvent::Exit {
-            session_id: session.id.clone(),
-            code: Some(session.exit_code.load(Ordering::SeqCst)),
-        });
+        // A runtime that ends without an explicit marker (for example one that
+        // panicked) still publishes the terminal state rather than leaving the
+        // session `Starting` forever.
+        let code = session.exit_code.load(Ordering::SeqCst);
+        publish_session_exit(&session, &tx, (code >= 0).then_some(code));
+    });
+}
+
+/// Publish the terminal `Exited` live state and exit event exactly once.
+///
+/// The activity snapshot is what `agents.list` and an attaching client read, so
+/// it must change before the exit notification is sent.
+fn publish_session_exit(session: &Session, tx: &broadcast::Sender<AgentEvent>, code: Option<i32>) {
+    session.running.store(false, Ordering::SeqCst);
+    {
+        let mut live = session.live.lock();
+        live.activity = Some(AgentActivity::Exited { code });
+    }
+    let live = session.live.lock().clone();
+    let _ = tx.send(AgentEvent::State {
+        session_id: session.id.clone(),
+        live: Box::new(live),
+    });
+    let _ = tx.send(AgentEvent::Exit {
+        session_id: session.id.clone(),
+        code,
     });
 }
 
@@ -1956,6 +1983,45 @@ mod session_launch_tests {
             manager.sessions().is_empty(),
             "an untracked session must not run"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_stopped_runtime_publishes_the_exited_activity() {
+        let (dir, pool) = scratch_pool("session-exited-state").await;
+        let mut manager = AgentManager::new();
+        manager.set_store(pool);
+        let info = manager
+            .start(
+                "true",
+                Arc::new(Agent::from_config(
+                    "true",
+                    &AgentConfig {
+                        command: "/bin/true".to_string(),
+                        ..Default::default()
+                    },
+                )),
+                launch(dir.clone()),
+            )
+            .await
+            .unwrap();
+
+        // The server exits without speaking ACP, so the turn never starts.
+        assert_eq!(manager.wait(&info.id).await, Some(1));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let snapshot = manager.find(&info.id).expect("session is retained");
+            assert!(!snapshot.running);
+            if snapshot.activity == Some(AgentActivity::Exited { code: Some(1) }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "runtime stop did not publish Exited: {snapshot:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

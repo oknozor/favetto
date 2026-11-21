@@ -53,7 +53,7 @@ impl DaemonHarness {
         F: Fn(&Path) -> Vec<(String, String)>,
     {
         for _ in 0..8 {
-            let mut daemon = Self::try_spawn(&agent_env);
+            let mut daemon = Self::try_spawn(&agent_env, &[]);
             if daemon.wait_bound() {
                 return daemon;
             }
@@ -82,9 +82,10 @@ impl DaemonHarness {
         }
     }
 
-    /// Create a scratch workspace with a fake echo agent and a one-task catalog,
-    /// then spawn `favetto daemon` against it.
-    fn try_spawn<F>(agent_env: &F) -> Self
+    /// Create a scratch workspace with fake ACP agents and a catalog of one
+    /// happy-path task plus the transport-fault tasks, then spawn
+    /// `favetto daemon` against it.
+    fn try_spawn<F>(agent_env: &F, daemon_env: &[(&str, &str)]) -> Self
     where
         F: Fn(&Path) -> Vec<(String, String)>,
     {
@@ -108,6 +109,17 @@ impl DaemonHarness {
             "agent = \"echo\"\nprovider = \"fake\"\nmodel = \"model-b\"\n---\necho: hello-e2e\n",
         )
         .unwrap();
+        // The transport-fault catalog. Each agent answers (or refuses to answer)
+        // with a distinct malformed startup so the daemon's failure path can be
+        // asserted end to end. `pid_file` lets a test prove the child was reaped.
+        let pid_file = root.join("agent.pid");
+        for name in ["broken_utf8", "oversized", "truncated", "hung"] {
+            std::fs::write(
+                tasks_dir.join(format!("{name}_task.md")),
+                format!("agent = \"{name}\"\n---\necho: {name}\n"),
+            )
+            .unwrap();
+        }
 
         let env_lines: String = agent_env(&root)
             .iter()
@@ -119,8 +131,20 @@ impl DaemonHarness {
             format!(
                 "[agent]\ndefault = \"echo\"\n\n\
                  [agents.echo]\ncommand = {:?}\nargs = []\n\
-                 [agents.echo.env]\n{env_lines}",
-                agent
+                 [agents.echo.env]\n{env_lines}\n\
+                 [agents.broken_utf8]\ncommand = {agent:?}\nargs = []\n\
+                 [agents.broken_utf8.env]\nFAKE_ACP_INVALID_UTF8 = \"1\"\n\
+                 FAKE_ACP_PID_FILE = {:?}\n\n\
+                 [agents.oversized]\ncommand = {agent:?}\nargs = []\n\
+                 [agents.oversized.env]\nFAKE_ACP_OVERSIZED = \"1\"\n\
+                 FAKE_ACP_PID_FILE = {:?}\n\n\
+                 [agents.truncated]\ncommand = {agent:?}\nargs = []\n\
+                 [agents.truncated.env]\nFAKE_ACP_TRUNCATE = \"1\"\n\
+                 FAKE_ACP_PID_FILE = {:?}\n\n\
+                 [agents.hung]\ncommand = {agent:?}\nargs = []\n\
+                 [agents.hung.env]\nFAKE_ACP_INIT_HANG = \"1\"\n\
+                 FAKE_ACP_PID_FILE = {:?}\n",
+                agent, pid_file, pid_file, pid_file, pid_file,
             ),
         )
         .unwrap();
@@ -147,6 +171,7 @@ impl DaemonHarness {
             .stderr(Stdio::from(log))
             .env_remove("FAVETTO_CONFIG")
             .env_remove("FAVETTO_DATA_DIR")
+            .envs(daemon_env.iter().copied())
             .spawn()
             .expect("spawn favetto daemon");
 
@@ -157,6 +182,18 @@ impl DaemonHarness {
             log_path,
             child,
         }
+    }
+
+    /// Spawn a daemon with extra variables in the daemon's own environment.
+    fn spawn_with_env(env: &[(&str, &str)]) -> Self {
+        for _ in 0..8 {
+            let mut daemon = Self::try_spawn(&|_| Vec::new(), env);
+            if daemon.wait_bound() {
+                return daemon;
+            }
+            // `daemon` is dropped: kills the child and removes its scratch dir.
+        }
+        panic!("daemon HTTP listener never bound after 8 attempts");
     }
 
     fn socket(&self) -> &Path {
@@ -492,6 +529,100 @@ async fn wire_client_pings_lists_catalog_and_runs_a_task() {
         output.contains("model: fake/model-b"),
         "the task's provider/model was not selected over ACP: {output:?}"
     );
+}
+
+/// A malformed, oversized, hung, or truncated ACP server must fail the task with
+/// a useful message and leave no child process behind. The setup deadline is
+/// shortened through the daemon environment so the hung case is fast.
+#[tokio::test]
+async fn acp_transport_faults_fail_the_task_and_reap_the_agent() {
+    let daemon = DaemonHarness::spawn_with_env(&[("FAVETTO_ACP_SETUP_TIMEOUT_MS", "500")]);
+    wait_for_unix_socket(daemon.socket(), &daemon).await;
+    let mut client = WireClient::connect(daemon.socket()).await;
+
+    for (name, needle) in [
+        ("broken_utf8_task", "UTF-8"),
+        ("oversized_task", "exceeds"),
+        ("truncated_task", "terminating newline"),
+        ("hung_task", "did not complete within"),
+    ] {
+        let started = client
+            .request(method::TASKS_START, serde_json::json!({ "name": name }))
+            .await;
+        assert!(
+            started.error.is_none(),
+            "tasks.start({name}) failed: {:?}",
+            started.error
+        );
+        let task_id = started.result.expect("tasks.start result")["id"]
+            .as_str()
+            .expect("task id")
+            .to_string();
+
+        let finished = client
+            .notification(|n| {
+                n.method == push::EVENT
+                    && n.params["kind"] == "task_finished"
+                    && n.params["payload"]["name"] == name
+            })
+            .await;
+        assert_eq!(
+            finished.params["payload"]["success"],
+            serde_json::json!(false),
+            "{name} must fail: {finished:?}"
+        );
+
+        let row = client
+            .request(method::TASKS_GET, serde_json::json!({ "id": task_id }))
+            .await
+            .result
+            .expect("tasks.get result");
+        assert_eq!(row["status"], "failed", "{name}: {row:?}");
+        let message = row["failure"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            message.contains(needle),
+            "{name} failure did not mention {needle:?}: {message:?}\n--- daemon log ---\n{}",
+            daemon.log()
+        );
+
+        // Both the agent and its supervisor must be gone: the reaper killed the
+        // process group and collected the direct child instead of leaving a
+        // zombie.
+        let pids = std::fs::read_to_string(daemon.root.join("agent.pid"))
+            .unwrap_or_else(|error| panic!("{name}: no agent pid file: {error}\n{}", daemon.log()));
+        let mut pids = pids.split_whitespace().map(|pid| {
+            pid.parse::<i32>()
+                .unwrap_or_else(|error| panic!("{name}: bad pid {pid:?}: {error}"))
+        });
+        let agent_pid = pids.next().expect("agent pid");
+        let supervisor_pid = pids.next().expect("supervisor pid");
+        for pid in [agent_pid, supervisor_pid] {
+            wait_for_pid_gone(pid, name, &daemon);
+        }
+    }
+}
+
+/// Wait (bounded) for `pid` to stop existing. A zombie still answers `kill(0)`,
+/// so this proves the process was reaped, not merely killed.
+fn wait_for_pid_gone(pid: i32, name: &str, daemon: &DaemonHarness) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        // SAFETY: signal 0 only probes for existence; it delivers nothing.
+        let exists = unsafe { libc::kill(pid, 0) } == 0;
+        if !exists {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "{name}: agent pid {pid} still exists after the task failed\n--- daemon log ---\n{}",
+                daemon.log()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 #[tokio::test]

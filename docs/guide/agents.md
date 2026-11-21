@@ -113,6 +113,25 @@ Agents launch through a small supervisor (`favetto __agent-exec`) that owns a
 process group and dies with the daemon — on both `SIGTERM` and `SIGKILL` — taking
 the agent and its children with it.
 
+### Transport limits
+
+The stdio transport is newline-delimited UTF-8 JSON-RPC and is bounded:
+
+- A single message may be at most **8 MiB** (excluding the terminating newline).
+  A longer line fails the session instead of buffering without bound.
+- Invalid UTF-8 and a partial line at EOF (a truncated message) are read errors,
+  not lossily repaired or parsed as complete messages.
+- `initialize`, `session/new`, `session/load` and model selection share a
+  startup deadline, **30 seconds** by default. A hung server fails the session
+  with the method and deadline in the error instead of leaving it `Starting` or
+  `Loading`. Override the bound with `FAVETTO_ACP_SETUP_TIMEOUT_MS` (milliseconds)
+  for an agent with a long cold start.
+- Prompt turns (`session/prompt`) are deliberately **not** bounded: a task may
+  legitimately run for hours.
+
+Any transport or setup failure kills the agent's whole process group and reaps
+the direct child, so a malformed or hung server cannot outlive its session.
+
 A **headless** run is exactly one ACP prompt turn. The session closes itself when
 the turn ends, and the task succeeds only when all of the following hold:
 
