@@ -40,7 +40,7 @@ use tokio::sync::mpsc;
 
 use favetto_core::model::{
     AgentCatalogEntry, AgentCommand, AgentPlanEntry, AgentSessionHistoryEntry, AgentSessionInfo,
-    Event, NotificationRecord, RepoInfo, Schedule, Task, UsageStats,
+    Event, NotificationRecord, ProviderSessionsResult, RepoInfo, Schedule, Task, UsageStats,
 };
 use favetto_core::rpc::{method, ConfigValidateResult, TasksEventsResult};
 use favetto_core::workflow::WorkflowInspect;
@@ -882,6 +882,32 @@ async fn run_session(
                             UiAction::LoadSession(session_id) => {
                                 load_session(client, app, session_id).await;
                             }
+                            UiAction::ResumeProviderSession {
+                                agent,
+                                provider_session_id,
+                                cwd,
+                            } => {
+                                resume_provider_session(
+                                    client,
+                                    app,
+                                    agent,
+                                    provider_session_id,
+                                    cwd,
+                                )
+                                .await;
+                            }
+                            UiAction::DeleteProviderSession {
+                                agent,
+                                provider_session_id,
+                            } => {
+                                delete_provider_session(
+                                    client,
+                                    app,
+                                    agent,
+                                    provider_session_id,
+                                )
+                                .await;
+                            }
                             UiAction::AgentInput(bytes) => {
                                 send_agent_input(client, app, &bytes).await;
                             }
@@ -1263,6 +1289,7 @@ async fn fetch_agents(client: &Client, app: &mut App) {
 fn merge_session_picker(
     agents: Vec<AgentCatalogEntry>,
     history: Vec<AgentSessionHistoryEntry>,
+    provider: Vec<ProviderSessionsResult>,
 ) -> Vec<SessionPickerEntry> {
     let titles: HashMap<String, String> = history
         .iter()
@@ -1270,10 +1297,24 @@ fn merge_session_picker(
         .collect();
     let live: Vec<AgentSessionInfo> = agents.into_iter().flat_map(|a| a.sessions).collect();
     let live_ids: HashSet<String> = live.iter().map(|s| s.id.clone()).collect();
+    let live_provider_ids: HashSet<(String, String)> = live
+        .iter()
+        .filter_map(|session| {
+            session
+                .session_id
+                .clone()
+                .map(|provider_id| (session.agent.clone(), provider_id))
+        })
+        .collect();
 
     let mut rows: Vec<SessionPickerEntry> = live
         .iter()
         .map(|session| SessionPickerEntry::from_live(session, titles.get(&session.id).cloned()))
+        .collect();
+    let local_ids: HashSet<String> = live_ids
+        .iter()
+        .chain(history.iter().map(|entry| &entry.id))
+        .cloned()
         .collect();
     rows.extend(
         history
@@ -1281,9 +1322,36 @@ fn merge_session_picker(
             .filter(|entry| !live_ids.contains(&entry.id))
             .map(SessionPickerEntry::from_history),
     );
+
+    // Provider-owned rows are distinct from Favetto-local records. Rows already
+    // imported or attached locally are not duplicated; unsupported/error agents
+    // contribute a single explanatory, non-actionable row.
+    for result in provider {
+        if let Some(error) = &result.error {
+            rows.push(SessionPickerEntry::provider_status(&result.agent, error));
+        }
+        for entry in &result.sessions {
+            if entry
+                .local_session_id
+                .as_ref()
+                .is_some_and(|id| local_ids.contains(id))
+            {
+                continue;
+            }
+            if live_provider_ids.contains(&(entry.agent.clone(), entry.session_id.clone())) {
+                continue;
+            }
+            rows.push(SessionPickerEntry::from_provider(
+                entry,
+                result.can_resume,
+                result.can_delete,
+            ));
+        }
+    }
+
     // Active sessions are the most likely target; keep their relative order and
     // put them before past rows. Everything else keeps history's newest-first
-    // order.
+    // order, with provider-only rows after Favetto's own records.
     rows.sort_by_key(|row| match row.state {
         SessionPickerState::Active => 0,
         SessionPickerState::Loading => 1,
@@ -1352,13 +1420,118 @@ async fn fetch_sessions(client: &Client, app: &mut App) {
         }
     };
 
+    let provider = fetch_provider_history(client, &agents).await;
     let live_sessions: Vec<AgentSessionInfo> = agents
         .iter()
         .flat_map(|agent| agent.sessions.iter().cloned())
         .collect();
-    let sessions = merge_session_picker(agents, history);
+    let sessions = merge_session_picker(agents, history, provider);
     app.set_agent_sessions(live_sessions);
     app.open_sessions(sessions);
+}
+
+/// How many provider pages the picker follows for one agent. A provider is free
+/// to return a small page; this bounds startup latency without hiding a normal
+/// history behind a "load more" interaction.
+const PROVIDER_PAGE_LIMIT: usize = 20;
+
+/// Fetch provider-owned sessions for every available ACP agent.
+///
+/// Each agent's opaque cursor is followed (bounded by [`PROVIDER_PAGE_LIMIT`])
+/// and its pages are merged into one result. A failing/unsupported agent yields
+/// a structured row with its explanation; the local `agents.history` list is
+/// unaffected.
+async fn fetch_provider_history(
+    client: &Client,
+    agents: &[AgentCatalogEntry],
+) -> Vec<ProviderSessionsResult> {
+    let mut results = Vec::new();
+    for agent in agents
+        .iter()
+        .filter(|agent| agent.available && agent.capabilities.acp)
+    {
+        let mut merged: Option<ProviderSessionsResult> = None;
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors: HashSet<String> = HashSet::new();
+        for _ in 0..PROVIDER_PAGE_LIMIT {
+            let mut params = serde_json::json!({ "agent": agent.name });
+            if let Some(cursor) = &cursor {
+                params["cursor"] = serde_json::json!(cursor);
+            }
+            let response = match client
+                .request(method::AGENTS_PROVIDER_SESSIONS, params)
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    results.push(ProviderSessionsResult {
+                        agent: agent.name.clone(),
+                        supported: false,
+                        can_resume: false,
+                        can_delete: false,
+                        sessions: Vec::new(),
+                        next_cursor: None,
+                        error: Some(format!("agents.provider_sessions failed: {error}")),
+                    });
+                    merged = None;
+                    break;
+                }
+            };
+            let Some(value) = response.result else {
+                let message = response
+                    .error
+                    .map(|error| error.message)
+                    .unwrap_or_else(|| "agents.provider_sessions failed".to_string());
+                results.push(ProviderSessionsResult {
+                    agent: agent.name.clone(),
+                    supported: false,
+                    can_resume: false,
+                    can_delete: false,
+                    sessions: Vec::new(),
+                    next_cursor: None,
+                    error: Some(message),
+                });
+                merged = None;
+                break;
+            };
+            let pages = match serde_json::from_value::<Vec<ProviderSessionsResult>>(value) {
+                Ok(pages) => pages,
+                Err(error) => {
+                    results.push(ProviderSessionsResult {
+                        agent: agent.name.clone(),
+                        supported: false,
+                        can_resume: false,
+                        can_delete: false,
+                        sessions: Vec::new(),
+                        next_cursor: None,
+                        error: Some(format!("agents.provider_sessions: {error}")),
+                    });
+                    merged = None;
+                    break;
+                }
+            };
+            let Some(page) = pages.into_iter().find(|page| page.agent == agent.name) else {
+                break;
+            };
+            let next = page.next_cursor.clone();
+            match &mut merged {
+                Some(aggregate) => {
+                    aggregate.sessions.extend(page.sessions);
+                    aggregate.next_cursor = next.clone();
+                }
+                None => merged = Some(page),
+            }
+            let Some(next) = next else { break };
+            if !seen_cursors.insert(next.clone()) {
+                break;
+            }
+            cursor = Some(next);
+        }
+        if let Some(result) = merged {
+            results.push(result);
+        }
+    }
+    results
 }
 
 /// Fetch `agents.list` and cache every live/retained session so the Tasks table
@@ -1418,6 +1591,76 @@ async fn load_session(client: &Client, app: &mut App, session_id: String) {
             agent_request_failed(app, "agents.load", &e.to_string());
         }
     }
+}
+
+/// Resume a provider-owned session by its ACP id.
+///
+/// The daemon imports it into a Favetto-local record and returns the local id;
+/// the attached session is then opened like any other restore. An agent that
+/// supports neither `session/load` nor `session/resume` reports an error and no
+/// fresh session is created.
+async fn resume_provider_session(
+    client: &Client,
+    app: &mut App,
+    agent: String,
+    provider_session_id: String,
+    cwd: Option<PathBuf>,
+) {
+    app.begin_session_load(&provider_session_id);
+    match client
+        .request(
+            method::AGENTS_PROVIDER_RESUME,
+            serde_json::json!({
+                "agent": agent,
+                "provider_session_id": provider_session_id,
+                "cwd": cwd,
+            }),
+        )
+        .await
+    {
+        Ok(resp) => {
+            let _ = apply_agent_response(app, resp);
+        }
+        Err(e) => {
+            app.finish_session_load();
+            agent_request_failed(app, "agents.provider_resume", &e.to_string());
+        }
+    }
+}
+
+/// Delete a provider-owned session and re-open the picker with fresh history.
+async fn delete_provider_session(
+    client: &Client,
+    app: &mut App,
+    agent: String,
+    provider_session_id: String,
+) {
+    match client
+        .request(
+            method::AGENTS_PROVIDER_DELETE,
+            serde_json::json!({
+                "agent": agent,
+                "provider_session_id": provider_session_id,
+            }),
+        )
+        .await
+    {
+        Ok(resp) => {
+            if let Some(error) = resp.error {
+                app.logs
+                    .push_back(format!("agents.provider_delete: {}", error.message));
+            } else {
+                app.logs
+                    .push_back("provider session deleted; local metadata is unchanged".to_string());
+            }
+        }
+        Err(e) => app
+            .logs
+            .push_back(format!("agents.provider_delete failed: {e}")),
+    }
+    // The provider list is the source of truth; refresh it instead of removing
+    // the row optimistically.
+    fetch_sessions(client, app).await;
 }
 
 /// Fetch the configured provider/model catalog for the wizard's selected agent.
@@ -2139,7 +2382,7 @@ mod tests {
         duplicate.title = Some("Live title".to_string());
         duplicate.state = favetto_core::model::AgentSessionState::Active;
 
-        let rows = merge_session_picker(agents, vec![past, duplicate]);
+        let rows = merge_session_picker(agents, vec![past, duplicate], Vec::new());
         assert_eq!(rows.len(), 2, "a live session is not listed twice");
         assert_eq!(rows[0].id, "local-live");
         assert_eq!(rows[0].title.as_deref(), Some("Live title"));
@@ -2148,6 +2391,109 @@ mod tests {
         assert_eq!(rows[1].state, SessionPickerState::Ended);
         assert_eq!(rows[1].action, app::SessionPickerAction::Load);
         assert_eq!(rows[1].cwd.as_deref(), Some(std::path::Path::new("/work")));
+    }
+
+    fn provider_entry(agent: &str, session_id: &str) -> favetto_core::model::ProviderSessionEntry {
+        favetto_core::model::ProviderSessionEntry {
+            agent: agent.to_string(),
+            session_id: session_id.to_string(),
+            cwd: PathBuf::from("/work"),
+            title: Some(format!("{agent} provider")),
+            updated_at: None,
+            local_session_id: None,
+        }
+    }
+
+    #[test]
+    fn provider_rows_are_capability_gated_and_scoped_per_agent() {
+        let result = |agent: &str, can_resume, can_delete, sessions| {
+            favetto_core::model::ProviderSessionsResult {
+                agent: agent.to_string(),
+                supported: true,
+                can_resume,
+                can_delete,
+                sessions,
+                next_cursor: None,
+                error: None,
+            }
+        };
+        let rows = merge_session_picker(
+            Vec::new(),
+            Vec::new(),
+            vec![
+                result(
+                    "opencode",
+                    true,
+                    true,
+                    vec![provider_entry("opencode", "session-1")],
+                ),
+                result("pi", false, false, vec![provider_entry("pi", "session-1")]),
+            ],
+        );
+        assert_eq!(rows.len(), 2, "colliding provider ids stay separate");
+        let opencode = rows.iter().find(|row| row.agent == "opencode").unwrap();
+        assert_eq!(opencode.state, SessionPickerState::Provider);
+        assert_eq!(opencode.action, app::SessionPickerAction::ResumeProvider);
+        assert!(opencode.deletable);
+        assert_eq!(opencode.provider_session_id.as_deref(), Some("session-1"));
+        let pi = rows.iter().find(|row| row.agent == "pi").unwrap();
+        assert_eq!(pi.action, app::SessionPickerAction::None);
+        assert!(!pi.deletable);
+        assert!(pi.blocked_reason().is_some());
+    }
+
+    #[test]
+    fn provider_rows_already_imported_or_unsupported_are_not_duplicated() {
+        let now = chrono::Utc::now();
+        let local = AgentSessionHistoryEntry {
+            id: "local-1".to_string(),
+            agent: "opencode".to_string(),
+            title: Some("Imported".to_string()),
+            cwd: PathBuf::from("/work"),
+            task_id: None,
+            state: favetto_core::model::AgentSessionState::Ended,
+            loadable: true,
+            load_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut imported = provider_entry("opencode", "provider-1");
+        imported.local_session_id = Some("local-1".to_string());
+        let rows = merge_session_picker(
+            Vec::new(),
+            vec![local],
+            vec![
+                favetto_core::model::ProviderSessionsResult {
+                    agent: "opencode".to_string(),
+                    supported: true,
+                    can_resume: true,
+                    can_delete: true,
+                    sessions: vec![imported],
+                    next_cursor: None,
+                    error: None,
+                },
+                favetto_core::model::ProviderSessionsResult {
+                    agent: "pi".to_string(),
+                    supported: false,
+                    can_resume: false,
+                    can_delete: false,
+                    sessions: Vec::new(),
+                    next_cursor: None,
+                    error: Some("session/list is not advertised".to_string()),
+                },
+            ],
+        );
+        assert_eq!(
+            rows.iter().filter(|row| row.id == "local-1").count(),
+            1,
+            "the already-imported provider row is not duplicated"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.state == SessionPickerState::Unsupported
+                    && row.detail.as_deref() == Some("session/list is not advertised")),
+            "unsupported provider history is explained inline"
+        );
     }
 
     #[test]

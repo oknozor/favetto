@@ -110,6 +110,19 @@ pub enum UiAction {
     /// Load a persisted session by its Favetto-local id (`agents.load`). Never
     /// starts a fresh ACP session when the restore is unsupported or fails.
     LoadSession(String),
+    /// Resume a provider-owned session (`agents.provider_resume`) by its
+    /// provider ACP id. The daemon imports it and returns a Favetto-local id.
+    ResumeProviderSession {
+        agent: String,
+        provider_session_id: String,
+        cwd: Option<PathBuf>,
+    },
+    /// Delete a provider-owned session (`agents.provider_delete`) when the
+    /// agent advertises `session/delete`.
+    DeleteProviderSession {
+        agent: String,
+        provider_session_id: String,
+    },
     /// Forward raw keystrokes to the active agent session.
     AgentInput(Vec<u8>),
     /// Interrupt the attached ACP session's in-flight turn (`agents.cancel`).
@@ -189,6 +202,9 @@ pub enum SessionPickerState {
     Failed,
     /// The record cannot be loaded (no ACP id, or the agent is unavailable).
     Unsupported,
+    /// Provider-owned history discovered through ACP `session/list`, not yet
+    /// imported into a Favetto-local record.
+    Provider,
 }
 
 /// What Enter does for one Ctrl+O row.
@@ -198,6 +214,8 @@ pub enum SessionPickerAction {
     Attach,
     /// Restore a persisted provider session by Favetto-local id (`agents.load`).
     Load,
+    /// Resume a provider-owned session through `agents.provider_resume`.
+    ResumeProvider,
     /// Nothing is launchable; the row explains why.
     None,
 }
@@ -220,6 +238,12 @@ pub struct SessionPickerEntry {
     /// Live activity/usage, when `agents.list` reported them.
     pub activity: Option<AgentActivity>,
     pub usage: Option<AgentUsage>,
+    /// The provider's own ACP session id, set only for provider-owned rows. It
+    /// is never accepted by `agents.load`/`agents.attach`; provider actions use
+    /// the dedicated `agents.provider_*` RPCs.
+    pub provider_session_id: Option<String>,
+    /// Whether the agent advertises `session/delete` for this row.
+    pub deletable: bool,
 }
 
 impl SessionPickerEntry {
@@ -256,6 +280,8 @@ impl SessionPickerEntry {
             headless: session.headless,
             activity: session.activity.clone(),
             usage: session.usage.clone(),
+            provider_session_id: None,
+            deletable: false,
         }
     }
 
@@ -295,6 +321,66 @@ impl SessionPickerEntry {
             headless: false,
             activity: None,
             usage: None,
+            provider_session_id: None,
+            deletable: false,
+        }
+    }
+
+    /// A provider-owned session from `agents.provider_sessions`.
+    pub fn from_provider(
+        entry: &favetto_core::model::ProviderSessionEntry,
+        can_resume: bool,
+        can_delete: bool,
+    ) -> Self {
+        let (action, detail) = if can_resume {
+            (SessionPickerAction::ResumeProvider, None)
+        } else {
+            (
+                SessionPickerAction::None,
+                Some(format!(
+                    "agent '{}' does not advertise ACP session/load or session/resume",
+                    entry.agent
+                )),
+            )
+        };
+        Self {
+            // Display/routing placeholder only: provider rows are never sent to
+            // `agents.load`. A local id, when already imported, is shown so the
+            // row can be de-duplicated against `agents.history`.
+            id: entry
+                .local_session_id
+                .clone()
+                .unwrap_or_else(|| format!("provider:{}:{}", entry.agent, entry.session_id)),
+            agent: entry.agent.clone(),
+            title: entry.title.clone(),
+            cwd: Some(entry.cwd.clone()),
+            state: SessionPickerState::Provider,
+            action,
+            detail,
+            headless: false,
+            activity: None,
+            usage: None,
+            provider_session_id: Some(entry.session_id.clone()),
+            deletable: can_delete,
+        }
+    }
+
+    /// A non-actionable row explaining that an agent's provider history is
+    /// unsupported or failed to load.
+    pub fn provider_status(agent: &str, error: &str) -> Self {
+        Self {
+            id: format!("provider-status:{agent}"),
+            agent: agent.to_string(),
+            title: Some(format!("{agent} provider history unavailable")),
+            cwd: None,
+            state: SessionPickerState::Unsupported,
+            action: SessionPickerAction::None,
+            detail: Some(error.to_string()),
+            headless: false,
+            activity: None,
+            usage: None,
+            provider_session_id: None,
+            deletable: false,
         }
     }
 
@@ -306,6 +392,7 @@ impl SessionPickerEntry {
             SessionPickerState::Ended => "ended",
             SessionPickerState::Failed => "failed",
             SessionPickerState::Unsupported => "cannot load",
+            SessionPickerState::Provider => "provider",
         }
     }
 
@@ -322,6 +409,9 @@ impl SessionPickerEntry {
                     }
                     SessionPickerState::Unsupported => {
                         "this session cannot be restored".to_string()
+                    }
+                    SessionPickerState::Provider => {
+                        "the agent does not support resuming this provider session".to_string()
                     }
                     _ => "this session cannot be opened".to_string(),
                 }))
@@ -356,11 +446,13 @@ pub enum Popup {
     /// Live runtime workflow inspector (`workflow.inspect`), opened with `i` on
     /// the Tasks tab for the selected task's root.
     WorkflowRuntime(WorkflowRuntime),
-    /// The Ctrl+O session picker: live sessions from `agents.list` plus
-    /// persisted Favetto-created sessions from `agents.history`.
+    /// The Ctrl+O session picker: live sessions from `agents.list`, persisted
+    /// Favetto-created sessions from `agents.history`, and provider-owned
+    /// sessions from `agents.provider_sessions`.
     Sessions {
         selected: usize,
         sessions: Vec<SessionPickerEntry>,
+        filter: TextBuffer,
     },
     /// The Ctrl+S session options picker: advertised config selectors and modes
     /// for the active ACP session.
@@ -2407,7 +2499,50 @@ impl App {
         self.popup = Popup::Sessions {
             selected: 0,
             sessions,
+            filter: TextBuffer::default(),
         };
+    }
+
+    /// The Ctrl+O rows after applying the current search filter. Matching is a
+    /// case-insensitive substring over the title, agent, local id and cwd, so a
+    /// path or agent name narrows provider and local rows alike.
+    pub fn filtered_sessions(&self) -> Vec<SessionPickerEntry> {
+        let (sessions, filter) = match &self.popup {
+            Popup::Sessions {
+                sessions, filter, ..
+            } => (sessions, filter.value().to_lowercase()),
+            _ => return Vec::new(),
+        };
+        if filter.is_empty() {
+            return sessions.clone();
+        }
+        sessions
+            .iter()
+            .filter(|row| {
+                let title = row.title.as_deref().unwrap_or_default();
+                let cwd = row
+                    .cwd
+                    .as_ref()
+                    .map(|cwd| cwd.display().to_string())
+                    .unwrap_or_default();
+                [row.agent.as_str(), row.id.as_str(), title, cwd.as_str()]
+                    .iter()
+                    .any(|value| value.to_lowercase().contains(&filter))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Keep the highlighted row inside the filtered list after an edit.
+    fn clamp_session_picker_selection(&mut self) {
+        let len = self.filtered_sessions().len();
+        if let Popup::Sessions { selected, .. } = &mut self.popup {
+            *selected = if len == 0 {
+                0
+            } else {
+                (*selected).min(len - 1)
+            };
+        }
     }
 
     /// Show that a persisted session is being restored, without clearing the

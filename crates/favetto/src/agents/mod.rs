@@ -23,7 +23,8 @@ use tokio::sync::broadcast;
 use favetto_core::model::{
     AgentActivity, AgentBackend, AgentCapabilities, AgentCommand, AgentLoadState, AgentPlanEntry,
     AgentSessionInfo, AgentStateEvent, AgentUsage, AwaitingInputReason, ContentRole, InputReply,
-    PermissionPolicy, SessionConfigOption, SessionConfigValue, SessionModes,
+    PermissionPolicy, ProviderSessionEntry, ProviderSessionsResult, SessionConfigOption,
+    SessionConfigValue, SessionModes,
 };
 use favetto_core::rpc::{AgentEventPush, AgentOptionsResult};
 
@@ -750,9 +751,100 @@ impl AgentManager {
                 record.id
             )
         })?;
+        self.restore_session(
+            name,
+            agent,
+            record,
+            acp::AcpSessionMode::Load {
+                external_session_id,
+            },
+        )
+        .await
+    }
 
-        // Reattaching to a live process is not a load. Replace only a terminal
-        // entry left behind by an earlier process.
+    /// Resume a provider-owned session discovered through `session/list`.
+    ///
+    /// This is the only path that imports a provider session into Favetto's
+    /// durable records. A provider id is never accepted by `agents.load`; the
+    /// returned [`AgentSessionInfo`] carries the newly imported local id. If a
+    /// local record already exists for the same `(agent, provider id)` pair, it
+    /// is reused rather than duplicated.
+    ///
+    /// The ACP method is negotiated by the runtime: `session/load` (with replay)
+    /// when advertised, otherwise `session/resume` (no replay).
+    pub async fn resume_provider(
+        &self,
+        name: &str,
+        agent: Arc<Agent>,
+        provider_session_id: &str,
+        cwd: Option<PathBuf>,
+    ) -> anyhow::Result<AgentSessionInfo> {
+        // Reattaching to a live process is not a resume.
+        let live = self
+            .sessions
+            .lock()
+            .values()
+            .find(|session| {
+                session.agent == name
+                    && session.external_session_id.lock().as_deref() == Some(provider_session_id)
+            })
+            .cloned();
+        if let Some(existing) = live {
+            if existing.running.load(Ordering::SeqCst) {
+                return Ok(existing.info());
+            }
+            self.sessions.lock().remove(&existing.id);
+        }
+
+        let store = self.store.clone().ok_or_else(|| {
+            anyhow::anyhow!("agent '{name}': session history storage is not attached")
+        })?;
+        let record = match store.find_by_external(name, provider_session_id).await? {
+            Some(record) => record,
+            None => {
+                let now = Utc::now();
+                let cwd = match cwd {
+                    Some(cwd) => cwd,
+                    None => std::env::current_dir().map_err(|error| {
+                        anyhow::anyhow!(
+                            "agent '{name}': cannot determine a working directory for provider \
+                             session '{provider_session_id}': {error}"
+                        )
+                    })?,
+                };
+                let id = uuid::Uuid::new_v4().to_string();
+                let mut record = AgentSessionRecord::loading(id.clone(), name, cwd, now);
+                record.external_session_id = Some(provider_session_id.to_string());
+                store.create(&record).await.map_err(|error| {
+                    anyhow::anyhow!(
+                        "agent '{name}': cannot import provider session \
+                         '{provider_session_id}' as local session '{id}': {error}"
+                    )
+                })?;
+                record
+            }
+        };
+        self.restore_session(
+            name,
+            agent,
+            record,
+            acp::AcpSessionMode::ProviderResume {
+                external_session_id: provider_session_id.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// Spawn and register a restore (local load or provider resume).
+    async fn restore_session(
+        &self,
+        name: &str,
+        agent: Arc<Agent>,
+        record: AgentSessionRecord,
+        mode: acp::AcpSessionMode,
+    ) -> anyhow::Result<AgentSessionInfo> {
+        // Reattaching to a live process is not a restore. Replace only a
+        // terminal entry left behind by an earlier process.
         if let Some(existing) = self.sessions.lock().get(&record.id).cloned() {
             if existing.running.load(Ordering::SeqCst) {
                 return Ok(existing.info());
@@ -781,7 +873,7 @@ impl AgentManager {
         };
         // Nothing about a restored conversation is exposed until the whole
         // replay has been applied. The runtime shares this lifecycle with the
-        // snapshot clients read and gates `session/load` behind registration.
+        // snapshot clients read and gates the restore behind registration.
         let lifecycle = Arc::new(Mutex::new(SessionLifecycle::loading()));
         let (start_tx, start_rx) = tokio::sync::oneshot::channel();
 
@@ -792,12 +884,11 @@ impl AgentManager {
             env,
             // The session's stored working directory, not the caller's.
             cwd: record.cwd.clone(),
-            mode: acp::AcpSessionMode::Load {
-                external_session_id: external_session_id.clone(),
-            },
+            mode,
             policy: agent.config.permission.unwrap_or_default(),
-            // A load restores the conversation; it does not configure a model or
-            // submit a prompt. Follow-up prompts still flow through the manager.
+            // A restore replays the conversation; it does not configure a model
+            // or submit a prompt. Follow-up prompts still flow through the
+            // manager.
             model: None,
             prompt: None,
             close_after_turn: false,
@@ -809,14 +900,14 @@ impl AgentManager {
             Ok(spawned) => spawned,
             Err(error) => {
                 if let Err(write) = store.mark_failed(&id, &error.to_string()).await {
-                    tracing::warn!(session = %id, error = %write, "failed to record session load failure");
+                    tracing::warn!(session = %id, error = %write, "failed to record session restore failure");
                 }
                 return Err(error);
             }
         };
         let Some(load) = handles.load.take() else {
             handles.shutdown();
-            anyhow::bail!("agent '{name}': load launch did not report readiness");
+            anyhow::bail!("agent '{name}': restore launch did not report readiness");
         };
         let outcome = handles.outcome.clone();
 
@@ -868,6 +959,141 @@ impl AgentManager {
             return Err(error);
         }
         Ok(session.info())
+    }
+
+    /// List one page of an agent's provider-owned sessions through ACP
+    /// `session/list`.
+    ///
+    /// Only the agent's own advertised history is returned; this never reads
+    /// Favetto's durable records. An unsupported or unavailable agent produces a
+    /// structured result with `supported: false` and a reason.
+    pub async fn provider_sessions(
+        &self,
+        name: &str,
+        agent: Arc<Agent>,
+        cwd_filter: Option<PathBuf>,
+        cursor: Option<String>,
+    ) -> anyhow::Result<ProviderSessionsResult> {
+        let LaunchCommand {
+            program,
+            args,
+            env,
+            cwd: spec_cwd,
+        } = self.launch_command(name, agent.as_ref(), &BTreeMap::new())?;
+        let process_cwd = match spec_cwd {
+            Some(cwd) => cwd,
+            None => match &cwd_filter {
+                Some(cwd) => cwd.clone(),
+                None => std::env::current_dir().map_err(|error| {
+                    anyhow::anyhow!(
+                        "agent '{name}': cannot determine a working directory for session/list: \
+                         {error}"
+                    )
+                })?,
+            },
+        };
+        let listing = acp::list_provider_sessions(acp::AcpProviderLaunch {
+            agent: name.to_string(),
+            program,
+            args,
+            env,
+            cwd: process_cwd,
+            filter_cwd: cwd_filter,
+            cursor,
+        })
+        .await?;
+
+        let can_resume = listing.capabilities.load_session
+            || listing.capabilities.session_capabilities.resume.is_some();
+        let can_delete = listing.capabilities.session_capabilities.delete.is_some();
+        let mut sessions: Vec<ProviderSessionEntry> = listing
+            .sessions
+            .into_iter()
+            .map(|session| ProviderSessionEntry {
+                agent: name.to_string(),
+                session_id: session.session_id,
+                cwd: session.cwd,
+                title: session.title,
+                updated_at: session.updated_at,
+                local_session_id: None,
+            })
+            .collect();
+        if let Some(store) = &self.store {
+            for entry in &mut sessions {
+                entry.local_session_id = store
+                    .find_by_external(name, &entry.session_id)
+                    .await?
+                    .map(|record| record.id);
+            }
+        }
+
+        Ok(ProviderSessionsResult {
+            agent: name.to_string(),
+            supported: listing.supported,
+            can_resume,
+            can_delete,
+            sessions,
+            next_cursor: listing.next_cursor,
+            error: (!listing.supported).then(|| {
+                format!(
+                    "agent '{name}' does not support ACP session/list \
+                     (sessionCapabilities.list is not advertised)"
+                )
+            }),
+        })
+    }
+
+    /// Delete a provider-owned session through ACP `session/delete`.
+    ///
+    /// A live Favetto session attached to the same transcript is refused, since
+    /// deleting it underneath a running turn would lose history. Favetto's local
+    /// metadata is never deleted here.
+    pub async fn delete_provider_session(
+        &self,
+        name: &str,
+        agent: Arc<Agent>,
+        provider_session_id: &str,
+    ) -> anyhow::Result<()> {
+        let live = self.sessions.lock().values().any(|session| {
+            session.agent == name
+                && session.running.load(Ordering::SeqCst)
+                && session.external_session_id.lock().as_deref() == Some(provider_session_id)
+        });
+        if live {
+            anyhow::bail!(
+                "agent '{name}' session '{provider_session_id}' is active; close it before \
+                 deleting the provider transcript"
+            );
+        }
+
+        let LaunchCommand {
+            program,
+            args,
+            env,
+            cwd: spec_cwd,
+        } = self.launch_command(name, agent.as_ref(), &BTreeMap::new())?;
+        let cwd = match spec_cwd {
+            Some(cwd) => cwd,
+            None => std::env::current_dir().map_err(|error| {
+                anyhow::anyhow!(
+                    "agent '{name}': cannot determine a working directory for session/delete: \
+                     {error}"
+                )
+            })?,
+        };
+        acp::delete_provider_session(
+            acp::AcpProviderLaunch {
+                agent: name.to_string(),
+                program,
+                args,
+                env,
+                cwd,
+                filter_cwd: None,
+                cursor: None,
+            },
+            provider_session_id.to_string(),
+        )
+        .await
     }
 
     /// A snapshot of a retained session by Favetto-local id.

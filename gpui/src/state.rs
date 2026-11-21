@@ -965,6 +965,95 @@ impl ClientState {
                     );
                 }
             },
+            Update::ProviderSessionsLoaded { provider_sessions } => {
+                self.session_history
+                    .set_provider_snapshot(provider_sessions);
+                self.touch_snapshot();
+            }
+            Update::ProviderSessionResumed {
+                agent,
+                session_id,
+                result,
+            } => {
+                match result {
+                    Ok(attached) => {
+                        let local = attached.session.id.clone();
+                        self.session_history.finish_provider_resume(
+                            &agent,
+                            &session_id,
+                            Ok(*attached),
+                        );
+                        self.show_toast(
+                            ToastKind::Success,
+                            format!(
+                                "Resumed provider session as Favetto session '{}'.",
+                                local.chars().take(8).collect::<String>()
+                            ),
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        if error.is_unauthorized() {
+                            self.connection = ConnectionState::Unauthorized {
+                                token_path: self.config.token_source.label(),
+                            };
+                        }
+                        self.session_history.finish_provider_resume(
+                            &agent,
+                            &session_id,
+                            Err(error.to_string()),
+                        );
+                        self.show_toast(
+                            ToastKind::Error,
+                            format!("Could not resume provider session '{session_id}': {error}."),
+                            cx,
+                        );
+                    }
+                }
+                // The import changed both the live roster and the durable
+                // history; the provider row needs a fresh listing too.
+                self.refresh_snapshot();
+                self.refresh_provider_sessions();
+            }
+            Update::ProviderSessionDeleted {
+                agent,
+                session_id,
+                result,
+            } => {
+                match result {
+                    Ok(()) => {
+                        self.session_history
+                            .finish_provider_delete(&agent, &session_id, Ok(()));
+                        self.show_toast(
+                            ToastKind::Success,
+                            "Provider session deleted; Favetto-local metadata is unchanged."
+                                .to_string(),
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        if error.is_unauthorized() {
+                            self.connection = ConnectionState::Unauthorized {
+                                token_path: self.config.token_source.label(),
+                            };
+                        }
+                        self.session_history.finish_provider_delete(
+                            &agent,
+                            &session_id,
+                            Err(error.to_string()),
+                        );
+                        self.show_toast(
+                            ToastKind::Error,
+                            format!("Could not delete provider session '{session_id}': {error}."),
+                            cx,
+                        );
+                    }
+                }
+                // Re-list so a successful delete disappears from the provider's
+                // own history rather than being removed optimistically.
+                self.refresh_snapshot();
+                self.refresh_provider_sessions();
+            }
             Update::TaskActionFinished {
                 action,
                 previous,
@@ -1305,6 +1394,13 @@ impl ClientState {
     pub fn ping(&mut self) {
         if let Some(runtime) = &self.runtime {
             runtime.ping();
+        }
+    }
+
+    /// Ask for a fresh provider-owned history snapshot (Settings card).
+    pub fn refresh_provider_sessions(&mut self) {
+        if let Some(runtime) = &self.runtime {
+            runtime.refresh_provider_sessions();
         }
     }
 
@@ -2316,6 +2412,90 @@ impl ClientState {
         }
     }
 
+    /// Resume a provider-owned session through `agents.provider_resume`.
+    ///
+    /// The daemon imports it into a Favetto-local record and returns that id;
+    /// only rows whose agent advertises `session/load` or `session/resume` are
+    /// actionable.
+    pub fn resume_provider_session(
+        &mut self,
+        agent: &str,
+        session_id: &str,
+        cwd: Option<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .session_history
+            .begin_provider_resume(agent, session_id)
+        {
+            self.show_toast(
+                ToastKind::Error,
+                "That provider session cannot be resumed here.".to_string(),
+                cx,
+            );
+            return;
+        }
+        match &self.runtime {
+            Some(runtime) => {
+                runtime.resume_provider_session(agent.to_string(), session_id.to_string(), cwd)
+            }
+            None => {
+                self.session_history.finish_provider_resume(
+                    agent,
+                    session_id,
+                    Err("the transport is not running".to_string()),
+                );
+                self.show_toast(
+                    ToastKind::Error,
+                    "The transport is not running, so the provider session was not resumed."
+                        .to_string(),
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Delete a provider-owned session through `agents.provider_delete`.
+    ///
+    /// Only the provider transcript is removed; Favetto's local metadata is a
+    /// separate lifecycle and remains.
+    pub fn delete_provider_session(
+        &mut self,
+        agent: &str,
+        session_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .session_history
+            .begin_provider_delete(agent, session_id)
+        {
+            self.show_toast(
+                ToastKind::Error,
+                "That provider session cannot be deleted here.".to_string(),
+                cx,
+            );
+            return;
+        }
+        match &self.runtime {
+            Some(runtime) => {
+                runtime.delete_provider_session(agent.to_string(), session_id.to_string())
+            }
+            None => {
+                self.session_history.finish_provider_delete(
+                    agent,
+                    session_id,
+                    Err("the transport is not running".to_string()),
+                );
+                self.show_toast(
+                    ToastKind::Error,
+                    "The transport is not running, so the provider session was not deleted."
+                        .to_string(),
+                    cx,
+                );
+            }
+        }
+    }
+
     /// Highlight a catalog row and load its preview when it changed.
     pub fn select_catalog_entry(&mut self, name: &str) {
         self.catalog.select(name);
@@ -2707,6 +2887,9 @@ impl ClientState {
         } else if route == Route::Settings {
             // The Agents card is the shared roster; a visit catches it up.
             self.refresh_snapshot();
+            // Provider history launches one ACP connection per agent, so it is
+            // refreshed on demand instead of on every inbox push.
+            self.refresh_provider_sessions();
         }
     }
 

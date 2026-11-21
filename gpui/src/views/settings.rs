@@ -527,7 +527,7 @@ impl SettingsView {
     }
 
     fn agents_card(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
-        let (agents, status, has_snapshot, history_rows) = {
+        let (agents, status, has_snapshot, history_rows, provider_sections) = {
             let state = self.state.read(cx);
             let history = state.session_history();
             let rows = history
@@ -542,11 +542,38 @@ impl SettingsView {
                     )
                 })
                 .collect::<Vec<_>>();
+            let provider_sections = history
+                .provider_results()
+                .iter()
+                .map(|result| {
+                    let rows = result
+                        .sessions
+                        .iter()
+                        .map(|entry| {
+                            (
+                                entry.clone(),
+                                history.provider_state(entry),
+                                history.can_resume_provider(entry),
+                                history.can_delete_provider(entry),
+                                history
+                                    .provider_transcript_preview(&entry.agent, &entry.session_id),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    (
+                        result.agent.clone(),
+                        result.error.clone(),
+                        result.supported,
+                        rows,
+                    )
+                })
+                .collect::<Vec<_>>();
             (
                 state.agent_roster().to_vec(),
                 state.snapshot_status().clone(),
                 state.has_snapshot_data(),
                 rows,
+                provider_sections,
             )
         };
         let notice: Option<Div> = match &status {
@@ -752,7 +779,9 @@ impl SettingsView {
                     let (dot, color) = match row_state {
                         SessionRowState::Active => ("●", theme.colors.success),
                         SessionRowState::Loading => ("◐", theme.colors.warning),
-                        SessionRowState::Ready => ("●", theme.colors.success),
+                        SessionRowState::Ready | SessionRowState::Provider => {
+                            ("●", theme.colors.success)
+                        }
                         SessionRowState::Ended => ("○", theme.colors.muted),
                         SessionRowState::Failed(_) | SessionRowState::Unsupported(_) => {
                             ("○", theme.colors.danger)
@@ -893,6 +922,220 @@ impl SettingsView {
                 .collect()
         };
 
+        let provider_items: Vec<_> = provider_sections
+            .iter()
+            .flat_map(|(agent, error, supported, rows)| {
+                let mut items: Vec<_> = Vec::new();
+                if let Some(error) = error {
+                    items.push(
+                        div()
+                            .px(px(theme.spacing.s2))
+                            .py(px(theme.spacing.s1))
+                            .text_size(px(theme.font.xs))
+                            .text_color(theme.colors.muted)
+                            .child(format!("{agent} provider history: {error}"))
+                            .into_any_element(),
+                    );
+                } else if !*supported {
+                    items.push(
+                        div()
+                            .px(px(theme.spacing.s2))
+                            .py(px(theme.spacing.s1))
+                            .text_size(px(theme.font.xs))
+                            .text_color(theme.colors.muted)
+                            .child(format!("{agent} does not advertise ACP session/list."))
+                            .into_any_element(),
+                    );
+                }
+                for (index, (entry, row_state, can_resume, can_delete, transcript)) in
+                    rows.iter().enumerate()
+                {
+                    let title = entry.title.clone().unwrap_or_else(|| {
+                        format!(
+                            "session {}",
+                            &entry.session_id[..entry.session_id.len().min(8)]
+                        )
+                    });
+                    let detail = row_state
+                        .detail()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| entry.cwd.display().to_string());
+                    let (dot, color) = match row_state {
+                        SessionRowState::Active => ("●", theme.colors.success),
+                        SessionRowState::Loading => ("◐", theme.colors.warning),
+                        SessionRowState::Ready | SessionRowState::Provider => {
+                            ("●", theme.colors.success)
+                        }
+                        SessionRowState::Ended => ("○", theme.colors.muted),
+                        SessionRowState::Failed(_) | SessionRowState::Unsupported(_) => {
+                            ("○", theme.colors.danger)
+                        }
+                    };
+                    let mut actions: Vec<gpui::AnyElement> = Vec::new();
+                    if *can_resume {
+                        let resume_agent = agent.clone();
+                        let resume_id = entry.session_id.clone();
+                        let resume_cwd = Some(entry.cwd.clone());
+                        actions.push(
+                            div()
+                                .id(("settings-provider-resume", index))
+                                .h(px(theme.controls.min))
+                                .px(px(theme.spacing.s2))
+                                .flex()
+                                .items_center()
+                                .rounded(px(theme.radii.r8))
+                                .bg(Hsla::from(theme.colors.accent).opacity(0.16))
+                                .text_size(px(theme.font.xs))
+                                .text_color(theme.colors.accent)
+                                .cursor_pointer()
+                                .child("Resume")
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                    this.state.update(cx, |state, cx| {
+                                        state.resume_provider_session(
+                                            &resume_agent,
+                                            &resume_id,
+                                            resume_cwd.clone(),
+                                            cx,
+                                        );
+                                        cx.notify();
+                                    });
+                                }))
+                                .into_any_element(),
+                        );
+                    }
+                    if *can_delete {
+                        let delete_agent = agent.clone();
+                        let delete_id = entry.session_id.clone();
+                        actions.push(
+                            div()
+                                .id(("settings-provider-delete", index))
+                                .h(px(theme.controls.min))
+                                .px(px(theme.spacing.s2))
+                                .flex()
+                                .items_center()
+                                .rounded(px(theme.radii.r8))
+                                .bg(Hsla::from(theme.colors.danger).opacity(0.14))
+                                .text_size(px(theme.font.xs))
+                                .text_color(theme.colors.danger)
+                                .cursor_pointer()
+                                .child("Delete")
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                    this.state.update(cx, |state, cx| {
+                                        state.delete_provider_session(
+                                            &delete_agent,
+                                            &delete_id,
+                                            cx,
+                                        );
+                                        cx.notify();
+                                    });
+                                }))
+                                .into_any_element(),
+                        );
+                    }
+                    if actions.is_empty() {
+                        actions.push(
+                            div()
+                                .text_size(px(theme.font.xs))
+                                .text_color(theme.colors.muted)
+                                .child(row_state.label())
+                                .into_any_element(),
+                        );
+                    }
+                    let row = div()
+                        .id(("settings-provider", index))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .px(px(theme.spacing.s2))
+                        .py(px(theme.spacing.s1))
+                        .border_b_1()
+                        .border_color(theme.colors.border)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(theme.spacing.s3))
+                                .child(
+                                    div()
+                                        .w(px(170.0))
+                                        .flex_shrink_0()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(theme.font.sm))
+                                        .text_color(theme.colors.text)
+                                        .child(title),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(120.0))
+                                        .flex_shrink_0()
+                                        .truncate()
+                                        .font_family("monospace")
+                                        .text_size(px(theme.font.xs))
+                                        .text_color(theme.colors.muted)
+                                        .child(agent.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(theme.font.xs))
+                                        .text_color(theme.colors.muted)
+                                        .child(detail),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(92.0))
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(theme.spacing.s1))
+                                        .text_size(px(theme.font.xs))
+                                        .text_color(color)
+                                        .child(dot)
+                                        .child(
+                                            div()
+                                                .text_color(theme.colors.text)
+                                                .child(row_state.label()),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(156.0))
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(theme.spacing.s1))
+                                        .children(actions),
+                                ),
+                        )
+                        .when_some(transcript.clone(), |row, text: String| {
+                            let text = if text.trim().is_empty() {
+                                "The provider resumed without a replayed transcript.".to_string()
+                            } else {
+                                text
+                            };
+                            row.child(
+                                div()
+                                    .mx(px(theme.spacing.s2))
+                                    .mb(px(theme.spacing.s1))
+                                    .p(px(theme.spacing.s2))
+                                    .rounded(px(theme.radii.r8))
+                                    .bg(Hsla::from(theme.colors.border).opacity(0.25))
+                                    .font_family("monospace")
+                                    .text_size(px(theme.font.xs))
+                                    .text_color(theme.colors.text)
+                                    .whitespace_normal()
+                                    .child(text),
+                            )
+                        });
+                    items.push(row.into_any_element());
+                }
+                items
+            })
+            .collect();
+
         card(theme)
             .child(components::section_label(theme, "AGENTS"))
             .child(hint(
@@ -926,7 +1169,7 @@ impl SettingsView {
                     .child(components::section_label(theme, "PAST SESSIONS"))
                     .child(hint(
                         theme,
-                        "Loading a past session restores the agent's own conversation by Favetto-local id; it never starts a fresh session. Only sessions Favetto created are listed.",
+                        "Loading a past session restores the agent's own conversation by Favetto-local id; it never starts a fresh session. Provider rows come from the agent's ACP session/list and are imported only when resumed.",
                     ))
                     .child(
                         div()
@@ -945,7 +1188,8 @@ impl SettingsView {
                             .child(div().w(px(96.0)).child("UPDATED"))
                             .child(div().w(px(96.0)).child("ACTION")),
                     )
-                    .child(div().flex().flex_col().children(history_items)),
+                    .child(div().flex().flex_col().children(history_items))
+                    .child(div().flex().flex_col().children(provider_items)),
             )
     }
 

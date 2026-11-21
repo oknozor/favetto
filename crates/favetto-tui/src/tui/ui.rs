@@ -7,8 +7,8 @@ use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Bar, BarChart, Block, BorderType, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table,
-    TableState, Wrap,
+    Bar, BarChart, Block, BorderType, Borders, Cell, Clear, List, ListItem, ListState, Paragraph,
+    Row, Table, TableState, Wrap,
 };
 use ratatui::Frame;
 
@@ -194,6 +194,16 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
         draw_task_result(frame, task, launch.as_ref(), theme);
         return;
     }
+    if let Popup::Sessions {
+        selected, filter, ..
+    } = &app.popup
+    {
+        let selected = *selected;
+        let filter = filter.value().to_string();
+        let sessions = app.filtered_sessions();
+        draw_sessions_picker(frame, selected, &sessions, &filter, theme);
+        return;
+    }
     match &mut app.popup {
         Popup::None => {}
         Popup::Menu { .. } => {}
@@ -219,9 +229,8 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
                 theme,
             },
         ),
-        Popup::Sessions { selected, sessions } => {
-            draw_sessions_picker(frame, *selected, sessions, theme)
-        }
+        // Handled above, before `popup` is borrowed.
+        Popup::Sessions { .. } => {}
         Popup::SessionOptions(popup) => draw_session_options(frame, popup, theme),
         Popup::Reply(prompt) => draw_reply(frame, prompt, theme),
         Popup::Confirm(prompt) => {
@@ -715,10 +724,11 @@ fn draw_sessions_picker(
     frame: &mut Frame,
     selected: usize,
     sessions: &[SessionPickerEntry],
+    filter: &str,
     theme: Theme,
 ) {
     let area = frame.area();
-    let rect = centered_rect(area, 70, (sessions.len() as u16).saturating_add(2));
+    let rect = centered_rect(area, 70, (sessions.len() as u16).saturating_add(4));
 
     let items: Vec<ListItem> = sessions
         .iter()
@@ -768,18 +778,24 @@ fn draw_sessions_picker(
         })
         .collect();
 
+    let title = if filter.is_empty() {
+        " Ctrl+O — Agent sessions · type to filter · Ctrl+D delete provider ".to_string()
+    } else {
+        format!(" Ctrl+O — Agent sessions · filter: {filter} ")
+    };
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .title(" Ctrl+O — Agent sessions ")
+                .title(title)
                 .style(theme.dialog_style())
                 .border_style(theme.focused()),
         )
         .highlight_style(Style::default().add_modifier(Modifier::BOLD));
     draw_dialog_shell(frame, rect, theme);
-    frame.render_widget(list, rect);
+    let mut state = ListState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(list, rect, &mut state);
 }
 
 /// Draw the Ctrl+P "Switch repo" picker: a live search input plus the filtered

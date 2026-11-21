@@ -113,7 +113,7 @@ impl App {
             Popup::Help { .. } => return self.handle_help_key(key.code),
             Popup::Workflow { .. } => return self.handle_workflow_key(key.code),
             Popup::WorkflowRuntime(_) => return self.handle_workflow_runtime_key(key.code),
-            Popup::Sessions { .. } => return self.handle_sessions_key(key.code),
+            Popup::Sessions { .. } => return self.handle_sessions_key(key),
             Popup::SessionOptions(_) => return self.handle_session_options_key(key.code),
             Popup::Reply(_) => return self.handle_reply_key(key),
             Popup::Confirm(_) => return self.handle_confirm_key(key.code),
@@ -707,10 +707,14 @@ impl App {
         }
     }
 
-    /// Keys while the Ctrl+O session picker is open: arrows move, Enter attaches,
-    /// Esc (or Ctrl+O) closes.
-    pub(super) fn handle_sessions_key(&mut self, code: KeyCode) -> UiAction {
-        match code {
+    /// Keys while the Ctrl+O session picker is open: arrows move, printable
+    /// characters filter, Enter attaches/loads/resumes, Ctrl+D deletes a
+    /// provider-owned row when the agent advertises `session/delete`, Esc (or
+    /// Ctrl+O) closes.
+    pub(super) fn handle_sessions_key(&mut self, key: KeyEvent) -> UiAction {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
             KeyCode::Esc => {
                 self.popup = Popup::None;
                 UiAction::None
@@ -722,29 +726,90 @@ impl App {
                 UiAction::None
             }
             KeyCode::Down => {
-                if let Popup::Sessions { selected, sessions } = &mut self.popup {
-                    *selected = (*selected + 1).min(sessions.len().saturating_sub(1));
+                let len = self.filtered_sessions().len();
+                if let Popup::Sessions { selected, .. } = &mut self.popup {
+                    *selected = (*selected + 1).min(len.saturating_sub(1));
                 }
                 UiAction::None
             }
-            KeyCode::Enter => {
-                let entry = match &self.popup {
-                    Popup::Sessions { selected, sessions } => sessions.get(*selected).cloned(),
-                    _ => None,
-                };
+            KeyCode::Backspace => {
+                if let Popup::Sessions { filter, .. } = &mut self.popup {
+                    filter.backspace();
+                }
+                self.clamp_session_picker_selection();
+                UiAction::None
+            }
+            KeyCode::Char('d') if ctrl => {
+                let entry = self
+                    .filtered_sessions()
+                    .get(match &self.popup {
+                        Popup::Sessions { selected, .. } => *selected,
+                        _ => 0,
+                    })
+                    .cloned();
                 match entry {
-                    Some(entry)
-                        if matches!(
-                            entry.action,
-                            SessionPickerAction::Attach | SessionPickerAction::Load
-                        ) =>
-                    {
+                    Some(entry) if entry.deletable => match entry.provider_session_id {
+                        Some(provider_session_id) => {
+                            self.popup = Popup::None;
+                            self.agent_error = None;
+                            UiAction::DeleteProviderSession {
+                                agent: entry.agent,
+                                provider_session_id,
+                            }
+                        }
+                        None => {
+                            self.popup = Popup::None;
+                            self.agent_error = Some(
+                                "only provider-owned sessions can be deleted here".to_string(),
+                            );
+                            UiAction::None
+                        }
+                    },
+                    Some(entry) if entry.provider_session_id.is_some() => {
+                        self.popup = Popup::None;
+                        self.agent_error = Some(format!(
+                            "agent '{}' does not support deleting provider sessions \
+                             (session/delete)",
+                            entry.agent
+                        ));
+                        UiAction::None
+                    }
+                    // Ctrl+D on a Favetto-local row is a no-op; local metadata
+                    // is a separate lifecycle from provider transcript deletion.
+                    Some(_) | None => UiAction::None,
+                }
+            }
+            KeyCode::Char(c) if !ctrl && !alt => {
+                if let Popup::Sessions { filter, .. } = &mut self.popup {
+                    filter.insert_char(c);
+                }
+                self.clamp_session_picker_selection();
+                UiAction::None
+            }
+            KeyCode::Enter => {
+                let entry = self
+                    .filtered_sessions()
+                    .get(match &self.popup {
+                        Popup::Sessions { selected, .. } => *selected,
+                        _ => 0,
+                    })
+                    .cloned();
+                match entry {
+                    Some(entry) if entry.action != SessionPickerAction::None => {
                         self.popup = Popup::None;
                         self.agent_error = None;
-                        match entry.action {
-                            SessionPickerAction::Attach => UiAction::AttachSession(entry.id),
-                            SessionPickerAction::Load => UiAction::LoadSession(entry.id),
-                            SessionPickerAction::None => UiAction::None,
+                        match (entry.action, entry.provider_session_id) {
+                            (SessionPickerAction::Attach, _) => UiAction::AttachSession(entry.id),
+                            (SessionPickerAction::Load, _) => UiAction::LoadSession(entry.id),
+                            (SessionPickerAction::ResumeProvider, Some(provider_session_id)) => {
+                                UiAction::ResumeProviderSession {
+                                    agent: entry.agent,
+                                    provider_session_id,
+                                    cwd: entry.cwd,
+                                }
+                            }
+                            (SessionPickerAction::ResumeProvider, None) => UiAction::None,
+                            (SessionPickerAction::None, _) => UiAction::None,
                         }
                     }
                     Some(entry) => {
