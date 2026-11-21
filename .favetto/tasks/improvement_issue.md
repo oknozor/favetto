@@ -1,4 +1,4 @@
-# repo:Favetto/improvement_issue — file one self-improvement issue every 2 hours.
+# repo:favetto/improvement_issue — file one self-improvement issue every 2 hours.
 #
 # A read-only scout: it inspects the checkout, picks the single highest-value
 # non-feature improvement (refactoring, code quality, performance, tests, CI,

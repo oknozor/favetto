@@ -1,9 +1,9 @@
-# repo:Favetto/design_supervisor — drive one document in docs/design/ to completion.
+# repo:favetto/design_supervisor — drive one document in docs/design/ to completion.
 #
 # The supervisor is a *client* of the favetto MCP, like the reference supervisor
 # in crates/favetto-tui/examples/reference_supervisor.rs. It reads the selected
 # design, decomposes it into a dependency-ordered GitHub backlog, then drives the
-# existing repo:Favetto/* catalog pipeline (triage -> plan -> implement -> merge)
+# existing repo:favetto/* catalog pipeline (triage -> plan -> implement -> merge)
 # through the MCP. Because one agent run cannot outlive a multi-day design
 # program, it re-arms itself by spawning this same task as a new root with the
 # next `round`, and stops by writing an empty manifest.
@@ -11,7 +11,7 @@ agent = "opencode"
 provider = "opencode-go"
 model = "deepseek-v4.1-flash"
 worktree = false
-spawn = "repo:Favetto/design_supervisor"
+spawn = "repo:favetto/design_supervisor"
 spawn_file = ".favetto/design/{{ input.design }}/next.json"
 spawn_new_root = true
 
@@ -107,7 +107,7 @@ the actual tree — the document may be stale. Classify each item as:
 ## 2. Build the backlog
 
 Decompose the implementable items into a dependency-ordered backlog where **one
-item is one `repo:Favetto/implement_issue` run** — a single crate/module, a clear
+item is one `repo:favetto/implement_issue` run** — a single crate/module, a clear
 acceptance test, and no upstream design debate. Prefer vertical slices that
 leave the tree green. Honor the repository's own guidance: keep the blast radius
 to the affected crate.
@@ -161,7 +161,7 @@ per observation, then re-inspect.
 
 ### Bootstrap
 
-- `favetto_start_task` with `name = "repo:Favetto/triage_issues"` and `input = {}` →
+- `favetto_start_task` with `name = "repo:favetto/triage_issues"` and `input = {}` →
   capture the returned root id.
 - The catalog is declarative: triage fans out to `plan_issue`, each plan to
   `implement_issue`, and `merge_implementations` fires on
@@ -189,8 +189,8 @@ Repeat until a stop condition:
 4. `favetto_wait` with `until = ["task_finished", "task_awaiting_input"]` and
    `timeout_ms = 120000` (the cap) instead of busy-polling.
 5. Discover new roots: `favetto_list_tasks` and/or `favetto_events_tail`. Any
-   root whose task is `repo:Favetto/triage_issues`, `repo:Favetto/merge_implementations`,
-   or `repo:Favetto/merge_pending`, created after you started, belongs to this
+   root whose task is `repo:favetto/triage_issues`, `repo:favetto/merge_implementations`,
+   or `repo:favetto/merge_pending`, created after you started, belongs to this
    program. Add it to the ledger in `state.json`.
 6. Re-check GitHub: `search_issues` for the tracking issue and its open
    sub-issues. If no root is active, actionable design issues remain, and
@@ -234,7 +234,7 @@ Always write both files, then write the spawn manifest:
 - `.favetto/design/{{ input.design }}/state.json` — machine-readable resume
   state: `{"design","tracking_issue","roots","cursor","round","processed_issues","phase","updated_at"}`.
 - `.favetto/design/{{ input.design }}/next.json` — the **spawn manifest**. On
-  success this task spawns `repo:Favetto/design_supervisor` as a fresh root, so this
+  success this task spawns `repo:favetto/design_supervisor` as a fresh root, so this
   file decides what happens next:
   - resume another round:
     `[{"design":"{{ input.design }}","repo":"{{ input.repo }}","file_issues":false,"autonomy":"{{ input.autonomy }}","round":2,"max_rounds":12}]`
@@ -246,7 +246,7 @@ Always write both files, then write the spawn manifest:
 
 If you stop with pull requests still open and the pipeline is no longer running,
 start the standalone merge queue so it drains without you:
-`favetto_start_task` with `name = "repo:Favetto/merge_pending"` and `input = {}`.
+`favetto_start_task` with `name = "repo:favetto/merge_pending"` and `input = {}`.
 Record the root in the report. Prefer the pipeline's own merge step when a
 workflow is still active.
 
@@ -255,7 +255,7 @@ workflow is still active.
 - `main` is linear: integration is rebase-only. Never create a merge commit,
   never squash, never push to `main` directly.
 - You do not write product code in this task. Delegate implementation to
-  `repo:Favetto/implement_issue` (or a spawned task) so it runs in a worktree under
+  `repo:favetto/implement_issue` (or a spawned task) so it runs in a worktree under
   the repository gates. Your own writes are limited to the coordination files
   under `.favetto/design/` and to GitHub issues.
 - `.favetto/` is gitignored; never commit it.
