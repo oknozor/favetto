@@ -48,6 +48,7 @@ pub struct DetailView {
     back_focus: FocusHandle,
     tab_focus: Vec<FocusHandle>,
     cancel_focus: FocusHandle,
+    interrupt_focus: FocusHandle,
     retry_focus: FocusHandle,
     copy_focus: FocusHandle,
     workflow_focus: FocusHandle,
@@ -103,6 +104,7 @@ impl DetailView {
                 })
                 .collect(),
             cancel_focus: cx.focus_handle().tab_index(53).tab_stop(true),
+            interrupt_focus: cx.focus_handle().tab_index(68).tab_stop(true),
             retry_focus: cx.focus_handle().tab_index(54).tab_stop(true),
             copy_focus: cx.focus_handle().tab_index(55).tab_stop(true),
             session_focus: cx.focus_handle().tab_index(51).tab_stop(true),
@@ -244,6 +246,31 @@ impl DetailView {
             .map(|duration| inbox::format_duration(Some(duration)))
             .unwrap_or_else(|| "—".to_string());
         let usage = detail::usage_summary(data.usage);
+        let (live_session, cancel_pending) = {
+            let state = self.state.read(cx);
+            (
+                state.detail_live_session_id(),
+                state.detail_turn_cancel_pending(),
+            )
+        };
+
+        let interrupt = live_session.map(|_| {
+            self.interrupt_button(
+                theme,
+                if cancel_pending {
+                    "Interrupting…"
+                } else {
+                    "Interrupt turn"
+                },
+                !cancel_pending,
+                cx.listener(|this, _event, _window, cx| {
+                    this.state.update(cx, |state, cx| {
+                        state.interrupt_detail_turn(cx);
+                        cx.notify();
+                    });
+                }),
+            )
+        });
 
         let workflow = self.action_button(
             theme,
@@ -411,6 +438,7 @@ impl DetailView {
                         row.child(div().flex_1().min_w_0().child(session))
                     })
                     .when(data.session_id.is_none(), |row| row.child(div().flex_1()))
+                    .when_some(interrupt, |row, interrupt| row.child(interrupt))
                     .child(workflow)
                     .child(cancel)
                     .child(retry)
@@ -480,6 +508,46 @@ impl DetailView {
                 .track_focus(focus)
                 .child(label)
                 .on_click(on_click),
+            theme,
+        )
+    }
+
+    /// The header's turn-interrupt control. It is disabled while a cancellation
+    /// is in flight, so a double click cannot send a second `agents.cancel`.
+    fn interrupt_button(
+        &self,
+        theme: &Theme,
+        label: &'static str,
+        enabled: bool,
+        on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+    ) -> Stateful<Div> {
+        components::with_focus(
+            div()
+                .id("detail-interrupt")
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .h(px(theme.controls.min))
+                .px(px(theme.spacing.s2))
+                .rounded(px(theme.radii.r4))
+                .border_1()
+                .border_color(Hsla::from(theme.colors.border))
+                .text_size(px(theme.font.xs))
+                .when(enabled, |button| {
+                    button
+                        .text_color(theme.colors.text)
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.colors.bg))
+                        .track_focus(&self.interrupt_focus)
+                        .on_click(on_click)
+                })
+                .when(!enabled, |button| {
+                    button
+                        .text_color(theme.colors.muted)
+                        .opacity(0.55)
+                        .cursor_default()
+                })
+                .child(label),
             theme,
         )
     }

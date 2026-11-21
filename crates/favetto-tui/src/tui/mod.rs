@@ -938,6 +938,9 @@ async fn run_session(
                             UiAction::Reply { session_id, request_id, reply } => {
                                 send_agent_reply(client, app, session_id, request_id, reply).await;
                             }
+                            UiAction::CancelTurn(session_id) => {
+                                cancel_agent_turn(client, app, session_id).await;
+                            }
                             UiAction::TaskCommand { method, params } => {
                                 task_command(client, app, method, params).await;
                             }
@@ -1514,6 +1517,40 @@ async fn send_agent_reply(
         Err(e) => app.agent_error = Some(e.to_string()),
     }
     fetch_agent_sessions(client, app).await;
+}
+
+/// Interrupt the attached ACP session's in-flight turn (`agents.cancel`).
+///
+/// This is distinct from `tasks.cancel`: the task stays alive and a follow-up
+/// prompt can be sent once the turn settles. The daemon pushes the resulting
+/// `Idle { Interrupted }` event, which the feed renders as "Turn interrupted".
+async fn cancel_agent_turn(client: &Client, app: &mut App, session_id: String) {
+    match client
+        .request(
+            method::AGENTS_CANCEL,
+            serde_json::json!({ "session_id": session_id }),
+        )
+        .await
+    {
+        Ok(resp) => match resp.result {
+            Some(_) => {
+                app.agent_status = "cancelling turn…".to_string();
+                app.logs.push_back("agents.cancel: ok".to_string());
+            }
+            None => {
+                let message = resp
+                    .error
+                    .as_ref()
+                    .map(|e| e.message.clone())
+                    .unwrap_or_else(|| "agents.cancel failed".to_string());
+                app.agent_error = Some(message);
+            }
+        },
+        Err(e) => {
+            app.agent_error = Some(e.to_string());
+            app.logs.push_back(format!("agents.cancel failed: {e}"));
+        }
+    }
 }
 
 /// Apply a task command (`tasks.cancel`, `tasks.retry`, `workflow.cancel`).

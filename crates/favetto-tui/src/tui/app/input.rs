@@ -110,6 +110,21 @@ impl App {
             return self.forward_agent_key(&key);
         }
 
+        // Ctrl+C interrupts the attached ACP session's current turn when favetto
+        // (not the agent) owns the keyboard. It is intentionally unavailable to a
+        // PTY-backed agent: there Ctrl+C belongs to the agent and is forwarded
+        // under capture. Task/workflow cancellation keeps its own `c` bindings.
+        if ctrl
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+            && self.tab == Tab::Agent
+            && self.agent_backend == AgentBackend::Acp
+            && self.agent_running
+        {
+            if let Some(session_id) = self.agent_session_id.clone() {
+                return UiAction::CancelTurn(session_id);
+            }
+        }
+
         // Ctrl+X arms the leader (shortcut) mode: the next key runs a palette
         // command (for example Ctrl+X h opens the docs). Under agent capture the
         // branch above forwards it to the PTY instead, matching Ctrl+P.

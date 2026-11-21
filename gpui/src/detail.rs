@@ -582,6 +582,9 @@ pub struct TaskDetail {
     pub new_events: u64,
     /// The request id with an in-flight `agents.reply`.
     pub reply_pending: Option<String>,
+    /// The live session id whose turn has an in-flight/cancelling
+    /// `agents.cancel`. Cleared when the turn reports idle or the RPC fails.
+    pub turn_cancel_pending: Option<String>,
     /// The request id most recently answered, hidden until a new request arrives.
     pub answered_request: Option<String>,
 }
@@ -610,6 +613,7 @@ impl TaskDetail {
             follow: true,
             new_events: 0,
             reply_pending: None,
+            turn_cancel_pending: None,
             answered_request: None,
         }
     }
@@ -651,6 +655,7 @@ impl TaskDetail {
             self.runs_loaded = false;
             self.answered_request = None;
             self.reply_pending = None;
+            self.turn_cancel_pending = None;
         } else if task.output.is_none() {
             if let Some(existing) = &self.task {
                 task.output = existing.output.clone();
@@ -1028,6 +1033,13 @@ mod tests {
         assert!(summary.contains("1.5k tok"));
         assert!(usage_summary(None).is_none());
         assert!(usage_summary(Some(&AgentUsage::default())).is_none());
+    }
+
+    #[test]
+    fn a_new_detail_has_no_pending_turn_interrupt() {
+        let detail = TaskDetail::new(Uuid::from_u128(7));
+        assert!(detail.turn_cancel_pending.is_none());
+        assert!(detail.reply_pending.is_none());
     }
 
     #[test]

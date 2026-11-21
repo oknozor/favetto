@@ -485,6 +485,28 @@ impl ClientState {
                                 detail.push_event(event.clone());
                             }
                         }
+                        // The cancelled turn's Idle event is the final feedback
+                        // for an interrupt: re-enable the control and confirm
+                        // that the agent stopped without cancelling the task.
+                        if matches!(
+                            event.event,
+                            favetto_wire::model::AgentStateEvent::Idle { .. }
+                        ) {
+                            let matching = self.detail.as_ref().is_some_and(|detail| {
+                                detail.turn_cancel_pending.as_deref()
+                                    == Some(event.session_id.as_str())
+                            });
+                            if matching {
+                                if let Some(detail) = self.detail.as_mut() {
+                                    detail.turn_cancel_pending = None;
+                                }
+                                self.show_toast(
+                                    ToastKind::Success,
+                                    "The agent's current turn stopped.".to_string(),
+                                    cx,
+                                );
+                            }
+                        }
                         self.refresh_snapshot();
                     }
                     // A blocked or resolved prompt changes the agent roster,
@@ -530,6 +552,34 @@ impl ClientState {
                 self.session_history.set_entries(history);
                 self.touch_snapshot();
                 self.snapshot_status = SnapshotStatus::Loaded;
+                // A cancelled turn that has already stopped may never deliver
+                // its Idle push before the roster refresh. Re-enable the control
+                // here as a second, roster-based signal.
+                let interrupted = self
+                    .detail
+                    .as_ref()
+                    .and_then(|detail| detail.turn_cancel_pending.clone());
+                if let Some(session_id) = interrupted {
+                    let stopped = self
+                        .sessions
+                        .iter()
+                        .find(|session| session.id == session_id)
+                        .is_none_or(|session| {
+                            !session.running
+                                || session.activity
+                                    == Some(favetto_wire::model::AgentActivity::Idle)
+                        });
+                    if stopped {
+                        if let Some(detail) = self.detail.as_mut() {
+                            detail.turn_cancel_pending = None;
+                        }
+                        self.show_toast(
+                            ToastKind::Success,
+                            "The agent's current turn stopped.".to_string(),
+                            cx,
+                        );
+                    }
+                }
                 // The Workflows root list is derived from this same snapshot,
                 // so a recovered daemon fills it without another RPC. The open
                 // root re-joins its dependency labels against the new rows.
@@ -746,6 +796,47 @@ impl ClientState {
                 // keeps the banner's request text in step.
                 self.refresh_snapshot();
             }
+            Update::TurnCancelFinished { session_id, result } => match result {
+                Ok(result) if result.cancelled => {
+                    // Keep the control disabled until the turn actually reports
+                    // Idle (or the roster shows it stopped).
+                    self.show_toast(
+                        ToastKind::Info,
+                        "Interrupting the agent's current turn…".to_string(),
+                        cx,
+                    );
+                    self.refresh_snapshot();
+                }
+                Ok(_) => {
+                    if let Some(detail) = self.detail.as_mut() {
+                        if detail.turn_cancel_pending.as_deref() == Some(session_id.as_str()) {
+                            detail.turn_cancel_pending = None;
+                        }
+                    }
+                    self.show_toast(
+                        ToastKind::Error,
+                        "The daemon did not request a turn interrupt.".to_string(),
+                        cx,
+                    );
+                }
+                Err(error) => {
+                    if let Some(detail) = self.detail.as_mut() {
+                        if detail.turn_cancel_pending.as_deref() == Some(session_id.as_str()) {
+                            detail.turn_cancel_pending = None;
+                        }
+                    }
+                    if error.is_unauthorized() {
+                        self.connection = ConnectionState::Unauthorized {
+                            token_path: self.config.token_source.label(),
+                        };
+                    }
+                    self.show_toast(
+                        ToastKind::Error,
+                        format!("Could not interrupt the agent's turn: {error}."),
+                        cx,
+                    );
+                }
+            },
             Update::AgentSessionLoaded { session_id, result } => {
                 match result {
                     Ok(attached) => {
@@ -3266,6 +3357,60 @@ impl ClientState {
                 self.selected_task()
                     .and_then(|task| task.session_id.clone())
             })
+    }
+
+    /// The Favetto-local id of the live agent session running the open task.
+    ///
+    /// This is the routing key for `agents.cancel`; the provider's ACP id
+    /// returned by [`detail_session_id`](Self::detail_session_id) is display
+    /// metadata and must not be sent to the daemon.
+    pub fn detail_live_session_id(&self) -> Option<String> {
+        let detail = self.detail.as_ref()?;
+        let task_id = detail.task_id.to_string();
+        self.sessions
+            .iter()
+            .find(|session| session.running && session.task_id.as_deref() == Some(task_id.as_str()))
+            .map(|session| session.id.clone())
+    }
+
+    /// Whether an `agents.cancel` round trip is in flight (or the cancelled turn
+    /// has not reported idle yet). The Interrupt button is disabled while true.
+    pub fn detail_turn_cancel_pending(&self) -> bool {
+        self.detail
+            .as_ref()
+            .is_some_and(|detail| detail.turn_cancel_pending.is_some())
+    }
+
+    /// Interrupt the current agent turn of the open task, leaving the task and
+    /// its session alive. Distinct from `tasks.cancel`, which is terminal.
+    pub fn interrupt_detail_turn(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self.detail_live_session_id() else {
+            self.show_toast(
+                ToastKind::Info,
+                "No live agent turn is running for this task.".to_string(),
+                cx,
+            );
+            return;
+        };
+        if self.detail_turn_cancel_pending() {
+            return;
+        }
+        if let Some(detail) = self.detail.as_mut() {
+            detail.turn_cancel_pending = Some(session_id.clone());
+        }
+        match &self.runtime {
+            Some(runtime) => runtime.cancel_turn(session_id),
+            None => {
+                if let Some(detail) = self.detail.as_mut() {
+                    detail.turn_cancel_pending = None;
+                }
+                self.show_toast(
+                    ToastKind::Error,
+                    "The transport is not running, so the turn was not interrupted.".to_string(),
+                    cx,
+                );
+            }
+        }
     }
 
     /// Retry the persisted-output fetch for the open detail.

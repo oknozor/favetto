@@ -156,6 +156,55 @@ pub(crate) enum AcpCommand {
     Shutdown,
 }
 
+/// Cancellation state for the one prompt turn that can be in flight at a time.
+///
+/// ACP sessions are long-lived and accept successive prompts, so cancellation
+/// must be scoped to a turn rather than to the connection. `generation` changes
+/// at every turn boundary; permission requests carry the generation that was
+/// active when they arrived, which lets the cancel path settle exactly the
+/// requests that belong to the cancelled turn.
+#[derive(Debug, Default)]
+struct TurnState {
+    generation: u64,
+    active: bool,
+    cancel_requested: bool,
+}
+
+impl TurnState {
+    /// Start a new turn. Cancellation from the previous turn never leaks into
+    /// the next one.
+    fn begin(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.active = true;
+        self.cancel_requested = false;
+        self.generation
+    }
+
+    /// The turn finished (or failed): later cancels must not send another
+    /// notification until a new prompt starts.
+    fn finish(&mut self) {
+        self.active = false;
+        self.cancel_requested = false;
+    }
+
+    /// Claim cancellation for the active turn. Returns the generation to settle,
+    /// or `None` when the connection is idle or this turn was already cancelled.
+    fn request_cancel(&mut self) -> Option<u64> {
+        if !self.active || self.cancel_requested {
+            return None;
+        }
+        self.cancel_requested = true;
+        Some(self.generation)
+    }
+
+    /// Whether `generation` is the active turn and already cancelled. A
+    /// permission request that arrives during cancellation is answered
+    /// `cancelled` immediately instead of blocking until the timeout.
+    fn is_cancelled(&self, generation: u64) -> bool {
+        self.active && self.cancel_requested && self.generation == generation
+    }
+}
+
 /// The structured result of the session's turns so far.
 #[derive(Debug, Default, Clone)]
 pub struct AcpOutcome {
@@ -309,12 +358,14 @@ pub(crate) fn spawn(
     let transcript = Arc::new(Mutex::new(String::new()));
     let outcome = Arc::new(Mutex::new(AcpOutcome::default()));
     let tools = Arc::new(Mutex::new(ToolTracker::default()));
+    let turn = Arc::new(Mutex::new(TurnState::default()));
 
     let responder = Arc::new(AcpResponder {
         policy: launch.policy,
         events: events_tx.clone(),
         pending: Mutex::new(HashMap::new()),
         timeout: launch.permission_timeout,
+        turn: turn.clone(),
     });
 
     let transport = Lines::new(sink_from_stdin(stdin), lossy_lines(stdout.compat()));
@@ -351,6 +402,8 @@ pub(crate) fn spawn(
     let result_events = events_tx.clone();
     let connection_outcome = outcome.clone();
     let capability_slot = capabilities.clone();
+    let prompt_turn = turn.clone();
+    let control_responder = responder.clone();
     let mode = launch.mode;
     let (load_tx, load_rx) = match &mode {
         AcpSessionMode::Load { .. } => {
@@ -615,17 +668,29 @@ pub(crate) fn spawn(
                     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
                     let control_connection = connection.clone();
                     let control_session = session_id.clone();
-                    let mut cancel_pending = false;
+                    let control_turn = prompt_turn.clone();
                     tokio::spawn(async move {
                         while let Some(command) = commands_rx.recv().await {
                             match command {
                                 AcpCommand::Cancel => {
-                                    if !cancel_pending {
-                                        cancel_pending = true;
-                                        let _ = control_connection.send_notification(
-                                            CancelNotification::new(control_session.clone()),
-                                        );
-                                    }
+                                    let Some(generation) = control_turn.lock().request_cancel()
+                                    else {
+                                        continue;
+                                    };
+                                    // ACP requires every pending permission request
+                                    // for the cancelled turn to be answered
+                                    // `cancelled` before the agent is left to
+                                    // unwind. Settle them first, then notify.
+                                    let settled = control_responder.cancel_turn(generation);
+                                    tracing::debug!(
+                                        target: "favetto::acp",
+                                        generation,
+                                        settled,
+                                        "cancelling ACP turn"
+                                    );
+                                    let _ = control_connection.send_notification(
+                                        CancelNotification::new(control_session.clone()),
+                                    );
                                 }
                                 AcpCommand::Shutdown => {
                                     let _ = control_connection.send_notification(
@@ -657,6 +722,9 @@ pub(crate) fn spawn(
                             }
                         };
 
+                        // A new prompt is a new turn: cancellation reset here,
+                        // never at connection lifetime.
+                        prompt_turn.lock().begin();
                         let response = connection
                             .send_request(PromptRequest::new(
                                 session_id.clone(),
@@ -665,6 +733,10 @@ pub(crate) fn spawn(
                             .block_task()
                             .await;
                         turns += 1;
+                        // The turn boundary closes immediately when the prompt
+                        // response arrives (or the request fails), so a cancel
+                        // that races the end cannot poison the next turn.
+                        prompt_turn.lock().finish();
 
                         let (stop_reason, turn_outcome) = match response {
                             Ok(response) => {
@@ -806,8 +878,15 @@ pub(crate) fn spawn(
 pub(crate) struct AcpResponder {
     policy: PermissionPolicy,
     events: mpsc::UnboundedSender<AcpEvent>,
-    pending: Mutex<HashMap<String, oneshot::Sender<InputReply>>>,
+    pending: Mutex<HashMap<String, PendingPermission>>,
     timeout: Duration,
+    turn: Arc<Mutex<TurnState>>,
+}
+
+/// One outstanding `ask` permission request, tagged with the turn that owns it.
+struct PendingPermission {
+    generation: u64,
+    reply: oneshot::Sender<InputReply>,
 }
 
 impl AcpResponder {
@@ -816,6 +895,13 @@ impl AcpResponder {
             PermissionPolicy::Allow => Self::response_for(request, InputReply::Once),
             PermissionPolicy::Deny => Self::response_for(request, InputReply::Reject),
             PermissionPolicy::Ask => {
+                let (generation, already_cancelled) = {
+                    let turn = self.turn.lock();
+                    (turn.generation, turn.is_cancelled(turn.generation))
+                };
+                if already_cancelled {
+                    return Self::response_for(request, InputReply::Cancelled);
+                }
                 let id = format!("acp-perm-{}", request.tool_call.tool_call_id.0);
                 let title = request
                     .tool_call
@@ -825,7 +911,13 @@ impl AcpResponder {
                     .or_else(|| request.tool_call.fields.name.clone())
                     .unwrap_or_else(|| "tool call".to_string());
                 let (tx, rx) = oneshot::channel();
-                self.pending.lock().insert(id.clone(), tx);
+                self.pending.lock().insert(
+                    id.clone(),
+                    PendingPermission {
+                        generation,
+                        reply: tx,
+                    },
+                );
                 let _ = self
                     .events
                     .send(AcpEvent::State(AgentStateEvent::InputRequested {
@@ -861,12 +953,39 @@ impl AcpResponder {
         }
     }
 
+    /// Settle every permission request owned by `generation` with the ACP
+    /// `cancelled` outcome. Returns how many requests were resolved.
+    fn cancel_turn(&self, generation: u64) -> usize {
+        let replies: Vec<oneshot::Sender<InputReply>> = {
+            let mut pending = self.pending.lock();
+            let owned: Vec<String> = pending
+                .iter()
+                .filter(|(_, request)| request.generation == generation)
+                .map(|(id, _)| id.clone())
+                .collect();
+            owned
+                .into_iter()
+                .filter_map(|id| pending.remove(&id).map(|request| request.reply))
+                .collect()
+        };
+        let resolved = replies.len();
+        for reply in replies {
+            let _ = reply.send(InputReply::Cancelled);
+        }
+        resolved
+    }
+
     /// Map a Favetto reply onto one of the agent's advertised options. Options
     /// are matched by `kind`, never by position or name.
     fn response_for(
         request: &RequestPermissionRequest,
         reply: InputReply,
     ) -> RequestPermissionResponse {
+        // A cancelled turn (or a dismissed prompt) must use ACP's dedicated
+        // outcome; selecting a reject option is a different protocol answer.
+        if reply == InputReply::Cancelled {
+            return RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled);
+        }
         let kinds: &[PermissionOptionKind] = match reply {
             InputReply::Once
             | InputReply::Value { .. }
@@ -878,12 +997,12 @@ impl AcpResponder {
                 PermissionOptionKind::AllowAlways,
                 PermissionOptionKind::AllowOnce,
             ],
-            InputReply::Reject
-            | InputReply::Cancelled
-            | InputReply::Confirmed { confirmed: false } => &[
+            InputReply::Reject | InputReply::Confirmed { confirmed: false } => &[
                 PermissionOptionKind::RejectOnce,
                 PermissionOptionKind::RejectAlways,
             ],
+            // Handled above: cancellation never selects an advertised option.
+            InputReply::Cancelled => &[],
         };
         let picked = kinds.iter().find_map(|kind| {
             request
@@ -904,10 +1023,12 @@ impl AcpResponder {
 impl AcpResponder {
     /// Answer a pending permission request from a client.
     pub(crate) async fn reply(&self, request_id: &str, reply: InputReply) -> anyhow::Result<()> {
-        let sender =
-            self.pending.lock().remove(request_id).ok_or_else(|| {
-                anyhow::anyhow!("no pending ACP permission request '{request_id}'")
-            })?;
+        let sender = self
+            .pending
+            .lock()
+            .remove(request_id)
+            .map(|request| request.reply)
+            .ok_or_else(|| anyhow::anyhow!("no pending ACP permission request '{request_id}'"))?;
         sender
             .send(reply)
             .map_err(|_| anyhow::anyhow!("permission request '{request_id}' is no longer waiting"))
@@ -2052,6 +2173,166 @@ mod tests {
         assert!(matches!(
             response.outcome,
             RequestPermissionOutcome::Selected(ref selected) if selected.option_id.0.as_ref() == "allow-1"
+        ));
+        // Cancellation uses the dedicated protocol outcome, never a reject
+        // option that may not even exist.
+        let response = AcpResponder::response_for(&request, InputReply::Cancelled);
+        assert!(matches!(
+            response.outcome,
+            RequestPermissionOutcome::Cancelled
+        ));
+    }
+
+    /// A permission request fixture with both allow and reject options.
+    fn permission_request() -> RequestPermissionRequest {
+        RequestPermissionRequest::new(
+            "ses_1",
+            agent_client_protocol::v1::schema::ToolCallUpdate::new(
+                ToolCallId::new("call_1"),
+                ToolCallUpdateFields::default().title("write"),
+            ),
+            vec![
+                agent_client_protocol::v1::schema::PermissionOption::new(
+                    "reject-1",
+                    "Reject",
+                    PermissionOptionKind::RejectOnce,
+                ),
+                agent_client_protocol::v1::schema::PermissionOption::new(
+                    "allow-1",
+                    "Allow",
+                    PermissionOptionKind::AllowOnce,
+                ),
+            ],
+        )
+    }
+
+    fn ask_responder(
+        timeout: Duration,
+    ) -> (
+        Arc<AcpResponder>,
+        mpsc::UnboundedReceiver<AcpEvent>,
+        Arc<Mutex<TurnState>>,
+    ) {
+        let (events, rx) = mpsc::unbounded_channel();
+        let turn = Arc::new(Mutex::new(TurnState::default()));
+        let responder = Arc::new(AcpResponder {
+            policy: PermissionPolicy::Ask,
+            events,
+            pending: Mutex::new(HashMap::new()),
+            timeout,
+            turn: turn.clone(),
+        });
+        (responder, rx, turn)
+    }
+
+    async fn next_input_requested(rx: &mut mpsc::UnboundedReceiver<AcpEvent>) -> String {
+        match rx.recv().await.expect("state event") {
+            AcpEvent::State(AgentStateEvent::InputRequested { request }) => request.id,
+            other => panic!("expected InputRequested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancellation_is_scoped_to_one_turn() {
+        let mut turn = TurnState::default();
+
+        // Idle: a cancel must not send a notification.
+        assert_eq!(turn.request_cancel(), None);
+
+        let first = turn.begin();
+        assert_eq!(turn.request_cancel(), Some(first));
+        // Duplicate cancels for the same turn are ignored.
+        assert_eq!(turn.request_cancel(), None);
+        assert!(turn.is_cancelled(first));
+
+        turn.finish();
+        assert_eq!(turn.request_cancel(), None);
+
+        // A later turn on the same connection is cancellable again.
+        let second = turn.begin();
+        assert_ne!(first, second);
+        assert_eq!(turn.request_cancel(), Some(second));
+        assert!(turn.is_cancelled(second));
+        assert!(!turn.is_cancelled(first));
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_turn_settles_its_pending_permission_as_cancelled() {
+        let (responder, mut rx, turn) = ask_responder(Duration::from_secs(60));
+        let generation = turn.lock().begin();
+        let request = permission_request();
+
+        let handle = {
+            let responder = responder.clone();
+            tokio::spawn(async move { responder.decide(&request).await })
+        };
+        let id = next_input_requested(&mut rx).await;
+        assert_eq!(id, "acp-perm-call_1");
+
+        assert_eq!(responder.cancel_turn(generation), 1);
+        let response = handle.await.expect("permission handler");
+        assert!(matches!(
+            response.outcome,
+            RequestPermissionOutcome::Cancelled
+        ));
+
+        // The request is resolved exactly once, and a second cancel has nothing
+        // left to settle.
+        match rx.recv().await.expect("state event") {
+            AcpEvent::State(AgentStateEvent::InputResolved { id: resolved }) => {
+                assert_eq!(resolved, id);
+            }
+            other => panic!("expected InputResolved, got {other:?}"),
+        }
+        assert_eq!(responder.cancel_turn(generation), 0);
+    }
+
+    #[tokio::test]
+    async fn a_client_answer_racing_cancellation_wins_once() {
+        let (responder, mut rx, turn) = ask_responder(Duration::from_secs(60));
+        let generation = turn.lock().begin();
+        let request = permission_request();
+
+        let handle = {
+            let responder = responder.clone();
+            tokio::spawn(async move { responder.decide(&request).await })
+        };
+        let id = next_input_requested(&mut rx).await;
+
+        responder
+            .reply(&id, InputReply::Once)
+            .await
+            .expect("answer the request");
+        // The answer already removed the pending request; the racing cancel
+        // must not resolve it a second time.
+        assert_eq!(responder.cancel_turn(generation), 0);
+
+        let response = handle.await.expect("permission handler");
+        assert!(matches!(
+            response.outcome,
+            RequestPermissionOutcome::Selected(ref selected) if selected.option_id.0.as_ref() == "allow-1"
+        ));
+        match rx.recv().await.expect("state event") {
+            AcpEvent::State(AgentStateEvent::InputResolved { .. }) => {}
+            other => panic!("expected InputResolved, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_permission_arriving_during_cancellation_is_answered_immediately() {
+        let (responder, mut rx, turn) = ask_responder(Duration::from_secs(60));
+        turn.lock().begin();
+        assert!(turn.lock().request_cancel().is_some());
+
+        let response = responder.decide(&permission_request()).await;
+        assert!(matches!(
+            response.outcome,
+            RequestPermissionOutcome::Cancelled
+        ));
+        // It never reaches the client as a blocking InputRequested event.
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
         ));
     }
 }

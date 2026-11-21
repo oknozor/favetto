@@ -110,6 +110,8 @@ pub enum UiAction {
     LoadSession(String),
     /// Forward raw keystrokes to the active agent session.
     AgentInput(Vec<u8>),
+    /// Interrupt the attached ACP session's in-flight turn (`agents.cancel`).
+    CancelTurn(String),
     /// Start a catalog task by name (runs headlessly through the configured agent).
     StartTask(String),
     /// Start a catalog task with collected input variables.
@@ -2217,6 +2219,14 @@ impl App {
             }
         }
         if self.agent_backend == AgentBackend::Acp {
+            if let AgentStateEvent::Idle { outcome } = event {
+                self.agent_status = match outcome {
+                    favetto_core::model::IdleOutcome::Succeeded => "idle",
+                    favetto_core::model::IdleOutcome::Interrupted => "interrupted",
+                    favetto_core::model::IdleOutcome::Failed => "failed",
+                }
+                .to_string();
+            }
             self.agent_feed.apply(event);
             // A pruned tool/thought may have taken the selection with it.
             if let Some(selected) = self.agent_feed_selected {

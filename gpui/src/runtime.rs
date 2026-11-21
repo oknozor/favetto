@@ -27,12 +27,12 @@ use favetto_wire::model::{
     TaskRun,
 };
 use favetto_wire::rpc::{
-    AgentAttachResult, AgentReplyParams, AgentReplyResult, AgentsHistoryParams, CatalogEntry,
-    CatalogGetParams, EmptyParams, PingParams, PingResult, ReposActivateParams, ReposListResult,
-    ScheduleDeleteParams, ScheduleUpsertParams, SchedulesDeleteResult, SessionIdParams,
-    StartOneshotParams, StartOneshotResult, TaskIdParams, TasksEventsParams, TasksListParams,
-    TasksStartParams, WorkflowCancelResultBody, WorkflowGetResult, WorkflowInspectParams,
-    WorkflowRetryParams,
+    AgentAttachResult, AgentCancelParams, AgentCancelResult, AgentReplyParams, AgentReplyResult,
+    AgentsHistoryParams, CatalogEntry, CatalogGetParams, EmptyParams, PingParams, PingResult,
+    ReposActivateParams, ReposListResult, ScheduleDeleteParams, ScheduleUpsertParams,
+    SchedulesDeleteResult, SessionIdParams, StartOneshotParams, StartOneshotResult, TaskIdParams,
+    TasksEventsParams, TasksListParams, TasksStartParams, WorkflowCancelResultBody,
+    WorkflowGetResult, WorkflowInspectParams, WorkflowRetryParams,
 };
 use favetto_wire::workflow::WorkflowInspect;
 use uuid::Uuid;
@@ -98,6 +98,8 @@ pub enum Command {
         request_id: String,
         reply: InputReply,
     },
+    /// Interrupt the in-flight turn of one live agent session (`agents.cancel`).
+    CancelTurn { session_id: String },
     /// Restore a persisted ACP session by its Favetto-local id (`agents.load`).
     LoadAgentSession { session_id: String },
     /// Fetch one root's runtime workflow graph (`workflow.inspect`).
@@ -214,6 +216,11 @@ pub enum Update {
         request_id: String,
         reply: InputReply,
         result: Result<AgentReplyResult, ClientError>,
+    },
+    /// `agents.cancel` completed for the live session.
+    TurnCancelFinished {
+        session_id: String,
+        result: Result<AgentCancelResult, ClientError>,
     },
     /// `agents.load` completed for the Favetto-local session id.
     AgentSessionLoaded {
@@ -395,6 +402,11 @@ impl Runtime {
             request_id,
             reply,
         });
+    }
+
+    /// Interrupt the in-flight turn of one live agent session.
+    pub fn cancel_turn(&self, session_id: String) {
+        self.send(Command::CancelTurn { session_id });
     }
 
     /// Restore a persisted session by its Favetto-local id.
@@ -581,6 +593,9 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
                     request_id,
                     reply,
                 );
+            }
+            Command::CancelTurn { session_id } => {
+                spawn_cancel_turn(client.clone(), updates.clone(), session_id);
             }
             Command::LoadAgentSession { session_id } => {
                 spawn_agent_load(client.clone(), updates.clone(), session_id);
@@ -924,6 +939,18 @@ fn spawn_reply(
             reply,
             result,
         });
+    });
+}
+
+/// Spawn one `agents.cancel` for a live session's in-flight turn.
+fn spawn_cancel_turn(client: Arc<RpcClient>, updates: Sender<Update>, session_id: String) {
+    tokio::spawn(async move {
+        let result = client
+            .agents_cancel(AgentCancelParams {
+                session_id: session_id.clone(),
+            })
+            .await;
+        let _ = updates.try_send(Update::TurnCancelFinished { session_id, result });
     });
 }
 

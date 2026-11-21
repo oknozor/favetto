@@ -4350,3 +4350,65 @@ fn set_tab_clears_agent_selection_and_notice() {
     assert!(app.agent_selection.is_none());
     assert!(app.copy_notice.is_none());
 }
+
+#[test]
+fn ctrl_c_interrupts_the_attached_acp_turn() {
+    let mut app = App::new();
+    app.open_agent(agent_session("s1", false, true, false), b"");
+    // Opening hands the keyboard to the agent; favetto focus is where the
+    // explicit interrupt control lives.
+    app.agent_capture = false;
+
+    match app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)) {
+        UiAction::CancelTurn(session_id) => assert_eq!(session_id, "s1"),
+        _ => panic!("expected CancelTurn"),
+    }
+}
+
+#[test]
+fn ctrl_c_stays_with_the_agent_under_capture_and_for_pty_sessions() {
+    let mut app = App::new();
+    app.open_agent(agent_session("s1", false, true, false), b"");
+    // Under agent capture Ctrl+C is the agent's own control key.
+    assert!(matches!(
+        app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        UiAction::AgentInput(_)
+    ));
+
+    // A PTY session has no structured turn to cancel; the key stays inert once
+    // favetto owns the keyboard.
+    app.open_agent(pty_session("s2", false, true, false), b"");
+    app.agent_capture = false;
+    assert!(matches!(
+        app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        UiAction::None
+    ));
+}
+
+#[test]
+fn an_interrupted_turn_shows_its_idle_state() {
+    let mut app = App::new();
+    app.open_agent(agent_session("s1", false, true, false), b"");
+    app.agent_status.clear();
+
+    app.agent_event(
+        "s1",
+        &favetto_core::model::AgentStateEvent::Idle {
+            outcome: favetto_core::model::IdleOutcome::Interrupted,
+        },
+    );
+    assert_eq!(app.agent_status, "interrupted");
+    let rendered = app.agent_feed.render(&Theme::dark(), None);
+    assert!(
+        rendered
+            .lines
+            .iter()
+            .any(|line| line.to_string().contains("Turn interrupted")),
+        "the feed should mark the turn as interrupted: {:?}",
+        rendered
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+    );
+}

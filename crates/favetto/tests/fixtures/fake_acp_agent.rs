@@ -40,8 +40,9 @@ fn main() {
     // per-agent uniqueness constraint) do not collide. A load replaces it with
     // the stored id supplied by the client.
     let mut session_id = format!("{SESSION_ID}-{}", std::process::id());
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
+    let mut lines = stdin.lock().lines();
+    let mut prompt_turn = 0u32;
+    while let Some(Ok(line)) = lines.next() {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -170,60 +171,16 @@ fn main() {
                 }
             }
             "session/prompt" => {
-                if let Some(marker) = std::env::var_os("FAKE_ACP_PROMPT_MARKER") {
-                    let _ = std::fs::write(marker, prompt_text(&message));
-                }
-                // Optional append-free counter, so a test can prove a turn was
-                // submitted exactly once across attach/backfill paths.
-                if let Some(marker) = std::env::var_os("FAKE_ACP_PROMPT_COUNT") {
-                    let count = std::fs::read_to_string(&marker)
-                        .ok()
-                        .and_then(|text| text.trim().parse::<u64>().ok())
-                        .unwrap_or_default();
-                    let _ = std::fs::write(marker, (count + 1).to_string());
-                }
-                // Tests can ask the agent to report a display title, proving the
-                // daemon persists ACP title updates on the durable session row.
-                if let Some(title) = std::env::var_os("FAKE_ACP_TITLE") {
-                    notify(
-                        &mut stdout,
-                        json!({
-                            "sessionId": session_id.clone(),
-                            "update": {
-                                "sessionUpdate": "session_info_update",
-                                "title": title.to_string_lossy()
-                            }
-                        }),
-                    );
-                }
-                // Tests can make the turn block deterministically: create
-                // `$FAKE_ACP_GATE_DIR/agent-ready`, then wait for
-                // `agent-release` before answering.
-                if let Some(dir) = gate_dir() {
-                    let _ = std::fs::create_dir_all(&dir);
-                    let _ = std::fs::write(dir.join("agent-ready"), b"");
-                    let release = dir.join("agent-release");
-                    while !release.exists() {
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                }
-                let text = prompt_text(&message);
-                notify(
+                prompt_turn += 1;
+                run_prompt(
                     &mut stdout,
-                    json!({
-                        "sessionId": session_id.clone(),
-                        "update": {
-                            "sessionUpdate": "agent_message_chunk",
-                            "content": {
-                                "type": "text",
-                                "text": format!(
-                                    "echo-agent: {text}\nmodel: {selected_model}\nECHO_AGENT_DONE"
-                                )
-                            }
-                        }
-                    }),
+                    &mut lines,
+                    id,
+                    &message,
+                    &session_id,
+                    &selected_model,
+                    prompt_turn,
                 );
-                respond(&mut stdout, id, json!({ "stopReason": "end_turn" }));
             }
             "session/close" => {
                 // Simulate agents that ignore the optional close request.
@@ -231,13 +188,174 @@ fn main() {
                     respond(&mut stdout, id, json!({}));
                 }
             }
-            // `session/cancel` is a notification: no response.
+            // `session/cancel` is a notification: no response. Record it so
+            // tests can assert when Favetto sent one (and when it did not).
+            "session/cancel" => record_cancel(),
             _ => {
                 if let Some(id) = id {
                     error(&mut stdout, id, -32601, "method not found");
                 }
             }
         }
+    }
+}
+
+/// Run one prompt turn, optionally blocking on a `session/request_permission`.
+///
+/// The fake agent is deliberately line-oriented, so this helper consumes stdin
+/// itself while the turn is in flight. That lets the fixture observe a client
+/// `session/cancel` and the permission response that ACP requires it to send,
+/// even though the prompt request has not returned yet.
+fn run_prompt<B: BufRead>(
+    stdout: &mut std::io::Stdout,
+    lines: &mut std::io::Lines<B>,
+    id: Option<Value>,
+    message: &Value,
+    session_id: &str,
+    selected_model: &str,
+    prompt_turn: u32,
+) {
+    if let Some(marker) = std::env::var_os("FAKE_ACP_PROMPT_MARKER") {
+        let _ = std::fs::write(marker, prompt_text(message));
+    }
+    // Optional append-free counter, so a test can prove a turn was submitted
+    // exactly once across attach/backfill paths.
+    if let Some(marker) = std::env::var_os("FAKE_ACP_PROMPT_COUNT") {
+        let count = std::fs::read_to_string(&marker)
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .unwrap_or_default();
+        let _ = std::fs::write(marker, (count + 1).to_string());
+    }
+    // Tests can ask the agent to report a display title, proving the
+    // daemon persists ACP title updates on the durable session row.
+    if let Some(title) = std::env::var_os("FAKE_ACP_TITLE") {
+        notify(
+            stdout,
+            json!({
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "session_info_update",
+                    "title": title.to_string_lossy()
+                }
+            }),
+        );
+    }
+    // Tests can make the turn block deterministically: create
+    // `$FAKE_ACP_GATE_DIR/agent-ready`, then wait for `agent-release` before
+    // answering.
+    if let Some(dir) = gate_dir() {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("agent-ready"), b"");
+        let release = dir.join("agent-release");
+        while !release.exists() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    if std::env::var_os("FAKE_ACP_PERMISSION").is_some() {
+        let permission_id = format!("perm-{}-{prompt_turn}", std::process::id());
+        record("permission");
+        write_json(
+            stdout,
+            json!({
+                "jsonrpc": "2.0",
+                "id": permission_id,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": session_id,
+                    "toolCall": {
+                        "toolCallId": format!("call_{prompt_turn}"),
+                        "title": "Write a file",
+                        "status": "pending"
+                    },
+                    "options": [
+                        { "optionId": "allow-once", "name": "Allow once", "kind": "allow_once" },
+                        { "optionId": "reject-once", "name": "Reject", "kind": "reject_once" }
+                    ]
+                }
+            }),
+        );
+        let mut cancelled = false;
+        loop {
+            let Some(Ok(line)) = lines.next() else {
+                return;
+            };
+            let Ok(incoming) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if incoming.get("method").and_then(Value::as_str) == Some("session/cancel") {
+                record_cancel();
+                cancelled = true;
+                continue;
+            }
+            if incoming.get("id") == Some(&Value::String(permission_id.clone())) {
+                let outcome = incoming
+                    .pointer("/result/outcome/outcome")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                record(&format!("outcome {outcome}"));
+                if outcome == "cancelled" {
+                    cancelled = true;
+                }
+                break;
+            }
+        }
+        if cancelled {
+            respond(stdout, id, json!({ "stopReason": "cancelled" }));
+        } else {
+            emit_echo(stdout, session_id, message, selected_model);
+            respond(stdout, id, json!({ "stopReason": "end_turn" }));
+        }
+        return;
+    }
+
+    emit_echo(stdout, session_id, message, selected_model);
+    respond(stdout, id, json!({ "stopReason": "end_turn" }));
+}
+
+/// Emit the deterministic assistant message used by the tests.
+fn emit_echo(
+    stdout: &mut std::io::Stdout,
+    session_id: &str,
+    message: &Value,
+    selected_model: &str,
+) {
+    let text = prompt_text(message);
+    notify(
+        stdout,
+        json!({
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "type": "text",
+                    "text": format!(
+                        "echo-agent: {text}\nmodel: {selected_model}\nECHO_AGENT_DONE"
+                    )
+                }
+            }
+        }),
+    );
+}
+
+/// Record a `session/cancel` notification for cancellation tests.
+fn record_cancel() {
+    record("cancel");
+}
+
+/// Append one line to `$FAKE_ACP_CANCEL_MARKER`, when configured.
+fn record(line: &str) {
+    let Some(marker) = std::env::var_os("FAKE_ACP_CANCEL_MARKER") else {
+        return;
+    };
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(marker)
+    {
+        let _ = writeln!(file, "{line}");
     }
 }
 

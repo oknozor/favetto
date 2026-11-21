@@ -76,7 +76,9 @@ Opening a task shows its ACP session: streamed assistant text, reasoning, tool
 calls and errors. Type into the panel to compose a follow-up prompt; **Enter**
 sends it as `agents.prompt`. Press **Ctrl+Y** to toggle keyboard focus between
 the panel and favetto, **Ctrl+Q** to leave (the session keeps running), and
-**Ctrl+N** to start a new session.
+**Ctrl+N** to start a new session. With favetto focus, **Ctrl+C** interrupts the
+current turn through `agents.cancel` without cancelling the task; the session
+stays open for a follow-up prompt.
 
 When the agent asks for permission, the panel shows the request. Answer it with
 **Ctrl+R**; the reply is correlated with the protocol request, not typed as
@@ -104,6 +106,13 @@ stays open for follow-up prompts until it is closed or its process exits.
 While a session waits on a permission request, `agents.list` reports its
 `awaiting_input` and the Agent panel shows the request. The task row itself stays
 `running` until the turn ends; answering with `agents.reply` resumes the turn.
+
+`agents.cancel` interrupts the in-flight turn (`session/cancel`). Every permission
+request still pending for that turn is answered with ACP's `cancelled` outcome,
+so the turn settles immediately instead of waiting for the permission timeout.
+Cancellation is scoped to the current turn: after it settles, a later prompt on
+the same session can be cancelled normally. Cancelling while the session is idle
+sends nothing to the agent.
 
 ## Session history
 
