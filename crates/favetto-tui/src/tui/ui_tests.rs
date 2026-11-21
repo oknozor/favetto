@@ -563,6 +563,148 @@ fn status_line_folds_in_attempt_when_retried() {
     assert!(retried.contains("#2"), "attempt missing: {retried:?}");
 }
 
+/// A succeeded parent and a failed child whose repo differs only by case. The
+/// Tasks banner and the status bar must name the full target and the reason.
+fn spawn_failure_app() -> App {
+    use chrono::Utc;
+    use favetto_core::model::Failure;
+
+    let mut app = App::new();
+    let mut parent = geom_task("repo:favetto/triage_issues");
+    parent.status = TaskStatus::Succeeded;
+    parent.finished_at = Some(Utc::now() - chrono::Duration::seconds(10));
+
+    let mut child = geom_task("repo:Favetto/plan_issue");
+    child.status = TaskStatus::Failed;
+    child.parent_id = Some(parent.id);
+    child.root_id = Some(parent.id);
+    child.error = Some("task 'repo:Favetto/plan_issue' not found in the catalog".to_string());
+    child.failure = Some(Failure::new(
+        FailureKind::InvalidInput,
+        "task 'repo:Favetto/plan_issue' not found in the catalog",
+    ));
+    child.finished_at = Some(Utc::now());
+
+    app.tasks = vec![parent, child];
+    app
+}
+
+#[test]
+fn tasks_surface_shows_a_persistent_spawn_failure_banner() {
+    let mut app = spawn_failure_app();
+    app.tab = Tab::Tasks;
+    let text = render_text(&mut app, 200, 30);
+    assert!(text.contains("SPAWN FAILED"), "banner missing: {text:?}");
+    assert!(
+        text.contains("repo:Favetto/plan_issue"),
+        "full target missing: {text:?}"
+    );
+    assert!(
+        text.contains("not found in the catalog"),
+        "reason missing: {text:?}"
+    );
+    assert!(
+        text.contains("which succeeded"),
+        "parent context missing: {text:?}"
+    );
+}
+
+#[test]
+fn status_bar_surfaces_failed_spawn_launches() {
+    let mut app = spawn_failure_app();
+    app.tab = Tab::Events;
+    let text = render_text(&mut app, 240, 30);
+    assert!(
+        text.contains("spawn launch failed"),
+        "status warning missing: {text:?}"
+    );
+    assert!(
+        text.contains("repo:Favetto/plan_issue"),
+        "target missing from the status bar: {text:?}"
+    );
+}
+
+#[test]
+fn healthy_workflows_do_not_show_a_launch_failure_warning() {
+    use chrono::Utc;
+
+    let mut app = App::new();
+    let mut parent = geom_task("repo:favetto/triage_issues");
+    parent.status = TaskStatus::Succeeded;
+    parent.finished_at = Some(Utc::now() - chrono::Duration::seconds(10));
+    let mut child = geom_task("repo:favetto/plan_issue");
+    child.status = TaskStatus::Succeeded;
+    child.parent_id = Some(parent.id);
+    child.root_id = Some(parent.id);
+    app.tasks = vec![parent, child];
+
+    let text = render_text(&mut app, 200, 30);
+    assert!(!text.contains("SPAWN FAILED"), "{text:?}");
+    assert!(!text.contains("spawn launch failed"), "{text:?}");
+}
+
+#[test]
+fn result_popup_names_the_full_launch_target_and_reason() {
+    let mut app = spawn_failure_app();
+    let child = app
+        .tasks
+        .iter()
+        .find(|task| task.status == TaskStatus::Failed)
+        .expect("failed child")
+        .clone();
+    app.popup = Popup::TaskResult {
+        task: Box::new(child),
+    };
+    let text = render_text(&mut app, 200, 40);
+    assert!(text.contains("Launch failure"), "{text:?}");
+    assert!(text.contains("repo:Favetto/plan_issue"), "{text:?}");
+    assert!(text.contains("not found in the catalog"), "{text:?}");
+    assert!(text.contains("which succeeded"), "{text:?}");
+}
+
+#[test]
+fn workflow_runtime_warns_about_a_succeeded_parent_with_a_failed_spawn() {
+    use favetto_core::workflow::{WorkflowInspect, WorkflowState, WorkflowTaskView};
+
+    let mut app = spawn_failure_app();
+    let parent = app.tasks[0].clone();
+    let child = app.tasks[1].clone();
+    let root = parent.id;
+    app.popup = runtime_popup(
+        root,
+        Some(WorkflowInspect {
+            root_id: root,
+            root_task: parent.name.clone(),
+            state: WorkflowState::Succeeded,
+            tasks: vec![
+                WorkflowTaskView {
+                    id: parent.id,
+                    name: parent.name.clone(),
+                    status: TaskStatus::Succeeded,
+                    attempt: 1,
+                    summary: None,
+                },
+                WorkflowTaskView {
+                    id: child.id,
+                    name: child.name.clone(),
+                    status: TaskStatus::Failed,
+                    attempt: 1,
+                    summary: child.error.clone(),
+                },
+            ],
+            ready: Vec::new(),
+            running: Vec::new(),
+            failed: vec![child.id],
+            blocked: Vec::new(),
+        }),
+    );
+    let text = render_text(&mut app, 200, 40);
+    assert!(text.contains("Launch failed"), "{text:?}");
+    assert!(text.contains("repo:Favetto/plan_issue"), "{text:?}");
+    assert!(text.contains("not found in the catalog"), "{text:?}");
+    assert!(text.contains("which succeeded"), "{text:?}");
+}
+
 #[test]
 fn failed_task_renders_typed_failure_and_retryability() {
     use favetto_core::model::Failure;
@@ -683,8 +825,8 @@ fn task_result_popup_renders_summary_and_status() {
         "summary missing: {text:?}"
     );
     assert!(
-        text.contains("new_issues") && !text.contains("repo:my-repo/new_issues"),
-        "bare name expected: {text:?}"
+        text.contains("new_issues") && text.contains("repo:my-repo/new_issues"),
+        "the full target must stay visible: {text:?}"
     );
 }
 

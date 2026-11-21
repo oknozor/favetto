@@ -1,7 +1,8 @@
 use super::*;
 use chrono::Utc;
 use favetto_core::model::{
-    AgentActivity, AgentUsage, AwaitingInputKind, EventKind, InputReply, InputRequest, TaskStatus,
+    AgentActivity, AgentUsage, AwaitingInputKind, EventKind, Failure, FailureKind, InputReply,
+    InputRequest, TaskStatus,
 };
 use favetto_core::rpc::AgentEventPush;
 
@@ -4411,4 +4412,99 @@ fn an_interrupted_turn_shows_its_idle_state() {
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
     );
+}
+
+/// A succeeded parent and one failed spawn target whose repo differs only by
+/// case. The target is hidden from the Tasks table by exact repo scoping, but
+/// the derived warning must still name it (and survive a refresh).
+#[test]
+fn launch_failures_name_the_full_target_across_repo_casing_and_refresh() {
+    let mut app = App::new();
+    let mut parent = task("repo:favetto/triage_issues");
+    parent.status = TaskStatus::Succeeded;
+    parent.finished_at = Some(Utc::now() - chrono::Duration::seconds(10));
+
+    let mut child = task("repo:Favetto/plan_issue");
+    child.status = TaskStatus::Failed;
+    child.parent_id = Some(parent.id);
+    child.root_id = Some(parent.id);
+    child.error = Some("task 'repo:Favetto/plan_issue' not found in the catalog".to_string());
+    child.failure = Some(Failure::new(
+        FailureKind::InvalidInput,
+        "task 'repo:Favetto/plan_issue' not found in the catalog",
+    ));
+    child.finished_at = Some(Utc::now());
+
+    app.active_repo = Some("favetto".to_string());
+    app.tasks = vec![parent.clone(), child.clone()];
+
+    let failures = app.launch_failures();
+    assert_eq!(failures.len(), 1);
+    let failure = &failures[0];
+    assert_eq!(failure.target, "repo:Favetto/plan_issue");
+    assert_eq!(failure.parent, "repo:favetto/triage_issues");
+    assert_eq!(failure.root, "repo:favetto/triage_issues");
+    assert_eq!(failure.kind, Some(FailureKind::InvalidInput));
+    assert!(failure.reason.contains("not found in the catalog"));
+
+    let notice = app.launch_failure_notice().expect("notice");
+    assert!(notice.contains("repo:Favetto/plan_issue"), "{notice}");
+    assert!(notice.contains("repo:favetto/triage_issues"), "{notice}");
+    assert!(notice.contains("which succeeded"), "{notice}");
+
+    // A refresh replaces the snapshot; re-deriving from the same rows keeps it.
+    app.tasks = vec![parent, child];
+    assert_eq!(app.launch_failures().len(), 1);
+}
+
+#[test]
+fn launch_failures_ignore_agent_runs_and_healthy_parents() {
+    let mut app = App::new();
+    let mut parent = task("repo:favetto/triage_issues");
+    parent.status = TaskStatus::Succeeded;
+    parent.finished_at = Some(Utc::now() - chrono::Duration::seconds(10));
+
+    let mut agent_failure = task("repo:favetto/plan_issue");
+    agent_failure.status = TaskStatus::Failed;
+    agent_failure.parent_id = Some(parent.id);
+    agent_failure.root_id = Some(parent.id);
+    agent_failure.failure = Some(Failure::new(FailureKind::Agent, "exit 1"));
+    agent_failure.error = Some("exit 1".to_string());
+
+    app.tasks = vec![parent.clone(), agent_failure];
+    assert!(app.launch_failures().is_empty());
+    assert!(app.launch_failure_notice().is_none());
+
+    // An ordinary healthy succeeded child is not a warning either.
+    let mut healthy = task("repo:favetto/plan_issue");
+    healthy.status = TaskStatus::Succeeded;
+    healthy.parent_id = Some(parent.id);
+    healthy.root_id = Some(parent.id);
+    app.tasks = vec![parent, healthy];
+    assert!(app.launch_failure_notice().is_none());
+}
+
+/// A parent retry re-spawns the same target; a failure left by the earlier
+/// attempt must not keep warning after the fresh child started.
+#[test]
+fn launch_failures_ignore_rows_from_an_earlier_parent_attempt() {
+    let mut app = App::new();
+    let mut parent = task("repo:favetto/triage_issues");
+    parent.status = TaskStatus::Succeeded;
+    parent.finished_at = Some(Utc::now() - chrono::Duration::seconds(5));
+
+    let mut stale = task("repo:favetto/plan_issue");
+    stale.status = TaskStatus::Failed;
+    stale.parent_id = Some(parent.id);
+    stale.root_id = Some(parent.id);
+    stale.created_at = Utc::now() - chrono::Duration::seconds(60);
+    stale.failure = Some(Failure::new(FailureKind::InvalidInput, "old failure"));
+
+    let mut fresh = task("repo:favetto/plan_issue");
+    fresh.status = TaskStatus::Succeeded;
+    fresh.parent_id = Some(parent.id);
+    fresh.root_id = Some(parent.id);
+
+    app.tasks = vec![parent, stale, fresh];
+    assert!(app.launch_failures().is_empty());
 }

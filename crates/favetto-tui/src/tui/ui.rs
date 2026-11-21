@@ -18,8 +18,8 @@ use favetto_core::workflow::{WorkflowInspect, WorkflowState};
 use super::app::{
     activity_cell, cost_cell, format_activity, repo_label, table_rows_area, task_display_name,
     task_repo, token_cell, App, CatalogRow, ClickAction, ClickRegion, ConfirmPrompt, ConnState,
-    Form, ListGeometry, MenuAction, MenuEntry, Popup, ReplyPrompt, SessionPickerEntry, Tab,
-    TaskPickerRow, TaskVarsForm, ThemeChoice, Wizard, WizardStep,
+    Form, LaunchFailure, ListGeometry, MenuAction, MenuEntry, Popup, ReplyPrompt,
+    SessionPickerEntry, Tab, TaskPickerRow, TaskVarsForm, ThemeChoice, Wizard, WizardStep,
 };
 use super::text_buffer::TextBuffer;
 use super::theme::{RaisedLevel, Theme};
@@ -185,6 +185,14 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
         draw_task_picker(frame, &entries, selected, &filter, theme);
         return;
     }
+    // The result popup uses the app's derived launch-failure model to name the
+    // full failed target and its succeeded parent, so compute it before `popup`
+    // is borrowed mutably.
+    if let Popup::TaskResult { task } = &app.popup {
+        let launch = app.launch_failure_for(task.id);
+        draw_task_result(frame, task, launch.as_ref(), theme);
+        return;
+    }
     match &mut app.popup {
         Popup::None => {}
         Popup::Menu { .. } => {}
@@ -219,9 +227,10 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
         }
         // Handled above, before `popup` is borrowed, so the full `App` is available.
         Popup::WorkflowRuntime(_) => {}
-        // Handled above, before `popup` is borrowed.
+        // Handled above, before `popup` is borrowed, so the full `App` is available.
         Popup::TaskError { .. } => {}
-        Popup::TaskResult { task } => draw_task_result(frame, task, theme),
+        // Handled above, before `popup` is borrowed.
+        Popup::TaskResult { .. } => {}
         Popup::ConfigError { path, errors } => draw_config_error(frame, path, errors, theme),
         // Handled above, before `popup` is borrowed.
         Popup::RepoPicker { .. } => {}
@@ -928,12 +937,18 @@ fn draw_task_error(frame: &mut Frame, app: &App, task_id: uuid::Uuid, theme: The
 
 /// Draw the action-task result popup: the run's status plus the executor's
 /// durable one-line `envelope.summary`, fetched through `tasks.get`.
-fn draw_task_result(frame: &mut Frame, task: &Task, theme: Theme) {
+fn draw_task_result(frame: &mut Frame, task: &Task, launch: Option<&LaunchFailure>, theme: Theme) {
     let mut content: Vec<Line<'static>> = Vec::new();
     content.push(Line::from(Span::styled(
         format!("{} · {}", short_id(&task.id), task_display_name(&task.name)),
         theme.title(),
     )));
+    if task_repo(&task.name).is_some() {
+        content.push(Line::from(vec![
+            Span::styled("target: ", theme.muted_style()),
+            Span::raw(task.name.clone()),
+        ]));
+    }
     content.push(Line::from(vec![
         Span::styled("status: ", theme.muted_style()),
         Span::styled(
@@ -941,6 +956,31 @@ fn draw_task_result(frame: &mut Frame, task: &Task, theme: Theme) {
             Style::default().fg(theme.semantic(task.status)),
         ),
     ]));
+    if let Some(launch) = launch {
+        content.push(Line::from(""));
+        content.push(Line::from(Span::styled(
+            "Launch failure",
+            Style::default()
+                .fg(theme.danger())
+                .add_modifier(Modifier::BOLD),
+        )));
+        content.push(Line::from(vec![
+            Span::styled("target: ", theme.muted_style()),
+            Span::styled(launch.target.clone(), Style::default().fg(theme.danger())),
+        ]));
+        content.push(Line::from(vec![
+            Span::styled("reason: ", theme.muted_style()),
+            Span::raw(launch.reason.clone()),
+        ]));
+        content.push(Line::from(vec![
+            Span::styled("spawned by: ", theme.muted_style()),
+            Span::raw(format!("{} (succeeded)", launch.parent)),
+        ]));
+        content.push(Line::from(Span::styled(
+            "The parent succeeded, but this spawned work did not start.",
+            Style::default().fg(theme.muted()),
+        )));
+    }
     content.push(Line::from(""));
     content.push(Line::from(Span::styled("Summary", theme.muted_style())));
     match envelope_summary(task) {
@@ -1640,8 +1680,42 @@ fn draw_workflow_runtime(frame: &mut Frame, app: &App) {
         return;
     };
 
-    // Header (buckets + any stale-view error), then the instance table.
-    let header_height = 1u16 + u16::from(rt.error.is_some());
+    // A succeeded root can hide a broken fan-out in the bucket table: its
+    // failed children only look like ordinary failures. Derive the launch
+    // failures from the current task rows and name the full target and reason
+    // above the instances, independent of repo scoping.
+    let launch_failures: Vec<LaunchFailure> = app
+        .launch_failures()
+        .into_iter()
+        .filter(|failure| failure.root_id == view.root_id)
+        .collect();
+    let mut launch_lines: Vec<Line<'static>> = Vec::new();
+    for failure in launch_failures.iter().take(2) {
+        launch_lines.push(Line::from(Span::styled(
+            format!("⚠ Launch failed: {}", failure.detail()),
+            Style::default()
+                .fg(theme.danger())
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    if launch_failures.len() > 2 {
+        launch_lines.push(Line::from(Span::styled(
+            format!(
+                "⚠ …and {} more failed spawn{}",
+                launch_failures.len() - 2,
+                if launch_failures.len() - 2 == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+            Style::default().fg(theme.danger()),
+        )));
+    }
+
+    // Header (buckets + any stale-view error + launch failures), then the
+    // instance table.
+    let header_height = 1u16 + u16::from(rt.error.is_some()) + launch_lines.len() as u16;
     let chunks =
         Layout::vertical([Constraint::Length(header_height), Constraint::Min(0)]).split(inner);
 
@@ -1652,6 +1726,7 @@ fn draw_workflow_runtime(frame: &mut Frame, app: &App) {
             Style::default().fg(theme.danger()),
         )));
     }
+    header.extend(launch_lines);
     frame.render_widget(Paragraph::new(header), chunks[0]);
 
     let widths = [
@@ -1666,9 +1741,16 @@ fn draw_workflow_runtime(frame: &mut Frame, app: &App) {
         .tasks
         .iter()
         .map(|t| {
+            // A failed row keeps its full `repo:<namespace>/<task>` name: the
+            // target (and any casing mismatch) must be visible, not stripped.
+            let name = if t.status == TaskStatus::Failed {
+                t.name.clone()
+            } else {
+                task_display_name(&t.name).to_string()
+            };
             Row::new(vec![
                 Cell::from(status_line(t.status, t.attempt, theme, &state)),
-                Cell::from(task_display_name(&t.name)),
+                Cell::from(name),
                 Cell::from(t.attempt.to_string()),
                 Cell::from(t.summary.clone().unwrap_or_default()),
             ])
@@ -2325,13 +2407,36 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
         .row_highlight_style(theme.selected())
         .column_spacing(2);
 
+    // A succeeded parent whose spawned work never launched is a persistent,
+    // row-derived warning. Give it its own line above the table so it cannot be
+    // mistaken for a transient status message.
+    let launch_failures = app.launch_failures();
+    let banner_height = u16::from(!launch_failures.is_empty() && area.height > 1);
+    let chunks =
+        Layout::vertical([Constraint::Length(banner_height), Constraint::Min(0)]).split(area);
+    if banner_height > 0 {
+        if let Some(notice) = app.launch_failure_notice() {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!(" ⚠ SPAWN FAILED: {notice} "),
+                    Style::default()
+                        .fg(theme.danger())
+                        .bg(theme.raised(RaisedLevel::Base))
+                        .add_modifier(Modifier::BOLD),
+                ))),
+                chunks[0],
+            );
+        }
+    }
+    let table_area = chunks[1];
+
     let mut state = TableState::default();
     if visible_len > 0 {
         state.select(Some(app.tasks_selected.min(visible_len - 1)));
     }
-    frame.render_stateful_widget(table, area, &mut state);
+    frame.render_stateful_widget(table, table_area, &mut state);
     app.tasks_geom = ListGeometry {
-        inner: table_rows_area(area),
+        inner: table_rows_area(table_area),
         offset: state.offset(),
         len: visible_len,
     };
@@ -2786,6 +2891,17 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, theme: Theme) {
                 format!("⚠ {awaiting} awaiting input · [Enter] open agent"),
                 Style::default()
                     .fg(theme.warning())
+                    .add_modifier(Modifier::BOLD),
+            )],
+        ));
+    }
+    if let Some(notice) = app.launch_failure_notice() {
+        segments.push((
+            1,
+            vec![Span::styled(
+                format!("⚠ {notice}"),
+                Style::default()
+                    .fg(theme.danger())
                     .add_modifier(Modifier::BOLD),
             )],
         ));

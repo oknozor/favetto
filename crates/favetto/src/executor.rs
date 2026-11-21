@@ -239,7 +239,7 @@ pub async fn reconcile(state: &State) -> anyhow::Result<ReconcileReport> {
         if known.contains(&task.name) {
             continue;
         }
-        let message = format!("task '{}' not found in the catalog", task.name);
+        let message = catalog_miss_message(&task.name);
         let failure = Failure::new(FailureKind::InvalidInput, message.clone());
         if db::fail_pending_task(&state.db, task.id, &message, &failure).await? {
             report.tasks_invalidated += 1;
@@ -303,13 +303,8 @@ async fn dispatch_loop(state: Arc<State>, cfg: ExecutorSettings) {
             };
 
             let Some(def) = lookup_def(&state, &task.name) else {
-                fail_task(
-                    &state,
-                    task,
-                    FailureKind::InvalidInput,
-                    "task not found in the catalog",
-                )
-                .await;
+                let error = catalog_miss_message(&task.name);
+                fail_task(&state, task, FailureKind::InvalidInput, &error).await;
                 continue;
             };
 
@@ -721,12 +716,30 @@ async fn run_one(
                         Ok(open) => open,
                         Err(e) => {
                             tracing::warn!(task = %task.name, error = %e, "failed to prepare action spawn");
+                            record_spawn_failure(
+                                state,
+                                &task,
+                                &spawn_task,
+                                serde_json::Value::Null,
+                                FailureKind::Infrastructure,
+                                format!("spawn manifest preparation failed: {e}"),
+                            )
+                            .await;
                             false
                         }
                     };
                     if gate_open {
                         if let Err(e) = spawn_from_manifest(state, &task, &def, &plan.cwd).await {
                             tracing::warn!(task = %task.name, error = %e, "failed to spawn tasks from handoff");
+                            record_spawn_failure(
+                                state,
+                                &task,
+                                &spawn_task,
+                                serde_json::Value::Null,
+                                FailureKind::InvalidInput,
+                                format!("spawn failed: {e}"),
+                            )
+                            .await;
                         }
                     }
                     // The parent's own `TaskFinished` was emitted above, before the
@@ -1114,6 +1127,63 @@ fn build_task_output(
     })
 }
 
+/// Persist a terminal failed child for a spawn that never produced a runnable
+/// task row.
+///
+/// `spawn_from_manifest` can fail as a whole (an unreadable or invalid manifest)
+/// or per item (the enqueue itself errors). Logging alone leaves no row, so a
+/// succeeded parent looks healthy forever. Record a failed child under the
+/// parent instead; the UI derives its persistent launch-failure warning from
+/// that row. The parent lineage is kept even for `spawn_new_root`, because this
+/// row is provenance for the warning, not a workflow execution edge.
+async fn record_spawn_failure(
+    state: &State,
+    parent: &Task,
+    target: &str,
+    input: serde_json::Value,
+    kind: FailureKind,
+    error: String,
+) {
+    let finished_at = Utc::now();
+    let mut failure = Failure::new(kind, error.clone());
+    // A spawn failure must not auto-retry an item that the parent cannot
+    // re-spawn: the fan-out is already decided.
+    failure.retryable = false;
+    let task = Task {
+        id: Uuid::new_v4(),
+        name: target.to_string(),
+        status: TaskStatus::Failed,
+        attempt: 1,
+        input,
+        output: None,
+        dedupe_key: None,
+        created_at: finished_at,
+        started_at: None,
+        finished_at: Some(finished_at),
+        error: Some(error),
+        failure: Some(failure),
+        session_id: None,
+        session_title: None,
+        parent_id: Some(parent.id),
+        root_id: Some(parent.root_or_self()),
+        interactive: false,
+    };
+    if let Err(e) = db::insert_task(&state.db, &task).await {
+        tracing::warn!(
+            task = %task.name,
+            error = %e,
+            "failed to record a spawn failure; only the log entry remains"
+        );
+        return;
+    }
+    state
+        .bus
+        .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
+    state
+        .emit_event(EventKind::TaskFinished, finished_payload(&task, false))
+        .await;
+}
+
 /// Read the task's `spawn_file` (rendered template), parse it as a JSON array,
 /// and enqueue one `spawn` task per element (the element becomes its `input`). An
 /// empty array is a no-op. A non-array JSON value is treated as a single element.
@@ -1167,7 +1237,7 @@ async fn spawn_from_manifest(
         match enqueue_with_lineage(
             state,
             spawn_task.to_string(),
-            item,
+            item.clone(),
             Some(dedupe),
             lineage,
             false,
@@ -1177,7 +1247,18 @@ async fn spawn_from_manifest(
             Ok(enqueued) => {
                 tracing::info!(task = %task.name, spawned = %enqueued.id, "spawned task");
             }
-            Err(e) => tracing::warn!(error = %e, "failed to enqueue spawned task"),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to enqueue spawned task");
+                record_spawn_failure(
+                    state,
+                    task,
+                    spawn_task,
+                    item,
+                    FailureKind::Infrastructure,
+                    format!("failed to enqueue spawned task: {e}"),
+                )
+                .await;
+            }
         }
     }
     Ok(())
@@ -1451,6 +1532,13 @@ fn lookup_def(state: &State, name: &str) -> Option<TaskDef> {
         .iter()
         .find(|d| d.name == name)
         .cloned()
+}
+
+/// The dispatcher's self-describing catalog miss. Kept in one place so the
+/// reconcile pass and the live dispatcher cannot drift; the full target name
+/// (casing included) travels with the reason even outside the UI.
+fn catalog_miss_message(name: &str) -> String {
+    format!("task '{name}' not found in the catalog")
 }
 
 /// Names of the task's `required` input variables that are absent, JSON `null`,

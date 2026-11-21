@@ -11,6 +11,7 @@ mod components;
 mod config;
 mod detail;
 mod inbox;
+mod launch;
 mod layout;
 mod markdown;
 mod motion;

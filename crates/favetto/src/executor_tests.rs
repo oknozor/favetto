@@ -316,6 +316,16 @@ fn blocked_failure_is_not_retryable() {
     assert!(!failure.retryable);
 }
 
+/// The dispatcher's catalog miss names the full target, so a copied reason
+/// identifies the spawn even outside the UI.
+#[test]
+fn catalog_miss_message_names_the_full_target() {
+    assert_eq!(
+        catalog_miss_message("repo:Favetto/plan_issue"),
+        "task 'repo:Favetto/plan_issue' not found in the catalog"
+    );
+}
+
 /// `fail_task` persists both the human-readable `error` and the typed
 /// `failure`, so a controller can classify a task that never started.
 #[tokio::test]
@@ -2318,6 +2328,78 @@ async fn action_when_true_writes_the_manifest_and_spawns_a_child() {
     assert_eq!(children[0].input["issue_id"], 7);
     assert_eq!(children[0].parent_id, Some(task.id));
     assert_eq!(children[0].root_id, Some(root));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A manifest that cannot be written by an action task still leaves a durable
+/// failed child row under the succeeded parent, so both clients can warn.
+#[tokio::test]
+async fn spawn_manifest_failure_is_recorded_as_a_failed_child_row() {
+    let dir = scratch_dir("spawn-manifest-failure");
+    std::fs::create_dir_all(&dir).unwrap();
+    // A regular file where the manifest's parent directory must go makes
+    // `create_dir_all` fail deterministically.
+    std::fs::write(dir.join("blocker"), b"not a directory").unwrap();
+    let (addr, server) = serve_json_once(r#"[{"number":1}]"#).await;
+    let state = join_state(&dir, Vec::new()).await;
+
+    let def = crate::tasks::parse_task_md(
+        "gate",
+        &format!(
+            "kind = \"action\"\nworktree = false\nspawn = \"repo:Favetto/plan_issue\"\n\
+             spawn_file = \"blocker/handoff.json\"\n\
+             [action]\nid = \"http.request\"\n\
+             [action.params]\nurl = \"http://{addr}/issues\"\n---\nPoll.\n"
+        ),
+    )
+    .unwrap();
+
+    let root = Uuid::new_v4();
+    let task = lineage_task("gate", TaskStatus::Running, Some(root), None);
+    db::insert_task(&state.db, &task).await.unwrap();
+    let plan = Plan {
+        cwd: dir.clone(),
+        needs_lock: false,
+        worktree: None,
+    };
+    let run = running_run(task.id);
+    db::insert_task_run(&state.db, &run).await.unwrap();
+    run_one(&state, task.clone(), run, def, plan, None).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+
+    let parent = db::get_task(&state.db, task.id).await.unwrap().unwrap();
+    assert_eq!(parent.status, TaskStatus::Succeeded);
+
+    let children = db::list_tasks_in_root(&state.db, root, "repo:Favetto/plan_issue")
+        .await
+        .unwrap();
+    assert_eq!(children.len(), 1, "spawn failure was not persisted");
+    let child = &children[0];
+    assert_eq!(child.status, TaskStatus::Failed);
+    assert_eq!(child.parent_id, Some(task.id));
+    assert_eq!(child.root_id, Some(root));
+    assert_eq!(child.attempt, 1);
+    assert!(
+        child
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("spawn manifest preparation failed")),
+        "{:?}",
+        child.error
+    );
+    let failure = child.failure.as_ref().expect("typed failure");
+    assert_eq!(failure.kind, FailureKind::Infrastructure);
+    assert!(!failure.retryable, "a decided fan-out must not auto-retry");
+    assert!(
+        db::tail_events(&state.db, 20)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == EventKind::TaskFinished
+                && event.payload["task_id"] == child.id.to_string()),
+        "the failure is not durable on the event bus"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
