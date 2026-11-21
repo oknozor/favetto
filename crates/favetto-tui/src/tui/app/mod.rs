@@ -13,6 +13,7 @@ use ratatui::layout::Rect;
 use serde_json::Value;
 use uuid::Uuid;
 
+use favetto_core::elicitation::{ElicitationReply, ElicitationRequest};
 use favetto_core::model::{
     AgentActivity, AgentAuthMethod, AgentAuthMethodKind, AgentAuthState, AgentBackend,
     AgentCapabilities, AgentCatalogEntry, AgentCommand, AgentPlanEntry, AgentSessionHistoryEntry,
@@ -33,9 +34,12 @@ use super::term::TerminalView;
 use super::text_buffer::TextBuffer;
 use super::theme::{Theme, ThemeMode};
 
+mod elicitation;
 mod input;
 mod task_vars;
 mod wizard;
+
+pub use elicitation::{ElicitationPrompt, ElicitationStage};
 
 #[cfg(test)]
 mod tests;
@@ -166,6 +170,12 @@ pub enum UiAction {
         session_id: String,
         request_id: String,
         reply: InputReply,
+    },
+    /// Answer an ACP form elicitation (`agents.reply_elicitation`).
+    ElicitationReply {
+        session_id: String,
+        request_id: String,
+        reply: ElicitationReply,
     },
     /// Change one advertised ACP config option (`agents.set_option`).
     SetSessionOption {
@@ -469,6 +479,9 @@ pub enum Popup {
     /// The Ctrl+R reply prompt: answer a session's structured input request
     /// (`AgentActivity::Waiting { request }`) through `agents.reply`.
     Reply(ReplyPrompt),
+    /// The Ctrl+R form for an ACP v1 elicitation: edit, review, then accept,
+    /// decline or cancel through `agents.reply_elicitation`.
+    Elicitation(ElicitationPrompt),
     /// The Ctrl+A sign-in chooser: complete an agent-handled ACP sign-in or
     /// sign out when the agent advertised logout.
     Auth(AuthPrompt),
@@ -2820,6 +2833,43 @@ impl App {
                 message: awaiting.message.clone(),
                 options: awaiting.options.clone(),
                 allow_always: awaiting.allow_always,
+                form: awaiting.form.clone(),
+            },
+        ))
+    }
+
+    /// The pending form elicitation on the attached session, if any.
+    pub fn pending_elicitation(&self) -> Option<(String, ElicitationRequest)> {
+        let session = self.agent_sessions.get(self.agent_session_id.as_deref()?)?;
+        let (id, message, form) =
+            if let Some(AgentActivity::Waiting { request }) = &session.activity {
+                if request.kind != AwaitingInputKind::Elicitation {
+                    return None;
+                }
+                (
+                    request.id.clone(),
+                    request.message.clone(),
+                    request.form.clone()?,
+                )
+            } else {
+                let awaiting = session.awaiting_input.as_ref()?;
+                if awaiting.kind != AwaitingInputKind::Elicitation {
+                    return None;
+                }
+                (
+                    awaiting.request_id.clone()?,
+                    awaiting.message.clone(),
+                    awaiting.form.clone()?,
+                )
+            };
+        Some((
+            session.id.clone(),
+            ElicitationRequest {
+                id,
+                agent: session.agent.clone(),
+                tool_call_id: None,
+                message,
+                form,
             },
         ))
     }
@@ -3816,6 +3866,9 @@ fn reply_for(request: &InputRequest, selected: usize, value: &str) -> InputReply
         AwaitingInputKind::Choice | AwaitingInputKind::Pinentry | AwaitingInputKind::Other => {
             InputReply::Value { value: label }
         }
+        // Form elicitations use the dedicated `agents.reply_elicitation` path.
+        // A stray Ctrl+R reply must fail closed instead of inventing a value.
+        AwaitingInputKind::Elicitation => InputReply::Cancelled,
     }
 }
 

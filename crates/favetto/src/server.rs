@@ -838,6 +838,21 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
             }
         }
 
+        method::AGENTS_REPLY_ELICITATION => {
+            let p: AgentElicitationReplyParams = parse_params(&req.method, &req.params)?;
+            match state
+                .agents
+                .reply_elicitation(&p.session_id, &p.request_id, p.reply)
+                .await
+            {
+                Ok(()) => to_value(AgentElicitationReplyResult { replied: true }),
+                Err(crate::agents::ElicitationReplyError::Invalid(error)) => {
+                    Err(RpcError::InvalidParams(error.to_string()))
+                }
+                Err(error) => Err(RpcError::Internal(error.to_string())),
+            }
+        }
+
         method::AGENTS_OPTIONS => {
             let p: AgentOptionsParams = parse_params(&req.method, &req.params)?;
             match state.agents.options(&p.session_id) {

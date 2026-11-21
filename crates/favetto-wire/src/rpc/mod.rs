@@ -171,6 +171,11 @@ pub mod method {
     pub const AGENTS_CLOSE: &str = "agents.close";
     /// Answer a structured input request on a session's state channel.
     pub const AGENTS_REPLY: &str = "agents.reply";
+    /// Answer an ACP v1 form elicitation request.
+    ///
+    /// Deliberately separate from [`AGENTS_REPLY`]: a form submission can never
+    /// be mapped onto a permission option.
+    pub const AGENTS_REPLY_ELICITATION: &str = "agents.reply_elicitation";
     /// Read a live session's advertised ACP config options and modes.
     pub const AGENTS_OPTIONS: &str = "agents.options";
     /// Change one config option advertised by a live ACP session.
@@ -361,6 +366,10 @@ pub const CLIENT_METHODS: &[(&str, &str)] = &[
     (
         method::AGENTS_REPLY,
         "Answer a structured input request on a session's state channel.",
+    ),
+    (
+        method::AGENTS_REPLY_ELICITATION,
+        "Answer an ACP v1 form elicitation request with accept, decline or cancel.",
     ),
     (
         method::AGENTS_OPTIONS,
@@ -603,6 +612,7 @@ mod tests {
             method::AGENTS_ATTACH,
             method::AGENTS_CLOSE,
             method::AGENTS_REPLY,
+            method::AGENTS_REPLY_ELICITATION,
             method::AGENTS_OPTIONS,
             method::AGENTS_SET_OPTION,
             method::AGENTS_SET_MODE,

@@ -10,6 +10,7 @@ mod catalog;
 mod components;
 mod config;
 mod detail;
+mod elicitation;
 mod inbox;
 mod launch;
 mod layout;

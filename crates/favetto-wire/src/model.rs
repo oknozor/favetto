@@ -551,12 +551,14 @@ pub enum AwaitingInputKind {
     Choice,
     /// A passphrase/pinentry prompt (e.g. `git` signing).
     Pinentry,
+    /// An ACP v1 form elicitation request.
+    Elicitation,
     /// A prompt was detected but could not be classified further.
     Other,
 }
 
 /// Why a session is considered blocked on the user.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AwaitingInputReason {
     pub kind: AwaitingInputKind,
@@ -573,6 +575,9 @@ pub struct AwaitingInputReason {
     /// Whether an "always" / "remember" answer is offered.
     #[serde(default, skip_serializing_if = "crate::agent_state::is_false")]
     pub allow_always: bool,
+    /// The pending form for a form elicitation request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form: Option<crate::elicitation::ElicitationForm>,
 }
 
 /// How an agent session is driven.
@@ -1646,6 +1651,7 @@ mod tests {
             AwaitingInputKind::Confirmation,
             AwaitingInputKind::Choice,
             AwaitingInputKind::Pinentry,
+            AwaitingInputKind::Elicitation,
             AwaitingInputKind::Other,
         ] {
             let reason = AwaitingInputReason {
@@ -1654,6 +1660,7 @@ mod tests {
                 request_id: Some("perm_1".to_string()),
                 options: vec!["Allow once".to_string(), "Reject".to_string()],
                 allow_always: true,
+                form: None,
             };
             let json = serde_json::to_value(&reason).unwrap();
             assert_eq!(json["kind"], serde_json::to_value(kind).unwrap());
@@ -1670,10 +1677,28 @@ mod tests {
         assert!(legacy.request_id.is_none());
         assert!(legacy.options.is_empty());
         assert!(!legacy.allow_always);
+        assert!(legacy.form.is_none());
         let json = serde_json::to_value(&legacy).unwrap();
         assert!(json.get("request_id").is_none());
         assert!(json.get("options").is_none());
         assert!(json.get("allow_always").is_none());
+        assert!(json.get("form").is_none());
+
+        let with_form = AwaitingInputReason {
+            kind: AwaitingInputKind::Elicitation,
+            message: "Fill in".to_string(),
+            request_id: Some("acp-elic-1".to_string()),
+            options: Vec::new(),
+            allow_always: false,
+            form: Some(crate::elicitation::ElicitationForm {
+                title: Some("Details".to_string()),
+                description: None,
+                fields: Vec::new(),
+            }),
+        };
+        let json = serde_json::to_value(&with_form).unwrap();
+        let back: AwaitingInputReason = serde_json::from_value(json).unwrap();
+        assert_eq!(back, with_form);
     }
 
     #[test]
@@ -1840,6 +1865,7 @@ mod tests {
                 request_id: None,
                 options: Vec::new(),
                 allow_always: false,
+                form: None,
             }),
             config_options: Vec::new(),
             modes: None,

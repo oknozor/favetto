@@ -54,6 +54,7 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | `agents.attach` | Attach to a session: returns the session and a replay of its output. |
 | `agents.close` | Terminate a session. |
 | `agents.reply` | Answer a structured input request on a session's state channel. |
+| `agents.reply_elicitation` | Answer an ACP v1 form elicitation request with accept, decline or cancel. |
 | `agents.options` | Read a live ACP session's advertised config options and session modes. The returned snapshot is the same one `agents.list` exposes. |
 | `agents.set_option` | Change one config option advertised by a live ACP session. The daemon validates the option id and value against that session's current snapshot and rejects values the agent did not offer. |
 | `agents.set_mode` | Switch a live ACP session to one of its advertised modes. Unknown mode ids are rejected; the result carries the reconciled mode/option snapshot. |
@@ -721,6 +722,24 @@ Answer a structured input request on a session's state channel.
 | `session_id` | string | — | yes |  |
 | `request_id` | string | — | yes |  |
 | `reply` | InputReply | — | yes |  |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `replied` | boolean | — | yes |  |
+
+### `agents.reply_elicitation`
+
+Answer an ACP v1 form elicitation request with accept, decline or cancel.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `session_id` | string | — | yes |  |
+| `request_id` | string | — | yes |  |
+| `reply` | ElicitationReply | — | yes |  |
 
 **Response**
 

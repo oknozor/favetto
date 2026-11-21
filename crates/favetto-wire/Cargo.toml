@@ -18,6 +18,7 @@ serde_json = { workspace = true }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
+url = "2"
 schemars = { version = "1", features = ["derive", "chrono04", "uuid1"], optional = true }
 
 # wasm32-unknown-unknown needs a randomness source for `Uuid::new_v4()` and the

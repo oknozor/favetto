@@ -19,14 +19,16 @@ use crate::actions::{
     self, CatalogChoiceNext, CatalogChoicePrev, CatalogFieldNext, CatalogFieldPrev,
     CatalogLaunchSubmit, CatalogNewOneshot, CatalogSearch, CatalogToggleFolder, CloseOverlay,
     DetailPromptComplete, DetailPromptNext, DetailPromptPrev, DetailPromptSend, DetailReply,
-    FocusNext, FocusPrev, GoCatalog, GoInbox, GoSchedules, GoSettings, GoTasks, GoWorkflows,
-    ListDown, ListEnd, ListHome, ListOpen, ListPageDown, ListPageUp, ListUp, PaletteConfirm,
-    PaletteDown, PaletteUp, Refresh, RepoPickerConfirm, RepoPickerDown, RepoPickerUp,
-    ScheduleDelete, ScheduleEdit, ScheduleFieldNext, ScheduleFieldPrev, ScheduleNew,
-    ScheduleSubmit, ScheduleToggleEnabled, SettingsActivate, SettingsFieldNext, SettingsFieldPrev,
-    SettingsSave, SettingsTest, TaskCancel, TaskConfirmAccept, TaskConfirmReject, TaskFilterNext,
-    TaskFilterPrev, TaskRetry, TaskSearch, TogglePalette, ToggleShortcuts, WorkflowCancelRoot,
-    WorkflowRetryInstance, WorkflowRootNext, WorkflowRootPrev,
+    ElicitationCancel, ElicitationConfirm, ElicitationDecline, ElicitationEdit, ElicitationLeft,
+    ElicitationNext, ElicitationPrev, ElicitationRight, ElicitationToggle, FocusNext, FocusPrev,
+    GoCatalog, GoInbox, GoSchedules, GoSettings, GoTasks, GoWorkflows, ListDown, ListEnd, ListHome,
+    ListOpen, ListPageDown, ListPageUp, ListUp, PaletteConfirm, PaletteDown, PaletteUp, Refresh,
+    RepoPickerConfirm, RepoPickerDown, RepoPickerUp, ScheduleDelete, ScheduleEdit,
+    ScheduleFieldNext, ScheduleFieldPrev, ScheduleNew, ScheduleSubmit, ScheduleToggleEnabled,
+    SettingsActivate, SettingsFieldNext, SettingsFieldPrev, SettingsSave, SettingsTest, TaskCancel,
+    TaskConfirmAccept, TaskConfirmReject, TaskFilterNext, TaskFilterPrev, TaskRetry, TaskSearch,
+    TogglePalette, ToggleShortcuts, WorkflowCancelRoot, WorkflowRetryInstance, WorkflowRootNext,
+    WorkflowRootPrev,
 };
 use crate::catalog::OneShotFocus;
 use crate::components;
@@ -2213,6 +2215,7 @@ impl Render for RootView {
             schedule_sheet_open,
             settings_typing,
             detail_prompt_active,
+            detail_elicitation_active,
         ) = {
             let state = self.state.read(cx);
             (
@@ -2229,6 +2232,7 @@ impl Render for RootView {
                 state.schedule_editor_open(),
                 state.settings().is_editing_text(),
                 state.detail_prompt_active(),
+                state.detail_elicitation().is_some(),
             )
         };
         let mut key_context = String::from("Root");
@@ -2287,6 +2291,10 @@ impl Render for RootView {
             // The composer owns typed text and key navigation; keep the generic
             // `Search` suppression so single-key jumps never fire mid-prompt.
             key_context.push_str(" DetailPrompt Search");
+        }
+        if detail_elicitation_active {
+            // The form modal owns typed text and every navigation key.
+            key_context.push_str(" Elicitation Search");
         }
 
         let root = shell_root()
@@ -2513,6 +2521,60 @@ impl Render for RootView {
                     cx.notify();
                 });
             }))
+            .on_action(cx.listener(|this, _: &ElicitationNext, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.elicitation_next();
+                    cx.notify();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &ElicitationPrev, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.elicitation_prev();
+                    cx.notify();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &ElicitationLeft, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.elicitation_adjust(true);
+                    cx.notify();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &ElicitationRight, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.elicitation_adjust(false);
+                    cx.notify();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &ElicitationToggle, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.elicitation_toggle();
+                    cx.notify();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &ElicitationConfirm, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.elicitation_confirm(cx);
+                    cx.notify();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &ElicitationDecline, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.elicitation_decline(cx);
+                    cx.notify();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &ElicitationEdit, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.elicitation_edit();
+                    cx.notify();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &ElicitationCancel, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.elicitation_cancel(cx);
+                    cx.notify();
+                });
+            }))
             .on_action(cx.listener(|this, _: &PaletteUp, _window, cx| {
                 this.move_palette(-1, cx);
             }))
@@ -2632,6 +2694,7 @@ impl Render for RootView {
                         schedule_typing,
                         settings_typing,
                         detail_typing,
+                        elicitation_typing,
                     ) = {
                         let state = this.state.read(cx);
                         let route = state.active_route();
@@ -2645,6 +2708,7 @@ impl Render for RootView {
                             route == Route::Schedules && state.schedule_editor_open(),
                             route == Route::Settings && state.settings().is_editing_text(),
                             state.detail_prompt_active(),
+                            state.detail_elicitation().is_some(),
                         )
                     };
                     if !task_typing
@@ -2652,12 +2716,17 @@ impl Render for RootView {
                         && !schedule_typing
                         && !settings_typing
                         && !detail_typing
+                        && !elicitation_typing
                     {
                         return;
                     }
                     if keystroke.key == "backspace" {
                         this.state.update(cx, |state, cx| {
-                            if detail_typing {
+                            if elicitation_typing {
+                                if let Some(form) = state.detail_elicitation_mut() {
+                                    form.backspace();
+                                }
+                            } else if detail_typing {
                                 state.detail_prompt_backspace();
                             } else if schedule_typing {
                                 state.schedule_backspace();
@@ -2679,7 +2748,11 @@ impl Render for RootView {
                         if !characters.is_empty() {
                             this.state.update(cx, |state, cx| {
                                 for character in characters {
-                                    if detail_typing {
+                                    if elicitation_typing {
+                                        if let Some(form) = state.detail_elicitation_mut() {
+                                            form.push_char(character);
+                                        }
+                                    } else if detail_typing {
                                         state.detail_prompt_push_char(character);
                                     } else if schedule_typing {
                                         state.schedule_push_char(character);

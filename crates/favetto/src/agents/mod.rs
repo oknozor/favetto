@@ -20,12 +20,13 @@ use parking_lot::Mutex;
 use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 
+use favetto_core::elicitation::ElicitationReply;
 use favetto_core::model::{
     AgentActivity, AgentAuthMethodKind, AgentAuthState, AgentAuthStatus, AgentBackend,
     AgentCapabilities, AgentCommand, AgentLoadState, AgentPlanEntry, AgentSessionInfo,
-    AgentStateEvent, AgentUsage, AwaitingInputReason, ContentRole, InputReply, PermissionPolicy,
-    ProviderSessionEntry, ProviderSessionsResult, SessionConfigOption, SessionConfigValue,
-    SessionModes,
+    AgentStateEvent, AgentUsage, AwaitingInputKind, AwaitingInputReason, ContentRole, InputReply,
+    InputRequest, PermissionPolicy, ProviderSessionEntry, ProviderSessionsResult,
+    SessionConfigOption, SessionConfigValue, SessionModes,
 };
 use favetto_core::rpc::{AgentEventPush, AgentOptionsResult};
 
@@ -37,6 +38,8 @@ pub use acp::AcpOutcome;
 pub use registry::AgentRegistry;
 
 mod acp;
+
+pub(crate) use acp::ElicitationReplyError;
 mod registry;
 mod session_store;
 
@@ -284,7 +287,29 @@ impl AgentLiveState {
                     request: request.clone(),
                 });
             }
-            AgentStateEvent::InputResolved { .. } | AgentStateEvent::Idle { .. } => {
+            AgentStateEvent::InputResolved { id } => {
+                if self.waiting_request_id() == Some(id.as_str()) {
+                    self.activity = Some(AgentActivity::Idle);
+                }
+            }
+            AgentStateEvent::ElicitationRequested { request } => {
+                self.activity = Some(AgentActivity::Waiting {
+                    request: InputRequest {
+                        id: request.id.clone(),
+                        kind: AwaitingInputKind::Elicitation,
+                        message: request.message.clone(),
+                        options: Vec::new(),
+                        allow_always: false,
+                        form: Some(request.form.clone()),
+                    },
+                });
+            }
+            AgentStateEvent::ElicitationResolved { id, .. } => {
+                if self.waiting_request_id() == Some(id.as_str()) {
+                    self.activity = Some(AgentActivity::Idle);
+                }
+            }
+            AgentStateEvent::Idle { .. } => {
                 self.activity = Some(AgentActivity::Idle);
             }
             AgentStateEvent::Usage { usage, snapshot } => match self.usage.as_mut() {
@@ -304,6 +329,13 @@ impl AgentLiveState {
             AgentStateEvent::Session { .. }
             | AgentStateEvent::Title { .. }
             | AgentStateEvent::Auth { .. } => {}
+        }
+    }
+
+    fn waiting_request_id(&self) -> Option<&str> {
+        match &self.activity {
+            Some(AgentActivity::Waiting { request }) => Some(request.id.as_str()),
+            _ => None,
         }
     }
 }
@@ -1213,6 +1245,20 @@ impl AgentManager {
             .await
     }
 
+    /// Answer a pending ACP form elicitation.
+    pub async fn reply_elicitation(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        reply: ElicitationReply,
+    ) -> Result<(), acp::ElicitationReplyError> {
+        self.get(session_id)
+            .map_err(|_| acp::ElicitationReplyError::NoPending(request_id.to_string()))?
+            .responder
+            .reply_elicitation(request_id, reply)
+            .await
+    }
+
     /// The session's current config-option and mode snapshot.
     pub fn options(&self, session_id: &str) -> anyhow::Result<AgentOptionsResult> {
         let session = self.get(session_id)?;
@@ -1539,9 +1585,40 @@ fn spawn_state_task(
                         request_id: Some(request.id.clone()),
                         options: request.options.clone(),
                         allow_always: request.allow_always,
+                        form: request.form.clone(),
                     });
                 }
-                AgentStateEvent::InputResolved { .. } | AgentStateEvent::Idle { .. } => {
+                AgentStateEvent::ElicitationRequested { request } => {
+                    *session.awaiting_input.lock() = Some(AwaitingInputReason {
+                        kind: AwaitingInputKind::Elicitation,
+                        message: request.message.clone(),
+                        request_id: Some(request.id.clone()),
+                        options: Vec::new(),
+                        allow_always: false,
+                        form: Some(request.form.clone()),
+                    });
+                }
+                AgentStateEvent::InputResolved { id } => {
+                    let mut awaiting = session.awaiting_input.lock();
+                    if awaiting
+                        .as_ref()
+                        .and_then(|reason| reason.request_id.as_deref())
+                        == Some(id.as_str())
+                    {
+                        *awaiting = None;
+                    }
+                }
+                AgentStateEvent::ElicitationResolved { id, .. } => {
+                    let mut awaiting = session.awaiting_input.lock();
+                    if awaiting
+                        .as_ref()
+                        .and_then(|reason| reason.request_id.as_deref())
+                        == Some(id.as_str())
+                    {
+                        *awaiting = None;
+                    }
+                }
+                AgentStateEvent::Idle { .. } => {
                     *session.awaiting_input.lock() = None;
                 }
                 AgentStateEvent::Session {

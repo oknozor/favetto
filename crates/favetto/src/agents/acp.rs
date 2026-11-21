@@ -18,15 +18,18 @@ use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::schema::{
     AgentCapabilities, AuthMethod, AuthenticateRequest, AvailableCommand as AcpAvailableCommand,
-    AvailableCommandInput as AcpAvailableCommandInput, CancelNotification, ContentBlock,
-    DeleteSessionRequest, EmbeddedResourceResource, InitializeRequest, ListSessionsRequest,
+    AvailableCommandInput as AcpAvailableCommandInput, CancelNotification, ClientCapabilities,
+    ContentBlock, CreateElicitationRequest, CreateElicitationResponse, DeleteSessionRequest,
+    ElicitationAcceptAction, ElicitationAction, ElicitationCapabilities, ElicitationContentValue,
+    ElicitationFormCapabilities, ElicitationMode, ElicitationPropertySchema, ElicitationSchema,
+    ElicitationScope, EmbeddedResourceResource, InitializeRequest, ListSessionsRequest,
     LoadSessionRequest, LogoutRequest, NewSessionRequest, PermissionOptionKind,
     PlanEntry as AcpPlanEntry, PlanEntryPriority as AcpPlanPriority,
     PlanEntryStatus as AcpPlanStatus, PromptRequest, RequestPermissionOutcome,
@@ -38,10 +41,10 @@ use agent_client_protocol::v1::schema::{
     SessionConfigSelectOptions as AcpSelectOptions,
     SessionConfigValueId as AcpSessionConfigValueId, SessionId, SessionModeId as AcpSessionModeId,
     SessionModeState as AcpSessionModeState, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, TextContent, ToolCall as AcpToolCall,
-    ToolCallContent as AcpToolCallContent, ToolCallLocation as AcpToolCallLocation,
-    ToolCallStatus as AcpToolCallStatus, ToolCallUpdateFields as AcpToolCallUpdateFields,
-    ToolKind as AcpToolKind,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, StringFormat, TextContent,
+    ToolCall as AcpToolCall, ToolCallContent as AcpToolCallContent,
+    ToolCallLocation as AcpToolCallLocation, ToolCallStatus as AcpToolCallStatus,
+    ToolCallUpdateFields as AcpToolCallUpdateFields, ToolKind as AcpToolKind,
 };
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::{Agent, Client, Lines};
@@ -51,6 +54,11 @@ use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
+use favetto_core::elicitation::{
+    ElicitationField, ElicitationFieldKind, ElicitationForm, ElicitationOption, ElicitationOutcome,
+    ElicitationReply, ElicitationRequest, ElicitationStringFormat, ElicitationValidationError,
+    ElicitationValue, MAX_ELICITATION_FIELDS, MAX_ELICITATION_OPTIONS,
+};
 use favetto_core::model::{
     AgentAuthMethod, AgentAuthMethodKind, AgentAuthState, AgentAuthStatus, AgentCommand,
     AgentLoadState, AgentPlanEntry, AgentPlanPriority, AgentPlanStatus, AgentStateEvent,
@@ -623,6 +631,10 @@ pub(crate) fn spawn(
         pending: Mutex::new(HashMap::new()),
         timeout: launch.permission_timeout,
         turn: turn.clone(),
+        agent: launch.agent.clone(),
+        session_id: external_session_id.clone(),
+        pending_elicitations: Mutex::new(HashMap::new()),
+        next_elicitation: AtomicU64::new(1),
     });
 
     let transport = Lines::new(sink_from_stdin(stdin), lossy_lines(stdout.compat()));
@@ -635,6 +647,7 @@ pub(crate) fn spawn(
     let replay_outcome = outcome.clone();
     let replay_tools = tools.clone();
     let permission_responder = responder.clone();
+    let elicitation_responder = responder.clone();
 
     let permission_events = events_tx.clone();
     // Loading restores a conversation; it must never submit a prompt as part of
@@ -730,6 +743,28 @@ pub(crate) fn spawn(
                 },
                 agent_client_protocol::on_receive_request!(),
             )
+            .on_receive_request(
+                async move |request: CreateElicitationRequest, responder_handle, _cx| {
+                    match elicitation_responder.decide_elicitation(&request).await {
+                        Ok(response) => {
+                            let _ = responder_handle.respond(response);
+                        }
+                        Err(reason) => {
+                            // A form Favetto cannot render must fail explicitly;
+                            // it must never fall back to a permission response.
+                            let _ = responder_handle.respond_with_error(
+                                agent_client_protocol::Error::new(
+                                    agent_client_protocol::ErrorCode::INVALID_PARAMS,
+                                    reason.clone(),
+                                )
+                                .data(reason),
+                            );
+                        }
+                    }
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
             .connect_with(
                 transport,
                 move |connection: ConnectionTo<Agent>| async move {
@@ -739,7 +774,10 @@ pub(crate) fn spawn(
                     // `plan_removed`, identified/Markdown plans), which Favetto
                     // intentionally does not advertise or implement.
                     let init = connection
-                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .send_request(
+                            InitializeRequest::new(ProtocolVersion::V1)
+                                .client_capabilities(client_capabilities()),
+                        )
                         .block_task()
                         .await?;
                     *capability_slot.lock() = Some(init.agent_capabilities.clone());
@@ -1729,7 +1767,10 @@ pub(crate) async fn list_provider_sessions(
             transport,
             move |connection: ConnectionTo<Agent>| async move {
                 let init = connection
-                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .send_request(
+                        InitializeRequest::new(ProtocolVersion::V1)
+                            .client_capabilities(client_capabilities()),
+                    )
                     .block_task()
                     .await?;
                 let capabilities = init.agent_capabilities;
@@ -1800,7 +1841,10 @@ pub(crate) async fn delete_provider_session(
             transport,
             move |connection: ConnectionTo<Agent>| async move {
                 let init = connection
-                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .send_request(
+                        InitializeRequest::new(ProtocolVersion::V1)
+                            .client_capabilities(client_capabilities()),
+                    )
                     .block_task()
                     .await?;
                 if init
@@ -1833,12 +1877,44 @@ pub(crate) struct AcpResponder {
     pending: Mutex<HashMap<String, PendingPermission>>,
     timeout: Duration,
     turn: Arc<Mutex<TurnState>>,
+    agent: String,
+    session_id: Arc<Mutex<Option<String>>>,
+    pending_elicitations: Mutex<HashMap<String, PendingElicitation>>,
+    next_elicitation: AtomicU64,
 }
 
 /// One outstanding `ask` permission request, tagged with the turn that owns it.
 struct PendingPermission {
     generation: u64,
     reply: oneshot::Sender<InputReply>,
+}
+
+/// One outstanding form elicitation, tagged with the turn that owns it.
+struct PendingElicitation {
+    generation: u64,
+    form: ElicitationForm,
+    reply: oneshot::Sender<ElicitationReply>,
+}
+
+/// Why a client-supplied elicitation reply was not delivered.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ElicitationReplyError {
+    /// The accepted values did not satisfy the requested form.
+    #[error("{0}")]
+    Invalid(ElicitationValidationError),
+    /// The request was already answered, timed out or cancelled.
+    #[error("no pending ACP elicitation request '{0}'")]
+    NoPending(String),
+    /// The waiting ACP handler is gone.
+    #[error("elicitation request '{0}' is no longer waiting")]
+    Closed(String),
+}
+
+/// The client capabilities Favetto advertises: form elicitation only. URL mode
+/// remains unadvertised until a separate user-consented browser flow exists.
+fn client_capabilities() -> ClientCapabilities {
+    ClientCapabilities::new()
+        .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()))
 }
 
 impl AcpResponder {
@@ -1886,6 +1962,7 @@ impl AcpResponder {
                                 .options
                                 .iter()
                                 .any(|option| option.kind == PermissionOptionKind::AllowAlways),
+                            form: None,
                         },
                     }));
                 let reply = tokio::time::timeout(self.timeout, rx)
@@ -1905,8 +1982,103 @@ impl AcpResponder {
         }
     }
 
-    /// Settle every permission request owned by `generation` with the ACP
-    /// `cancelled` outcome. Returns how many requests were resolved.
+    /// Handle one ACP `elicitation/create` request.
+    ///
+    /// Unsupported modes or schemas return an error string that the caller sends
+    /// to the agent as JSON-RPC `-32602`. A timeout or dropped connection is
+    /// always [cancelled](ElicitationOutcome::Cancelled), never accepted.
+    async fn decide_elicitation(
+        &self,
+        request: &CreateElicitationRequest,
+    ) -> Result<CreateElicitationResponse, String> {
+        let ElicitationMode::Form(mode) = &request.mode else {
+            return Err(
+                "URL and unknown elicitation modes are not advertised by Favetto".to_string(),
+            );
+        };
+        let tool_call_id = match &mode.scope {
+            ElicitationScope::Session(scope) => {
+                if let Some(expected) = self.session_id.lock().clone() {
+                    if scope.session_id.0.as_ref() != expected {
+                        return Err(format!(
+                            "elicitation is scoped to another ACP session ('{}')",
+                            scope.session_id.0
+                        ));
+                    }
+                }
+                scope.tool_call_id.as_ref().map(|id| id.0.to_string())
+            }
+            // Request-scoped elicitation is accepted: it carries no session and
+            // is still correlated by its JSON-RPC response.
+            ElicitationScope::Request(_) => None,
+            _ => return Err("unknown elicitation scope is not supported".to_string()),
+        };
+        let form = wire_form(&mode.requested_schema)?;
+        let (generation, already_cancelled) = {
+            let turn = self.turn.lock();
+            (turn.generation, turn.is_cancelled(turn.generation))
+        };
+        if already_cancelled {
+            return Ok(CreateElicitationResponse::new(ElicitationAction::Cancel));
+        }
+
+        let id = format!(
+            "acp-elic-{}",
+            self.next_elicitation.fetch_add(1, Ordering::SeqCst)
+        );
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.pending_elicitations.lock();
+            if !pending.is_empty() {
+                return Err(
+                    "another elicitation request is already pending in this session".to_string(),
+                );
+            }
+            pending.insert(
+                id.clone(),
+                PendingElicitation {
+                    generation,
+                    form: form.clone(),
+                    reply: tx,
+                },
+            );
+        }
+        let _ = self
+            .events
+            .send(AcpEvent::State(AgentStateEvent::ElicitationRequested {
+                request: ElicitationRequest {
+                    id: id.clone(),
+                    agent: self.agent.clone(),
+                    tool_call_id,
+                    message: request.message.clone(),
+                    form,
+                },
+            }));
+        let reply = tokio::time::timeout(self.timeout, rx)
+            .await
+            .ok()
+            .and_then(Result::ok);
+        self.pending_elicitations.lock().remove(&id);
+        let outcome = match reply.as_ref() {
+            Some(ElicitationReply::Accept { .. }) => ElicitationOutcome::Accepted,
+            Some(ElicitationReply::Decline) => ElicitationOutcome::Declined,
+            Some(ElicitationReply::Cancel) | None => ElicitationOutcome::Cancelled,
+        };
+        let _ = self
+            .events
+            .send(AcpEvent::State(AgentStateEvent::ElicitationResolved {
+                id,
+                outcome,
+            }));
+        Ok(match reply {
+            Some(reply) => Self::elicitation_response(reply),
+            // No client answered in time: fail closed.
+            None => CreateElicitationResponse::new(ElicitationAction::Cancel),
+        })
+    }
+
+    /// Settle every permission and elicitation request owned by `generation`
+    /// with the ACP `cancelled` outcome. Returns how many requests were resolved.
     fn cancel_turn(&self, generation: u64) -> usize {
         let replies: Vec<oneshot::Sender<InputReply>> = {
             let mut pending = self.pending.lock();
@@ -1920,11 +2092,59 @@ impl AcpResponder {
                 .filter_map(|id| pending.remove(&id).map(|request| request.reply))
                 .collect()
         };
-        let resolved = replies.len();
+        let elicitations: Vec<oneshot::Sender<ElicitationReply>> = {
+            let mut pending = self.pending_elicitations.lock();
+            let owned: Vec<String> = pending
+                .iter()
+                .filter(|(_, request)| request.generation == generation)
+                .map(|(id, _)| id.clone())
+                .collect();
+            owned
+                .into_iter()
+                .filter_map(|id| pending.remove(&id).map(|request| request.reply))
+                .collect()
+        };
+        let resolved = replies.len() + elicitations.len();
         for reply in replies {
             let _ = reply.send(InputReply::Cancelled);
         }
+        for reply in elicitations {
+            let _ = reply.send(ElicitationReply::Cancel);
+        }
         resolved
+    }
+
+    /// Map a validated Favetto form reply onto the ACP action variants.
+    fn elicitation_response(reply: ElicitationReply) -> CreateElicitationResponse {
+        match reply {
+            ElicitationReply::Accept { values } => {
+                let content = values
+                    .into_iter()
+                    .map(|(name, value)| {
+                        let value = match value {
+                            ElicitationValue::String(value) => {
+                                ElicitationContentValue::String(value)
+                            }
+                            ElicitationValue::Integer(value) => {
+                                ElicitationContentValue::Integer(value)
+                            }
+                            ElicitationValue::Number(value) => {
+                                ElicitationContentValue::Number(value)
+                            }
+                            ElicitationValue::Boolean(value) => {
+                                ElicitationContentValue::Boolean(value)
+                            }
+                        };
+                        (name, value)
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                CreateElicitationResponse::new(ElicitationAction::Accept(
+                    ElicitationAcceptAction::new().content(content),
+                ))
+            }
+            ElicitationReply::Decline => CreateElicitationResponse::new(ElicitationAction::Decline),
+            ElicitationReply::Cancel => CreateElicitationResponse::new(ElicitationAction::Cancel),
+        }
     }
 
     /// Map a Favetto reply onto one of the agent's advertised options. Options
@@ -1985,6 +2205,293 @@ impl AcpResponder {
             .send(reply)
             .map_err(|_| anyhow::anyhow!("permission request '{request_id}' is no longer waiting"))
     }
+
+    /// Answer a pending form elicitation from a client.
+    ///
+    /// Invalid accepted values are rejected without removing the request, so
+    /// the UI can keep the form open and let the user correct it.
+    pub(crate) async fn reply_elicitation(
+        &self,
+        request_id: &str,
+        reply: ElicitationReply,
+    ) -> Result<(), ElicitationReplyError> {
+        let pending = {
+            let mut pending = self.pending_elicitations.lock();
+            let request = pending
+                .get(request_id)
+                .ok_or_else(|| ElicitationReplyError::NoPending(request_id.to_string()))?;
+            if let ElicitationReply::Accept { values } = &reply {
+                request
+                    .form
+                    .validate(values)
+                    .map_err(ElicitationReplyError::Invalid)?;
+            }
+            pending
+                .remove(request_id)
+                .ok_or_else(|| ElicitationReplyError::NoPending(request_id.to_string()))?
+        };
+        pending
+            .reply
+            .send(reply)
+            .map_err(|_| ElicitationReplyError::Closed(request_id.to_string()))
+    }
+}
+
+/// Convert one ACP elicitation schema into the restricted wire form.
+///
+/// Any unsupported type, constraint or invalid default is rejected with a
+/// reason. The caller returns that reason to the agent as `-32602`; it never
+/// silently becomes an empty form or a permission approval.
+fn wire_form(schema: &ElicitationSchema) -> Result<ElicitationForm, String> {
+    if schema.properties.len() > MAX_ELICITATION_FIELDS {
+        return Err(format!(
+            "elicitation schema has more than {MAX_ELICITATION_FIELDS} fields"
+        ));
+    }
+    let required = schema.required.clone().unwrap_or_default();
+    if let Some(name) = required
+        .iter()
+        .find(|name| !schema.properties.contains_key(*name))
+    {
+        return Err(format!(
+            "elicitation schema requires unknown property '{name}'"
+        ));
+    }
+    check_label("title", schema.title.as_deref())?;
+    check_label("description", schema.description.as_deref())?;
+    let mut fields = Vec::with_capacity(schema.properties.len());
+    for (name, property) in &schema.properties {
+        let field = wire_field(
+            name,
+            property,
+            required.iter().any(|required| required == name),
+        )?;
+        fields.push(field);
+    }
+    fields.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(ElicitationForm {
+        title: schema.title.clone(),
+        description: schema.description.clone(),
+        fields,
+    })
+}
+
+fn wire_field(
+    name: &str,
+    property: &ElicitationPropertySchema,
+    required: bool,
+) -> Result<ElicitationField, String> {
+    let field = match property {
+        ElicitationPropertySchema::String(string) => {
+            if string.pattern.is_some() {
+                return Err(format!(
+                    "elicitation field '{name}' uses an unsupported pattern constraint"
+                ));
+            }
+            if string.enum_values.is_some() && string.one_of.is_some() {
+                return Err(format!(
+                    "elicitation field '{name}' declares both enum and oneOf"
+                ));
+            }
+            check_label(name, string.title.as_deref())?;
+            check_label(name, string.description.as_deref())?;
+            let kind = if let Some(options) = &string.enum_values {
+                if options.is_empty() {
+                    return Err(format!("elicitation field '{name}' has no enum options"));
+                }
+                if options.len() > MAX_ELICITATION_OPTIONS {
+                    return Err(format!(
+                        "elicitation field '{name}' has more than {MAX_ELICITATION_OPTIONS} options"
+                    ));
+                }
+                let options = options
+                    .iter()
+                    .map(|value| ElicitationOption {
+                        value: value.clone(),
+                        title: value.clone(),
+                        description: None,
+                    })
+                    .collect();
+                ElicitationFieldKind::Enum {
+                    options,
+                    default: string.default.clone(),
+                }
+            } else if let Some(options) = &string.one_of {
+                if options.is_empty() {
+                    return Err(format!("elicitation field '{name}' has no enum options"));
+                }
+                if options.len() > MAX_ELICITATION_OPTIONS {
+                    return Err(format!(
+                        "elicitation field '{name}' has more than {MAX_ELICITATION_OPTIONS} options"
+                    ));
+                }
+                let options = options
+                    .iter()
+                    .map(|option| {
+                        check_label(name, option.description.as_deref())?;
+                        Ok(ElicitationOption {
+                            value: option.value.clone(),
+                            title: option.title.clone(),
+                            description: option.description.clone(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                ElicitationFieldKind::Enum {
+                    options,
+                    default: string.default.clone(),
+                }
+            } else {
+                if let (Some(min), Some(max)) = (string.min_length, string.max_length) {
+                    if min > max {
+                        return Err(format!(
+                            "elicitation field '{name}' has minLength greater than maxLength"
+                        ));
+                    }
+                }
+                ElicitationFieldKind::String {
+                    default: string.default.clone(),
+                    min_length: string.min_length,
+                    max_length: string.max_length,
+                    format: match string.format {
+                        Some(format) => Some(wire_string_format(name, format)?),
+                        None => None,
+                    },
+                }
+            };
+            ElicitationField {
+                name: name.to_string(),
+                title: string.title.clone(),
+                description: string.description.clone(),
+                required,
+                kind,
+            }
+        }
+        ElicitationPropertySchema::Integer(integer) => {
+            if let (Some(min), Some(max)) = (integer.minimum, integer.maximum) {
+                if min > max {
+                    return Err(format!(
+                        "elicitation field '{name}' has minimum greater than maximum"
+                    ));
+                }
+            }
+            check_label(name, integer.title.as_deref())?;
+            check_label(name, integer.description.as_deref())?;
+            ElicitationField {
+                name: name.to_string(),
+                title: integer.title.clone(),
+                description: integer.description.clone(),
+                required,
+                kind: ElicitationFieldKind::Integer {
+                    default: integer.default,
+                    minimum: integer.minimum,
+                    maximum: integer.maximum,
+                },
+            }
+        }
+        ElicitationPropertySchema::Number(number) => {
+            if number.minimum.is_some_and(|minimum| !minimum.is_finite())
+                || number.maximum.is_some_and(|maximum| !maximum.is_finite())
+                || number.default.is_some_and(|default| !default.is_finite())
+            {
+                return Err(format!(
+                    "elicitation field '{name}' has a non-finite numeric constraint"
+                ));
+            }
+            if let (Some(min), Some(max)) = (number.minimum, number.maximum) {
+                if min > max {
+                    return Err(format!(
+                        "elicitation field '{name}' has minimum greater than maximum"
+                    ));
+                }
+            }
+            check_label(name, number.title.as_deref())?;
+            check_label(name, number.description.as_deref())?;
+            ElicitationField {
+                name: name.to_string(),
+                title: number.title.clone(),
+                description: number.description.clone(),
+                required,
+                kind: ElicitationFieldKind::Number {
+                    default: number.default,
+                    minimum: number.minimum,
+                    maximum: number.maximum,
+                },
+            }
+        }
+        ElicitationPropertySchema::Boolean(boolean) => {
+            check_label(name, boolean.title.as_deref())?;
+            check_label(name, boolean.description.as_deref())?;
+            ElicitationField {
+                name: name.to_string(),
+                title: boolean.title.clone(),
+                description: boolean.description.clone(),
+                required,
+                kind: ElicitationFieldKind::Boolean {
+                    default: boolean.default,
+                },
+            }
+        }
+        ElicitationPropertySchema::Array(_) => {
+            return Err(format!(
+                "elicitation field '{name}' is a multi-select array, which Favetto does not support"
+            ));
+        }
+        ElicitationPropertySchema::Other(other) => {
+            return Err(format!(
+                "elicitation field '{name}' uses unknown property type '{}'",
+                other.type_
+            ));
+        }
+        _ => {
+            return Err(format!(
+                "elicitation field '{name}' uses an unknown property type"
+            ));
+        }
+    };
+    check_label(name, field.title.as_deref())?;
+    check_label(name, field.description.as_deref())?;
+    if let Some(default) = default_value(&field.kind) {
+        field.validate_value(&default).map_err(|error| {
+            format!("elicitation field '{name}' has an invalid default: {error}")
+        })?;
+    }
+    Ok(field)
+}
+
+fn wire_string_format(name: &str, format: StringFormat) -> Result<ElicitationStringFormat, String> {
+    match format {
+        StringFormat::Email => Ok(ElicitationStringFormat::Email),
+        StringFormat::Uri => Ok(ElicitationStringFormat::Uri),
+        StringFormat::Date => Ok(ElicitationStringFormat::Date),
+        StringFormat::DateTime => Ok(ElicitationStringFormat::DateTime),
+        _ => Err(format!(
+            "elicitation field '{name}' uses an unsupported string format"
+        )),
+    }
+}
+
+fn default_value(kind: &ElicitationFieldKind) -> Option<ElicitationValue> {
+    match kind {
+        ElicitationFieldKind::String { default, .. } => {
+            default.clone().map(ElicitationValue::String)
+        }
+        ElicitationFieldKind::Enum { default, .. } => default.clone().map(ElicitationValue::String),
+        ElicitationFieldKind::Integer { default, .. } => default.map(ElicitationValue::Integer),
+        ElicitationFieldKind::Number { default, .. } => default.map(ElicitationValue::Number),
+        ElicitationFieldKind::Boolean { default, .. } => default.map(ElicitationValue::Boolean),
+    }
+}
+
+fn check_label(name: &str, value: Option<&str>) -> Result<(), String> {
+    if value.is_some_and(|value| {
+        value.chars().count() > favetto_core::elicitation::MAX_ELICITATION_LABEL_LEN
+    }) {
+        return Err(format!(
+            "elicitation field '{name}' has a label longer than {} characters",
+            favetto_core::elicitation::MAX_ELICITATION_LABEL_LEN
+        ));
+    }
+    Ok(())
 }
 
 /// The current model reported by a session setup response, if any.
@@ -3777,6 +4284,10 @@ mod tests {
             pending: Mutex::new(HashMap::new()),
             timeout,
             turn: turn.clone(),
+            agent: "test-agent".to_string(),
+            session_id: Arc::new(Mutex::new(Some("s1".to_string()))),
+            pending_elicitations: Mutex::new(HashMap::new()),
+            next_elicitation: AtomicU64::new(1),
         });
         (responder, rx, turn)
     }
@@ -3890,5 +4401,259 @@ mod tests {
             rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    fn elicitation_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "title": "Profile",
+            "properties": {
+                "name": { "type": "string", "minLength": 2 },
+                "color": { "type": "string", "enum": ["red", "blue"] },
+                "count": { "type": "integer", "minimum": 1, "maximum": 9 },
+                "ratio": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                "enabled": { "type": "boolean", "default": true }
+            },
+            "required": ["name"]
+        })
+    }
+
+    fn form_request(schema: serde_json::Value) -> CreateElicitationRequest {
+        serde_json::from_value(serde_json::json!({
+            "mode": "form",
+            "sessionId": "s1",
+            "message": "Please fill in the form",
+            "requestedSchema": schema
+        }))
+        .expect("valid form request")
+    }
+
+    async fn next_elicitation_requested(
+        rx: &mut mpsc::UnboundedReceiver<AcpEvent>,
+    ) -> (String, ElicitationRequest) {
+        match rx.recv().await.expect("state event") {
+            AcpEvent::State(AgentStateEvent::ElicitationRequested { request }) => {
+                (request.id.clone(), request)
+            }
+            other => panic!("expected ElicitationRequested, got {other:?}"),
+        }
+    }
+
+    async fn next_elicitation_resolved(
+        rx: &mut mpsc::UnboundedReceiver<AcpEvent>,
+    ) -> (String, ElicitationOutcome) {
+        match rx.recv().await.expect("state event") {
+            AcpEvent::State(AgentStateEvent::ElicitationResolved { id, outcome }) => (id, outcome),
+            other => panic!("expected ElicitationResolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_capabilities_advertise_form_elicitation_only() {
+        let json = serde_json::to_value(client_capabilities()).unwrap();
+        assert_eq!(json["elicitation"]["form"], serde_json::json!({}));
+        assert!(
+            json["elicitation"].get("url").is_none(),
+            "URL mode must stay unadvertised: {json}"
+        );
+    }
+
+    #[test]
+    fn wire_form_maps_supported_fields_and_rejects_unsupported_schemas() {
+        let request = form_request(elicitation_schema());
+        let ElicitationMode::Form(mode) = &request.mode else {
+            panic!("form mode");
+        };
+        let form = wire_form(&mode.requested_schema).expect("supported form");
+        assert_eq!(form.title.as_deref(), Some("Profile"));
+        let names: Vec<_> = form
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect();
+        assert_eq!(names, ["color", "count", "enabled", "name", "ratio"]);
+        assert!(
+            form.fields
+                .iter()
+                .find(|field| field.name == "name")
+                .unwrap()
+                .required
+        );
+
+        for (index, schema) in [
+            serde_json::json!({
+                "type": "object",
+                "properties": { "tags": { "type": "array", "items": { "type": "string", "enum": ["a", "b"] } } }
+            }),
+            serde_json::json!({
+                "type": "object",
+                "properties": { "name": { "type": "string", "pattern": "^a" } }
+            }),
+            serde_json::json!({
+                "type": "object",
+                "properties": { "name": { "type": "string" } },
+                "required": ["missing"]
+            }),
+            serde_json::json!({
+                "type": "object",
+                "properties": { "count": { "type": "integer", "default": 99, "maximum": 9 } }
+            }),
+            serde_json::json!({
+                "type": "object",
+                "properties": { "future": { "type": "object" } }
+            }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let schema: ElicitationSchema = serde_json::from_value(schema)
+                .unwrap_or_else(|error| panic!("schema {index} did not parse: {error}"));
+            assert!(
+                wire_form(&schema).is_err(),
+                "unsupported schema {index} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_accept_keeps_the_request_pending_until_corrected() {
+        let (responder, mut rx, turn) = ask_responder(Duration::from_secs(60));
+        turn.lock().begin();
+        let request = form_request(elicitation_schema());
+        let handle = {
+            let responder = responder.clone();
+            tokio::spawn(async move { responder.decide_elicitation(&request).await })
+        };
+        let (id, emitted) = next_elicitation_requested(&mut rx).await;
+        assert_eq!(emitted.agent, "test-agent");
+        assert_eq!(emitted.form.fields.len(), 5);
+
+        let mut values = BTreeMap::new();
+        values.insert(
+            "name".to_string(),
+            ElicitationValue::String("x".to_string()),
+        );
+        let error = responder
+            .reply_elicitation(&id, ElicitationReply::Accept { values })
+            .await
+            .expect_err("short required value must be rejected");
+        assert!(matches!(error, ElicitationReplyError::Invalid(_)));
+        assert!(
+            responder.pending_elicitations.lock().contains_key(&id),
+            "an invalid reply must keep the form open"
+        );
+
+        let mut values = BTreeMap::new();
+        values.insert(
+            "name".to_string(),
+            ElicitationValue::String("Ada".to_string()),
+        );
+        values.insert(
+            "color".to_string(),
+            ElicitationValue::String("blue".to_string()),
+        );
+        values.insert("count".to_string(), ElicitationValue::Integer(3));
+        responder
+            .reply_elicitation(&id, ElicitationReply::Accept { values })
+            .await
+            .expect("corrected reply");
+        let response = handle.await.expect("handler").expect("response");
+        match response.action {
+            ElicitationAction::Accept(accept) => {
+                let content = accept.content.expect("content");
+                assert_eq!(
+                    content.get("name"),
+                    Some(&ElicitationContentValue::String("Ada".to_string()))
+                );
+                assert_eq!(
+                    content.get("count"),
+                    Some(&ElicitationContentValue::Integer(3))
+                );
+            }
+            other => panic!("expected accept, got {other:?}"),
+        }
+        assert_eq!(
+            next_elicitation_resolved(&mut rx).await,
+            (id.clone(), ElicitationOutcome::Accepted)
+        );
+        assert!(matches!(
+            responder
+                .reply_elicitation(&id, ElicitationReply::Decline)
+                .await,
+            Err(ElicitationReplyError::NoPending(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn timeout_and_cancel_turn_never_accept() {
+        let (responder, mut rx, turn) = ask_responder(Duration::from_millis(20));
+        turn.lock().begin();
+        let response = responder
+            .decide_elicitation(&form_request(elicitation_schema()))
+            .await
+            .expect("response");
+        assert!(matches!(response.action, ElicitationAction::Cancel));
+        let (_, _) = next_elicitation_requested(&mut rx).await;
+        let (_, outcome) = next_elicitation_resolved(&mut rx).await;
+        assert_eq!(outcome, ElicitationOutcome::Cancelled);
+
+        let (responder, mut rx, turn) = ask_responder(Duration::from_secs(60));
+        let generation = turn.lock().begin();
+        let request = form_request(elicitation_schema());
+        let handle = {
+            let responder = responder.clone();
+            tokio::spawn(async move { responder.decide_elicitation(&request).await })
+        };
+        let (id, _) = next_elicitation_requested(&mut rx).await;
+        assert_eq!(responder.cancel_turn(generation), 1);
+        let response = handle.await.expect("handler").expect("response");
+        assert!(matches!(response.action, ElicitationAction::Cancel));
+        assert_eq!(
+            next_elicitation_resolved(&mut rx).await,
+            (id, ElicitationOutcome::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_elicitation_during_cancellation_is_answered_without_an_event() {
+        let (responder, mut rx, turn) = ask_responder(Duration::from_secs(60));
+        turn.lock().begin();
+        assert!(turn.lock().request_cancel().is_some());
+        let response = responder
+            .decide_elicitation(&form_request(elicitation_schema()))
+            .await
+            .expect("response");
+        assert!(matches!(response.action, ElicitationAction::Cancel));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn url_scope_and_wrong_session_are_rejected_explicitly() {
+        let (responder, _rx, _turn) = ask_responder(Duration::from_secs(1));
+        let url: CreateElicitationRequest = serde_json::from_value(serde_json::json!({
+            "mode": "url",
+            "sessionId": "s1",
+            "message": "Open this",
+            "elicitationId": "e1",
+            "url": "https://example.com"
+        }))
+        .unwrap();
+        assert!(responder.decide_elicitation(&url).await.is_err());
+
+        let wrong_session: CreateElicitationRequest = serde_json::from_value(serde_json::json!({
+            "mode": "form",
+            "sessionId": "other",
+            "message": "Fill",
+            "requestedSchema": elicitation_schema()
+        }))
+        .unwrap();
+        let error = responder
+            .decide_elicitation(&wrong_session)
+            .await
+            .expect_err("another session must not be able to prompt");
+        assert!(error.contains("another ACP session"), "{error}");
     }
 }

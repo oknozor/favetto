@@ -555,6 +555,7 @@ mod tests {
             request_id: Some("req-1".to_string()),
             options: vec!["Allow once".to_string(), "Reject".to_string()],
             allow_always: false,
+            form: None,
         }
     }
 

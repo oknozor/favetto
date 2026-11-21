@@ -26,6 +26,7 @@ use crate::agent_state::{
     AgentActivity, AgentCommand, AgentPlanEntry, AgentStateEvent, AgentUsage, InputReply,
     SessionConfigOption, SessionConfigValue, SessionModes, UsagePeriod, UsageStats,
 };
+use crate::elicitation::ElicitationReply;
 use crate::model::{
     AgentAuthState, AgentCatalogEntry, AgentSessionHistoryEntry, AgentSessionInfo, Event,
     NotificationRecord, ProviderSessionsResult, RepoInfo, Schedule, Task, TaskRun,
@@ -564,6 +565,23 @@ pub struct AgentReplyResult {
     pub replied: bool,
 }
 
+/// `agents.reply_elicitation` params: answer a form request identified by
+/// `request_id`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AgentElicitationReplyParams {
+    pub session_id: String,
+    pub request_id: String,
+    pub reply: ElicitationReply,
+}
+
+/// `agents.reply_elicitation` result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AgentElicitationReplyResult {
+    pub replied: bool,
+}
+
 /// `agents.options` params: read one live session's advertised selectors.
 pub type AgentOptionsParams = SessionIdParams;
 
@@ -1022,6 +1040,8 @@ rpc_calls! {
     AgentsCloseCall => method::AGENTS_CLOSE, SessionIdParams, AgentCloseResult;
     /// Typed call for `agents.reply`.
     AgentsReplyCall => method::AGENTS_REPLY, AgentReplyParams, AgentReplyResult;
+    /// Typed call for `agents.reply_elicitation`.
+    AgentsReplyElicitationCall => method::AGENTS_REPLY_ELICITATION, AgentElicitationReplyParams, AgentElicitationReplyResult;
     /// Typed call for `agents.options`.
     AgentsOptionsCall => method::AGENTS_OPTIONS, AgentOptionsParams, AgentOptionsResult;
     /// Typed call for `agents.set_option`.
@@ -1242,6 +1262,11 @@ pub const CLIENT_CALLS: &[RpcCallSpec] = &[
         method: method::AGENTS_REPLY,
         params_schema: schema_of::<AgentReplyParams>,
         result_schema: schema_of::<AgentReplyResult>,
+    },
+    RpcCallSpec {
+        method: method::AGENTS_REPLY_ELICITATION,
+        params_schema: schema_of::<AgentElicitationReplyParams>,
+        result_schema: schema_of::<AgentElicitationReplyResult>,
     },
     RpcCallSpec {
         method: method::AGENTS_OPTIONS,

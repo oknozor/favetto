@@ -964,6 +964,16 @@ async fn run_session(
                             UiAction::Reply { session_id, request_id, reply } => {
                                 send_agent_reply(client, app, session_id, request_id, reply).await;
                             }
+                            UiAction::ElicitationReply { session_id, request_id, reply } => {
+                                send_agent_elicitation_reply(
+                                    client,
+                                    app,
+                                    session_id,
+                                    request_id,
+                                    reply,
+                                )
+                                .await;
+                            }
                             UiAction::SetSessionOption {
                                 session_id,
                                 option_id,
@@ -1782,6 +1792,44 @@ async fn send_agent_reply(
                     .as_ref()
                     .map(|e| e.message.clone())
                     .unwrap_or_else(|| "agents.reply failed".to_string());
+                app.agent_error = Some(message);
+            }
+        },
+        Err(e) => app.agent_error = Some(e.to_string()),
+    }
+    fetch_agent_sessions(client, app).await;
+}
+
+/// Answer an ACP form elicitation through `agents.reply_elicitation`.
+///
+/// Only the method outcome is logged; the submitted values never enter the log,
+/// the prompt, the feed or the transcript.
+async fn send_agent_elicitation_reply(
+    client: &Client,
+    app: &mut App,
+    session_id: String,
+    request_id: String,
+    reply: favetto_core::elicitation::ElicitationReply,
+) {
+    let params = serde_json::json!({
+        "session_id": session_id,
+        "request_id": request_id,
+        "reply": reply,
+    });
+    match client
+        .request(method::AGENTS_REPLY_ELICITATION, params)
+        .await
+    {
+        Ok(resp) => match resp.result {
+            Some(_) => app
+                .logs
+                .push_back("agents.reply_elicitation: ok".to_string()),
+            None => {
+                let message = resp
+                    .error
+                    .as_ref()
+                    .map(|e| e.message.clone())
+                    .unwrap_or_else(|| "agents.reply_elicitation failed".to_string());
                 app.agent_error = Some(message);
             }
         },
