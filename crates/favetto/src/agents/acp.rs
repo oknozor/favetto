@@ -30,10 +30,17 @@ use agent_client_protocol::v1::schema::{
     PermissionOptionKind, PlanEntry as AcpPlanEntry, PlanEntryPriority as AcpPlanPriority,
     PlanEntryStatus as AcpPlanStatus, PromptRequest, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionConfigOption, SessionId, SessionNotification, SessionUpdate, TextContent,
-    ToolCall as AcpToolCall, ToolCallContent as AcpToolCallContent,
-    ToolCallLocation as AcpToolCallLocation, ToolCallStatus as AcpToolCallStatus,
-    ToolCallUpdateFields as AcpToolCallUpdateFields, ToolKind as AcpToolKind,
+    SessionConfigId as AcpSessionConfigId, SessionConfigKind as AcpSessionConfigKind,
+    SessionConfigOption as AcpSessionConfigOption,
+    SessionConfigOptionCategory as AcpSessionConfigCategory,
+    SessionConfigOptionValue as AcpSessionConfigValue,
+    SessionConfigSelectOptions as AcpSelectOptions,
+    SessionConfigValueId as AcpSessionConfigValueId, SessionId, SessionModeId as AcpSessionModeId,
+    SessionModeState as AcpSessionModeState, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, TextContent, ToolCall as AcpToolCall,
+    ToolCallContent as AcpToolCallContent, ToolCallLocation as AcpToolCallLocation,
+    ToolCallStatus as AcpToolCallStatus, ToolCallUpdateFields as AcpToolCallUpdateFields,
+    ToolKind as AcpToolKind,
 };
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::{Agent, Client, Lines};
@@ -46,8 +53,9 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use favetto_core::model::{
     AgentCommand, AgentLoadState, AgentPlanEntry, AgentPlanPriority, AgentPlanStatus,
     AgentStateEvent, AwaitingInputKind, ContentRole, InputReply, InputRequest, MessageContent,
-    MessageRole, PermissionPolicy, ToolCallDetail, ToolCallStatus, ToolContent, ToolKind,
-    ToolLocation,
+    MessageRole, PermissionPolicy, SessionConfigChoice, SessionConfigChoices, SessionConfigGroup,
+    SessionConfigKind, SessionConfigOption, SessionConfigValue, SessionMode, SessionModes,
+    ToolCallDetail, ToolCallStatus, ToolContent, ToolKind, ToolLocation,
 };
 
 use super::session_store::SessionBinding;
@@ -60,6 +68,10 @@ pub(crate) const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
 /// method is optional in practice, and a completed turn must never leave the
 /// task `running`.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a client-requested config/mode change may take before the RPC fails
+/// instead of holding the connection open.
+const CONFIG_CHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Whether the initial ACP setup creates a session or restores a known one.
 #[derive(Debug, Clone)]
@@ -159,6 +171,17 @@ pub(crate) enum AcpCommand {
     Cancel,
     /// Close the session and stop the server.
     Shutdown,
+    /// Change one advertised config option (`session/set_config_option`).
+    SetConfigOption {
+        option_id: String,
+        value: SessionConfigValue,
+        reply: oneshot::Sender<Result<Vec<SessionConfigOption>, String>>,
+    },
+    /// Switch to an advertised mode (`session/set_mode`).
+    SetMode {
+        mode_id: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// Cancellation state for the one prompt turn that can be in flight at a time.
@@ -290,6 +313,40 @@ impl AcpHandles {
     pub(crate) fn shutdown(&self) {
         let _ = self.commands.send(AcpCommand::Shutdown);
         self.task.abort();
+    }
+
+    /// Change one advertised config option and return the agent's full snapshot.
+    pub(crate) async fn set_config_option(
+        &self,
+        option_id: String,
+        value: SessionConfigValue,
+    ) -> anyhow::Result<Vec<SessionConfigOption>> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(AcpCommand::SetConfigOption {
+                option_id,
+                value,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("agent session is no longer running"))?;
+        tokio::time::timeout(CONFIG_CHANGE_TIMEOUT, response)
+            .await
+            .map_err(|_| anyhow::anyhow!("agent did not answer the config change in time"))?
+            .map_err(|_| anyhow::anyhow!("agent session ended during the config change"))?
+            .map_err(anyhow::Error::msg)
+    }
+
+    /// Switch to an advertised mode.
+    pub(crate) async fn set_mode(&self, mode_id: String) -> anyhow::Result<()> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(AcpCommand::SetMode { mode_id, reply })
+            .map_err(|_| anyhow::anyhow!("agent session is no longer running"))?;
+        tokio::time::timeout(CONFIG_CHANGE_TIMEOUT, response)
+            .await
+            .map_err(|_| anyhow::anyhow!("agent did not answer the mode change in time"))?
+            .map_err(|_| anyhow::anyhow!("agent session ended during the mode change"))?
+            .map_err(anyhow::Error::msg)
     }
 }
 
@@ -520,7 +577,13 @@ pub(crate) fn spawn(
                     // created, while a load restores the agent's own session id.
                     // A load never falls back to `session/new`, because a fresh
                     // session would be presented as a restored conversation.
-                    let (session_id, external_session_id, chosen_model) = match &mode {
+                    let (
+                        session_id,
+                        external_session_id,
+                        chosen_model,
+                        config_options,
+                        modes,
+                    ) = match &mode {
                         AcpSessionMode::Load {
                             external_session_id: known,
                         } => {
@@ -577,6 +640,8 @@ pub(crate) fn spawn(
                                 SessionId::new(known.clone()),
                                 known.clone(),
                                 current_model(loaded.config_options.as_deref()),
+                                normalized_config_options(loaded.config_options.as_deref()),
+                                loaded.modes.as_ref().map(normalized_modes),
                             )
                         }
                         AcpSessionMode::New => {
@@ -619,23 +684,30 @@ pub(crate) fn spawn(
                             // instead of relying on the agent's last-used
                             // default (which may be stale or unavailable on
                             // this account).
-                            let chosen_model = if let Some(wanted) = &requested_model {
-                                match apply_model(&connection, &session, wanted).await {
-                                    Ok(model) => Some(model),
-                                    Err(error) => {
-                                        let message = format!("agent '{agent_name}': {error}");
-                                        let _ = events_tx.send(AcpEvent::State(
-                                            AgentStateEvent::Error {
-                                                message: message.clone(),
-                                            },
-                                        ));
-                                        return Err(anyhow::anyhow!(message).into());
+                            let (chosen_model, options) =
+                                if let Some(wanted) = &requested_model {
+                                    match apply_model(&connection, &session, wanted).await {
+                                        Ok((model, options)) => (Some(model), options),
+                                        Err(error) => {
+                                            let message = format!("agent '{agent_name}': {error}");
+                                            let _ = events_tx.send(AcpEvent::State(
+                                                AgentStateEvent::Error {
+                                                    message: message.clone(),
+                                                },
+                                            ));
+                                            return Err(anyhow::anyhow!(message).into());
+                                        }
                                     }
-                                }
-                            } else {
-                                current_model(session.config_options.as_deref())
-                            };
-                            (session_id, external_session_id, chosen_model)
+                                } else {
+                                    (
+                                        current_model(session.config_options.as_deref()),
+                                        normalized_config_options(
+                                            session.config_options.as_deref(),
+                                        ),
+                                    )
+                                };
+                            let modes = session.modes.as_ref().map(normalized_modes);
+                            (session_id, external_session_id, chosen_model, options, modes)
                         }
                     };
                     // A successful load releases the buffered replay in arrival
@@ -660,6 +732,12 @@ pub(crate) fn spawn(
                         title: None,
                         model: chosen_model,
                     }));
+                    let _ = events_tx.send(AcpEvent::State(AgentStateEvent::ConfigOptions {
+                        options: config_options,
+                    }));
+                    if let Some(modes) = modes {
+                        let _ = events_tx.send(AcpEvent::State(AgentStateEvent::Modes { modes }));
+                    }
                     if replay_gate.is_some() {
                         let (applied_tx, applied_rx) = oneshot::channel();
                         let _ = events_tx.send(AcpEvent::ReplayApplied(applied_tx));
@@ -685,9 +763,64 @@ pub(crate) fn spawn(
                     let control_connection = connection.clone();
                     let control_session = session_id.clone();
                     let control_turn = prompt_turn.clone();
+                    let control_events = events_tx.clone();
                     tokio::spawn(async move {
                         while let Some(command) = commands_rx.recv().await {
                             match command {
+                                AcpCommand::SetConfigOption {
+                                    option_id,
+                                    value,
+                                    reply,
+                                } => {
+                                    let request = SetSessionConfigOptionRequest::new(
+                                        control_session.clone(),
+                                        AcpSessionConfigId::new(option_id),
+                                        acp_config_value(value),
+                                    );
+                                    let result = control_connection
+                                        .send_request(request)
+                                        .block_task()
+                                        .await;
+                                    match result {
+                                        Ok(response) => {
+                                            let options = normalized_config_options(Some(
+                                                &response.config_options,
+                                            ));
+                                            let _ = control_events.send(AcpEvent::State(
+                                                AgentStateEvent::ConfigOptions {
+                                                    options: options.clone(),
+                                                },
+                                            ));
+                                            let _ = reply.send(Ok(options));
+                                        }
+                                        Err(error) => {
+                                            let _ = reply.send(Err(error.to_string()));
+                                        }
+                                    }
+                                }
+                                AcpCommand::SetMode { mode_id, reply } => {
+                                    let request = SetSessionModeRequest::new(
+                                        control_session.clone(),
+                                        AcpSessionModeId::new(mode_id.clone()),
+                                    );
+                                    let result = control_connection
+                                        .send_request(request)
+                                        .block_task()
+                                        .await;
+                                    match result {
+                                        Ok(_) => {
+                                            let _ = control_events.send(AcpEvent::State(
+                                                AgentStateEvent::CurrentMode {
+                                                    mode_id: mode_id.clone(),
+                                                },
+                                            ));
+                                            let _ = reply.send(Ok(()));
+                                        }
+                                        Err(error) => {
+                                            let _ = reply.send(Err(error.to_string()));
+                                        }
+                                    }
+                                }
                                 AcpCommand::Cancel => {
                                     let Some(generation) = control_turn.lock().request_cancel()
                                     else {
@@ -1062,36 +1195,28 @@ impl AcpResponder {
 }
 
 /// The current model reported by a session setup response, if any.
-fn current_model(options: Option<&[SessionConfigOption]>) -> Option<String> {
+fn current_model(options: Option<&[AcpSessionConfigOption]>) -> Option<String> {
     let option = model_option(options.unwrap_or(&[]))?;
-    let agent_client_protocol::v1::schema::SessionConfigKind::Select(select) = &option.kind else {
+    let AcpSessionConfigKind::Select(select) = &option.kind else {
         return None;
     };
     Some(select.current_value.0.to_string())
 }
 
 /// Find the model selector among a session's config options.
-fn model_option(
-    options: &[agent_client_protocol::v1::schema::SessionConfigOption],
-) -> Option<&agent_client_protocol::v1::schema::SessionConfigOption> {
-    use agent_client_protocol::v1::schema::SessionConfigOptionCategory;
+fn model_option(options: &[AcpSessionConfigOption]) -> Option<&AcpSessionConfigOption> {
     options.iter().find(|option| {
-        option.category == Some(SessionConfigOptionCategory::Model)
-            || option.id.0.as_ref() == "model"
+        option.category == Some(AcpSessionConfigCategory::Model) || option.id.0.as_ref() == "model"
     })
 }
 
-/// Select `wanted` on the model config option, returning the applied model id.
+/// Select `wanted` on the model config option, returning the applied model id and
+/// the complete post-selection option snapshot.
 async fn apply_model(
     connection: &ConnectionTo<Agent>,
     session: &agent_client_protocol::v1::schema::NewSessionResponse,
     wanted: &str,
-) -> anyhow::Result<String> {
-    use agent_client_protocol::v1::schema::{
-        SessionConfigKind, SessionConfigOptionValue, SessionConfigSelectOptions,
-        SetSessionConfigOptionRequest,
-    };
-
+) -> anyhow::Result<(String, Vec<SessionConfigOption>)> {
     let option = session
         .config_options
         .as_deref()
@@ -1101,21 +1226,19 @@ async fn apply_model(
                 "this agent does not expose model selection over ACP; cannot select '{wanted}'"
             )
         })?;
-    let SessionConfigKind::Select(select) = &option.kind else {
+    let AcpSessionConfigKind::Select(select) = &option.kind else {
         anyhow::bail!("the agent's model option is not a select");
     };
-    let mut available: Vec<String> = Vec::new();
-    match &select.options {
-        SessionConfigSelectOptions::Ungrouped(list) => {
-            available.extend(list.iter().map(|value| value.value.0.to_string()))
+    let available: Vec<String> = match &select.options {
+        AcpSelectOptions::Ungrouped(list) => {
+            list.iter().map(|value| value.value.0.to_string()).collect()
         }
-        SessionConfigSelectOptions::Grouped(groups) => available.extend(
-            groups
-                .iter()
-                .flat_map(|group| group.options.iter().map(|value| value.value.0.to_string())),
-        ),
-        _ => {}
-    }
+        AcpSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|group| group.options.iter().map(|value| value.value.0.to_string()))
+            .collect(),
+        _ => Vec::new(),
+    };
     if !available.iter().any(|value| value == wanted) {
         anyhow::bail!(
             "model '{wanted}' is not offered by this agent; available: {}",
@@ -1131,20 +1254,114 @@ async fn apply_model(
         .send_request(SetSessionConfigOptionRequest::new(
             session.session_id.clone(),
             option.id.clone(),
-            SessionConfigOptionValue::value_id(wanted.to_string()),
+            AcpSessionConfigValue::value_id(wanted.to_string()),
         ))
         .block_task()
         .await?;
     let applied = model_option(&response.config_options)
         .and_then(|option| match &option.kind {
-            SessionConfigKind::Select(select) => Some(select.current_value.0.to_string()),
+            AcpSessionConfigKind::Select(select) => Some(select.current_value.0.to_string()),
             _ => None,
         })
         .unwrap_or_else(|| wanted.to_string());
     if applied != wanted {
         anyhow::bail!("agent kept model '{applied}' instead of '{wanted}'");
     }
-    Ok(applied)
+    Ok((
+        applied,
+        normalized_config_options(Some(&response.config_options)),
+    ))
+}
+
+/// Normalize the agent's complete config-option list without dropping unknown
+/// categories or option kinds.
+fn normalized_config_options(
+    options: Option<&[AcpSessionConfigOption]>,
+) -> Vec<SessionConfigOption> {
+    options
+        .unwrap_or(&[])
+        .iter()
+        .map(|option| SessionConfigOption {
+            id: option.id.0.to_string(),
+            name: option.name.clone(),
+            description: option.description.clone(),
+            category: option.category.as_ref().map(config_category_name),
+            kind: match &option.kind {
+                AcpSessionConfigKind::Select(select) => SessionConfigKind::Select {
+                    current_value: select.current_value.0.to_string(),
+                    choices: match &select.options {
+                        AcpSelectOptions::Ungrouped(list) => SessionConfigChoices::Ungrouped {
+                            options: list.iter().map(config_choice).collect(),
+                        },
+                        AcpSelectOptions::Grouped(groups) => SessionConfigChoices::Grouped {
+                            groups: groups
+                                .iter()
+                                .map(|group| SessionConfigGroup {
+                                    id: group.group.0.to_string(),
+                                    name: group.name.clone(),
+                                    options: group.options.iter().map(config_choice).collect(),
+                                })
+                                .collect(),
+                        },
+                        _ => SessionConfigChoices::Ungrouped {
+                            options: Vec::new(),
+                        },
+                    },
+                },
+                AcpSessionConfigKind::Boolean(boolean) => SessionConfigKind::Boolean {
+                    current_value: boolean.current_value,
+                },
+                _ => SessionConfigKind::Other,
+            },
+        })
+        .collect()
+}
+
+fn config_choice(
+    choice: &agent_client_protocol::v1::schema::SessionConfigSelectOption,
+) -> SessionConfigChoice {
+    SessionConfigChoice {
+        value: choice.value.0.to_string(),
+        name: choice.name.clone(),
+        description: choice.description.clone(),
+    }
+}
+
+/// Keep an unknown category's raw name instead of collapsing it to "other".
+fn config_category_name(category: &AcpSessionConfigCategory) -> String {
+    match category {
+        AcpSessionConfigCategory::Mode => "mode".to_string(),
+        AcpSessionConfigCategory::Model => "model".to_string(),
+        AcpSessionConfigCategory::ModelConfig => "model_config".to_string(),
+        AcpSessionConfigCategory::ThoughtLevel => "thought_level".to_string(),
+        AcpSessionConfigCategory::Other(name) => name.clone(),
+        _ => "other".to_string(),
+    }
+}
+
+/// Normalize the complete mode state advertised at session setup.
+fn normalized_modes(modes: &AcpSessionModeState) -> SessionModes {
+    SessionModes {
+        current_mode_id: modes.current_mode_id.0.to_string(),
+        available_modes: modes
+            .available_modes
+            .iter()
+            .map(|mode| SessionMode {
+                id: mode.id.0.to_string(),
+                name: mode.name.clone(),
+                description: mode.description.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn acp_config_value(value: SessionConfigValue) -> AcpSessionConfigValue {
+    match value {
+        SessionConfigValue::Boolean { value } => AcpSessionConfigValue::boolean(value),
+        SessionConfigValue::ValueId { value } => AcpSessionConfigValue::ValueId {
+            value: AcpSessionConfigValueId::new(value),
+        },
+    }
 }
 
 /// Cumulative per-session tool-call state.
@@ -1442,9 +1659,14 @@ fn map_update(
                     .collect(),
             }]
         }
-        // Mode, config and vendor-specific updates are not part of the
-        // normalized model yet. `SessionUpdate` is non-exhaustive, so this arm
-        // is required and keeps unknown updates harmless.
+        SessionUpdate::ConfigOptionUpdate(update) => vec![AgentStateEvent::ConfigOptions {
+            options: normalized_config_options(Some(&update.config_options)),
+        }],
+        SessionUpdate::CurrentModeUpdate(update) => vec![AgentStateEvent::CurrentMode {
+            mode_id: update.current_mode_id.0.to_string(),
+        }],
+        // Vendor-specific updates that have no normalized representation are
+        // harmless. `SessionUpdate` is non-exhaustive, so this arm is required.
         _ => Vec::new(),
     }
 }
@@ -2041,6 +2263,99 @@ mod tests {
             )),
             vec![AgentStateEvent::AvailableCommands {
                 commands: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn config_option_update_preserves_grouped_choices_and_unknown_categories() {
+        use agent_client_protocol::v1::schema::{
+            ConfigOptionUpdate, SessionConfigGroupId, SessionConfigOptionCategory,
+            SessionConfigSelectGroup, SessionConfigSelectOption, SessionConfigSelectOptions,
+        };
+
+        let harness = Harness::new();
+        let select = AcpSessionConfigOption::select(
+            "thought",
+            "Thought level",
+            "medium",
+            SessionConfigSelectOptions::Grouped(vec![SessionConfigSelectGroup::new(
+                SessionConfigGroupId::new("main"),
+                "Main",
+                vec![
+                    SessionConfigSelectOption::new("low", "Low"),
+                    SessionConfigSelectOption::new("medium", "Medium"),
+                    SessionConfigSelectOption::new("high", "High"),
+                ],
+            )]),
+        )
+        .description("Reasoning depth")
+        .category(SessionConfigOptionCategory::ThoughtLevel);
+        let vendor = AcpSessionConfigOption::boolean("vendor-toggle", "Vendor toggle", true)
+            .category(SessionConfigOptionCategory::Other("vendor_custom".into()));
+        assert_eq!(
+            harness.map(&SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
+                vec![select, vendor]
+            ))),
+            vec![AgentStateEvent::ConfigOptions {
+                options: vec![
+                    SessionConfigOption {
+                        id: "thought".to_string(),
+                        name: "Thought level".to_string(),
+                        description: Some("Reasoning depth".to_string()),
+                        category: Some("thought_level".to_string()),
+                        kind: SessionConfigKind::Select {
+                            current_value: "medium".to_string(),
+                            choices: SessionConfigChoices::Grouped {
+                                groups: vec![SessionConfigGroup {
+                                    id: "main".to_string(),
+                                    name: "Main".to_string(),
+                                    options: vec![
+                                        SessionConfigChoice {
+                                            value: "low".to_string(),
+                                            name: "Low".to_string(),
+                                            description: None,
+                                        },
+                                        SessionConfigChoice {
+                                            value: "medium".to_string(),
+                                            name: "Medium".to_string(),
+                                            description: None,
+                                        },
+                                        SessionConfigChoice {
+                                            value: "high".to_string(),
+                                            name: "High".to_string(),
+                                            description: None,
+                                        },
+                                    ],
+                                }],
+                            },
+                        },
+                    },
+                    SessionConfigOption {
+                        id: "vendor-toggle".to_string(),
+                        name: "Vendor toggle".to_string(),
+                        description: None,
+                        category: Some("vendor_custom".to_string()),
+                        kind: SessionConfigKind::Boolean {
+                            current_value: true,
+                        },
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn current_mode_update_maps_to_a_focused_mode_event() {
+        use agent_client_protocol::v1::schema::{CurrentModeUpdate, SessionModeId};
+
+        let harness = Harness::new();
+        assert_eq!(
+            harness.map(&SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(
+                SessionModeId::new("plan")
+            ))),
+            vec![AgentStateEvent::CurrentMode {
+                mode_id: "plan".to_string(),
             }]
         );
     }

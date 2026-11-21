@@ -23,9 +23,9 @@ use tokio::sync::broadcast;
 use favetto_core::model::{
     AgentActivity, AgentBackend, AgentCapabilities, AgentCommand, AgentLoadState, AgentPlanEntry,
     AgentSessionInfo, AgentStateEvent, AgentUsage, AwaitingInputReason, ContentRole, InputReply,
-    PermissionPolicy,
+    PermissionPolicy, SessionConfigOption, SessionConfigValue, SessionModes,
 };
-use favetto_core::rpc::AgentEventPush;
+use favetto_core::rpc::{AgentEventPush, AgentOptionsResult};
 
 use crate::config::{AgentConfig, FavettoConfig, GitSettings};
 use crate::db::AgentSessionRecord;
@@ -222,6 +222,12 @@ pub struct AgentLiveState {
     /// The latest complete advertised command list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<AgentCommand>,
+    /// The latest complete ACP config-option snapshot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_options: Vec<SessionConfigOption>,
+    /// The mode state advertised at session setup, when the agent supports modes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modes: Option<SessionModes>,
 }
 
 /// A (re)attaching client's complete snapshot of one session.
@@ -285,6 +291,13 @@ impl AgentLiveState {
             },
             AgentStateEvent::Plan { entries } => self.plan = entries.clone(),
             AgentStateEvent::AvailableCommands { commands } => self.commands = commands.clone(),
+            AgentStateEvent::ConfigOptions { options } => self.config_options = options.clone(),
+            AgentStateEvent::Modes { modes } => self.modes = Some(modes.clone()),
+            AgentStateEvent::CurrentMode { mode_id } => {
+                if let Some(modes) = self.modes.as_mut() {
+                    modes.current_mode_id = mode_id.clone();
+                }
+            }
             AgentStateEvent::Error { .. } => {}
             AgentStateEvent::Session { .. } | AgentStateEvent::Title { .. } => {}
         }
@@ -332,6 +345,8 @@ impl Session {
             usage: live.usage.clone(),
             load_state: lifecycle.state,
             load_error: lifecycle.error.clone(),
+            config_options: live.config_options.clone(),
+            modes: live.modes.clone(),
         }
     }
 
@@ -343,6 +358,27 @@ impl Session {
             .map(|(seq, _)| *seq)
             .unwrap_or_default()
     }
+}
+
+/// A complete option/mode snapshot ready for the RPC layer.
+fn options_snapshot(session: &Session) -> AgentOptionsResult {
+    let live = session.live.lock();
+    AgentOptionsResult {
+        session_id: session.id.clone(),
+        config_options: live.config_options.clone(),
+        modes: live.modes.clone(),
+    }
+}
+
+fn option_ids(options: &[SessionConfigOption]) -> String {
+    if options.is_empty() {
+        return "(none)".to_string();
+    }
+    options
+        .iter()
+        .map(|option| option.id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// `[git]` settings resolved once at startup, keyed by agent name.
@@ -671,6 +707,8 @@ impl AgentManager {
                 usage: None,
                 plan: Vec::new(),
                 commands: Vec::new(),
+                config_options: Vec::new(),
+                modes: None,
             })),
             lifecycle: Arc::new(Mutex::new(SessionLifecycle::ready())),
             responder: handles.responder.clone(),
@@ -799,6 +837,8 @@ impl AgentManager {
                 usage: None,
                 plan: Vec::new(),
                 commands: Vec::new(),
+                config_options: Vec::new(),
+                modes: None,
             })),
             lifecycle: lifecycle.clone(),
             responder: handles.responder.clone(),
@@ -935,6 +975,86 @@ impl AgentManager {
             .responder
             .reply(request_id, reply)
             .await
+    }
+
+    /// The session's current config-option and mode snapshot.
+    pub fn options(&self, session_id: &str) -> anyhow::Result<AgentOptionsResult> {
+        let session = self.get(session_id)?;
+        Ok(options_snapshot(&session))
+    }
+
+    /// Change one option advertised by the live session.
+    ///
+    /// Validation happens against the session's current snapshot, not the
+    /// caller's idea of it: a stale option id or an unadvertised select value is
+    /// rejected before anything reaches the agent.
+    pub async fn set_config_option(
+        &self,
+        session_id: &str,
+        option_id: &str,
+        value: SessionConfigValue,
+    ) -> anyhow::Result<AgentOptionsResult> {
+        let session = self.get(session_id)?;
+        let option = {
+            let live = session.live.lock();
+            live.config_options
+                .iter()
+                .find(|option| option.id == option_id)
+                .cloned()
+        }
+        .ok_or_else(|| {
+            let live = session.live.lock();
+            anyhow::anyhow!(
+                "session '{session_id}' does not advertise config option '{option_id}'; available: {}",
+                option_ids(&live.config_options)
+            )
+        })?;
+        if !option.kind.accepts(&value) {
+            let offered = option.kind.values();
+            anyhow::bail!(
+                "value is not offered by config option '{option_id}'; available: {}",
+                if offered.is_empty() {
+                    "the option is not a select".to_string()
+                } else {
+                    offered.join(", ")
+                }
+            );
+        }
+        let options = session
+            .handles
+            .set_config_option(option_id.to_string(), value)
+            .await?;
+        {
+            let mut live = session.live.lock();
+            live.config_options = options;
+        }
+        Ok(options_snapshot(&session))
+    }
+
+    /// Switch the live session to one of its advertised modes.
+    pub async fn set_mode(
+        &self,
+        session_id: &str,
+        mode_id: &str,
+    ) -> anyhow::Result<AgentOptionsResult> {
+        let session = self.get(session_id)?;
+        {
+            let live = session.live.lock();
+            let modes = live.modes.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("session '{session_id}' does not advertise session modes")
+            })?;
+            if !modes.available_modes.iter().any(|mode| mode.id == mode_id) {
+                anyhow::bail!(
+                    "mode '{mode_id}' is not offered by session '{session_id}'; available: {}",
+                    modes.values().join(", ")
+                );
+            }
+        }
+        session.handles.set_mode(mode_id.to_string()).await?;
+        if let Some(modes) = session.live.lock().modes.as_mut() {
+            modes.current_mode_id = mode_id.to_string();
+        }
+        Ok(options_snapshot(&session))
     }
 
     /// Terminate a session, mark its durable record terminal, and drop it from
@@ -1230,6 +1350,115 @@ mod plan_state_tests {
         });
         assert!(live.plan.is_empty());
         assert!(live.commands.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod session_options_state_tests {
+    use super::*;
+    use favetto_core::model::{
+        SessionConfigChoice, SessionConfigChoices, SessionConfigKind, SessionMode,
+    };
+
+    fn options(current: &str) -> Vec<SessionConfigOption> {
+        vec![SessionConfigOption {
+            id: "model".to_string(),
+            name: "Model".to_string(),
+            description: None,
+            category: Some("model".to_string()),
+            kind: SessionConfigKind::Select {
+                current_value: current.to_string(),
+                choices: SessionConfigChoices::Ungrouped {
+                    options: vec![
+                        SessionConfigChoice {
+                            value: "a".to_string(),
+                            name: "A".to_string(),
+                            description: None,
+                        },
+                        SessionConfigChoice {
+                            value: "b".to_string(),
+                            name: "B".to_string(),
+                            description: None,
+                        },
+                    ],
+                },
+            },
+        }]
+    }
+
+    fn modes(current: &str) -> SessionModes {
+        SessionModes {
+            current_mode_id: current.to_string(),
+            available_modes: vec![
+                SessionMode {
+                    id: "build".to_string(),
+                    name: "Build".to_string(),
+                    description: None,
+                },
+                SessionMode {
+                    id: "plan".to_string(),
+                    name: "Plan".to_string(),
+                    description: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn config_option_updates_replace_the_whole_snapshot() {
+        let mut live = AgentLiveState::default();
+        live.apply(&AgentStateEvent::ConfigOptions {
+            options: options("a"),
+        });
+        assert_eq!(
+            live.config_options[0].kind.values(),
+            vec!["a", "b"],
+            "the first snapshot is preserved"
+        );
+
+        // A later update replaces the list rather than merging by id.
+        live.apply(&AgentStateEvent::ConfigOptions {
+            options: vec![SessionConfigOption {
+                id: "thought".to_string(),
+                name: "Thought".to_string(),
+                description: None,
+                category: Some("future_category".to_string()),
+                kind: SessionConfigKind::Other,
+            }],
+        });
+        assert_eq!(live.config_options.len(), 1);
+        assert_eq!(live.config_options[0].id, "thought");
+        assert_eq!(
+            live.config_options[0].category.as_deref(),
+            Some("future_category")
+        );
+
+        // An empty update clears the snapshot.
+        live.apply(&AgentStateEvent::ConfigOptions {
+            options: Vec::new(),
+        });
+        assert!(live.config_options.is_empty());
+    }
+
+    #[test]
+    fn mode_updates_change_only_the_current_mode() {
+        let mut live = AgentLiveState::default();
+        live.apply(&AgentStateEvent::Modes {
+            modes: modes("build"),
+        });
+        live.apply(&AgentStateEvent::CurrentMode {
+            mode_id: "plan".to_string(),
+        });
+        let modes = live.modes.expect("modes remain advertised");
+        assert_eq!(modes.current_mode_id, "plan");
+        assert_eq!(modes.available_modes.len(), 2);
+
+        // A current-mode update without an advertised list stays harmless.
+        let mut live = AgentLiveState::default();
+        live.apply(&AgentStateEvent::CurrentMode {
+            mode_id: "plan".to_string(),
+        });
+        assert!(live.modes.is_none());
     }
 }
 

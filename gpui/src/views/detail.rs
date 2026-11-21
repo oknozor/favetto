@@ -20,7 +20,8 @@ use std::time::Duration;
 use chrono::Utc;
 use favetto_wire::model::{
     AgentCommand, AgentPlanEntry, AgentPlanStatus, AgentUsage, ContentRole, InputReply,
-    MessageRole, Task, TaskRun,
+    MessageRole, SessionConfigKind, SessionConfigOption, SessionConfigValue, SessionModes, Task,
+    TaskRun,
 };
 use gpui::{
     div, list, prelude::*, px, AnyElement, Context, Div, ElementId, Entity, FocusHandle, FontStyle,
@@ -471,6 +472,189 @@ impl DetailView {
                 })),
             theme,
         )
+    }
+
+    /// The session option/mode strip below the header. It renders the daemon's
+    /// complete snapshot; clicking a supported selector cycles to the next
+    /// advertised value and sends a validated `agents.set_option` / `set_mode`.
+    fn session_options_bar(
+        &self,
+        theme: &Theme,
+        snapshot: (String, Vec<SessionConfigOption>, Option<SessionModes>),
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let (_session_id, options, modes) = snapshot;
+        let mut pills: Vec<AnyElement> = Vec::new();
+
+        if let Some(modes) = modes.filter(|modes| !modes.available_modes.is_empty()) {
+            let current = modes
+                .available_modes
+                .iter()
+                .find(|mode| mode.id == modes.current_mode_id)
+                .map(|mode| mode.name.clone())
+                .unwrap_or_else(|| modes.current_mode_id.clone());
+            if let Some(next) = next_mode(&modes, &modes.current_mode_id) {
+                let mode_id = next.id.clone();
+                let index = pills.len();
+                pills.push(self.session_pill(
+                    theme,
+                    index,
+                    "mode",
+                    current,
+                    Some(format!("Next: {}", next.name)),
+                    cx.listener(move |this, _event, _window, cx| {
+                        this.state.update(cx, |state, cx| {
+                            state.set_detail_session_mode(mode_id.clone(), cx);
+                            cx.notify();
+                        });
+                    }),
+                ));
+            } else {
+                pills.push(read_only_pill(theme, "mode", current));
+            }
+        }
+
+        for option in options {
+            let label = option
+                .category
+                .as_deref()
+                .unwrap_or(&option.name)
+                .to_string();
+            match &option.kind {
+                SessionConfigKind::Select {
+                    current_value,
+                    choices,
+                } => {
+                    let all = choices.all();
+                    let current = all
+                        .iter()
+                        .find(|choice| &choice.value == current_value)
+                        .map(|choice| choice.name.clone())
+                        .unwrap_or_else(|| current_value.clone());
+                    let next = all
+                        .iter()
+                        .position(|choice| &choice.value == current_value)
+                        .map(|index| &all[(index + 1) % all.len()])
+                        .filter(|_choice| all.len() > 1);
+                    if let Some(next) = next {
+                        let option_id = option.id.clone();
+                        let value = SessionConfigValue::ValueId {
+                            value: next.value.clone(),
+                        };
+                        let index = pills.len();
+                        pills.push(self.session_pill(
+                            theme,
+                            index,
+                            &label,
+                            current,
+                            Some(format!("Next: {}", next.name)),
+                            cx.listener(move |this, _event, _window, cx| {
+                                this.state.update(cx, |state, cx| {
+                                    state.set_detail_session_option(
+                                        option_id.clone(),
+                                        value.clone(),
+                                        cx,
+                                    );
+                                    cx.notify();
+                                });
+                            }),
+                        ));
+                    } else {
+                        pills.push(read_only_pill(theme, &label, current));
+                    }
+                }
+                SessionConfigKind::Boolean { current_value } => {
+                    let value = SessionConfigValue::Boolean {
+                        value: !current_value,
+                    };
+                    let option_id = option.id.clone();
+                    let index = pills.len();
+                    pills.push(self.session_pill(
+                        theme,
+                        index,
+                        &label,
+                        if *current_value { "on" } else { "off" }.to_string(),
+                        Some(format!(
+                            "Click to turn {}",
+                            if *current_value { "off" } else { "on" }
+                        )),
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.state.update(cx, |state, cx| {
+                                state.set_detail_session_option(
+                                    option_id.clone(),
+                                    value.clone(),
+                                    cx,
+                                );
+                                cx.notify();
+                            });
+                        }),
+                    ));
+                }
+                SessionConfigKind::Other => {
+                    pills.push(read_only_pill(theme, &label, "unsupported".to_string()));
+                }
+            }
+        }
+
+        if pills.is_empty() {
+            return None;
+        }
+        Some(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(theme.spacing.s1))
+                .px(px(theme.spacing.s3))
+                .py(px(theme.spacing.s1))
+                .border_b_1()
+                .border_color(theme.colors.border)
+                .bg(theme.colors.surface)
+                .child(components::section_label(theme, "SESSION"))
+                .children(pills),
+        )
+    }
+
+    fn session_pill(
+        &self,
+        theme: &Theme,
+        index: usize,
+        label: &str,
+        value: String,
+        hint: Option<String>,
+        on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+    ) -> AnyElement {
+        let hint = hint.unwrap_or_default();
+        div()
+            .id(("session-option", index))
+            .flex()
+            .items_center()
+            .gap(px(theme.spacing.s1))
+            .px(px(theme.spacing.s2))
+            .py(px(2.0))
+            .rounded(px(theme.radii.r4))
+            .border_1()
+            .border_color(theme.colors.border)
+            .bg(theme.colors.bg)
+            .text_size(px(theme.font.xs))
+            .text_color(theme.colors.text)
+            .cursor_pointer()
+            .hover(|style| style.border_color(theme.colors.accent))
+            .child(
+                div()
+                    .text_color(theme.colors.muted)
+                    .child(format!("{label}:")),
+            )
+            .child(div().child(format!("{value} ▾")))
+            .when(!hint.is_empty(), |pill| {
+                pill.child(
+                    div()
+                        .text_color(theme.colors.muted)
+                        .child(format!("({hint})")),
+                )
+            })
+            .on_click(on_click)
+            .into_any_element()
     }
 
     /// A small secondary button used by the header. The click handler comes in
@@ -1731,6 +1915,9 @@ impl Render for DetailView {
             narrow,
             cx,
         );
+        let session_options = self.state.read(cx).detail_session_options();
+        let options_bar =
+            session_options.and_then(|snapshot| self.session_options_bar(theme, snapshot, cx));
         let banner = pending.as_ref().map(|request| {
             let in_flight = self
                 .state
@@ -1845,6 +2032,7 @@ impl Render for DetailView {
             .flex_col()
             .bg(theme.colors.surface)
             .child(header)
+            .when_some(options_bar, |detail, bar| detail.child(bar))
             .when_some(banner, |detail, banner| detail.child(banner))
             .child(tabs)
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))
@@ -1866,6 +2054,41 @@ impl DetailView {
             .child(components::section_label(theme, "DETAIL"))
             .when(narrow, |header| header.child(self.back_button(theme, cx)))
     }
+}
+
+/// The next advertised mode after `current`, wrapping once. `None` when there is
+/// nothing else to switch to.
+fn next_mode<'a>(
+    modes: &'a SessionModes,
+    current: &str,
+) -> Option<&'a favetto_wire::model::SessionMode> {
+    if modes.available_modes.len() < 2 {
+        return None;
+    }
+    let index = modes
+        .available_modes
+        .iter()
+        .position(|mode| mode.id == current)?;
+    modes
+        .available_modes
+        .get((index + 1) % modes.available_modes.len())
+}
+
+fn read_only_pill(theme: &Theme, label: &str, value: String) -> AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(theme.spacing.s1))
+        .px(px(theme.spacing.s2))
+        .py(px(2.0))
+        .rounded(px(theme.radii.r4))
+        .border_1()
+        .border_color(theme.colors.border)
+        .text_size(px(theme.font.xs))
+        .text_color(theme.colors.muted)
+        .child(format!("{label}:"))
+        .child(value)
+        .into_any_element()
 }
 
 fn meta(theme: &Theme, label: &str, value: &str) -> Div {
@@ -2879,6 +3102,42 @@ mod tests {
         }
         assert_eq!(heading_style(theme, 5).2, Hsla::from(theme.colors.muted));
         assert_eq!(heading_style(theme, 1).2, Hsla::from(theme.colors.text));
+    }
+
+    #[test]
+    fn next_mode_wraps_and_rejects_an_unadvertised_current() {
+        use favetto_wire::model::{SessionMode, SessionModes};
+
+        let modes = SessionModes {
+            current_mode_id: "build".to_string(),
+            available_modes: vec![
+                SessionMode {
+                    id: "build".to_string(),
+                    name: "Build".to_string(),
+                    description: None,
+                },
+                SessionMode {
+                    id: "plan".to_string(),
+                    name: "Plan".to_string(),
+                    description: None,
+                },
+            ],
+        };
+        assert_eq!(
+            next_mode(&modes, "build").map(|mode| mode.id.as_str()),
+            Some("plan")
+        );
+        assert_eq!(
+            next_mode(&modes, "plan").map(|mode| mode.id.as_str()),
+            Some("build")
+        );
+        assert!(next_mode(&modes, "stale").is_none());
+
+        let one = SessionModes {
+            current_mode_id: "build".to_string(),
+            available_modes: vec![modes.available_modes[0].clone()],
+        };
+        assert!(next_mode(&one, "build").is_none());
     }
 
     #[test]

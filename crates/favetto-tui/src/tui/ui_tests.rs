@@ -21,6 +21,8 @@ fn session(id: &str, agent: &str, headless: bool, running: bool) -> AgentSession
         usage: None,
         load_state: Default::default(),
         load_error: None,
+        config_options: Vec::new(),
+        modes: None,
     }
 }
 
@@ -139,6 +141,35 @@ fn all_popups_render_without_panic() {
                     picker("s2", "pi", true, false),
                 ],
             },
+            Popup::SessionOptions(
+                SessionOptionsPopup::new(
+                    &[favetto_core::model::SessionConfigOption {
+                        id: "model".to_string(),
+                        name: "Model".to_string(),
+                        description: None,
+                        category: Some("model".to_string()),
+                        kind: favetto_core::model::SessionConfigKind::Select {
+                            current_value: "a".to_string(),
+                            choices: favetto_core::model::SessionConfigChoices::Ungrouped {
+                                options: vec![favetto_core::model::SessionConfigChoice {
+                                    value: "a".to_string(),
+                                    name: "A".to_string(),
+                                    description: None,
+                                }],
+                            },
+                        },
+                    }],
+                    Some(&favetto_core::model::SessionModes {
+                        current_mode_id: "build".to_string(),
+                        available_modes: vec![favetto_core::model::SessionMode {
+                            id: "build".to_string(),
+                            name: "Build".to_string(),
+                            description: None,
+                        }],
+                    }),
+                )
+                .expect("session options rows"),
+            ),
             Popup::Reply(ReplyPrompt::new(
                 "s1".to_string(),
                 favetto_core::model::InputRequest {

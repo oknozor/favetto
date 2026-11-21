@@ -170,8 +170,11 @@ and is never used as one when loading a past session.
 
 - Model selection uses the agent's ACP **model config option**: a task's
   `provider`/`model` is sent as `provider/model` and the run fails with a clear
-  error if the agent does not offer it. The provider catalog
-  (`providers.list`) is still empty, so the UI has no model picker.
+  error if the agent does not offer it. Live sessions also expose their complete
+  ACP config-option and mode snapshots to clients; the TUI opens the picker with
+  `Ctrl+S` in the Agent panel and GPUI renders the same controls above the task
+  detail tabs. The provider catalog (`providers.list`) is still empty; model
+  choices come from the session's ACP options.
 - Sessions can be restored across daemon restarts only when both Favetto's
   durable record and the agent's own persisted session survive, and the agent
   advertises ACP `loadSession`. A session created entirely outside Favetto is

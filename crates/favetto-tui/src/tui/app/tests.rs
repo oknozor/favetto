@@ -207,6 +207,8 @@ fn session_with_backend(
         usage: None,
         load_state: Default::default(),
         load_error: None,
+        config_options: Vec::new(),
+        modes: None,
     }
 }
 
@@ -4626,4 +4628,196 @@ fn launch_failures_ignore_rows_from_an_earlier_parent_attempt() {
 
     app.tasks = vec![parent, stale, fresh];
     assert!(app.launch_failures().is_empty());
+}
+
+fn session_option_fixture() -> (
+    Vec<favetto_core::model::SessionConfigOption>,
+    Option<favetto_core::model::SessionModes>,
+) {
+    use favetto_core::model::{
+        SessionConfigChoice, SessionConfigChoices, SessionConfigKind, SessionConfigOption,
+        SessionMode, SessionModes,
+    };
+    let options = vec![
+        SessionConfigOption {
+            id: "thought".to_string(),
+            name: "Thought level".to_string(),
+            description: None,
+            category: Some("thought_level".to_string()),
+            kind: SessionConfigKind::Select {
+                current_value: "medium".to_string(),
+                choices: SessionConfigChoices::Grouped {
+                    groups: vec![favetto_core::model::SessionConfigGroup {
+                        id: "main".to_string(),
+                        name: "Main".to_string(),
+                        options: vec![
+                            SessionConfigChoice {
+                                value: "low".to_string(),
+                                name: "Low".to_string(),
+                                description: None,
+                            },
+                            SessionConfigChoice {
+                                value: "medium".to_string(),
+                                name: "Medium".to_string(),
+                                description: None,
+                            },
+                            SessionConfigChoice {
+                                value: "high".to_string(),
+                                name: "High".to_string(),
+                                description: None,
+                            },
+                        ],
+                    }],
+                },
+            },
+        },
+        SessionConfigOption {
+            id: "fast".to_string(),
+            name: "Fast mode".to_string(),
+            description: None,
+            category: Some("speed".to_string()),
+            kind: SessionConfigKind::Boolean {
+                current_value: false,
+            },
+        },
+        SessionConfigOption {
+            id: "future".to_string(),
+            name: "Future".to_string(),
+            description: None,
+            category: Some("vendor_custom".to_string()),
+            kind: SessionConfigKind::Other,
+        },
+    ];
+    let modes = SessionModes {
+        current_mode_id: "build".to_string(),
+        available_modes: vec![
+            SessionMode {
+                id: "build".to_string(),
+                name: "Build".to_string(),
+                description: None,
+            },
+            SessionMode {
+                id: "plan".to_string(),
+                name: "Plan".to_string(),
+                description: None,
+            },
+        ],
+    };
+    (options, Some(modes))
+}
+
+#[test]
+fn session_options_picker_lists_modes_grouped_values_and_read_only_rows() {
+    let (options, modes) = session_option_fixture();
+    let popup = SessionOptionsPopup::new(&options, modes.as_ref()).expect("rows");
+    assert_eq!(popup.rows.len(), 4);
+    assert_eq!(popup.rows[0].label, "Mode");
+    assert_eq!(popup.rows[0].display(), "Build");
+    assert_eq!(popup.rows[1].label, "Thought level · thought_level");
+    assert_eq!(popup.rows[1].choices.len(), 3);
+    assert_eq!(popup.rows[1].display(), "Medium");
+    assert_eq!(popup.rows[2].choices[1].0, "true");
+    assert_eq!(popup.rows[3].kind, SessionOptionRowKind::ReadOnly);
+    assert!(matches!(popup.rows[3].kind, SessionOptionRowKind::ReadOnly));
+}
+
+#[test]
+fn session_options_picker_dispatches_only_advertised_values() {
+    let (options, modes) = session_option_fixture();
+    let mut app = App::new();
+    app.agent_session_id = Some("s1".to_string());
+    app.seed_agent_options(options, modes);
+    assert!(app.open_session_options());
+
+    // Cycle the Thought level row one value forward and apply it.
+    {
+        let Popup::SessionOptions(popup) = &mut app.popup else {
+            panic!("session options popup");
+        };
+        popup.selected = 1;
+    }
+    let action = app.handle_session_options_key(KeyCode::Right);
+    assert!(matches!(action, UiAction::None));
+    {
+        let Popup::SessionOptions(popup) = &app.popup else {
+            panic!("session options popup");
+        };
+        assert_eq!(popup.rows[1].selected_value(), Some("high"));
+    }
+    let action = app.handle_session_options_key(KeyCode::Enter);
+    match action {
+        UiAction::SetSessionOption {
+            session_id,
+            option_id,
+            value,
+        } => {
+            assert_eq!(session_id, "s1");
+            assert_eq!(option_id, "thought");
+            assert_eq!(
+                value,
+                favetto_core::model::SessionConfigValue::ValueId {
+                    value: "high".to_string()
+                }
+            );
+        }
+        _ => panic!("expected a set_option action"),
+    }
+    assert!(matches!(app.popup, Popup::None));
+
+    // The mode row dispatches set_mode, never a config option.
+    assert!(app.open_session_options());
+    {
+        let Popup::SessionOptions(popup) = &mut app.popup else {
+            panic!("session options popup");
+        };
+        popup.selected = 0;
+    }
+    let action = app.handle_session_options_key(KeyCode::Right);
+    assert!(matches!(action, UiAction::None));
+    let action = app.handle_session_options_key(KeyCode::Enter);
+    assert!(matches!(
+        action,
+        UiAction::SetSessionMode { ref mode_id, .. } if mode_id == "plan"
+    ));
+
+    // A read-only row never dispatches a change.
+    assert!(app.open_session_options());
+    {
+        let Popup::SessionOptions(popup) = &mut app.popup else {
+            panic!("session options popup");
+        };
+        popup.selected = 3;
+    }
+    assert!(matches!(
+        app.handle_session_options_key(KeyCode::Enter),
+        UiAction::None
+    ));
+}
+
+#[test]
+fn config_option_and_mode_events_replace_the_live_snapshot() {
+    let (options, modes) = session_option_fixture();
+    let mut app = App::new();
+    app.open_agent(agent_session("s1", false, true, false), &[]);
+    app.agent_event(
+        "s1",
+        &AgentStateEvent::ConfigOptions {
+            options: options.clone(),
+        },
+    );
+    app.agent_event(
+        "s1",
+        &AgentStateEvent::Modes {
+            modes: modes.clone().expect("modes"),
+        },
+    );
+    assert_eq!(app.agent_config_options, options);
+    assert_eq!(app.agent_modes.as_ref().unwrap().current_mode_id, "build");
+    app.agent_event(
+        "s1",
+        &AgentStateEvent::CurrentMode {
+            mode_id: "plan".to_string(),
+        },
+    );
+    assert_eq!(app.agent_modes.as_ref().unwrap().current_mode_id, "plan");
 }
