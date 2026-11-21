@@ -27,7 +27,8 @@ use favetto_wire::model::{
     ProviderSessionsResult, Schedule, SessionConfigValue, Task, TaskRun,
 };
 use favetto_wire::rpc::{
-    AgentAttachResult, AgentCancelParams, AgentCancelResult, AgentOptionsResult, AgentPromptParams,
+    AgentAttachResult, AgentAuthenticateParams, AgentAuthenticateResult, AgentCancelParams,
+    AgentCancelResult, AgentLogoutParams, AgentLogoutResult, AgentOptionsResult, AgentPromptParams,
     AgentPromptResult, AgentReplyParams, AgentReplyResult, AgentSetModeParams,
     AgentSetOptionParams, AgentsHistoryParams, CatalogEntry, CatalogGetParams, EmptyParams,
     PingParams, PingResult, ProviderDeleteParams, ProviderResumeParams, ProviderSessionsParams,
@@ -119,6 +120,13 @@ pub enum Command {
     },
     /// Switch a live ACP session to an advertised mode (`agents.set_mode`).
     SetAgentMode { session_id: String, mode_id: String },
+    /// Complete an agent-handled ACP sign-in (`agents.authenticate`).
+    Authenticate {
+        session_id: String,
+        method_id: String,
+    },
+    /// Sign an ACP session out when the agent advertised logout (`agents.logout`).
+    Logout { session_id: String },
     /// Resume a provider-owned session by its ACP id (`agents.provider_resume`).
     ResumeProviderSession {
         agent: String,
@@ -278,6 +286,17 @@ pub enum Update {
         agent: String,
         session_id: String,
         result: Result<(), ClientError>,
+    },
+    /// `agents.authenticate` completed for one session.
+    AuthFinished {
+        session_id: String,
+        method_id: String,
+        result: Result<Box<AgentAuthenticateResult>, ClientError>,
+    },
+    /// `agents.logout` completed for one session.
+    LogoutFinished {
+        session_id: String,
+        result: Result<AgentLogoutResult, ClientError>,
     },
     /// `workflow.inspect` completed for one root.
     WorkflowInspectLoaded {
@@ -491,6 +510,19 @@ impl Runtime {
             session_id,
             mode_id,
         });
+    }
+
+    /// Complete an agent-handled ACP sign-in for a session.
+    pub fn authenticate(&self, session_id: String, method_id: String) {
+        self.send(Command::Authenticate {
+            session_id,
+            method_id,
+        });
+    }
+
+    /// Sign a session out when the agent advertised ACP logout.
+    pub fn logout(&self, session_id: String) {
+        self.send(Command::Logout { session_id });
     }
 
     /// Re-list provider-owned sessions for the Settings Past sessions card.
@@ -727,6 +759,15 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
                 mode_id,
             } => {
                 spawn_agent_set_mode(client.clone(), updates.clone(), session_id, mode_id);
+            }
+            Command::Authenticate {
+                session_id,
+                method_id,
+            } => {
+                spawn_agent_authenticate(client.clone(), updates.clone(), session_id, method_id);
+            }
+            Command::Logout { session_id } => {
+                spawn_agent_logout(client.clone(), updates.clone(), session_id);
             }
             Command::ResumeProviderSession {
                 agent,
@@ -1298,6 +1339,29 @@ fn spawn_provider_resume(
     });
 }
 
+/// Spawn one `agents.authenticate` for an advertised agent-handled method.
+fn spawn_agent_authenticate(
+    client: Arc<RpcClient>,
+    updates: Sender<Update>,
+    session_id: String,
+    method_id: String,
+) {
+    tokio::spawn(async move {
+        let result = client
+            .agents_authenticate(AgentAuthenticateParams {
+                session_id: session_id.clone(),
+                method_id: method_id.clone(),
+            })
+            .await
+            .map(Box::new);
+        let _ = updates.try_send(Update::AuthFinished {
+            session_id,
+            method_id,
+            result,
+        });
+    });
+}
+
 /// Spawn one `agents.provider_delete` for a provider-owned session.
 fn spawn_provider_delete(
     client: Arc<RpcClient>,
@@ -1318,6 +1382,19 @@ fn spawn_provider_delete(
             session_id,
             result,
         });
+    });
+}
+
+/// Spawn one `agents.logout`, only reached after the UI saw the advertised
+/// capability.
+fn spawn_agent_logout(client: Arc<RpcClient>, updates: Sender<Update>, session_id: String) {
+    tokio::spawn(async move {
+        let result = client
+            .agents_logout(AgentLogoutParams {
+                session_id: session_id.clone(),
+            })
+            .await;
+        let _ = updates.try_send(Update::LogoutFinished { session_id, result });
     });
 }
 

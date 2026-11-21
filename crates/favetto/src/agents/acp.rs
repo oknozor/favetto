@@ -24,13 +24,14 @@ use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::schema::{
-    AgentCapabilities, AvailableCommand as AcpAvailableCommand,
+    AgentCapabilities, AuthMethod, AuthenticateRequest, AvailableCommand as AcpAvailableCommand,
     AvailableCommandInput as AcpAvailableCommandInput, CancelNotification, ContentBlock,
     DeleteSessionRequest, EmbeddedResourceResource, InitializeRequest, ListSessionsRequest,
-    LoadSessionRequest, NewSessionRequest, PermissionOptionKind, PlanEntry as AcpPlanEntry,
-    PlanEntryPriority as AcpPlanPriority, PlanEntryStatus as AcpPlanStatus, PromptRequest,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigId as AcpSessionConfigId,
+    LoadSessionRequest, LogoutRequest, NewSessionRequest, PermissionOptionKind,
+    PlanEntry as AcpPlanEntry, PlanEntryPriority as AcpPlanPriority,
+    PlanEntryStatus as AcpPlanStatus, PromptRequest, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
+    SelectedPermissionOutcome, SessionConfigId as AcpSessionConfigId,
     SessionConfigKind as AcpSessionConfigKind, SessionConfigOption as AcpSessionConfigOption,
     SessionConfigOptionCategory as AcpSessionConfigCategory,
     SessionConfigOptionValue as AcpSessionConfigValue,
@@ -51,9 +52,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use favetto_core::model::{
-    AgentCommand, AgentLoadState, AgentPlanEntry, AgentPlanPriority, AgentPlanStatus,
-    AgentStateEvent, AwaitingInputKind, ContentRole, InputReply, InputRequest, MessageContent,
-    MessageRole, PermissionPolicy, SessionConfigChoice, SessionConfigChoices, SessionConfigGroup,
+    AgentAuthMethod, AgentAuthMethodKind, AgentAuthState, AgentAuthStatus, AgentCommand,
+    AgentLoadState, AgentPlanEntry, AgentPlanPriority, AgentPlanStatus, AgentStateEvent,
+    AwaitingInputKind, ContentRole, InputReply, InputRequest, MessageContent, MessageRole,
+    PermissionPolicy, SessionConfigChoice, SessionConfigChoices, SessionConfigGroup,
     SessionConfigKind, SessionConfigOption, SessionConfigValue, SessionMode, SessionModes,
     ToolCallDetail, ToolCallStatus, ToolContent, ToolKind, ToolLocation,
 };
@@ -72,6 +74,17 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a client-requested config/mode change may take before the RPC fails
 /// instead of holding the connection open.
 const CONFIG_CHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Upper bound on one ACP `authenticate` round trip. The daemon keeps the agent
+/// process alive and the UI can retry, so a stuck authentication must not pin a
+/// session forever.
+pub(crate) const AUTH_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The safe message shown when an agent only offers terminal sign-in. The
+/// daemon preserves the method for display but never advertises or runs it.
+pub(crate) const TERMINAL_AUTH_UNSUPPORTED: &str =
+    "terminal authentication is not supported by the Favetto daemon; use an agent-handled \
+     sign-in method";
 
 /// Whether the initial ACP setup creates a session or restores a known one.
 #[derive(Debug, Clone)]
@@ -212,7 +225,6 @@ impl ReplayGate {
 }
 
 /// Commands that do not need the prompt turn to be in flight.
-#[derive(Debug)]
 pub(crate) enum AcpCommand {
     /// Interrupt the current turn (`session/cancel`).
     Cancel,
@@ -227,6 +239,10 @@ pub(crate) enum AcpCommand {
     /// Switch to an advertised mode (`session/set_mode`).
     SetMode {
         mode_id: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Sign out through ACP `logout`, gated on the advertised capability.
+    Logout {
         reply: oneshot::Sender<Result<(), String>>,
     },
 }
@@ -277,6 +293,91 @@ impl TurnState {
     /// `cancelled` immediately instead of blocking until the timeout.
     fn is_cancelled(&self, generation: u64) -> bool {
         self.active && self.cancel_requested && self.generation == generation
+    }
+}
+/// A setup-time sign-in request forwarded to the connection task.
+pub(crate) struct AcpAuthCommand {
+    pub method_id: String,
+    pub reply: oneshot::Sender<Result<(), String>>,
+}
+
+/// Progress of a load-mode setup, as observed by the manager.
+#[derive(Debug, Clone)]
+pub(crate) enum LoadUpdate {
+    /// The agent requires sign-in; the load is paused but retryable.
+    AuthRequired,
+    /// `session/load` succeeded and the replay is applied.
+    Ready,
+    /// The load failed terminally.
+    Failed(String),
+}
+
+/// Why one session-setup attempt did not complete.
+enum SessionSetup {
+    AuthRequired,
+    Fatal(String),
+}
+
+/// Classify a session setup error: authentication is retryable, everything else
+/// is terminal for this launch attempt.
+fn setup_error(
+    context: impl FnOnce() -> String,
+    error: agent_client_protocol::Error,
+) -> SessionSetup {
+    if error.code == agent_client_protocol::ErrorCode::AUTH_REQUIRED {
+        SessionSetup::AuthRequired
+    } else {
+        SessionSetup::Fatal(format!("{}: {error}", context()))
+    }
+}
+
+/// Convert ACP auth methods into the wire/UI shape. Terminal methods are kept
+/// but explicitly unsupported: Favetto's daemon cannot bridge an interactive
+/// login process to a remote client.
+fn wire_auth_methods(methods: &[AuthMethod]) -> Vec<AgentAuthMethod> {
+    methods
+        .iter()
+        .map(|method| {
+            let (kind, supported) = match method {
+                AuthMethod::Agent(_) => (AgentAuthMethodKind::Agent, true),
+                AuthMethod::Terminal(_) => (AgentAuthMethodKind::Terminal, false),
+                _ => (AgentAuthMethodKind::Agent, false),
+            };
+            AgentAuthMethod {
+                id: method.id().0.to_string(),
+                name: method.name().to_string(),
+                description: method.description().map(str::to_string),
+                kind,
+                supported,
+            }
+        })
+        .collect()
+}
+
+/// Publish one session-scoped auth snapshot to the manager snapshot and clients.
+fn publish_auth(
+    state: AgentAuthState,
+    auth: &Mutex<Option<AgentAuthState>>,
+    events: &mpsc::UnboundedSender<AcpEvent>,
+) {
+    *auth.lock() = Some(state.clone());
+    let _ = events.send(AcpEvent::State(AgentStateEvent::Auth { auth: state }));
+}
+
+/// A safe auth snapshot preserving advertised method metadata.
+fn auth_snapshot(
+    methods: &[AgentAuthMethod],
+    logout_supported: bool,
+    status: AgentAuthStatus,
+    method_id: Option<&str>,
+    message: Option<String>,
+) -> AgentAuthState {
+    AgentAuthState {
+        status,
+        methods: methods.to_vec(),
+        logout_supported,
+        method_id: method_id.map(str::to_string),
+        message,
     }
 }
 
@@ -331,6 +432,10 @@ impl AcpOutcome {
 pub(crate) struct AcpHandles {
     pub prompts: mpsc::UnboundedSender<String>,
     pub commands: mpsc::UnboundedSender<AcpCommand>,
+    /// Sign-in requests consumed while session setup is paused on auth.
+    pub authenticate: mpsc::UnboundedSender<AcpAuthCommand>,
+    /// Current session-scoped auth state, shared with the manager snapshot.
+    pub auth: Arc<Mutex<Option<AgentAuthState>>>,
     pub responder: Arc<AcpResponder>,
     pub running: Arc<AtomicBool>,
     pub exit_code: Arc<AtomicI32>,
@@ -340,10 +445,12 @@ pub(crate) struct AcpHandles {
     #[allow(dead_code)] // read by later session-history steps and capability-aware callers
     pub capabilities: Arc<Mutex<Option<AgentCapabilities>>>,
     /// Completion of a load-mode startup, when `mode` was [`AcpSessionMode::Load`].
-    /// `None` means the load has not settled yet; `Ok` is sent only after the
+    /// `None` means the load has not settled yet; `Ready` is sent only after the
     /// agent acknowledged `session/load` and the complete replay has been applied
-    /// to the feed. The receiver closes if the server exits before either way.
-    pub load: Option<tokio::sync::watch::Receiver<Option<Result<(), String>>>>,
+    /// to the feed. `AuthRequired` lets the manager return a retryable session
+    /// snapshot while the process stays alive. The receiver closes if the server
+    /// exits before either way.
+    pub load: Option<tokio::sync::watch::Receiver<Option<LoadUpdate>>>,
     pub last_activity: Arc<Mutex<Instant>>,
     /// Plain-text transcript (assistant text plus tool summaries) used as the
     /// run's captured output.
@@ -497,11 +604,13 @@ pub(crate) fn spawn(
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     let (prompts_tx, mut prompts_rx) = mpsc::unbounded_channel();
     let (commands_tx, mut commands_rx) = mpsc::unbounded_channel();
+    let (auth_tx, mut auth_rx) = mpsc::unbounded_channel::<AcpAuthCommand>();
 
     let running = Arc::new(AtomicBool::new(true));
     let exit_code = Arc::new(AtomicI32::new(-1));
     let external_session_id = Arc::new(Mutex::new(None));
     let capabilities = Arc::new(Mutex::new(None));
+    let auth_state = Arc::new(Mutex::new(None));
     let last_activity = Arc::new(Mutex::new(Instant::now()));
     let transcript = Arc::new(Mutex::new(String::new()));
     let outcome = Arc::new(Mutex::new(AcpOutcome::default()));
@@ -578,6 +687,8 @@ pub(crate) fn spawn(
     let failure_load_tx = load_tx.clone();
     let failure_replay = replay_gate.clone();
     let notification_replay = replay_gate.clone();
+    let auth_slot = auth_state.clone();
+    let handles_auth_tx = auth_tx.clone();
     let mut child = child;
     let task = tokio::spawn(async move {
         let notification_transcript = Arc::clone(&notification_transcript);
@@ -637,11 +748,28 @@ pub(crate) fn spawn(
                     // below is the cleanup path otherwise.
                     let close_supported =
                         init.agent_capabilities.session_capabilities.close.is_some();
+                    let auth_methods = wire_auth_methods(&init.auth_methods);
+                    let logout_supported = init.agent_capabilities.auth.logout.is_some();
+                    if !auth_methods.is_empty() || logout_supported {
+                        publish_auth(
+                            auth_snapshot(
+                                &auth_methods,
+                                logout_supported,
+                                AgentAuthStatus::NotRequired,
+                                None,
+                                None,
+                            ),
+                            &auth_slot,
+                            &events_tx,
+                        );
+                    }
                     tracing::debug!(
                         target: "favetto::acp",
                         agent = ?init.agent_info,
                         load_session = init.agent_capabilities.load_session,
                         close_supported,
+                        auth_methods = auth_methods.len(),
+                        logout = logout_supported,
                         "ACP agent initialized"
                     );
 
@@ -662,258 +790,684 @@ pub(crate) fn spawn(
                         }
                     }
 
+                    // Start the control task before session setup: it must
+                    // forward a sign-in command while `session/new`/`load` is
+                    // paused on auth-required, and honour shutdown throughout.
+                    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+                    let control_connection = connection.clone();
+                    let session_slot: Arc<Mutex<Option<SessionId>>> = Arc::new(Mutex::new(None));
+                    let control_session = session_slot.clone();
+                    let control_auth = auth_slot.clone();
+                    let control_events = events_tx.clone();
+                    let control_shutdown = shutdown_tx.clone();
+                    let control_turn = prompt_turn.clone();
+                    tokio::spawn(async move {
+                        while let Some(command) = commands_rx.recv().await {
+                            match command {
+                                AcpCommand::Cancel => {
+                                    let Some(session) = control_session.lock().clone() else {
+                                        continue;
+                                    };
+                                    let Some(generation) = control_turn.lock().request_cancel()
+                                    else {
+                                        continue;
+                                    };
+                                    // ACP requires every pending permission request
+                                    // for the cancelled turn to be answered
+                                    // `cancelled` before the agent is left to
+                                    // unwind. Settle them first, then notify.
+                                    let settled = control_responder.cancel_turn(generation);
+                                    tracing::debug!(
+                                        target: "favetto::acp",
+                                        generation,
+                                        settled,
+                                        "cancelling ACP turn"
+                                    );
+                                    let _ = control_connection
+                                        .send_notification(CancelNotification::new(session));
+                                }
+                                AcpCommand::SetConfigOption {
+                                    option_id,
+                                    value,
+                                    reply,
+                                } => {
+                                    let Some(session) = control_session.lock().clone() else {
+                                        let _ = reply.send(Err(
+                                            "the ACP session is not ready".to_string()
+                                        ));
+                                        continue;
+                                    };
+                                    let request = SetSessionConfigOptionRequest::new(
+                                        session,
+                                        AcpSessionConfigId::new(option_id),
+                                        acp_config_value(value),
+                                    );
+                                    let result = control_connection
+                                        .send_request(request)
+                                        .block_task()
+                                        .await;
+                                    match result {
+                                        Ok(response) => {
+                                            let options = normalized_config_options(Some(
+                                                &response.config_options,
+                                            ));
+                                            let _ = control_events.send(AcpEvent::State(
+                                                AgentStateEvent::ConfigOptions {
+                                                    options: options.clone(),
+                                                },
+                                            ));
+                                            let _ = reply.send(Ok(options));
+                                        }
+                                        Err(error) => {
+                                            let _ = reply.send(Err(error.to_string()));
+                                        }
+                                    }
+                                }
+                                AcpCommand::SetMode { mode_id, reply } => {
+                                    let Some(session) = control_session.lock().clone() else {
+                                        let _ = reply.send(Err(
+                                            "the ACP session is not ready".to_string()
+                                        ));
+                                        continue;
+                                    };
+                                    let request = SetSessionModeRequest::new(
+                                        session,
+                                        AcpSessionModeId::new(mode_id.clone()),
+                                    );
+                                    let result = control_connection
+                                        .send_request(request)
+                                        .block_task()
+                                        .await;
+                                    match result {
+                                        Ok(_) => {
+                                            let _ = control_events.send(AcpEvent::State(
+                                                AgentStateEvent::CurrentMode {
+                                                    mode_id: mode_id.clone(),
+                                                },
+                                            ));
+                                            let _ = reply.send(Ok(()));
+                                        }
+                                        Err(error) => {
+                                            let _ = reply.send(Err(error.to_string()));
+                                        }
+                                    }
+                                }
+                                AcpCommand::Shutdown => {
+                                    if let Some(session) = control_session.lock().clone() {
+                                        let _ = control_connection
+                                            .send_notification(CancelNotification::new(session));
+                                    }
+                                    let _ = control_shutdown.send(true);
+                                    break;
+                                }
+                                AcpCommand::Logout { reply } => {
+                                    let advertised = control_auth
+                                        .lock()
+                                        .as_ref()
+                                        .is_some_and(|state| state.logout_supported);
+                                    if !advertised {
+                                        let _ = reply.send(Err(
+                                            "the agent did not advertise ACP logout".to_string(),
+                                        ));
+                                        continue;
+                                    }
+                                    let result = control_connection
+                                        .send_request(LogoutRequest::new())
+                                        .block_task()
+                                        .await;
+                                    match result {
+                                        Ok(_) => {
+                                            let mut state =
+                                                control_auth.lock().clone().unwrap_or_default();
+                                            state.status = AgentAuthStatus::NotRequired;
+                                            state.method_id = None;
+                                            state.message = Some("signed out".to_string());
+                                            *control_auth.lock() = Some(state.clone());
+                                            let _ = control_events.send(AcpEvent::State(
+                                                AgentStateEvent::Auth { auth: state },
+                                            ));
+                                            let _ = reply.send(Ok(()));
+                                        }
+                                        Err(error) => {
+                                            let _ = reply.send(Err(format!(
+                                                "agent logout failed: {error}"
+                                            )));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+
                     // Session setup differs only here: a new conversation is
                     // created, while a load restores the agent's own session id.
                     // A load never falls back to `session/new`, because a fresh
                     // session would be presented as a restored conversation.
+                    // Auth-required is not a failure: the process stays alive and
+                    // the loop waits for an agent-handled sign-in before retrying.
+                    let mut pending_auth_reply: Option<oneshot::Sender<Result<(), String>>> = None;
                     let (
                         session_id,
                         external_session_id,
                         chosen_model,
                         config_options,
                         modes,
-                    ) = match &mode {
-                        AcpSessionMode::Load {
-                            external_session_id: known,
-                        } => {
-                            if !init.agent_capabilities.load_session {
-                                let message = format!(
-                                    "agent '{agent_name}' does not support loading ACP sessions \
-                                     (session/load); cannot restore session '{known}'"
-                                );
-                                fail_load(&lifecycle, &load_tx, &message);
-                                let _ = events_tx.send(AcpEvent::State(AgentStateEvent::Error {
-                                    message: message.clone(),
-                                }));
-                                return Err(anyhow::anyhow!(message).into());
+                    ) = loop {
+                        if *shutdown_rx.borrow() {
+                            if let Some(reply) = pending_auth_reply.take() {
+                                let _ = reply.send(Err(
+                                    "the session was closed before sign-in completed".to_string(),
+                                ));
                             }
-                            let loaded = connection
-                                .send_request(LoadSessionRequest::new(
-                                    SessionId::new(known.clone()),
-                                    cwd.clone(),
-                                ))
-                                .block_task()
-                                .await
-                                .map_err(|error| {
-                                    let message = format!(
-                                        "agent '{agent_name}' could not load ACP session \
-                                         '{known}': {error}"
-                                    );
-                                    fail_load(&lifecycle, &load_tx, &message);
-                                    let _ = events_tx.send(AcpEvent::State(AgentStateEvent::Error {
-                                        message: message.clone(),
-                                    }));
-                                    anyhow::anyhow!(message)
-                                })?;
-                            // The local id is the routing key; the ACP id stays
-                            // separate metadata, unchanged by the restore.
-                            if let Some(binding) = &ready_binding {
-                                if let Err(error) = binding
-                                    .store
-                                    .mark_ready(&binding.id, known, binding.run_id.as_deref())
-                                    .await
-                                {
-                                    let message = format!(
-                                        "agent '{agent_name}': cannot record loaded ACP session \
-                                         id: {error}"
-                                    );
-                                    fail_load(&lifecycle, &load_tx, &message);
-                                    let _ = events_tx.send(AcpEvent::State(AgentStateEvent::Error {
-                                        message: message.clone(),
-                                    }));
-                                    return Err(anyhow::anyhow!(message).into());
-                                }
-                            }
-                            *session_id_slot.lock() = Some(known.clone());
-                            (
-                                SessionId::new(known.clone()),
-                                known.clone(),
-                                current_model(loaded.config_options.as_deref()),
-                                normalized_config_options(loaded.config_options.as_deref()),
-                                loaded.modes.as_ref().map(normalized_modes),
-                            )
+                            return Ok(());
                         }
-                        AcpSessionMode::ProviderResume {
-                            external_session_id: known,
-                        } => {
-                            // Prefer `session/load`: it replays the transcript.
-                            // `session/resume` is the v1 fallback for agents that
-                            // advertise resume without load.
-                            if init.agent_capabilities.load_session {
-                                let loaded = connection
-                                    .send_request(LoadSessionRequest::new(
-                                        SessionId::new(known.clone()),
-                                        cwd.clone(),
-                                    ))
-                                    .block_task()
-                                    .await
-                                    .map_err(|error| {
-                                        let message = format!(
-                                            "agent '{agent_name}' could not load provider session \
-                                             '{known}': {error}"
-                                        );
-                                        fail_load(&lifecycle, &load_tx, &message);
-                                        let _ = events_tx.send(AcpEvent::State(
-                                            AgentStateEvent::Error {
-                                                message: message.clone(),
-                                            },
-                                        ));
-                                        anyhow::anyhow!(message)
-                                    })?;
-                                if let Some(binding) = &ready_binding {
-                                    if let Err(error) = binding
-                                        .store
-                                        .mark_ready(&binding.id, known, binding.run_id.as_deref())
+                        let setup = match &mode {
+                            AcpSessionMode::Load {
+                                external_session_id: known,
+                            } => {
+                                if !init.agent_capabilities.load_session {
+                                    Err(SessionSetup::Fatal(format!(
+                                        "agent '{agent_name}' does not support loading ACP sessions \
+                                         (session/load); cannot restore session '{known}'"
+                                    )))
+                                } else {
+                                    match connection
+                                        .send_request(LoadSessionRequest::new(
+                                            SessionId::new(known.clone()),
+                                            cwd.clone(),
+                                        ))
+                                        .block_task()
                                         .await
                                     {
-                                        let message = format!(
-                                            "agent '{agent_name}': cannot record resumed provider \
-                                             session id: {error}"
-                                        );
-                                        fail_load(&lifecycle, &load_tx, &message);
-                                        let _ = events_tx.send(AcpEvent::State(
-                                            AgentStateEvent::Error {
-                                                message: message.clone(),
-                                            },
-                                        ));
-                                        return Err(anyhow::anyhow!(message).into());
-                                    }
-                                }
-                                *session_id_slot.lock() = Some(known.clone());
-                                (
-                                    SessionId::new(known.clone()),
-                                    known.clone(),
-                                    current_model(loaded.config_options.as_deref()),
-                                    normalized_config_options(loaded.config_options.as_deref()),
-                                    loaded.modes.as_ref().map(normalized_modes),
-                                )
-                            } else if init.agent_capabilities.session_capabilities.resume.is_some() {
-                                let resumed = connection
-                                    .send_request(ResumeSessionRequest::new(
-                                        SessionId::new(known.clone()),
-                                        cwd.clone(),
-                                    ))
-                                    .block_task()
-                                    .await
-                                    .map_err(|error| {
-                                        let message = format!(
-                                            "agent '{agent_name}' could not resume provider session \
-                                             '{known}': {error}"
-                                        );
-                                        fail_load(&lifecycle, &load_tx, &message);
-                                        let _ = events_tx.send(AcpEvent::State(
-                                            AgentStateEvent::Error {
-                                                message: message.clone(),
-                                            },
-                                        ));
-                                        anyhow::anyhow!(message)
-                                    })?;
-                                if let Some(binding) = &ready_binding {
-                                    if let Err(error) = binding
-                                        .store
-                                        .mark_ready(&binding.id, known, binding.run_id.as_deref())
-                                        .await
-                                    {
-                                        let message = format!(
-                                            "agent '{agent_name}': cannot record resumed provider \
-                                             session id: {error}"
-                                        );
-                                        fail_load(&lifecycle, &load_tx, &message);
-                                        let _ = events_tx.send(AcpEvent::State(
-                                            AgentStateEvent::Error {
-                                                message: message.clone(),
-                                            },
-                                        ));
-                                        return Err(anyhow::anyhow!(message).into());
-                                    }
-                                }
-                                *session_id_slot.lock() = Some(known.clone());
-                                (
-                                    SessionId::new(known.clone()),
-                                    known.clone(),
-                                    current_model(resumed.config_options.as_deref()),
-                                    normalized_config_options(resumed.config_options.as_deref()),
-                                    resumed.modes.as_ref().map(normalized_modes),
-                                )
-                            } else {
-                                let message = format!(
-                                    "agent '{agent_name}' cannot resume provider session \
-                                     '{known}': neither session/load nor session/resume is \
-                                     supported"
-                                );
-                                fail_load(&lifecycle, &load_tx, &message);
-                                let _ = events_tx.send(AcpEvent::State(AgentStateEvent::Error {
-                                    message: message.clone(),
-                                }));
-                                return Err(anyhow::anyhow!(message).into());
-                            }
-                        }
-                        AcpSessionMode::New => {
-                            let session = connection
-                                .send_request(NewSessionRequest::new(cwd.clone()))
-                                .block_task()
-                                .await?;
-                            let session_id = session.session_id.clone();
-                            let external_session_id = session_id.0.to_string();
-                            // Record the agent's identity immediately: a task
-                            // run can be finalized (or the daemon can crash)
-                            // long before the first turn ends. A write fault
-                            // aborts the session rather than letting an
-                            // untracked conversation continue.
-                            if let Some(binding) = &ready_binding {
-                                if let Err(error) = binding
-                                    .store
-                                    .mark_ready(
-                                        &binding.id,
-                                        &external_session_id,
-                                        binding.run_id.as_deref(),
-                                    )
-                                    .await
-                                {
-                                    let message = format!(
-                                        "agent '{agent_name}': cannot record ACP session id: \
-                                         {error}"
-                                    );
-                                    let _ = events_tx.send(AcpEvent::State(AgentStateEvent::Error {
-                                        message: message.clone(),
-                                    }));
-                                    return Err(anyhow::anyhow!(message).into());
-                                }
-                            }
-                            // Expose the id to the manager even if model
-                            // selection fails below, so a failed run still
-                            // reports its identity.
-                            *session_id_slot.lock() = Some(external_session_id.clone());
-                            // A task names its model explicitly; apply it
-                            // instead of relying on the agent's last-used
-                            // default (which may be stale or unavailable on
-                            // this account).
-                            let (chosen_model, options) =
-                                if let Some(wanted) = &requested_model {
-                                    match apply_model(&connection, &session, wanted).await {
-                                        Ok((model, options)) => (Some(model), options),
-                                        Err(error) => {
-                                            let message = format!("agent '{agent_name}': {error}");
-                                            let _ = events_tx.send(AcpEvent::State(
-                                                AgentStateEvent::Error {
-                                                    message: message.clone(),
-                                                },
-                                            ));
-                                            return Err(anyhow::anyhow!(message).into());
+                                        Ok(loaded) => {
+                                            // The local id is the routing key;
+                                            // the ACP id stays separate metadata,
+                                            // unchanged by the restore.
+                                            let recorded = match &ready_binding {
+                                                Some(binding) => binding
+                                                    .store
+                                                    .mark_ready(
+                                                        &binding.id,
+                                                        known,
+                                                        binding.run_id.as_deref(),
+                                                    )
+                                                    .await
+                                                    .map_err(|error| {
+                                                        format!(
+                                                            "agent '{agent_name}': cannot record \
+                                                             loaded ACP session id: {error}"
+                                                        )
+                                                    }),
+                                                None => Ok(()),
+                                            };
+                                            match recorded {
+                                                Err(message) => {
+                                                    Err(SessionSetup::Fatal(message))
+                                                }
+                                                Ok(()) => {
+                                                    *session_id_slot.lock() =
+                                                        Some(known.clone());
+                                                    Ok::<_, SessionSetup>((
+                                                        SessionId::new(known.clone()),
+                                                        known.clone(),
+                                                        current_model(
+                                                            loaded.config_options.as_deref(),
+                                                        ),
+                                                        normalized_config_options(
+                                                            loaded.config_options.as_deref(),
+                                                        ),
+                                                        loaded
+                                                            .modes
+                                                            .as_ref()
+                                                            .map(normalized_modes),
+                                                    ))
+                                                }
+                                            }
                                         }
+                                        Err(error) => Err(setup_error(
+                                            || {
+                                                format!(
+                                                    "agent '{agent_name}' could not load ACP \
+                                                     session '{known}'"
+                                                )
+                                            },
+                                            error,
+                                        )),
+                                    }
+                                }
+                            }
+                            AcpSessionMode::ProviderResume {
+                                external_session_id: known,
+                            } => {
+                                // Prefer `session/load`: it replays the transcript.
+                                // `session/resume` is the v1 fallback for agents that
+                                // advertise resume without load.
+                                if init.agent_capabilities.load_session {
+                                    match connection
+                                        .send_request(LoadSessionRequest::new(
+                                            SessionId::new(known.clone()),
+                                            cwd.clone(),
+                                        ))
+                                        .block_task()
+                                        .await
+                                    {
+                                        Ok(loaded) => {
+                                            let recorded = match &ready_binding {
+                                                Some(binding) => binding
+                                                    .store
+                                                    .mark_ready(
+                                                        &binding.id,
+                                                        known,
+                                                        binding.run_id.as_deref(),
+                                                    )
+                                                    .await
+                                                    .map_err(|error| {
+                                                        format!(
+                                                            "agent '{agent_name}': cannot record \
+                                                             resumed provider session id: {error}"
+                                                        )
+                                                    }),
+                                                None => Ok(()),
+                                            };
+                                            match recorded {
+                                                Err(message) => {
+                                                    Err(SessionSetup::Fatal(message))
+                                                }
+                                                Ok(()) => {
+                                                    *session_id_slot.lock() =
+                                                        Some(known.clone());
+                                                    Ok::<_, SessionSetup>((
+                                                        SessionId::new(known.clone()),
+                                                        known.clone(),
+                                                        current_model(
+                                                            loaded.config_options.as_deref(),
+                                                        ),
+                                                        normalized_config_options(
+                                                            loaded.config_options.as_deref(),
+                                                        ),
+                                                        loaded
+                                                            .modes
+                                                            .as_ref()
+                                                            .map(normalized_modes),
+                                                    ))
+                                                }
+                                            }
+                                        }
+                                        Err(error) => Err(setup_error(
+                                            || {
+                                                format!(
+                                                    "agent '{agent_name}' could not load provider \
+                                                     session '{known}'"
+                                                )
+                                            },
+                                            error,
+                                        )),
+                                    }
+                                } else if init.agent_capabilities.session_capabilities.resume.is_some() {
+                                    match connection
+                                        .send_request(ResumeSessionRequest::new(
+                                            SessionId::new(known.clone()),
+                                            cwd.clone(),
+                                        ))
+                                        .block_task()
+                                        .await
+                                    {
+                                        Ok(resumed) => {
+                                            let recorded = match &ready_binding {
+                                                Some(binding) => binding
+                                                    .store
+                                                    .mark_ready(
+                                                        &binding.id,
+                                                        known,
+                                                        binding.run_id.as_deref(),
+                                                    )
+                                                    .await
+                                                    .map_err(|error| {
+                                                        format!(
+                                                            "agent '{agent_name}': cannot record \
+                                                             resumed provider session id: {error}"
+                                                        )
+                                                    }),
+                                                None => Ok(()),
+                                            };
+                                            match recorded {
+                                                Err(message) => {
+                                                    Err(SessionSetup::Fatal(message))
+                                                }
+                                                Ok(()) => {
+                                                    *session_id_slot.lock() =
+                                                        Some(known.clone());
+                                                    Ok::<_, SessionSetup>((
+                                                        SessionId::new(known.clone()),
+                                                        known.clone(),
+                                                        current_model(
+                                                            resumed.config_options.as_deref(),
+                                                        ),
+                                                        normalized_config_options(
+                                                            resumed.config_options.as_deref(),
+                                                        ),
+                                                        resumed
+                                                            .modes
+                                                            .as_ref()
+                                                            .map(normalized_modes),
+                                                    ))
+                                                }
+                                            }
+                                        }
+                                        Err(error) => Err(setup_error(
+                                            || {
+                                                format!(
+                                                    "agent '{agent_name}' could not resume provider \
+                                                     session '{known}'"
+                                                )
+                                            },
+                                            error,
+                                        )),
                                     }
                                 } else {
-                                    (
-                                        current_model(session.config_options.as_deref()),
-                                        normalized_config_options(
-                                            session.config_options.as_deref(),
-                                        ),
-                                    )
+                                    Err(SessionSetup::Fatal(format!(
+                                        "agent '{agent_name}' cannot resume provider session \
+                                         '{known}': neither session/load nor session/resume is \
+                                         supported"
+                                    )))
+                                }
+                            }
+                            AcpSessionMode::New => match connection
+                                .send_request(NewSessionRequest::new(cwd.clone()))
+                                .block_task()
+                                .await
+                            {
+                                Ok(session) => {
+                                    let session_id = session.session_id.clone();
+                                    let external_session_id = session_id.0.to_string();
+                                    // Record the agent's identity immediately: a
+                                    // task run can be finalized (or the daemon
+                                    // can crash) long before the first turn ends.
+                                    // A write fault aborts the session rather
+                                    // than letting an untracked conversation
+                                    // continue.
+                                    let recorded = match &ready_binding {
+                                        Some(binding) => binding
+                                            .store
+                                            .mark_ready(
+                                                &binding.id,
+                                                &external_session_id,
+                                                binding.run_id.as_deref(),
+                                            )
+                                            .await
+                                            .map_err(|error| {
+                                                format!(
+                                                    "agent '{agent_name}': cannot record ACP \
+                                                     session id: {error}"
+                                                )
+                                            }),
+                                        None => Ok(()),
+                                    };
+                                    match recorded {
+                                        Err(message) => Err(SessionSetup::Fatal(message)),
+                                        Ok(()) => {
+                                            // Expose the id to the manager even
+                                            // if model selection fails below, so
+                                            // a failed run still reports its
+                                            // identity.
+                                            *session_id_slot.lock() =
+                                                Some(external_session_id.clone());
+                                            // A task names its model explicitly;
+                                            // apply it instead of relying on the
+                                            // agent's last-used default (which may
+                                            // be stale or unavailable here).
+                                            let chosen = if let Some(wanted) =
+                                                &requested_model
+                                            {
+                                                apply_model(&connection, &session, wanted)
+                                                    .await
+                                                    .map(|(model, options)| (Some(model), options))
+                                                    .map_err(|error| {
+                                                        SessionSetup::Fatal(format!(
+                                                            "agent '{agent_name}': {error}"
+                                                        ))
+                                                    })
+                                            } else {
+                                                Ok((
+                                                    current_model(
+                                                        session.config_options.as_deref(),
+                                                    ),
+                                                    normalized_config_options(
+                                                        session.config_options.as_deref(),
+                                                    ),
+                                                ))
+                                            };
+                                            match chosen {
+                                                Ok((chosen_model, options)) => Ok((
+                                                    session_id,
+                                                    external_session_id,
+                                                    chosen_model,
+                                                    options,
+                                                    session.modes.as_ref().map(normalized_modes),
+                                                )),
+                                                Err(failure) => Err(failure),
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(error) => Err(setup_error(
+                                    || {
+                                        format!(
+                                            "agent '{agent_name}' could not create ACP session"
+                                        )
+                                    },
+                                    error,
+                                )),
+                            },
+                        };
+
+                        match setup {
+                            Ok(value) => {
+                                if let Some(reply) = pending_auth_reply.take() {
+                                    let _ = reply.send(Ok(()));
+                                }
+                                break value;
+                            }
+                            Err(SessionSetup::AuthRequired) => {
+                                publish_auth(
+                                    auth_snapshot(
+                                        &auth_methods,
+                                        logout_supported,
+                                        AgentAuthStatus::Required,
+                                        None,
+                                        Some("the agent requires sign-in".to_string()),
+                                    ),
+                                    &auth_slot,
+                                    &events_tx,
+                                );
+                                if let Some(tx) = &load_tx {
+                                    let _ = tx.send(Some(LoadUpdate::AuthRequired));
+                                }
+                                // A previous authenticate call that still ended
+                                // in auth-required must not hang its caller.
+                                if let Some(reply) = pending_auth_reply.take() {
+                                    let _ = reply.send(Err(
+                                        "the agent still requires authentication".to_string(),
+                                    ));
+                                }
+                                loop {
+                                let command = loop {
+                                    tokio::select! {
+                                        command = auth_rx.recv() => break command,
+                                        _ = shutdown_rx.changed() => {
+                                            if *shutdown_rx.borrow() {
+                                                if let Some(reply) = pending_auth_reply.take() {
+                                                    let _ = reply.send(Err(
+                                                        "the session was closed before sign-in completed"
+                                                            .to_string(),
+                                                    ));
+                                                }
+                                                return Ok(());
+                                            }
+                                        }
+                                    }
                                 };
-                            let modes = session.modes.as_ref().map(normalized_modes);
-                            (session_id, external_session_id, chosen_model, options, modes)
+                                let Some(command) = command else {
+                                    let message = format!(
+                                        "agent '{agent_name}': authentication was requested but \
+                                         no sign-in channel is available"
+                                    );
+                                    if let Some(reply) = pending_auth_reply.take() {
+                                        let _ = reply.send(Err(message.clone()));
+                                    }
+                                    return Err(anyhow::anyhow!(message).into());
+                                };
+                                let method = auth_methods
+                                    .iter()
+                                    .find(|method| method.id == command.method_id);
+                                let Some(method) = method else {
+                                    let message = format!(
+                                        "authentication method '{}' was not advertised by the agent",
+                                        command.method_id
+                                    );
+                                    publish_auth(
+                                        auth_snapshot(
+                                            &auth_methods,
+                                            logout_supported,
+                                            AgentAuthStatus::Failed,
+                                            Some(&command.method_id),
+                                            Some(message.clone()),
+                                        ),
+                                        &auth_slot,
+                                        &events_tx,
+                                    );
+                                    let _ = command.reply.send(Err(message));
+                                    continue;
+                                };
+                                if !method.supported {
+                                    let message = if method.kind == AgentAuthMethodKind::Terminal {
+                                        TERMINAL_AUTH_UNSUPPORTED.to_string()
+                                    } else {
+                                        format!(
+                                            "authentication method '{}' is not supported by the \
+                                             Favetto daemon",
+                                            method.id
+                                        )
+                                    };
+                                    publish_auth(
+                                        auth_snapshot(
+                                            &auth_methods,
+                                            logout_supported,
+                                            AgentAuthStatus::Failed,
+                                            Some(&command.method_id),
+                                            Some(message.clone()),
+                                        ),
+                                        &auth_slot,
+                                        &events_tx,
+                                    );
+                                    let _ = command.reply.send(Err(message));
+                                    continue;
+                                }
+
+                                publish_auth(
+                                    auth_snapshot(
+                                        &auth_methods,
+                                        logout_supported,
+                                        AgentAuthStatus::Authenticating,
+                                        Some(&command.method_id),
+                                        None,
+                                    ),
+                                    &auth_slot,
+                                    &events_tx,
+                                );
+                                let result = tokio::time::timeout(
+                                    AUTH_TIMEOUT,
+                                    connection
+                                        .send_request(AuthenticateRequest::new(
+                                            command.method_id.clone(),
+                                        ))
+                                        .block_task(),
+                                )
+                                .await;
+                                match result {
+                                    Ok(Ok(_)) => {
+                                        publish_auth(
+                                            auth_snapshot(
+                                                &auth_methods,
+                                                logout_supported,
+                                                AgentAuthStatus::Authenticated,
+                                                Some(&command.method_id),
+                                                None,
+                                            ),
+                                            &auth_slot,
+                                            &events_tx,
+                                        );
+                                        pending_auth_reply = Some(command.reply);
+                                        // Retry session setup now that the agent
+                                        // accepted the sign-in.
+                                        break;
+                                    }
+                                    Ok(Err(error)) => {
+                                        let message =
+                                            format!("agent sign-in failed: {error}");
+                                        publish_auth(
+                                            auth_snapshot(
+                                                &auth_methods,
+                                                logout_supported,
+                                                AgentAuthStatus::Failed,
+                                                Some(&command.method_id),
+                                                Some(message.clone()),
+                                            ),
+                                            &auth_slot,
+                                            &events_tx,
+                                        );
+                                        let _ = command.reply.send(Err(message));
+                                    }
+                                    Err(_) => {
+                                        let message =
+                                            "agent sign-in timed out".to_string();
+                                        publish_auth(
+                                            auth_snapshot(
+                                                &auth_methods,
+                                                logout_supported,
+                                                AgentAuthStatus::Failed,
+                                                Some(&command.method_id),
+                                                Some(message.clone()),
+                                            ),
+                                            &auth_slot,
+                                            &events_tx,
+                                        );
+                                        let _ = command.reply.send(Err(message));
+                                    }
+                                }
+                                }
+                            }
+                            Err(SessionSetup::Fatal(message)) => {
+                                if let Some(reply) = pending_auth_reply.take() {
+                                    let _ = reply.send(Err(message.clone()));
+                                }
+                                if matches!(&mode, AcpSessionMode::Load { .. }) {
+                                    fail_load(&lifecycle, &load_tx, &message);
+                                }
+                                let _ = events_tx.send(AcpEvent::State(AgentStateEvent::Error {
+                                    message: message.clone(),
+                                }));
+                                return Err(anyhow::anyhow!(message).into());
+                            }
                         }
                     };
+                    *session_slot.lock() = Some(session_id.clone());
+                    // Setup completed: any pending sign-in is no longer blocking.
+                    // Keep the advertised method metadata for the session's
+                    // lifetime so clients can still sign out when supported.
+                    if !auth_methods.is_empty() || logout_supported {
+                        publish_auth(
+                            auth_snapshot(
+                                &auth_methods,
+                                logout_supported,
+                                AgentAuthStatus::NotRequired,
+                                None,
+                                None,
+                            ),
+                            &auth_slot,
+                            &events_tx,
+                        );
+                    }
                     // A successful load releases the buffered replay in arrival
                     // order, then waits for the manager to fold it into the feed
                     // before readiness is published. Nothing here runs for a
@@ -958,103 +1512,8 @@ pub(crate) fn spawn(
                     // A load is only reported as restored after the replay is
                     // applied and the record is ready.
                     if let Some(tx) = &load_tx {
-                        let _ = tx.send(Some(Ok(())));
+                        let _ = tx.send(Some(LoadUpdate::Ready));
                     }
-
-                    // A control task turns external commands into protocol
-                    // notifications, so the prompt loop below stays linear.
-                    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-                    let control_connection = connection.clone();
-                    let control_session = session_id.clone();
-                    let control_turn = prompt_turn.clone();
-                    let control_events = events_tx.clone();
-                    tokio::spawn(async move {
-                        while let Some(command) = commands_rx.recv().await {
-                            match command {
-                                AcpCommand::SetConfigOption {
-                                    option_id,
-                                    value,
-                                    reply,
-                                } => {
-                                    let request = SetSessionConfigOptionRequest::new(
-                                        control_session.clone(),
-                                        AcpSessionConfigId::new(option_id),
-                                        acp_config_value(value),
-                                    );
-                                    let result = control_connection
-                                        .send_request(request)
-                                        .block_task()
-                                        .await;
-                                    match result {
-                                        Ok(response) => {
-                                            let options = normalized_config_options(Some(
-                                                &response.config_options,
-                                            ));
-                                            let _ = control_events.send(AcpEvent::State(
-                                                AgentStateEvent::ConfigOptions {
-                                                    options: options.clone(),
-                                                },
-                                            ));
-                                            let _ = reply.send(Ok(options));
-                                        }
-                                        Err(error) => {
-                                            let _ = reply.send(Err(error.to_string()));
-                                        }
-                                    }
-                                }
-                                AcpCommand::SetMode { mode_id, reply } => {
-                                    let request = SetSessionModeRequest::new(
-                                        control_session.clone(),
-                                        AcpSessionModeId::new(mode_id.clone()),
-                                    );
-                                    let result = control_connection
-                                        .send_request(request)
-                                        .block_task()
-                                        .await;
-                                    match result {
-                                        Ok(_) => {
-                                            let _ = control_events.send(AcpEvent::State(
-                                                AgentStateEvent::CurrentMode {
-                                                    mode_id: mode_id.clone(),
-                                                },
-                                            ));
-                                            let _ = reply.send(Ok(()));
-                                        }
-                                        Err(error) => {
-                                            let _ = reply.send(Err(error.to_string()));
-                                        }
-                                    }
-                                }
-                                AcpCommand::Cancel => {
-                                    let Some(generation) = control_turn.lock().request_cancel()
-                                    else {
-                                        continue;
-                                    };
-                                    // ACP requires every pending permission request
-                                    // for the cancelled turn to be answered
-                                    // `cancelled` before the agent is left to
-                                    // unwind. Settle them first, then notify.
-                                    let settled = control_responder.cancel_turn(generation);
-                                    tracing::debug!(
-                                        target: "favetto::acp",
-                                        generation,
-                                        settled,
-                                        "cancelling ACP turn"
-                                    );
-                                    let _ = control_connection.send_notification(
-                                        CancelNotification::new(control_session.clone()),
-                                    );
-                                }
-                                AcpCommand::Shutdown => {
-                                    let _ = control_connection.send_notification(
-                                        CancelNotification::new(control_session.clone()),
-                                    );
-                                    let _ = shutdown_tx.send(true);
-                                    break;
-                                }
-                            }
-                        }
-                    });
 
                     let mut pending = initial_prompt;
                     let mut turns = 0u32;
@@ -1222,6 +1681,8 @@ pub(crate) fn spawn(
         AcpHandles {
             prompts: prompts_tx,
             commands: commands_tx,
+            authenticate: handles_auth_tx,
+            auth: auth_state,
             responder,
             running,
             exit_code,
@@ -1826,7 +2287,7 @@ fn emit_update(
 /// later prompt/transport error) is not overwritten with a restore failure.
 fn fail_load(
     lifecycle: &Option<Arc<Mutex<SessionLifecycle>>>,
-    load: &Option<tokio::sync::watch::Sender<Option<Result<(), String>>>>,
+    load: &Option<tokio::sync::watch::Sender<Option<LoadUpdate>>>,
     message: &str,
 ) {
     let was_loading = match lifecycle {
@@ -1844,7 +2305,7 @@ fn fail_load(
     };
     if was_loading {
         if let Some(tx) = load {
-            let _ = tx.send(Some(Err(message.to_string())));
+            let _ = tx.send(Some(LoadUpdate::Failed(message.to_string())));
         }
     }
 }
@@ -3183,6 +3644,59 @@ mod tests {
         outcome.error = None;
         outcome.stop_reason = Some("cancelled".to_string());
         assert!(!outcome.succeeded());
+    }
+
+    #[test]
+    fn terminal_auth_methods_keep_metadata_but_are_never_supported() {
+        let methods = vec![
+            AuthMethod::Agent(agent_client_protocol::v1::schema::AuthMethodAgent::new(
+                "agent-login",
+                "Sign in",
+            )),
+            AuthMethod::Terminal(
+                agent_client_protocol::v1::schema::AuthMethodTerminal::new(
+                    "terminal-login",
+                    "Terminal sign in",
+                )
+                .env(HashMap::from([(
+                    "TERMINAL_AUTH_SECRET".to_string(),
+                    "never-expose-this".to_string(),
+                )])),
+            ),
+        ];
+        let wire = wire_auth_methods(&methods);
+        assert_eq!(wire.len(), 2);
+        assert_eq!(wire[0].id, "agent-login");
+        assert!(wire[0].supported);
+        assert_eq!(wire[0].kind, AgentAuthMethodKind::Agent);
+        assert_eq!(wire[1].kind, AgentAuthMethodKind::Terminal);
+        assert!(!wire[1].supported);
+        let json = serde_json::to_string(&wire).unwrap();
+        assert!(!json.contains("never-expose-this"));
+        assert!(!json.contains("TERMINAL_AUTH_SECRET"));
+    }
+
+    #[test]
+    fn terminal_auth_is_not_advertised_to_agents() {
+        let request = InitializeRequest::new(ProtocolVersion::V1);
+        assert!(!request.client_capabilities.auth.terminal);
+    }
+
+    #[test]
+    fn auth_required_is_retryable_while_other_setup_errors_are_fatal() {
+        let required = setup_error(
+            || "create session".to_string(),
+            agent_client_protocol::Error::auth_required(),
+        );
+        assert!(matches!(required, SessionSetup::AuthRequired));
+        let fatal = setup_error(
+            || "create session".to_string(),
+            agent_client_protocol::Error::internal_error(),
+        );
+        match fatal {
+            SessionSetup::Fatal(message) => assert!(message.contains("create session")),
+            SessionSetup::AuthRequired => panic!("internal error must be fatal"),
+        }
     }
 
     #[test]

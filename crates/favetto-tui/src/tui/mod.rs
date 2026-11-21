@@ -977,6 +977,12 @@ async fn run_session(
                             UiAction::CancelTurn(session_id) => {
                                 cancel_agent_turn(client, app, session_id).await;
                             }
+                            UiAction::Authenticate { session_id, method_id } => {
+                                send_agent_authenticate(client, app, session_id, method_id).await;
+                            }
+                            UiAction::Logout { session_id } => {
+                                send_agent_logout(client, app, session_id).await;
+                            }
                             UiAction::TaskCommand { method, params } => {
                                 task_command(client, app, method, params).await;
                             }
@@ -1856,6 +1862,40 @@ async fn apply_session_options_response(
     fetch_agent_sessions(client, app).await;
 }
 
+/// Complete an agent-handled ACP sign-in for a session.
+///
+/// The daemon performs the flow; the TUI only chooses an advertised method id.
+/// No credential is collected, sent, or displayed here.
+async fn send_agent_authenticate(
+    client: &Client,
+    app: &mut App,
+    session_id: String,
+    method_id: String,
+) {
+    let params = serde_json::json!({
+        "session_id": session_id,
+        "method_id": method_id,
+    });
+    match client.request(method::AGENTS_AUTHENTICATE, params).await {
+        Ok(resp) => match resp.result {
+            Some(_) => {
+                app.agent_error = None;
+                app.logs.push_back("agents.authenticate: ok".to_string());
+            }
+            None => {
+                let message = resp
+                    .error
+                    .as_ref()
+                    .map(|error| error.message.clone())
+                    .unwrap_or_else(|| "agents.authenticate failed".to_string());
+                app.agent_error = Some(message);
+            }
+        },
+        Err(error) => app.agent_error = Some(error.to_string()),
+    }
+    fetch_agent_sessions(client, app).await;
+}
+
 /// Interrupt the attached ACP session's in-flight turn (`agents.cancel`).
 ///
 /// This is distinct from `tasks.cancel`: the task stays alive and a follow-up
@@ -1888,6 +1928,29 @@ async fn cancel_agent_turn(client: &Client, app: &mut App, session_id: String) {
             app.logs.push_back(format!("agents.cancel failed: {e}"));
         }
     }
+}
+
+/// Sign a session out through ACP `logout` when the agent advertised it.
+async fn send_agent_logout(client: &Client, app: &mut App, session_id: String) {
+    let params = serde_json::json!({ "session_id": session_id });
+    match client.request(method::AGENTS_LOGOUT, params).await {
+        Ok(resp) => match resp.result {
+            Some(_) => {
+                app.agent_error = None;
+                app.logs.push_back("agents.logout: ok".to_string());
+            }
+            None => {
+                let message = resp
+                    .error
+                    .as_ref()
+                    .map(|error| error.message.clone())
+                    .unwrap_or_else(|| "agents.logout failed".to_string());
+                app.agent_error = Some(message);
+            }
+        },
+        Err(error) => app.agent_error = Some(error.to_string()),
+    }
+    fetch_agent_sessions(client, app).await;
 }
 
 /// Apply a task command (`tasks.cancel`, `tasks.retry`, `workflow.cancel`).
@@ -2354,6 +2417,7 @@ mod tests {
 
             config_options: Vec::new(),
             modes: None,
+            auth: None,
         };
         let agents = vec![AgentCatalogEntry {
             name: "opencode".to_string(),

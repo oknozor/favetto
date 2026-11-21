@@ -60,6 +60,8 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | `agents.provider_sessions` | List provider-owned ACP sessions through the agent's advertised `session/list`, with cwd filtering and opaque cursor pagination. Distinct from `agents.history`: rows may never have been created by Favetto. Unsupported agents return `supported: false` and a reason. |
 | `agents.provider_resume` | Resume a provider-owned ACP session by its provider ACP id. Prefers `session/load` (with replay) when advertised, then `session/resume`; imports the session into a Favetto-local record and returns that local id for all subsequent calls. |
 | `agents.provider_delete` | Delete a provider-owned ACP session through the advertised `session/delete`. Only the provider transcript is deleted; Favetto-local metadata is untouched. |
+| `agents.authenticate` | Complete an agent-handled ACP v1 sign-in. Only methods advertised by the agent are accepted; terminal methods are rejected because the daemon cannot run an interactive login process for a remote client. |
+| `agents.logout` | Sign a session out through ACP `logout` when the agent advertised it. |
 | `providers.list` | List configured providers and their available models. |
 | `schedules.list` | List cron schedules, with the next occurrence (`next_run`, UTC) computed for enabled entries. |
 | `schedules.upsert` | Create or update a cron schedule. |
@@ -837,6 +839,40 @@ Delete a provider-owned ACP session through the advertised `session/delete`. Onl
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
 | `deleted` | boolean | — | yes |  |
+
+### `agents.authenticate`
+
+Complete an agent-handled ACP v1 sign-in. Only methods advertised by the agent are accepted; terminal methods are rejected because the daemon cannot run an interactive login process for a remote client.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `session_id` | string | — | yes |  |
+| `method_id` | string | — | yes |  |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `authenticated` | boolean | — | yes |  |
+| `auth` | AgentAuthState | — | yes |  |
+
+### `agents.logout`
+
+Sign a session out through ACP `logout` when the agent advertised it.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `session_id` | string | — | yes |  |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `logged_out` | boolean | — | yes |  |
 
 ### `providers.list`
 

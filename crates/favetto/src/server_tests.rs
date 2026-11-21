@@ -1045,6 +1045,7 @@ fn live_session(running: bool, headless: bool, awaiting: bool) -> AgentSessionIn
         load_error: None,
         config_options: Vec::new(),
         modes: None,
+        auth: None,
     }
 }
 

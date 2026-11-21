@@ -14,12 +14,12 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use favetto_core::model::{
-    AgentActivity, AgentBackend, AgentCapabilities, AgentCatalogEntry, AgentCommand,
-    AgentPlanEntry, AgentSessionHistoryEntry, AgentSessionInfo, AgentSessionState, AgentStateEvent,
-    AgentUsage, AwaitingInputKind, Event, EventKind, FailureKind, InputReply, InputRequest,
-    MessageRole, NotificationRecord, RepoInfo, Schedule, SessionConfigChoices, SessionConfigKind,
-    SessionConfigOption, SessionConfigValue, SessionModes, Task, TaskStatus, UsagePeriod,
-    UsageStats,
+    AgentActivity, AgentAuthMethod, AgentAuthMethodKind, AgentAuthState, AgentBackend,
+    AgentCapabilities, AgentCatalogEntry, AgentCommand, AgentPlanEntry, AgentSessionHistoryEntry,
+    AgentSessionInfo, AgentSessionState, AgentStateEvent, AgentUsage, AwaitingInputKind, Event,
+    EventKind, FailureKind, InputReply, InputRequest, MessageRole, NotificationRecord, RepoInfo,
+    Schedule, SessionConfigChoices, SessionConfigKind, SessionConfigOption, SessionConfigValue,
+    SessionModes, Task, TaskStatus, UsagePeriod, UsageStats,
 };
 use favetto_core::rpc::{method, push, AgentEventPush, Notification};
 use favetto_core::workflow::WorkflowInspect;
@@ -177,6 +177,15 @@ pub enum UiAction {
     SetSessionMode {
         session_id: String,
         mode_id: String,
+    },
+    /// Complete an agent-handled ACP sign-in (`agents.authenticate`).
+    Authenticate {
+        session_id: String,
+        method_id: String,
+    },
+    /// Sign an ACP session out when the agent advertised logout.
+    Logout {
+        session_id: String,
     },
     /// Cancel or retry a task, or cancel a whole workflow root, over RPC. The
     /// daemon pushes `task.updated` for every change, so the client never
@@ -460,6 +469,9 @@ pub enum Popup {
     /// The Ctrl+R reply prompt: answer a session's structured input request
     /// (`AgentActivity::Waiting { request }`) through `agents.reply`.
     Reply(ReplyPrompt),
+    /// The Ctrl+A sign-in chooser: complete an agent-handled ACP sign-in or
+    /// sign out when the agent advertised logout.
+    Auth(AuthPrompt),
     /// A destructive task action (`c` cancel / `C` cancel root / `r` retry)
     /// awaiting explicit confirmation before its RPC is submitted.
     Confirm(ConfirmPrompt),
@@ -822,6 +834,55 @@ impl ReplyPrompt {
     /// The typed reply for the current selection/buffer.
     pub fn reply(&self) -> InputReply {
         reply_for(&self.request, self.selected, self.input.value())
+    }
+}
+
+/// The Ctrl+A sign-in chooser for a session whose agent requires authentication.
+///
+/// Only agent-handled methods are listed as actions. A terminal method is
+/// preserved by the daemon for display, but selecting it would be rejected; the
+/// chooser therefore never offers it. `logout` adds a final sign-out row.
+pub struct AuthPrompt {
+    /// The daemon session id the action is sent to.
+    pub session_id: String,
+    /// Advertised agent-handled methods that the daemon can perform.
+    pub methods: Vec<AgentAuthMethod>,
+    /// Whether the agent advertised `logout`.
+    pub logout: bool,
+    /// Selected row (methods first, then optional sign-out).
+    pub selected: usize,
+}
+
+impl AuthPrompt {
+    pub fn new(session: &AgentSessionInfo, auth: &AgentAuthState) -> Self {
+        Self {
+            session_id: session.id.clone(),
+            methods: auth
+                .methods
+                .iter()
+                .filter(|method| method.supported)
+                .cloned()
+                .collect(),
+            logout: auth.logout_supported,
+            selected: 0,
+        }
+    }
+
+    /// Total selectable rows.
+    pub fn len(&self) -> usize {
+        self.methods.len() + usize::from(self.logout)
+    }
+
+    /// The method id for the selected row, or `None` when sign-out is selected.
+    pub fn selected_method(&self) -> Option<&str> {
+        self.methods
+            .get(self.selected)
+            .map(|method| method.id.as_str())
+    }
+
+    /// Whether the selected row is the optional sign-out action.
+    pub fn logout_selected(&self) -> bool {
+        self.logout && self.selected >= self.methods.len()
     }
 }
 
@@ -2763,6 +2824,48 @@ impl App {
         ))
     }
 
+    /// Session-scoped ACP authentication state for the attached session.
+    pub fn agent_auth(&self) -> Option<&AgentAuthState> {
+        self.agent_session_id
+            .as_deref()
+            .and_then(|id| self.agent_sessions.get(id))
+            .and_then(|session| session.auth.as_ref())
+    }
+
+    /// Open the sign-in chooser for the attached session.
+    ///
+    /// A terminal-only agent has no usable action: say so explicitly instead of
+    /// offering a method the daemon would reject, and never imply that the
+    /// remote TUI can launch the daemon's agent command.
+    pub fn open_auth_prompt(&mut self) -> bool {
+        let Some(session) = self
+            .agent_session_id
+            .as_deref()
+            .and_then(|id| self.agent_sessions.get(id))
+        else {
+            return false;
+        };
+        let Some(auth) = session.auth.as_ref() else {
+            return false;
+        };
+        let prompt = AuthPrompt::new(session, auth);
+        if prompt.len() == 0 {
+            let terminal_only = auth
+                .methods
+                .iter()
+                .any(|method| method.kind == AgentAuthMethodKind::Terminal && !method.supported);
+            self.agent_error = Some(if terminal_only {
+                "This agent only offers terminal sign-in, which the Favetto daemon cannot run remotely. Configure credentials on the daemon host instead.".to_string()
+            } else {
+                "This agent did not advertise an agent-handled sign-in method.".to_string()
+            });
+            return false;
+        }
+        self.agent_error = None;
+        self.popup = Popup::Auth(prompt);
+        true
+    }
+
     /// Fold one structured ACP event into the active session. ACP sessions render
     /// the ordered feed; PTY sessions keep their existing terminal-transcript
     /// behavior.
@@ -2814,6 +2917,12 @@ impl App {
                         favetto_core::model::IdleOutcome::Failed => "failed",
                     }
                     .to_string();
+                }
+                AgentStateEvent::Auth { auth } => {
+                    if let Some(session) = self.agent_sessions.get_mut(session_id) {
+                        session.auth = Some(auth.clone());
+                    }
+                    return;
                 }
                 AgentStateEvent::Plan { entries } => {
                     self.agent_plan = entries.clone();

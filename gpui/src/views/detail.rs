@@ -19,9 +19,9 @@ use std::time::Duration;
 
 use chrono::Utc;
 use favetto_wire::model::{
-    AgentCommand, AgentPlanEntry, AgentPlanStatus, AgentUsage, ContentRole, InputReply,
-    MessageRole, SessionConfigKind, SessionConfigOption, SessionConfigValue, SessionModes, Task,
-    TaskRun,
+    AgentAuthState, AgentAuthStatus, AgentCommand, AgentPlanEntry, AgentPlanStatus, AgentUsage,
+    ContentRole, InputReply, MessageRole, SessionConfigKind, SessionConfigOption,
+    SessionConfigValue, SessionModes, Task, TaskRun,
 };
 use gpui::{
     div, list, prelude::*, px, AnyElement, Context, Div, ElementId, Entity, FocusHandle, FontStyle,
@@ -810,6 +810,162 @@ impl DetailView {
 
         bar.child(div().flex_1())
             .child(self.follow_toggle(theme, follow, cx))
+    }
+
+    /// The pinned ACP sign-in banner. The daemon performs the flow; the client
+    /// only selects an advertised agent-handled method (or logout when
+    /// advertised). It never displays or accepts credentials.
+    fn auth_banner(
+        &self,
+        theme: &Theme,
+        session_id: &str,
+        auth: &AgentAuthState,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let (headline, color) = match auth.status {
+            AgentAuthStatus::Required => (
+                "Agent needs sign-in before this session can start.",
+                theme.colors.warning,
+            ),
+            AgentAuthStatus::Authenticating => {
+                ("Signing in through the agent…", theme.colors.accent)
+            }
+            AgentAuthStatus::Failed => (
+                "Sign-in failed; retry with an advertised method.",
+                theme.colors.danger,
+            ),
+            AgentAuthStatus::NotRequired | AgentAuthStatus::Authenticated => {
+                if !auth.logout_supported {
+                    return div();
+                }
+                ("Signed in to the agent.", theme.colors.success)
+            }
+        };
+        let supported: Vec<_> = auth
+            .methods
+            .iter()
+            .filter(|method| method.supported)
+            .collect();
+        let mut actions = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(theme.spacing.s1));
+        for (index, method) in supported.iter().enumerate() {
+            let session_id = session_id.to_string();
+            let method_id = method.id.clone();
+            let enabled = auth.status != AgentAuthStatus::Authenticating
+                && auth.status != AgentAuthStatus::Authenticated;
+            actions = actions.child(components::with_focus(
+                div()
+                    .id(("detail-auth", index))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(theme.controls.primary))
+                    .px(px(theme.spacing.s3))
+                    .rounded(px(theme.radii.r4))
+                    .border_1()
+                    .border_color(Hsla::from(theme.colors.border))
+                    .text_size(px(theme.font.xs))
+                    .when(enabled, |button| {
+                        button
+                            .text_color(theme.colors.text)
+                            .cursor_pointer()
+                            .hover(|style| style.bg(Hsla::from(theme.colors.accent).opacity(0.16)))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.state.update(cx, |state, cx| {
+                                    state.authenticate(session_id.clone(), method_id.clone(), cx);
+                                    cx.notify();
+                                });
+                            }))
+                    })
+                    .when(!enabled, |button| {
+                        button
+                            .text_color(theme.colors.muted)
+                            .opacity(0.55)
+                            .cursor_default()
+                    })
+                    .child(format!("Sign in with {}", method.name)),
+                theme,
+            ));
+        }
+        if auth.logout_supported {
+            let session_id = session_id.to_string();
+            actions = actions.child(components::with_focus(
+                div()
+                    .id("detail-auth-logout")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(theme.controls.primary))
+                    .px(px(theme.spacing.s3))
+                    .rounded(px(theme.radii.r4))
+                    .border_1()
+                    .border_color(Hsla::from(theme.colors.border))
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.text)
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.state.update(cx, |state, cx| {
+                            state.logout(session_id.clone(), cx);
+                            cx.notify();
+                        });
+                    }))
+                    .child("Sign out"),
+                theme,
+            ));
+        }
+        let terminal_only = supported.is_empty()
+            && auth
+                .methods
+                .iter()
+                .any(|method| method.kind == favetto_wire::model::AgentAuthMethodKind::Terminal);
+        let status = auth
+            .message
+            .clone()
+            .or_else(|| {
+                terminal_only.then(|| {
+                    "Terminal sign-in cannot run remotely; configure credentials on the daemon host."
+                        .to_string()
+                })
+            })
+            .unwrap_or_else(|| {
+                "The daemon completes the agent's own sign-in flow; no credential is sent by this client."
+                    .to_string()
+            });
+
+        div()
+            .flex()
+            .items_center()
+            .gap(px(theme.spacing.s3))
+            .px(px(theme.spacing.s3))
+            .py(px(theme.spacing.s2))
+            .border_b_1()
+            .border_color(Hsla::from(color).opacity(0.35))
+            .bg(Hsla::from(color).opacity(0.08))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex_col()
+                    .gap(px(theme.spacing.s1))
+                    .child(
+                        div()
+                            .text_size(px(theme.font.xs))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(color)
+                            .child(headline),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(theme.font.xs))
+                            .text_color(theme.colors.muted)
+                            .child(status),
+                    ),
+            )
+            .child(actions)
     }
 
     /// The pinned permission banner. It names the request and gives exactly
@@ -1918,6 +2074,15 @@ impl Render for DetailView {
         let session_options = self.state.read(cx).detail_session_options();
         let options_bar =
             session_options.and_then(|snapshot| self.session_options_bar(theme, snapshot, cx));
+        let auth = {
+            let state = self.state.read(cx);
+            state
+                .detail_auth()
+                .map(|(session, auth)| (session.id.clone(), auth.clone()))
+        };
+        let auth_banner = auth
+            .as_ref()
+            .map(|(session_id, auth)| self.auth_banner(theme, session_id, auth, cx));
         let banner = pending.as_ref().map(|request| {
             let in_flight = self
                 .state
@@ -2033,6 +2198,7 @@ impl Render for DetailView {
             .bg(theme.colors.surface)
             .child(header)
             .when_some(options_bar, |detail, bar| detail.child(bar))
+            .when_some(auth_banner, |detail, banner| detail.child(banner))
             .when_some(banner, |detail, banner| detail.child(banner))
             .child(tabs)
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))

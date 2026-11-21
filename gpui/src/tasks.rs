@@ -409,6 +409,7 @@ mod tests {
             load_error: None,
             config_options: Vec::new(),
             modes: None,
+            auth: None,
         }
     }
 

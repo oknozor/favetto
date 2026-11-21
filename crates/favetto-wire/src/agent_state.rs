@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use std::str::FromStr;
 
-use crate::model::{AwaitingInputKind, MessageRole};
+use crate::model::{AgentAuthState, AwaitingInputKind, MessageRole};
 
 /// What an agent is doing right now (coarse, for the task list / picker).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -995,6 +995,9 @@ pub enum AgentStateEvent {
     Modes { modes: SessionModes },
     /// The agent switched the current mode. The available list is unchanged.
     CurrentMode { mode_id: String },
+    /// Session-scoped ACP authentication state changed. Carries method metadata
+    /// and safe progress/error text only, never credentials or terminal output.
+    Auth { auth: AgentAuthState },
     /// The session became idle (turn/run boundary).
     Idle { outcome: IdleOutcome },
     /// A session-level error.
@@ -1436,6 +1439,21 @@ mod tests {
                     description: "Search the web".to_string(),
                     input_hint: Some("query".to_string()),
                 }],
+            },
+            AgentStateEvent::Auth {
+                auth: crate::model::AgentAuthState {
+                    status: crate::model::AgentAuthStatus::Required,
+                    methods: vec![crate::model::AgentAuthMethod {
+                        id: "agent-login".to_string(),
+                        name: "Sign in".to_string(),
+                        description: None,
+                        kind: crate::model::AgentAuthMethodKind::Agent,
+                        supported: true,
+                    }],
+                    logout_supported: false,
+                    method_id: None,
+                    message: Some("sign in".to_string()),
+                },
             },
             AgentStateEvent::Idle {
                 outcome: IdleOutcome::Interrupted,

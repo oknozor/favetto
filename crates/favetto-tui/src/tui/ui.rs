@@ -12,13 +12,16 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use favetto_core::model::{AgentBackend, FailureKind, Task, TaskStatus, UsagePeriod};
+use favetto_core::model::{
+    AgentAuthMethodKind, AgentAuthState, AgentAuthStatus, AgentBackend, FailureKind, Task,
+    TaskStatus, UsagePeriod,
+};
 use favetto_core::workflow::{WorkflowInspect, WorkflowState};
 
 use super::app::{
     activity_cell, cost_cell, format_activity, repo_label, table_rows_area, task_display_name,
-    task_repo, token_cell, App, CatalogRow, ClickAction, ClickRegion, ConfirmPrompt, ConnState,
-    Form, LaunchFailure, ListGeometry, MenuAction, MenuEntry, Popup, ReplyPrompt,
+    task_repo, token_cell, App, AuthPrompt, CatalogRow, ClickAction, ClickRegion, ConfirmPrompt,
+    ConnState, Form, LaunchFailure, ListGeometry, MenuAction, MenuEntry, Popup, ReplyPrompt,
     SessionOptionRowKind, SessionOptionsPopup, SessionPickerEntry, Tab, TaskPickerRow,
     TaskVarsForm, ThemeChoice, Wizard, WizardStep,
 };
@@ -233,6 +236,7 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
         Popup::Sessions { .. } => {}
         Popup::SessionOptions(popup) => draw_session_options(frame, popup, theme),
         Popup::Reply(prompt) => draw_reply(frame, prompt, theme),
+        Popup::Auth(prompt) => draw_auth(frame, prompt, theme),
         Popup::Confirm(prompt) => {
             draw_confirm(frame, prompt, theme);
         }
@@ -941,6 +945,69 @@ fn draw_reply(frame: &mut Frame, prompt: &ReplyPrompt, theme: Theme) {
     );
 }
 
+/// Draw the Ctrl+A sign-in chooser. Only methods the daemon can perform are
+/// listed; selecting one sends its id, never a credential. A terminal method is
+/// never offered here (the daemon would reject it).
+fn draw_auth(frame: &mut Frame, prompt: &AuthPrompt, theme: Theme) {
+    let area = frame.area();
+    let mut content: Vec<Line<'static>> = Vec::new();
+    content.push(Line::from(Span::styled(
+        format!("Agent sign-in for {}", short_str(&prompt.session_id)),
+        Style::default().fg(theme.muted()),
+    )));
+    content.push(Line::from(""));
+    for (index, method) in prompt.methods.iter().enumerate() {
+        let style = if index == prompt.selected {
+            theme.selected()
+        } else {
+            Style::default()
+        };
+        content.push(Line::from(Span::styled(
+            format!("  {} ", method.name),
+            style,
+        )));
+        if let Some(description) = &method.description {
+            content.push(Line::from(Span::styled(
+                format!("    {description}"),
+                Style::default().fg(theme.muted()),
+            )));
+        }
+    }
+    if prompt.logout {
+        let index = prompt.methods.len();
+        let style = if index == prompt.selected {
+            theme.selected()
+        } else {
+            Style::default()
+        };
+        content.push(Line::from(Span::styled("  Sign out ", style)));
+    }
+    if prompt.methods.is_empty() {
+        content.push(Line::from(Span::styled(
+            "This agent did not advertise an agent-handled sign-in method.",
+            Style::default().fg(theme.warning()),
+        )));
+    }
+
+    let footer = vec![Line::from(Span::styled(
+        "↑/↓ select · Enter continue · Esc cancel",
+        Style::default().fg(theme.muted()),
+    ))];
+
+    draw_growing_popup(
+        frame,
+        GrowingPopup {
+            area,
+            width_pct: 60,
+            title: " Ctrl+A — agent sign-in ".to_string(),
+            content,
+            footer,
+            focus_line: 0,
+            theme,
+        },
+    );
+}
+
 /// Draw the confirmation gate shown before `tasks.cancel`, `tasks.retry`, and
 /// `workflow.cancel`. It only presents an intent already decided by the app; the
 /// RPC runs on confirm and the daemon's `task.updated` push updates the row.
@@ -1399,6 +1466,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+X h", "open docs in the browser"),
             ("Ctrl+O", "pick a live/retained agent session"),
             ("Ctrl+R", "answer a pending agent prompt"),
+            ("Ctrl+A", "sign in to an agent that requires authentication"),
             ("?", "open/close this help"),
             ("w", "open/close the workflow graph"),
             ("i (Tasks)", "inspect the selected task's runtime workflow"),
@@ -1508,6 +1576,10 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             (
                 "(pending prompt) Ctrl+R",
                 "answer the agent's permission/dialog prompt",
+            ),
+            (
+                "(advertised) Ctrl+A",
+                "choose an agent-handled sign-in method or sign out",
             ),
             ("(favetto focus) Ctrl+Q", "leave the panel"),
             ("(favetto focus) Ctrl+N", "start a new session"),
@@ -2528,6 +2600,77 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     };
 }
 
+/// Rows for the session's auth banner, or `None` when no user action is needed.
+///
+/// The copy names only advertised method metadata and a sanitized, safe status
+/// message. It never renders credentials or raw agent terminal output.
+fn auth_banner_lines(auth: &AgentAuthState, theme: Theme) -> Option<Vec<Line<'static>>> {
+    let message = auth
+        .message
+        .as_deref()
+        .map(super::sanitize::text)
+        .filter(|message| !message.trim().is_empty());
+    let (headline, color) = match auth.status {
+        AgentAuthStatus::Required => (
+            "⚠ Agent needs sign-in before this session can start.".to_string(),
+            theme.warning(),
+        ),
+        AgentAuthStatus::Authenticating => (
+            "Signing in through the agent; this can take a moment.".to_string(),
+            theme.accent(),
+        ),
+        AgentAuthStatus::Failed => (
+            "Sign-in failed; you can retry with an advertised method.".to_string(),
+            theme.danger(),
+        ),
+        AgentAuthStatus::NotRequired | AgentAuthStatus::Authenticated => {
+            let terminal_only = auth
+                .methods
+                .iter()
+                .any(|method| method.kind == AgentAuthMethodKind::Terminal && !method.supported);
+            if auth.logout_supported {
+                return Some(vec![Line::from(Span::styled(
+                    "Signed in · Ctrl+A to sign out",
+                    Style::default().fg(theme.muted()),
+                ))]);
+            }
+            if terminal_only {
+                return Some(vec![Line::from(Span::styled(
+                    "This agent only offers terminal sign-in; configure credentials on the daemon host.",
+                    Style::default().fg(theme.muted()),
+                ))]);
+            }
+            return None;
+        }
+    };
+    let mut lines = vec![Line::from(Span::styled(
+        headline,
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ))];
+    if let Some(message) = message {
+        lines.push(Line::from(Span::styled(
+            message,
+            Style::default().fg(theme.fg()),
+        )));
+    }
+    if auth.methods.iter().any(|method| method.supported) || auth.logout_supported {
+        lines.push(Line::from(Span::styled(
+            "Ctrl+A to choose a sign-in method",
+            Style::default().fg(theme.muted()),
+        )));
+    } else if auth
+        .methods
+        .iter()
+        .any(|method| method.kind == AgentAuthMethodKind::Terminal && !method.supported)
+    {
+        lines.push(Line::from(Span::styled(
+            "Terminal sign-in cannot run remotely; configure credentials on the daemon host.",
+            Style::default().fg(theme.muted()),
+        )));
+    }
+    Some(lines)
+}
+
 fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     let inner = Block::default()
         .borders(Borders::ALL)
@@ -2564,12 +2707,18 @@ fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
         } else {
             format!(" · {}", app.agent_status)
         };
+        let auth = match app.agent_auth() {
+            Some(auth) if auth.status == AgentAuthStatus::Required => " · sign-in required",
+            Some(auth) if auth.status == AgentAuthStatus::Authenticating => " · signing in…",
+            Some(auth) if auth.status == AgentAuthStatus::Failed => " · sign-in failed",
+            _ => "",
+        };
         let mut spans = vec![Span::raw(" Agent · ")];
         if app.agent_running {
             spans.push(throbber_span(theme, &app.throbber_state));
         }
         spans.push(Span::raw(format!(
-            "{name} · {state}{extra} · Ctrl+S options · Ctrl+O sessions · Ctrl+N new · Ctrl+Q leave "
+            "{name} · {state}{extra}{auth} · Ctrl+S options · Ctrl+O sessions · Ctrl+N new · Ctrl+Q leave "
         )));
         Line::from(spans)
     };
@@ -2595,15 +2744,40 @@ fn draw_agent(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
         return;
     }
 
+    // Authentication is session-scoped: show the safe next step above the feed
+    // without printing credentials, raw agent output, or terminal sequences.
+    let mut body_area = inner_area;
+    if let Some(lines) = app
+        .agent_auth()
+        .and_then(|auth| auth_banner_lines(auth, theme))
+    {
+        let height = (lines.len() as u16).min(inner_area.height);
+        if height > 0 {
+            let banner_area = Rect {
+                x: inner_area.x,
+                y: inner_area.y,
+                width: inner_area.width,
+                height,
+            };
+            frame.render_widget(Paragraph::new(lines), banner_area);
+            body_area = Rect {
+                x: inner_area.x,
+                y: inner_area.y + height,
+                width: inner_area.width,
+                height: inner_area.height - height,
+            };
+        }
+    }
+
     // ACP sessions render the structured event feed. A non-ACP headless run with
     // no interactive view keeps its structured state snapshot, never the raw
     // machine-output PTY (JSON event stream).
     if app.agent_backend == AgentBackend::Acp {
-        draw_acp_agent(frame, app, inner_area, theme);
+        draw_acp_agent(frame, app, body_area, theme);
         return;
     }
     if app.agent_structured {
-        draw_agent_structured(frame, app, inner_area, theme);
+        draw_agent_structured(frame, app, body_area, theme);
         return;
     }
 

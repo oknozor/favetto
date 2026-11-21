@@ -866,6 +866,25 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
             }
         }
 
+        method::AGENTS_AUTHENTICATE => {
+            let p: AgentAuthenticateParams = parse_params(&req.method, &req.params)?;
+            match state.agents.authenticate(&p.session_id, &p.method_id).await {
+                Ok(auth) => to_value(AgentAuthenticateResult {
+                    authenticated: true,
+                    auth,
+                }),
+                Err(e) => Err(RpcError::InvalidParams(e.to_string())),
+            }
+        }
+
+        method::AGENTS_LOGOUT => {
+            let p: AgentLogoutParams = parse_params(&req.method, &req.params)?;
+            match state.agents.logout(&p.session_id).await {
+                Ok(()) => to_value(AgentLogoutResult { logged_out: true }),
+                Err(e) => Err(RpcError::InvalidParams(e.to_string())),
+            }
+        }
+
         method::SCHEDULES_LIST => match db::list_schedules(&state.db).await {
             Ok(mut schedules) => {
                 let now = chrono::Utc::now();

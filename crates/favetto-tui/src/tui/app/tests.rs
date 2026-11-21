@@ -1,7 +1,8 @@
 use super::*;
 use chrono::Utc;
 use favetto_core::model::{
-    AgentActivity, AgentCommand, AgentPlanEntry, AgentPlanPriority, AgentPlanStatus, AgentUsage,
+    AgentActivity, AgentAuthMethod, AgentAuthMethodKind, AgentAuthState, AgentAuthStatus,
+    AgentCommand, AgentPlanEntry, AgentPlanPriority, AgentPlanStatus, AgentUsage,
     AwaitingInputKind, EventKind, Failure, FailureKind, InputReply, InputRequest, TaskStatus,
 };
 use favetto_core::rpc::AgentEventPush;
@@ -209,6 +210,7 @@ fn session_with_backend(
         load_error: None,
         config_options: Vec::new(),
         modes: None,
+        auth: None,
     }
 }
 
@@ -230,6 +232,100 @@ fn pty_session(id: &str, headless: bool, running: bool, awaiting: bool) -> Agent
         awaiting,
         favetto_core::model::AgentBackend::Pty,
     )
+}
+
+fn auth_session(status: AgentAuthStatus, methods: Vec<AgentAuthMethod>) -> AgentSessionInfo {
+    let mut session = agent_session("auth", false, true, false);
+    session.auth = Some(AgentAuthState {
+        status,
+        methods,
+        logout_supported: true,
+        method_id: None,
+        message: Some("the agent requires sign-in".to_string()),
+    });
+    session
+}
+
+fn auth_method(id: &str, kind: AgentAuthMethodKind, supported: bool) -> AgentAuthMethod {
+    AgentAuthMethod {
+        id: id.to_string(),
+        name: id.to_string(),
+        description: None,
+        kind,
+        supported,
+    }
+}
+
+#[test]
+fn ctrl_a_offers_only_agent_handled_methods_and_logout() {
+    let mut app = App::new();
+    app.open_agent(
+        auth_session(
+            AgentAuthStatus::Required,
+            vec![
+                auth_method("agent-login", AgentAuthMethodKind::Agent, true),
+                auth_method("terminal-login", AgentAuthMethodKind::Terminal, false),
+            ],
+        ),
+        b"",
+    );
+
+    assert!(matches!(
+        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+        UiAction::None
+    ));
+    let Popup::Auth(prompt) = &app.popup else {
+        panic!("expected the sign-in chooser");
+    };
+    assert_eq!(prompt.methods.len(), 1);
+    assert_eq!(prompt.methods[0].id, "agent-login");
+    assert!(prompt.logout);
+
+    app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+    match app.handle_key(key(KeyCode::Enter, KeyModifiers::empty())) {
+        UiAction::Logout { session_id } => assert_eq!(session_id, "auth"),
+        _ => panic!("expected logout"),
+    }
+}
+
+#[test]
+fn terminal_only_auth_reports_the_safe_next_step() {
+    let mut app = App::new();
+    let mut session = auth_session(
+        AgentAuthStatus::Required,
+        vec![auth_method(
+            "terminal-login",
+            AgentAuthMethodKind::Terminal,
+            false,
+        )],
+    );
+    session.auth.as_mut().unwrap().logout_supported = false;
+    app.open_agent(session, b"");
+
+    app.handle_key(key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert!(matches!(app.popup, Popup::None));
+    let error = app.agent_error.as_deref().unwrap_or_default();
+    assert!(error.contains("terminal sign-in"), "{error}");
+}
+
+#[test]
+fn an_auth_event_updates_the_cached_session() {
+    let mut app = App::new();
+    app.open_agent(agent_session("s1", false, true, false), b"");
+    let auth = AgentAuthState {
+        status: AgentAuthStatus::Required,
+        methods: vec![auth_method("agent-login", AgentAuthMethodKind::Agent, true)],
+        logout_supported: false,
+        method_id: None,
+        message: None,
+    };
+    app.agent_event("s1", &AgentStateEvent::Auth { auth: auth.clone() });
+    assert_eq!(
+        app.agent_sessions
+            .get("s1")
+            .and_then(|session| session.auth.clone()),
+        Some(auth)
+    );
 }
 
 #[test]

@@ -186,6 +186,14 @@ pub mod method {
     /// Delete a provider-owned ACP session through `session/delete`; Favetto's
     /// local metadata is left untouched.
     pub const AGENTS_PROVIDER_DELETE: &str = "agents.provider_delete";
+    /// Complete an advertised agent-handled ACP v1 sign-in.
+    ///
+    /// Terminal methods are preserved in the session's auth state but rejected
+    /// here: the daemon cannot safely run an interactive login process for a
+    /// remote client.
+    pub const AGENTS_AUTHENTICATE: &str = "agents.authenticate";
+    /// Sign a session out through ACP `logout`, only when advertised.
+    pub const AGENTS_LOGOUT: &str = "agents.logout";
     /// List configured providers and their available models.
     pub const PROVIDERS_LIST: &str = "providers.list";
     /// List cron schedules.
@@ -391,6 +399,16 @@ pub const CLIENT_METHODS: &[(&str, &str)] = &[
          metadata is untouched.",
     ),
     (
+        method::AGENTS_AUTHENTICATE,
+        "Complete an agent-handled ACP v1 sign-in. Only methods advertised by \
+         the agent are accepted; terminal methods are rejected because the \
+         daemon cannot run an interactive login process for a remote client.",
+    ),
+    (
+        method::AGENTS_LOGOUT,
+        "Sign a session out through ACP `logout` when the agent advertised it.",
+    ),
+    (
         method::PROVIDERS_LIST,
         "List configured providers and their available models.",
     ),
@@ -591,6 +609,8 @@ mod tests {
             method::AGENTS_PROVIDER_SESSIONS,
             method::AGENTS_PROVIDER_RESUME,
             method::AGENTS_PROVIDER_DELETE,
+            method::AGENTS_AUTHENTICATE,
+            method::AGENTS_LOGOUT,
             method::PROVIDERS_LIST,
             method::SCHEDULES_LIST,
             method::SCHEDULES_UPSERT,

@@ -270,6 +270,10 @@ typed_calls! {
     agents_provider_resume => AgentsProviderResumeCall,
     /// `agents.provider_delete`.
     agents_provider_delete => AgentsProviderDeleteCall,
+    /// `agents.authenticate`.
+    agents_authenticate => AgentsAuthenticateCall,
+    /// `agents.logout`.
+    agents_logout => AgentsLogoutCall,
     /// `workflow.get`.
     workflow_get => WorkflowGetCall,
     /// `workflow.inspect`.

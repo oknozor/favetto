@@ -20,8 +20,9 @@ use std::time::Duration;
 
 use chrono::Utc;
 use favetto_wire::model::{
-    AgentCatalogEntry, AgentCommand, AgentPlanEntry, AgentSessionInfo, AgentUsage, EventKind,
-    InputReply, RepoInfo, SessionConfigOption, SessionConfigValue, SessionModes, Task, TaskStatus,
+    AgentAuthState, AgentAuthStatus, AgentCatalogEntry, AgentCommand, AgentPlanEntry,
+    AgentSessionInfo, AgentUsage, EventKind, InputReply, RepoInfo, SessionConfigOption,
+    SessionConfigValue, SessionModes, Task, TaskStatus,
 };
 use favetto_wire::rpc::AgentEventPush;
 use gpui::{ClipboardItem, Context, Task as GpuiTask, WindowAppearance};
@@ -965,6 +966,41 @@ impl ClientState {
                     );
                 }
             },
+            Update::AuthFinished {
+                session_id,
+                method_id,
+                result,
+            } => {
+                match result {
+                    Ok(result) if result.authenticated => {
+                        let status = match result.auth.status {
+                            AgentAuthStatus::Required => "The agent still requires authentication.",
+                            AgentAuthStatus::Failed => "The agent rejected the sign-in method.",
+                            _ => "Signed in; retrying the session setup.",
+                        };
+                        self.show_toast(ToastKind::Success, status.to_string(), cx);
+                    }
+                    Ok(_) => self.show_toast(
+                        ToastKind::Error,
+                        "The daemon did not complete the agent sign-in.".to_string(),
+                        cx,
+                    ),
+                    Err(error) => {
+                        if error.is_unauthorized() {
+                            self.connection = ConnectionState::Unauthorized {
+                                token_path: self.config.token_source.label(),
+                            };
+                        }
+                        self.show_toast(
+                            ToastKind::Error,
+                            format!("Could not sign in with '{method_id}': {error}."),
+                            cx,
+                        );
+                    }
+                }
+                let _ = session_id;
+                self.refresh_snapshot();
+            }
             Update::ProviderSessionsLoaded { provider_sessions } => {
                 self.session_history
                     .set_provider_snapshot(provider_sessions);
@@ -1053,6 +1089,33 @@ impl ClientState {
                 // own history rather than being removed optimistically.
                 self.refresh_snapshot();
                 self.refresh_provider_sessions();
+            }
+            Update::LogoutFinished { session_id, result } => {
+                match result {
+                    Ok(result) if result.logged_out => self.show_toast(
+                        ToastKind::Success,
+                        "Signed out of the agent session.".to_string(),
+                        cx,
+                    ),
+                    Ok(_) => self.show_toast(
+                        ToastKind::Error,
+                        "The daemon did not sign the session out.".to_string(),
+                        cx,
+                    ),
+                    Err(error) => {
+                        if error.is_unauthorized() {
+                            self.connection = ConnectionState::Unauthorized {
+                                token_path: self.config.token_source.label(),
+                            };
+                        }
+                        self.show_toast(
+                            ToastKind::Error,
+                            format!("Could not sign out session '{session_id}': {error}."),
+                            cx,
+                        );
+                    }
+                }
+                self.refresh_snapshot();
             }
             Update::TaskActionFinished {
                 action,
@@ -2494,6 +2557,58 @@ impl ClientState {
                 );
             }
         }
+    }
+
+    /// Complete an agent-handled ACP sign-in. Only an advertised, daemon-
+    /// supported method can reach here; the method id is metadata, not a secret.
+    pub fn authenticate(&mut self, session_id: String, method_id: String, cx: &mut Context<Self>) {
+        if self.runtime.is_none() {
+            self.show_toast(
+                ToastKind::Error,
+                "The transport is not running, so the agent was not signed in.".to_string(),
+                cx,
+            );
+            return;
+        }
+        self.show_toast(
+            ToastKind::Info,
+            "Signing in through the agent…".to_string(),
+            cx,
+        );
+        if let Some(runtime) = &self.runtime {
+            runtime.authenticate(session_id, method_id);
+        }
+    }
+
+    /// Sign a session out through ACP `logout`, only when advertised.
+    pub fn logout(&mut self, session_id: String, cx: &mut Context<Self>) {
+        if let Some(runtime) = &self.runtime {
+            runtime.logout(session_id);
+        } else {
+            self.show_toast(
+                ToastKind::Error,
+                "The transport is not running, so the agent was not signed out.".to_string(),
+                cx,
+            );
+        }
+    }
+
+    /// The selected run's live session authentication state, when any.
+    pub fn detail_auth(&self) -> Option<(&AgentSessionInfo, &AgentAuthState)> {
+        let task_id = self.selected_task?;
+        let task_id = task_id.to_string();
+        self.sessions
+            .iter()
+            .filter(|session| session.task_id.as_deref() == Some(task_id.as_str()))
+            .find_map(|session| session.auth.as_ref().map(|auth| (session, auth)))
+    }
+
+    /// Live sessions for one configured agent, used by Settings → Agents.
+    pub fn sessions_for_agent(&self, agent: &str) -> Vec<&AgentSessionInfo> {
+        self.sessions
+            .iter()
+            .filter(|session| session.agent == agent && session.auth.is_some())
+            .collect()
     }
 
     /// Highlight a catalog row and load its preview when it changed.

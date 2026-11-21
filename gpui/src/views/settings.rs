@@ -657,7 +657,7 @@ impl SettingsView {
             }
             _ => None,
         };
-        let rows: Vec<_> = if agents.is_empty() {
+        let mut rows: Vec<gpui::AnyElement> = if agents.is_empty() {
             vec![div()
                 .text_size(px(theme.font.sm))
                 .text_color(theme.colors.muted)
@@ -755,6 +755,162 @@ impl SettingsView {
                 })
                 .collect()
         };
+
+        // ACP authentication is session-scoped. Surface the safe next step for
+        // every live session that needs sign-in (or can sign out), without
+        // assuming this client can launch the daemon's agent command.
+        let mut auth_row_id = 0usize;
+        for agent in &agents {
+            for session in &agent.sessions {
+                let Some(auth) = &session.auth else {
+                    continue;
+                };
+                let supported: Vec<_> = auth
+                    .methods
+                    .iter()
+                    .filter(|method| method.supported)
+                    .collect();
+                if supported.is_empty() && !auth.logout_supported {
+                    continue;
+                }
+                let terminal_only = supported.is_empty()
+                    && auth.methods.iter().any(|method| {
+                        method.kind == favetto_wire::model::AgentAuthMethodKind::Terminal
+                    });
+                let headline = match auth.status {
+                    favetto_wire::model::AgentAuthStatus::Required => "needs sign-in",
+                    favetto_wire::model::AgentAuthStatus::Authenticating => "signing in…",
+                    favetto_wire::model::AgentAuthStatus::Failed => "sign-in failed",
+                    favetto_wire::model::AgentAuthStatus::Authenticated => "signed in",
+                    favetto_wire::model::AgentAuthStatus::NotRequired => "signed in",
+                };
+                let detail = auth
+                    .message
+                    .clone()
+                    .or_else(|| {
+                        terminal_only.then(|| {
+                            "Terminal sign-in cannot run remotely; configure credentials on the daemon host."
+                                .to_string()
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        format!(
+                            "session {} · the daemon runs the agent's own sign-in flow",
+                            &session.id[..session.id.len().min(8)]
+                        )
+                    });
+                let mut actions = div().flex().items_center().gap(px(theme.spacing.s1));
+                for method in &supported {
+                    let session_id = session.id.clone();
+                    let method_id = method.id.clone();
+                    let enabled =
+                        auth.status != favetto_wire::model::AgentAuthStatus::Authenticating;
+                    let row_id = auth_row_id;
+                    auth_row_id = auth_row_id.wrapping_add(1);
+                    actions = actions.child(components::with_focus(
+                        div()
+                            .id(("settings-agent-auth", row_id))
+                            .h(px(theme.controls.min))
+                            .px(px(theme.spacing.s2))
+                            .flex()
+                            .items_center()
+                            .rounded(px(theme.radii.r8))
+                            .text_size(px(theme.font.xs))
+                            .when(enabled, |button| {
+                                button
+                                    .bg(Hsla::from(theme.colors.accent).opacity(0.16))
+                                    .text_color(theme.colors.accent)
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                                        this.state.update(cx, |state, cx| {
+                                            state.authenticate(
+                                                session_id.clone(),
+                                                method_id.clone(),
+                                                cx,
+                                            );
+                                            cx.notify();
+                                        });
+                                    }))
+                            })
+                            .when(!enabled, |button| {
+                                button
+                                    .text_color(theme.colors.muted)
+                                    .opacity(0.55)
+                                    .cursor_default()
+                            })
+                            .child(format!("Sign in with {}", method.name)),
+                        theme,
+                    ));
+                }
+                if auth.logout_supported {
+                    let session_id = session.id.clone();
+                    let row_id = auth_row_id;
+                    auth_row_id = auth_row_id.wrapping_add(1);
+                    actions = actions.child(components::with_focus(
+                        div()
+                            .id(("settings-agent-logout", row_id))
+                            .h(px(theme.controls.min))
+                            .px(px(theme.spacing.s2))
+                            .flex()
+                            .items_center()
+                            .rounded(px(theme.radii.r8))
+                            .text_size(px(theme.font.xs))
+                            .text_color(theme.colors.text)
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.state.update(cx, |state, cx| {
+                                    state.logout(session_id.clone(), cx);
+                                    cx.notify();
+                                });
+                            }))
+                            .child("Sign out"),
+                        theme,
+                    ));
+                }
+                let row_id = auth_row_id;
+                auth_row_id = auth_row_id.wrapping_add(1);
+                rows.push(
+                    div()
+                        .id(("settings-agent-session", row_id))
+                        .flex()
+                        .items_center()
+                        .gap(px(theme.spacing.s3))
+                        .px(px(theme.spacing.s2))
+                        .py(px(theme.spacing.s1))
+                        .border_b_1()
+                        .border_color(theme.colors.border)
+                        .child(
+                            div()
+                                .w(px(170.0))
+                                .flex_shrink_0()
+                                .text_size(px(theme.font.xs))
+                                .text_color(theme.colors.muted)
+                                .child(format!("↳ {}", agent.name)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .text_size(px(theme.font.xs))
+                                        .text_color(theme.colors.text)
+                                        .child(headline),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(theme.font.xs))
+                                        .text_color(theme.colors.muted)
+                                        .child(detail),
+                                ),
+                        )
+                        .child(actions)
+                        .into_any_element(),
+                );
+            }
+        }
 
         let history_items: Vec<_> = if history_rows.is_empty() {
             vec![div()

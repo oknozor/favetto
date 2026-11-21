@@ -104,6 +104,18 @@ impl App {
             };
         }
 
+        // Ctrl+A opens the agent sign-in chooser when the session advertised an
+        // agent-handled method or logout. Terminal-only agents report the safe
+        // next step instead of offering an unusable action.
+        if ctrl
+            && matches!(key.code, KeyCode::Char('a') | KeyCode::Char('A'))
+            && matches!(self.popup, Popup::None)
+            && self.agent_auth().is_some()
+        {
+            self.open_auth_prompt();
+            return UiAction::None;
+        }
+
         // A popup owns the keyboard while it is open.
         match &self.popup {
             Popup::Form(_) => return self.handle_form_key(key),
@@ -116,6 +128,7 @@ impl App {
             Popup::Sessions { .. } => return self.handle_sessions_key(key),
             Popup::SessionOptions(_) => return self.handle_session_options_key(key.code),
             Popup::Reply(_) => return self.handle_reply_key(key),
+            Popup::Auth(_) => return self.handle_auth_key(key.code),
             Popup::Confirm(_) => return self.handle_confirm_key(key.code),
             Popup::TaskError { .. } => return self.handle_task_error_key(key.code),
             Popup::TaskResult { .. } => return self.handle_task_result_key(key.code),
@@ -982,6 +995,44 @@ impl App {
                 UiAction::None
             }
             KeyCode::Enter => self.activate_task_picker_selection(),
+            _ => UiAction::None,
+        }
+    }
+
+    /// Keys while the Ctrl+A sign-in chooser is open: arrows pick a method (or
+    /// the optional sign-out row), Enter submits it, Esc closes.
+    pub(super) fn handle_auth_key(&mut self, code: KeyCode) -> UiAction {
+        let Popup::Auth(prompt) = &mut self.popup else {
+            return UiAction::None;
+        };
+        match code {
+            KeyCode::Esc => {
+                self.popup = Popup::None;
+                UiAction::None
+            }
+            KeyCode::Up => {
+                prompt.selected = prompt.selected.saturating_sub(1);
+                UiAction::None
+            }
+            KeyCode::Down => {
+                let last = prompt.len().saturating_sub(1);
+                prompt.selected = (prompt.selected + 1).min(last);
+                UiAction::None
+            }
+            KeyCode::Enter => {
+                let session_id = prompt.session_id.clone();
+                let method_id = prompt.selected_method().map(str::to_string);
+                let logout = prompt.logout_selected();
+                self.popup = Popup::None;
+                match (session_id, method_id, logout) {
+                    (session_id, Some(method_id), _) => UiAction::Authenticate {
+                        session_id,
+                        method_id,
+                    },
+                    (session_id, None, true) => UiAction::Logout { session_id },
+                    _ => UiAction::None,
+                }
+            }
             _ => UiAction::None,
         }
     }
