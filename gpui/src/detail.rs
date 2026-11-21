@@ -190,7 +190,11 @@ fn trimmed(value: f64) -> String {
 pub fn usage_summary(usage: Option<&AgentUsage>) -> Option<String> {
     let usage = usage?;
     let mut parts = Vec::new();
-    if let Some(cost) = inbox::format_cost(usage.cost_usd) {
+    if let Some(cost) = usage
+        .reported_cost()
+        .as_ref()
+        .and_then(|cost| inbox::format_cost(Some(cost)))
+    {
         parts.push(cost);
     }
     let tokens = usage.total_tokens();
@@ -414,7 +418,9 @@ pub fn build_feed(events: &[AgentEventPush]) -> Vec<FeedItem> {
                     }
                 }
             }
-            AgentStateEvent::Usage { usage } => items.push(FeedItem::Usage(usage.clone())),
+            AgentStateEvent::Usage { usage, .. } => {
+                items.push(FeedItem::Usage(usage.clone()))
+            }
             AgentStateEvent::Title { title } => items.push(FeedItem::Title(title.clone())),
             AgentStateEvent::Idle { outcome } => {
                 for index in pending_inputs.drain().map(|(_, index)| index) {
@@ -1029,10 +1035,18 @@ mod tests {
             ..Default::default()
         };
         let summary = usage_summary(Some(&usage)).expect("summary");
-        assert!(summary.contains("$0.05"));
+        assert!(summary.contains("$0.0500"));
         assert!(summary.contains("1.5k tok"));
         assert!(usage_summary(None).is_none());
         assert!(usage_summary(Some(&AgentUsage::default())).is_none());
+
+        let credits = AgentUsage {
+            cost: Some(favetto_wire::model::AgentCost::new(2.5, "credits")),
+            ..Default::default()
+        };
+        let summary = usage_summary(Some(&credits)).expect("summary");
+        assert!(summary.contains("2.5000 credits"));
+        assert!(!summary.contains('$'));
     }
 
     #[test]
@@ -1081,6 +1095,7 @@ mod tests {
                         input_tokens: 2,
                         ..Default::default()
                     },
+                    snapshot: false,
                 },
             ),
             push(

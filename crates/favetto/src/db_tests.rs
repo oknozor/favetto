@@ -1680,6 +1680,37 @@ async fn usage_survives_the_retention_pass_that_clears_outputs() {
 }
 
 #[tokio::test]
+async fn non_usd_run_cost_round_trips_without_becoming_usd() {
+    let (dir, pool) = scratch_pool("usage-currency").await;
+    let task = task_at(Utc::now(), None, None);
+    upsert_task(&pool, &task).await.unwrap();
+    let mut run = run_at(task.id, 1);
+    run.status = RunStatus::Succeeded;
+    run.finished_at = Some(Utc::now());
+    run.usage = Some(AgentUsage {
+        input_tokens: 7,
+        cost: Some(AgentCost::new(1.5, "credits")),
+        ..Default::default()
+    });
+    insert_task_run(&pool, &run).await.unwrap();
+
+    let got = get_task_run(&pool, run.id).await.unwrap().unwrap();
+    let usage = got.usage.expect("usage");
+    assert_eq!(usage.input_tokens, 7);
+    assert_eq!(usage.cost_usd, None, "a credits amount is not dollars");
+    assert_eq!(usage.reported_cost(), Some(AgentCost::new(1.5, "credits")));
+
+    // USD-only aggregation excludes the credits run instead of summing it.
+    let stats = usage_stats(&pool, UsagePeriod::Day, Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(stats.totals.usage.input_tokens, 7);
+    assert_eq!(stats.totals.usage.cost_usd, None);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn finalized_run_round_trips_usage_model_and_agent() {
     let (dir, pool) = scratch_pool("usage-roundtrip").await;
     let task = task_at(Utc::now(), None, None);
@@ -1702,6 +1733,22 @@ async fn finalized_run_round_trips_usage_model_and_agent() {
     assert_eq!(usage.input_tokens, 100);
     assert_eq!(usage.output_tokens, 20);
     assert_eq!(usage.cost_usd, Some(0.03));
+    assert_eq!(usage.reported_cost(), Some(AgentCost::usd(0.03)));
+
+    // A legacy row only has the USD column; it still decodes as a USD cost.
+    sqlx::query("UPDATE task_runs SET cost_amount = NULL, cost_currency = NULL WHERE id = ?")
+        .bind(run.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let legacy = get_task_run(&pool, run.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .usage
+        .expect("usage");
+    assert_eq!(legacy.cost, Some(AgentCost::usd(0.03)));
+    assert_eq!(legacy.cost_usd, Some(0.03));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1748,6 +1795,8 @@ async fn migrate_adds_usage_columns_to_a_legacy_task_runs_table() {
         "cache_read_tokens",
         "cache_write_tokens",
         "cost_usd",
+        "cost_amount",
+        "cost_currency",
     ] {
         assert!(
             columns.iter().any(|c| c == expected),

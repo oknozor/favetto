@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use favetto_wire::model::{
-    AgentSessionInfo, AwaitingInputKind, AwaitingInputReason, Task, TaskStatus,
+    AgentCost, AgentSessionInfo, AwaitingInputKind, AwaitingInputReason, Task, TaskStatus,
 };
 use uuid::Uuid;
 
@@ -156,8 +156,9 @@ pub struct RecentRow {
     pub repo: Option<String>,
     /// Elapsed time for a live run, total time for a finished one.
     pub duration: Option<Duration>,
-    /// Usage cost reported by the task's live agent session, when known.
-    pub cost_usd: Option<f64>,
+    /// Usage cost reported by the task's live agent session, when known. The
+    /// amount keeps its reported unit so a credits value is never shown as USD.
+    pub cost: Option<AgentCost>,
     /// Creation time, used for the newest-first order.
     pub created_at: DateTime<Utc>,
 }
@@ -378,14 +379,21 @@ pub fn build(
             .then_with(|| left.key.cmp(&right.key))
     });
 
-    let mut costs: HashMap<&str, f64> = HashMap::new();
+    let mut costs: HashMap<&str, AgentCost> = HashMap::new();
     for session in sessions {
         let (Some(task_id), Some(usage)) = (session.task_id.as_deref(), session.usage.as_ref())
         else {
             continue;
         };
-        if let Some(cost) = usage.cost_usd {
-            *costs.entry(task_id).or_insert(0.0) += cost;
+        if let Some(cost) = usage.reported_cost().filter(|cost| cost.amount.is_finite()) {
+            match costs.entry(task_id) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().merge(&cost);
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(cost);
+                }
+            }
         }
     }
 
@@ -399,10 +407,7 @@ pub fn build(
             name: task_display_name(&task.name).to_string(),
             repo: task_repo(&task.name).map(str::to_string),
             duration: task_duration(task, now),
-            cost_usd: costs
-                .get(task.id.to_string().as_str())
-                .copied()
-                .filter(|cost| cost.is_finite()),
+            cost: costs.get(task.id.to_string().as_str()).cloned(),
             created_at: task.created_at,
         })
         .collect();
@@ -468,22 +473,13 @@ pub fn format_duration(duration: Option<Duration>) -> String {
     }
 }
 
-/// A usage-cost cell value; `None` when the cost is unknown or not finite.
-pub fn format_cost(cost: Option<f64>) -> Option<String> {
-    let cost = cost.filter(|cost| cost.is_finite())?;
-    let cost = cost.max(0.0);
-    let mut text = if cost < 1.0 {
-        format!("${cost:.4}")
-    } else {
-        format!("${cost:.2}")
-    };
-    // Keep sub-dollar costs precise but tidy: `$0.0500` becomes `$0.05`.
-    if cost < 1.0 {
-        while text.len() > "$0.00".len() && text.ends_with('0') {
-            text.pop();
-        }
-    }
-    Some(text)
+/// A usage-cost cell value with an explicit unit (`$0.0123`, `2.5000 credits`);
+/// `None` when the cost is unknown or not finite.
+pub fn format_cost(cost: Option<&AgentCost>) -> Option<String> {
+    let cost = cost.filter(|cost| cost.amount.is_finite())?;
+    let mut cost = cost.clone();
+    cost.amount = cost.amount.max(0.0);
+    Some(cost.display())
 }
 
 /// Elapsed time of a task: live elapsed for a running task, total for a
@@ -764,7 +760,7 @@ mod tests {
         assert_eq!(row.repo.as_deref(), Some("favetto"));
         assert_eq!(row.name, "costly");
         assert_eq!(row.duration, Some(Duration::from_secs(7 * 60)));
-        assert_eq!(format_cost(row.cost_usd).as_deref(), Some("$0.0123"));
+        assert_eq!(format_cost(row.cost.as_ref()).as_deref(), Some("$0.0123"));
     }
 
     #[test]
@@ -851,8 +847,18 @@ mod tests {
         assert_eq!(format_elapsed(3 * 86_400 + 4 * 3_600), "3d 4h");
         assert_eq!(format_duration(None), "—");
         assert_eq!(format_cost(None), None);
-        assert_eq!(format_cost(Some(f64::NAN)), None);
-        assert_eq!(format_cost(Some(0.0)).as_deref(), Some("$0.00"));
-        assert_eq!(format_cost(Some(0.5)).as_deref(), Some("$0.50"));
+        assert_eq!(format_cost(Some(&AgentCost::usd(f64::NAN))), None);
+        assert_eq!(
+            format_cost(Some(&AgentCost::usd(0.0))).as_deref(),
+            Some("$0.0000")
+        );
+        assert_eq!(
+            format_cost(Some(&AgentCost::usd(0.5))).as_deref(),
+            Some("$0.5000")
+        );
+        assert_eq!(
+            format_cost(Some(&AgentCost::new(2.5, "credits"))).as_deref(),
+            Some("2.5000 credits")
+        );
     }
 }

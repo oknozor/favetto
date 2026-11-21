@@ -245,11 +245,10 @@ impl AgentLiveState {
             AgentStateEvent::InputResolved { .. } | AgentStateEvent::Idle { .. } => {
                 self.activity = Some(AgentActivity::Idle);
             }
-            AgentStateEvent::Usage { usage } => {
-                self.usage
-                    .get_or_insert_with(AgentUsage::default)
-                    .merge(usage);
-            }
+            AgentStateEvent::Usage { usage, snapshot } => match self.usage.as_mut() {
+                Some(live) if !snapshot => live.merge(usage),
+                _ => self.usage = Some(usage.clone()),
+            },
             AgentStateEvent::Error { .. } => {}
             AgentStateEvent::Session { .. } | AgentStateEvent::Title { .. } => {}
         }
@@ -1204,5 +1203,57 @@ mod model_selector_tests {
             "a provider without a model selects nothing"
         );
         assert_eq!(model_selector(Some(""), Some("m")).as_deref(), Some("m"));
+    }
+}
+
+#[cfg(test)]
+mod live_state_tests {
+    use super::{AgentLiveState, AgentStateEvent, AgentUsage};
+    use favetto_core::model::AgentCost;
+
+    #[test]
+    fn cumulative_usage_snapshots_replace_instead_of_accumulating() {
+        let mut live = AgentLiveState::default();
+        live.apply(&AgentStateEvent::Usage {
+            usage: AgentUsage {
+                context_used: Some(1_000),
+                context_size: Some(200_000),
+                cost: Some(AgentCost::new(0.01, "credits")),
+                ..Default::default()
+            },
+            snapshot: true,
+        });
+        live.apply(&AgentStateEvent::Usage {
+            usage: AgentUsage {
+                context_used: Some(2_000),
+                context_size: Some(200_000),
+                cost: Some(AgentCost::new(0.02, "credits")),
+                ..Default::default()
+            },
+            snapshot: true,
+        });
+
+        let usage = live.usage.expect("usage");
+        assert_eq!(usage.context_used, Some(2_000));
+        assert_eq!(usage.reported_cost(), Some(AgentCost::new(0.02, "credits")));
+    }
+
+    #[test]
+    fn incremental_usage_events_still_merge() {
+        let mut live = AgentLiveState::default();
+        for cost in [0.01, 0.02] {
+            live.apply(&AgentStateEvent::Usage {
+                usage: AgentUsage {
+                    input_tokens: 1,
+                    cost: Some(AgentCost::usd(cost)),
+                    ..Default::default()
+                },
+                snapshot: false,
+            });
+        }
+
+        let usage = live.usage.expect("usage");
+        assert_eq!(usage.input_tokens, 2);
+        assert_eq!(usage.reported_cost(), Some(AgentCost::usd(0.03)));
     }
 }

@@ -477,7 +477,7 @@ impl InboxView {
     ) -> Stateful<Div> {
         let task_id = row.task_id;
         let color = status_color(theme, row.status);
-        let cost = inbox::format_cost(row.cost_usd);
+        let cost = inbox::format_cost(row.cost.as_ref());
 
         div()
             .id(("inbox-recent", index))

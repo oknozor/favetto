@@ -3280,10 +3280,11 @@ pub fn token_cell(usage: Option<&AgentUsage>) -> String {
     }
 }
 
-/// Cost cell value: `$x.xxxx`, or an em dash when `cost_usd` is absent.
+/// Cost cell value with an explicit unit (`$x.xxxx` for USD,
+/// `x.xxxx credits` otherwise), or an em dash when no cost was reported.
 pub fn cost_cell(usage: Option<&AgentUsage>) -> String {
-    match usage.and_then(|u| u.cost_usd) {
-        Some(cost) => format!("${cost:.4}"),
+    match usage.and_then(|u| u.reported_cost()) {
+        Some(cost) => cost.display(),
         None => "—".to_string(),
     }
 }

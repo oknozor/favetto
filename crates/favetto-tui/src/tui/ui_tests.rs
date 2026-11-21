@@ -854,7 +854,7 @@ fn tasks_table_omits_the_error_column() {
 
     let text = render_text(&mut app, 200, 24);
     assert!(text.contains("TOKEN"), "token header missing: {text:?}");
-    assert!(text.contains("$COST"), "cost header missing: {text:?}");
+    assert!(text.contains("COST"), "cost header missing: {text:?}");
     assert!(
         !text.contains("inline-boom"),
         "error text must not render inline: {text:?}"
@@ -1502,7 +1502,7 @@ fn tasks_table_renders_activity_and_usage_cells() {
         "activity header missing: {text:?}"
     );
     assert!(text.contains("TOKEN"), "token header missing: {text:?}");
-    assert!(text.contains("$COST"), "cost header missing: {text:?}");
+    assert!(text.contains("COST"), "cost header missing: {text:?}");
     assert!(!text.contains("USAGE"), "stale usage header: {text:?}");
     assert!(text.contains("tool: bash"), "activity missing: {text:?}");
     assert!(text.contains("1.5k/20 tok"), "token cell missing: {text:?}");

@@ -16,7 +16,9 @@ use sqlx::sqlite::{
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
-use favetto_core::agent_state::{AgentUsage, UsageBucket, UsagePeriod, UsageStats, UsageTotals};
+use favetto_core::agent_state::{
+    AgentCost, AgentUsage, UsageBucket, UsagePeriod, UsageStats, UsageTotals,
+};
 use favetto_core::model::{
     Event, EventKind, Failure, NotificationRecord, RepoSource, RunStatus, Schedule, Task, TaskRun,
     TaskStatus,
@@ -134,7 +136,9 @@ CREATE TABLE IF NOT EXISTS task_runs (
     reasoning_tokens    INTEGER,
     cache_read_tokens   INTEGER,
     cache_write_tokens  INTEGER,
-    cost_usd            REAL
+    cost_usd            REAL,
+    cost_amount         REAL,
+    cost_currency       TEXT
 );
 
 -- Per-instance workflow dependencies for runtime DAGs created through
@@ -265,6 +269,8 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
         "cache_read_tokens INTEGER",
         "cache_write_tokens INTEGER",
         "cost_usd REAL",
+        "cost_amount REAL",
+        "cost_currency TEXT",
     ] {
         // `column` is one of the fixed literals above, never user input.
         let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -545,7 +551,22 @@ fn usage_from_row(row: &SqliteRow) -> Option<AgentUsage> {
         .try_get::<Option<i64>, _>("cache_write_tokens")
         .ok()
         .flatten();
-    let cost = row.try_get::<Option<f64>, _>("cost_usd").ok().flatten();
+    let cost_usd = row.try_get::<Option<f64>, _>("cost_usd").ok().flatten();
+    let cost_amount = row.try_get::<Option<f64>, _>("cost_amount").ok().flatten();
+    let cost_currency = row
+        .try_get::<Option<String>, _>("cost_currency")
+        .ok()
+        .flatten();
+    // New rows store the currency-qualified amount separately so a non-USD unit
+    // is never mistaken for dollars. Legacy rows only have `cost_usd`, which was
+    // always USD.
+    let cost = match cost_amount {
+        Some(amount) => Some(AgentCost::new(
+            amount,
+            cost_currency.unwrap_or_else(|| AgentCost::USD.to_string()),
+        )),
+        None => cost_usd.map(AgentCost::usd),
+    };
     if input.is_none()
         && output.is_none()
         && reasoning.is_none()
@@ -561,7 +582,8 @@ fn usage_from_row(row: &SqliteRow) -> Option<AgentUsage> {
         reasoning_tokens: reasoning.unwrap_or(0).max(0) as u64,
         cache_read_tokens: cache_read.unwrap_or(0).max(0) as u64,
         cache_write_tokens: cache_write.unwrap_or(0).max(0) as u64,
-        cost_usd: cost,
+        cost_usd,
+        cost,
         context_used: None,
         context_size: None,
     })
@@ -1341,6 +1363,17 @@ pub async fn list_root_dependencies(
 // Task runs
 // ---------------------------------------------------------------------------
 
+/// Split a usage's reported cost into the legacy USD column, the
+/// currency-qualified amount, and its unit. Non-USD amounts leave `cost_usd`
+/// NULL so they can never be summed with dollars or rendered as USD.
+fn usage_cost_columns(usage: Option<&AgentUsage>) -> (Option<f64>, Option<f64>, Option<String>) {
+    let Some(cost) = usage.and_then(|usage| usage.reported_cost()) else {
+        return (None, None, None);
+    };
+    let usd = cost.is_usd().then_some(cost.amount);
+    (usd, Some(cost.amount), Some(cost.currency))
+}
+
 /// Insert a run row.
 ///
 /// Generic over the sqlx executor so `claim_task` can create the run inside its
@@ -1349,11 +1382,13 @@ pub async fn insert_task_run<'e, E>(executor: E, run: &TaskRun) -> anyhow::Resul
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
+    let (cost_usd, cost_amount, cost_currency) = usage_cost_columns(run.usage.as_ref());
     sqlx::query(
         "INSERT INTO task_runs
             (id, task_id, attempt, status, agent, model, session_id, started_at, finished_at, exit_code, error, failure,
-             input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, cost_usd,
+             cost_amount, cost_currency)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(run.id.to_string())
     .bind(run.task_id.to_string())
@@ -1372,7 +1407,9 @@ where
     .bind(run.usage.as_ref().map(|u| u.reasoning_tokens as i64))
     .bind(run.usage.as_ref().map(|u| u.cache_read_tokens as i64))
     .bind(run.usage.as_ref().map(|u| u.cache_write_tokens as i64))
-    .bind(run.usage.as_ref().and_then(|u| u.cost_usd))
+    .bind(cost_usd)
+    .bind(cost_amount)
+    .bind(cost_currency)
     .execute(executor)
     .await?;
     Ok(())
@@ -1383,7 +1420,8 @@ where
 pub async fn get_task_run(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Option<TaskRun>> {
     let row = sqlx::query(
         "SELECT id, task_id, attempt, status, agent, model, session_id, started_at, finished_at, exit_code, error, failure, \
-                input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, cost_usd \
+                input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, cost_usd, \
+                cost_amount, cost_currency \
          FROM task_runs WHERE id = ?",
     )
     .bind(id.to_string())
@@ -1397,7 +1435,8 @@ pub async fn get_task_run(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Option<
 pub async fn list_task_runs(pool: &SqlitePool, task_id: Uuid) -> anyhow::Result<Vec<TaskRun>> {
     let rows = sqlx::query(
         "SELECT id, task_id, attempt, status, agent, model, session_id, started_at, finished_at, exit_code, error, failure, \
-                input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, cost_usd \
+                input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, cost_usd, \
+                cost_amount, cost_currency \
          FROM task_runs WHERE task_id = ? ORDER BY attempt ASC, started_at ASC",
     )
     .bind(task_id.to_string())
@@ -1414,7 +1453,8 @@ pub async fn get_active_task_run(
 ) -> anyhow::Result<Option<TaskRun>> {
     let row = sqlx::query(
         "SELECT id, task_id, attempt, status, agent, model, session_id, started_at, finished_at, exit_code, error, failure, \
-                input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, cost_usd \
+                input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, cost_usd, \
+                cost_amount, cost_currency \
          FROM task_runs WHERE task_id = ? AND status IN ('pending', 'running', 'awaiting_input') \
          ORDER BY attempt DESC LIMIT 1",
     )
@@ -1429,7 +1469,8 @@ pub async fn get_active_task_run(
 pub async fn list_active_task_runs(pool: &SqlitePool) -> anyhow::Result<Vec<TaskRun>> {
     let rows = sqlx::query(
         "SELECT id, task_id, attempt, status, agent, model, session_id, started_at, finished_at, exit_code, error, failure, \
-                input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, cost_usd \
+                input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, cost_usd, \
+                cost_amount, cost_currency \
          FROM task_runs WHERE status IN ('pending', 'running', 'awaiting_input') \
          ORDER BY started_at ASC",
     )
@@ -1445,6 +1486,7 @@ pub async fn list_active_task_runs(pool: &SqlitePool) -> anyhow::Result<Vec<Task
 /// earlier is kept when `None` is passed. Takes a whole [`TaskRun`] because the
 /// executor already has one in hand when finishing an attempt.
 pub async fn finalize_task_run(pool: &SqlitePool, run: &TaskRun) -> anyhow::Result<bool> {
+    let (cost_usd, cost_amount, cost_currency) = usage_cost_columns(run.usage.as_ref());
     let result = sqlx::query(
         "UPDATE task_runs SET
              status = ?,
@@ -1460,7 +1502,9 @@ pub async fn finalize_task_run(pool: &SqlitePool, run: &TaskRun) -> anyhow::Resu
              reasoning_tokens = ?,
              cache_read_tokens = ?,
              cache_write_tokens = ?,
-             cost_usd = ?
+             cost_usd = ?,
+             cost_amount = ?,
+             cost_currency = ?
          WHERE id = ?",
     )
     .bind(run.status.as_str())
@@ -1481,7 +1525,9 @@ pub async fn finalize_task_run(pool: &SqlitePool, run: &TaskRun) -> anyhow::Resu
     .bind(run.usage.as_ref().map(|u| u.reasoning_tokens as i64))
     .bind(run.usage.as_ref().map(|u| u.cache_read_tokens as i64))
     .bind(run.usage.as_ref().map(|u| u.cache_write_tokens as i64))
-    .bind(run.usage.as_ref().and_then(|u| u.cost_usd))
+    .bind(cost_usd)
+    .bind(cost_amount)
+    .bind(cost_currency)
     .bind(run.id.to_string())
     .execute(pool)
     .await?;
@@ -1943,13 +1989,15 @@ pub async fn usage_stats(
     let mut grouped: HashMap<String, (AgentUsage, u64)> = HashMap::new();
     for row in &rows {
         let key: String = row.get("bucket");
+        let cost_usd = row.try_get::<Option<f64>, _>("cost_usd").ok().flatten();
         let usage = AgentUsage {
             input_tokens: row.get::<i64, _>("input_tokens").max(0) as u64,
             output_tokens: row.get::<i64, _>("output_tokens").max(0) as u64,
             reasoning_tokens: row.get::<i64, _>("reasoning_tokens").max(0) as u64,
             cache_read_tokens: row.get::<i64, _>("cache_read_tokens").max(0) as u64,
             cache_write_tokens: row.get::<i64, _>("cache_write_tokens").max(0) as u64,
-            cost_usd: row.try_get::<Option<f64>, _>("cost_usd").ok().flatten(),
+            cost_usd,
+            cost: cost_usd.map(AgentCost::usd),
             context_used: None,
             context_size: None,
         };
