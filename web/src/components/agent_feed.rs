@@ -337,7 +337,8 @@ pub fn feed_item(event: &AgentStateEvent) -> Option<FeedItem> {
         | AgentStateEvent::AvailableCommands { .. }
         | AgentStateEvent::ConfigOptions { .. }
         | AgentStateEvent::Modes { .. }
-        | AgentStateEvent::CurrentMode { .. } => None,
+        | AgentStateEvent::CurrentMode { .. }
+        | AgentStateEvent::Auth { .. } => None,
     }
 }
 
