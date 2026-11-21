@@ -23,6 +23,7 @@ fn session(id: &str, agent: &str, headless: bool, running: bool) -> AgentSession
         load_error: None,
         config_options: Vec::new(),
         modes: None,
+        auth: None,
     }
 }
 

@@ -434,11 +434,15 @@ pub fn build_feed(events: &[AgentEventPush]) -> Vec<FeedItem> {
             }
             AgentStateEvent::Usage { usage, .. } => items.push(FeedItem::Usage(usage.clone())),
             AgentStateEvent::Title { title } => items.push(FeedItem::Title(title.clone())),
+            // Auth progress is rendered by the detail's pinned banner, which
+            // reads the authoritative live session instead of duplicating an
+            // event into the transcript.
             AgentStateEvent::Plan { .. }
             | AgentStateEvent::AvailableCommands { .. }
             | AgentStateEvent::ConfigOptions { .. }
             | AgentStateEvent::Modes { .. }
-            | AgentStateEvent::CurrentMode { .. } => {}
+            | AgentStateEvent::CurrentMode { .. }
+            | AgentStateEvent::Auth { .. } => {}
             AgentStateEvent::Idle { outcome } => {
                 for index in pending_inputs.drain().map(|(_, index)| index) {
                     if let FeedItem::InputRequest { resolved, .. } = &mut items[index] {
@@ -1372,6 +1376,25 @@ mod tests {
     }
 
     #[test]
+    fn auth_progress_stays_in_the_banner_not_the_transcript() {
+        let auth = favetto_wire::model::AgentAuthState {
+            status: favetto_wire::model::AgentAuthStatus::Required,
+            methods: vec![favetto_wire::model::AgentAuthMethod {
+                id: "agent-login".to_string(),
+                name: "Sign in".to_string(),
+                description: None,
+                kind: favetto_wire::model::AgentAuthMethodKind::Agent,
+                supported: true,
+            }],
+            logout_supported: true,
+            method_id: None,
+            message: Some("the agent requires sign-in".to_string()),
+        };
+        let feed = build_feed(&[push(1, AgentStateEvent::Auth { auth })]);
+        assert!(feed.is_empty(), "auth state must not duplicate feed rows");
+    }
+
+    #[test]
     fn compact_json_skips_empty_values_and_cuts_long_ones() {
         assert!(compact_json(&serde_json::Value::Null).is_none());
         assert!(compact_json(&serde_json::json!({})).is_none());
@@ -1625,6 +1648,7 @@ mod tests {
 
             config_options: Vec::new(),
             modes: None,
+            auth: None,
         };
         let pending = detail
             .pending_request(std::slice::from_ref(&session))

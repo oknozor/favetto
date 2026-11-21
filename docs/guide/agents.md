@@ -62,6 +62,29 @@ permission = "deny"
 Update the changelog.
 ```
 
+## Authentication
+
+ACP v1 agents can advertise authentication methods during initialization. When
+a session needs sign-in before `session/new` or `session/load` can succeed, the
+daemon keeps the agent process alive and reports an `auth` state on the session
+(`required`, `authenticating`, `failed`, …) instead of failing the launch.
+
+- **Agent-handled methods** are completed by the daemon through ACP
+  `authenticate`. The client sends only the advertised method id
+  (`agents.authenticate`); it never collects or transports a credential.
+- **Terminal methods** are preserved in the advertised list for display but are
+  never offered as usable: Favetto's daemon cannot safely bridge an interactive
+  login process to a remote TUI/GPUI client. The daemon rejects them explicitly.
+  Configure those credentials on the daemon host.
+- **Logout** (`agents.logout`) is available only when the agent advertises the
+  ACP `logout` capability.
+
+In the TUI Agent panel, **Ctrl+A** opens the sign-in chooser for sessions that
+advertise an agent-handled method or logout; the panel shows progress and errors
+without printing credentials or raw terminal output. The GPUI client shows the
+same state and actions in the task detail and **Settings → Agents** card. After
+sign-in the daemon retries the paused session setup automatically.
+
 ## Availability
 
 The daemon probes its `PATH` for each agent's executable once at startup and

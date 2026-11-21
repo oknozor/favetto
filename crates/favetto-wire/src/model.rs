@@ -627,6 +627,86 @@ pub enum AgentLoadState {
     Failed,
 }
 
+/// How an advertised ACP v1 authentication method is handled.
+///
+/// Favetto is a daemon/remote-client architecture: a terminal method would have
+/// to run an interactive agent process on the daemon host, so it is preserved
+/// for display but never offered as a usable action.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AgentAuthMethodKind {
+    /// The agent handles authentication itself through ACP `authenticate`.
+    #[default]
+    Agent,
+    /// The client would have to launch an interactive terminal process.
+    Terminal,
+}
+
+/// One authentication method advertised by an ACP agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AgentAuthMethod {
+    /// The method id passed back to ACP `authenticate`.
+    pub id: String,
+    /// Human-readable method name.
+    pub name: String,
+    /// Optional human-readable description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Whether this is an agent-handled or terminal method.
+    #[serde(default)]
+    pub kind: AgentAuthMethodKind,
+    /// Whether the daemon can carry out this method for a remote client.
+    ///
+    /// This is `false` for terminal methods until a safe interactive bridge
+    /// exists. Clients must not present an unsupported method as actionable.
+    #[serde(default)]
+    pub supported: bool,
+}
+
+/// Where a session's ACP authentication currently stands.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AgentAuthStatus {
+    /// The agent did not require authentication (or a sign-out completed).
+    #[default]
+    NotRequired,
+    /// Session setup is paused until the user completes a sign-in.
+    Required,
+    /// An `authenticate` request is in flight.
+    Authenticating,
+    /// Authentication succeeded; session setup is being retried.
+    Authenticated,
+    /// The last sign-in attempt failed. The session remains retryable.
+    Failed,
+}
+
+/// Session-scoped ACP authentication state exposed to daemon clients.
+///
+/// It deliberately contains only method metadata, status and a safe message: no
+/// credential, token, or agent-authored terminal output ever enters this state
+/// or the MessagePack payloads built from it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AgentAuthState {
+    #[serde(default)]
+    pub status: AgentAuthStatus,
+    /// Methods advertised during ACP `initialize`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<AgentAuthMethod>,
+    /// Whether the agent advertised ACP `logout`.
+    #[serde(default, skip_serializing_if = "crate::agent_state::is_false")]
+    pub logout_supported: bool,
+    /// The agent-handled method currently or most recently attempted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method_id: Option<String>,
+    /// Safe progress/error text; never a credential or raw terminal sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 /// A live external-agent session on the daemon.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -673,6 +753,11 @@ pub struct AgentSessionInfo {
     /// The session's mode state, when the agent advertises modes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modes: Option<SessionModes>,
+    /// Session-scoped ACP authentication state, when the agent advertised any
+    /// methods or required sign-in. Absent for PTY sessions and agents that
+    /// neither advertise auth methods nor logout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AgentAuthState>,
 }
 
 /// The lifecycle of a persisted ACP session, as shown by `agents.history`.
@@ -1657,6 +1742,7 @@ mod tests {
                 load_error: (state == AgentLoadState::Failed).then(|| "boom".to_string()),
                 config_options: Vec::new(),
                 modes: None,
+                auth: None,
             };
             let json = serde_json::to_value(&info).unwrap();
             assert_eq!(json["load_state"], serde_json::json!(state));
@@ -1682,6 +1768,7 @@ mod tests {
             load_error: Some("cannot load session".to_string()),
             config_options: Vec::new(),
             modes: None,
+            auth: None,
         };
         let json = serde_json::to_value(&failed).unwrap();
         assert_eq!(json["load_state"], "failed");
@@ -1762,6 +1849,48 @@ mod tests {
         assert_eq!(json["awaiting_input"]["kind"], "pinentry");
         let back: AgentSessionInfo = serde_json::from_value(json).unwrap();
         assert_eq!(back.awaiting_input, with_reason.awaiting_input);
+    }
+
+    #[test]
+    fn agent_auth_state_round_trips_and_omits_empty_fields() {
+        let state = AgentAuthState {
+            status: AgentAuthStatus::Required,
+            methods: vec![
+                AgentAuthMethod {
+                    id: "agent-login".to_string(),
+                    name: "Sign in".to_string(),
+                    description: Some("Opens the provider's device flow".to_string()),
+                    kind: AgentAuthMethodKind::Agent,
+                    supported: true,
+                },
+                AgentAuthMethod {
+                    id: "terminal-login".to_string(),
+                    name: "Terminal sign-in".to_string(),
+                    description: None,
+                    kind: AgentAuthMethodKind::Terminal,
+                    supported: false,
+                },
+            ],
+            logout_supported: true,
+            method_id: None,
+            message: Some("the agent requires sign-in".to_string()),
+        };
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["status"], "required");
+        assert_eq!(json["methods"][0]["kind"], "agent");
+        assert_eq!(json["methods"][0]["supported"], true);
+        assert_eq!(json["methods"][1]["kind"], "terminal");
+        assert_eq!(json["methods"][1]["supported"], false);
+        assert_eq!(json["logout_supported"], true);
+        let back: AgentAuthState = serde_json::from_value(json).unwrap();
+        assert_eq!(back, state);
+
+        // No credentials are part of this shape. Only method metadata, status
+        // and a safe message serialize.
+        let empty = serde_json::to_value(AgentAuthState::default()).unwrap();
+        assert_eq!(empty, serde_json::json!({ "status": "not_required" }));
+        assert!(empty.get("methods").is_none());
+        assert!(empty.get("message").is_none());
     }
 
     #[test]

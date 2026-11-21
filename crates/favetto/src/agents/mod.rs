@@ -21,10 +21,11 @@ use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 
 use favetto_core::model::{
-    AgentActivity, AgentBackend, AgentCapabilities, AgentCommand, AgentLoadState, AgentPlanEntry,
-    AgentSessionInfo, AgentStateEvent, AgentUsage, AwaitingInputReason, ContentRole, InputReply,
-    PermissionPolicy, ProviderSessionEntry, ProviderSessionsResult, SessionConfigOption,
-    SessionConfigValue, SessionModes,
+    AgentActivity, AgentAuthMethodKind, AgentAuthState, AgentAuthStatus, AgentBackend,
+    AgentCapabilities, AgentCommand, AgentLoadState, AgentPlanEntry, AgentSessionInfo,
+    AgentStateEvent, AgentUsage, AwaitingInputReason, ContentRole, InputReply, PermissionPolicy,
+    ProviderSessionEntry, ProviderSessionsResult, SessionConfigOption, SessionConfigValue,
+    SessionModes,
 };
 use favetto_core::rpc::{AgentEventPush, AgentOptionsResult};
 
@@ -300,7 +301,9 @@ impl AgentLiveState {
                 }
             }
             AgentStateEvent::Error { .. } => {}
-            AgentStateEvent::Session { .. } | AgentStateEvent::Title { .. } => {}
+            AgentStateEvent::Session { .. }
+            | AgentStateEvent::Title { .. }
+            | AgentStateEvent::Auth { .. } => {}
         }
     }
 }
@@ -319,6 +322,8 @@ struct Session {
     live: Arc<Mutex<AgentLiveState>>,
     /// Restore lifecycle shared with the ACP runtime.
     lifecycle: Arc<Mutex<SessionLifecycle>>,
+    /// Session-scoped ACP authentication state shared with the runtime.
+    auth: Arc<Mutex<Option<AgentAuthState>>>,
     responder: Arc<acp::AcpResponder>,
     /// Durable metadata writer, when the manager has a database attached.
     store: Option<SessionStore>,
@@ -348,6 +353,7 @@ impl Session {
             load_error: lifecycle.error.clone(),
             config_options: live.config_options.clone(),
             modes: live.modes.clone(),
+            auth: self.auth.lock().clone(),
         }
     }
 
@@ -712,6 +718,7 @@ impl AgentManager {
                 modes: None,
             })),
             lifecycle: Arc::new(Mutex::new(SessionLifecycle::ready())),
+            auth: handles.auth.clone(),
             responder: handles.responder.clone(),
             store: self.store.clone(),
             state_tx: state_tx.clone(),
@@ -932,6 +939,7 @@ impl AgentManager {
                 modes: None,
             })),
             lifecycle: lifecycle.clone(),
+            auth: handles.auth.clone(),
             responder: handles.responder.clone(),
             store: self.store.clone(),
             state_tx: state_tx.clone(),
@@ -947,18 +955,20 @@ impl AgentManager {
         self.sessions.lock().insert(id, session.clone());
         let _ = start_tx.send(());
 
-        if let Err(error) = wait_for_load(load, outcome).await {
-            // The runtime normally records this already; keep the snapshot
-            // honest for failures that happen before it can (initialize,
-            // transport teardown).
-            let mut lifecycle = lifecycle.lock();
-            if lifecycle.state != AgentLoadState::Failed {
-                lifecycle.state = AgentLoadState::Failed;
-                lifecycle.error = Some(error.to_string());
+        match wait_for_load(load, outcome).await {
+            Ok(LoadWait::Ready | LoadWait::AuthRequired) => Ok(session.info()),
+            Err(error) => {
+                // The runtime normally records this already; keep the snapshot
+                // honest for failures that happen before it can (initialize,
+                // transport teardown).
+                let mut lifecycle = lifecycle.lock();
+                if lifecycle.state != AgentLoadState::Failed {
+                    lifecycle.state = AgentLoadState::Failed;
+                    lifecycle.error = Some(error.to_string());
+                }
+                Err(error)
             }
-            return Err(error);
         }
-        Ok(session.info())
     }
 
     /// List one page of an agent's provider-owned sessions through ACP
@@ -1283,6 +1293,104 @@ impl AgentManager {
         Ok(options_snapshot(&session))
     }
 
+    /// Complete an agent-handled ACP sign-in and retry session setup.
+    ///
+    /// Only a method advertised by the agent is accepted, and terminal methods
+    /// are rejected because the daemon cannot run an interactive login process
+    /// for a remote client.
+    pub async fn authenticate(
+        &self,
+        session_id: &str,
+        method_id: &str,
+    ) -> anyhow::Result<AgentAuthState> {
+        let session = self.get(session_id)?;
+        {
+            let auth = session.auth.lock();
+            let Some(state) = auth.as_ref() else {
+                anyhow::bail!("agent session '{session_id}' does not advertise ACP authentication");
+            };
+            if !matches!(
+                state.status,
+                AgentAuthStatus::Required | AgentAuthStatus::Failed
+            ) {
+                anyhow::bail!("agent session '{session_id}' does not require authentication");
+            }
+            let method = state
+                .methods
+                .iter()
+                .find(|method| method.id == method_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "authentication method '{method_id}' was not advertised by this agent"
+                    )
+                })?;
+            if !method.supported {
+                if method.kind == AgentAuthMethodKind::Terminal {
+                    anyhow::bail!("{}", acp::TERMINAL_AUTH_UNSUPPORTED);
+                }
+                anyhow::bail!(
+                    "authentication method '{method_id}' is not supported by the Favetto daemon"
+                );
+            }
+        }
+
+        let (reply, result) = tokio::sync::oneshot::channel();
+        session
+            .handles
+            .authenticate
+            .send(acp::AcpAuthCommand {
+                method_id: method_id.to_string(),
+                reply,
+            })
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "agent session '{session_id}' is no longer waiting for authentication"
+                )
+            })?;
+        match tokio::time::timeout(acp::AUTH_TIMEOUT, result).await {
+            Ok(Ok(Ok(()))) => Ok(session.auth.lock().clone().unwrap_or_default()),
+            Ok(Ok(Err(error))) => Err(anyhow::anyhow!(error)),
+            Ok(Err(_)) => {
+                anyhow::bail!("agent session '{session_id}' ended before the sign-in completed")
+            }
+            Err(_) => anyhow::bail!("agent session '{session_id}' sign-in timed out"),
+        }
+    }
+
+    /// Sign a session out through ACP `logout`, only when advertised.
+    pub async fn logout(&self, session_id: &str) -> anyhow::Result<()> {
+        let session = self.get(session_id)?;
+        {
+            let auth = session.auth.lock();
+            let Some(state) = auth.as_ref() else {
+                anyhow::bail!("agent session '{session_id}' did not advertise ACP logout");
+            };
+            if !state.logout_supported {
+                anyhow::bail!("agent session '{session_id}' did not advertise ACP logout");
+            }
+            if state.status != AgentAuthStatus::NotRequired {
+                anyhow::bail!(
+                    "agent session '{session_id}' cannot sign out while authentication is in \
+                     progress"
+                );
+            }
+        }
+        let (reply, result) = tokio::sync::oneshot::channel();
+        session
+            .handles
+            .commands
+            .send(acp::AcpCommand::Logout { reply })
+            .map_err(|_| anyhow::anyhow!("agent session '{session_id}' is no longer running"))?;
+        match tokio::time::timeout(acp::AUTH_TIMEOUT, result).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(error))) => Err(anyhow::anyhow!(error)),
+            Ok(Err(_)) => {
+                anyhow::bail!("agent session '{session_id}' ended before logout completed")
+            }
+            Err(_) => anyhow::bail!("agent session '{session_id}' logout timed out"),
+        }
+    }
+
     /// Terminate a session, mark its durable record terminal, and drop it from
     /// the registry. The metadata row is kept for history.
     pub async fn close(&self, session_id: &str) -> anyhow::Result<()> {
@@ -1327,20 +1435,31 @@ impl AgentManager {
     }
 }
 
+/// How a load-mode startup settled for the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadWait {
+    /// The conversation is restored and the replay is applied.
+    Ready,
+    /// The agent needs sign-in; the session remains live and retryable.
+    AuthRequired,
+}
+
 /// Wait for a load-mode ACP session to acknowledge `session/load`.
 ///
-/// The runtime sends `Ok` only after the agent returned and the durable record
-/// is ready, and a message-bearing `Err` for an unsupported or failed load. If
-/// the process exits before either, report the recorded outcome rather than
+/// `Ready` is sent only after the agent returned and the durable record is
+/// ready. `AuthRequired` returns a retryable snapshot while the process stays
+/// alive for `agents.authenticate`. A message-bearing failure is terminal. If the
+/// process exits before either, report the recorded outcome rather than
 /// pretending the conversation was restored.
 async fn wait_for_load(
-    mut load: tokio::sync::watch::Receiver<Option<Result<(), String>>>,
+    mut load: tokio::sync::watch::Receiver<Option<acp::LoadUpdate>>,
     outcome: Arc<Mutex<AcpOutcome>>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<LoadWait> {
     loop {
         match load.borrow_and_update().clone() {
-            Some(Ok(())) => return Ok(()),
-            Some(Err(error)) => return Err(anyhow::anyhow!(error)),
+            Some(acp::LoadUpdate::Ready) => return Ok(LoadWait::Ready),
+            Some(acp::LoadUpdate::AuthRequired) => return Ok(LoadWait::AuthRequired),
+            Some(acp::LoadUpdate::Failed(error)) => return Err(anyhow::anyhow!(error)),
             None => {}
         }
         if load.changed().await.is_err() {

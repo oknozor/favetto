@@ -27,8 +27,8 @@ use crate::agent_state::{
     SessionConfigOption, SessionConfigValue, SessionModes, UsagePeriod, UsageStats,
 };
 use crate::model::{
-    AgentCatalogEntry, AgentSessionHistoryEntry, AgentSessionInfo, Event, NotificationRecord,
-    ProviderSessionsResult, RepoInfo, Schedule, Task, TaskRun,
+    AgentAuthState, AgentCatalogEntry, AgentSessionHistoryEntry, AgentSessionInfo, Event,
+    NotificationRecord, ProviderSessionsResult, RepoInfo, Schedule, Task, TaskRun,
 };
 use crate::task_var::TaskVar;
 use crate::workflow::{WorkflowCancelResult, WorkflowCreateResult, WorkflowGraph, WorkflowInspect};
@@ -655,6 +655,42 @@ pub struct ProviderDeleteResult {
     pub deleted: bool,
 }
 
+/// `agents.authenticate` params: complete an agent-handled ACP v1 sign-in.
+///
+/// Only method ids the agent advertised during `initialize` are accepted.
+/// Credentials never travel through this call: the daemon asks the agent to run
+/// its own authentication flow on the daemon host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AgentAuthenticateParams {
+    pub session_id: String,
+    pub method_id: String,
+}
+
+/// `agents.authenticate` result: the session's authentication state after the
+/// attempt, plus whether the daemon completed the agent-handled sign-in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AgentAuthenticateResult {
+    pub authenticated: bool,
+    pub auth: AgentAuthState,
+}
+
+/// `agents.logout` params: sign an ACP session out when the agent advertised
+/// `logout`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AgentLogoutParams {
+    pub session_id: String,
+}
+
+/// `agents.logout` result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AgentLogoutResult {
+    pub logged_out: bool,
+}
+
 // ---------------------------------------------------------------------------
 // providers
 // ---------------------------------------------------------------------------
@@ -998,6 +1034,10 @@ rpc_calls! {
     AgentsProviderResumeCall => method::AGENTS_PROVIDER_RESUME, ProviderResumeParams, AgentAttachResult;
     /// Typed call for `agents.provider_delete`.
     AgentsProviderDeleteCall => method::AGENTS_PROVIDER_DELETE, ProviderDeleteParams, ProviderDeleteResult;
+    /// Typed call for `agents.authenticate`.
+    AgentsAuthenticateCall => method::AGENTS_AUTHENTICATE, AgentAuthenticateParams, AgentAuthenticateResult;
+    /// Typed call for `agents.logout`.
+    AgentsLogoutCall => method::AGENTS_LOGOUT, AgentLogoutParams, AgentLogoutResult;
     /// Typed call for `providers.list`.
     ProvidersListCall => method::PROVIDERS_LIST, ProvidersListParams, ProvidersListResult;
     /// Typed call for `schedules.list`.
@@ -1232,6 +1272,16 @@ pub const CLIENT_CALLS: &[RpcCallSpec] = &[
         method: method::AGENTS_PROVIDER_DELETE,
         params_schema: schema_of::<ProviderDeleteParams>,
         result_schema: schema_of::<ProviderDeleteResult>,
+    },
+    RpcCallSpec {
+        method: method::AGENTS_AUTHENTICATE,
+        params_schema: schema_of::<AgentAuthenticateParams>,
+        result_schema: schema_of::<AgentAuthenticateResult>,
+    },
+    RpcCallSpec {
+        method: method::AGENTS_LOGOUT,
+        params_schema: schema_of::<AgentLogoutParams>,
+        result_schema: schema_of::<AgentLogoutResult>,
     },
     RpcCallSpec {
         method: method::PROVIDERS_LIST,

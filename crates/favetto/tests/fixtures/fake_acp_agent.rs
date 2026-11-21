@@ -80,6 +80,7 @@ fn main() {
     if let Some(marker) = std::env::var_os("FAKE_ACP_PID_MARKER") {
         let _ = std::fs::write(marker, std::process::id().to_string());
     }
+    let mut authenticated = std::env::var_os("FAKE_ACP_AUTH_REQUIRED").is_none();
     let mut lines = stdin.lock().lines();
     let mut prompt_turn = 0u32;
     while let Some(Ok(line)) = lines.next() {
@@ -115,19 +116,29 @@ fn main() {
                         session_capabilities.insert(key.clone(), value.clone());
                     }
                 }
+                if std::env::var_os("FAKE_ACP_AUTH_LOGOUT").is_some() {
+                    capabilities["auth"] = json!({ "logout": {} });
+                }
                 if !session_capabilities.is_empty() {
                     capabilities["sessionCapabilities"] = Value::Object(session_capabilities);
                 }
-                respond(
-                    &mut stdout,
-                    id,
-                    json!({
-                        "protocolVersion": 1,
-                        "agentCapabilities": capabilities
-                    }),
-                );
+                let mut response = json!({
+                    "protocolVersion": 1,
+                    "agentCapabilities": capabilities
+                });
+                if let Ok(methods) = std::env::var("FAKE_ACP_AUTH_METHODS") {
+                    response["authMethods"] =
+                        serde_json::from_str(&methods).unwrap_or_else(|_| json!([]));
+                }
+                respond(&mut stdout, id, response);
             }
             "session/new" => {
+                if !authenticated {
+                    if let Some(id) = id {
+                        error(&mut stdout, id, -32000, "Authentication required");
+                    }
+                    continue;
+                }
                 respond(
                     &mut stdout,
                     id,
@@ -138,7 +149,42 @@ fn main() {
                     }),
                 );
             }
+            "authenticate" => {
+                let method_id = message
+                    .get("params")
+                    .and_then(|params| params.get("methodId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let expected =
+                    std::env::var("FAKE_ACP_AUTH_METHOD").unwrap_or_else(|_| "fake-login".into());
+                if std::env::var("FAKE_ACP_AUTH_RESULT").as_deref() == Ok("error") {
+                    if let Some(id) = id {
+                        error(&mut stdout, id, -32603, "fake sign-in rejected");
+                    }
+                } else if method_id == expected {
+                    authenticated = true;
+                    respond(&mut stdout, id, json!({}));
+                } else if let Some(id) = id {
+                    error(&mut stdout, id, -32602, "unknown authentication method");
+                }
+            }
+            "logout" => {
+                if std::env::var_os("FAKE_ACP_AUTH_LOGOUT").is_none() {
+                    if let Some(id) = id {
+                        error(&mut stdout, id, -32601, "method not found");
+                    }
+                    continue;
+                }
+                authenticated = false;
+                respond(&mut stdout, id, json!({}));
+            }
             "session/load" => {
+                if !authenticated {
+                    if let Some(id) = id {
+                        error(&mut stdout, id, -32000, "Authentication required");
+                    }
+                    continue;
+                }
                 let params = message.get("params");
                 let loaded = params
                     .and_then(|params| params.get("sessionId"))
@@ -194,7 +240,8 @@ fn main() {
                 }
                 if std::env::var("FAKE_ACP_LOAD_RESULT").as_deref() == Ok("error") {
                     if let Some(id) = id {
-                        error(&mut stdout, id, -32000, "cannot load session");
+                        // A generic load failure, not auth-required (-32000).
+                        error(&mut stdout, id, -32603, "cannot load session");
                     }
                 } else {
                     respond(
