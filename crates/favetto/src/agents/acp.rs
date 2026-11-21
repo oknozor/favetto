@@ -16,6 +16,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
@@ -73,6 +74,37 @@ use super::SessionLifecycle;
 
 /// Deadline for an `ask`-policy permission answered by a remote client.
 pub(crate) const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Largest newline-delimited ACP message accepted from an agent, in bytes.
+///
+/// ACP frames one JSON-RPC message per line. The limit excludes the trailing
+/// newline and is enforced while reading, before the whole line is buffered or
+/// parsed, so a broken or hostile agent cannot grow the daemon's memory without
+/// bound. Exceeding it fails the session and tears the child process down.
+pub(crate) const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Deadline for the ACP `initialize` handshake and each session-setup request
+/// (`session/new`, `session/load`, `session/set_config_option`).
+///
+/// Prompt turns are deliberately never bounded: a task may legitimately run for
+/// hours. Only startup may hang forever, stranding the session in
+/// `Starting`/`Loading`.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Environment override for [`SETUP_TIMEOUT`], in milliseconds. It exists for
+/// operators whose agent has a long cold start and for the regression tests that
+/// exercise a hung agent without waiting the production deadline.
+const SETUP_TIMEOUT_ENV: &str = "FAVETTO_ACP_SETUP_TIMEOUT_MS";
+
+/// The configured startup deadline for one ACP session.
+pub(crate) fn setup_timeout() -> Duration {
+    std::env::var(SETUP_TIMEOUT_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(SETUP_TIMEOUT)
+}
 
 /// How long to wait for `session/close` before ending the session anyway. The
 /// method is optional in practice, and a completed turn must never leave the
@@ -171,6 +203,9 @@ pub(crate) struct AcpLaunch {
     pub close_after_turn: bool,
     /// How long an `ask` request waits for a client answer.
     pub permission_timeout: Duration,
+    /// Deadline for initialization and session setup. Prompt turns are never
+    /// bounded by this.
+    pub setup_timeout: Duration,
     /// Durable metadata writer for the Favetto-local session record.
     pub session: Option<SessionBinding>,
     /// For a load, wait for the manager to register the local session before
@@ -191,6 +226,11 @@ pub(crate) enum AcpEvent {
     State(AgentStateEvent),
     /// Replay is fully emitted; acknowledge once it is in the feed.
     ReplayApplied(oneshot::Sender<()>),
+    /// The runtime has stopped. The manager publishes the terminal `Exited`
+    /// live state and exit event exactly once from this marker.
+    Exited {
+        code: Option<i32>,
+    },
 }
 
 /// How replay notifications are handled before `session/load` settles.
@@ -339,6 +379,30 @@ fn setup_error(
     }
 }
 
+/// Await one session-setup request under the startup deadline.
+///
+/// A hung server becomes a fatal setup failure naming the method and the
+/// deadline instead of stranding the session in `Starting`/`Loading`; a real
+/// protocol error is classified by [`setup_error`] so `auth_required` keeps the
+/// retryable sign-in flow.
+async fn setup_request<T, F>(
+    context: impl FnOnce() -> String,
+    what: &str,
+    deadline: Duration,
+    future: F,
+) -> Result<T, SessionSetup>
+where
+    F: Future<Output = Result<T, agent_client_protocol::Error>>,
+{
+    match tokio::time::timeout(deadline, future).await {
+        Ok(result) => result.map_err(|error| setup_error(context, error)),
+        Err(_) => Err(SessionSetup::Fatal(format!(
+            "{}: {what} did not complete within {deadline:?}; the ACP server may be hung",
+            context()
+        ))),
+    }
+}
+
 /// Convert ACP auth methods into the wire/UI shape. Terminal methods are kept
 /// but explicitly unsupported: Favetto's daemon cannot bridge an interactive
 /// login process to a remote client.
@@ -464,17 +528,31 @@ pub(crate) struct AcpHandles {
     /// run's captured output.
     pub transcript: Arc<Mutex<String>>,
     pub outcome: Arc<Mutex<AcpOutcome>>,
-    /// The connection task. Aborting it drops the child handle, whose
-    /// `kill_on_drop` setting terminates the server.
+    /// Kept so a forced shutdown can still publish the terminal exit marker,
+    /// even after the runtime task is aborted.
+    events: mpsc::UnboundedSender<AcpEvent>,
+    /// Whether the terminal exit marker has been published; the runtime and a
+    /// forced shutdown race here, and only the first one wins.
+    terminated: Arc<AtomicBool>,
+    /// The connection task. Aborting it drops the runtime's child-reaper signal;
+    /// the dedicated reaper then kills and reaps the server.
     task: tokio::task::JoinHandle<()>,
 }
 
 impl AcpHandles {
     /// Close the session: request a clean stop, then abort the connection task
-    /// so a stuck server is killed rather than leaking.
+    /// so a stuck server is killed rather than leaking. The terminal exit state
+    /// is published here too, because an aborted runtime cannot do it itself.
     pub(crate) fn shutdown(&self) {
         let _ = self.commands.send(AcpCommand::Shutdown);
         self.task.abort();
+        self.publish_exit(None);
+    }
+
+    fn publish_exit(&self, code: Option<i32>) {
+        if !self.terminated.swap(true, Ordering::SeqCst) {
+            let _ = self.events.send(AcpEvent::Exited { code });
+        }
     }
 
     /// Change one advertised config option and return the agent's full snapshot.
@@ -637,7 +715,7 @@ pub(crate) fn spawn(
         next_elicitation: AtomicU64::new(1),
     });
 
-    let transport = Lines::new(sink_from_stdin(stdin), lossy_lines(stdout.compat()));
+    let transport = Lines::new(sink_from_stdin(stdin), bounded_lines(stdout.compat()));
 
     let notification_events = events_tx.clone();
     let notification_transcript = transcript.clone();
@@ -658,10 +736,13 @@ pub(crate) fn spawn(
     };
     let requested_model = launch.model.clone();
     let agent_name = launch.agent.clone();
+    let setup_deadline = launch.setup_timeout;
     let close_after_turn = launch.close_after_turn;
     let cwd = launch.cwd.clone();
     let running_task = running.clone();
     let exit_task = exit_code.clone();
+    let terminated = Arc::new(AtomicBool::new(false));
+    let terminated_task = terminated.clone();
     let session_id_slot = external_session_id.clone();
     let ready_binding = launch.session.clone();
     let end_binding = launch.session;
@@ -670,6 +751,7 @@ pub(crate) fn spawn(
 
     let result_outcome = outcome.clone();
     let result_events = events_tx.clone();
+    let handle_events = events_tx.clone();
     let connection_outcome = outcome.clone();
     let capability_slot = capabilities.clone();
     let prompt_turn = turn.clone();
@@ -702,7 +784,15 @@ pub(crate) fn spawn(
     let notification_replay = replay_gate.clone();
     let auth_slot = auth_state.clone();
     let handles_auth_tx = auth_tx.clone();
+    // The reaper owns the child. The runtime holds the `teardown_tx` sender: a
+    // normal finish sends it, and an aborted runtime drops it, so either way the
+    // server is killed and its SIGCHLD is collected instead of leaking a zombie.
+    let (teardown_tx, teardown_rx) = oneshot::channel::<()>();
     let mut child = child;
+    tokio::spawn(async move {
+        let _ = teardown_rx.await;
+        reap_child(&mut child).await;
+    });
     let task = tokio::spawn(async move {
         let notification_transcript = Arc::clone(&notification_transcript);
         let result = Client
@@ -773,13 +863,18 @@ pub(crate) fn spawn(
                     // capability opts into plan operations (`plan_update` /
                     // `plan_removed`, identified/Markdown plans), which Favetto
                     // intentionally does not advertise or implement.
-                    let init = connection
-                        .send_request(
-                            InitializeRequest::new(ProtocolVersion::V1)
-                                .client_capabilities(client_capabilities()),
-                        )
-                        .block_task()
-                        .await?;
+                    let init = with_deadline(
+                        "initialize",
+                        setup_deadline,
+                        connection
+                            .send_request(
+                                InitializeRequest::new(ProtocolVersion::V1)
+                                    .client_capabilities(client_capabilities()),
+                            )
+                            .block_task(),
+                    )
+                    .await
+                    .map_err(|error| anyhow::anyhow!("agent '{agent_name}': {error}"))?;
                     *capability_slot.lock() = Some(init.agent_capabilities.clone());
                     // `session/close` is optional. Only call it when the agent
                     // advertised `sessionCapabilities.close`; process teardown
@@ -999,7 +1094,8 @@ pub(crate) fn spawn(
                             }
                             return Ok(());
                         }
-                        let setup = match &mode {
+                        let setup = async {
+                            match &mode {
                             AcpSessionMode::Load {
                                 external_session_id: known,
                             } => {
@@ -1009,68 +1105,57 @@ pub(crate) fn spawn(
                                          (session/load); cannot restore session '{known}'"
                                     )))
                                 } else {
-                                    match connection
-                                        .send_request(LoadSessionRequest::new(
-                                            SessionId::new(known.clone()),
-                                            cwd.clone(),
-                                        ))
-                                        .block_task()
-                                        .await
-                                    {
-                                        Ok(loaded) => {
-                                            // The local id is the routing key;
-                                            // the ACP id stays separate metadata,
-                                            // unchanged by the restore.
-                                            let recorded = match &ready_binding {
-                                                Some(binding) => binding
-                                                    .store
-                                                    .mark_ready(
-                                                        &binding.id,
-                                                        known,
-                                                        binding.run_id.as_deref(),
-                                                    )
-                                                    .await
-                                                    .map_err(|error| {
-                                                        format!(
-                                                            "agent '{agent_name}': cannot record \
-                                                             loaded ACP session id: {error}"
-                                                        )
-                                                    }),
-                                                None => Ok(()),
-                                            };
-                                            match recorded {
-                                                Err(message) => {
-                                                    Err(SessionSetup::Fatal(message))
-                                                }
-                                                Ok(()) => {
-                                                    *session_id_slot.lock() =
-                                                        Some(known.clone());
-                                                    Ok::<_, SessionSetup>((
-                                                        SessionId::new(known.clone()),
-                                                        known.clone(),
-                                                        current_model(
-                                                            loaded.config_options.as_deref(),
-                                                        ),
-                                                        normalized_config_options(
-                                                            loaded.config_options.as_deref(),
-                                                        ),
-                                                        loaded
-                                                            .modes
-                                                            .as_ref()
-                                                            .map(normalized_modes),
-                                                    ))
-                                                }
-                                            }
-                                        }
-                                        Err(error) => Err(setup_error(
-                                            || {
+                                    let loaded = setup_request(
+                                        || {
+                                            format!(
+                                                "agent '{agent_name}' could not load ACP session \
+                                                 '{known}'"
+                                            )
+                                        },
+                                        "session/load",
+                                        setup_deadline,
+                                        connection
+                                            .send_request(LoadSessionRequest::new(
+                                                SessionId::new(known.clone()),
+                                                cwd.clone(),
+                                            ))
+                                            .block_task(),
+                                    )
+                                    .await?;
+                                    // The local id is the routing key; the ACP
+                                    // id stays separate metadata, unchanged by
+                                    // the restore.
+                                    let recorded = match &ready_binding {
+                                        Some(binding) => binding
+                                            .store
+                                            .mark_ready(
+                                                &binding.id,
+                                                known,
+                                                binding.run_id.as_deref(),
+                                            )
+                                            .await
+                                            .map_err(|error| {
                                                 format!(
-                                                    "agent '{agent_name}' could not load ACP \
-                                                     session '{known}'"
+                                                    "agent '{agent_name}': cannot record loaded \
+                                                     ACP session id: {error}"
                                                 )
-                                            },
-                                            error,
-                                        )),
+                                            }),
+                                        None => Ok(()),
+                                    };
+                                    match recorded {
+                                        Err(message) => Err(SessionSetup::Fatal(message)),
+                                        Ok(()) => {
+                                            *session_id_slot.lock() = Some(known.clone());
+                                            Ok((
+                                                SessionId::new(known.clone()),
+                                                known.clone(),
+                                                current_model(loaded.config_options.as_deref()),
+                                                normalized_config_options(
+                                                    loaded.config_options.as_deref(),
+                                                ),
+                                                loaded.modes.as_ref().map(normalized_modes),
+                                            ))
+                                        }
                                     }
                                 }
                             }
@@ -1081,126 +1166,104 @@ pub(crate) fn spawn(
                                 // `session/resume` is the v1 fallback for agents that
                                 // advertise resume without load.
                                 if init.agent_capabilities.load_session {
-                                    match connection
-                                        .send_request(LoadSessionRequest::new(
-                                            SessionId::new(known.clone()),
-                                            cwd.clone(),
-                                        ))
-                                        .block_task()
-                                        .await
-                                    {
-                                        Ok(loaded) => {
-                                            let recorded = match &ready_binding {
-                                                Some(binding) => binding
-                                                    .store
-                                                    .mark_ready(
-                                                        &binding.id,
-                                                        known,
-                                                        binding.run_id.as_deref(),
-                                                    )
-                                                    .await
-                                                    .map_err(|error| {
-                                                        format!(
-                                                            "agent '{agent_name}': cannot record \
-                                                             resumed provider session id: {error}"
-                                                        )
-                                                    }),
-                                                None => Ok(()),
-                                            };
-                                            match recorded {
-                                                Err(message) => {
-                                                    Err(SessionSetup::Fatal(message))
-                                                }
-                                                Ok(()) => {
-                                                    *session_id_slot.lock() =
-                                                        Some(known.clone());
-                                                    Ok::<_, SessionSetup>((
-                                                        SessionId::new(known.clone()),
-                                                        known.clone(),
-                                                        current_model(
-                                                            loaded.config_options.as_deref(),
-                                                        ),
-                                                        normalized_config_options(
-                                                            loaded.config_options.as_deref(),
-                                                        ),
-                                                        loaded
-                                                            .modes
-                                                            .as_ref()
-                                                            .map(normalized_modes),
-                                                    ))
-                                                }
-                                            }
-                                        }
-                                        Err(error) => Err(setup_error(
-                                            || {
+                                    let loaded = setup_request(
+                                        || {
+                                            format!(
+                                                "agent '{agent_name}' could not load provider \
+                                                 session '{known}'"
+                                            )
+                                        },
+                                        "session/load",
+                                        setup_deadline,
+                                        connection
+                                            .send_request(LoadSessionRequest::new(
+                                                SessionId::new(known.clone()),
+                                                cwd.clone(),
+                                            ))
+                                            .block_task(),
+                                    )
+                                    .await?;
+                                    let recorded = match &ready_binding {
+                                        Some(binding) => binding
+                                            .store
+                                            .mark_ready(
+                                                &binding.id,
+                                                known,
+                                                binding.run_id.as_deref(),
+                                            )
+                                            .await
+                                            .map_err(|error| {
                                                 format!(
-                                                    "agent '{agent_name}' could not load provider \
-                                                     session '{known}'"
+                                                    "agent '{agent_name}': cannot record resumed \
+                                                     provider session id: {error}"
                                                 )
-                                            },
-                                            error,
-                                        )),
+                                            }),
+                                        None => Ok(()),
+                                    };
+                                    match recorded {
+                                        Err(message) => Err(SessionSetup::Fatal(message)),
+                                        Ok(()) => {
+                                            *session_id_slot.lock() = Some(known.clone());
+                                            Ok((
+                                                SessionId::new(known.clone()),
+                                                known.clone(),
+                                                current_model(loaded.config_options.as_deref()),
+                                                normalized_config_options(
+                                                    loaded.config_options.as_deref(),
+                                                ),
+                                                loaded.modes.as_ref().map(normalized_modes),
+                                            ))
+                                        }
                                     }
                                 } else if init.agent_capabilities.session_capabilities.resume.is_some() {
-                                    match connection
-                                        .send_request(ResumeSessionRequest::new(
-                                            SessionId::new(known.clone()),
-                                            cwd.clone(),
-                                        ))
-                                        .block_task()
-                                        .await
-                                    {
-                                        Ok(resumed) => {
-                                            let recorded = match &ready_binding {
-                                                Some(binding) => binding
-                                                    .store
-                                                    .mark_ready(
-                                                        &binding.id,
-                                                        known,
-                                                        binding.run_id.as_deref(),
-                                                    )
-                                                    .await
-                                                    .map_err(|error| {
-                                                        format!(
-                                                            "agent '{agent_name}': cannot record \
-                                                             resumed provider session id: {error}"
-                                                        )
-                                                    }),
-                                                None => Ok(()),
-                                            };
-                                            match recorded {
-                                                Err(message) => {
-                                                    Err(SessionSetup::Fatal(message))
-                                                }
-                                                Ok(()) => {
-                                                    *session_id_slot.lock() =
-                                                        Some(known.clone());
-                                                    Ok::<_, SessionSetup>((
-                                                        SessionId::new(known.clone()),
-                                                        known.clone(),
-                                                        current_model(
-                                                            resumed.config_options.as_deref(),
-                                                        ),
-                                                        normalized_config_options(
-                                                            resumed.config_options.as_deref(),
-                                                        ),
-                                                        resumed
-                                                            .modes
-                                                            .as_ref()
-                                                            .map(normalized_modes),
-                                                    ))
-                                                }
-                                            }
-                                        }
-                                        Err(error) => Err(setup_error(
-                                            || {
+                                    let resumed = setup_request(
+                                        || {
+                                            format!(
+                                                "agent '{agent_name}' could not resume provider \
+                                                 session '{known}'"
+                                            )
+                                        },
+                                        "session/resume",
+                                        setup_deadline,
+                                        connection
+                                            .send_request(ResumeSessionRequest::new(
+                                                SessionId::new(known.clone()),
+                                                cwd.clone(),
+                                            ))
+                                            .block_task(),
+                                    )
+                                    .await?;
+                                    let recorded = match &ready_binding {
+                                        Some(binding) => binding
+                                            .store
+                                            .mark_ready(
+                                                &binding.id,
+                                                known,
+                                                binding.run_id.as_deref(),
+                                            )
+                                            .await
+                                            .map_err(|error| {
                                                 format!(
-                                                    "agent '{agent_name}' could not resume provider \
-                                                     session '{known}'"
+                                                    "agent '{agent_name}': cannot record resumed \
+                                                     provider session id: {error}"
                                                 )
-                                            },
-                                            error,
-                                        )),
+                                            }),
+                                        None => Ok(()),
+                                    };
+                                    match recorded {
+                                        Err(message) => Err(SessionSetup::Fatal(message)),
+                                        Ok(()) => {
+                                            *session_id_slot.lock() = Some(known.clone());
+                                            Ok((
+                                                SessionId::new(known.clone()),
+                                                known.clone(),
+                                                current_model(resumed.config_options.as_deref()),
+                                                normalized_config_options(
+                                                    resumed.config_options.as_deref(),
+                                                ),
+                                                resumed.modes.as_ref().map(normalized_modes),
+                                            ))
+                                        }
                                     }
                                 } else {
                                     Err(SessionSetup::Fatal(format!(
@@ -1210,94 +1273,94 @@ pub(crate) fn spawn(
                                     )))
                                 }
                             }
-                            AcpSessionMode::New => match connection
-                                .send_request(NewSessionRequest::new(cwd.clone()))
-                                .block_task()
-                                .await
-                            {
-                                Ok(session) => {
-                                    let session_id = session.session_id.clone();
-                                    let external_session_id = session_id.0.to_string();
-                                    // Record the agent's identity immediately: a
-                                    // task run can be finalized (or the daemon
-                                    // can crash) long before the first turn ends.
-                                    // A write fault aborts the session rather
-                                    // than letting an untracked conversation
-                                    // continue.
-                                    let recorded = match &ready_binding {
-                                        Some(binding) => binding
-                                            .store
-                                            .mark_ready(
-                                                &binding.id,
-                                                &external_session_id,
-                                                binding.run_id.as_deref(),
-                                            )
-                                            .await
-                                            .map_err(|error| {
-                                                format!(
-                                                    "agent '{agent_name}': cannot record ACP \
-                                                     session id: {error}"
-                                                )
-                                            }),
-                                        None => Ok(()),
-                                    };
-                                    match recorded {
-                                        Err(message) => Err(SessionSetup::Fatal(message)),
-                                        Ok(()) => {
-                                            // Expose the id to the manager even
-                                            // if model selection fails below, so
-                                            // a failed run still reports its
-                                            // identity.
-                                            *session_id_slot.lock() =
-                                                Some(external_session_id.clone());
-                                            // A task names its model explicitly;
-                                            // apply it instead of relying on the
-                                            // agent's last-used default (which may
-                                            // be stale or unavailable here).
-                                            let chosen = if let Some(wanted) =
-                                                &requested_model
-                                            {
-                                                apply_model(&connection, &session, wanted)
-                                                    .await
-                                                    .map(|(model, options)| (Some(model), options))
-                                                    .map_err(|error| {
-                                                        SessionSetup::Fatal(format!(
-                                                            "agent '{agent_name}': {error}"
-                                                        ))
-                                                    })
-                                            } else {
-                                                Ok((
-                                                    current_model(
-                                                        session.config_options.as_deref(),
-                                                    ),
-                                                    normalized_config_options(
-                                                        session.config_options.as_deref(),
-                                                    ),
-                                                ))
-                                            };
-                                            match chosen {
-                                                Ok((chosen_model, options)) => Ok((
-                                                    session_id,
-                                                    external_session_id,
-                                                    chosen_model,
-                                                    options,
-                                                    session.modes.as_ref().map(normalized_modes),
-                                                )),
-                                                Err(failure) => Err(failure),
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(error) => Err(setup_error(
+                            AcpSessionMode::New => {
+                                let session = setup_request(
                                     || {
                                         format!(
                                             "agent '{agent_name}' could not create ACP session"
                                         )
                                     },
-                                    error,
-                                )),
-                            },
-                        };
+                                    "session/new",
+                                    setup_deadline,
+                                    connection
+                                        .send_request(NewSessionRequest::new(cwd.clone()))
+                                        .block_task(),
+                                )
+                                .await?;
+                                let session_id = session.session_id.clone();
+                                let external_session_id = session_id.0.to_string();
+                                // Record the agent's identity immediately: a
+                                // task run can be finalized (or the daemon can
+                                // crash) long before the first turn ends. A
+                                // write fault aborts the session rather than
+                                // letting an untracked conversation continue.
+                                let recorded = match &ready_binding {
+                                    Some(binding) => binding
+                                        .store
+                                        .mark_ready(
+                                            &binding.id,
+                                            &external_session_id,
+                                            binding.run_id.as_deref(),
+                                        )
+                                        .await
+                                        .map_err(|error| {
+                                            format!(
+                                                "agent '{agent_name}': cannot record ACP session \
+                                                 id: {error}"
+                                            )
+                                        }),
+                                    None => Ok(()),
+                                };
+                                match recorded {
+                                    Err(message) => Err(SessionSetup::Fatal(message)),
+                                    Ok(()) => {
+                                        // Expose the id to the manager even if
+                                        // model selection fails below, so a
+                                        // failed run still reports its identity.
+                                        *session_id_slot.lock() =
+                                            Some(external_session_id.clone());
+                                        // A task names its model explicitly;
+                                        // apply it instead of relying on the
+                                        // agent's last-used default (which may
+                                        // be stale or unavailable here).
+                                        let chosen = if let Some(wanted) = &requested_model {
+                                            apply_model(
+                                                &connection,
+                                                &session,
+                                                wanted,
+                                                setup_deadline,
+                                            )
+                                            .await
+                                            .map(|(model, options)| (Some(model), options))
+                                            .map_err(|error| {
+                                                SessionSetup::Fatal(format!(
+                                                    "agent '{agent_name}': {error}"
+                                                ))
+                                            })
+                                        } else {
+                                            Ok((
+                                                current_model(session.config_options.as_deref()),
+                                                normalized_config_options(
+                                                    session.config_options.as_deref(),
+                                                ),
+                                            ))
+                                        };
+                                        match chosen {
+                                            Ok((chosen_model, options)) => Ok((
+                                                session_id,
+                                                external_session_id,
+                                                chosen_model,
+                                                options,
+                                                session.modes.as_ref().map(normalized_modes),
+                                            )),
+                                            Err(failure) => Err(failure),
+                                        }
+                                    }
+                                }
+                            }
+                            }
+                        }
+                        .await;
 
                         match setup {
                             Ok(value) => {
@@ -1708,11 +1771,18 @@ pub(crate) fn spawn(
             }
         }
         running_task.store(false, Ordering::SeqCst);
-        // Kill and reap the server: a clean `close_session` normally ends it,
-        // but a stuck or crashed server must not outlive the daemon or become a
-        // zombie.
-        let _ = child.start_kill();
-        let _ = child.wait().await;
+        // Publish the terminal live state before waking the reaper. The
+        // manager folds it into the session snapshot and forwards the exit
+        // event, so a client never sees a stopped session stuck in Starting.
+        let code = exit_task.load(Ordering::SeqCst);
+        if !terminated_task.swap(true, Ordering::SeqCst) {
+            let _ = result_events.send(AcpEvent::Exited {
+                code: (code >= 0).then_some(code),
+            });
+        }
+        // Ask the reaper to kill the whole agent process group and collect
+        // the child, so a hung or malformed server cannot become a zombie.
+        let _ = teardown_tx.send(());
     });
 
     Ok((
@@ -1730,6 +1800,8 @@ pub(crate) fn spawn(
             last_activity,
             transcript,
             outcome,
+            events: handle_events,
+            terminated,
             task,
         },
         events_rx,
@@ -1757,7 +1829,7 @@ pub(crate) async fn list_provider_sessions(
         &launch.env,
         &launch.cwd,
     )?;
-    let transport = Lines::new(sink_from_stdin(stdin), lossy_lines(stdout.compat()));
+    let transport = Lines::new(sink_from_stdin(stdin), bounded_lines(stdout.compat()));
     let filter_cwd = launch.filter_cwd;
     let cursor = launch.cursor;
 
@@ -1832,7 +1904,7 @@ pub(crate) async fn delete_provider_session(
         &launch.env,
         &launch.cwd,
     )?;
-    let transport = Lines::new(sink_from_stdin(stdin), lossy_lines(stdout.compat()));
+    let transport = Lines::new(sink_from_stdin(stdin), bounded_lines(stdout.compat()));
     let agent = launch.agent;
 
     let result = Client
@@ -2516,6 +2588,7 @@ async fn apply_model(
     connection: &ConnectionTo<Agent>,
     session: &agent_client_protocol::v1::schema::NewSessionResponse,
     wanted: &str,
+    deadline: Duration,
 ) -> anyhow::Result<(String, Vec<SessionConfigOption>)> {
     let option = session
         .config_options
@@ -2550,14 +2623,18 @@ async fn apply_model(
         );
     }
 
-    let response = connection
-        .send_request(SetSessionConfigOptionRequest::new(
-            session.session_id.clone(),
-            option.id.clone(),
-            AcpSessionConfigValue::value_id(wanted.to_string()),
-        ))
-        .block_task()
-        .await?;
+    let response = with_deadline(
+        "session/set_config_option",
+        deadline,
+        connection
+            .send_request(SetSessionConfigOptionRequest::new(
+                session.session_id.clone(),
+                option.id.clone(),
+                AcpSessionConfigValue::value_id(wanted.to_string()),
+            ))
+            .block_task(),
+    )
+    .await?;
     let applied = model_option(&response.config_options)
         .and_then(|option| match &option.kind {
             AcpSessionConfigKind::Select(select) => Some(select.current_value.0.to_string()),
@@ -3177,8 +3254,12 @@ fn sink_from_stdin(
     })
 }
 
-/// Read newline-delimited UTF-8 lossily, like the SDK's stdio transport.
-fn lossy_lines<R>(
+/// Read newline-delimited UTF-8, enforcing [`MAX_MESSAGE_BYTES`].
+///
+/// Unlike the SDK's stdio transport this never lossily rewrites a protocol
+/// message: invalid UTF-8, an oversized line, and EOF in the middle of a line
+/// are all surfaced as read errors that fail the session.
+fn bounded_lines<R>(
     reader: R,
 ) -> impl futures_util::Stream<Item = io::Result<String>> + Send + 'static
 where
@@ -3186,18 +3267,103 @@ where
 {
     let reader = Box::pin(BufReader::new(reader));
     futures_util::stream::try_unfold(reader, |mut reader| async move {
-        let mut line = Vec::new();
-        if reader.read_until(b'\n', &mut line).await? == 0 {
-            return Ok::<_, io::Error>(None);
+        match read_message(&mut reader, MAX_MESSAGE_BYTES).await? {
+            Some(line) => Ok::<_, io::Error>(Some((line, reader))),
+            None => Ok(None),
         }
-        if line.ends_with(b"\n") {
-            line.pop();
-            if line.ends_with(b"\r") {
-                line.pop();
+    })
+}
+
+/// Read one newline-terminated message, without allocating past `max` bytes.
+///
+/// Blank lines are skipped; CRLF is accepted. A partial line at EOF is treated
+/// as a truncated message rather than delivered as if it were complete.
+async fn read_message<R>(reader: &mut R, max: usize) -> io::Result<Option<String>>
+where
+    R: futures_util::io::AsyncBufRead + Unpin,
+{
+    loop {
+        let mut line = Vec::new();
+        loop {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                if line.is_empty() {
+                    return Ok(None);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "ACP message ended before its terminating newline",
+                ));
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let chunk = newline.unwrap_or(available.len());
+            if line.len() + chunk > max {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("ACP message exceeds the {max} byte limit"),
+                ));
+            }
+            match newline {
+                Some(position) => {
+                    line.extend_from_slice(&available[..position]);
+                    reader.consume_unpin(position + 1);
+                    break;
+                }
+                None => {
+                    let consumed = available.len();
+                    line.extend_from_slice(available);
+                    reader.consume_unpin(consumed);
+                }
             }
         }
-        Ok(Some((String::from_utf8_lossy(&line).into_owned(), reader)))
-    })
+        if line.ends_with(b"\r") {
+            line.pop();
+        }
+        if line.is_empty() {
+            continue;
+        }
+        return String::from_utf8(line).map(Some).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("ACP message is not valid UTF-8: {}", error.utf8_error()),
+            )
+        });
+    }
+}
+
+/// Await a setup request, failing with an actionable message on error or timeout.
+///
+/// Only initialization and session setup use this; prompt turns stay unlimited.
+async fn with_deadline<T, F>(what: &str, deadline: Duration, future: F) -> anyhow::Result<T>
+where
+    F: Future<Output = Result<T, agent_client_protocol::Error>>,
+{
+    match tokio::time::timeout(deadline, future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(anyhow::anyhow!("{what} failed: {error}")),
+        Err(_) => Err(anyhow::anyhow!(
+            "{what} did not complete within {deadline:?}; the ACP server may be hung"
+        )),
+    }
+}
+
+/// Kill the agent's process group and reap the direct child.
+///
+/// The supervisor created by `__agent-exec` starts its own process group, so
+/// the negative pid reaches a hung agent and its descendants. When no wrapper
+/// was used the child is not a group leader and the group kill is a harmless
+/// no-op; `start_kill` still terminates the child itself.
+async fn reap_child(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // SAFETY: `kill` is async-signal-safe and accepts any pid; a negative
+        // pid targets the process group `__agent-exec` created.
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        }
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
 }
 
 #[cfg(test)]
@@ -4091,6 +4257,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn framing_rejects_invalid_utf8_instead_of_rewriting_it() {
+        let mut reader = BufReader::new(futures_util::io::Cursor::new(vec![
+            0x7b, 0xff, 0xfe, 0x7d, b'\n',
+        ]));
+        let error = read_message(&mut reader, 64)
+            .await
+            .expect_err("invalid UTF-8 must be a read error");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("not valid UTF-8"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn framing_rejects_an_oversized_line_before_buffering_it() {
+        let mut reader = BufReader::new(futures_util::io::Cursor::new(vec![b'x'; 65]));
+        let error = read_message(&mut reader, 64)
+            .await
+            .expect_err("an oversized line must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("exceeds the 64 byte limit"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn framing_accepts_a_line_exactly_at_the_limit() {
+        let mut input = vec![b'x'; 64];
+        input.push(b'\n');
+        let mut reader = BufReader::new(futures_util::io::Cursor::new(input));
+        let line = read_message(&mut reader, 64)
+            .await
+            .expect("a line at the limit is valid")
+            .expect("one message");
+        assert_eq!(line.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn framing_rejects_eof_in_the_middle_of_a_message() {
+        let mut reader = BufReader::new(futures_util::io::Cursor::new(
+            b"{\"jsonrpc\":\"2.0\"".to_vec(),
+        ));
+        let error = read_message(&mut reader, 1024)
+            .await
+            .expect_err("a truncated message must fail");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(error.to_string().contains("terminating newline"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn framing_handles_fragmented_reads_crlf_and_blank_lines() {
+        let (mut writer, reader) = tokio::io::duplex(8);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            for chunk in [&b"{\"a\""[..], b":1}\r", b"\n\n{\"b\":2}", b"\n"] {
+                writer.write_all(chunk).await.unwrap();
+            }
+            writer.shutdown().await.unwrap();
+        });
+
+        let mut lines = Box::pin(bounded_lines(reader.compat()));
+        assert_eq!(lines.next().await.unwrap().unwrap(), "{\"a\":1}");
+        assert_eq!(lines.next().await.unwrap().unwrap(), "{\"b\":2}");
+        assert!(lines.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_setup_request_times_out_with_the_method_and_deadline() {
+        let pending = std::future::pending::<Result<(), agent_client_protocol::Error>>();
+        let error = with_deadline("initialize", Duration::from_millis(10), pending)
+            .await
+            .expect_err("a hung setup request must time out");
+        let message = error.to_string();
+        assert!(message.contains("initialize"), "{message}");
+        assert!(message.contains("did not complete within"), "{message}");
+        assert!(message.contains("10ms"), "{message}");
+    }
+
+    #[tokio::test]
     async fn a_missing_working_directory_is_named_in_the_error() {
         let launch = AcpLaunch {
             agent: "demo".to_string(),
@@ -4104,6 +4348,7 @@ mod tests {
             prompt: None,
             close_after_turn: true,
             permission_timeout: Duration::from_secs(1),
+            setup_timeout: Duration::from_secs(1),
             session: None,
             start_gate: None,
             lifecycle: None,

@@ -80,6 +80,9 @@ fn main() {
     if let Some(marker) = std::env::var_os("FAKE_ACP_PID_MARKER") {
         let _ = std::fs::write(marker, std::process::id().to_string());
     }
+    record_pids();
+    inject_transport_fault(&mut stdout);
+
     let mut authenticated = std::env::var_os("FAKE_ACP_AUTH_REQUIRED").is_none();
     let mut lines = stdin.lock().lines();
     let mut prompt_turn = 0u32;
@@ -821,6 +824,49 @@ fn provider_cwd(index: usize) -> std::path::PathBuf {
     std::env::var_os("FAKE_ACP_PROVIDER_CWD")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("/tmp/favetto-provider-{}", index % 2)))
+}
+
+/// Record the agent's and its supervisor's pids for the reaping regression.
+///
+/// Tests wait for both to disappear after a failed session, proving the daemon
+/// killed and reaped both the direct child and the process group.
+fn record_pids() {
+    let Some(path) = std::env::var_os("FAKE_ACP_PID_FILE") else {
+        return;
+    };
+    #[cfg(unix)]
+    let parent = unsafe { libc::getppid() };
+    #[cfg(not(unix))]
+    let parent = 0;
+    let _ = std::fs::write(path, format!("{} {parent}\n", std::process::id()));
+}
+
+/// Emit the malformed, oversized, truncated, or hung I/O selected by the test
+/// environment before normal protocol handling begins.
+fn inject_transport_fault(stdout: &mut std::io::Stdout) {
+    if std::env::var_os("FAKE_ACP_TRUNCATE").is_some() {
+        // A partial JSON-RPC frame without its terminating newline, then EOF.
+        let _ = stdout.write_all(br#"{"jsonrpc":"2.0","id":1,"res"#);
+        let _ = stdout.flush();
+        std::process::exit(0);
+    }
+    if std::env::var_os("FAKE_ACP_INVALID_UTF8").is_some() {
+        let _ = stdout.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"\xff\xfe\"}\n");
+        let _ = stdout.flush();
+    }
+    if std::env::var_os("FAKE_ACP_OVERSIZED").is_some() {
+        // One byte over the daemon's documented 8 MiB message bound.
+        let mut line = vec![b'x'; 8 * 1024 * 1024 + 1];
+        line.push(b'\n');
+        let _ = stdout.write_all(&line);
+        let _ = stdout.flush();
+    }
+    if std::env::var_os("FAKE_ACP_INIT_HANG").is_some() {
+        // Never read stdin and never answer `initialize`.
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
 }
 
 /// The optional file gate directory, from `FAKE_ACP_GATE_DIR`.
