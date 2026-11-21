@@ -13,7 +13,8 @@ use std::collections::{HashMap, HashSet};
 
 use dioxus::prelude::*;
 use favetto_wire::model::{
-    AgentStateEvent, AgentUsage, IdleOutcome, InputRequest, MessageRole, RunSummary,
+    AgentStateEvent, AgentUsage, ContentRole, IdleOutcome, InputRequest, MessageContent,
+    MessageRole, RunSummary,
 };
 use favetto_wire::rpc::AgentEventPush;
 
@@ -105,6 +106,22 @@ pub fn tool_icon(name: &str) -> AppIconKind {
         AppIconKind::ToolTodo
     } else {
         AppIconKind::ToolGeneric
+    }
+}
+
+fn content_role_label(role: ContentRole) -> &'static str {
+    match role {
+        ContentRole::User => "user",
+        ContentRole::Assistant => "assistant",
+        ContentRole::Thought => "thinking",
+    }
+}
+
+fn content_role_class(role: ContentRole) -> &'static str {
+    match role {
+        ContentRole::User => "role-user",
+        ContentRole::Assistant => "role-assistant",
+        ContentRole::Thought => "role-reasoning",
     }
 }
 
@@ -220,6 +237,11 @@ pub enum FeedItem {
     /// event follows (or for the persisted [`summary_feed`] block, which is
     /// never streaming).
     Reasoning { text: String, streaming: bool },
+    /// A non-text message block, rendered as a safe placeholder.
+    ContentBlock {
+        role: ContentRole,
+        content: MessageContent,
+    },
     /// A tool invocation, from `Started` to `Finished`.
     Tool {
         id: String,
@@ -262,6 +284,10 @@ pub fn feed_item(event: &AgentStateEvent) -> Option<FeedItem> {
             // A lone delta is an in-progress chunk; `build_feed` coalesces the
             // run and clears the flag on the event that closes it.
             streaming: true,
+        }),
+        AgentStateEvent::ContentBlock { role, content } => Some(FeedItem::ContentBlock {
+            role: *role,
+            content: content.clone(),
         }),
         AgentStateEvent::ToolStarted {
             id, name, input, ..
@@ -724,6 +750,16 @@ fn FeedRow(
                 }
             }
         }
+        FeedItem::ContentBlock { role, content } => {
+            let label = content_role_label(role);
+            let role_class = content_role_class(role);
+            rsx! {
+                div { class: "feed-item feed-content-block",
+                    span { class: "feed-role {role_class}", "{label}" }
+                    pre { class: "feed-text", "{content.placeholder()}" }
+                }
+            }
+        }
         FeedItem::Tool {
             name,
             input,
@@ -938,6 +974,22 @@ mod tests {
             }),
             Some(FeedItem::Reasoning { .. })
         ));
+        assert_eq!(
+            feed_item(&AgentStateEvent::ContentBlock {
+                role: ContentRole::Assistant,
+                content: MessageContent::Image {
+                    mime_type: "image/png".to_string(),
+                    uri: Some("https://example.com/a.png".to_string()),
+                },
+            }),
+            Some(FeedItem::ContentBlock {
+                role: ContentRole::Assistant,
+                content: MessageContent::Image {
+                    mime_type: "image/png".to_string(),
+                    uri: Some("https://example.com/a.png".to_string()),
+                },
+            })
+        );
         assert!(matches!(
             feed_item(&AgentStateEvent::ToolStarted {
                 id: "c1".to_string(),
@@ -1024,6 +1076,56 @@ mod tests {
             id: "req_1".to_string()
         })
         .is_none());
+    }
+
+    #[test]
+    fn build_feed_keeps_non_text_content_blocks_in_stream_order() {
+        let content = MessageContent::ResourceLink {
+            uri: "file:///tmp/a.txt".to_string(),
+            name: "a.txt".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            title: None,
+            description: None,
+            size: None,
+        };
+        let events = vec![
+            push(
+                1,
+                AgentStateEvent::TextDelta {
+                    role: MessageRole::Assistant,
+                    text: "before".to_string(),
+                },
+            ),
+            push(
+                2,
+                AgentStateEvent::ContentBlock {
+                    role: ContentRole::Thought,
+                    content: content.clone(),
+                },
+            ),
+            push(
+                3,
+                AgentStateEvent::TextDelta {
+                    role: MessageRole::Assistant,
+                    text: "after".to_string(),
+                },
+            ),
+        ];
+        let items = build_feed(&events);
+        assert_eq!(items.len(), 3);
+        assert!(matches!(
+            &items[0],
+            FeedItem::Message { text, .. } if text == "before"
+        ));
+        assert!(matches!(
+            &items[1],
+            FeedItem::ContentBlock { role: ContentRole::Thought, content: block }
+                if block == &content
+        ));
+        assert!(matches!(
+            &items[2],
+            FeedItem::Message { text, .. } if text == "after"
+        ));
     }
 
     #[test]
@@ -1585,6 +1687,52 @@ mod tests {
         }
         let mut dom = VirtualDom::new(Harness);
         dom.rebuild_in_place();
+    }
+
+    #[test]
+    fn content_block_rows_render_a_plain_non_interactive_placeholder() {
+        #[component]
+        fn Harness() -> Element {
+            use_context_provider(AppState::new);
+            let items = use_signal(|| {
+                vec![FeedItem::ContentBlock {
+                    role: ContentRole::Thought,
+                    content: MessageContent::Image {
+                        mime_type: "image/png".to_string(),
+                        uri: Some("https://example.com/a.png".to_string()),
+                    },
+                }]
+            });
+            let busy = use_signal(|| false);
+            let toast = use_signal(|| None::<(ToastKind, String)>);
+            let refresh = use_signal(|| 0u64);
+            rsx! {
+                FeedList {
+                    items: items(),
+                    session_id: "ses_1".to_string(),
+                    revision: 1,
+                    busy,
+                    toast,
+                    refresh,
+                }
+            }
+        }
+
+        let mut dom = VirtualDom::new(Harness);
+        let mutations = dom.rebuild_to_vec();
+        let text = rendered_text(&mutations);
+        assert!(text.contains("thinking"), "role label missing: {text}");
+        assert!(
+            text.contains("image image/png <https://example.com/a.png>"),
+            "placeholder missing: {text}"
+        );
+        assert!(
+            !mutations.edits.iter().any(|mutation| matches!(
+                mutation,
+                Mutation::SetAttribute { name, .. } if *name == "href"
+            )),
+            "the placeholder must not create a link"
+        );
     }
 
     // -- Host-side intent regression ----------------------------------------

@@ -41,8 +41,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use favetto_core::model::{
-    AgentLoadState, AgentStateEvent, AwaitingInputKind, InputReply, InputRequest, MessageRole,
-    PermissionPolicy, ToolCallDetail, ToolCallStatus, ToolContent, ToolKind, ToolLocation,
+    AgentLoadState, AgentStateEvent, AwaitingInputKind, ContentRole, InputReply, InputRequest,
+    MessageContent, MessageRole, PermissionPolicy, ToolCallDetail, ToolCallStatus, ToolContent,
+    ToolKind, ToolLocation,
 };
 
 use super::session_store::SessionBinding;
@@ -1298,35 +1299,33 @@ fn map_update(
     tools: &Mutex<ToolTracker>,
 ) -> Vec<AgentStateEvent> {
     match update {
-        SessionUpdate::UserMessageChunk(chunk) => content_text(&chunk.content)
-            .map(|text| {
+        SessionUpdate::UserMessageChunk(chunk) => match &chunk.content {
+            ContentBlock::Text(text) => vec![AgentStateEvent::TextDelta {
+                role: MessageRole::User,
+                text: text.text.clone(),
+            }],
+            block => content_block_event(ContentRole::User, block),
+        },
+        SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+            ContentBlock::Text(text) => {
+                transcript.lock().push_str(&text.text);
+                {
+                    let mut state = outcome.lock();
+                    state.assistant_text.push_str(&text.text);
+                }
                 vec![AgentStateEvent::TextDelta {
-                    role: MessageRole::User,
-                    text: text.to_string(),
+                    role: MessageRole::Assistant,
+                    text: text.text.clone(),
                 }]
-            })
-            .unwrap_or_default(),
-        SessionUpdate::AgentMessageChunk(chunk) => {
-            let Some(text) = content_text(&chunk.content) else {
-                return Vec::new();
-            };
-            transcript.lock().push_str(text);
-            {
-                let mut state = outcome.lock();
-                state.assistant_text.push_str(text);
             }
-            vec![AgentStateEvent::TextDelta {
-                role: MessageRole::Assistant,
-                text: text.to_string(),
-            }]
-        }
-        SessionUpdate::AgentThoughtChunk(chunk) => content_text(&chunk.content)
-            .map(|text| {
-                vec![AgentStateEvent::ReasoningDelta {
-                    text: text.to_string(),
-                }]
-            })
-            .unwrap_or_default(),
+            block => content_block_event(ContentRole::Assistant, block),
+        },
+        SessionUpdate::AgentThoughtChunk(chunk) => match &chunk.content {
+            ContentBlock::Text(text) => vec![AgentStateEvent::ReasoningDelta {
+                text: text.text.clone(),
+            }],
+            block => content_block_event(ContentRole::Thought, block),
+        },
         SessionUpdate::ToolCall(tool) => {
             transcript.lock().push_str(&format!(
                 "\n[tool] {}: {}\n",
@@ -1429,10 +1428,47 @@ fn map_update(
     }
 }
 
-fn content_text(block: &ContentBlock) -> Option<&str> {
+/// Normalize a non-text message block into one wire event. Binary payloads are
+/// never copied; clients receive only the metadata for a safe placeholder.
+fn content_block_event(role: ContentRole, block: &ContentBlock) -> Vec<AgentStateEvent> {
+    vec![AgentStateEvent::ContentBlock {
+        role,
+        content: message_content(block),
+    }]
+}
+
+fn message_content(block: &ContentBlock) -> MessageContent {
     match block {
-        ContentBlock::Text(text) => Some(&text.text),
-        _ => None,
+        ContentBlock::Text(_) => MessageContent::Unknown,
+        ContentBlock::Image(image) => MessageContent::Image {
+            mime_type: image.mime_type.clone(),
+            uri: image.uri.clone(),
+        },
+        ContentBlock::Audio(audio) => MessageContent::Audio {
+            mime_type: audio.mime_type.clone(),
+        },
+        ContentBlock::ResourceLink(link) => MessageContent::ResourceLink {
+            uri: link.uri.clone(),
+            name: link.name.clone(),
+            mime_type: link.mime_type.clone(),
+            title: link.title.clone(),
+            description: link.description.clone(),
+            size: link.size,
+        },
+        ContentBlock::Resource(resource) => match &resource.resource {
+            EmbeddedResourceResource::TextResourceContents(text) => MessageContent::Resource {
+                uri: text.uri.clone(),
+                mime_type: text.mime_type.clone(),
+                binary: false,
+            },
+            EmbeddedResourceResource::BlobResourceContents(blob) => MessageContent::Resource {
+                uri: blob.uri.clone(),
+                mime_type: blob.mime_type.clone(),
+                binary: true,
+            },
+            _ => MessageContent::Unknown,
+        },
+        _ => MessageContent::Unknown,
     }
 }
 
@@ -1582,8 +1618,9 @@ where
 mod tests {
     use super::*;
     use agent_client_protocol::v1::schema::{
-        Content, ContentChunk, Cost, Diff, ImageContent, Terminal, TextResourceContents, ToolCall,
-        ToolCallId, ToolCallLocation, ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
+        AudioContent, BlobResourceContents, Content, ContentChunk, Cost, Diff, EmbeddedResource,
+        EmbeddedResourceResource, ImageContent, ResourceLink, Terminal, TextResourceContents,
+        ToolCall, ToolCallId, ToolCallLocation, ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
     };
 
     /// A `map_update` fixture with isolated transcript/outcome/tool state.
@@ -1720,6 +1757,110 @@ mod tests {
             }
             other => panic!("expected usage snapshots, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn non_text_message_chunks_preserve_role_and_metadata() {
+        let harness = Harness::new();
+
+        let user = SessionUpdate::UserMessageChunk(ContentChunk::new(ContentBlock::ResourceLink(
+            ResourceLink::new("notes.txt", "file:///tmp/notes.txt").mime_type("text/plain"),
+        )));
+        assert_eq!(
+            harness.map(&user),
+            vec![AgentStateEvent::ContentBlock {
+                role: ContentRole::User,
+                content: MessageContent::ResourceLink {
+                    uri: "file:///tmp/notes.txt".to_string(),
+                    name: "notes.txt".to_string(),
+                    mime_type: Some("text/plain".to_string()),
+                    title: None,
+                    description: None,
+                    size: None,
+                },
+            }]
+        );
+
+        let assistant = SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Image(
+            ImageContent::new("BASE64_PAYLOAD", "image/png").uri("https://example.com/a.png"),
+        )));
+        assert_eq!(
+            harness.map(&assistant),
+            vec![AgentStateEvent::ContentBlock {
+                role: ContentRole::Assistant,
+                content: MessageContent::Image {
+                    mime_type: "image/png".to_string(),
+                    uri: Some("https://example.com/a.png".to_string()),
+                },
+            }]
+        );
+        // A non-text assistant chunk is not assistant prose for success accounting.
+        assert_eq!(&*harness.transcript.lock(), "");
+        assert_eq!(harness.outcome.lock().assistant_text, "");
+
+        let thought = SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Audio(
+            AudioContent::new("BASE64_AUDIO", "audio/wav"),
+        )));
+        assert_eq!(
+            harness.map(&thought),
+            vec![AgentStateEvent::ContentBlock {
+                role: ContentRole::Thought,
+                content: MessageContent::Audio {
+                    mime_type: "audio/wav".to_string(),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn embedded_message_resources_are_metadata_only() {
+        let harness = Harness::new();
+        let blob = SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Resource(
+            EmbeddedResource::new(EmbeddedResourceResource::BlobResourceContents(
+                BlobResourceContents::new("SECRET_BLOB", "file:///tmp/a.bin")
+                    .mime_type("application/octet-stream"),
+            )),
+        )));
+        let events = harness.map(&blob);
+        match &events[0] {
+            AgentStateEvent::ContentBlock {
+                role: ContentRole::Assistant,
+                content:
+                    MessageContent::Resource {
+                        uri,
+                        mime_type,
+                        binary: true,
+                    },
+            } => {
+                assert_eq!(uri, "file:///tmp/a.bin");
+                assert_eq!(mime_type.as_deref(), Some("application/octet-stream"));
+            }
+            other => panic!("expected a binary resource block, got {other:?}"),
+        }
+        let json = serde_json::to_value(&events).unwrap();
+        assert!(
+            !json.to_string().contains("SECRET_BLOB"),
+            "binary payload leaked into the wire event"
+        );
+
+        let text = SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Resource(
+            EmbeddedResource::new(EmbeddedResourceResource::TextResourceContents(
+                TextResourceContents::new("EMBEDDED_TEXT", "file:///tmp/a.txt"),
+            )),
+        )));
+        let events = harness.map(&text);
+        assert!(matches!(
+            &events[0],
+            AgentStateEvent::ContentBlock {
+                role: ContentRole::Thought,
+                content: MessageContent::Resource { binary: false, .. }
+            }
+        ));
+        let json = serde_json::to_value(&events).unwrap();
+        assert!(
+            !json.to_string().contains("EMBEDDED_TEXT"),
+            "embedded text should stay out of the metadata-only wire event"
+        );
     }
 
     #[test]

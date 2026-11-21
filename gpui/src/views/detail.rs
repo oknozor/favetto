@@ -18,7 +18,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use chrono::Utc;
-use favetto_wire::model::{AgentUsage, InputReply, MessageRole, Task, TaskRun};
+use favetto_wire::model::{AgentUsage, ContentRole, InputReply, MessageRole, Task, TaskRun};
 use gpui::{
     div, list, prelude::*, px, AnyElement, Context, Div, ElementId, Entity, FocusHandle, FontStyle,
     FontWeight, Hsla, InteractiveText, IntoElement, ListAlignment, ListState, Render, ScrollHandle,
@@ -1637,6 +1637,14 @@ fn role_label(role: MessageRole) -> &'static str {
     }
 }
 
+fn content_role_label(role: ContentRole) -> &'static str {
+    match role {
+        ContentRole::User => "user",
+        ContentRole::Assistant => "assistant",
+        ContentRole::Thought => "thinking",
+    }
+}
+
 fn outcome_label(outcome: favetto_wire::model::IdleOutcome) -> &'static str {
     match outcome {
         favetto_wire::model::IdleOutcome::Succeeded => "succeeded",
@@ -1699,6 +1707,29 @@ fn feed_item(theme: &Theme, base: &TextStyle, index: usize, row: &FeedRow) -> Di
                 .child(header)
                 .child(body)
         }
+        FeedItem::ContentBlock { role, content } => div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .px(px(theme.spacing.s2))
+            .py(px(theme.spacing.s1))
+            .rounded(px(theme.radii.r4))
+            .border_1()
+            .border_color(Hsla::from(theme.colors.border).opacity(0.45))
+            .child(
+                div()
+                    .text_size(px(theme.font.xs))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.colors.muted)
+                    .child(content_role_label(*role)),
+            )
+            .child(
+                div()
+                    .font_family("monospace")
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.muted)
+                    .child(content.placeholder()),
+            ),
         FeedItem::Tool {
             name,
             input,

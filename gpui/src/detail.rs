@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use favetto_wire::model::{
-    AgentSessionInfo, AgentStateEvent, AgentUsage, AwaitingInputKind, IdleOutcome, InputRequest,
-    MessageRole, RunStatus, Task, TaskRun, TaskStatus,
+    AgentSessionInfo, AgentStateEvent, AgentUsage, AwaitingInputKind, ContentRole, IdleOutcome,
+    InputRequest, MessageContent, MessageRole, RunStatus, Task, TaskRun, TaskStatus,
 };
 use favetto_wire::rpc::{AgentEventPush, RpcCall, TasksEventsParams};
 use serde::{Deserialize, Serialize};
@@ -264,6 +264,13 @@ pub enum FeedItem {
         /// True while this is the trailing reasoning run.
         streaming: bool,
     },
+    /// A non-text message block, rendered as a safe placeholder.
+    ContentBlock {
+        /// Which message stream carried the block.
+        role: ContentRole,
+        /// Metadata-only block (no binary payload).
+        content: MessageContent,
+    },
     /// A tool invocation, from start to finish.
     Tool {
         /// The agent's correlation id.
@@ -337,6 +344,12 @@ pub fn build_feed(events: &[AgentEventPush]) -> Vec<FeedItem> {
                     streaming: true,
                 }),
             },
+            AgentStateEvent::ContentBlock { role, content } => {
+                items.push(FeedItem::ContentBlock {
+                    role: *role,
+                    content: content.clone(),
+                });
+            }
             AgentStateEvent::ToolStarted {
                 id, name, input, ..
             } => {
@@ -1137,6 +1150,42 @@ mod tests {
             FeedItem::Boundary(IdleOutcome::Succeeded)
         ));
         assert!(matches!(&feed[6], FeedItem::Error(message) if message == "boom"));
+    }
+
+    #[test]
+    fn feed_keeps_non_text_content_blocks_in_order() {
+        let content = MessageContent::Image {
+            mime_type: "image/png".to_string(),
+            uri: Some("https://example.com/a.png".to_string()),
+        };
+        let events = vec![
+            text(1, MessageRole::Assistant, "before"),
+            push(
+                2,
+                AgentStateEvent::ContentBlock {
+                    role: ContentRole::Assistant,
+                    content: content.clone(),
+                },
+            ),
+            text(3, MessageRole::Assistant, "after"),
+        ];
+        let feed = build_feed(&events);
+        assert_eq!(feed.len(), 3);
+        assert!(matches!(
+            &feed[0],
+            FeedItem::Message { text, .. } if text == "before"
+        ));
+        assert!(matches!(
+            &feed[1],
+            FeedItem::ContentBlock { role: ContentRole::Assistant, content: block }
+                if block == &content
+        ));
+        assert!(matches!(
+            &feed[2],
+            FeedItem::Message { text, .. } if text == "after"
+        ));
+        assert!(content.placeholder().contains("image/png"));
+        assert!(content.placeholder().contains("https://example.com/a.png"));
     }
 
     #[test]

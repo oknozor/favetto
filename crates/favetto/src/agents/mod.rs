@@ -22,7 +22,7 @@ use tokio::sync::broadcast;
 
 use favetto_core::model::{
     AgentActivity, AgentBackend, AgentCapabilities, AgentLoadState, AgentSessionInfo,
-    AgentStateEvent, AgentUsage, AwaitingInputReason, InputReply, PermissionPolicy,
+    AgentStateEvent, AgentUsage, AwaitingInputReason, ContentRole, InputReply, PermissionPolicy,
 };
 use favetto_core::rpc::AgentEventPush;
 
@@ -226,6 +226,13 @@ impl AgentLiveState {
             }
             AgentStateEvent::TextDelta { .. } => {
                 self.activity = Some(AgentActivity::Responding);
+            }
+            AgentStateEvent::ContentBlock { role, .. } => {
+                self.activity = Some(if *role == ContentRole::Thought {
+                    AgentActivity::Thinking
+                } else {
+                    AgentActivity::Responding
+                });
             }
             AgentStateEvent::ToolStarted { name, .. } => {
                 self.activity = Some(AgentActivity::Tool {
@@ -1070,6 +1077,32 @@ fn spawn_state_task(
             code: Some(session.exit_code.load(Ordering::SeqCst)),
         });
     });
+}
+
+#[cfg(test)]
+mod content_block_state_tests {
+    use super::*;
+    use favetto_core::model::MessageContent;
+
+    #[test]
+    fn non_text_message_blocks_drive_activity_without_usage() {
+        let mut live = AgentLiveState::default();
+        live.apply(&AgentStateEvent::ContentBlock {
+            role: ContentRole::Assistant,
+            content: MessageContent::Image {
+                mime_type: "image/png".to_string(),
+                uri: None,
+            },
+        });
+        assert_eq!(live.activity, Some(AgentActivity::Responding));
+        assert!(live.usage.is_none());
+
+        live.apply(&AgentStateEvent::ContentBlock {
+            role: ContentRole::Thought,
+            content: MessageContent::Unknown,
+        });
+        assert_eq!(live.activity, Some(AgentActivity::Thinking));
+    }
 }
 
 #[cfg(test)]
