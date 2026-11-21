@@ -1,6 +1,7 @@
 agent = "opencode"
 provider = "opencode-go"
 model = "deepseek-v4.1-flash"
+worktree = false
 spawn = "repo:Favetto/plan_issue"
 spawn_file = ".favetto/triage/{{ task.id }}/manifest.json"
 ---
