@@ -13,8 +13,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use favetto_core::model::{
-    AgentStateEvent, IdleOutcome, MessageRole, ToolCallDetail, ToolCallStatus, ToolContent,
-    ToolKind, ToolLocation,
+    AgentStateEvent, ContentRole, IdleOutcome, MessageContent, MessageRole, ToolCallDetail,
+    ToolCallStatus, ToolContent, ToolKind, ToolLocation,
 };
 
 use super::sanitize::{line as clean_line, text as clean_text};
@@ -51,6 +51,12 @@ pub enum FeedKind {
         text: String,
         streaming: bool,
         expanded: bool,
+    },
+    /// A non-text message block, rendered as a safe, non-interactive
+    /// placeholder. Binary payloads never reach the feed.
+    ContentBlock {
+        role: ContentRole,
+        content: MessageContent,
     },
     /// A tool invocation, updated in place by ACP id.
     Tool(Box<ToolCard>),
@@ -294,6 +300,12 @@ impl AgentFeed {
                     }
                 }
                 self.push(FeedKind::Message { role: *role, text });
+            }
+            AgentStateEvent::ContentBlock { role, content } => {
+                self.push(FeedKind::ContentBlock {
+                    role: *role,
+                    content: content.clone(),
+                });
             }
             AgentStateEvent::ReasoningDelta { text } => {
                 let text = clean_text(text);
@@ -548,6 +560,9 @@ impl AgentFeed {
                     theme,
                     selected == Some(item.id),
                 ),
+                FeedKind::ContentBlock { role, content } => {
+                    push_content_block(&mut lines, *role, content, theme)
+                }
                 FeedKind::Tool(tool) => {
                     push_tool(&mut lines, tool, theme, selected == Some(item.id))
                 }
@@ -738,6 +753,33 @@ fn push_thinking(
             )));
         }
     }
+}
+
+fn push_content_block(
+    out: &mut Vec<Line<'static>>,
+    role: ContentRole,
+    content: &MessageContent,
+    theme: &Theme,
+) {
+    let label = match role {
+        ContentRole::User => "You",
+        ContentRole::Assistant => "Assistant",
+        ContentRole::Thought => "Thinking",
+    };
+    out.push(Line::from(vec![
+        Span::styled(
+            format!("{label}  "),
+            Style::default()
+                .fg(theme.accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            clean_line(&content.placeholder()),
+            Style::default()
+                .fg(theme.muted())
+                .add_modifier(Modifier::ITALIC),
+        ),
+    ]));
 }
 
 /// Highlight the selected row. A background is enough in a colour theme; the
@@ -1124,6 +1166,52 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn non_text_message_blocks_render_in_order_as_placeholders() {
+        let mut feed = AgentFeed::new();
+        feed.apply(&AgentStateEvent::TextDelta {
+            role: MessageRole::Assistant,
+            text: "before".to_string(),
+        });
+        feed.apply(&AgentStateEvent::ContentBlock {
+            role: ContentRole::Assistant,
+            content: MessageContent::Image {
+                mime_type: "image/png".to_string(),
+                uri: Some("https://example.com/a.png".to_string()),
+            },
+        });
+        feed.apply(&AgentStateEvent::ContentBlock {
+            role: ContentRole::Thought,
+            content: MessageContent::Resource {
+                uri: "file:///tmp/a.bin".to_string(),
+                mime_type: None,
+                binary: true,
+            },
+        });
+        feed.apply(&AgentStateEvent::TextDelta {
+            role: MessageRole::Assistant,
+            text: "after".to_string(),
+        });
+
+        assert_eq!(feed.len(), 4, "a content block splits the text run");
+        let text = rendered_text(&feed);
+        let before = text.find("before").expect("first text");
+        let image = text
+            .find("image image/png <https://example.com/a.png>")
+            .expect("image placeholder");
+        let resource = text
+            .find("resource <file:///tmp/a.bin> (binary)")
+            .expect("resource placeholder");
+        let after = text.find("after").expect("last text");
+        assert!(before < image && image < resource && resource < after);
+        assert!(text.contains("Thinking"));
+        assert_eq!(
+            text.matches("https://example.com/a.png").count(),
+            1,
+            "the URI is shown as text and never auto-fetched or duplicated"
+        );
     }
 
     #[test]

@@ -511,6 +511,128 @@ pub enum ToolContent {
     Terminal { terminal_id: String },
 }
 
+/// The message-chunk role that carried a non-text [`MessageContent`] block.
+///
+/// This is deliberately separate from [`MessageRole`]: thoughts are a streaming
+/// display concept, not a role in the persisted conversation model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ContentRole {
+    /// A user message chunk.
+    User,
+    /// An assistant message chunk.
+    Assistant,
+    /// The assistant's chain-of-thought.
+    Thought,
+}
+
+impl ContentRole {
+    /// Stable string form used on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContentRole::User => "user",
+            ContentRole::Assistant => "assistant",
+            ContentRole::Thought => "thought",
+        }
+    }
+}
+
+/// A non-text content block carried by a user, assistant, or thought message.
+///
+/// Binary payloads (base64 image/audio bytes and blob resources) are
+/// deliberately omitted. Only the metadata needed to render an explanatory
+/// placeholder survives the ACP-to-wire conversion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MessageContent {
+    /// An image, without its base64 payload.
+    Image {
+        mime_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uri: Option<String>,
+    },
+    /// An audio clip, without its base64 payload.
+    Audio { mime_type: String },
+    /// A reference to an external resource.
+    ResourceLink {
+        uri: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<i64>,
+    },
+    /// An embedded resource, without its text or binary payload.
+    Resource {
+        uri: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        binary: bool,
+    },
+    /// A block this client does not understand. Clients render a generic
+    /// placeholder rather than failing to decode the whole feed.
+    #[serde(other)]
+    Unknown,
+}
+
+impl MessageContent {
+    /// A deterministic, plain-text placeholder for clients that cannot render
+    /// this block. It never implies a fetch or opens a URI.
+    pub fn placeholder(&self) -> String {
+        match self {
+            MessageContent::Image { mime_type, uri } => {
+                media_placeholder("image", mime_type, uri.as_deref())
+            }
+            MessageContent::Audio { mime_type } => media_placeholder("audio", mime_type, None),
+            MessageContent::ResourceLink {
+                uri,
+                name,
+                mime_type,
+                size,
+                ..
+            } => {
+                let mut text = format!("link {name} <{uri}>");
+                if let Some(mime_type) = mime_type {
+                    text.push_str(&format!(" {mime_type}"));
+                }
+                if let Some(size) = size {
+                    text.push_str(&format!(" {size} bytes"));
+                }
+                text
+            }
+            MessageContent::Resource {
+                uri,
+                mime_type,
+                binary,
+            } => {
+                let mut text = format!("resource <{uri}>");
+                if let Some(mime_type) = mime_type {
+                    text.push_str(&format!(" {mime_type}"));
+                }
+                if *binary {
+                    text.push_str(" (binary)");
+                }
+                text
+            }
+            MessageContent::Unknown => "unsupported content block".to_string(),
+        }
+    }
+}
+
+fn media_placeholder(kind: &str, mime_type: &str, uri: Option<&str>) -> String {
+    match uri {
+        Some(uri) => format!("{kind} {mime_type} <{uri}>"),
+        None => format!("{kind} {mime_type}"),
+    }
+}
+
 /// Cumulative, wire-friendly detail for one tool call.
 ///
 /// This is a *snapshot*, not a patch: every field is the latest value the
@@ -576,6 +698,16 @@ pub enum AgentStateEvent {
     TextDelta { role: MessageRole, text: String },
     /// Chain-of-thought text (display-only).
     ReasoningDelta { text: String },
+    /// A non-text message block (image, audio, resource, …).
+    ///
+    /// Text continues to stream through [`AgentStateEvent::TextDelta`] and
+    /// [`AgentStateEvent::ReasoningDelta`]. This event preserves the role and
+    /// streamed position of every other block without transporting its binary
+    /// payload.
+    ContentBlock {
+        role: ContentRole,
+        content: MessageContent,
+    },
     /// A tool invocation started.
     ///
     /// `name`/`input` are the legacy flattened fields; `detail` carries the
@@ -855,6 +987,13 @@ mod tests {
             AgentStateEvent::ReasoningDelta {
                 text: "why".to_string(),
             },
+            AgentStateEvent::ContentBlock {
+                role: ContentRole::Assistant,
+                content: MessageContent::Image {
+                    mime_type: "image/png".to_string(),
+                    uri: Some("file:///tmp/a.png".to_string()),
+                },
+            },
             AgentStateEvent::ToolStarted {
                 id: "c1".to_string(),
                 name: "read".to_string(),
@@ -915,6 +1054,89 @@ mod tests {
             snapshot,
             AgentStateEvent::Usage { snapshot: true, .. }
         ));
+    }
+
+    #[test]
+    fn message_content_is_metadata_only_and_has_a_safe_placeholder() {
+        let content = [
+            MessageContent::Image {
+                mime_type: "image/png".to_string(),
+                uri: Some("https://example.com/a.png".to_string()),
+            },
+            MessageContent::Audio {
+                mime_type: "audio/wav".to_string(),
+            },
+            MessageContent::ResourceLink {
+                uri: "file:///tmp/a.txt".to_string(),
+                name: "a.txt".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                title: Some("A".to_string()),
+                description: Some("notes".to_string()),
+                size: Some(12),
+            },
+            MessageContent::Resource {
+                uri: "file:///tmp/b.bin".to_string(),
+                mime_type: Some("application/octet-stream".to_string()),
+                binary: true,
+            },
+            MessageContent::Unknown,
+        ];
+
+        for block in content {
+            let json = serde_json::to_value(&block).unwrap();
+            assert!(json.get("data").is_none());
+            assert!(json.get("blob").is_none());
+            assert!(json.get("text").is_none());
+            let back: MessageContent = serde_json::from_value(json).unwrap();
+            assert_eq!(back, block);
+        }
+
+        // A future block tag decodes to the generic variant instead of failing.
+        let unknown: MessageContent =
+            serde_json::from_value(serde_json::json!({ "type": "future_block" })).unwrap();
+        assert_eq!(unknown, MessageContent::Unknown);
+        assert_eq!(unknown.placeholder(), "unsupported content block");
+    }
+
+    #[test]
+    fn content_block_placeholders_are_deterministic_and_non_rendering() {
+        let image = MessageContent::Image {
+            mime_type: "image/png".to_string(),
+            uri: Some("https://example.com/a.png".to_string()),
+        };
+        assert_eq!(
+            image.placeholder(),
+            "image image/png <https://example.com/a.png>"
+        );
+        assert_eq!(
+            MessageContent::Audio {
+                mime_type: "audio/wav".to_string(),
+            }
+            .placeholder(),
+            "audio audio/wav"
+        );
+        assert_eq!(
+            MessageContent::ResourceLink {
+                uri: "file:///tmp/a.txt".to_string(),
+                name: "a.txt".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                title: Some("A".to_string()),
+                description: None,
+                size: Some(12),
+            }
+            .placeholder(),
+            "link a.txt <file:///tmp/a.txt> text/plain 12 bytes"
+        );
+        assert_eq!(
+            MessageContent::Resource {
+                uri: "file:///tmp/b.bin".to_string(),
+                mime_type: None,
+                binary: true,
+            }
+            .placeholder(),
+            "resource <file:///tmp/b.bin> (binary)"
+        );
+        assert_eq!(ContentRole::Thought.as_str(), "thought");
     }
 
     #[test]
