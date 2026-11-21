@@ -24,11 +24,14 @@ use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::schema::{
-    AgentCapabilities, CancelNotification, ContentBlock, EmbeddedResourceResource,
-    InitializeRequest, LoadSessionRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionConfigOption, SessionId, SessionNotification, SessionUpdate,
-    TextContent, ToolCall as AcpToolCall, ToolCallContent as AcpToolCallContent,
+    AgentCapabilities, AvailableCommand as AcpAvailableCommand,
+    AvailableCommandInput as AcpAvailableCommandInput, CancelNotification, ContentBlock,
+    EmbeddedResourceResource, InitializeRequest, LoadSessionRequest, NewSessionRequest,
+    PermissionOptionKind, PlanEntry as AcpPlanEntry, PlanEntryPriority as AcpPlanPriority,
+    PlanEntryStatus as AcpPlanStatus, PromptRequest, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionConfigOption, SessionId, SessionNotification, SessionUpdate, TextContent,
+    ToolCall as AcpToolCall, ToolCallContent as AcpToolCallContent,
     ToolCallLocation as AcpToolCallLocation, ToolCallStatus as AcpToolCallStatus,
     ToolCallUpdateFields as AcpToolCallUpdateFields, ToolKind as AcpToolKind,
 };
@@ -41,9 +44,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use favetto_core::model::{
-    AgentLoadState, AgentStateEvent, AwaitingInputKind, ContentRole, InputReply, InputRequest,
-    MessageContent, MessageRole, PermissionPolicy, ToolCallDetail, ToolCallStatus, ToolContent,
-    ToolKind, ToolLocation,
+    AgentCommand, AgentLoadState, AgentPlanEntry, AgentPlanPriority, AgentPlanStatus,
+    AgentStateEvent, AwaitingInputKind, ContentRole, InputReply, InputRequest, MessageContent,
+    MessageRole, PermissionPolicy, ToolCallDetail, ToolCallStatus, ToolContent, ToolKind,
+    ToolLocation,
 };
 
 use super::session_store::SessionBinding;
@@ -472,6 +476,11 @@ pub(crate) fn spawn(
             .connect_with(
                 transport,
                 move |connection: ConnectionTo<Agent>| async move {
+                    // Plain ACP v1 plan checklists and available-command updates
+                    // are baseline and need no client capability. The `plan`
+                    // capability opts into plan operations (`plan_update` /
+                    // `plan_removed`, identified/Markdown plans), which Favetto
+                    // intentionally does not advertise or implement.
                     let init = connection
                         .send_request(InitializeRequest::new(ProtocolVersion::V1))
                         .block_task()
@@ -1421,9 +1430,21 @@ fn map_update(
                 }]
             })
             .unwrap_or_default(),
-        // Plan, mode, command-list and vendor-specific updates are not part of
-        // the normalized model yet. `SessionUpdate` is non-exhaustive, so this
-        // arm is required and keeps unknown updates harmless.
+        SessionUpdate::Plan(plan) => vec![AgentStateEvent::Plan {
+            entries: plan.entries.iter().map(plan_entry).collect(),
+        }],
+        SessionUpdate::AvailableCommandsUpdate(update) => {
+            vec![AgentStateEvent::AvailableCommands {
+                commands: update
+                    .available_commands
+                    .iter()
+                    .map(available_command)
+                    .collect(),
+            }]
+        }
+        // Mode, config and vendor-specific updates are not part of the
+        // normalized model yet. `SessionUpdate` is non-exhaustive, so this arm
+        // is required and keeps unknown updates harmless.
         _ => Vec::new(),
     }
 }
@@ -1435,6 +1456,49 @@ fn content_block_event(role: ContentRole, block: &ContentBlock) -> Vec<AgentStat
         role,
         content: message_content(block),
     }]
+}
+
+/// Normalize one ACP plan entry.
+fn plan_entry(entry: &AcpPlanEntry) -> AgentPlanEntry {
+    AgentPlanEntry {
+        content: entry.content.clone(),
+        priority: plan_priority(&entry.priority),
+        status: plan_status(&entry.status),
+    }
+}
+
+/// Normalize an ACP plan priority. A future/unknown value maps to `Unknown`.
+fn plan_priority(priority: &AcpPlanPriority) -> AgentPlanPriority {
+    match priority {
+        AcpPlanPriority::High => AgentPlanPriority::High,
+        AcpPlanPriority::Medium => AgentPlanPriority::Medium,
+        AcpPlanPriority::Low => AgentPlanPriority::Low,
+        _ => AgentPlanPriority::Unknown,
+    }
+}
+
+/// Normalize an ACP plan status. A future/unknown value maps to `Unknown`.
+fn plan_status(status: &AcpPlanStatus) -> AgentPlanStatus {
+    match status {
+        AcpPlanStatus::Pending => AgentPlanStatus::Pending,
+        AcpPlanStatus::InProgress => AgentPlanStatus::InProgress,
+        AcpPlanStatus::Completed => AgentPlanStatus::Completed,
+        _ => AgentPlanStatus::Unknown,
+    }
+}
+
+/// Normalize one advertised ACP command, keeping only the unstructured input
+/// hint clients can display.
+fn available_command(command: &AcpAvailableCommand) -> AgentCommand {
+    let input_hint = match &command.input {
+        Some(AcpAvailableCommandInput::Unstructured(input)) => Some(input.hint.clone()),
+        _ => None,
+    };
+    AgentCommand {
+        name: command.name.clone(),
+        description: command.description.clone(),
+        input_hint,
+    }
 }
 
 fn message_content(block: &ContentBlock) -> MessageContent {
@@ -1619,8 +1683,9 @@ mod tests {
     use super::*;
     use agent_client_protocol::v1::schema::{
         AudioContent, BlobResourceContents, Content, ContentChunk, Cost, Diff, EmbeddedResource,
-        EmbeddedResourceResource, ImageContent, ResourceLink, Terminal, TextResourceContents,
-        ToolCall, ToolCallId, ToolCallLocation, ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
+        EmbeddedResourceResource, ImageContent, Plan as AcpPlan, ResourceLink, Terminal,
+        TextResourceContents, ToolCall, ToolCallId, ToolCallLocation, ToolCallUpdate,
+        ToolCallUpdateFields, UsageUpdate,
     };
 
     /// A `map_update` fixture with isolated transcript/outcome/tool state.
@@ -1860,6 +1925,123 @@ mod tests {
         assert!(
             !json.to_string().contains("EMBEDDED_TEXT"),
             "embedded text should stay out of the metadata-only wire event"
+        );
+    }
+
+    #[test]
+    fn plan_update_replaces_entries_and_preserves_order() {
+        let harness = Harness::new();
+        let first = SessionUpdate::Plan(AcpPlan::new(vec![
+            AcpPlanEntry::new("First", AcpPlanPriority::High, AcpPlanStatus::Completed),
+            AcpPlanEntry::new("Second", AcpPlanPriority::Low, AcpPlanStatus::Pending),
+        ]));
+        assert_eq!(
+            harness.map(&first),
+            vec![AgentStateEvent::Plan {
+                entries: vec![
+                    AgentPlanEntry {
+                        content: "First".to_string(),
+                        priority: AgentPlanPriority::High,
+                        status: AgentPlanStatus::Completed,
+                    },
+                    AgentPlanEntry {
+                        content: "Second".to_string(),
+                        priority: AgentPlanPriority::Low,
+                        status: AgentPlanStatus::Pending,
+                    },
+                ],
+            }]
+        );
+
+        // A later update is the complete new list, not an append or patch.
+        let second = SessionUpdate::Plan(AcpPlan::new(vec![AcpPlanEntry::new(
+            "Only",
+            AcpPlanPriority::Medium,
+            AcpPlanStatus::InProgress,
+        )]));
+        assert_eq!(
+            harness.map(&second),
+            vec![AgentStateEvent::Plan {
+                entries: vec![AgentPlanEntry {
+                    content: "Only".to_string(),
+                    priority: AgentPlanPriority::Medium,
+                    status: AgentPlanStatus::InProgress,
+                }],
+            }]
+        );
+        assert_eq!(&*harness.transcript.lock(), "");
+    }
+
+    #[test]
+    fn plan_update_with_empty_entries_is_a_replacement() {
+        let harness = Harness::new();
+        assert_eq!(
+            harness.map(&SessionUpdate::Plan(AcpPlan::new(Vec::new()))),
+            vec![AgentStateEvent::Plan {
+                entries: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn available_commands_update_replaces_list_and_keeps_hints() {
+        use agent_client_protocol::v1::schema::{
+            AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
+            UnstructuredCommandInput,
+        };
+
+        let harness = Harness::new();
+        let first = SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
+            AvailableCommand::new("web", "Search the web").input(
+                AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("query")),
+            ),
+            AvailableCommand::new("test", "Run tests"),
+        ]));
+        assert_eq!(
+            harness.map(&first),
+            vec![AgentStateEvent::AvailableCommands {
+                commands: vec![
+                    AgentCommand {
+                        name: "web".to_string(),
+                        description: "Search the web".to_string(),
+                        input_hint: Some("query".to_string()),
+                    },
+                    AgentCommand {
+                        name: "test".to_string(),
+                        description: "Run tests".to_string(),
+                        input_hint: None,
+                    },
+                ],
+            }]
+        );
+
+        let second = SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
+            AvailableCommand::new("plan", "Show the plan"),
+        ]));
+        assert_eq!(
+            harness.map(&second),
+            vec![AgentStateEvent::AvailableCommands {
+                commands: vec![AgentCommand {
+                    name: "plan".to_string(),
+                    description: "Show the plan".to_string(),
+                    input_hint: None,
+                }],
+            }]
+        );
+    }
+
+    #[test]
+    fn available_commands_update_with_empty_list_clears() {
+        use agent_client_protocol::v1::schema::AvailableCommandsUpdate;
+
+        let harness = Harness::new();
+        assert_eq!(
+            harness.map(&SessionUpdate::AvailableCommandsUpdate(
+                AvailableCommandsUpdate::new(Vec::new())
+            )),
+            vec![AgentStateEvent::AvailableCommands {
+                commands: Vec::new(),
+            }]
         );
     }
 

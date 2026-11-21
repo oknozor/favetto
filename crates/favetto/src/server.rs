@@ -33,7 +33,7 @@ use favetto_core::workflow::{
     WorkflowTaskView,
 };
 
-use crate::agents::AgentEvent;
+use crate::agents::{AgentEvent, AttachedAgent};
 use crate::db;
 use crate::event_bus::{OnLag, ServerPush};
 use crate::state::State;
@@ -232,7 +232,13 @@ async fn handle_request(
         let resp = match parse_params::<StartAgentParams>(&req.method, &req.params) {
             Ok(params) => match start_agent(state, params).await {
                 Ok(session) => match state.agents.attach(&session.id) {
-                    Ok((session, data, seq)) => {
+                    Ok(AttachedAgent {
+                        session,
+                        data,
+                        seq,
+                        plan,
+                        commands,
+                    }) => {
                         subscribed.lock().insert(session.id.clone());
                         Response::ok(
                             id,
@@ -240,6 +246,8 @@ async fn handle_request(
                                 session,
                                 data: base64::engine::general_purpose::STANDARD.encode(&data),
                                 seq,
+                                plan,
+                                commands,
                             }),
                         )
                     }
@@ -274,7 +282,13 @@ async fn handle_request(
     if req.method == method::AGENTS_ATTACH {
         let resp = match parse_params::<SessionIdParams>(&req.method, &req.params) {
             Ok(p) => match state.agents.attach(&p.session_id) {
-                Ok((session, data, seq)) => {
+                Ok(AttachedAgent {
+                    session,
+                    data,
+                    seq,
+                    plan,
+                    commands,
+                }) => {
                     subscribed.lock().insert(p.session_id);
                     Response::ok(
                         id,
@@ -282,6 +296,8 @@ async fn handle_request(
                             session,
                             data: base64::engine::general_purpose::STANDARD.encode(&data),
                             seq,
+                            plan,
+                            commands,
                         }),
                     )
                 }
@@ -301,7 +317,13 @@ async fn handle_request(
         let resp = match parse_params::<AgentLoadParams>(&req.method, &req.params) {
             Ok(p) => match load_agent(state, &p.session_id, None).await {
                 Ok(session) => match state.agents.attach(&session.id) {
-                    Ok((session, data, seq)) => {
+                    Ok(AttachedAgent {
+                        session,
+                        data,
+                        seq,
+                        plan,
+                        commands,
+                    }) => {
                         subscribed.lock().insert(session.id.clone());
                         Response::ok(
                             id,
@@ -309,6 +331,8 @@ async fn handle_request(
                                 session,
                                 data: base64::engine::general_purpose::STANDARD.encode(&data),
                                 seq,
+                                plan,
+                                commands,
                             }),
                         )
                     }
@@ -662,14 +686,15 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
         method::TASKS_EVENTS => {
             let p: TasksEventsParams = parse_params(&req.method, &req.params)?;
             let limit = p.limit.unwrap_or(500).min(2000) as usize;
-            let (session_id, events, next_cursor) =
-                state
-                    .agents
-                    .events_for_task(&p.id.to_string(), p.after.unwrap_or(0), limit);
+            let feed = state
+                .agents
+                .events_for_task(&p.id.to_string(), p.after.unwrap_or(0), limit);
             to_value(TasksEventsResult {
-                session_id,
-                events,
-                next_cursor,
+                session_id: feed.session_id,
+                events: feed.events,
+                next_cursor: feed.next_cursor,
+                plan: feed.plan,
+                commands: feed.commands,
             })
         }
 
@@ -1693,12 +1718,12 @@ async fn start_oneshot_task(
         });
     }
 
-    let (session_info, frame, seq) = state.agents.attach(&info.id)?;
+    let attached = state.agents.attach(&info.id)?;
     Ok(StartOneshotResult {
         task,
-        session: session_info,
-        data: base64::engine::general_purpose::STANDARD.encode(&frame),
-        seq,
+        session: attached.session,
+        data: base64::engine::general_purpose::STANDARD.encode(&attached.data),
+        seq: attached.seq,
     })
 }
 

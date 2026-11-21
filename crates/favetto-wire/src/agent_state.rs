@@ -668,6 +668,65 @@ pub struct ToolCallDetail {
     pub locations: Vec<ToolLocation>,
 }
 
+/// The relative importance of one execution-plan entry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPlanPriority {
+    High,
+    #[default]
+    Medium,
+    Low,
+    /// A priority this client does not understand.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The lifecycle status of one execution-plan entry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPlanStatus {
+    #[default]
+    Pending,
+    InProgress,
+    Completed,
+    /// A status this client does not understand.
+    #[serde(other)]
+    Unknown,
+}
+
+/// One step of the agent's current execution plan.
+///
+/// A plan update carries the complete ordered checklist; consumers replace their
+/// previous list wholesale rather than appending to it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AgentPlanEntry {
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub priority: AgentPlanPriority,
+    #[serde(default)]
+    pub status: AgentPlanStatus,
+}
+
+/// One slash command advertised by the agent.
+///
+/// Commands are prompt text: the client inserts `/name ` into the composer and
+/// sends the user's prompt unchanged. It never invokes them out of band.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AgentCommand {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Hint shown for a command that accepts free-form arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_hint: Option<String>,
+}
+
 /// How a run or turn ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -757,6 +816,18 @@ pub enum AgentStateEvent {
     },
     /// The session's title changed.
     Title { title: String },
+    /// The agent's complete current execution plan. Replaces any previous plan;
+    /// an empty list is a replacement that clears it.
+    Plan {
+        #[serde(default)]
+        entries: Vec<AgentPlanEntry>,
+    },
+    /// The agent's complete set of advertised slash commands. Replaces any
+    /// previous list; an empty list is a replacement that clears it.
+    AvailableCommands {
+        #[serde(default)]
+        commands: Vec<AgentCommand>,
+    },
     /// The session became idle (turn/run boundary).
     Idle { outcome: IdleOutcome },
     /// A session-level error.
@@ -972,6 +1043,66 @@ mod tests {
     }
 
     #[test]
+    fn plan_and_commands_replace_whole_lists_and_default_unknowns() {
+        let empty_plan = AgentStateEvent::Plan {
+            entries: Vec::new(),
+        };
+        let json = serde_json::to_value(&empty_plan).unwrap();
+        assert_eq!(json, serde_json::json!({ "event": "plan", "entries": [] }));
+        assert_eq!(
+            serde_json::from_value::<AgentStateEvent>(json).unwrap(),
+            empty_plan
+        );
+
+        let empty_commands = AgentStateEvent::AvailableCommands {
+            commands: Vec::new(),
+        };
+        let json = serde_json::to_value(&empty_commands).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "event": "available_commands", "commands": [] })
+        );
+        assert_eq!(
+            serde_json::from_value::<AgentStateEvent>(json).unwrap(),
+            empty_commands
+        );
+
+        // Unknown priorities/statuses degrade instead of failing the whole event.
+        let decoded: AgentStateEvent = serde_json::from_value(serde_json::json!({
+            "event": "plan",
+            "entries": [{ "content": "future", "priority": "urgent", "status": "blocked" }]
+        }))
+        .unwrap();
+        assert_eq!(
+            decoded,
+            AgentStateEvent::Plan {
+                entries: vec![AgentPlanEntry {
+                    content: "future".to_string(),
+                    priority: AgentPlanPriority::Unknown,
+                    status: AgentPlanStatus::Unknown,
+                }],
+            }
+        );
+
+        // Fields missing from an older/newer payload use their defaults.
+        let lean: AgentStateEvent = serde_json::from_value(serde_json::json!({
+            "event": "plan",
+            "entries": [{ "content": "step" }]
+        }))
+        .unwrap();
+        assert_eq!(
+            lean,
+            AgentStateEvent::Plan {
+                entries: vec![AgentPlanEntry {
+                    content: "step".to_string(),
+                    priority: AgentPlanPriority::Medium,
+                    status: AgentPlanStatus::Pending,
+                }],
+            }
+        );
+    }
+
+    #[test]
     fn agent_state_event_round_trips() {
         let events = [
             AgentStateEvent::Session {
@@ -1010,6 +1141,20 @@ mod tests {
             AgentStateEvent::Usage {
                 usage: AgentUsage::default(),
                 snapshot: true,
+            },
+            AgentStateEvent::Plan {
+                entries: vec![AgentPlanEntry {
+                    content: "Read the issue".to_string(),
+                    priority: AgentPlanPriority::High,
+                    status: AgentPlanStatus::InProgress,
+                }],
+            },
+            AgentStateEvent::AvailableCommands {
+                commands: vec![AgentCommand {
+                    name: "web".to_string(),
+                    description: "Search the web".to_string(),
+                    input_hint: Some("query".to_string()),
+                }],
             },
             AgentStateEvent::Idle {
                 outcome: IdleOutcome::Interrupted,

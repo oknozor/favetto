@@ -252,6 +252,8 @@ typed_calls! {
     agents_history => AgentsHistoryCall,
     /// `agents.load`.
     agents_load => AgentsLoadCall,
+    /// `agents.prompt`.
+    agents_prompt => AgentsPromptCall,
     /// `agents.reply`.
     agents_reply => AgentsReplyCall,
     /// `agents.cancel`.
@@ -565,6 +567,25 @@ mod tests {
                 assert_eq!(request.id, 5);
                 assert_eq!(request.method, method::AGENTS_CANCEL);
                 assert_eq!(request.params["session_id"], "local-live");
+            }
+            other => panic!("expected a request frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_prompt_request_preserves_an_unknown_command_verbatim() {
+        let params = AgentPromptParams {
+            session_id: "sess-1".to_string(),
+            prompt: "/unknown arg with spaces".to_string(),
+        };
+        let bytes = encode_request::<AgentsPromptCall>(5, &params).expect("encode");
+        let frame: Frame = rmp_serde::from_slice(&bytes).expect("decode frame");
+        match frame {
+            Frame::Request(request) => {
+                assert_eq!(request.id, 5);
+                assert_eq!(request.method, method::AGENTS_PROMPT);
+                assert_eq!(request.params["session_id"], "sess-1");
+                assert_eq!(request.params["prompt"], "/unknown arg with spaces");
             }
             other => panic!("expected a request frame, got {other:?}"),
         }

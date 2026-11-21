@@ -18,6 +18,7 @@ use gpui::{
 use crate::actions::{
     self, CatalogChoiceNext, CatalogChoicePrev, CatalogFieldNext, CatalogFieldPrev,
     CatalogLaunchSubmit, CatalogNewOneshot, CatalogSearch, CatalogToggleFolder, CloseOverlay,
+    DetailPromptComplete, DetailPromptNext, DetailPromptPrev, DetailPromptSend, DetailReply,
     FocusNext, FocusPrev, GoCatalog, GoInbox, GoSchedules, GoSettings, GoTasks, GoWorkflows,
     ListDown, ListEnd, ListHome, ListOpen, ListPageDown, ListPageUp, ListUp, PaletteConfirm,
     PaletteDown, PaletteUp, Refresh, RepoPickerConfirm, RepoPickerDown, RepoPickerUp,
@@ -1269,6 +1270,13 @@ impl RootView {
             ("Toggle enabled", "⌘E"),
             ("Save schedule", "⌘↵"),
         ];
+        let detail = [
+            ("Reply to the agent", "m"),
+            ("Send the prompt", "↵"),
+            ("Complete a slash command", "tab"),
+            ("Select a command", "↑ ↓"),
+            ("Close the composer", "esc"),
+        ];
 
         let panel = div()
             .w(px(640.0))
@@ -1324,6 +1332,7 @@ impl RootView {
                     .flex()
                     .gap(px(theme.spacing.s6))
                     .items_start()
+                    .child(shortcut_section(theme, "DETAIL", &detail))
                     .child(shortcut_section(theme, "ANYWHERE", &anywhere)),
             );
 
@@ -2203,6 +2212,7 @@ impl Render for RootView {
             catalog_oneshot_open,
             schedule_sheet_open,
             settings_typing,
+            detail_prompt_active,
         ) = {
             let state = self.state.read(cx);
             (
@@ -2218,6 +2228,7 @@ impl Render for RootView {
                 state.catalog().oneshot().is_some(),
                 state.schedule_editor_open(),
                 state.settings().is_editing_text(),
+                state.detail_prompt_active(),
             )
         };
         let mut key_context = String::from("Root");
@@ -2272,6 +2283,11 @@ impl Render for RootView {
             // triggering the global single-key shortcuts.
             key_context.push_str(" RepoPicker Search");
         }
+        if detail_prompt_active {
+            // The composer owns typed text and key navigation; keep the generic
+            // `Search` suppression so single-key jumps never fire mid-prompt.
+            key_context.push_str(" DetailPrompt Search");
+        }
 
         let root = shell_root()
             .bg(theme.colors.bg)
@@ -2295,6 +2311,14 @@ impl Render for RootView {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &CloseOverlay, window, cx| {
+                if this.state.read(cx).detail_prompt_active() {
+                    this.state.update(cx, |state, cx| {
+                        state.close_detail_prompt();
+                        cx.notify();
+                    });
+                    cx.stop_propagation();
+                    return;
+                }
                 this.close_overlay(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleShortcuts, window, cx| {
@@ -2459,6 +2483,36 @@ impl Render for RootView {
                     cx.notify();
                 });
             }))
+            .on_action(cx.listener(|this, _: &DetailReply, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.start_detail_reply();
+                    cx.notify();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &DetailPromptSend, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.send_detail_prompt(cx);
+                    cx.notify();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &DetailPromptComplete, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.detail_prompt_complete_command();
+                    cx.notify();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &DetailPromptNext, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.detail_prompt_move_command(1);
+                    cx.notify();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &DetailPromptPrev, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.detail_prompt_move_command(-1);
+                    cx.notify();
+                });
+            }))
             .on_action(cx.listener(|this, _: &PaletteUp, _window, cx| {
                 this.move_palette(-1, cx);
             }))
@@ -2572,7 +2626,13 @@ impl Render for RootView {
                     {
                         return;
                     }
-                    let (task_typing, catalog_typing, schedule_typing, settings_typing) = {
+                    let (
+                        task_typing,
+                        catalog_typing,
+                        schedule_typing,
+                        settings_typing,
+                        detail_typing,
+                    ) = {
                         let state = this.state.read(cx);
                         let route = state.active_route();
                         (
@@ -2584,14 +2644,22 @@ impl Render for RootView {
                                     || state.catalog().any_form_open()),
                             route == Route::Schedules && state.schedule_editor_open(),
                             route == Route::Settings && state.settings().is_editing_text(),
+                            state.detail_prompt_active(),
                         )
                     };
-                    if !task_typing && !catalog_typing && !schedule_typing && !settings_typing {
+                    if !task_typing
+                        && !catalog_typing
+                        && !schedule_typing
+                        && !settings_typing
+                        && !detail_typing
+                    {
                         return;
                     }
                     if keystroke.key == "backspace" {
                         this.state.update(cx, |state, cx| {
-                            if schedule_typing {
+                            if detail_typing {
+                                state.detail_prompt_backspace();
+                            } else if schedule_typing {
                                 state.schedule_backspace();
                             } else if settings_typing {
                                 state.settings_backspace();
@@ -2611,7 +2679,9 @@ impl Render for RootView {
                         if !characters.is_empty() {
                             this.state.update(cx, |state, cx| {
                                 for character in characters {
-                                    if schedule_typing {
+                                    if detail_typing {
+                                        state.detail_prompt_push_char(character);
+                                    } else if schedule_typing {
                                         state.schedule_push_char(character);
                                     } else if settings_typing {
                                         state.settings_push_char(character);

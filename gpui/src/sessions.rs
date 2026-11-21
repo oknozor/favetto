@@ -276,6 +276,8 @@ mod tests {
             session: session(id),
             data: base64::engine::general_purpose::STANDARD.encode(text.as_bytes()),
             seq: 3,
+            plan: Vec::new(),
+            commands: Vec::new(),
         }
     }
 
@@ -407,6 +409,8 @@ mod tests {
                 session: session("local-past"),
                 data: "not base64!".to_string(),
                 seq: 0,
+                plan: Vec::new(),
+                commands: Vec::new(),
             }),
         );
         assert_eq!(history.transcript("local-past"), None);

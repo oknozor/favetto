@@ -27,12 +27,13 @@ use favetto_wire::model::{
     TaskRun,
 };
 use favetto_wire::rpc::{
-    AgentAttachResult, AgentCancelParams, AgentCancelResult, AgentReplyParams, AgentReplyResult,
-    AgentsHistoryParams, CatalogEntry, CatalogGetParams, EmptyParams, PingParams, PingResult,
-    ReposActivateParams, ReposListResult, ScheduleDeleteParams, ScheduleUpsertParams,
-    SchedulesDeleteResult, SessionIdParams, StartOneshotParams, StartOneshotResult, TaskIdParams,
-    TasksEventsParams, TasksListParams, TasksStartParams, WorkflowCancelResultBody,
-    WorkflowGetResult, WorkflowInspectParams, WorkflowRetryParams,
+    AgentAttachResult, AgentCancelParams, AgentCancelResult, AgentPromptParams, AgentPromptResult,
+    AgentReplyParams, AgentReplyResult, AgentsHistoryParams, CatalogEntry, CatalogGetParams,
+    EmptyParams, PingParams, PingResult, ReposActivateParams, ReposListResult,
+    ScheduleDeleteParams, ScheduleUpsertParams, SchedulesDeleteResult, SessionIdParams,
+    StartOneshotParams, StartOneshotResult, TaskIdParams, TasksEventsParams, TasksListParams,
+    TasksStartParams, WorkflowCancelResultBody, WorkflowGetResult, WorkflowInspectParams,
+    WorkflowRetryParams,
 };
 use favetto_wire::workflow::WorkflowInspect;
 use uuid::Uuid;
@@ -100,6 +101,9 @@ pub enum Command {
     },
     /// Interrupt the in-flight turn of one live agent session (`agents.cancel`).
     CancelTurn { session_id: String },
+    /// Send an ordinary follow-up prompt (`agents.prompt`). Slash commands are
+    /// prompt text; the runtime never rewrites the string.
+    Prompt { session_id: String, prompt: String },
     /// Restore a persisted ACP session by its Favetto-local id (`agents.load`).
     LoadAgentSession { session_id: String },
     /// Fetch one root's runtime workflow graph (`workflow.inspect`).
@@ -221,6 +225,12 @@ pub enum Update {
     TurnCancelFinished {
         session_id: String,
         result: Result<AgentCancelResult, ClientError>,
+    },
+    /// `agents.prompt` completed for one follow-up prompt.
+    PromptFinished {
+        session_id: String,
+        prompt: String,
+        result: Result<AgentPromptResult, ClientError>,
     },
     /// `agents.load` completed for the Favetto-local session id.
     AgentSessionLoaded {
@@ -407,6 +417,11 @@ impl Runtime {
     /// Interrupt the in-flight turn of one live agent session.
     pub fn cancel_turn(&self, session_id: String) {
         self.send(Command::CancelTurn { session_id });
+    }
+
+    /// Send an ordinary follow-up prompt through `agents.prompt`.
+    pub fn prompt(&self, session_id: String, prompt: String) {
+        self.send(Command::Prompt { session_id, prompt });
     }
 
     /// Restore a persisted session by its Favetto-local id.
@@ -596,6 +611,9 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
             }
             Command::CancelTurn { session_id } => {
                 spawn_cancel_turn(client.clone(), updates.clone(), session_id);
+            }
+            Command::Prompt { session_id, prompt } => {
+                spawn_prompt(client.clone(), updates.clone(), session_id, prompt);
             }
             Command::LoadAgentSession { session_id } => {
                 spawn_agent_load(client.clone(), updates.clone(), session_id);
@@ -852,6 +870,8 @@ fn spawn_events_load(client: Arc<RpcClient>, updates: Sender<Update>, task_id: U
         let mut ignored = 0usize;
         let mut next_cursor = 0u64;
         let mut after = 0u64;
+        let mut plan = None;
+        let mut commands = None;
 
         for _ in 0..MAX_PAGES {
             let page = client
@@ -865,6 +885,12 @@ fn spawn_events_load(client: Arc<RpcClient>, updates: Sender<Update>, task_id: U
                 Ok(page) => {
                     if session_id.is_none() {
                         session_id = page.session_id.clone();
+                    }
+                    if page.plan.is_some() {
+                        plan = page.plan.clone();
+                    }
+                    if page.commands.is_some() {
+                        commands = page.commands.clone();
                     }
                     ignored += page.ignored;
                     next_cursor = next_cursor.max(page.next_cursor);
@@ -896,6 +922,8 @@ fn spawn_events_load(client: Arc<RpcClient>, updates: Sender<Update>, task_id: U
             session_id,
             events,
             next_cursor,
+            plan,
+            commands,
             ignored,
         };
         let _ = updates.try_send(Update::EventsLoaded {
@@ -951,6 +979,28 @@ fn spawn_cancel_turn(client: Arc<RpcClient>, updates: Sender<Update>, session_id
             })
             .await;
         let _ = updates.try_send(Update::TurnCancelFinished { session_id, result });
+    });
+}
+
+/// Spawn one `agents.prompt` for a follow-up prompt.
+fn spawn_prompt(
+    client: Arc<RpcClient>,
+    updates: Sender<Update>,
+    session_id: String,
+    prompt: String,
+) {
+    tokio::spawn(async move {
+        let result = client
+            .agents_prompt(AgentPromptParams {
+                session_id: session_id.clone(),
+                prompt: prompt.clone(),
+            })
+            .await;
+        let _ = updates.try_send(Update::PromptFinished {
+            session_id,
+            prompt,
+            result,
+        });
     });
 }
 

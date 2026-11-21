@@ -263,7 +263,28 @@ impl App {
     }
 
     /// Encode a keypress and forward it to the active agent session.
-    pub(super) fn forward_agent_key(&self, key: &KeyEvent) -> UiAction {
+    pub(super) fn forward_agent_key(&mut self, key: &KeyEvent) -> UiAction {
+        if self.agent_backend == AgentBackend::Acp
+            && !self.agent_read_only
+            && self.agent_command_query().is_some()
+            && !self.agent_command_matches().is_empty()
+        {
+            match key.code {
+                KeyCode::Tab => {
+                    self.complete_agent_command();
+                    return UiAction::None;
+                }
+                KeyCode::Up => {
+                    self.move_agent_command(-1);
+                    return UiAction::None;
+                }
+                KeyCode::Down => {
+                    self.move_agent_command(1);
+                    return UiAction::None;
+                }
+                _ => {}
+            }
+        }
         let bytes = encode_key(key);
         if bytes.is_empty() {
             UiAction::None

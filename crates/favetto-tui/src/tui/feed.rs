@@ -13,8 +13,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use favetto_core::model::{
-    AgentStateEvent, ContentRole, IdleOutcome, MessageContent, MessageRole, ToolCallDetail,
-    ToolCallStatus, ToolContent, ToolKind, ToolLocation,
+    AgentPlanEntry, AgentPlanPriority, AgentPlanStatus, AgentStateEvent, ContentRole, IdleOutcome,
+    MessageContent, MessageRole, ToolCallDetail, ToolCallStatus, ToolContent, ToolKind,
+    ToolLocation,
 };
 
 use super::sanitize::{line as clean_line, text as clean_text};
@@ -1091,6 +1092,56 @@ fn one_line(text: &str) -> String {
     }
 }
 
+/// Render the current plan as a compact checklist. Content is sanitized plain
+/// text (never Markdown), and the row count is capped for hostile/large plans.
+pub fn plan_lines(plan: &[AgentPlanEntry], theme: &Theme) -> Vec<Line<'static>> {
+    const MAX_PLAN_ROWS: usize = 12;
+    let total = plan.len();
+    let completed = plan
+        .iter()
+        .filter(|entry| entry.status == AgentPlanStatus::Completed)
+        .count();
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            "Plan",
+            Style::default()
+                .fg(theme.accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" · {completed}/{total}"),
+            Style::default().fg(theme.muted()),
+        ),
+    ])];
+
+    for entry in plan.iter().take(MAX_PLAN_ROWS) {
+        let (glyph, color) = match entry.status {
+            AgentPlanStatus::Completed => ("[x]", theme.success()),
+            AgentPlanStatus::InProgress => ("[>]", theme.accent()),
+            AgentPlanStatus::Pending => ("[ ]", theme.fg()),
+            AgentPlanStatus::Unknown => ("[?]", theme.muted()),
+        };
+        let priority = match entry.priority {
+            AgentPlanPriority::High => " (!)",
+            _ => "",
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{glyph} "), Style::default().fg(color)),
+            Span::styled(
+                format!("{}{}", clean_line(&entry.content), priority),
+                Style::default().fg(theme.fg()),
+            ),
+        ]));
+    }
+    if total > MAX_PLAN_ROWS {
+        lines.push(Line::from(Span::styled(
+            format!("… {} more", total - MAX_PLAN_ROWS),
+            Style::default().fg(theme.muted()),
+        )));
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1749,5 +1800,56 @@ mod tests {
         assert!(expanded.contains("-old"));
         assert!(expanded.contains("+new"));
         assert!(expanded.contains("terminal term-1"));
+    }
+
+    #[test]
+    fn plan_lines_renders_statuses_order_priority_and_caps_rows() {
+        let theme = Theme::dark();
+        let plan = vec![
+            AgentPlanEntry {
+                content: "done".to_string(),
+                priority: AgentPlanPriority::High,
+                status: AgentPlanStatus::Completed,
+            },
+            AgentPlanEntry {
+                content: "running".to_string(),
+                priority: AgentPlanPriority::Medium,
+                status: AgentPlanStatus::InProgress,
+            },
+            AgentPlanEntry {
+                content: "waiting".to_string(),
+                priority: AgentPlanPriority::Low,
+                status: AgentPlanStatus::Pending,
+            },
+        ];
+        let lines = plan_lines(&plan, &theme);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(text[0].contains("Plan · 1/3"));
+        assert!(text[1].contains("[x] done (!)"));
+        assert!(text[2].contains("[>] running"));
+        assert!(text[3].contains("[ ] waiting"));
+
+        let many: Vec<_> = (0..14)
+            .map(|index| AgentPlanEntry {
+                content: format!("step {index}"),
+                ..Default::default()
+            })
+            .collect();
+        let capped = plan_lines(&many, &theme);
+        assert_eq!(capped.len(), 1 + 12 + 1);
+        assert!(capped
+            .last()
+            .unwrap()
+            .spans
+            .iter()
+            .any(|span| span.content.contains("2 more")));
     }
 }

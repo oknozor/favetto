@@ -20,8 +20,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use favetto_wire::model::{
-    AgentCatalogEntry, AgentSessionInfo, AgentUsage, EventKind, InputReply, RepoInfo, Task,
-    TaskStatus,
+    AgentCatalogEntry, AgentCommand, AgentPlanEntry, AgentSessionInfo, AgentUsage, EventKind,
+    InputReply, RepoInfo, Task, TaskStatus,
 };
 use favetto_wire::rpc::AgentEventPush;
 use gpui::{ClipboardItem, Context, Task as GpuiTask, WindowAppearance};
@@ -716,6 +716,8 @@ impl ClientState {
                             result.session_id,
                             result.events,
                             result.next_cursor,
+                            result.plan,
+                            result.commands,
                             result.ignored,
                         );
                     }
@@ -839,6 +841,64 @@ impl ClientState {
                     );
                 }
             },
+            Update::PromptFinished {
+                session_id,
+                prompt,
+                result,
+            } => {
+                if let Some(detail) = self.detail.as_mut() {
+                    if detail
+                        .events_session
+                        .as_deref()
+                        .is_none_or(|id| id == session_id)
+                    {
+                        detail.prompt_sending = false;
+                    }
+                }
+                match result {
+                    Ok(result) if result.accepted => {
+                        if let Some(detail) = self.detail.as_mut() {
+                            detail.prompt.clear();
+                            detail.prompt_selected = None;
+                            detail.prompt_error = None;
+                        }
+                        // Pull the first plan/command snapshot for the new turn.
+                        if let (Some(runtime), Some(task_id)) = (
+                            &self.runtime,
+                            self.detail.as_ref().map(|detail| detail.task_id),
+                        ) {
+                            runtime.load_task_events(task_id);
+                        }
+                    }
+                    Ok(_) => {
+                        if let Some(detail) = self.detail.as_mut() {
+                            detail.prompt_error =
+                                Some("The daemon did not accept the prompt.".to_string());
+                        }
+                        self.show_toast(
+                            ToastKind::Error,
+                            "The agent did not accept the prompt.".to_string(),
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        if error.is_unauthorized() {
+                            self.connection = ConnectionState::Unauthorized {
+                                token_path: self.config.token_source.label(),
+                            };
+                        }
+                        if let Some(detail) = self.detail.as_mut() {
+                            detail.prompt_error = Some(error.to_string());
+                        }
+                        let _ = prompt;
+                        self.show_toast(
+                            ToastKind::Error,
+                            format!("Could not send the prompt: {error}."),
+                            cx,
+                        );
+                    }
+                }
+            }
             Update::AgentSessionLoaded { session_id, result } => {
                 match result {
                     Ok(attached) => {
@@ -3393,6 +3453,19 @@ impl ClientState {
             .map(|session| session.id.clone())
     }
 
+    /// The Favetto-local session id used for `agents.prompt`: the live session
+    /// for the selected task, falling back to the session behind the event feed.
+    pub fn detail_agent_session_id(&self) -> Option<String> {
+        let detail = self.detail.as_ref()?;
+        let task_id = detail.task_id.to_string();
+        self.sessions
+            .iter()
+            .filter(|session| session.task_id.as_deref() == Some(task_id.as_str()))
+            .max_by_key(|session| (session.running, session.id.as_str()))
+            .map(|session| session.id.clone())
+            .or_else(|| detail.events_session.clone())
+    }
+
     /// Whether an `agents.cancel` round trip is in flight (or the cancelled turn
     /// has not reported idle yet). The Interrupt button is disabled while true.
     pub fn detail_turn_cancel_pending(&self) -> bool {
@@ -3427,6 +3500,134 @@ impl ClientState {
                 self.show_toast(
                     ToastKind::Error,
                     "The transport is not running, so the turn was not interrupted.".to_string(),
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// The current plan for the open detail, preferring its explicit snapshot.
+    pub fn detail_plan(&self) -> Vec<AgentPlanEntry> {
+        self.detail
+            .as_ref()
+            .map(TaskDetail::plan)
+            .unwrap_or_default()
+    }
+
+    /// The current advertised command list for the open detail.
+    pub fn detail_commands(&self) -> Vec<AgentCommand> {
+        self.detail
+            .as_ref()
+            .map(TaskDetail::commands)
+            .unwrap_or_default()
+    }
+
+    /// Whether the follow-up composer can accept a prompt right now.
+    pub fn detail_prompt_active(&self) -> bool {
+        if !matches!(self.active_route, Route::Inbox | Route::Tasks) {
+            return false;
+        }
+        let Some(detail) = self.detail.as_ref() else {
+            return false;
+        };
+        if detail.tab != DetailTab::Events || detail.is_terminal() {
+            return false;
+        }
+        detail.prompt_open && self.detail_agent_session_id().is_some()
+    }
+
+    /// Activate the composer and clear any previous error.
+    pub fn start_detail_reply(&mut self) {
+        if let Some(detail) = self.detail.as_mut() {
+            detail.tab = DetailTab::Events;
+            detail.prompt_open = true;
+            detail.prompt_error = None;
+        }
+    }
+
+    /// Close the composer without sending, returning keyboard focus to the shell.
+    pub fn close_detail_prompt(&mut self) {
+        if let Some(detail) = self.detail.as_mut() {
+            detail.prompt_open = false;
+            detail.prompt_selected = None;
+        }
+    }
+
+    /// Append one typed character to the follow-up draft (bounded).
+    pub fn detail_prompt_push_char(&mut self, ch: char) {
+        const MAX_PROMPT: usize = 4096;
+        if let Some(detail) = self.detail.as_mut() {
+            if detail.prompt.chars().count() < MAX_PROMPT {
+                detail.prompt.push(ch);
+                detail.prompt_selected = None;
+            }
+        }
+    }
+
+    /// Delete the last draft character.
+    pub fn detail_prompt_backspace(&mut self) {
+        if let Some(detail) = self.detail.as_mut() {
+            detail.prompt.pop();
+            detail.prompt_selected = None;
+        }
+    }
+
+    /// Move the highlighted slash-command completion.
+    pub fn detail_prompt_move_command(&mut self, delta: isize) {
+        if let Some(detail) = self.detail.as_mut() {
+            detail.move_command(delta);
+        }
+    }
+
+    /// Accept the highlighted (or first) slash-command completion.
+    pub fn detail_prompt_complete_command(&mut self) -> bool {
+        self.detail
+            .as_mut()
+            .is_some_and(TaskDetail::complete_command)
+    }
+
+    /// Fill a clicked command into the draft (an explicit accept).
+    pub fn detail_prompt_choose_command(&mut self, index: usize) {
+        if let Some(detail) = self.detail.as_mut() {
+            detail.prompt_selected = Some(index);
+            detail.complete_command();
+        }
+    }
+
+    /// Send the raw draft through `agents.prompt`. Slash commands and unknown
+    /// text are never rewritten.
+    pub fn send_detail_prompt(&mut self, cx: &mut Context<Self>) {
+        let Some(detail) = self.detail.as_ref() else {
+            return;
+        };
+        if detail.prompt_sending {
+            return;
+        }
+        let prompt = detail.prompt.trim().to_string();
+        if prompt.is_empty() {
+            return;
+        }
+        let Some(session_id) = self.detail_agent_session_id() else {
+            if let Some(detail) = self.detail.as_mut() {
+                detail.prompt_error = Some("No live agent session is attached.".to_string());
+            }
+            return;
+        };
+        let Some(detail) = self.detail.as_mut() else {
+            return;
+        };
+        detail.prompt_sending = true;
+        detail.prompt_error = None;
+        match &self.runtime {
+            Some(runtime) => runtime.prompt(session_id, prompt),
+            None => {
+                if let Some(detail) = self.detail.as_mut() {
+                    detail.prompt_sending = false;
+                    detail.prompt_error = Some("The transport is not running.".to_string());
+                }
+                self.show_toast(
+                    ToastKind::Error,
+                    "Could not send the prompt: the transport is not running.".to_string(),
                     cx,
                 );
             }

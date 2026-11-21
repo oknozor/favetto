@@ -14,10 +14,10 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use favetto_core::model::{
-    AgentActivity, AgentBackend, AgentCapabilities, AgentCatalogEntry, AgentSessionHistoryEntry,
-    AgentSessionInfo, AgentSessionState, AgentStateEvent, AgentUsage, AwaitingInputKind, Event,
-    EventKind, FailureKind, InputReply, InputRequest, MessageRole, NotificationRecord, RepoInfo,
-    Schedule, Task, TaskStatus, UsagePeriod, UsageStats,
+    AgentActivity, AgentBackend, AgentCapabilities, AgentCatalogEntry, AgentCommand,
+    AgentPlanEntry, AgentSessionHistoryEntry, AgentSessionInfo, AgentSessionState, AgentStateEvent,
+    AgentUsage, AwaitingInputKind, Event, EventKind, FailureKind, InputReply, InputRequest,
+    MessageRole, NotificationRecord, RepoInfo, Schedule, Task, TaskStatus, UsagePeriod, UsageStats,
 };
 use favetto_core::rpc::{method, push, AgentEventPush, Notification};
 use favetto_core::workflow::WorkflowInspect;
@@ -1134,6 +1134,12 @@ pub struct App {
     /// The last `agent.event` / `tasks.events` sequence folded into the feed.
     /// Live pushes and a backfill overlap, so this deduplicates them.
     pub agent_feed_cursor: u64,
+    /// The active ACP session's current complete plan.
+    pub agent_plan: Vec<AgentPlanEntry>,
+    /// The active ACP session's advertised slash commands.
+    pub agent_commands: Vec<AgentCommand>,
+    /// Index into the filtered command matches while composing `/…`.
+    pub agent_command_selected: Option<usize>,
     /// The last `agents.start` / `agents.attach` / `agents.load` / `tasks.get`
     /// error, shown in the status bar.
     pub agent_error: Option<String>,
@@ -1274,6 +1280,9 @@ impl App {
             agent_feed_follow: true,
             agent_feed_selected: None,
             agent_feed_cursor: 0,
+            agent_plan: Vec::new(),
+            agent_commands: Vec::new(),
+            agent_command_selected: None,
             agent_error: None,
             agent_loading: None,
             notice: None,
@@ -2169,6 +2178,8 @@ impl App {
             self.agent_feed_follow = true;
             self.agent_feed_selected = None;
             self.agent_feed_cursor = 0;
+            self.agent_prompt.clear();
+            self.clear_agent_plan();
         }
         // An ACP attach payload is a plain transcript, not a terminal frame; it
         // must never be parsed as terminal control input. Live events seed the
@@ -2231,6 +2242,88 @@ impl App {
     /// Clear the restore-in-progress indicator (success or failure).
     pub fn finish_session_load(&mut self) {
         self.agent_loading = None;
+    }
+
+    /// Replace the active session's plan and advertised commands from an
+    /// attach/backfill snapshot.
+    pub fn seed_agent_plan(&mut self, plan: Vec<AgentPlanEntry>, commands: Vec<AgentCommand>) {
+        self.set_agent_plan(plan, commands);
+    }
+
+    /// Replace both plan and command lists wholesale and reset completion.
+    pub fn set_agent_plan(&mut self, plan: Vec<AgentPlanEntry>, commands: Vec<AgentCommand>) {
+        self.agent_plan = plan;
+        self.agent_commands = commands;
+        self.reset_agent_command_selection();
+    }
+
+    /// Clear the plan/command snapshot when switching to a new session.
+    pub fn clear_agent_plan(&mut self) {
+        self.agent_plan.clear();
+        self.agent_commands.clear();
+        self.agent_command_selected = None;
+    }
+
+    /// The prefix being completed, when the prompt is a bare `/prefix` token.
+    pub fn agent_command_query(&self) -> Option<&str> {
+        let rest = self.agent_prompt.strip_prefix('/')?;
+        if rest.chars().any(char::is_whitespace) {
+            return None;
+        }
+        Some(rest)
+    }
+
+    /// Advertised commands matching the current `/prefix`, in advertised order.
+    pub fn agent_command_matches(&self) -> Vec<&AgentCommand> {
+        let Some(query) = self.agent_command_query() else {
+            return Vec::new();
+        };
+        self.agent_commands
+            .iter()
+            .filter(|command| command.name.starts_with(query))
+            .collect()
+    }
+
+    /// Move the highlighted command completion by `delta`, clamped to matches.
+    pub fn move_agent_command(&mut self, delta: isize) -> bool {
+        let count = self.agent_command_matches().len();
+        if count == 0 {
+            self.agent_command_selected = None;
+            return false;
+        }
+        let current = self.agent_command_selected.unwrap_or(0).min(count - 1);
+        let next = (current as isize + delta).clamp(0, count as isize - 1);
+        self.agent_command_selected = Some(next as usize);
+        true
+    }
+
+    /// Accept the highlighted (or first) matching command into the prompt.
+    pub fn complete_agent_command(&mut self) -> bool {
+        let Some(command) = self
+            .agent_command_matches()
+            .get(self.agent_command_selected.unwrap_or(0))
+            .map(|command| command.name.clone())
+        else {
+            return false;
+        };
+        self.agent_prompt = format!("/{command} ");
+        self.reset_agent_command_selection();
+        true
+    }
+
+    /// The exact matched command's input hint, when it has one.
+    pub fn agent_command_hint(&self) -> Option<&str> {
+        let rest = self.agent_prompt.strip_prefix('/')?;
+        let name = rest.split_whitespace().next().unwrap_or_default();
+        self.agent_commands
+            .iter()
+            .find(|command| command.name == name)
+            .and_then(|command| command.input_hint.as_deref())
+    }
+
+    /// Forget the completion highlight after any prompt edit.
+    pub fn reset_agent_command_selection(&mut self) {
+        self.agent_command_selected = None;
     }
 
     /// Replace the cached `agents.list` sessions (the Activity/Usage source for
@@ -2370,13 +2463,28 @@ impl App {
             }
         }
         if self.agent_backend == AgentBackend::Acp {
-            if let AgentStateEvent::Idle { outcome } = event {
-                self.agent_status = match outcome {
-                    favetto_core::model::IdleOutcome::Succeeded => "idle",
-                    favetto_core::model::IdleOutcome::Interrupted => "interrupted",
-                    favetto_core::model::IdleOutcome::Failed => "failed",
+            match event {
+                AgentStateEvent::Idle { outcome } => {
+                    self.agent_status = match outcome {
+                        favetto_core::model::IdleOutcome::Succeeded => "idle",
+                        favetto_core::model::IdleOutcome::Interrupted => "interrupted",
+                        favetto_core::model::IdleOutcome::Failed => "failed",
+                    }
+                    .to_string();
                 }
-                .to_string();
+                AgentStateEvent::Plan { entries } => {
+                    self.agent_plan = entries.clone();
+                    return;
+                }
+                AgentStateEvent::AvailableCommands { commands } => {
+                    self.agent_commands = commands.clone();
+                    let count = self.agent_command_matches().len();
+                    self.agent_command_selected = self
+                        .agent_command_selected
+                        .filter(|selected| *selected < count);
+                    return;
+                }
+                _ => {}
             }
             self.agent_feed.apply(event);
             // A pruned tool/thought may have taken the selection with it.

@@ -10,9 +10,10 @@ use uuid::Uuid;
 use crate::rpc::{push, Notification};
 
 pub use crate::agent_state::{
-    AgentActivity, AgentCost, AgentStateEvent, AgentUsage, ContentRole, IdleOutcome, InputReply,
-    InputRequest, MessageContent, RunSummary, ToolCall, ToolCallDetail, ToolCallStatus,
-    ToolContent, ToolKind, ToolLocation, UsageBucket, UsagePeriod, UsageStats, UsageTotals,
+    AgentActivity, AgentCommand, AgentCost, AgentPlanEntry, AgentPlanPriority, AgentPlanStatus,
+    AgentStateEvent, AgentUsage, ContentRole, IdleOutcome, InputReply, InputRequest,
+    MessageContent, RunSummary, ToolCall, ToolCallDetail, ToolCallStatus, ToolContent, ToolKind,
+    ToolLocation, UsageBucket, UsagePeriod, UsageStats, UsageTotals,
 };
 
 /// Lifecycle of a single task.

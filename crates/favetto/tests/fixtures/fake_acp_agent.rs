@@ -254,6 +254,37 @@ fn run_prompt<B: BufRead>(
             }),
         );
     }
+    // Optional deterministic plan/command notifications, so the daemon and
+    // both clients can be tested against real ACP v1 update shapes without a
+    // live agent.
+    if let Ok(plan) = std::env::var("FAKE_ACP_PLAN") {
+        if let Ok(entries) = serde_json::from_str::<Value>(&plan) {
+            notify(
+                stdout,
+                json!({
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "plan",
+                        "entries": entries
+                    }
+                }),
+            );
+        }
+    }
+    if let Ok(commands) = std::env::var("FAKE_ACP_COMMANDS") {
+        if let Ok(available_commands) = serde_json::from_str::<Value>(&commands) {
+            notify(
+                stdout,
+                json!({
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "available_commands_update",
+                        "availableCommands": available_commands
+                    }
+                }),
+            );
+        }
+    }
     // Tests can make the turn block deterministically: create
     // `$FAKE_ACP_GATE_DIR/agent-ready`, then wait for `agent-release` before
     // answering.
