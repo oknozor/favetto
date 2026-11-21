@@ -12,6 +12,7 @@ mod config;
 mod detail;
 mod inbox;
 mod layout;
+mod markdown;
 mod motion;
 mod palette;
 mod routes;

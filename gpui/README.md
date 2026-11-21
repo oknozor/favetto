@@ -89,6 +89,10 @@ pinned while the tab body scrolls:
   `agent.event` pushes in `seq` order. Consecutive text/reasoning deltas become
   one block, tool start/finish events merge into one card, usage and errors keep
   their own rows. Unknown event kinds are skipped and counted, never fatal.
+  Agent messages and reasoning render as Markdown — headings, lists, tables and
+  fenced code with language highlighting — and links open `http(s)` targets in
+  the browser. Parsing is cached per feed revision, so completed blocks are not
+  re-parsed on every delta.
 - **Runs** is the `tasks.runs` attempt table: attempt, status, exit code,
   duration and usage.
 
