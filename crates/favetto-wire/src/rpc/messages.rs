@@ -443,6 +443,10 @@ pub type AgentsHistoryResult = Vec<AgentSessionHistoryEntry>;
 pub type AgentLoadParams = SessionIdParams;
 
 /// `agents.start` params. `rows`/`cols` default to 24/80, `new` to false.
+///
+/// With `task_id` and without `new`, a live session for that task is returned
+/// as-is (its feed is backfilled with `tasks.events`) rather than starting a
+/// duplicate. `new` forces a fresh session.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct StartAgentParams {
