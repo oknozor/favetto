@@ -1,7 +1,7 @@
 agent = "opencode"
 provider = "opencode-go"
 model = "deepseek-v4.1-flash"
-spawn = "repo:Favetto/merge_pending"
+spawn = "repo:favetto/merge_pending"
 spawn_file = ".favetto/merge_pending/{{ task.id }}/manifest.json"
 spawn_new_root = true
 
@@ -135,7 +135,7 @@ This is round {{ input.round }} of at most {{ input.max_rounds }}.
 
      Replace the example values with the real target repository, this round
      plus one, and the configured `max_rounds`. To stop, write `[]`. The task
-     spawns `repo:Favetto/merge_pending` again as a fresh workflow root, so the loop
+     spawns `repo:favetto/merge_pending` again as a fresh workflow root, so the loop
      keeps running until the queue is empty or you stop at the cap.
    - Write your full report to
      `.favetto/merge_pending/{{ task.id }}/report.md`: the PRs reviewed, the
