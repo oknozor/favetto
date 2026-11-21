@@ -48,10 +48,10 @@ Keyboard: `⌘K`/`Ctrl+K` opens the command palette, `g i`/`g t`/`g c`/`g w`/
 `g s` jump to Inbox/Tasks/Catalog/Workflows/Schedules, `⌘,`/`Ctrl+,` opens
 Settings, `?` opens the shortcut sheet, `Esc` closes the topmost overlay or
 steps back from a pushed detail. **Tab** and **Shift+Tab** move real focus
-through the top bar, sidebar, active surface, detail column and status bar in
-visual order; **Enter** or **Space** activates the focused control. On the
-Inbox, `↑`/`↓` move the Needs you highlight, `Enter` opens the highlighted run,
-and `r` refreshes the surface.
+through the top bar, sidebar, active surface, detail column (Inbox and Tasks
+only) and status bar in visual order; **Enter** or **Space** activates the
+focused control. On the Inbox, `↑`/`↓` move the Needs you highlight, `Enter`
+opens the highlighted run, and `r` refreshes the surface.
 
 On the Tasks surface, `↑`/`↓` move (Home/End and PageUp/PageDown jump), `Enter`
 opens the run, `c` cancels and `r` retries a finished run (both confirm first,

@@ -30,7 +30,6 @@ use crate::detail::{
 };
 use crate::inbox::{self, StatusKind};
 use crate::layout::{container_query, LayoutMode};
-use crate::routes::Route;
 use crate::state::ClientState;
 use crate::tasks;
 use crate::theme::Theme;
@@ -1333,26 +1332,6 @@ impl Render for DetailView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.state.read(cx).theme(window.appearance());
         let narrow = container_query(window.viewport_size().width) == LayoutMode::Narrow;
-        let route = self.state.read(cx).active_route();
-
-        // The detail only holds runs on the Inbox and Tasks surfaces.
-        if !matches!(route, Route::Inbox | Route::Tasks) {
-            let (icon, eyebrow, title, body) = route_copy(route);
-            return div()
-                .size_full()
-                .flex()
-                .flex_col()
-                .bg(theme.colors.surface)
-                .child(self.plain_route_header(theme, narrow, cx))
-                .child(components::empty_state(
-                    theme,
-                    icon,
-                    eyebrow,
-                    title,
-                    body,
-                    "Open a row to inspect it",
-                ));
-        }
 
         let (task, agent, session_id, usage, tab, follow, new_events, pending) = {
             let state = self.state.read(cx);
@@ -1487,7 +1466,7 @@ impl Render for DetailView {
 }
 
 impl DetailView {
-    /// The title strip used when the active route is not a run list.
+    /// The title strip shown before a run is selected.
     fn plain_route_header(&self, theme: &Theme, narrow: bool, cx: &mut Context<Self>) -> Div {
         div()
             .flex()
@@ -1500,41 +1479,6 @@ impl DetailView {
             .border_color(theme.colors.border)
             .child(components::section_label(theme, "DETAIL"))
             .when(narrow, |header| header.child(self.back_button(theme, cx)))
-    }
-}
-
-fn route_copy(route: Route) -> (&'static str, &'static str, &'static str, &'static str) {
-    match route {
-        Route::Catalog => (
-            Route::Catalog.icon(),
-            "DEFINITION",
-            "No definition selected",
-            "Choose a definition to preview its declared variables and launch form here.",
-        ),
-        Route::Workflows => (
-            Route::Workflows.icon(),
-            "ROOT",
-            "No workflow selected",
-            "Choose a root run to inspect its DAG, completed steps and per-node progress here.",
-        ),
-        Route::Schedules => (
-            Route::Schedules.icon(),
-            "TRIGGER",
-            "No schedule selected",
-            "Choose a schedule to see its cadence, next fire time and last run here.",
-        ),
-        Route::Settings => (
-            Route::Settings.icon(),
-            "CONNECTION",
-            "Current connection",
-            "The settings surface owns editing. This column keeps the endpoint and token source visible while you work.",
-        ),
-        Route::Inbox | Route::Tasks => (
-            "◎",
-            "RUN",
-            "No run selected",
-            "Open a run in the list to see its status, agent and attempt here.",
-        ),
     }
 }
 
@@ -1948,20 +1892,4 @@ fn at_bottom(scroll: &ScrollHandle) -> bool {
     }
     let offset = -f32::from(scroll.offset().y);
     offset >= max - FOLLOW_THRESHOLD
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_route_has_detail_copy() {
-        for route in Route::ALL {
-            let (icon, eyebrow, title, body) = route_copy(route);
-            assert!(!icon.is_empty());
-            assert!(!eyebrow.is_empty());
-            assert!(!title.is_empty());
-            assert!(!body.is_empty());
-        }
-    }
 }

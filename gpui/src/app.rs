@@ -1758,7 +1758,9 @@ impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.state.read(cx).theme(window.appearance());
         let mode = container_query(window.viewport_size().width);
-        let detail_open = self.state.read(cx).is_detail_open();
+        let route = self.state.read(cx).active_route();
+        // Only the run lists have a detail page to push or a column to fill.
+        let detail_open = self.state.read(cx).is_detail_open() && route.shows_detail();
         let palette_open = self.palette.is_open();
         let shortcuts_open = self.shortcuts_open;
 
@@ -1787,14 +1789,16 @@ impl Render for RootView {
                 .min_h_0()
                 .child(sidebar)
                 .child(div().flex_1().min_w_0().child(content))
-                .child(
-                    div()
-                        .w(px(DETAIL_WIDTH))
-                        .flex_shrink_0()
-                        .border_l_1()
-                        .border_color(theme.colors.border)
-                        .child(detail),
-                ),
+                .when(route.shows_detail(), |body| {
+                    body.child(
+                        div()
+                            .w(px(DETAIL_WIDTH))
+                            .flex_shrink_0()
+                            .border_l_1()
+                            .border_color(theme.colors.border)
+                            .child(detail),
+                    )
+                }),
         };
 
         let (
