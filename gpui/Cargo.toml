@@ -43,3 +43,9 @@ croner = "3"
 # smallest fix; keep it until gpui updates `xattr`.
 [dependencies.libc]
 version = "=0.2.188"
+
+[dev-dependencies]
+# `TestAppContext`/`VisualTestContext` (headless window rendering and resize)
+# live behind this feature. Dev-only, so the shipped binary keeps the lean
+# dependency graph.
+gpui = { version = "=0.2.2", features = ["test-support"] }

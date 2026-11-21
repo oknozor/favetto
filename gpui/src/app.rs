@@ -81,6 +81,17 @@ pub struct RootView {
     shortcuts_close_focus: FocusHandle,
 }
 
+/// The full-window frame every route lives in.
+///
+/// `w_full()` is not redundant with `h_full()`: GPUI lays a root view out at
+/// its content width when no width is requested. A window wider than that
+/// content would then leave the surplus columns unpainted (the black strip
+/// from issue #441) and the working list would never receive its share of the
+/// extra space. Keeping both axes explicit makes the resize contract testable.
+fn shell_root() -> Div {
+    div().relative().flex().flex_col().w_full().h_full()
+}
+
 impl RootView {
     /// Build the shell, create the route entities, and focus the root anchor so
     /// `⌘K` and `g`-jumps work from launch.
@@ -1864,11 +1875,7 @@ impl Render for RootView {
             }
         }
 
-        let root = div()
-            .relative()
-            .flex()
-            .flex_col()
-            .h_full()
+        let root = shell_root()
             .bg(theme.colors.bg)
             .text_color(theme.colors.text)
             .text_size(px(theme.font.base))
@@ -2209,5 +2216,87 @@ impl Render for RootView {
             }
             root
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{
+        point, px, size, Bounds, Pixels, Size, TestAppContext, VisualTestContext, WindowBounds,
+        WindowOptions,
+    };
+
+    /// A minimal stand-in for the shell: the same root helper, a fixed sidebar
+    /// and a flexible working list. Rendering the real `RootView` would start
+    /// the daemon runtime, so the resize contract is tested on the frame the
+    /// shell uses.
+    struct ShellProbe;
+
+    impl Render for ShellProbe {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            shell_root()
+                .debug_selector(|| "shell-root".to_string())
+                .child(
+                    div()
+                        .flex()
+                        .flex_1()
+                        .min_h_0()
+                        .child(
+                            div()
+                                .w(px(240.0))
+                                .h_full()
+                                .debug_selector(|| "shell-sidebar".to_string()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .debug_selector(|| "shell-list".to_string()),
+                        ),
+                )
+        }
+    }
+
+    fn open_probe(cx: &mut TestAppContext, window_size: Size<Pixels>) -> &mut VisualTestContext {
+        let window = cx.update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: point(px(0.0), px(0.0)),
+                        size: window_size,
+                    })),
+                    ..Default::default()
+                },
+                |_window, cx| cx.new(|_cx| ShellProbe),
+            )
+            .expect("opening the test window must succeed")
+        });
+        let cx = VisualTestContext::from_window(*window, cx).into_mut();
+        cx.run_until_parked();
+        cx
+    }
+
+    #[gpui::test]
+    fn the_shell_root_and_working_list_follow_a_window_resize(cx: &mut TestAppContext) {
+        let cx = open_probe(cx, size(px(900.0), px(700.0)));
+
+        let before = cx.debug_bounds("shell-root").expect("root is rendered");
+        let before_list = cx.debug_bounds("shell-list").expect("list is rendered");
+        assert_eq!(before.size, size(px(900.0), px(700.0)));
+        assert_eq!(before_list.size.width, px(660.0));
+
+        cx.simulate_resize(size(px(1400.0), px(900.0)));
+        cx.run_until_parked();
+
+        let after = cx
+            .debug_bounds("shell-root")
+            .expect("root is rendered after the resize");
+        let after_list = cx
+            .debug_bounds("shell-list")
+            .expect("list is rendered after the resize");
+        assert_eq!(after.size, size(px(1400.0), px(900.0)));
+        assert_eq!(after_list.size.width, px(1160.0));
+        assert!(after_list.size.width > before_list.size.width);
     }
 }
