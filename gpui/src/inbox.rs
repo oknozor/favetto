@@ -20,6 +20,8 @@ use favetto_wire::model::{
 };
 use uuid::Uuid;
 
+use crate::repos::repo_visible;
+
 /// How far back a failure still counts as "needs you".
 pub const FAILED_WINDOW_HOURS: i64 = 24;
 
@@ -199,14 +201,20 @@ fn request_message(request: &AwaitingInputReason) -> Option<String> {
 }
 
 /// Build both groups from a `tasks.list` snapshot and the flattened
-/// `agents.list` sessions.
+/// `agents.list` sessions, scoped to `active_repo`.
 ///
 /// An awaiting session is authoritative even when its task row still says
 /// `running` (the status push can lag). A session with `task_id: None` (or an id
 /// outside the fetched task window) still appears in Needs you, labelled
 /// neutrally, so a blocked agent is never hidden just because its task row is
-/// missing.
-pub fn build(tasks: &[Task], sessions: &[AgentSessionInfo], now: DateTime<Utc>) -> InboxRows {
+/// missing. With an active repo, rows whose repo cannot be resolved are treated
+/// as global and hidden, matching the TUI's task/event scoping.
+pub fn build(
+    tasks: &[Task],
+    sessions: &[AgentSessionInfo],
+    active_repo: Option<&str>,
+    now: DateTime<Utc>,
+) -> InboxRows {
     let mut session_by_task: HashMap<&str, &AgentSessionInfo> = HashMap::new();
     let mut awaiting_by_task: HashMap<&str, &AgentSessionInfo> = HashMap::new();
     for session in sessions {
@@ -224,6 +232,9 @@ pub fn build(tasks: &[Task], sessions: &[AgentSessionInfo], now: DateTime<Utc>) 
     let mut needs_task_ids = HashSet::new();
 
     for task in tasks {
+        if !repo_visible(active_repo, task_repo(&task.name)) {
+            continue;
+        }
         let task_id = task.id.to_string();
         let agent = session_by_task
             .get(task_id.as_str())
@@ -285,6 +296,11 @@ pub fn build(tasks: &[Task], sessions: &[AgentSessionInfo], now: DateTime<Utc>) 
             .and_then(|task_id| tasks.iter().find(|task| task.id == task_id));
 
         let Some(task) = task else {
+            // A session with no task row has no repo namespace; under an active
+            // repo it is treated as global and hidden, like the TUI.
+            if active_repo.is_some() {
+                continue;
+            }
             needs.push(NeedsRow {
                 key: InboxKey::Session(session.id.clone()),
                 status: StatusKind::AwaitingInput,
@@ -299,6 +315,10 @@ pub fn build(tasks: &[Task], sessions: &[AgentSessionInfo], now: DateTime<Utc>) 
             });
             continue;
         };
+
+        if !repo_visible(active_repo, task_repo(&task.name)) {
+            continue;
+        }
 
         // A stale session flag must not resurrect a finished task.
         if matches!(
@@ -356,6 +376,7 @@ pub fn build(tasks: &[Task], sessions: &[AgentSessionInfo], now: DateTime<Utc>) 
 
     let mut recent: Vec<RecentRow> = tasks
         .iter()
+        .filter(|task| repo_visible(active_repo, task_repo(&task.name)))
         .filter(|task| !needs_task_ids.contains(&task.id))
         .map(|task| RecentRow {
             task_id: task.id,
@@ -545,7 +566,7 @@ mod tests {
             Some(permission("Approve `git push`?")),
         )];
 
-        let rows = build(&[awaiting, failed], &sessions, now);
+        let rows = build(&[awaiting, failed], &sessions, None, now);
         assert_eq!(rows.needs.len(), 2);
         // The awaiting row started waiting 120m ago, the failure 30m ago.
         assert_eq!(rows.needs[0].key, InboxKey::Task(awaiting_id));
@@ -569,7 +590,7 @@ mod tests {
         let fresh_id = fresh.id;
         let old_id = old.id;
 
-        let rows = build(&[old, fresh], &[], now);
+        let rows = build(&[old, fresh], &[], None, now);
         assert!(rows.needs.is_empty());
         assert_eq!(rows.recent.len(), 2);
         assert_eq!(rows.recent[0].task_id, fresh_id);
@@ -591,7 +612,7 @@ mod tests {
             ));
         }
 
-        let rows = build(&tasks, &[], now);
+        let rows = build(&tasks, &[], None, now);
         assert_eq!(rows.needs.len(), 1);
         assert_eq!(rows.recent.len(), RECENT_LIMIT);
         assert!(rows
@@ -626,7 +647,7 @@ mod tests {
             "claude",
             Some(permission("Allow?")),
         )];
-        let rows = build(&[], &sessions, now);
+        let rows = build(&[], &sessions, None, now);
         assert_eq!(rows.needs.len(), 1);
         assert_eq!(rows.needs[0].task_name, "Unknown task");
         assert_eq!(rows.needs[0].key, InboxKey::Session("s-orphan".to_string()));
@@ -647,7 +668,7 @@ mod tests {
             Some(permission("Allow the deploy?")),
         )];
 
-        let rows = build(&[running], &sessions, now);
+        let rows = build(&[running], &sessions, None, now);
         assert_eq!(rows.needs.len(), 1);
         assert_eq!(rows.needs[0].key, InboxKey::Task(running_id));
         assert_eq!(rows.needs[0].status, StatusKind::AwaitingInput);
@@ -667,7 +688,7 @@ mod tests {
             "opencode",
             Some(permission("already answered")),
         )];
-        let rows = build(&[done], &sessions, now);
+        let rows = build(&[done], &sessions, None, now);
         assert!(rows.needs.is_empty());
         assert_eq!(rows.recent.len(), 1);
     }
@@ -684,7 +705,7 @@ mod tests {
             ..AgentUsage::default()
         });
 
-        let rows = build(&[done], &[live], now);
+        let rows = build(&[done], &[live], None, now);
         let row = rows.recent.first().expect("recent row");
         assert_eq!(row.repo.as_deref(), Some("favetto"));
         assert_eq!(row.name, "costly");
@@ -697,7 +718,7 @@ mod tests {
         let now = at(0);
         let mut running = task(1, "live", TaskStatus::Running, at(-30));
         running.started_at = Some(at(-30));
-        let rows = build(&[running], &[], now);
+        let rows = build(&[running], &[], None, now);
         assert_eq!(rows.recent[0].duration, Some(Duration::from_secs(30 * 60)));
     }
 
@@ -708,10 +729,47 @@ mod tests {
         awaiting.started_at = Some(at(-10));
         let done = task(2, "done", TaskStatus::Succeeded, at(-5));
         let done_id = done.id;
-        let rows = build(&[awaiting, done], &[], now);
+        let rows = build(&[awaiting, done], &[], None, now);
         assert_eq!(
             rows.keys(),
             vec![InboxKey::Task(Uuid::from_u128(1)), InboxKey::Task(done_id)]
+        );
+    }
+
+    #[test]
+    fn the_active_repo_scopes_needs_you_and_recent_rows() {
+        let now = at(0);
+        let mut local = task(1, "repo:favetto/triage", TaskStatus::AwaitingInput, at(-10));
+        local.started_at = Some(at(-10));
+        let failed = task(2, "repo:web/release", TaskStatus::Failed, at(-5));
+        let global = task(3, "nightly", TaskStatus::Succeeded, at(-2));
+        let orphan = session("s-orphan", None, "claude", Some(permission("Allow?")));
+
+        let scoped = build(&[local, failed, global], &[orphan], Some("favetto"), now);
+        assert_eq!(scoped.needs.len(), 1);
+        assert_eq!(scoped.needs[0].task_name, "triage");
+        assert_eq!(scoped.recent.len(), 0);
+
+        let all = build(
+            &[
+                task(4, "repo:favetto/triage", TaskStatus::Succeeded, at(-10)),
+                task(5, "repo:web/release", TaskStatus::Succeeded, at(-5)),
+                task(6, "nightly", TaskStatus::Succeeded, at(-2)),
+            ],
+            &[session(
+                "s-orphan",
+                None,
+                "claude",
+                Some(permission("Allow?")),
+            )],
+            None,
+            now,
+        );
+        assert_eq!(all.needs.len(), 1, "the orphan session is visible globally");
+        assert_eq!(
+            all.recent.len(),
+            3,
+            "global rows are visible with no active repo"
         );
     }
 

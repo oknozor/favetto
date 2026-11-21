@@ -268,6 +268,10 @@ typed_calls! {
     schedules_upsert => SchedulesUpsertCall,
     /// `schedules.delete`.
     schedules_delete => SchedulesDeleteCall,
+    /// `repos.list`.
+    repos_list => ReposListCall,
+    /// `repos.activate`.
+    repos_activate => ReposActivateCall,
     /// `events.subscribe`.
     events_subscribe => EventsSubscribeCall,
 }
@@ -363,6 +367,44 @@ mod tests {
                 }
                 other => panic!("expected a request frame, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn repo_requests_use_the_registry_methods_and_optional_name() {
+        let list = encode_request::<ReposListCall>(30, &EmptyParams {}).expect("encode list");
+        let activate = encode_request::<ReposActivateCall>(
+            31,
+            &ReposActivateParams {
+                name: Some("favetto".to_string()),
+            },
+        )
+        .expect("encode activate");
+        let clear = encode_request::<ReposActivateCall>(32, &ReposActivateParams { name: None })
+            .expect("encode clear");
+
+        let frame: Frame = rmp_serde::from_slice(&list).expect("decode list");
+        match frame {
+            Frame::Request(request) => assert_eq!(request.method, method::REPOS_LIST),
+            other => panic!("expected a request frame, got {other:?}"),
+        }
+
+        let frame: Frame = rmp_serde::from_slice(&activate).expect("decode activate");
+        match frame {
+            Frame::Request(request) => {
+                assert_eq!(request.method, method::REPOS_ACTIVATE);
+                assert_eq!(request.params["name"], "favetto");
+            }
+            other => panic!("expected a request frame, got {other:?}"),
+        }
+
+        let frame: Frame = rmp_serde::from_slice(&clear).expect("decode clear");
+        match frame {
+            Frame::Request(request) => {
+                assert_eq!(request.method, method::REPOS_ACTIVATE);
+                assert!(request.params["name"].is_null());
+            }
+            other => panic!("expected a request frame, got {other:?}"),
         }
     }
 
