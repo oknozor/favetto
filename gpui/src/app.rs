@@ -18,11 +18,11 @@ use gpui::{
 use crate::actions::{
     self, CatalogChoiceNext, CatalogChoicePrev, CatalogFieldNext, CatalogFieldPrev,
     CatalogLaunchSubmit, CatalogNewOneshot, CatalogSearch, CatalogToggleFolder, CloseOverlay,
-    DetailPromptComplete, DetailPromptNext, DetailPromptPrev, DetailPromptSend, DetailReply,
-    ElicitationCancel, ElicitationConfirm, ElicitationDecline, ElicitationEdit, ElicitationLeft,
-    ElicitationNext, ElicitationPrev, ElicitationRight, ElicitationToggle, FocusNext, FocusPrev,
-    GoCatalog, GoInbox, GoSchedules, GoSettings, GoTasks, GoWorkflows, ListDown, ListEnd, ListHome,
-    ListOpen, ListPageDown, ListPageUp, ListUp, PaletteConfirm, PaletteDown, PaletteUp, Refresh,
+    DetailPromptComplete, DetailPromptNext, DetailPromptPrev, DetailPromptSend, ElicitationCancel,
+    ElicitationConfirm, ElicitationDecline, ElicitationEdit, ElicitationLeft, ElicitationNext,
+    ElicitationPrev, ElicitationRight, ElicitationToggle, FocusNext, FocusPrev, GoCatalog, GoInbox,
+    GoSchedules, GoSettings, GoTasks, GoWorkflows, ListDown, ListEnd, ListHome, ListOpen,
+    ListPageDown, ListPageUp, ListUp, PaletteConfirm, PaletteDown, PaletteUp, Refresh,
     RepoPickerConfirm, RepoPickerDown, RepoPickerUp, ScheduleDelete, ScheduleEdit,
     ScheduleFieldNext, ScheduleFieldPrev, ScheduleNew, ScheduleSubmit, ScheduleToggleEnabled,
     SettingsActivate, SettingsFieldNext, SettingsFieldPrev, SettingsSave, SettingsTest, TaskCancel,
@@ -1483,11 +1483,10 @@ impl RootView {
             ("Save schedule", "⌘↵"),
         ];
         let detail = [
-            ("Reply to the agent", "m"),
             ("Send the prompt", "↵"),
             ("Complete a slash command", "tab"),
             ("Select a command", "↑ ↓"),
-            ("Close the composer", "esc"),
+            ("Leave the composer", "esc"),
         ];
         let text_fields = [
             ("Move by character", "← →"),
@@ -2705,9 +2704,10 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &CloseOverlay, window, cx| {
                 if this.state.read(cx).detail_prompt_active() {
                     this.state.update(cx, |state, cx| {
-                        state.close_detail_prompt();
+                        state.blur_detail_prompt();
                         cx.notify();
                     });
+                    window.focus(&this.root_focus);
                     cx.stop_propagation();
                     return;
                 }
@@ -2886,12 +2886,6 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &Refresh, _window, cx| {
                 this.state.update(cx, |state, cx| {
                     state.refresh_active();
-                    cx.notify();
-                });
-            }))
-            .on_action(cx.listener(|this, _: &DetailReply, _window, cx| {
-                this.state.update(cx, |state, cx| {
-                    state.start_detail_reply();
                     cx.notify();
                 });
             }))

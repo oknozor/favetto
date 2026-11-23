@@ -39,7 +39,7 @@ use crate::layout::{container_query, LayoutMode};
 use crate::markdown::{self, MarkdownDoc};
 use crate::state::ClientState;
 use crate::tasks;
-use crate::text_element::state_text_element;
+use crate::text_element::{state_text_element, TextElement};
 use crate::text_input::TextTarget;
 use crate::theme::Theme;
 use crate::views::markdown::{self as markdown_view, Tone};
@@ -68,6 +68,11 @@ pub struct DetailView {
     new_events_focus: FocusHandle,
     /// Copy action for whichever full-body error state is visible.
     error_copy_focus: FocusHandle,
+    /// The always-visible follow-up composer's focus handle. Tab lands here and
+    /// a click focuses it; the composer only takes text keys while focused.
+    prompt_focus: FocusHandle,
+    /// Whether the focus listeners for [`Self::prompt_focus`] are registered.
+    prompt_focus_hooked: bool,
     /// Persisted across renders so live events never jump the reader.
     output_scroll: ScrollHandle,
     /// Virtualized feed state: only the visible window is measured/painted.
@@ -128,6 +133,8 @@ impl DetailView {
             workflow_focus: cx.focus_handle().tab_index(52).tab_stop(true),
             new_events_focus: cx.focus_handle().tab_index(66).tab_stop(true),
             error_copy_focus: cx.focus_handle().tab_index(67).tab_stop(true),
+            prompt_focus: cx.focus_handle().tab_index(77).tab_stop(true),
+            prompt_focus_hooked: false,
             output_scroll: ScrollHandle::new(),
             events_list,
             events_feed: Rc::new(Vec::new()),
@@ -141,6 +148,31 @@ impl DetailView {
         };
         view.start_clock(cx);
         view
+    }
+
+    /// Register the composer's focus listeners once. Real focus drives the
+    /// composer's enabled state: Tab landing on its handle (or a click) starts
+    /// routing text to the draft, and leaving it hands the shell its keys back.
+    fn hook_prompt_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.prompt_focus_hooked {
+            return;
+        }
+        self.prompt_focus_hooked = true;
+        let focus = self.prompt_focus.clone();
+        cx.on_focus(&focus, window, |this, _window, cx| {
+            this.state.update(cx, |state, cx| {
+                state.focus_detail_prompt();
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.on_blur(&focus, window, |this, _window, cx| {
+            this.state.update(cx, |state, cx| {
+                state.blur_detail_prompt();
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Keep `elapsed` honest for a live run even when the agent is quiet.
@@ -1568,6 +1600,20 @@ impl DetailView {
     }
 
     fn merged_output_content(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let body = self.output_view(theme, cx);
+        let mut column = div().flex_1().min_h_0().flex().flex_col();
+        // The composer is part of the Output tab itself, so it stays under every
+        // body state (loading, error, empty, live feed, raw transcript) instead
+        // of being replaced by it.
+        column = column.child(div().flex_1().min_h_0().flex().flex_col().child(body));
+        if let Some(composer) = self.prompt_composer(theme, cx) {
+            column = column.child(composer);
+        }
+        column.into_any_element()
+    }
+
+    /// The Output tab body without the always-visible composer.
+    fn output_view(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let (
             task_id,
             status,
@@ -1583,12 +1629,6 @@ impl DetailView {
             ignored,
             events_revision,
             plan,
-            commands,
-            prompt,
-            prompt_selected,
-            prompt_open,
-            prompt_sending,
-            prompt_error,
             summary,
         ) = {
             let state = self.state.read(cx);
@@ -1611,14 +1651,6 @@ impl DetailView {
                 detail.map(|detail| detail.events_ignored).unwrap_or(0),
                 detail.map(|detail| detail.events_revision).unwrap_or(0),
                 state.detail_plan(),
-                state.detail_commands(),
-                detail
-                    .map(|detail| detail.prompt.value().to_string())
-                    .unwrap_or_default(),
-                detail.and_then(|detail| detail.prompt_selected),
-                detail.is_some_and(|detail| detail.prompt_open),
-                detail.is_some_and(|detail| detail.prompt_sending),
-                detail.and_then(|detail| detail.prompt_error.clone()),
                 task.and_then(|task| task.output.as_ref())
                     .and_then(detail::extract_run_summary),
             )
@@ -1733,12 +1765,6 @@ impl DetailView {
                 session,
                 ignored,
                 plan,
-                commands,
-                prompt,
-                prompt_selected,
-                prompt_open,
-                prompt_sending,
-                prompt_error,
                 raw_available,
             },
             cx,
@@ -1931,19 +1957,13 @@ impl DetailView {
             session,
             ignored,
             plan,
-            commands,
-            prompt,
-            prompt_selected,
-            prompt_open,
-            prompt_sending,
-            prompt_error,
             raw_available,
         } = data;
         let has_plan = !plan.is_empty();
-        if loading && feed.is_empty() && !loaded && !has_plan && !prompt_open {
+        if loading && feed.is_empty() && !loaded && !has_plan {
             return self.loading(theme, "OUTPUT");
         }
-        if feed.is_empty() && events_error.is_some() && !has_plan && !prompt_open {
+        if feed.is_empty() && events_error.is_some() && !has_plan {
             return self.error_body(
                 theme,
                 ErrorBody {
@@ -1962,7 +1982,7 @@ impl DetailView {
                 cx,
             );
         }
-        if feed.is_empty() && !has_plan && !prompt_open {
+        if feed.is_empty() && !has_plan {
             if ignored > 0 {
                 return self.empty_body(
                     theme,
@@ -2042,19 +2062,6 @@ impl DetailView {
         });
 
         let plan_card = has_plan.then(|| self.plan_card(theme, &plan));
-        let composer = prompt_open.then(|| {
-            self.prompt_composer(
-                theme,
-                PromptBody {
-                    commands: &commands,
-                    prompt: &prompt,
-                    selected: prompt_selected,
-                    sending: prompt_sending,
-                    error: prompt_error.as_deref(),
-                },
-                cx,
-            )
-        });
         let raw_toggle = raw_available.then(|| {
             div()
                 .flex()
@@ -2100,18 +2107,15 @@ impl DetailView {
                     )),
             );
         }
-        container
-            .child(list)
-            .when_some(pill, |container, pill| {
-                container.child(
-                    div()
-                        .absolute()
-                        .right(px(theme.spacing.s3))
-                        .bottom(px(theme.spacing.s3))
-                        .child(pill),
-                )
-            })
-            .when_some(composer, |container, composer| container.child(composer))
+        container.child(list).when_some(pill, |container, pill| {
+            container.child(
+                div()
+                    .absolute()
+                    .right(px(theme.spacing.s3))
+                    .bottom(px(theme.spacing.s3))
+                    .child(pill),
+            )
+        })
     }
 
     /// A compact plan card above the output feed.
@@ -2185,24 +2189,39 @@ impl DetailView {
         card
     }
 
-    /// The follow-up prompt composer, including slash-command completion.
-    fn prompt_composer(&self, theme: &Theme, data: PromptBody<'_>, cx: &mut Context<Self>) -> Div {
-        let PromptBody {
-            commands,
-            prompt,
-            selected,
-            sending,
-            error,
-        } = data;
-        let matches: Vec<(usize, &AgentCommand)> = detail::matching_commands(commands, prompt)
-            .into_iter()
-            .take(5)
-            .collect();
+    /// The always-visible follow-up prompt composer, including slash-command
+    /// completion. Returns `None` when no run detail is open (there is nothing
+    /// to reply to).
+    fn prompt_composer(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<Div> {
+        let (commands, prompt, selected, sending, error, enabled, focused, disabled_reason) = {
+            let state = self.state.read(cx);
+            let detail = state.detail()?;
+            let enabled = state.detail_prompt_enabled();
+            (
+                state.detail_commands(),
+                detail.prompt.value().to_string(),
+                detail.prompt_selected,
+                detail.prompt_sending,
+                detail.prompt_error.clone(),
+                enabled,
+                detail.prompt_focused && enabled,
+                state.detail_prompt_disabled_reason(),
+            )
+        };
+        let matches: Vec<(usize, &AgentCommand)> = if enabled {
+            detail::matching_commands(&commands, &prompt)
+                .into_iter()
+                .take(5)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let exact = prompt
             .strip_prefix('/')
             .and_then(|rest| rest.split_whitespace().next())
             .and_then(|name| commands.iter().find(|command| command.name == name));
         let hint = exact.and_then(|command| command.input_hint.as_deref());
+        let placeholder = disabled_reason.unwrap_or("Type a message, or / for commands");
 
         let mut composer = div()
             .m(px(theme.spacing.s3))
@@ -2220,26 +2239,56 @@ impl DetailView {
                     .py(px(theme.spacing.s1))
                     .rounded(px(theme.radii.r4))
                     .border_1()
-                    .border_color(theme.colors.accent)
+                    .border_color(if focused {
+                        theme.colors.accent
+                    } else {
+                        theme.colors.border
+                    })
                     .bg(theme.colors.bg)
                     .text_size(px(theme.font.sm))
-                    .child(div().text_color(theme.colors.accent).child(if sending {
-                        "…"
-                    } else {
-                        ">"
-                    }))
+                    .when(enabled, |input| {
+                        input
+                            .track_focus(&self.prompt_focus)
+                            .cursor_text()
+                            .on_click(cx.listener(|this, _event, window, cx| {
+                                window.focus(&this.prompt_focus);
+                                this.state.update(cx, |state, cx| {
+                                    state.focus_detail_prompt();
+                                    cx.notify();
+                                });
+                            }))
+                    })
+                    .when(!enabled, |input| input.opacity(0.55).cursor_default())
+                    .child(
+                        div()
+                            .text_color(if enabled {
+                                theme.colors.accent
+                            } else {
+                                theme.colors.muted
+                            })
+                            .child(if sending { "…" } else { ">" }),
+                    )
                     .child(
                         div().flex_1().min_w_0().text_size(px(theme.font.sm)).child(
-                            state_text_element(&self.state, TextTarget::DetailPrompt, theme, cx)
-                                .multiline(true)
-                                .placeholder("Type a message, or / for commands"),
+                            TextElement::new(
+                                self.state.clone(),
+                                TextTarget::DetailPrompt,
+                                self.prompt_focus.clone(),
+                                theme,
+                            )
+                            .multiline(true)
+                            .placeholder(placeholder),
                         ),
                     )
                     .child(
                         div()
                             .text_size(px(theme.font.xs))
                             .text_color(theme.colors.muted)
-                            .child("↵ send · tab complete · esc close"),
+                            .child(if enabled {
+                                "↵ send · tab complete · esc back"
+                            } else {
+                                "read-only"
+                            }),
                     ),
             );
         for (position, (index, command)) in matches.into_iter().enumerate() {
@@ -2296,7 +2345,7 @@ impl DetailView {
                     .child(error.to_string()),
             );
         }
-        composer
+        Some(composer)
     }
 
     fn runs_body(
@@ -2398,22 +2447,7 @@ struct EventsBody {
     session: Option<String>,
     ignored: usize,
     plan: Vec<AgentPlanEntry>,
-    commands: Vec<AgentCommand>,
-    prompt: String,
-    prompt_selected: Option<usize>,
-    prompt_open: bool,
-    prompt_sending: bool,
-    prompt_error: Option<String>,
     raw_available: bool,
-}
-
-/// The follow-up composer's view data.
-struct PromptBody<'a> {
-    commands: &'a [AgentCommand],
-    prompt: &'a str,
-    selected: Option<usize>,
-    sending: bool,
-    error: Option<&'a str>,
 }
 
 /// One rendered feed row plus the parsed Markdown for prose/reasoning items.
@@ -2444,6 +2478,7 @@ struct RunsBody<'a> {
 
 impl Render for DetailView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.hook_prompt_focus(window, cx);
         let theme = self.state.read(cx).theme(window.appearance());
         let narrow = container_query(window.viewport_size().width) == LayoutMode::Narrow;
 

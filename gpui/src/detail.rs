@@ -867,8 +867,8 @@ pub struct TaskDetail {
     pub prompt_selected: Option<usize>,
     /// Whether an `agents.prompt` is in flight.
     pub prompt_sending: bool,
-    /// Whether the follow-up composer is open and owns the keyboard.
-    pub prompt_open: bool,
+    /// Whether the always-visible follow-up composer owns the keyboard.
+    pub prompt_focused: bool,
     /// The last prompt-send failure.
     pub prompt_error: Option<String>,
     /// The task-scoped restoration of the run's agent conversation.
@@ -913,7 +913,7 @@ impl TaskDetail {
             prompt: TextInput::default(),
             prompt_selected: None,
             prompt_sending: false,
-            prompt_open: false,
+            prompt_focused: false,
             prompt_error: None,
             restore: SessionRestore::Checking,
             restore_request: 0,
@@ -964,7 +964,7 @@ impl TaskDetail {
             self.prompt.set_value(String::new());
             self.prompt_selected = None;
             self.prompt_sending = false;
-            self.prompt_open = false;
+            self.prompt_focused = false;
             self.prompt_error = None;
             // A new attempt owns a new agent conversation; the previous attempt's
             // restored history must never appear under it.
@@ -1224,6 +1224,14 @@ impl TaskDetail {
     /// Whether the run is finished and will not change again.
     pub fn is_terminal(&self) -> bool {
         self.status().is_some_and(tasks::is_terminal)
+    }
+
+    /// Whether the always-visible follow-up composer can accept a prompt.
+    ///
+    /// A finished run or a run with no attached agent session keeps the
+    /// composer on screen but read-only.
+    pub fn prompt_enabled(&self, has_session: bool) -> bool {
+        has_session && !self.is_terminal()
     }
 
     /// The latest unresolved structured prompt in the event feed.
@@ -2335,6 +2343,52 @@ mod tests {
         let pending = detail.pending_request(&[]).expect("generic banner");
         assert!(!pending.can_reply());
         assert!(pending.message.contains("waiting for input"));
+    }
+
+    #[test]
+    fn the_composer_is_read_only_without_a_live_session_or_after_the_run_ends() {
+        let mut detail = TaskDetail::new(Uuid::from_u128(7));
+        assert!(detail.prompt_enabled(true), "a session can take a prompt");
+        assert!(
+            !detail.prompt_enabled(false),
+            "without a session the box stays read-only"
+        );
+
+        detail.set_task(task(TaskStatus::Running));
+        assert!(detail.prompt_enabled(true));
+        assert!(!detail.prompt_enabled(false));
+
+        detail.set_task(task(TaskStatus::Succeeded));
+        assert!(
+            !detail.prompt_enabled(true),
+            "a finished run cannot accept a prompt, even with a restored session"
+        );
+    }
+
+    #[test]
+    fn a_new_attempt_clears_the_composer_focus_but_a_same_attempt_update_keeps_the_draft() {
+        let mut detail = TaskDetail::new(Uuid::from_u128(7));
+        detail.set_task(task(TaskStatus::Running));
+        detail.prompt.set_value("draft".to_string());
+        detail.prompt_focused = true;
+
+        let mut same = task(TaskStatus::Running);
+        same.output = None;
+        detail.update_summary(same);
+        assert!(
+            detail.prompt_focused,
+            "a live update keeps the composer focused"
+        );
+        assert_eq!(detail.prompt.value(), "draft");
+
+        let mut next = task(TaskStatus::Running);
+        next.attempt = 2;
+        detail.update_summary(next);
+        assert!(
+            !detail.prompt_focused,
+            "a new attempt owns a new conversation"
+        );
+        assert_eq!(detail.prompt.value(), "");
     }
 
     #[test]
