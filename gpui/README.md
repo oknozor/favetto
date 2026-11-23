@@ -129,6 +129,12 @@ The search field fuzzy-matches definition names and prompt text. Selecting a row
 loads `catalog.get` and shows the raw Markdown in a monospace pane beside the
 list; **Copy** puts the source on the clipboard.
 
+The preview's left edge is an invisible 8 px resize handle with a
+column-resize cursor. Dragging it clamps the width to 280–720 px and to the
+space left by the sidebar and a 360 px definition-list floor. The width lasts
+for the session (selecting another definition or refreshing the catalog keeps
+it); restarting the app restores 350 px.
+
 **Start with variables…** (or `Enter`) opens the launch sheet. It shows the
 definition's agent, provider/model, `cwd`, schedule and every declared `[[vars]]`
 entry. Required values are marked and validated inline; `int`/`bool` and fixed
@@ -283,7 +289,10 @@ field blank keeps the shared token file.
 - `src/palette.rs` — pure command-palette model: fuzzy filtering, wrapping
   selection, recents and command execution kinds (unit-tested without a window).
 - `src/layout.rs` — the responsive breakpoint helper (the container-query
-  equivalent for this GPUI version) and the detail-width clamp helper.
+  equivalent for this GPUI version) and the detail/pane-width clamp helpers.
+- `src/resize.rs` — the shared drag-to-resize state behind the detail column
+  and Catalog preview dividers: pointer math, the drag marker and the zero-sized
+  drag preview.
 - `src/motion.rs` — OS reduced-motion detection (GTK settings plus
   `FAVETTO_REDUCE_MOTION`/`GTK_ENABLE_ANIMATIONS`). The only decorative motion
   is the toast fade; everything else changes state immediately.
