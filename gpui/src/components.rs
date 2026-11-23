@@ -301,11 +301,14 @@ pub fn shortcut_row(theme: &Theme, label: &str, keys: &str) -> Div {
         .rounded(px(theme.radii.r4))
         .child(
             div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
                 .text_size(px(theme.font.sm))
                 .text_color(theme.colors.text)
                 .child(label.to_string()),
         )
-        .child(keycap(theme, keys))
+        .child(div().flex_none().child(keycap(theme, keys)))
 }
 
 /// Visible focus ring for an already-built button.
