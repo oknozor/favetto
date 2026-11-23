@@ -2230,6 +2230,51 @@ async fn list_agent_sessions_orders_by_most_recent_update() {
 }
 
 #[tokio::test]
+async fn list_agent_sessions_for_task_is_scoped_to_the_task() {
+    let (dir, pool) = scratch_pool("agent-session-task-scope").await;
+    let base = from_ms(1_700_000_000_000);
+    let task_a = "task-a";
+    let task_b = "task-b";
+
+    let mut first = AgentSessionRecord::loading("local-first", "opencode", "/work", base);
+    first.task_id = Some(task_a.to_string());
+    insert_agent_session(&pool, &first).await.unwrap();
+
+    let mut second = AgentSessionRecord::loading(
+        "local-second",
+        "opencode",
+        "/work",
+        base + ChronoDuration::seconds(1),
+    );
+    second.task_id = Some(task_a.to_string());
+    insert_agent_session(&pool, &second).await.unwrap();
+
+    let mut other = AgentSessionRecord::loading(
+        "local-other",
+        "opencode",
+        "/work",
+        base + ChronoDuration::seconds(2),
+    );
+    other.task_id = Some(task_b.to_string());
+    insert_agent_session(&pool, &other).await.unwrap();
+
+    let ids: Vec<String> = list_agent_sessions_for_task(&pool, task_a, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|session| session.id)
+        .collect();
+    assert_eq!(ids, vec!["local-second", "local-first"]);
+
+    assert!(list_agent_sessions_for_task(&pool, "task-none", 10)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn migrate_creates_agent_sessions_without_touching_existing_data() {
     let dir = std::env::temp_dir().join(format!(
         "favetto-agent-session-migrate-{}-{}",

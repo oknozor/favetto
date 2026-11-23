@@ -109,6 +109,10 @@ pub mod method {
     /// Backfill a task's normalized agent-event feed from the live session's
     /// bounded ring buffer (non-durable; `seq` is the per-session cursor).
     pub const TASKS_EVENTS: &str = "tasks.events";
+    /// Resolve the Favetto-created agent session associated with a task, by
+    /// Favetto-local id. Used to restore a task's conversation on demand without
+    /// enumerating global history.
+    pub const TASKS_SESSION: &str = "tasks.session";
     pub const TASKS_CANCEL: &str = "tasks.cancel";
     /// Retry a terminal task, preserving its prior run history.
     pub const TASKS_RETRY: &str = "tasks.retry";
@@ -268,6 +272,12 @@ pub const CLIENT_METHODS: &[(&str, &str)] = &[
         method::TASKS_EVENTS,
         "Backfill a task's normalized agent-event feed from its session's bounded \
          ring buffer (non-durable; `after`/`next_cursor` are per-session `seq`s).",
+    ),
+    (
+        method::TASKS_SESSION,
+        "Resolve the Favetto-created agent session associated with a task, by \
+         Favetto-local id, preferring a live record over the most recently \
+         updated ended one. Returns `null` when the task has no session.",
     ),
     (method::TASKS_CANCEL, "Cancel a task."),
     (
@@ -587,6 +597,7 @@ mod tests {
             method::TASKS_GET,
             method::TASKS_RUNS,
             method::TASKS_EVENTS,
+            method::TASKS_SESSION,
             method::TASKS_CANCEL,
             method::TASKS_RETRY,
             method::TASKS_START,

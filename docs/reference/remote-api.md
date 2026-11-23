@@ -29,6 +29,7 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | `tasks.get` | Fetch a single task by id, including its stored output. |
 | `tasks.runs` | List a task's execution attempts (run history). |
 | `tasks.events` | Backfill a task's normalized agent-event feed from its session's bounded ring buffer (non-durable; `after`/`next_cursor` are per-session `seq`s). |
+| `tasks.session` | Resolve the Favetto-created agent session associated with a task, by Favetto-local id, preferring a live record over the most recently updated ended one. Returns `null` when the task has no session. |
 | `tasks.cancel` | Cancel a task. |
 | `tasks.retry` | Retry a terminal task, preserving its prior run history. |
 | `tasks.start` | Start a catalog task by name. |
@@ -196,6 +197,22 @@ Backfill a task's normalized agent-event feed from its session's bounded ring bu
 | `next_cursor` | integer | — | yes |  |
 | `plan` | AgentPlanEntry[] (optional) | — | no | The session's current plan at `next_cursor`, when it has one. `None` means there is no structured session; `Some(empty)` means the agent explicitly cleared the plan. |
 | `commands` | AgentCommand[] (optional) | — | no | The session's current command list at `next_cursor`, with the same `None`/empty distinction as [`Self::plan`]. |
+
+### `tasks.session`
+
+Resolve the Favetto-created agent session associated with a task, by Favetto-local id, preferring a live record over the most recently updated ended one. Returns `null` when the task has no session.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `id` | string | — | yes |  |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `session` | AgentSessionHistoryEntry (optional) | — | no |  |
 
 ### `tasks.cancel`
 

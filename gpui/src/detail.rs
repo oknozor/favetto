@@ -20,11 +20,11 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use favetto_wire::elicitation::ElicitationRequest;
 use favetto_wire::model::{
-    AgentCommand, AgentPlanEntry, AgentSessionInfo, AgentStateEvent, AgentUsage, AwaitingInputKind,
-    ContentRole, IdleOutcome, InputRequest, MessageContent, MessageRole, RunStatus, RunSummary,
-    Task, TaskRun, TaskStatus,
+    AgentCommand, AgentPlanEntry, AgentSessionHistoryEntry, AgentSessionInfo, AgentSessionState,
+    AgentStateEvent, AgentUsage, AwaitingInputKind, ContentRole, IdleOutcome, InputRequest,
+    MessageContent, MessageRole, RunStatus, RunSummary, Task, TaskRun, TaskStatus,
 };
-use favetto_wire::rpc::{AgentEventPush, RpcCall, TasksEventsParams};
+use favetto_wire::rpc::{AgentAttachResult, AgentEventPush, RpcCall, TasksEventsParams};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -695,6 +695,104 @@ pub struct PendingElicitation {
     pub request: ElicitationRequest,
 }
 
+/// How much of a restored conversation the detail renders. The agent owns the
+/// full transcript; this is a bounded, read-only preview.
+pub const RESTORED_TRANSCRIPT_CHARS: usize = 8_000;
+
+/// The task-scoped restoration of the run's associated agent conversation.
+///
+/// The state machine is GPUI-free: the daemon lookup (`tasks.session`) and a
+/// single `agents.load` are the only reads, and neither ever starts a fresh
+/// session or prompts the agent.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SessionRestore {
+    /// `tasks.session` is in flight.
+    Checking,
+    /// The daemon resolved an associated session and `agents.load` is replaying
+    /// its conversation.
+    Attaching {
+        session_id: String,
+        agent: String,
+        /// Whether the resolved session was live when the lookup ran.
+        live: bool,
+    },
+    /// The conversation was restored and can be rendered read-only.
+    Restored(RestoredSession),
+    /// The task has no associated session, or it cannot be restored.
+    Unavailable(String),
+    /// The lookup, load, or transcript decode failed.
+    Failed(String),
+}
+
+/// One restored agent conversation, addressed by its Favetto-local session id.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RestoredSession {
+    /// Favetto-local id, the only routing key accepted by `agents.load`.
+    pub session_id: String,
+    /// Configured agent that owns the session.
+    pub agent: String,
+    /// The session lifecycle at replay time.
+    pub state: AgentSessionState,
+    /// The replayed plain-text conversation, bounded for display.
+    pub transcript: String,
+}
+
+impl RestoredSession {
+    /// Whether the replay contains anything worth painting.
+    pub fn has_transcript(&self) -> bool {
+        !self.transcript.trim().is_empty()
+    }
+
+    /// The lifecycle as a short label.
+    pub fn state_label(&self) -> &'static str {
+        match self.state {
+            AgentSessionState::Active => "live",
+            AgentSessionState::Loading => "loading",
+            AgentSessionState::Ended => "ended",
+            AgentSessionState::Failed => "failed",
+        }
+    }
+}
+
+/// Decode an `agents.load` replay into a bounded display transcript.
+pub fn restored_session(
+    attached: AgentAttachResult,
+    expected_id: &str,
+) -> Result<RestoredSession, String> {
+    if attached.session.id != expected_id {
+        return Err(format!(
+            "the daemon loaded session '{}' instead of '{expected_id}'",
+            attached.session.id
+        ));
+    }
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&attached.data)
+        .map_err(|_| "the daemon returned an unreadable session transcript".to_string())?;
+    let transcript = String::from_utf8(bytes)
+        .map_err(|_| "the daemon returned a transcript that is not valid UTF-8".to_string())?;
+    let transcript = strip_ansi(&transcript);
+    let state = if attached.session.running {
+        AgentSessionState::Active
+    } else {
+        AgentSessionState::Ended
+    };
+    Ok(RestoredSession {
+        session_id: attached.session.id,
+        agent: attached.session.agent,
+        state,
+        transcript: bound_transcript(&transcript),
+    })
+}
+
+fn bound_transcript(transcript: &str) -> String {
+    if transcript.chars().count() <= RESTORED_TRANSCRIPT_CHARS {
+        return transcript.to_string();
+    }
+    let head: String = transcript.chars().take(RESTORED_TRANSCRIPT_CHARS).collect();
+    format!("{head}\n… (transcript truncated for display)")
+}
+
 /// The client's per-task detail state. One lives on [`crate::state::ClientState`]
 /// for the selected run and is replaced when another run opens.
 #[derive(Clone, Debug)]
@@ -765,6 +863,12 @@ pub struct TaskDetail {
     pub prompt_open: bool,
     /// The last prompt-send failure.
     pub prompt_error: Option<String>,
+    /// The task-scoped restoration of the run's agent conversation.
+    pub restore: SessionRestore,
+    /// Monotonic id of the in-flight restore lookup, used to drop stale replies.
+    pub restore_request: u64,
+    /// The Favetto-local id this detail asked `agents.load` for, when attaching.
+    pub restore_session: Option<String>,
 }
 
 impl TaskDetail {
@@ -803,6 +907,9 @@ impl TaskDetail {
             prompt_sending: false,
             prompt_open: false,
             prompt_error: None,
+            restore: SessionRestore::Checking,
+            restore_request: 0,
+            restore_session: None,
         }
     }
 
@@ -851,6 +958,11 @@ impl TaskDetail {
             self.prompt_sending = false;
             self.prompt_open = false;
             self.prompt_error = None;
+            // A new attempt owns a new agent conversation; the previous attempt's
+            // restored history must never appear under it.
+            self.restore = SessionRestore::Checking;
+            self.restore_request = self.restore_request.wrapping_add(1);
+            self.restore_session = None;
         } else if task.output.is_none() {
             if let Some(existing) = &self.task {
                 task.output = existing.output.clone();
@@ -1006,6 +1118,84 @@ impl TaskDetail {
     pub fn fail_runs(&mut self, message: String) {
         self.runs_loading = false;
         self.runs_error = Some(message);
+    }
+
+    /// Start a fresh, task-scoped restore lookup and return its generation id.
+    ///
+    /// The generation is echoed by the runtime so a reply for an earlier open or
+    /// attempt can never overwrite the current detail.
+    pub fn begin_restore(&mut self) -> u64 {
+        self.restore_request = self.restore_request.wrapping_add(1);
+        self.restore = SessionRestore::Checking;
+        self.restore_session = None;
+        self.restore_request
+    }
+
+    /// Record that the resolved session is being restored through `agents.load`.
+    pub fn attach_restore(&mut self, entry: &AgentSessionHistoryEntry) {
+        self.restore_session = Some(entry.id.clone());
+        self.restore = SessionRestore::Attaching {
+            session_id: entry.id.clone(),
+            agent: entry.agent.clone(),
+            live: entry.state == AgentSessionState::Active,
+        };
+    }
+
+    /// Whether a `tasks.session` reply belongs to this detail's current open or
+    /// attempt. A duplicate reply after the attach started is not accepted.
+    pub fn accepts_restore_reply(&self, task_id: Uuid, request_id: u64) -> bool {
+        self.task_id == task_id
+            && self.restore_request == request_id
+            && matches!(self.restore, SessionRestore::Checking)
+    }
+
+    /// Record that the task has no restorable associated session.
+    pub fn mark_restore_unavailable(&mut self, reason: String) {
+        self.restore_session = None;
+        self.restore = SessionRestore::Unavailable(reason);
+    }
+
+    /// Record a lookup/load failure; the task row and its output are untouched.
+    pub fn fail_restore(&mut self, reason: String) {
+        self.restore_session = None;
+        self.restore = SessionRestore::Failed(reason);
+    }
+
+    /// Fold a completed `agents.load` in and return whether the resolved session
+    /// changed, so the caller can reset the feed cursor and reload once.
+    pub fn finish_restore(&mut self, result: Result<AgentAttachResult, String>) -> bool {
+        let Some(expected) = self.restore_session.clone() else {
+            return false;
+        };
+        match result.and_then(|attached| restored_session(attached, &expected)) {
+            Ok(restored) => {
+                let changed = self.events_session.as_deref() != Some(restored.session_id.as_str());
+                self.restore = SessionRestore::Restored(restored);
+                self.restore_session = None;
+                if changed {
+                    self.reset_events_for_restore();
+                }
+                changed
+            }
+            Err(message) => {
+                self.fail_restore(message);
+                false
+            }
+        }
+    }
+
+    /// Drop the previous attempt's feed so a replayed conversation is not
+    /// filtered out by the old session's cursor.
+    fn reset_events_for_restore(&mut self) {
+        self.events.clear();
+        self.events_session = None;
+        self.events_cursor = 0;
+        self.events_loaded = false;
+        self.events_ignored = 0;
+        self.events_revision = self.events_revision.wrapping_add(1);
+        self.new_events = 0;
+        self.plan = None;
+        self.commands = None;
     }
 
     /// The persisted output, reduced to plain text.
@@ -2252,5 +2442,159 @@ mod tests {
         assert_eq!(run_status_kind(run.status), StatusKind::Neutral);
         assert_eq!(run_duration(&run, started), Some(Duration::from_secs(90)));
         assert_eq!(run_exit_label(&run), "1");
+    }
+
+    fn history_entry(
+        id: &str,
+        state: AgentSessionState,
+        loadable: bool,
+    ) -> AgentSessionHistoryEntry {
+        AgentSessionHistoryEntry {
+            id: id.to_string(),
+            agent: "opencode".to_string(),
+            title: Some(format!("session {id}")),
+            cwd: std::path::PathBuf::from("/work"),
+            task_id: Some(Uuid::from_u128(7).to_string()),
+            state,
+            loadable,
+            load_error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn attached(id: &str, text: &str) -> AgentAttachResult {
+        AgentAttachResult {
+            session: AgentSessionInfo {
+                id: id.to_string(),
+                agent: "opencode".to_string(),
+                backend: favetto_wire::model::AgentBackend::Acp,
+                task_id: Some(Uuid::from_u128(7).to_string()),
+                running: false,
+                headless: true,
+                session_id: None,
+                awaiting_input: None,
+                activity: None,
+                usage: None,
+                load_state: Default::default(),
+                load_error: None,
+                config_options: Vec::new(),
+                modes: None,
+                auth: None,
+            },
+            data: base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                text.as_bytes(),
+            ),
+            seq: 0,
+            plan: Vec::new(),
+            commands: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn restore_attaches_a_resolved_session_and_decodes_the_replay() {
+        let mut detail = TaskDetail::new(Uuid::from_u128(7));
+        let request = detail.begin_restore();
+        assert!(matches!(detail.restore, SessionRestore::Checking));
+        assert_eq!(request, 1);
+
+        detail.attach_restore(&history_entry("local-past", AgentSessionState::Ended, true));
+        assert_eq!(detail.restore_session.as_deref(), Some("local-past"));
+
+        let changed = detail.finish_restore(Ok(attached("local-past", "question\nhello")));
+        assert!(changed, "there was no prior feed session");
+        let SessionRestore::Restored(restored) = &detail.restore else {
+            panic!("expected a restored session: {:?}", detail.restore);
+        };
+        assert_eq!(restored.session_id, "local-past");
+        assert_eq!(restored.agent, "opencode");
+        assert_eq!(restored.state, AgentSessionState::Ended);
+        assert_eq!(restored.transcript, "question\nhello");
+        assert!(detail.restore_session.is_none());
+    }
+
+    #[test]
+    fn a_stale_or_duplicate_restore_reply_is_dropped() {
+        let task_id = Uuid::from_u128(7);
+        let mut detail = TaskDetail::new(task_id);
+        let request = detail.begin_restore();
+        assert!(detail.accepts_restore_reply(task_id, request));
+
+        // A reply for another task or an earlier attempt is stale.
+        assert!(!detail.accepts_restore_reply(Uuid::from_u128(8), request));
+        assert!(!detail.accepts_restore_reply(task_id, request + 1));
+
+        // Once the attach started, a duplicate lookup reply is a no-op.
+        detail.attach_restore(&history_entry("local-past", AgentSessionState::Ended, true));
+        assert!(!detail.accepts_restore_reply(task_id, request));
+    }
+
+    #[test]
+    fn restore_records_unavailable_and_failed_states_without_falling_back() {
+        let mut detail = TaskDetail::new(Uuid::from_u128(7));
+        detail.begin_restore();
+        detail.attach_restore(&history_entry(
+            "local-failed",
+            AgentSessionState::Ended,
+            false,
+        ));
+        detail.finish_restore(Err("agent does not support session/load".to_string()));
+        assert!(matches!(
+            detail.restore,
+            SessionRestore::Failed(ref message) if message.contains("does not support")
+        ));
+        assert!(detail.restore_session.is_none());
+
+        detail.begin_restore();
+        detail
+            .mark_restore_unavailable("No agent conversation is associated with this task.".into());
+        assert!(matches!(
+            detail.restore,
+            SessionRestore::Unavailable(ref reason) if reason.contains("No agent conversation")
+        ));
+    }
+
+    #[test]
+    fn restore_drops_a_replay_for_a_different_local_id() {
+        let mut detail = TaskDetail::new(Uuid::from_u128(7));
+        detail.begin_restore();
+        detail.attach_restore(&history_entry("local-past", AgentSessionState::Ended, true));
+        detail.finish_restore(Ok(attached("provider-id", "wrong transcript")));
+        assert!(matches!(
+            detail.restore,
+            SessionRestore::Failed(ref message) if message.contains("provider-id")
+        ));
+        assert!(detail.restore_session.is_none());
+    }
+
+    #[test]
+    fn restore_resets_the_feed_cursor_when_the_session_changes() {
+        let mut detail = TaskDetail::new(Uuid::from_u128(7));
+        detail.push_event(text(4, MessageRole::Assistant, "old"));
+        assert_eq!(detail.events_session.as_deref(), Some("ses_1"));
+        assert_eq!(detail.events_cursor, 4);
+
+        detail.begin_restore();
+        detail.attach_restore(&history_entry("local-past", AgentSessionState::Ended, true));
+        let changed = detail.finish_restore(Ok(attached("local-past", "replay")));
+        assert!(changed);
+        assert!(detail.events.is_empty());
+        assert!(detail.events_session.is_none());
+        assert_eq!(detail.events_cursor, 0);
+        assert!(!detail.events_loaded);
+    }
+
+    #[test]
+    fn the_restored_transcript_is_bounded() {
+        let long = "x".repeat(RESTORED_TRANSCRIPT_CHARS + 10);
+        let mut detail = TaskDetail::new(Uuid::from_u128(7));
+        detail.begin_restore();
+        detail.attach_restore(&history_entry("local-past", AgentSessionState::Ended, true));
+        detail.finish_restore(Ok(attached("local-past", &long)));
+        let SessionRestore::Restored(restored) = &detail.restore else {
+            panic!("expected a restored session");
+        };
+        assert!(restored.transcript.contains("truncated for display"));
     }
 }

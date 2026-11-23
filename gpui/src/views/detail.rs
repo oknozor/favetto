@@ -30,7 +30,8 @@ use uuid::Uuid;
 
 use crate::components;
 use crate::detail::{
-    self, DetailTab, FeedItem, OutputSource, OutputText, PendingRequest, TaskDetail, ToolStatus,
+    self, DetailTab, FeedItem, OutputSource, OutputText, PendingRequest, SessionRestore,
+    TaskDetail, ToolStatus,
 };
 use crate::elicitation::ElicitationStage;
 use crate::inbox::{self, StatusKind};
@@ -1406,6 +1407,137 @@ impl DetailView {
     /// the plain persisted transcript, and keep the raw transcript one click
     /// away whenever a structured log is available.
     fn merged_output_body(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let restore = self
+            .state
+            .read(cx)
+            .detail()
+            .map(|detail| detail.restore.clone());
+        let panel = restore.and_then(|restore| self.restore_panel(theme, &restore, cx));
+        let body = self.merged_output_content(theme, cx);
+        match panel {
+            Some(panel) => div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .child(panel)
+                .child(div().flex_1().min_h_0().child(body))
+                .into_any_element(),
+            None => body,
+        }
+    }
+
+    /// A read-only banner/transcript for the task-scoped agent conversation.
+    ///
+    /// The restored text is only painted when no structured feed is available;
+    /// otherwise the replayed feed below is the conversation.
+    fn restore_panel(
+        &self,
+        theme: &Theme,
+        restore: &SessionRestore,
+        cx: &mut Context<Self>,
+    ) -> Option<Stateful<Div>> {
+        let feed_present = self
+            .state
+            .read(cx)
+            .detail()
+            .is_some_and(|detail| !detail.events.is_empty());
+        let (headline, detail, color) = match restore {
+            SessionRestore::Checking => (
+                "Restoring conversation…".to_string(),
+                "Looking up the agent session associated with this run.".to_string(),
+                theme.colors.muted,
+            ),
+            SessionRestore::Attaching {
+                session_id,
+                agent,
+                live,
+            } => (
+                "Restoring conversation…".to_string(),
+                format!(
+                    "Attaching to session {session_id} ({agent}){}.",
+                    if *live { " · live" } else { "" }
+                ),
+                theme.colors.warning,
+            ),
+            SessionRestore::Restored(restored) => (
+                "Restored conversation".to_string(),
+                format!(
+                    "{} · session {} · {}",
+                    restored.agent,
+                    restored.session_id,
+                    restored.state_label(),
+                ),
+                theme.colors.success,
+            ),
+            SessionRestore::Unavailable(reason) => (
+                "No agent conversation to restore".to_string(),
+                reason.clone(),
+                theme.colors.muted,
+            ),
+            SessionRestore::Failed(reason) => (
+                "The agent conversation could not be restored".to_string(),
+                reason.clone(),
+                theme.colors.danger,
+            ),
+        };
+
+        let mut panel = div()
+            .id("detail-restore")
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .px(px(theme.spacing.s3))
+            .py(px(theme.spacing.s2))
+            .border_b_1()
+            .border_color(theme.colors.border)
+            .bg(Hsla::from(theme.colors.border).opacity(0.12))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s1))
+                    .text_size(px(theme.font.xs))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(color)
+                    .child("●")
+                    .child(headline),
+            )
+            .child(
+                div()
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.muted)
+                    .child(detail),
+            );
+
+        if let SessionRestore::Restored(restored) = restore {
+            if restored.has_transcript() && !feed_present {
+                panel = panel.child(
+                    div()
+                        .id("detail-restored-transcript")
+                        .mt(px(theme.spacing.s1))
+                        .max_h(px(240.0))
+                        .overflow_y_scroll()
+                        .font_family("monospace")
+                        .text_size(px(theme.font.xs))
+                        .text_color(theme.colors.text)
+                        .whitespace_normal()
+                        .child(restored.transcript.clone()),
+                );
+            } else if feed_present {
+                panel = panel.child(
+                    div()
+                        .text_size(px(theme.font.xs))
+                        .text_color(theme.colors.muted)
+                        .child("The replayed conversation is shown in the structured feed below."),
+                );
+            }
+        }
+
+        Some(panel)
+    }
+
+    fn merged_output_content(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let (
             task_id,
             status,

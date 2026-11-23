@@ -351,7 +351,8 @@ Favetto-local session id; loading, ready, failed and cannot-load states are show
 inline. This restores the provider's own conversation and never starts a fresh
 session. This page lists only Favetto-created rows; provider-owned history is
 available through `agents.provider_sessions` and is integrated into the TUI
-Ctrl+O picker and the desktop Past sessions card.
+Ctrl+O picker. The desktop client does not enumerate provider history; opening a
+task restores only that run's conversation through `tasks.session`.
 
 ### Soft keyboard
 
