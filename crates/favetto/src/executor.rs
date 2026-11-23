@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use favetto_core::Timestamp;
 use parking_lot::Mutex;
 use sqlx::SqlitePool;
 use tokio::process::Command;
@@ -139,14 +139,14 @@ async fn schedule_auto_retry(state: &State, task: &Task, retry: &RetrySettings) 
         return false;
     }
     let delay = retry.backoff_delay(task.attempt);
-    let at =
-        Utc::now() + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::zero());
+    let delay = time::Duration::nanoseconds(i64::try_from(delay.as_nanos()).unwrap_or(i64::MAX));
+    let at = Timestamp::now() + delay;
     match db::schedule_task_retry(&state.db, task.id, at).await {
         Ok(true) => {
             tracing::info!(
                 task_id = %task.id,
                 attempt = task.attempt,
-                retry_in_ms = delay.as_millis(),
+                retry_in_ms = delay.whole_milliseconds(),
                 "scheduling automatic retry"
             );
             if let Ok(Some(fresh)) = db::get_task(&state.db, task.id).await {
@@ -516,7 +516,7 @@ async fn enqueue_with_id(
         input,
         output: None,
         dedupe_key,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         started_at: None,
         finished_at: None,
         error: None,
@@ -623,7 +623,7 @@ async fn record_dependencies(
     task_id: Uuid,
     depends_on: &[Uuid],
 ) -> anyhow::Result<()> {
-    let now = Utc::now();
+    let now = Timestamp::now();
     for predecessor in depends_on {
         db::insert_dependency(&state.db, task_id, *predecessor, now).await?;
     }
@@ -688,7 +688,7 @@ async fn run_one(
     // copy so the task update we publish and persist matches the run.
     task.status = TaskStatus::Running;
     task.attempt = run.attempt;
-    task.started_at = run.started_at.or_else(|| Some(Utc::now()));
+    task.started_at = run.started_at.or_else(|| Some(Timestamp::now()));
     state
         .bus
         .publish(ServerPush::TaskUpdated(Box::new(task.summary())));
@@ -761,7 +761,7 @@ async fn run_one(
     // Take the reported usage out before `record_run_outcome` consumes the outcome.
     let usage = outcome.as_ref().ok().and_then(|run| run.usage.clone());
     let success = record_run_outcome(&mut task, outcome);
-    task.finished_at = Some(Utc::now());
+    task.finished_at = Some(Timestamp::now());
     // The terminal snapshot pushed to attached clients keeps the run's usage,
     // so a finished row does not lose its cost until the next full refresh.
     task.latest_usage = usage.clone();
@@ -1384,7 +1384,7 @@ async fn record_spawn_failure(
     kind: FailureKind,
     error: String,
 ) {
-    let finished_at = Utc::now();
+    let finished_at = Timestamp::now();
     let mut failure = Failure::new(kind, error.clone());
     // A spawn failure must not auto-retry an item that the parent cannot
     // re-spawn: the fan-out is already decided.
@@ -1756,7 +1756,7 @@ async fn fail_task(state: &State, task: Task, kind: FailureKind, error: &str) {
     task.status = TaskStatus::Failed;
     task.error = Some(error.to_string());
     task.failure = Some(Failure::new(kind, error));
-    task.finished_at = Some(Utc::now());
+    task.finished_at = Some(Timestamp::now());
     // Compare-and-set: only write while the task is still active, so a
     // cancellation that landed between the claim and here wins.
     let finished = db::finish_active_task(&state.db, &task)
@@ -1893,7 +1893,7 @@ async fn make_plan(
                 repo: repo.clone(),
                 path: path.clone(),
                 branch: branch.clone(),
-                created_at: Utc::now(),
+                created_at: Timestamp::now(),
             };
             if let Err(e) = db::record_worktree(&state.db, &record).await {
                 tracing::warn!(
@@ -2082,13 +2082,13 @@ pub(crate) fn is_terminal(status: TaskStatus) -> bool {
 /// - `cutoff == None` (i.e. `days == 0`) disables age-based removal.
 fn select_prunable(
     records: &[db::WorktreeRecord],
-    tasks: &HashMap<Uuid, (TaskStatus, Option<chrono::DateTime<Utc>>)>,
-    cutoff: Option<chrono::DateTime<Utc>>,
+    tasks: &HashMap<Uuid, (TaskStatus, Option<Timestamp>)>,
+    cutoff: Option<Timestamp>,
     keep_worktree: bool,
     min_worktrees: usize,
 ) -> Vec<db::WorktreeRecord> {
     let mut unconditional: Vec<db::WorktreeRecord> = Vec::new();
-    let mut age_candidates: Vec<(chrono::DateTime<Utc>, db::WorktreeRecord)> = Vec::new();
+    let mut age_candidates: Vec<(Timestamp, db::WorktreeRecord)> = Vec::new();
 
     for record in records {
         match tasks.get(&record.task_id) {
@@ -2279,8 +2279,8 @@ pub async fn prune_worktrees(state: &State) -> anyhow::Result<WorktreePruneStats
         }
     }
 
-    let cutoff =
-        (retention.days > 0).then(|| Utc::now() - chrono::Duration::days(retention.days as i64));
+    let cutoff = (retention.days > 0)
+        .then(|| Timestamp::now() - time::Duration::days(retention.days as i64));
     let selected = select_prunable(
         &records,
         &tasks,

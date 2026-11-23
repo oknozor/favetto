@@ -289,12 +289,16 @@ impl ElicitationField {
                     let valid = match format {
                         ElicitationStringFormat::Email => valid_email(value),
                         ElicitationStringFormat::Uri => url::Url::parse(value).is_ok(),
-                        ElicitationStringFormat::Date => {
-                            chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
-                        }
-                        ElicitationStringFormat::DateTime => {
-                            chrono::DateTime::parse_from_rfc3339(value).is_ok()
-                        }
+                        ElicitationStringFormat::Date => time::Date::parse(
+                            value,
+                            &time::macros::format_description!("[year]-[month]-[day]"),
+                        )
+                        .is_ok(),
+                        ElicitationStringFormat::DateTime => time::OffsetDateTime::parse(
+                            value,
+                            &time::format_description::well_known::Rfc3339,
+                        )
+                        .is_ok(),
                     };
                     if !valid {
                         let label = match format {

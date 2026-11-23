@@ -188,15 +188,15 @@ pub fn banner_lines(failures: &[LaunchFailure]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{DateTime, Utc};
     use favetto_wire::model::Failure;
+    use favetto_wire::Timestamp;
 
-    fn at(offset_minutes: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp")
-            + chrono::Duration::minutes(offset_minutes)
+    fn at(offset_minutes: i64) -> Timestamp {
+        Timestamp::from_unix_timestamp(1_700_000_000).expect("timestamp")
+            + time::Duration::minutes(offset_minutes)
     }
 
-    fn task(id: u128, name: &str, status: TaskStatus, created: DateTime<Utc>) -> Task {
+    fn task(id: u128, name: &str, status: TaskStatus, created: Timestamp) -> Task {
         Task {
             id: Uuid::from_u128(id),
             name: name.to_string(),

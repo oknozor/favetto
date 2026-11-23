@@ -17,7 +17,6 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use favetto_wire::elicitation::ElicitationRequest;
 use favetto_wire::model::{
     AgentCommand, AgentPlanEntry, AgentSessionHistoryEntry, AgentSessionInfo, AgentSessionState,
@@ -25,6 +24,7 @@ use favetto_wire::model::{
     MessageContent, MessageRole, RunStatus, RunSummary, Task, TaskRun, TaskStatus,
 };
 use favetto_wire::rpc::{AgentAttachResult, AgentEventPush, RpcCall, TasksEventsParams};
+use favetto_wire::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -643,10 +643,12 @@ pub fn run_status_kind(status: RunStatus) -> StatusKind {
 
 /// A run's duration: finished minus started, or the live elapsed for a running
 /// attempt. `None` until the daemon records a start time.
-pub fn run_duration(run: &TaskRun, now: DateTime<Utc>) -> Option<Duration> {
+pub fn run_duration(run: &TaskRun, now: Timestamp) -> Option<Duration> {
     let started = run.started_at?;
     let end = run.finished_at.unwrap_or(now);
-    let seconds = end.timestamp().saturating_sub(started.timestamp());
+    let seconds = end
+        .unix_timestamp()
+        .saturating_sub(started.unix_timestamp());
     Some(Duration::from_secs(u64::try_from(seconds).unwrap_or(0)))
 }
 
@@ -1613,7 +1615,6 @@ impl RpcCall for DetailEventsCall {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     fn push(seq: u64, event: AgentStateEvent) -> AgentEventPush {
         AgentEventPush {
@@ -1643,8 +1644,8 @@ mod tests {
             input: serde_json::json!({}),
             output: None,
             dedupe_key: None,
-            created_at: Utc::now(),
-            started_at: Some(Utc::now()),
+            created_at: Timestamp::now(),
+            started_at: Some(Timestamp::now()),
             finished_at: None,
             error: None,
             failure: None,
@@ -2461,7 +2462,7 @@ mod tests {
 
     #[test]
     fn run_helpers_name_the_run_only_outcomes() {
-        let started = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+        let started = "2026-01-01T12:00:00Z".parse::<Timestamp>().unwrap();
         let run = TaskRun {
             id: Uuid::from_u128(1),
             task_id: Uuid::from_u128(7),
@@ -2471,7 +2472,7 @@ mod tests {
             model: None,
             session_id: None,
             started_at: Some(started),
-            finished_at: Some(started + chrono::Duration::seconds(90)),
+            finished_at: Some(started + time::Duration::seconds(90)),
             exit_code: Some(1),
             error: None,
             usage: None,
@@ -2497,8 +2498,8 @@ mod tests {
             state,
             loadable,
             load_error: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
         }
     }
 

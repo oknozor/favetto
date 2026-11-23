@@ -1,16 +1,15 @@
 //! The Schedules model: the table, the create/edit sheet and cron validation.
 //!
-//! Cron parsing uses `croner` with the same configuration as the daemon
-//! (`Seconds::Required`, `dom_and_dow(true)`, UTC), so the next fire time the
-//! sheet previews is the one the daemon will register. A five-field expression
-//! is accepted as a convenience and normalized by adding a zero-seconds field.
+//! Cron parsing uses the daemon's own `favetto-cron` parser, so the next fire
+//! time the sheet previews is the one the daemon will register. A five-field
+//! expression is accepted as a convenience and normalized by adding a
+//! zero-seconds field.
 //!
 //! Everything here is free of GPUI types so the validation, the plain-language
 //! hints and the confirmation copy can be unit-tested without a window.
 
-use chrono::{DateTime, Utc};
-use croner::parser::{CronParser, Seconds};
 use favetto_wire::model::Schedule;
+use favetto_wire::Timestamp;
 use serde_json::Value;
 
 use crate::text_input::TextInput;
@@ -95,7 +94,7 @@ impl ScheduleEditor {
     }
 
     /// The edit sheet for an existing row.
-    pub fn edit(schedule: &Schedule, now: DateTime<Utc>) -> Self {
+    pub fn edit(schedule: &Schedule, now: Timestamp) -> Self {
         let mut editor = Self {
             id: Some(schedule.id.clone()),
             cron: TextInput::new(schedule.cron.clone()),
@@ -198,8 +197,8 @@ impl ScheduleEditor {
 
     /// Recompute the hint and (when the user has typed something) the inline
     /// cron error. An empty new field is not an error until submit.
-    pub fn refresh(&mut self, now: Option<DateTime<Utc>>) {
-        let now = now.unwrap_or_else(Utc::now);
+    pub fn refresh(&mut self, now: Option<Timestamp>) {
+        let now = now.unwrap_or_else(Timestamp::now);
         self.hint = None;
         self.cron_error = None;
         if self.cron.value().trim().is_empty() {
@@ -215,7 +214,7 @@ impl ScheduleEditor {
 
     /// Validate every field. Returns the normalized cron, task and enabled flag
     /// when the form can be sent.
-    pub fn validate(&mut self, now: DateTime<Utc>) -> Option<(String, String, bool)> {
+    pub fn validate(&mut self, now: Timestamp) -> Option<(String, String, bool)> {
         self.server_error = None;
         let normalized = match normalize_cron(self.cron.value()) {
             Ok(normalized) => {
@@ -483,7 +482,7 @@ pub fn normalize_cron(input: &str) -> Result<String, String> {
             ));
         }
     };
-    parser().parse(&normalized).map_err(|error| {
+    favetto_cron::Cron::parse(&normalized).map_err(|error| {
         format!(
             "{error} Check the field ranges: seconds/minutes 0–59, hours 0–23, \
                  day of month 1–31, month 1–12, weekday 0–7 (or SUN–SAT)."
@@ -492,21 +491,10 @@ pub fn normalize_cron(input: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
-fn parser() -> CronParser {
-    CronParser::builder()
-        .seconds(Seconds::Required)
-        .dom_and_dow(true)
-        .build()
-}
-
 /// The next UTC occurrence strictly after `now`, matching the daemon's
 /// `scheduler::next_run_after`.
-pub fn next_run_after(normalized: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    parser()
-        .parse(normalized)
-        .ok()?
-        .find_next_occurrence(&now, false)
-        .ok()
+pub fn next_run_after(normalized: &str, now: Timestamp) -> Option<Timestamp> {
+    favetto_cron::next_run_after(normalized, now)
 }
 
 /// A plain-language cadence plus the next fire time, e.g.
@@ -515,7 +503,7 @@ pub fn next_run_after(normalized: &str, now: DateTime<Utc>) -> Option<DateTime<U
 /// Complex field lists fall back to `"Custom schedule"` but still carry the
 /// computed next occurrence, so the hint never pretends to understand more than
 /// it does.
-pub fn describe_cron(normalized: &str, now: DateTime<Utc>) -> String {
+pub fn describe_cron(normalized: &str, now: Timestamp) -> String {
     let fields: Vec<&str> = normalized.split_whitespace().collect();
     let cadence = if fields.len() == 6 {
         cadence_for(
@@ -698,12 +686,17 @@ fn month_name(month: u32) -> Option<&'static str> {
 }
 
 /// `Fri 21 Nov 09:00` in UTC.
-pub fn short_datetime(value: DateTime<Utc>) -> String {
-    value.format("%a %-d %b %H:%M UTC").to_string()
+pub fn short_datetime(value: Timestamp) -> String {
+    value
+        .to_offset_datetime()
+        .format(time::macros::format_description!(
+            "[weekday repr:short] [day padding:none] [month repr:short] [hour]:[minute] UTC"
+        ))
+        .unwrap_or_default()
 }
 
 /// The table's next-run cell: an absolute UTC time with a relative hint.
-pub fn next_run_label(schedule: &Schedule, now: DateTime<Utc>) -> String {
+pub fn next_run_label(schedule: &Schedule, now: Timestamp) -> String {
     if !schedule.enabled {
         return "disabled".to_string();
     }
@@ -713,8 +706,8 @@ pub fn next_run_label(schedule: &Schedule, now: DateTime<Utc>) -> String {
     format!("{} · {}", short_datetime(next), relative(next, now))
 }
 
-fn relative(next: DateTime<Utc>, now: DateTime<Utc>) -> String {
-    let seconds = (next - now).num_seconds().max(0);
+fn relative(next: Timestamp, now: Timestamp) -> String {
+    let seconds = (next - now).whole_seconds().max(0);
     if seconds < 60 {
         format!("in {seconds}s")
     } else if seconds < 3_600 {
@@ -730,10 +723,8 @@ fn relative(next: DateTime<Utc>, now: DateTime<Utc>) -> String {
 mod tests {
     use super::*;
 
-    fn utc(value: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(value)
-            .expect("rfc3339")
-            .with_timezone(&Utc)
+    fn utc(value: &str) -> Timestamp {
+        value.parse().expect("rfc3339")
     }
 
     fn schedule(id: &str, cron: &str, task: &str, enabled: bool) -> Schedule {

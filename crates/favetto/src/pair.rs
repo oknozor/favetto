@@ -165,7 +165,7 @@ mod tests {
             data_dir: dir.clone(),
             tasks_dir: dir,
             catalog: Arc::new(parking_lot::RwLock::new(Vec::new())),
-            scheduler: tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
+            scheduler: crate::scheduler::Scheduler::new().await.unwrap(),
             hook_store: Arc::new(parking_lot::RwLock::new(Vec::new())),
         }))
     }

@@ -1,16 +1,21 @@
-//! Cron scheduler: loads `schedules` from SQLite and runs them via
-//! `tokio-cron-scheduler`. Each fire enqueues a task and emits a `CronTick` event.
-//! Schedules can be added/removed live through the RPC API, and catalog tasks with
-//! a `schedule` header are registered here as recurring tasks.
+//! Cron scheduler: loads `schedules` from SQLite and runs them on a tokio timer.
+//! Each fire enqueues a task and emits a `CronTick` event. Schedules can be
+//! added/removed live through the RPC API, and catalog tasks with a `schedule`
+//! header are registered here as recurring tasks.
+//!
+//! Jobs are driven by [`favetto_cron`] and plain [`tokio::time::sleep`], so the
+//! daemon no longer depends on `croner`/`tokio-cron-scheduler` (both of which
+//! require the unmaintained `chrono` crate).
 
+use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
-use croner::parser::{CronParser, Seconds};
-use tokio_cron_scheduler::{Job, JobScheduler};
-use uuid::Uuid;
-
 use favetto_core::model::Schedule;
+use favetto_core::Timestamp;
+use parking_lot::Mutex;
+use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 use crate::db;
 use crate::executor;
@@ -19,23 +24,71 @@ use crate::state::State;
 /// The next UTC occurrence of `cron` strictly after `now`, or `None` when the
 /// expression does not parse / has no future occurrence.
 ///
-/// Uses the same parser configuration `tokio-cron-scheduler` applies when it
-/// registers jobs (`Seconds::Required`, `dom_and_dow(true)`, UTC), so a shown
+/// Uses the same parser configuration the daemon applies when it registers a
+/// job (seconds required, day-of-month + day-of-week AND, UTC), so a shown
 /// `next_run` always matches when the job would actually fire.
-pub fn next_run_after(cron: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    CronParser::builder()
-        .seconds(Seconds::Required)
-        .dom_and_dow(true)
-        .build()
-        .parse(cron)
-        .ok()?
-        .find_next_occurrence(&now, false)
-        .ok()
+pub fn next_run_after(cron: &str, now: Timestamp) -> Option<Timestamp> {
+    favetto_cron::next_run_after(cron, now)
+}
+
+/// A set of live cron jobs, each running on its own tokio task.
+///
+/// `register` adds a job immediately; there is no separate tick to start.
+/// Removing a job aborts its task, which is safe even if it is mid-fire.
+#[derive(Debug, Clone, Default)]
+pub struct Scheduler {
+    jobs: Arc<Mutex<HashMap<Uuid, JoinHandle<()>>>>,
+}
+
+impl Scheduler {
+    /// Create an empty scheduler.
+    pub async fn new() -> anyhow::Result<Self> {
+        Ok(Self::default())
+    }
+
+    /// Validate `cron` and spawn `run` on every occurrence. Returns the job id.
+    pub async fn add<F, Fut>(&self, cron: &str, run: F) -> anyhow::Result<Uuid>
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let schedule = favetto_cron::Cron::parse(cron)
+            .map_err(|error| anyhow::anyhow!("invalid cron expression '{cron}': {error}"))?;
+        let id = Uuid::new_v4();
+        let handle = tokio::spawn(run_loop(schedule, run));
+        self.jobs.lock().insert(id, handle);
+        Ok(id)
+    }
+
+    /// Abort a registered job, if it exists.
+    pub async fn remove(&self, id: &Uuid) -> anyhow::Result<()> {
+        if let Some(handle) = self.jobs.lock().remove(id) {
+            handle.abort();
+        }
+        Ok(())
+    }
+}
+
+async fn run_loop<F, Fut>(schedule: favetto_cron::Cron, run: F)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    loop {
+        let now = Timestamp::now();
+        let Some(next) = schedule.next_after(now) else {
+            break;
+        };
+        let delay = next - now;
+        let nanos = u64::try_from(delay.whole_nanoseconds()).unwrap_or(u64::MAX);
+        tokio::time::sleep(std::time::Duration::from_nanos(nanos)).await;
+        run().await;
+    }
 }
 
 /// Register a schedule's job with the scheduler. Returns the job id.
 pub async fn register(
-    scheduler: &JobScheduler,
+    scheduler: &Scheduler,
     state: Arc<State>,
     schedule: &Schedule,
 ) -> anyhow::Result<Uuid> {
@@ -45,33 +98,37 @@ pub async fn register(
     let input = schedule.input.clone();
     let schedule_id = schedule.id.clone();
 
-    let job = Job::new_async(cron, move |_uuid, _sched| {
-        let state = state2.clone();
-        let task = task.clone();
-        let input = input.clone();
-        let schedule_id = schedule_id.clone();
-        Box::pin(async move {
-            let dedupe = format!("schedule:{schedule_id}:{}", Utc::now().timestamp());
-            if let Ok(task) = executor::enqueue_task(&state, task, input, Some(dedupe), false).await
-            {
-                state
-                    .emit_event(
-                        favetto_core::model::EventKind::CronTick,
-                        serde_json::json!({ "schedule_id": schedule_id, "task_id": task.id }),
-                    )
-                    .await;
+    let id = scheduler
+        .add(&cron, move || {
+            let state = state2.clone();
+            let task = task.clone();
+            let input = input.clone();
+            let schedule_id = schedule_id.clone();
+            async move {
+                let dedupe = format!(
+                    "schedule:{schedule_id}:{}",
+                    Timestamp::now().unix_timestamp()
+                );
+                if let Ok(task) =
+                    executor::enqueue_task(&state, task, input, Some(dedupe), false).await
+                {
+                    state
+                        .emit_event(
+                            favetto_core::model::EventKind::CronTick,
+                            serde_json::json!({ "schedule_id": schedule_id, "task_id": task.id }),
+                        )
+                        .await;
+                }
+                let _ = db::touch_schedule(&state.db, &schedule_id).await;
             }
-            let _ = db::touch_schedule(&state.db, &schedule_id).await;
         })
-    })?;
-
-    let id = scheduler.add(job).await?;
+        .await?;
     Ok(id)
 }
 
 /// Unregister a schedule's job.
-pub async fn unregister(scheduler: &JobScheduler, job_id: &Uuid) -> anyhow::Result<()> {
-    Ok(scheduler.remove(job_id).await?)
+pub async fn unregister(scheduler: &Scheduler, job_id: &Uuid) -> anyhow::Result<()> {
+    scheduler.remove(job_id).await
 }
 
 /// Remove a schedule: unregister its cron job and delete its row. Shared by the
@@ -158,7 +215,7 @@ pub async fn reconcile_catalog_schedules(state: &Arc<State>) -> anyhow::Result<(
     Ok(())
 }
 
-/// Load persisted schedules, register their jobs, and start the scheduler tick loop.
+/// Load persisted schedules and register their jobs.
 pub async fn start(state: &Arc<State>) -> anyhow::Result<()> {
     let schedules = db::list_schedules(&state.db).await?;
     for schedule in &schedules {
@@ -178,14 +235,6 @@ pub async fn start(state: &Arc<State>) -> anyhow::Result<()> {
             }
         }
     }
-
-    let runner = state.scheduler.clone();
-    tokio::spawn(async move {
-        if let Err(e) = runner.start().await {
-            tracing::error!(error = %e, "scheduler failed");
-        }
-    });
-
     Ok(())
 }
 
@@ -193,8 +242,8 @@ pub async fn start(state: &Arc<State>) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    fn utc(s: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    fn utc(s: &str) -> Timestamp {
+        s.parse().unwrap()
     }
 
     #[test]
@@ -231,5 +280,41 @@ mod tests {
         // Five-field expressions fail the seconds-required parser, matching
         // registration.
         assert_eq!(next_run_after("0 8 * * *", now), None);
+    }
+
+    #[tokio::test]
+    async fn scheduler_runs_a_job_and_can_be_removed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let scheduler = Scheduler::new().await.unwrap();
+        let fired = Arc::new(AtomicUsize::new(0));
+        let fired2 = fired.clone();
+        // Every second.
+        let id = scheduler
+            .add("* * * * * *", move || {
+                let fired = fired2.clone();
+                async move {
+                    fired.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while fired.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("job should fire");
+        scheduler.remove(&id).await.unwrap();
+        let count = fired.load(Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert_eq!(fired.load(Ordering::SeqCst), count);
+    }
+
+    #[tokio::test]
+    async fn scheduler_rejects_invalid_cron() {
+        let scheduler = Scheduler::new().await.unwrap();
+        assert!(scheduler.add("nope", || async {}).await.is_err());
     }
 }

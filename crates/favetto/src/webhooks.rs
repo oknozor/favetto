@@ -594,7 +594,7 @@ mod tests {
             data_dir: dir.clone(),
             tasks_dir: dir.clone(),
             catalog: Arc::new(RwLock::new(Vec::<TaskDef>::new())),
-            scheduler: tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
+            scheduler: crate::scheduler::Scheduler::new().await.unwrap(),
             hook_store: Arc::new(RwLock::new(Vec::new())),
         }));
         (state, dir, pool)

@@ -41,7 +41,7 @@ async fn test_state_with_config(
     let catalog = Arc::new(parking_lot::RwLock::new(
         crate::tasks::load_catalog(tasks_dir).unwrap(),
     ));
-    let scheduler = tokio_cron_scheduler::JobScheduler::new().await.unwrap();
+    let scheduler = crate::scheduler::Scheduler::new().await.unwrap();
     // Use the same registry construction as the daemon, so a test config that
     // adds an agent can actually resolve it from `agents.history`/`agents.load`.
     let registry = crate::agents::AgentRegistry::from_config(&config).unwrap();
@@ -174,7 +174,7 @@ async fn usage_stats_dispatches_aggregated_usage() {
     std::fs::create_dir_all(&tasks_dir).unwrap();
     let state = test_state(&dir, &tasks_dir).await;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     let task_id = Uuid::new_v4();
     db::insert_task_run(
         &state.db,
@@ -270,7 +270,7 @@ async fn workflow_inspect_buckets_a_spawn_all_finished_root() {
     let mut child_fail = oneshot_task();
     child_fail.name = "child".to_string();
     child_fail.status = TaskStatus::Failed;
-    child_fail.finished_at = Some(Utc::now());
+    child_fail.finished_at = Some(Timestamp::now());
     child_fail.error = Some("boom".to_string());
     child_fail.root_id = Some(root);
     child_fail.parent_id = Some(root);
@@ -330,7 +330,7 @@ async fn workflow_inspect_buckets_a_spawn_all_finished_root() {
     // Once the last active child finishes, the all_finished barrier unblocks.
     let mut child_done = child_open.clone();
     child_done.status = TaskStatus::Succeeded;
-    child_done.finished_at = Some(Utc::now());
+    child_done.finished_at = Some(Timestamp::now());
     db::upsert_task(&state.db, &child_done).await.unwrap();
 
     let resp = dispatch(
@@ -414,7 +414,7 @@ async fn workflow_cancel_cancels_active_tasks_and_skips_terminal() {
     let mut done = oneshot_task();
     done.name = "done".to_string();
     done.status = TaskStatus::Succeeded;
-    done.finished_at = Some(Utc::now());
+    done.finished_at = Some(Timestamp::now());
     done.root_id = Some(root);
 
     for task in [&root_task, &child_running, &grandchild_pending, &done] {
@@ -524,7 +524,7 @@ async fn workflow_retry_delegates_to_manual_retry() {
     failed.status = TaskStatus::Failed;
     failed.error = Some("boom".to_string());
     failed.failure = Some(Failure::new(FailureKind::Agent, "boom"));
-    failed.finished_at = Some(Utc::now());
+    failed.finished_at = Some(Timestamp::now());
     db::upsert_task(&state.db, &failed).await.unwrap();
     db::insert_task_run(
         &state.db,
@@ -536,8 +536,8 @@ async fn workflow_retry_delegates_to_manual_retry() {
             agent: None,
             model: None,
             session_id: None,
-            started_at: Some(Utc::now()),
-            finished_at: Some(Utc::now()),
+            started_at: Some(Timestamp::now()),
+            finished_at: Some(Timestamp::now()),
             exit_code: None,
             error: None,
             usage: None,
@@ -948,7 +948,7 @@ async fn agent_state_with_config(
     let catalog = Arc::new(parking_lot::RwLock::new(
         crate::tasks::load_catalog(tasks_dir).unwrap(),
     ));
-    let scheduler = tokio_cron_scheduler::JobScheduler::new().await.unwrap();
+    let scheduler = crate::scheduler::Scheduler::new().await.unwrap();
     Arc::new(State::new(StateInit {
         db: pool,
         bus: crate::event_bus::EventBus::new(64),
@@ -1010,8 +1010,8 @@ fn oneshot_task() -> Task {
         input: serde_json::json!({ "oneshot": true }),
         output: None,
         dedupe_key: None,
-        created_at: Utc::now(),
-        started_at: Some(Utc::now()),
+        created_at: Timestamp::now(),
+        started_at: Some(Timestamp::now()),
         finished_at: None,
         error: None,
         failure: None,
@@ -1088,7 +1088,7 @@ async fn tasks_session_resolves_the_most_recent_record_for_the_task() {
     let tasks_dir = dir.join("tasks");
     std::fs::create_dir_all(&tasks_dir).unwrap();
     let state = test_state_with_config(&dir, &tasks_dir, available_agent_config()).await;
-    let now = Utc::now();
+    let now = Timestamp::now();
     let task_id = Uuid::new_v4();
     let task_id_text = task_id.to_string();
 
@@ -1105,7 +1105,7 @@ async fn tasks_session_resolves_the_most_recent_record_for_the_task() {
         "local-newer",
         "opencode",
         dir.join("work"),
-        now + chrono::Duration::seconds(1),
+        now + time::Duration::seconds(1),
     );
     newer.task_id = Some(task_id_text.clone());
     newer.external_session_id = Some("provider-acp-newer".to_string());
@@ -1118,7 +1118,7 @@ async fn tasks_session_resolves_the_most_recent_record_for_the_task() {
         "local-unrelated",
         "opencode",
         dir.join("work"),
-        now + chrono::Duration::seconds(2),
+        now + time::Duration::seconds(2),
     );
     unrelated.task_id = Some(Uuid::new_v4().to_string());
     crate::db::insert_agent_session(&state.db, &unrelated)
@@ -1171,7 +1171,7 @@ async fn tasks_session_reuses_history_loadability_derivation() {
         "local-no-id",
         "opencode",
         dir.join("work"),
-        Utc::now(),
+        Timestamp::now(),
     );
     unlinked.task_id = Some(task_id.to_string());
     unlinked.status = crate::db::AgentSessionStatus::Ended;
@@ -1207,7 +1207,7 @@ async fn agents_history_lists_persisted_metadata_and_loadability() {
     let tasks_dir = dir.join("tasks");
     std::fs::create_dir_all(&tasks_dir).unwrap();
     let state = test_state_with_config(&dir, &tasks_dir, available_agent_config()).await;
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     let mut ready =
         crate::db::AgentSessionRecord::loading("local-ready", "opencode", dir.join("work"), now);
@@ -1313,7 +1313,7 @@ async fn agents_load_routes_only_by_favetto_local_id() {
     let tasks_dir = dir.join("tasks");
     std::fs::create_dir_all(&tasks_dir).unwrap();
     let state = test_state_with_config(&dir, &tasks_dir, available_agent_config()).await;
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     let mut ready =
         crate::db::AgentSessionRecord::loading("local-ready", "opencode", dir.join("work"), now);
@@ -1397,9 +1397,9 @@ async fn agents_start_rejects_an_action_task() {
             "envelope": { "summary": "http 200: 3 issues" }
         })),
         dedupe_key: None,
-        created_at: Utc::now(),
-        started_at: Some(Utc::now()),
-        finished_at: Some(Utc::now()),
+        created_at: Timestamp::now(),
+        started_at: Some(Timestamp::now()),
+        finished_at: Some(Timestamp::now()),
         error: None,
         failure: None,
         session_id: None,
@@ -1604,9 +1604,9 @@ async fn tasks_list_omits_output_and_honours_limit_and_get_returns_it() {
         input: serde_json::json!({}),
         output: Some(serde_json::json!({ "output": "x".repeat(20_000) })),
         dedupe_key: None,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         started_at: None,
-        finished_at: Some(Utc::now()),
+        finished_at: Some(Timestamp::now()),
         error: None,
         failure: None,
         session_id: None,
@@ -1700,9 +1700,9 @@ async fn tasks_runs_returns_history_oldest_first() {
         input: serde_json::json!({}),
         output: None,
         dedupe_key: None,
-        created_at: Utc::now(),
-        started_at: Some(Utc::now()),
-        finished_at: Some(Utc::now()),
+        created_at: Timestamp::now(),
+        started_at: Some(Timestamp::now()),
+        finished_at: Some(Timestamp::now()),
         error: None,
         failure: None,
         session_id: None,
@@ -1725,8 +1725,8 @@ async fn tasks_runs_returns_history_oldest_first() {
         agent: Some("opencode".to_string()),
         model: None,
         session_id: None,
-        started_at: Some(Utc::now()),
-        finished_at: Some(Utc::now()),
+        started_at: Some(Timestamp::now()),
+        finished_at: Some(Timestamp::now()),
         exit_code: None,
         error: None,
         usage: None,
@@ -1797,9 +1797,9 @@ async fn tasks_retry_requeues_terminal_tasks_and_rejects_live_runs() {
         input: serde_json::json!({}),
         output: None,
         dedupe_key: None,
-        created_at: Utc::now(),
-        started_at: Some(Utc::now()),
-        finished_at: Some(Utc::now()),
+        created_at: Timestamp::now(),
+        started_at: Some(Timestamp::now()),
+        finished_at: Some(Timestamp::now()),
         error: None,
         failure: None,
         session_id: None,
@@ -1820,7 +1820,7 @@ async fn tasks_retry_requeues_terminal_tasks_and_rejects_live_runs() {
         agent: None,
         model: None,
         session_id: None,
-        started_at: Some(Utc::now()),
+        started_at: Some(Timestamp::now()),
         finished_at: None,
         exit_code: None,
         error: None,
@@ -2160,7 +2160,7 @@ async fn workflow_create_runs_in_dependency_order() {
     // Readiness is re-derived from the DB — no in-memory dispatcher state.
     let mut a = db::get_task(&state.db, id_a).await.unwrap().unwrap();
     a.status = TaskStatus::Succeeded;
-    a.finished_at = Some(Utc::now());
+    a.finished_at = Some(Timestamp::now());
     db::upsert_task(&state.db, &a).await.unwrap();
 
     let pending: Vec<Uuid> = db::next_pending_tasks(&state.db, 50)
@@ -2437,7 +2437,7 @@ async fn workflow_inspect_marks_dynamic_dependency_blocked() {
     // Finish the predecessor: the dependent moves from `blocked` to `ready`.
     let mut a = db::get_task(&state.db, id_a).await.unwrap().unwrap();
     a.status = TaskStatus::Succeeded;
-    a.finished_at = Some(Utc::now());
+    a.finished_at = Some(Timestamp::now());
     db::upsert_task(&state.db, &a).await.unwrap();
     let view = inspect(3).await;
     assert!(id_list(&view, "blocked").is_empty());

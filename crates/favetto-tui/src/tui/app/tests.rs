@@ -1,11 +1,11 @@
 use super::*;
-use chrono::Utc;
 use favetto_core::model::{
     AgentActivity, AgentAuthMethod, AgentAuthMethodKind, AgentAuthState, AgentAuthStatus,
     AgentCommand, AgentPlanEntry, AgentPlanPriority, AgentPlanStatus, AgentUsage,
     AwaitingInputKind, EventKind, Failure, FailureKind, InputReply, InputRequest, TaskStatus,
 };
 use favetto_core::rpc::AgentEventPush;
+use favetto_core::Timestamp;
 
 use crate::tasks::VarType;
 
@@ -35,7 +35,7 @@ fn task(name: &str) -> Task {
         input: serde_json::json!({}),
         output: None,
         dedupe_key: None,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         started_at: None,
         finished_at: None,
         error: None,
@@ -752,7 +752,7 @@ fn history_entry(
     loadable: bool,
     error: Option<&str>,
 ) -> favetto_core::model::AgentSessionHistoryEntry {
-    let now = Utc::now();
+    let now = Timestamp::now();
     favetto_core::model::AgentSessionHistoryEntry {
         id: id.to_string(),
         agent: "opencode".to_string(),
@@ -1374,7 +1374,7 @@ fn event(id: i64, kind: EventKind, payload: serde_json::Value) -> Event {
         id,
         kind,
         payload,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
     }
 }
 
@@ -2655,7 +2655,7 @@ fn clicking_events_row_selects_newest_first() {
             id,
             kind: EventKind::Unknown,
             payload: serde_json::json!({}),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         });
     }
     let inner = Rect {
@@ -2688,7 +2688,7 @@ fn page_keys_move_events_selection_only() {
             id,
             kind: EventKind::Unknown,
             payload: serde_json::json!({}),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         });
     }
     app.handle_key(key(KeyCode::PageDown, KeyModifiers::empty()));
@@ -2713,7 +2713,7 @@ fn page_keys_move_events_selection_only() {
         subject: "s".to_string(),
         body: "b".to_string(),
         status: "ok".to_string(),
-        sent_at: Utc::now(),
+        sent_at: Timestamp::now(),
     }];
 
     for tab in [Tab::Tasks, Tab::Scheduler, Tab::Notifications] {
@@ -2758,7 +2758,7 @@ fn clicking_scheduler_and_notifications_rows_selects_only() {
         subject: "hi".to_string(),
         body: "body".to_string(),
         status: "ok".to_string(),
-        sent_at: Utc::now(),
+        sent_at: Timestamp::now(),
     }];
     let inner = Rect {
         x: 0,
@@ -2984,7 +2984,7 @@ fn keyboard_up_down_moves_scheduler_and_notification_selection() {
             subject: "a".to_string(),
             body: String::new(),
             status: "ok".to_string(),
-            sent_at: Utc::now(),
+            sent_at: Timestamp::now(),
         },
         NotificationRecord {
             id: 2,
@@ -2992,7 +2992,7 @@ fn keyboard_up_down_moves_scheduler_and_notification_selection() {
             subject: "b".to_string(),
             body: String::new(),
             status: "ok".to_string(),
-            sent_at: Utc::now(),
+            sent_at: Timestamp::now(),
         },
     ];
 
@@ -3509,7 +3509,7 @@ fn needs_animation_for_scheduler_tab_with_future_run() {
     assert!(!app.needs_animation());
 
     // A future next run keeps the countdown ticking.
-    app.schedules[0].next_run = Some(Utc::now() + chrono::Duration::hours(1));
+    app.schedules[0].next_run = Some(Timestamp::now() + time::Duration::hours(1));
     assert!(app.needs_animation());
 
     // Only on the Scheduler tab.
@@ -4820,7 +4820,7 @@ fn launch_failures_name_the_full_target_across_repo_casing_and_refresh() {
     let mut app = App::new();
     let mut parent = task("repo:favetto/triage_issues");
     parent.status = TaskStatus::Succeeded;
-    parent.finished_at = Some(Utc::now() - chrono::Duration::seconds(10));
+    parent.finished_at = Some(Timestamp::now() - time::Duration::seconds(10));
 
     let mut child = task("repo:Favetto/plan_issue");
     child.status = TaskStatus::Failed;
@@ -4831,7 +4831,7 @@ fn launch_failures_name_the_full_target_across_repo_casing_and_refresh() {
         FailureKind::InvalidInput,
         "task 'repo:Favetto/plan_issue' not found in the catalog",
     ));
-    child.finished_at = Some(Utc::now());
+    child.finished_at = Some(Timestamp::now());
 
     app.active_repo = Some("favetto".to_string());
     app.tasks = vec![parent.clone(), child.clone()];
@@ -4860,7 +4860,7 @@ fn launch_failures_ignore_agent_runs_and_healthy_parents() {
     let mut app = App::new();
     let mut parent = task("repo:favetto/triage_issues");
     parent.status = TaskStatus::Succeeded;
-    parent.finished_at = Some(Utc::now() - chrono::Duration::seconds(10));
+    parent.finished_at = Some(Timestamp::now() - time::Duration::seconds(10));
 
     let mut agent_failure = task("repo:favetto/plan_issue");
     agent_failure.status = TaskStatus::Failed;
@@ -4889,13 +4889,13 @@ fn launch_failures_ignore_rows_from_an_earlier_parent_attempt() {
     let mut app = App::new();
     let mut parent = task("repo:favetto/triage_issues");
     parent.status = TaskStatus::Succeeded;
-    parent.finished_at = Some(Utc::now() - chrono::Duration::seconds(5));
+    parent.finished_at = Some(Timestamp::now() - time::Duration::seconds(5));
 
     let mut stale = task("repo:favetto/plan_issue");
     stale.status = TaskStatus::Failed;
     stale.parent_id = Some(parent.id);
     stale.root_id = Some(parent.id);
-    stale.created_at = Utc::now() - chrono::Duration::seconds(60);
+    stale.created_at = Timestamp::now() - time::Duration::seconds(60);
     stale.failure = Some(Failure::new(FailureKind::InvalidInput, "old failure"));
 
     let mut fresh = task("repo:favetto/plan_issue");
@@ -4914,7 +4914,7 @@ fn dismissing_launch_failures_hides_them_until_a_new_attempt_fails() {
     let mut app = App::new();
     let mut parent = task("repo:favetto/triage_issues");
     parent.status = TaskStatus::Succeeded;
-    parent.finished_at = Some(Utc::now() - chrono::Duration::seconds(10));
+    parent.finished_at = Some(Timestamp::now() - time::Duration::seconds(10));
 
     let mut child = task("repo:Favetto/plan_issue");
     child.status = TaskStatus::Failed;

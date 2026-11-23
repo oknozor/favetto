@@ -14,7 +14,7 @@
 //! Keyboard is owned by the shell (`↑`/`↓`, `Enter`, `r`); rows are clickable
 //! for the same primary action — open the run (docs §1, "One primary action").
 
-use chrono::Utc;
+use favetto_wire::Timestamp;
 use gpui::{
     div, prelude::*, px, Context, Div, Entity, Hsla, IntoElement, Render, Rgba, ScrollHandle,
     Stateful, Window,
@@ -323,7 +323,7 @@ impl InboxView {
         } else {
             theme.colors.muted
         };
-        let elapsed = inbox::elapsed_since(row.since, Utc::now());
+        let elapsed = inbox::elapsed_since(row.since, Timestamp::now());
         let click_key = row.key.clone();
 
         div()

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use chrono::{DateTime, Utc};
+use crate::timestamp::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -165,9 +165,9 @@ pub struct TaskRun {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub started_at: Option<DateTime<Utc>>,
+    pub started_at: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub finished_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -265,9 +265,9 @@ pub struct Task {
     pub output: Option<serde_json::Value>,
     /// Optional dedupe key. Inserting a second task with the same key is a no-op.
     pub dedupe_key: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub started_at: Option<DateTime<Utc>>,
-    pub finished_at: Option<DateTime<Utc>>,
+    pub created_at: Timestamp,
+    pub started_at: Option<Timestamp>,
+    pub finished_at: Option<Timestamp>,
     /// Human-readable failure reason when `status == Failed`.
     pub error: Option<String>,
     /// Machine-readable failure classification when `status == Failed`. Absent on
@@ -481,7 +481,7 @@ pub struct Event {
     pub id: i64,
     pub kind: EventKind,
     pub payload: serde_json::Value,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 impl Event {
@@ -843,9 +843,9 @@ pub struct AgentSessionHistoryEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_error: Option<String>,
     /// When the session record was created.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// When the record last changed (a load or close updates it).
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 /// One provider-owned (ACP) session discovered through `session/list`.
@@ -1002,13 +1002,13 @@ pub struct Schedule {
     pub task: String,
     pub input: serde_json::Value,
     pub enabled: bool,
-    pub last_run: Option<DateTime<Utc>>,
+    pub last_run: Option<Timestamp>,
     /// The next occurrence of `cron` in UTC, computed by the daemon for enabled
     /// schedules. `None` when the schedule is disabled, its expression does not
     /// parse, or no future occurrence exists. Never persisted; older payloads
     /// omit it.
     #[serde(default)]
-    pub next_run: Option<DateTime<Utc>>,
+    pub next_run: Option<Timestamp>,
 }
 
 /// How a repository entered the known-repos registry.
@@ -1056,7 +1056,7 @@ pub struct NotificationRecord {
     pub subject: String,
     pub body: String,
     pub status: String,
-    pub sent_at: DateTime<Utc>,
+    pub sent_at: Timestamp,
 }
 
 #[cfg(test)]
@@ -1074,8 +1074,8 @@ mod tests {
             state: AgentSessionState::Ended,
             loadable: true,
             load_error: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
         };
         let json = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["id"], "local-1");
@@ -1159,7 +1159,7 @@ mod tests {
             input: serde_json::json!({}),
             output: None,
             dedupe_key: None,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             started_at: None,
             finished_at: None,
             error: None,
@@ -1212,7 +1212,7 @@ mod tests {
             input: serde_json::json!({}),
             output: None,
             dedupe_key: None,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             started_at: None,
             finished_at: None,
             error: None,
@@ -1260,7 +1260,7 @@ mod tests {
             input: serde_json::json!({}),
             output: None,
             dedupe_key: None,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             started_at: None,
             finished_at: None,
             error: None,
@@ -1310,7 +1310,7 @@ mod tests {
             input: serde_json::json!({}),
             output: None,
             dedupe_key: None,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             started_at: None,
             finished_at: None,
             error: None,
@@ -1500,8 +1500,8 @@ mod tests {
     fn task_run_round_trips() {
         let id = Uuid::new_v4();
         let task_id = Uuid::new_v4();
-        let started_at = Utc::now();
-        let finished_at = started_at + chrono::Duration::seconds(5);
+        let started_at = Timestamp::now();
+        let finished_at = started_at + time::Duration::seconds(5);
         let run = TaskRun {
             id,
             task_id,
@@ -1544,12 +1544,12 @@ mod tests {
         assert_eq!(back.model, run.model);
         assert_eq!(back.session_id, run.session_id);
         assert_eq!(
-            back.started_at.map(|t| t.timestamp_millis()),
-            run.started_at.map(|t| t.timestamp_millis())
+            back.started_at.map(|t| t.unix_timestamp_millis()),
+            run.started_at.map(|t| t.unix_timestamp_millis())
         );
         assert_eq!(
-            back.finished_at.map(|t| t.timestamp_millis()),
-            run.finished_at.map(|t| t.timestamp_millis())
+            back.finished_at.map(|t| t.unix_timestamp_millis()),
+            run.finished_at.map(|t| t.unix_timestamp_millis())
         );
         assert_eq!(back.exit_code, run.exit_code);
         assert_eq!(back.error, run.error);
@@ -1645,7 +1645,7 @@ mod tests {
             input: serde_json::json!({}),
             output: None,
             dedupe_key: None,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             started_at: None,
             finished_at: None,
             error: Some("exit 1".to_string()),
@@ -1984,7 +1984,7 @@ mod tests {
             input: serde_json::json!({}),
             output: None,
             dedupe_key: None,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             started_at: None,
             finished_at: None,
             error: None,
@@ -2011,7 +2011,7 @@ mod tests {
             id: 7,
             kind: EventKind::TaskUpdated,
             payload: serde_json::json!({ "k": "v" }),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         };
         let n = event.into_notification().expect("event serialization");
         assert_eq!(n.method, push::EVENT);

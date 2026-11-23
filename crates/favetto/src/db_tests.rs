@@ -1,5 +1,4 @@
 use super::*;
-use chrono::Utc;
 use favetto_core::model::{Event, Failure, FailureKind, RunStatus, TaskRun};
 use sqlx::Row;
 
@@ -16,7 +15,7 @@ async fn event_replay_resumes_from_cursor() {
             id: 0,
             kind: EventKind::Unknown,
             payload: serde_json::json!({ "n": i }),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         };
         let id = insert_event(&pool, &ev).await.unwrap();
         assert_eq!(id, i + 1);
@@ -41,7 +40,7 @@ async fn row_to_event_falls_back_to_unknown() {
     let (dir, pool) = scratch_pool("unknown-kind").await;
     // A kind an older or newer build wrote that this build does not know.
     sqlx::query("INSERT INTO events (kind, payload, created_at) VALUES ('not_a_kind', '{}', ?)")
-        .bind(ts_ms(Utc::now()))
+        .bind(ts_ms(Timestamp::now()))
         .execute(&pool)
         .await
         .unwrap();
@@ -90,7 +89,7 @@ async fn task_session_id_round_trips() {
         input: serde_json::json!({}),
         output: None,
         dedupe_key: None,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         started_at: None,
         finished_at: None,
         error: None,
@@ -117,7 +116,7 @@ async fn task_session_id_round_trips() {
 async fn task_launch_overrides_round_trip_through_the_database() {
     let (dir, pool) = scratch_pool("overrides-roundtrip").await;
 
-    let mut task = task_at(Utc::now(), None, None);
+    let mut task = task_at(Timestamp::now(), None, None);
     task.agent = Some("other-agent".to_string());
     task.provider = Some("other-provider".to_string());
     task.model = Some("other-model".to_string());
@@ -148,7 +147,7 @@ async fn task_launch_overrides_round_trip_through_the_database() {
 async fn task_failure_round_trips_through_the_database() {
     let (dir, pool) = scratch_pool("failure-roundtrip").await;
 
-    let mut task = task_at(Utc::now(), Some(Utc::now()), None);
+    let mut task = task_at(Timestamp::now(), Some(Timestamp::now()), None);
     task.status = TaskStatus::Failed;
     task.error = Some("exit 1".to_string());
     task.failure = Some(Failure::new(FailureKind::Agent, "exit 1"));
@@ -177,9 +176,9 @@ async fn task_interactive_round_trips_through_the_database() {
 
     let user = Task {
         interactive: true,
-        ..task_at(Utc::now(), None, None)
+        ..task_at(Timestamp::now(), None, None)
     };
-    let programmatic = task_at(Utc::now(), None, None);
+    let programmatic = task_at(Timestamp::now(), None, None);
     assert!(!programmatic.interactive);
 
     insert_task(&pool, &user).await.unwrap();
@@ -237,7 +236,7 @@ async fn migrate_adds_session_title_to_legacy_database() {
     let legacy_id = Uuid::new_v4();
     sqlx::query("INSERT INTO tasks (id, name, status, input, created_at) VALUES (?, 'legacy', 'succeeded', '{}', ?)")
         .bind(legacy_id.to_string())
-        .bind(ts_ms(Utc::now()))
+        .bind(ts_ms(Timestamp::now()))
         .execute(&pool)
         .await
         .unwrap();
@@ -261,7 +260,7 @@ async fn migrate_adds_session_title_to_legacy_database() {
         input: serde_json::json!({}),
         output: None,
         dedupe_key: None,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         started_at: None,
         finished_at: None,
         error: None,
@@ -299,8 +298,8 @@ async fn scratch_pool(tag: &str) -> (std::path::PathBuf, SqlitePool) {
 }
 
 fn task_at(
-    created_at: DateTime<Utc>,
-    finished_at: Option<DateTime<Utc>>,
+    created_at: Timestamp,
+    finished_at: Option<Timestamp>,
     output: Option<serde_json::Value>,
 ) -> Task {
     Task {
@@ -337,7 +336,7 @@ fn run_at(task_id: Uuid, attempt: u32) -> TaskRun {
         agent: None,
         model: None,
         session_id: None,
-        started_at: Some(Utc::now()),
+        started_at: Some(Timestamp::now()),
         finished_at: None,
         exit_code: None,
         error: None,
@@ -351,8 +350,8 @@ async fn list_tasks_omits_output_but_get_task_keeps_it() {
     let (dir, pool) = scratch_pool("list-omits-output").await;
 
     let task = task_at(
-        Utc::now(),
-        Some(Utc::now()),
+        Timestamp::now(),
+        Some(Timestamp::now()),
         Some(serde_json::json!({ "output": "x".repeat(50_000) })),
     );
     upsert_task(&pool, &task).await.unwrap();
@@ -407,11 +406,11 @@ async fn migrate_creates_task_indexes() {
 #[tokio::test]
 async fn prune_keeps_newest_min_tasks_and_deletes_old_rows() {
     let (dir, pool) = scratch_pool("prune-tasks").await;
-    let old = Utc::now() - ChronoDuration::days(60);
+    let old = Timestamp::now() - time::Duration::days(60);
     // Four terminal tasks, oldest first. `min_tasks = 2` keeps the newest two.
     let mut ids = Vec::new();
     for i in 0..4 {
-        let created = old + ChronoDuration::hours(i);
+        let created = old + time::Duration::hours(i);
         let task = task_at(created, Some(created), None);
         ids.push(task.id);
         upsert_task(&pool, &task).await.unwrap();
@@ -451,7 +450,7 @@ async fn prune_keeps_newest_min_tasks_and_deletes_old_rows() {
 #[tokio::test]
 async fn prune_clears_old_outputs() {
     let (dir, pool) = scratch_pool("prune-outputs").await;
-    let old = Utc::now() - ChronoDuration::days(60);
+    let old = Timestamp::now() - time::Duration::days(60);
     let task = task_at(
         old,
         Some(old),
@@ -474,7 +473,7 @@ async fn prune_clears_old_outputs() {
 #[tokio::test]
 async fn task_awaiting_input_round_trips() {
     let (dir, pool) = scratch_pool("awaiting-roundtrip").await;
-    let mut task = task_at(Utc::now(), None, None);
+    let mut task = task_at(Timestamp::now(), None, None);
     task.status = TaskStatus::AwaitingInput;
     upsert_task(&pool, &task).await.unwrap();
 
@@ -491,7 +490,7 @@ async fn task_lineage_round_trips() {
     let (dir, pool) = scratch_pool("lineage-roundtrip").await;
     let root = Uuid::new_v4();
     let parent = Uuid::new_v4();
-    let mut task = task_at(Utc::now(), None, None);
+    let mut task = task_at(Timestamp::now(), None, None);
     task.name = "target".to_string();
     task.parent_id = Some(parent);
     task.root_id = Some(root);
@@ -502,7 +501,7 @@ async fn task_lineage_round_trips() {
     assert_eq!(got.root_id, Some(root));
 
     // The root task itself has no `root_id` but is its own root.
-    let mut root_task = task_at(Utc::now(), Some(Utc::now()), None);
+    let mut root_task = task_at(Timestamp::now(), Some(Timestamp::now()), None);
     root_task.name = "target".to_string();
     root_task.status = TaskStatus::Succeeded;
     upsert_task(&pool, &root_task).await.unwrap();
@@ -520,23 +519,23 @@ async fn list_tasks_in_root_scopes_by_root_and_name() {
     // Two `target` children of root A (one terminal, one active) plus one of
     // root B, and an unrelated name in root A.
     let mut done = task_at(
-        Utc::now(),
-        Some(Utc::now()),
+        Timestamp::now(),
+        Some(Timestamp::now()),
         Some(serde_json::json!({ "ok": true })),
     );
     done.name = "target".to_string();
     done.root_id = Some(root_a);
     done.parent_id = Some(root_a);
-    let mut running = task_at(Utc::now(), None, None);
+    let mut running = task_at(Timestamp::now(), None, None);
     running.name = "target".to_string();
     running.status = TaskStatus::Running;
     running.root_id = Some(root_a);
     running.parent_id = Some(root_a);
-    let mut other_root = task_at(Utc::now(), Some(Utc::now()), None);
+    let mut other_root = task_at(Timestamp::now(), Some(Timestamp::now()), None);
     other_root.name = "target".to_string();
     other_root.root_id = Some(root_b);
     other_root.parent_id = Some(root_b);
-    let mut noise = task_at(Utc::now(), Some(Utc::now()), None);
+    let mut noise = task_at(Timestamp::now(), Some(Timestamp::now()), None);
     noise.name = "unrelated".to_string();
     noise.root_id = Some(root_a);
     for task in [&done, &running, &other_root, &noise] {
@@ -556,7 +555,7 @@ async fn list_tasks_in_root_scopes_by_root_and_name() {
 
     // A terminal-only root has an empty barrier.
     let root_c = Uuid::new_v4();
-    let mut only_done = task_at(Utc::now(), Some(Utc::now()), None);
+    let mut only_done = task_at(Timestamp::now(), Some(Timestamp::now()), None);
     only_done.name = "target".to_string();
     only_done.root_id = Some(root_c);
     upsert_task(&pool, &only_done).await.unwrap();
@@ -575,17 +574,25 @@ async fn list_root_tasks_includes_root_and_descendants_without_output() {
     let other_root = Uuid::new_v4();
 
     // The root task carries no `root_id` of its own; it is included via `id = ?`.
-    let mut root_task = task_at(Utc::now(), None, Some(serde_json::json!({ "big": "x" })));
+    let mut root_task = task_at(
+        Timestamp::now(),
+        None,
+        Some(serde_json::json!({ "big": "x" })),
+    );
     root_task.id = root;
     root_task.name = "root".to_string();
     root_task.status = TaskStatus::Running;
 
-    let mut child = task_at(Utc::now(), None, Some(serde_json::json!({ "child": true })));
+    let mut child = task_at(
+        Timestamp::now(),
+        None,
+        Some(serde_json::json!({ "child": true })),
+    );
     child.name = "child".to_string();
     child.root_id = Some(root);
     child.parent_id = Some(root);
 
-    let mut other = task_at(Utc::now(), None, None);
+    let mut other = task_at(Timestamp::now(), None, None);
     other.name = "elsewhere".to_string();
     other.root_id = Some(other_root);
 
@@ -618,13 +625,13 @@ async fn stale_task_helpers_are_conditional_and_idempotent() {
     let (dir, pool) = scratch_pool("stale-helpers").await;
     let interrupted = Failure::new(FailureKind::Infrastructure, "interrupted by daemon restart");
 
-    let mut running = task_at(Utc::now(), None, None);
+    let mut running = task_at(Timestamp::now(), None, None);
     running.status = TaskStatus::Running;
-    let mut awaiting = task_at(Utc::now(), None, None);
+    let mut awaiting = task_at(Timestamp::now(), None, None);
     awaiting.status = TaskStatus::AwaitingInput;
-    let mut pending = task_at(Utc::now(), None, None);
+    let mut pending = task_at(Timestamp::now(), None, None);
     pending.status = TaskStatus::Pending;
-    let done = task_at(Utc::now(), Some(Utc::now()), None);
+    let done = task_at(Timestamp::now(), Some(Timestamp::now()), None);
     for task in [&running, &awaiting, &pending, &done] {
         upsert_task(&pool, task).await.unwrap();
     }
@@ -690,15 +697,15 @@ async fn stale_task_helpers_are_conditional_and_idempotent() {
 async fn cancel_active_task_cancels_only_non_terminal_tasks() {
     let (dir, pool) = scratch_pool("cancel-active").await;
 
-    let mut pending = task_at(Utc::now(), None, None);
+    let mut pending = task_at(Timestamp::now(), None, None);
     pending.status = TaskStatus::Pending;
     pending.started_at = None;
-    let mut running = task_at(Utc::now(), None, None);
+    let mut running = task_at(Timestamp::now(), None, None);
     running.status = TaskStatus::Running;
-    let mut awaiting = task_at(Utc::now(), None, None);
+    let mut awaiting = task_at(Timestamp::now(), None, None);
     awaiting.status = TaskStatus::AwaitingInput;
-    let succeeded = task_at(Utc::now(), Some(Utc::now()), None);
-    let mut cancelled = task_at(Utc::now(), Some(Utc::now()), None);
+    let succeeded = task_at(Timestamp::now(), Some(Timestamp::now()), None);
+    let mut cancelled = task_at(Timestamp::now(), Some(Timestamp::now()), None);
     cancelled.status = TaskStatus::Cancelled;
     for task in [&pending, &running, &awaiting, &succeeded, &cancelled] {
         upsert_task(&pool, task).await.unwrap();
@@ -732,11 +739,11 @@ async fn cancel_active_task_cancels_only_non_terminal_tasks() {
 async fn finish_active_task_never_overwrites_a_cancelled_row() {
     let (dir, pool) = scratch_pool("finish-active").await;
 
-    let mut running = task_at(Utc::now(), None, None);
+    let mut running = task_at(Timestamp::now(), None, None);
     running.status = TaskStatus::Running;
-    let mut awaiting = task_at(Utc::now(), None, None);
+    let mut awaiting = task_at(Timestamp::now(), None, None);
     awaiting.status = TaskStatus::AwaitingInput;
-    let mut cancelled = task_at(Utc::now(), Some(Utc::now()), None);
+    let mut cancelled = task_at(Timestamp::now(), Some(Timestamp::now()), None);
     cancelled.status = TaskStatus::Cancelled;
     for task in [&running, &awaiting, &cancelled] {
         upsert_task(&pool, task).await.unwrap();
@@ -745,7 +752,7 @@ async fn finish_active_task_never_overwrites_a_cancelled_row() {
     // A running task is finalized with the run's outcome.
     let mut done = running.clone();
     done.status = TaskStatus::Succeeded;
-    done.finished_at = Some(Utc::now());
+    done.finished_at = Some(Timestamp::now());
     done.output = Some(serde_json::json!({ "ok": true }));
     assert!(finish_active_task(&pool, &done).await.unwrap());
     let got = get_task(&pool, done.id).await.unwrap().unwrap();
@@ -756,7 +763,7 @@ async fn finish_active_task_never_overwrites_a_cancelled_row() {
     // `awaiting_input` is still active and can be finalized as a failure.
     let mut failed = awaiting.clone();
     failed.status = TaskStatus::Failed;
-    failed.finished_at = Some(Utc::now());
+    failed.finished_at = Some(Timestamp::now());
     failed.error = Some("boom".to_string());
     assert!(finish_active_task(&pool, &failed).await.unwrap());
     assert_eq!(
@@ -768,7 +775,7 @@ async fn finish_active_task_never_overwrites_a_cancelled_row() {
     // a "successful" outcome.
     let mut resurrection = cancelled.clone();
     resurrection.status = TaskStatus::Succeeded;
-    resurrection.finished_at = Some(Utc::now());
+    resurrection.finished_at = Some(Timestamp::now());
     resurrection.output = Some(serde_json::json!({ "ok": true }));
     assert!(!finish_active_task(&pool, &resurrection).await.unwrap());
     let got = get_task(&pool, cancelled.id).await.unwrap().unwrap();
@@ -787,7 +794,7 @@ async fn finish_active_task_never_overwrites_a_cancelled_row() {
 #[tokio::test]
 async fn interrupt_run_marks_active_runs_and_is_idempotent() {
     let (dir, pool) = scratch_pool("interrupt-run").await;
-    let task = task_at(Utc::now(), None, None);
+    let task = task_at(Timestamp::now(), None, None);
     upsert_task(&pool, &task).await.unwrap();
     let run = run_at(task.id, 1);
     insert_task_run(&pool, &run).await.unwrap();
@@ -826,13 +833,13 @@ async fn interrupt_run_marks_active_runs_and_is_idempotent() {
 #[tokio::test]
 async fn worktree_record_round_trips() {
     let (dir, pool) = scratch_pool("worktree-roundtrip").await;
-    let now = Utc::now();
+    let now = Timestamp::now();
     let first = WorktreeRecord {
         task_id: Uuid::new_v4(),
         repo: PathBuf::from("/repo/one"),
         path: PathBuf::from("/data/worktrees/one"),
         branch: "favetto/one-1234".to_string(),
-        created_at: now - ChronoDuration::hours(1),
+        created_at: now - time::Duration::hours(1),
     };
     let second = WorktreeRecord {
         task_id: Uuid::new_v4(),
@@ -852,8 +859,8 @@ async fn worktree_record_round_trips() {
     assert_eq!(listed[0].path, first.path);
     assert_eq!(listed[0].branch, first.branch);
     assert_eq!(
-        listed[0].created_at.timestamp_millis(),
-        first.created_at.timestamp_millis()
+        listed[0].created_at.unix_timestamp_millis(),
+        first.created_at.unix_timestamp_millis()
     );
     assert_eq!(listed[1].task_id, second.task_id);
 
@@ -918,11 +925,11 @@ async fn migrate_creates_task_runs_table_and_index() {
 #[tokio::test]
 async fn task_run_round_trips() {
     let (dir, pool) = scratch_pool("task-run-roundtrip").await;
-    let task = task_at(Utc::now(), Some(Utc::now()), None);
+    let task = task_at(Timestamp::now(), Some(Timestamp::now()), None);
     upsert_task(&pool, &task).await.unwrap();
 
-    let started = Utc::now();
-    let finished = started + ChronoDuration::seconds(3);
+    let started = Timestamp::now();
+    let finished = started + time::Duration::seconds(3);
     let mut first = run_at(task.id, 1);
     first.status = RunStatus::Succeeded;
     first.agent = Some("opencode".to_string());
@@ -952,12 +959,12 @@ async fn task_run_round_trips() {
     assert_eq!(got.session_id.as_deref(), Some("ses_1"));
     assert_eq!(got.exit_code, Some(0));
     assert_eq!(
-        got.started_at.map(|t| t.timestamp_millis()),
-        Some(started.timestamp_millis())
+        got.started_at.map(|t| t.unix_timestamp_millis()),
+        Some(started.unix_timestamp_millis())
     );
     assert_eq!(
-        got.finished_at.map(|t| t.timestamp_millis()),
-        Some(finished.timestamp_millis())
+        got.finished_at.map(|t| t.unix_timestamp_millis()),
+        Some(finished.unix_timestamp_millis())
     );
 
     let listed = list_task_runs(&pool, task.id).await.unwrap();
@@ -987,12 +994,12 @@ async fn task_run_round_trips() {
 #[tokio::test]
 async fn active_run_is_latest_non_terminal() {
     let (dir, pool) = scratch_pool("active-run").await;
-    let task = task_at(Utc::now(), None, None);
+    let task = task_at(Timestamp::now(), None, None);
     upsert_task(&pool, &task).await.unwrap();
 
     let mut failed = run_at(task.id, 1);
     failed.status = RunStatus::Failed;
-    failed.finished_at = Some(Utc::now());
+    failed.finished_at = Some(Timestamp::now());
     let mut running = run_at(task.id, 2);
     running.status = RunStatus::Running;
     insert_task_run(&pool, &failed).await.unwrap();
@@ -1009,7 +1016,7 @@ async fn active_run_is_latest_non_terminal() {
     // Finalizing the running attempt leaves no active run.
     let mut done = running.clone();
     done.status = RunStatus::Succeeded;
-    done.finished_at = Some(Utc::now());
+    done.finished_at = Some(Timestamp::now());
     done.exit_code = Some(0);
     assert!(finalize_task_run(&pool, &done).await.unwrap());
     assert!(get_active_task_run(&pool, task.id).await.unwrap().is_none());
@@ -1021,17 +1028,17 @@ async fn active_run_is_latest_non_terminal() {
 #[tokio::test]
 async fn finalize_task_run_writes_outcome_and_keeps_started() {
     let (dir, pool) = scratch_pool("finalize-run").await;
-    let task = task_at(Utc::now(), None, None);
+    let task = task_at(Timestamp::now(), None, None);
     upsert_task(&pool, &task).await.unwrap();
 
-    let started = Utc::now();
+    let started = Timestamp::now();
     let mut run = run_at(task.id, 1);
     run.started_at = Some(started);
     run.agent = Some("opencode".to_string());
     run.session_id = Some("ses_keep".to_string());
     insert_task_run(&pool, &run).await.unwrap();
 
-    let finished = started + ChronoDuration::seconds(7);
+    let finished = started + time::Duration::seconds(7);
     let mut outcome = run.clone();
     outcome.status = RunStatus::Succeeded;
     outcome.finished_at = Some(finished);
@@ -1046,19 +1053,19 @@ async fn finalize_task_run_writes_outcome_and_keeps_started() {
     assert_eq!(got.session_id.as_deref(), Some("ses_keep"));
     assert_eq!(got.agent.as_deref(), Some("opencode"));
     assert_eq!(
-        got.started_at.map(|t| t.timestamp_millis()),
-        Some(started.timestamp_millis()),
+        got.started_at.map(|t| t.unix_timestamp_millis()),
+        Some(started.unix_timestamp_millis()),
         "finalize must not touch started_at"
     );
     assert_eq!(
-        got.finished_at.map(|t| t.timestamp_millis()),
-        Some(finished.timestamp_millis())
+        got.finished_at.map(|t| t.unix_timestamp_millis()),
+        Some(finished.unix_timestamp_millis())
     );
 
     // A second finalization to a failure round-trips the typed failure.
     let mut timeout = run.clone();
     timeout.status = RunStatus::TimedOut;
-    timeout.finished_at = Some(Utc::now());
+    timeout.finished_at = Some(Timestamp::now());
     timeout.error = Some("deadline".to_string());
     timeout.failure = Some(Failure::new(FailureKind::Timeout, "deadline"));
     assert!(finalize_task_run(&pool, &timeout).await.unwrap());
@@ -1082,7 +1089,7 @@ async fn finalize_task_run_writes_outcome_and_keeps_started() {
 #[tokio::test]
 async fn claim_task_creates_one_run_and_increments_attempt() {
     let (dir, pool) = scratch_pool("claim-run").await;
-    let mut task = task_at(Utc::now(), None, None);
+    let mut task = task_at(Timestamp::now(), None, None);
     task.status = TaskStatus::Pending;
     task.attempt = 0;
     insert_task(&pool, &task).await.unwrap();
@@ -1113,7 +1120,7 @@ async fn claim_task_creates_one_run_and_increments_attempt() {
 #[tokio::test]
 async fn claim_task_advances_the_attempt_for_a_retry() {
     let (dir, pool) = scratch_pool("claim-retry").await;
-    let mut task = task_at(Utc::now(), None, None);
+    let mut task = task_at(Timestamp::now(), None, None);
     task.status = TaskStatus::Pending;
     task.attempt = 2;
     insert_task(&pool, &task).await.unwrap();
@@ -1132,7 +1139,7 @@ async fn claim_task_advances_the_attempt_for_a_retry() {
 async fn schedule_task_retry_defers_dispatch_until_the_deadline() {
     let (dir, pool) = scratch_pool("schedule-retry").await;
 
-    let mut future = task_at(Utc::now(), Some(Utc::now()), None);
+    let mut future = task_at(Timestamp::now(), Some(Timestamp::now()), None);
     future.status = TaskStatus::Failed;
     future.attempt = 1;
     future.error = Some("PTY died".to_string());
@@ -1147,16 +1154,20 @@ async fn schedule_task_retry_defers_dispatch_until_the_deadline() {
     ready.id = Uuid::new_v4();
     upsert_task(&pool, &ready).await.unwrap();
 
-    assert!(
-        schedule_task_retry(&pool, future.id, Utc::now() + ChronoDuration::seconds(60))
-            .await
-            .unwrap()
-    );
-    assert!(
-        schedule_task_retry(&pool, ready.id, Utc::now() - ChronoDuration::seconds(1))
-            .await
-            .unwrap()
-    );
+    assert!(schedule_task_retry(
+        &pool,
+        future.id,
+        Timestamp::now() + time::Duration::seconds(60)
+    )
+    .await
+    .unwrap());
+    assert!(schedule_task_retry(
+        &pool,
+        ready.id,
+        Timestamp::now() - time::Duration::seconds(1)
+    )
+    .await
+    .unwrap());
 
     // The outcome is cleared but the attempt is untouched until the claim.
     let stored = get_task(&pool, future.id).await.unwrap().unwrap();
@@ -1182,7 +1193,7 @@ async fn schedule_task_retry_defers_dispatch_until_the_deadline() {
     );
 
     // Only a failed row can be scheduled: a second attempt is a no-op.
-    assert!(!schedule_task_retry(&pool, future.id, Utc::now())
+    assert!(!schedule_task_retry(&pool, future.id, Timestamp::now())
         .await
         .unwrap());
 
@@ -1196,8 +1207,8 @@ async fn requeue_terminal_task_is_conditional_on_a_terminal_status() {
     let (dir, pool) = scratch_pool("requeue-terminal").await;
 
     let mut failed = task_at(
-        Utc::now(),
-        Some(Utc::now()),
+        Timestamp::now(),
+        Some(Timestamp::now()),
         Some(serde_json::json!({ "old": true })),
     );
     failed.status = TaskStatus::Failed;
@@ -1226,19 +1237,19 @@ async fn requeue_terminal_task_is_conditional_on_a_terminal_status() {
     // Not terminal any more: a second call is a no-op.
     assert!(!requeue_terminal_task(&pool, failed.id).await.unwrap());
 
-    let mut running = task_at(Utc::now(), None, None);
+    let mut running = task_at(Timestamp::now(), None, None);
     running.status = TaskStatus::Running;
     upsert_task(&pool, &running).await.unwrap();
     assert!(!requeue_terminal_task(&pool, running.id).await.unwrap());
 
-    let mut pending = task_at(Utc::now(), None, None);
+    let mut pending = task_at(Timestamp::now(), None, None);
     pending.status = TaskStatus::Pending;
     upsert_task(&pool, &pending).await.unwrap();
     assert!(!requeue_terminal_task(&pool, pending.id).await.unwrap());
 
     // A succeeded or cancelled task can also be retried.
     for status in [TaskStatus::Succeeded, TaskStatus::Cancelled] {
-        let mut task = task_at(Utc::now(), Some(Utc::now()), None);
+        let mut task = task_at(Timestamp::now(), Some(Timestamp::now()), None);
         task.status = status;
         upsert_task(&pool, &task).await.unwrap();
         assert!(requeue_terminal_task(&pool, task.id).await.unwrap());
@@ -1254,11 +1265,11 @@ async fn requeue_terminal_task_is_conditional_on_a_terminal_status() {
 #[tokio::test]
 async fn prune_cascades_task_runs() {
     let (dir, pool) = scratch_pool("prune-runs").await;
-    let old = Utc::now() - ChronoDuration::days(60);
+    let old = Timestamp::now() - time::Duration::days(60);
     // Four old terminal tasks, each with one run. `min_tasks = 2` keeps two.
     let mut kept_ids = Vec::new();
     for i in 0..4 {
-        let created = old + ChronoDuration::hours(i);
+        let created = old + time::Duration::hours(i);
         let task = task_at(created, Some(created), None);
         upsert_task(&pool, &task).await.unwrap();
         insert_task_run(&pool, &run_at(task.id, 1)).await.unwrap();
@@ -1324,7 +1335,7 @@ async fn migrate_adds_task_runs_to_legacy_database() {
     migrate(&pool).await.unwrap();
     migrate(&pool).await.unwrap();
 
-    let task = task_at(Utc::now(), None, None);
+    let task = task_at(Timestamp::now(), None, None);
     upsert_task(&pool, &task).await.unwrap();
     let run = run_at(task.id, 1);
     insert_task_run(&pool, &run).await.unwrap();
@@ -1338,7 +1349,7 @@ async fn migrate_adds_task_runs_to_legacy_database() {
 
 /// A minimal pending task, optionally in a workflow root.
 fn pending_task(name: &str, root: Option<Uuid>) -> Task {
-    let mut task = task_at(Utc::now(), None, None);
+    let mut task = task_at(Timestamp::now(), None, None);
     task.name = name.to_string();
     task.status = TaskStatus::Pending;
     task.started_at = None;
@@ -1386,7 +1397,7 @@ async fn next_pending_tasks_skips_tasks_with_unmet_dependencies() {
     for task in [&a, &b, &c] {
         upsert_task(&pool, task).await.unwrap();
     }
-    insert_dependency(&pool, b.id, a.id, Utc::now())
+    insert_dependency(&pool, b.id, a.id, Timestamp::now())
         .await
         .unwrap();
 
@@ -1406,7 +1417,7 @@ async fn next_pending_tasks_skips_tasks_with_unmet_dependencies() {
     // Once `a` is terminal, `b` becomes dispatchable.
     let mut done = a.clone();
     done.status = TaskStatus::Succeeded;
-    done.finished_at = Some(Utc::now());
+    done.finished_at = Some(Timestamp::now());
     upsert_task(&pool, &done).await.unwrap();
     let names: Vec<String> = next_pending_tasks(&pool, 50)
         .await
@@ -1425,7 +1436,7 @@ async fn next_pending_tasks_ignores_missing_predecessor() {
     let b = pending_task("b", None);
     upsert_task(&pool, &b).await.unwrap();
     // A pruned predecessor must not wedge the dependent forever.
-    insert_dependency(&pool, b.id, Uuid::new_v4(), Utc::now())
+    insert_dependency(&pool, b.id, Uuid::new_v4(), Timestamp::now())
         .await
         .unwrap();
 
@@ -1442,10 +1453,10 @@ async fn next_pending_tasks_cancelled_predecessor_unblocks() {
     let mut a = pending_task("a", None);
     let b = pending_task("b", None);
     a.status = TaskStatus::Cancelled;
-    a.finished_at = Some(Utc::now());
+    a.finished_at = Some(Timestamp::now());
     upsert_task(&pool, &a).await.unwrap();
     upsert_task(&pool, &b).await.unwrap();
-    insert_dependency(&pool, b.id, a.id, Utc::now())
+    insert_dependency(&pool, b.id, a.id, Timestamp::now())
         .await
         .unwrap();
 
@@ -1473,10 +1484,10 @@ async fn insert_dependency_is_idempotent_and_listable() {
         upsert_task(&pool, task).await.unwrap();
     }
 
-    insert_dependency(&pool, b.id, a.id, Utc::now())
+    insert_dependency(&pool, b.id, a.id, Timestamp::now())
         .await
         .unwrap();
-    insert_dependency(&pool, b.id, a.id, Utc::now())
+    insert_dependency(&pool, b.id, a.id, Timestamp::now())
         .await
         .unwrap();
 
@@ -1516,7 +1527,7 @@ async fn get_task_by_dedupe_key_returns_the_stored_row() {
 #[tokio::test]
 async fn prune_deletes_orphan_dependencies() {
     let (dir, pool) = scratch_pool("prune-deps").await;
-    let old = Utc::now() - ChronoDuration::days(60);
+    let old = Timestamp::now() - time::Duration::days(60);
     let a = task_at(old, Some(old), None);
     let b = task_at(old, Some(old), None);
     upsert_task(&pool, &a).await.unwrap();
@@ -1539,7 +1550,7 @@ async fn prune_deletes_orphan_dependencies() {
 async fn insert_finished_run(
     pool: &SqlitePool,
     task_id: Uuid,
-    finished_at: DateTime<Utc>,
+    finished_at: Timestamp,
     usage: Option<AgentUsage>,
 ) {
     let run = TaskRun {
@@ -1563,20 +1574,20 @@ fn tokens(input: u64, output: u64, cost: Option<f64>) -> AgentUsage {
 #[tokio::test]
 async fn usage_stats_buckets_by_hour_and_sums_cost_and_runs() {
     let (dir, pool) = scratch_pool("usage-day").await;
-    let now = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(); // 2023-11-14T22:13:20Z
+    let now = Timestamp::from_unix_timestamp_millis(1_700_000_000_000).unwrap(); // 2023-11-14T22:13:20Z
     let task = Uuid::new_v4();
     // Same current hour as `now`, and three hours earlier.
     insert_finished_run(
         &pool,
         task,
-        now - ChronoDuration::minutes(30),
+        now - time::Duration::minutes(30),
         Some(tokens(10, 2, Some(0.5))),
     )
     .await;
     insert_finished_run(
         &pool,
         task,
-        now - ChronoDuration::hours(3),
+        now - time::Duration::hours(3),
         Some(tokens(5, 0, None)),
     )
     .await;
@@ -1601,7 +1612,7 @@ async fn usage_stats_buckets_by_hour_and_sums_cost_and_runs() {
     assert_eq!(stats.buckets[23].start, floor_to(now, HOUR_MS));
     assert_eq!(
         stats.buckets[0].end - stats.buckets[0].start,
-        ChronoDuration::hours(1)
+        time::Duration::hours(1)
     );
     assert_eq!(stats.buckets[23].runs, 0, "the current hour has no runs");
 
@@ -1623,7 +1634,7 @@ async fn usage_stats_buckets_by_hour_and_sums_cost_and_runs() {
 #[tokio::test]
 async fn context_only_usage_persists_context_and_nulls_token_columns() {
     let (dir, pool) = scratch_pool("usage-context-only").await;
-    let now = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+    let now = Timestamp::from_unix_timestamp_millis(1_700_000_000_000).unwrap();
     let mut task = task_at(now, Some(now), None);
     upsert_task(&pool, &task).await.unwrap();
 
@@ -1677,7 +1688,7 @@ async fn context_only_usage_persists_context_and_nulls_token_columns() {
 #[tokio::test]
 async fn task_rows_expose_the_current_attempt_usage() {
     let (dir, pool) = scratch_pool("task-latest-usage").await;
-    let now = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+    let now = Timestamp::from_unix_timestamp_millis(1_700_000_000_000).unwrap();
     let mut task = task_at(now, Some(now), None);
     task.attempt = 2;
     upsert_task(&pool, &task).await.unwrap();
@@ -1711,7 +1722,7 @@ async fn task_rows_expose_the_current_attempt_usage() {
 #[tokio::test]
 async fn usage_stats_keep_unknown_cost_distinct_from_a_reported_zero() {
     let (dir, pool) = scratch_pool("usage-cost-zero").await;
-    let now = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+    let now = Timestamp::from_unix_timestamp_millis(1_700_000_000_000).unwrap();
     let task = Uuid::new_v4();
 
     // No cost reported anywhere in the window: the total is unknown.
@@ -1735,13 +1746,13 @@ async fn usage_stats_keep_unknown_cost_distinct_from_a_reported_zero() {
 #[tokio::test]
 async fn usage_stats_buckets_by_day_and_month() {
     let (dir, pool) = scratch_pool("usage-coarse").await;
-    let now = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+    let now = Timestamp::from_unix_timestamp_millis(1_700_000_000_000).unwrap();
     let task = Uuid::new_v4();
     insert_finished_run(&pool, task, now, Some(tokens(1, 0, None))).await;
     insert_finished_run(
         &pool,
         task,
-        now - ChronoDuration::days(2),
+        now - time::Duration::days(2),
         Some(tokens(2, 0, None)),
     )
     .await;
@@ -1749,7 +1760,7 @@ async fn usage_stats_buckets_by_day_and_month() {
     insert_finished_run(
         &pool,
         task,
-        now - ChronoDuration::days(40),
+        now - time::Duration::days(40),
         Some(tokens(4, 0, None)),
     )
     .await;
@@ -1780,7 +1791,7 @@ async fn usage_stats_buckets_by_day_and_month() {
 #[tokio::test]
 async fn usage_stats_empty_history_is_all_zero_with_fixed_buckets() {
     let (dir, pool) = scratch_pool("usage-empty").await;
-    let now = Utc::now();
+    let now = Timestamp::now();
     for (period, expected) in [
         (UsagePeriod::Day, 24),
         (UsagePeriod::Week, 7),
@@ -1803,7 +1814,7 @@ async fn usage_stats_empty_history_is_all_zero_with_fixed_buckets() {
 #[tokio::test]
 async fn usage_survives_the_retention_pass_that_clears_outputs() {
     let (dir, pool) = scratch_pool("usage-retention").await;
-    let old = Utc::now() - ChronoDuration::days(60);
+    let old = Timestamp::now() - time::Duration::days(60);
     let task = task_at(
         old,
         Some(old),
@@ -1838,11 +1849,11 @@ async fn usage_survives_the_retention_pass_that_clears_outputs() {
 #[tokio::test]
 async fn non_usd_run_cost_round_trips_without_becoming_usd() {
     let (dir, pool) = scratch_pool("usage-currency").await;
-    let task = task_at(Utc::now(), None, None);
+    let task = task_at(Timestamp::now(), None, None);
     upsert_task(&pool, &task).await.unwrap();
     let mut run = run_at(task.id, 1);
     run.status = RunStatus::Succeeded;
-    run.finished_at = Some(Utc::now());
+    run.finished_at = Some(Timestamp::now());
     run.usage = Some(AgentUsage {
         input_tokens: 7,
         cost: Some(AgentCost::new(1.5, "credits")),
@@ -1857,7 +1868,7 @@ async fn non_usd_run_cost_round_trips_without_becoming_usd() {
     assert_eq!(usage.reported_cost(), Some(AgentCost::new(1.5, "credits")));
 
     // USD-only aggregation excludes the credits run instead of summing it.
-    let stats = usage_stats(&pool, UsagePeriod::Day, Utc::now())
+    let stats = usage_stats(&pool, UsagePeriod::Day, Timestamp::now())
         .await
         .unwrap();
     assert_eq!(stats.totals.usage.input_tokens, 7);
@@ -1869,14 +1880,14 @@ async fn non_usd_run_cost_round_trips_without_becoming_usd() {
 #[tokio::test]
 async fn finalized_run_round_trips_usage_model_and_agent() {
     let (dir, pool) = scratch_pool("usage-roundtrip").await;
-    let task = task_at(Utc::now(), None, None);
+    let task = task_at(Timestamp::now(), None, None);
     upsert_task(&pool, &task).await.unwrap();
     let run = run_at(task.id, 1);
     insert_task_run(&pool, &run).await.unwrap();
 
     let mut done = run.clone();
     done.status = RunStatus::Succeeded;
-    done.finished_at = Some(Utc::now());
+    done.finished_at = Some(Timestamp::now());
     done.agent = Some("opencode".to_string());
     done.model = Some("deepseek-v4-flash".to_string());
     done.usage = Some(tokens(100, 20, Some(0.03)));
@@ -1962,7 +1973,13 @@ async fn migrate_adds_usage_columns_to_a_legacy_task_runs_table() {
 
     // A run inserted against the migrated table carries its usage.
     let task_id = Uuid::new_v4();
-    insert_finished_run(&pool, task_id, Utc::now(), Some(tokens(3, 1, Some(0.01)))).await;
+    insert_finished_run(
+        &pool,
+        task_id,
+        Timestamp::now(),
+        Some(tokens(3, 1, Some(0.01))),
+    )
+    .await;
     let runs = list_task_runs(&pool, task_id).await.unwrap();
     assert_eq!(runs[0].usage.as_ref().map(|u| u.input_tokens), Some(3));
 
@@ -2143,7 +2160,7 @@ async fn agent_session_metadata_survives_reopen() {
 
     // Closing the in-memory session is represented by a status update, not a
     // delete: the row must remain for history.
-    let ended_at = created_at + ChronoDuration::seconds(30);
+    let ended_at = created_at + time::Duration::seconds(30);
     assert!(
         set_agent_session_status(&pool, "local-1", AgentSessionStatus::Ended, None, ended_at)
             .await
@@ -2178,7 +2195,7 @@ async fn agent_session_updates_preserve_local_identity_and_created_at() {
     insert_agent_session(&pool, &session).await.unwrap();
 
     // Targeted setters cover the lifecycle transitions step 2 needs.
-    let ready_at = created_at + ChronoDuration::seconds(1);
+    let ready_at = created_at + time::Duration::seconds(1);
     assert!(
         set_agent_session_external_id(&pool, "local-1", "ses_acp_1", ready_at)
             .await
@@ -2207,7 +2224,7 @@ async fn agent_session_updates_preserve_local_identity_and_created_at() {
 
     // A full update replaces mutable fields but never the local id or creation
     // time.
-    let failed_at = created_at + ChronoDuration::seconds(2);
+    let failed_at = created_at + time::Duration::seconds(2);
     expected.agent = "claude".to_string();
     expected.cwd = PathBuf::from("/work/other");
     expected.task_id = Some("task-9".to_string());
@@ -2302,7 +2319,7 @@ async fn list_agent_sessions_orders_by_most_recent_update() {
     let (dir, pool) = scratch_pool("agent-session-order").await;
     let base = from_ms(1_700_000_000_000);
     for (n, name) in ["first", "second", "third"].into_iter().enumerate() {
-        let at = base + ChronoDuration::seconds(n as i64);
+        let at = base + time::Duration::seconds(n as i64);
         let session = AgentSessionRecord::loading(format!("local-{name}"), "opencode", "/work", at);
         insert_agent_session(&pool, &session).await.unwrap();
     }
@@ -2317,7 +2334,7 @@ async fn list_agent_sessions_orders_by_most_recent_update() {
     assert_eq!(ids, vec!["local-third", "local-second", "local-first"]);
 
     // Touching the oldest record moves it to the front.
-    let touched_at = base + ChronoDuration::seconds(10);
+    let touched_at = base + time::Duration::seconds(10);
     assert!(set_agent_session_status(
         &pool,
         "local-first",
@@ -2360,7 +2377,7 @@ async fn list_agent_sessions_for_task_is_scoped_to_the_task() {
         "local-second",
         "opencode",
         "/work",
-        base + ChronoDuration::seconds(1),
+        base + time::Duration::seconds(1),
     );
     second.task_id = Some(task_a.to_string());
     insert_agent_session(&pool, &second).await.unwrap();
@@ -2369,7 +2386,7 @@ async fn list_agent_sessions_for_task_is_scoped_to_the_task() {
         "local-other",
         "opencode",
         "/work",
-        base + ChronoDuration::seconds(2),
+        base + time::Duration::seconds(2),
     );
     other.task_id = Some(task_b.to_string());
     insert_agent_session(&pool, &other).await.unwrap();
@@ -2423,7 +2440,7 @@ async fn migrate_creates_agent_sessions_without_touching_existing_data() {
     let legacy_id = Uuid::new_v4();
     sqlx::query("INSERT INTO tasks (id, name, status, input, created_at) VALUES (?, 'legacy', 'succeeded', '{}', ?)")
         .bind(legacy_id.to_string())
-        .bind(ts_ms(Utc::now()))
+        .bind(ts_ms(Timestamp::now()))
         .execute(&pool)
         .await
         .unwrap();

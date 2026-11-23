@@ -12,7 +12,7 @@
 //! Closing or failing updates the row in place: history is never deleted by
 //! teardown.
 
-use chrono::Utc;
+use favetto_core::Timestamp;
 use sqlx::SqlitePool;
 
 use crate::db::{self, AgentSessionRecord, AgentSessionStatus};
@@ -54,7 +54,8 @@ impl SessionStore {
         run_id: Option<&str>,
     ) -> anyhow::Result<()> {
         let written =
-            db::mark_agent_session_ready(&self.pool, id, external_session_id, Utc::now()).await?;
+            db::mark_agent_session_ready(&self.pool, id, external_session_id, Timestamp::now())
+                .await?;
         if !written {
             anyhow::bail!("session record '{id}' was not found while recording its ACP id");
         }
@@ -85,7 +86,7 @@ impl SessionStore {
             id,
             AgentSessionStatus::Loading,
             None,
-            Utc::now(),
+            Timestamp::now(),
         )
         .await?;
         if !written {
@@ -97,7 +98,8 @@ impl SessionStore {
     /// Record a title reported by the agent. Title updates are display-only, so
     /// a missing row or write fault is logged rather than ending the session.
     pub(crate) async fn set_title(&self, id: &str, title: &str) -> anyhow::Result<()> {
-        let written = db::set_agent_session_title(&self.pool, id, Some(title), Utc::now()).await?;
+        let written =
+            db::set_agent_session_title(&self.pool, id, Some(title), Timestamp::now()).await?;
         if !written {
             anyhow::bail!("session record '{id}' was not found while recording its title");
         }
@@ -116,7 +118,7 @@ impl SessionStore {
 
     /// Mark the session closed, keeping the row for history.
     pub(crate) async fn mark_ended(&self, id: &str) -> anyhow::Result<()> {
-        if !db::close_agent_session(&self.pool, id, Utc::now()).await? {
+        if !db::close_agent_session(&self.pool, id, Timestamp::now()).await? {
             tracing::debug!(session = %id, "session was already terminal when it closed");
         }
         Ok(())
@@ -124,7 +126,7 @@ impl SessionStore {
 
     /// Mark the session failed with the reason, keeping the row for history.
     pub(crate) async fn mark_failed(&self, id: &str, error: &str) -> anyhow::Result<()> {
-        if !db::fail_agent_session(&self.pool, id, error, Utc::now()).await? {
+        if !db::fail_agent_session(&self.pool, id, error, Timestamp::now()).await? {
             tracing::debug!(session = %id, "session was already terminal when it failed");
         }
         Ok(())
@@ -135,7 +137,6 @@ impl SessionStore {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use chrono::{DateTime, Utc};
     use favetto_core::model::{RunStatus, Task, TaskRun, TaskStatus};
     use sqlx::SqlitePool;
     use uuid::Uuid;
@@ -156,14 +157,14 @@ mod tests {
         (dir, pool)
     }
 
-    fn loading(id: &str, now: DateTime<Utc>) -> AgentSessionRecord {
+    fn loading(id: &str, now: Timestamp) -> AgentSessionRecord {
         AgentSessionRecord::loading(id, "echo", Path::new("/work"), now)
     }
 
     #[tokio::test]
     async fn a_failed_ready_write_does_not_advertise_the_session_as_resumable() {
         let (dir, pool) = scratch_pool("session-ready-failure").await;
-        let now = Utc::now();
+        let now = Timestamp::now();
         db::insert_agent_session(&pool, &loading("local-1", now))
             .await
             .unwrap();
@@ -205,7 +206,7 @@ mod tests {
     #[tokio::test]
     async fn ready_records_the_acp_id_and_the_run_link() {
         let (dir, pool) = scratch_pool("session-ready-run").await;
-        let now = Utc::now();
+        let now = Timestamp::now();
         db::insert_agent_session(&pool, &loading("local-1", now))
             .await
             .unwrap();
@@ -274,7 +275,7 @@ mod tests {
     #[tokio::test]
     async fn closing_and_failing_keep_the_metadata() {
         let (dir, pool) = scratch_pool("session-terminal").await;
-        let now = Utc::now();
+        let now = Timestamp::now();
         db::insert_agent_session(&pool, &loading("ended", now))
             .await
             .unwrap();

@@ -18,7 +18,6 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
-use chrono::Utc;
 use favetto_wire::elicitation::ElicitationReply;
 use favetto_wire::model::{
     AgentAuthState, AgentAuthStatus, AgentCatalogEntry, AgentCommand, AgentPlanEntry,
@@ -26,6 +25,7 @@ use favetto_wire::model::{
     SessionConfigValue, SessionModes, Task, TaskStatus,
 };
 use favetto_wire::rpc::AgentEventPush;
+use favetto_wire::Timestamp;
 use gpui::{ClipboardItem, Context, FocusHandle, Task as GpuiTask, WindowAppearance};
 
 use crate::catalog::{AgentChoice, CatalogState, OneShotFocus};
@@ -1289,7 +1289,7 @@ impl ClientState {
                         }
                         // Keep the shared snapshot in step until its own push
                         // and reconciling load land.
-                        let now = Utc::now();
+                        let now = Timestamp::now();
                         let mut changed = false;
                         for task in &mut self.tasks {
                             if cancelled.contains(&task.id) {
@@ -2095,7 +2095,7 @@ impl ClientState {
             return;
         };
         self.schedules
-            .open_editor(ScheduleEditor::edit(&schedule, Utc::now()));
+            .open_editor(ScheduleEditor::edit(&schedule, Timestamp::now()));
     }
 
     pub fn schedule_editor_open(&self) -> bool {
@@ -2154,7 +2154,7 @@ impl ClientState {
     /// Validate the sheet and send `schedules.upsert`. Validation stays inline;
     /// a daemon rejection stays attached to the sheet.
     pub fn submit_schedule(&mut self) {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let Some(editor) = self.schedules.editor_mut() else {
             return;
         };
@@ -3125,7 +3125,7 @@ impl ClientState {
             &self.tasks,
             &self.sessions,
             self.active_repo.as_deref(),
-            Utc::now(),
+            Timestamp::now(),
             &launch::launch_failures(&self.tasks),
             &self.dismissed_launch_failures,
         ));
@@ -3213,7 +3213,7 @@ impl ClientState {
             self.tasks_query.value(),
             self.tasks_filter,
             self.active_repo.as_deref(),
-            Utc::now(),
+            Timestamp::now(),
         ));
         derived.task_revision = self.snapshot_revision;
         derived.task_query = self.tasks_query.value().to_string();
@@ -3680,7 +3680,7 @@ impl ClientState {
         match confirm.action {
             TaskAction::Cancel => {
                 optimistic.status = TaskStatus::Cancelled;
-                optimistic.finished_at = Some(Utc::now());
+                optimistic.finished_at = Some(Timestamp::now());
             }
             TaskAction::Retry => {
                 optimistic.status = TaskStatus::Pending;

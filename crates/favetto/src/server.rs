@@ -14,7 +14,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response as AxumResponse};
 use base64::Engine as _;
-use chrono::Utc;
+use favetto_core::Timestamp;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
@@ -935,7 +935,7 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
 
         method::SCHEDULES_LIST => match db::list_schedules(&state.db).await {
             Ok(mut schedules) => {
-                let now = chrono::Utc::now();
+                let now = Timestamp::now();
                 for schedule in &mut schedules {
                     if schedule.enabled {
                         schedule.next_run = crate::scheduler::next_run_after(&schedule.cron, now);
@@ -991,7 +991,7 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
         method::USAGE_STATS => {
             let p: UsageStatsParams = parse_params(&req.method, &req.params)?;
             let period = p.period.unwrap_or_default();
-            match db::usage_stats(&state.db, period, Utc::now()).await {
+            match db::usage_stats(&state.db, period, Timestamp::now()).await {
                 Ok(stats) => to_value(stats),
                 Err(e) => Err(RpcError::Internal(e.to_string())),
             }
@@ -1358,7 +1358,7 @@ async fn create_workflow(
         if existing.contains(&id) {
             // Already inserted by an earlier submission; just make sure its
             // dependency edges are present (idempotent).
-            let now = Utc::now();
+            let now = Timestamp::now();
             for predecessor in &depends_on {
                 db::insert_dependency(&state.db, id, *predecessor, now)
                     .await
@@ -1911,8 +1911,8 @@ async fn start_oneshot_task(
         }),
         output: None,
         dedupe_key: None,
-        created_at: Utc::now(),
-        started_at: Some(Utc::now()),
+        created_at: Timestamp::now(),
+        started_at: Some(Timestamp::now()),
         finished_at: None,
         error: None,
         failure: None,
@@ -1971,7 +1971,7 @@ async fn start_oneshot_task(
             failed.status = TaskStatus::Failed;
             failed.error = Some(error.to_string());
             failed.failure = Some(Failure::new(FailureKind::Infrastructure, error.to_string()));
-            failed.finished_at = Some(Utc::now());
+            failed.finished_at = Some(Timestamp::now());
             if db::finish_active_task(&state.db, &failed)
                 .await
                 .unwrap_or(false)
@@ -2045,7 +2045,7 @@ async fn finish_oneshot(
                 .unwrap_or_else(|| "?".to_string())
         ))
     };
-    task.finished_at = Some(Utc::now());
+    task.finished_at = Some(Timestamp::now());
     // Compare-and-set: a cancellation while the session was winding down wins.
     if !db::finish_active_task(&state.db, &task)
         .await
@@ -2104,7 +2104,7 @@ async fn upsert_schedule(
 
     crate::scheduler::upsert(state, &schedule).await?;
     if schedule.enabled {
-        schedule.next_run = crate::scheduler::next_run_after(&schedule.cron, chrono::Utc::now());
+        schedule.next_run = crate::scheduler::next_run_after(&schedule.cron, Timestamp::now());
     }
     Ok(schedule)
 }
@@ -2353,7 +2353,7 @@ async fn announce_cancelled(state: &State, task: &Task) {
         id: 0,
         kind: favetto_core::model::EventKind::TaskCancelled,
         payload: serde_json::json!({ "task_id": task.id }),
-        created_at: chrono::Utc::now(),
+        created_at: Timestamp::now(),
     };
     if let Ok(event_id) = db::insert_event(&state.db, &event).await {
         let event = favetto_core::model::Event {

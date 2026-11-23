@@ -1316,7 +1316,8 @@ impl WorkflowsView {
                 (
                     row.id,
                     row.parent_id,
-                    row.created_at.map(|created| created.timestamp_millis()),
+                    row.created_at
+                        .map(|created| created.unix_timestamp_millis()),
                 )
             })
             .collect();

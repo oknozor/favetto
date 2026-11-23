@@ -8,7 +8,7 @@
 //! All types are additive on the wire: every new field defaults, so an older
 //! client or daemon decodes a newer payload unchanged.
 
-use chrono::{DateTime, Utc};
+use crate::timestamp::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use std::str::FromStr;
@@ -366,9 +366,9 @@ impl FromStr for UsagePeriod {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UsageBucket {
     /// Inclusive bucket start (UTC).
-    pub start: DateTime<Utc>,
+    pub start: Timestamp,
     /// Exclusive bucket end (UTC).
-    pub end: DateTime<Utc>,
+    pub end: Timestamp,
     /// Token/cost totals for the bucket. Aggregated cost is USD-only (the
     /// legacy `cost_usd` column); non-USD run costs are not mixed into it.
     pub usage: AgentUsage,
@@ -2117,7 +2117,7 @@ mod tests {
 
     #[test]
     fn usage_stats_round_trip_and_total_tokens() {
-        let start = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let start = Timestamp::from_unix_timestamp_millis(1_700_000_000_000).unwrap();
         let usage = AgentUsage {
             input_tokens: 10,
             output_tokens: 4,
@@ -2140,7 +2140,7 @@ mod tests {
             },
             buckets: vec![UsageBucket {
                 start,
-                end: start + chrono::Duration::hours(1),
+                end: start + time::Duration::hours(1),
                 usage,
                 runs: 3,
             }],

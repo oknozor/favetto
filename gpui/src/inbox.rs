@@ -14,10 +14,10 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use favetto_wire::model::{
     AgentCost, AgentSessionInfo, AwaitingInputKind, AwaitingInputReason, Task, TaskStatus,
 };
+use favetto_wire::Timestamp;
 use uuid::Uuid;
 
 use crate::launch;
@@ -136,7 +136,7 @@ pub struct NeedsRow {
     /// Execution attempt, when the row is backed by a task.
     pub attempt: Option<u32>,
     /// When the row started needing a decision (fair-queue order and elapsed).
-    pub since: DateTime<Utc>,
+    pub since: Timestamp,
     /// The permission prompt (awaiting rows) or the failure message (failed).
     pub detail: Option<String>,
     /// True when [`NeedsRow::detail`] is a permission request message.
@@ -160,7 +160,7 @@ pub struct RecentRow {
     /// amount keeps its reported unit so a credits value is never shown as USD.
     pub cost: Option<AgentCost>,
     /// Creation time, used for the newest-first order.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 /// Both groups, already sorted.
@@ -219,7 +219,7 @@ pub fn build(
     tasks: &[Task],
     sessions: &[AgentSessionInfo],
     active_repo: Option<&str>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     launch_failures: &[launch::LaunchFailure],
     dismissed_launch_failures: &HashSet<launch::LaunchKey>,
 ) -> InboxRows {
@@ -235,7 +235,7 @@ pub fn build(
         }
     }
 
-    let cutoff = now - chrono::Duration::hours(FAILED_WINDOW_HOURS);
+    let cutoff = now - time::Duration::hours(FAILED_WINDOW_HOURS);
     let all_launch_by_task: HashMap<Uuid, &launch::LaunchFailure> = launch_failures
         .iter()
         .map(|failure| (failure.task_id, failure))
@@ -488,8 +488,8 @@ pub fn format_elapsed(seconds: i64) -> String {
 }
 
 /// Time since `since`, in the compact list form.
-pub fn elapsed_since(since: DateTime<Utc>, now: DateTime<Utc>) -> String {
-    format_elapsed(now.timestamp().saturating_sub(since.timestamp()))
+pub fn elapsed_since(since: Timestamp, now: Timestamp) -> String {
+    format_elapsed(now.unix_timestamp().saturating_sub(since.unix_timestamp()))
 }
 
 /// A duration cell value; `—` when the daemon has no timestamps.
@@ -511,10 +511,12 @@ pub fn format_cost(cost: Option<&AgentCost>) -> Option<String> {
 
 /// Elapsed time of a task: live elapsed for a running task, total for a
 /// finished one, `None` before it starts.
-pub fn task_duration(task: &Task, now: DateTime<Utc>) -> Option<Duration> {
+pub fn task_duration(task: &Task, now: Timestamp) -> Option<Duration> {
     let started = task.started_at?;
     let end = task.finished_at.unwrap_or(now);
-    let seconds = end.timestamp().saturating_sub(started.timestamp());
+    let seconds = end
+        .unix_timestamp()
+        .saturating_sub(started.unix_timestamp());
     Some(Duration::from_secs(u64::try_from(seconds).unwrap_or(0)))
 }
 
@@ -528,7 +530,7 @@ mod tests {
         tasks: &[Task],
         sessions: &[AgentSessionInfo],
         active_repo: Option<&str>,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> InboxRows {
         super::build(
             tasks,
@@ -540,12 +542,12 @@ mod tests {
         )
     }
 
-    fn at(offset_minutes: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp")
-            + chrono::Duration::minutes(offset_minutes)
+    fn at(offset_minutes: i64) -> Timestamp {
+        Timestamp::from_unix_timestamp(1_700_000_000).expect("timestamp")
+            + time::Duration::minutes(offset_minutes)
     }
 
-    fn task(id: u128, name: &str, status: TaskStatus, created: DateTime<Utc>) -> Task {
+    fn task(id: u128, name: &str, status: TaskStatus, created: Timestamp) -> Task {
         Task {
             id: Uuid::from_u128(id),
             name: name.to_string(),

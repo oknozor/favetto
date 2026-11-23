@@ -5,8 +5,8 @@
 //! model. Keyboard is owned by the shell: `n` creates, `↵` edits, `d` opens the
 //! delete confirmation, Tab/Shift+Tab walk the sheet and `⌘↵` saves.
 
-use chrono::Utc;
 use favetto_wire::model::Schedule;
+use favetto_wire::Timestamp;
 use gpui::{
     div, prelude::*, px, AnyElement, Context, Div, Entity, FocusHandle, Hsla, IntoElement, Render,
     ScrollHandle, Stateful, Window,
@@ -287,7 +287,7 @@ impl SchedulesView {
                     } else {
                         theme.colors.muted
                     })
-                    .child(schedules::next_run_label(schedule, Utc::now())),
+                    .child(schedules::next_run_label(schedule, Timestamp::now())),
             )
             .child(
                 div()

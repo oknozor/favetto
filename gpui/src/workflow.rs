@@ -16,9 +16,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, Utc};
 use favetto_wire::model::{Task, TaskStatus};
 use favetto_wire::workflow::{WorkflowInspect, WorkflowState};
+use favetto_wire::Timestamp;
 use uuid::Uuid;
 
 use crate::inbox::{self, StatusKind};
@@ -194,7 +194,7 @@ pub struct WorkflowRow {
     pub parent_id: Option<Uuid>,
     /// Creation time, the graph's stable sibling order. Missing when the task
     /// is no longer in the shared snapshot.
-    pub created_at: Option<DateTime<Utc>>,
+    pub created_at: Option<Timestamp>,
     /// Whether the daemon considered the pending row blocked by a predecessor.
     /// Retained so a live `pending` push cannot accidentally unblock it.
     pub blocked: bool,
@@ -220,7 +220,7 @@ impl WorkflowRow {
     fn order_key(&self) -> (i64, Uuid) {
         (
             self.created_at
-                .map(|created| created.timestamp_millis())
+                .map(|created| created.unix_timestamp_millis())
                 .unwrap_or(i64::MAX),
             self.id,
         )
@@ -383,7 +383,7 @@ pub struct WorkflowRoot {
     /// succeeded parent (the persistent launch-failure warning).
     pub launch_failures: usize,
     /// The newest instance's creation time, the list's sort key.
-    pub newest: DateTime<Utc>,
+    pub newest: Timestamp,
 }
 
 impl WorkflowRoot {
@@ -783,7 +783,7 @@ pub fn roots(tasks: &[Task], launch_failures: &[LaunchFailure]) -> Vec<WorkflowR
                 .iter()
                 .map(|task| task.created_at)
                 .max()
-                .unwrap_or_else(Utc::now);
+                .unwrap_or_else(Timestamp::now);
             WorkflowRoot {
                 root_id,
                 name,
@@ -913,10 +913,10 @@ impl WorkflowCancelConfirm {
 mod tests {
     use super::*;
     use crate::launch;
-    use chrono::TimeZone;
 
-    fn at(offset_minutes: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_700_000_000, 0).unwrap() + chrono::Duration::minutes(offset_minutes)
+    fn at(offset_minutes: i64) -> Timestamp {
+        Timestamp::from_unix_timestamp(1_700_000_000).unwrap()
+            + time::Duration::minutes(offset_minutes)
     }
 
     fn task(id: u128, name: &str, status: TaskStatus, root: Option<Uuid>) -> Task {

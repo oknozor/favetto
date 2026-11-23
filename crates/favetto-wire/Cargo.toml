@@ -15,8 +15,18 @@ schema = ["dep:schemars"]
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+time = { workspace = true }
 uuid = { version = "1", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 url = "2"
-schemars = { version = "1", features = ["derive", "chrono04", "uuid1"], optional = true }
+schemars = { version = "1", features = ["derive", "uuid1"], optional = true }
+
+[dev-dependencies]
+rmp-serde = "1.3"
+
+# wasm32-unknown-unknown needs a randomness source for `Uuid::new_v4()` and the
+# JS clock for `OffsetDateTime::now_utc()`; these features are additive on top
+# of the normal deps.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { version = "1", features = ["js"] }
+time = { workspace = true, features = ["wasm-bindgen"] }

@@ -158,6 +158,7 @@ impl EventBus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use favetto_core::Timestamp;
 
     #[test]
     fn catalog_updated_push_maps_to_notification() {
@@ -200,7 +201,7 @@ mod tests {
             input: serde_json::json!({}),
             output: None,
             dedupe_key: None,
-            created_at: chrono::Utc::now(),
+            created_at: Timestamp::now(),
             started_at: None,
             finished_at: None,
             error: None,
@@ -228,7 +229,7 @@ mod tests {
             id: 7,
             kind: favetto_core::model::EventKind::TaskIdle,
             payload: serde_json::json!({}),
-            created_at: chrono::Utc::now(),
+            created_at: Timestamp::now(),
         };
         assert_eq!(ServerPush::Event(event).event_id(), Some(7));
         assert_eq!(ServerPush::CatalogUpdated.event_id(), None);
@@ -241,7 +242,7 @@ mod tests {
                 input: serde_json::json!({}),
                 output: None,
                 dedupe_key: None,
-                created_at: chrono::Utc::now(),
+                created_at: Timestamp::now(),
                 started_at: None,
                 finished_at: None,
                 error: None,
@@ -280,7 +281,7 @@ mod tests {
             id: 0,
             kind: favetto_core::model::EventKind::TaskIdle,
             payload: serde_json::json!({ "n": n }),
-            created_at: chrono::Utc::now(),
+            created_at: Timestamp::now(),
         };
         crate::db::insert_event(pool, &event).await.unwrap();
     }

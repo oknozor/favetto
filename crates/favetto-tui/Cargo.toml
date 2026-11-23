@@ -22,7 +22,6 @@ favetto-providers = { path = "../favetto-providers" }
 anyhow = "1"
 ascii-dag = "0.11"
 base64 = "0.23"
-chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 fuzzy-matcher = "0.3"
@@ -34,6 +33,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { workspace = true }
 serde_json = { workspace = true }
 throbber-widgets-tui = "0.11"
+time = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", features = ["codec"] }
