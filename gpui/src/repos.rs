@@ -115,7 +115,9 @@ pub struct RepoPicker {
     filter: TextInput,
     selected: usize,
     error: Option<String>,
-    submitting: bool,
+    /// The target of the in-flight activation. `Some(None)` asks for the
+    /// global view; `None` means no request is in flight.
+    pending_target: Option<Option<String>>,
 }
 
 impl RepoPicker {
@@ -125,7 +127,7 @@ impl RepoPicker {
         self.open = true;
         self.filter.set_value(String::new());
         self.error = None;
-        self.submitting = false;
+        self.pending_target = None;
         self.selected = repos
             .iter()
             .position(|repo| repo.active)
@@ -140,7 +142,7 @@ impl RepoPicker {
         self.filter.set_value(String::new());
         self.selected = 0;
         self.error = None;
-        self.submitting = false;
+        self.pending_target = None;
     }
 
     pub fn is_open(&self) -> bool {
@@ -168,7 +170,15 @@ impl RepoPicker {
     }
 
     pub fn is_submitting(&self) -> bool {
-        self.submitting
+        self.pending_target.is_some()
+    }
+
+    /// The repo requested while an activation is in flight; the outer `None`
+    /// means no request is in flight and the inner `None` targets the global
+    /// view. The client uses this to close the picker when either the
+    /// activation reply or a `repos.list` refresh reports that repo active.
+    pub fn pending_target(&self) -> Option<Option<&str>> {
+        self.pending_target.as_ref().map(|target| target.as_deref())
     }
 
     /// The filtered rows, always with the leading `global` row.
@@ -224,15 +234,15 @@ impl RepoPicker {
         self.clamp(repos);
     }
 
-    /// Mark an activation as in flight.
-    pub fn begin_submit(&mut self) {
-        self.submitting = true;
+    /// Mark an activation as in flight and remember its target.
+    pub fn begin_submit(&mut self, target: Option<String>) {
+        self.pending_target = Some(target);
         self.error = None;
     }
 
     /// Keep the daemon rejection attached to the picker.
     pub fn fail(&mut self, message: String) {
-        self.submitting = false;
+        self.pending_target = None;
         self.error = Some(message);
     }
 
@@ -360,5 +370,50 @@ mod tests {
         picker.close();
         assert!(!picker.is_open());
         assert_eq!(picker.selected(), 0);
+    }
+
+    #[test]
+    fn the_picker_tracks_the_in_flight_switch_and_clears_it_on_failure_or_close() {
+        let repos = vec![
+            repo("favetto", "/code/favetto", true, false),
+            repo("web", "/srv/web", true, true),
+        ];
+        let mut picker = RepoPicker::default();
+        picker.open(&repos);
+        assert!(!picker.is_submitting());
+        assert_eq!(picker.pending_target(), None);
+
+        picker.begin_submit(Some("web".to_string()));
+        assert!(picker.is_submitting());
+        assert_eq!(picker.pending_target(), Some(Some("web")));
+
+        picker.fail("The daemon rejected the switch.".to_string());
+        assert!(!picker.is_submitting());
+        assert_eq!(picker.pending_target(), None);
+        assert_eq!(
+            picker.error(),
+            Some("The daemon rejected the switch."),
+            "a rejection stays on the picker for its inline error"
+        );
+
+        picker.begin_submit(None);
+        assert_eq!(
+            picker.pending_target(),
+            Some(None),
+            "the global row is a target, not an absent request"
+        );
+        picker.close();
+        assert!(!picker.is_submitting());
+        assert_eq!(picker.pending_target(), None);
+        assert_eq!(picker.error(), None);
+
+        picker.open(&repos);
+        picker.begin_submit(Some("web".to_string()));
+        picker.open(&repos);
+        assert_eq!(
+            picker.pending_target(),
+            None,
+            "reopening starts without a stale request"
+        );
     }
 }
