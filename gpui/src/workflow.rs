@@ -35,6 +35,10 @@ pub const COLUMN_GAP: f32 = 64.0;
 pub const ROW_GAP: f32 = 20.0;
 /// Padding around the whole graph.
 pub const GRAPH_MARGIN: f32 = 24.0;
+/// Length of the filled arrowhead at the child end of an edge.
+pub const ARROW_LENGTH: f32 = 8.0;
+/// Half the base width of the arrowhead, so the visible head is twice as wide.
+pub const ARROW_HALF_WIDTH: f32 = 4.0;
 
 /// One node placed on the graph canvas.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -58,6 +62,54 @@ pub struct WorkflowEdge {
     pub parent: Uuid,
     /// The instance that waited for or was spawned by the parent.
     pub child: Uuid,
+}
+
+/// The paint geometry of one lineage edge.
+///
+/// The stroke is a cubic from the parent's right-center to the arrowhead's
+/// base, with its first control point level with the parent and its second
+/// level with the child. That keeps both ends horizontal: the fork reads left
+/// to right and the filled head can point straight at the child.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EdgeGeometry {
+    /// Start point on the parent's right edge.
+    pub start: (f32, f32),
+    /// First cubic control point, level with the parent.
+    pub control_start: (f32, f32),
+    /// Second cubic control point, level with the child.
+    pub control_end: (f32, f32),
+    /// Where the stroke stops (the arrowhead's base center).
+    pub stroke_end: (f32, f32),
+    /// The arrow tip, touching the child's left edge.
+    pub tip: (f32, f32),
+    /// First base corner of the arrowhead.
+    pub base_top: (f32, f32),
+    /// Second base corner of the arrowhead.
+    pub base_bottom: (f32, f32),
+}
+
+/// Compute the stroke and arrowhead geometry for a parent → child edge.
+///
+/// The tip sits on the child's left edge at its vertical center; the base is
+/// [`ARROW_LENGTH`] behind it and [`ARROW_HALF_WIDTH`] above and below, so the
+/// head never covers the card's text or status chips.
+pub fn edge_geometry(parent: &WorkflowNode, child: &WorkflowNode) -> EdgeGeometry {
+    let start = (parent.x + NODE_WIDTH, parent.y + NODE_HEIGHT / 2.0);
+    let tip = (child.x, child.y + NODE_HEIGHT / 2.0);
+    // Neighbouring columns are at least COLUMN_GAP apart; clamping keeps the
+    // base on the parent side even if a future layout ever gets tighter.
+    let base_x = (tip.0 - ARROW_LENGTH).max(start.0);
+    let stroke_end = (base_x, tip.1);
+    let half_horizontal = ((stroke_end.0 - start.0) / 2.0).max(0.0);
+    EdgeGeometry {
+        start,
+        control_start: (start.0 + half_horizontal, start.1),
+        control_end: (stroke_end.0 - half_horizontal, stroke_end.1),
+        stroke_end,
+        tip,
+        base_top: (base_x, tip.1 - ARROW_HALF_WIDTH),
+        base_bottom: (base_x, tip.1 + ARROW_HALF_WIDTH),
+    }
 }
 
 /// A window-free layout of one root's instances.
@@ -1103,6 +1155,48 @@ mod tests {
         boxes.dedup();
         assert_eq!(boxes.len(), layout.nodes.len());
         assert!(layout.height >= GRAPH_MARGIN * 2.0 + NODE_HEIGHT * 3.0);
+    }
+
+    #[test]
+    fn edge_geometry_puts_a_symmetric_head_on_the_child_left_edge() {
+        let parent = WorkflowNode {
+            id: Uuid::from_u128(1),
+            column: 0,
+            row: 0,
+            x: GRAPH_MARGIN,
+            y: GRAPH_MARGIN,
+        };
+        let child = WorkflowNode {
+            id: Uuid::from_u128(2),
+            column: 1,
+            row: 2,
+            x: GRAPH_MARGIN + NODE_WIDTH + COLUMN_GAP,
+            y: GRAPH_MARGIN + 2.0 * (NODE_HEIGHT + ROW_GAP),
+        };
+        let geometry = edge_geometry(&parent, &child);
+
+        assert_eq!(
+            geometry.start,
+            (parent.x + NODE_WIDTH, parent.y + NODE_HEIGHT / 2.0)
+        );
+        assert_eq!(geometry.tip, (child.x, child.y + NODE_HEIGHT / 2.0));
+        // The stroke stops at the arrowhead base; the tip touches the card.
+        assert_eq!(geometry.stroke_end.0, geometry.tip.0 - ARROW_LENGTH);
+        assert_eq!(geometry.stroke_end.1, geometry.tip.1);
+        // The base is symmetric around the child's vertical center.
+        assert_eq!(geometry.base_top.1, geometry.tip.1 - ARROW_HALF_WIDTH);
+        assert_eq!(geometry.base_bottom.1, geometry.tip.1 + ARROW_HALF_WIDTH);
+        assert_eq!(
+            geometry.base_top.1 + geometry.base_bottom.1,
+            geometry.tip.1 * 2.0
+        );
+        assert_eq!(geometry.base_top.0, geometry.base_bottom.0);
+
+        // Both cubic ends are horizontal, so the head points right.
+        assert_eq!(geometry.control_start.1, geometry.start.1);
+        assert_eq!(geometry.control_end.1, geometry.stroke_end.1);
+        assert!(geometry.stroke_end.0 > geometry.start.0);
+        assert!(geometry.stroke_end.0 < geometry.tip.0);
     }
 
     #[test]

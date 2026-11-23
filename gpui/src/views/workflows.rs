@@ -34,9 +34,9 @@ use crate::workflow::{
 /// remember which node was last scrolled into view.
 type GraphSignature = Vec<(uuid::Uuid, Option<uuid::Uuid>, Option<i64>)>;
 
-/// One painted edge: start point, end point and whether the selected node is
-/// the child (so the path is accent colored).
-type PaintedEdge = ((f32, f32), (f32, f32), bool);
+/// One painted edge: its stroke/arrowhead geometry and whether the selected
+/// node is the child (so the path and head are accent colored).
+type PaintedEdge = (workflow::EdgeGeometry, bool);
 
 /// The Workflows surface.
 pub struct WorkflowsView {
@@ -772,9 +772,14 @@ impl WorkflowsView {
         let connector = || {
             div()
                 .w(px(workflow::COLUMN_GAP))
-                .h(px(1.0))
+                .h(px(workflow::NODE_HEIGHT))
                 .flex_shrink_0()
-                .bg(theme.colors.border)
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(theme.font.lg))
+                .text_color(theme.colors.border)
+                .child("›")
         };
 
         div()
@@ -854,8 +859,10 @@ impl WorkflowsView {
             .child(content)
     }
 
-    /// Paint every lineage edge. The selected node's incoming edge is accent
-    /// colored; all others use the muted border token.
+    /// Paint every lineage edge and its child-end arrowhead. The selected
+    /// node's incoming edge is accent colored; all others use the muted border
+    /// token. Heads are filled and painted after the strokes so they sit on
+    /// top, and each matches the color of the line it terminates.
     fn edge_canvas(
         &self,
         theme: &Theme,
@@ -869,11 +876,7 @@ impl WorkflowsView {
                 let parent = layout.node(edge.parent)?;
                 let child = layout.node(edge.child)?;
                 Some((
-                    (
-                        parent.x + workflow::NODE_WIDTH,
-                        parent.y + workflow::NODE_HEIGHT / 2.0,
-                    ),
-                    (child.x, child.y + workflow::NODE_HEIGHT / 2.0),
+                    workflow::edge_geometry(parent, child),
                     selected == Some(edge.child),
                 ))
             })
@@ -888,31 +891,50 @@ impl WorkflowsView {
             move |_bounds, edges, window, _cx| {
                 let mut muted_path = PathBuilder::stroke(px(1.5));
                 let mut accent_path = PathBuilder::stroke(px(1.5));
+                let mut muted_head = PathBuilder::fill();
+                let mut accent_head = PathBuilder::fill();
                 let mut has_muted = false;
                 let mut has_accent = false;
-                for ((start_x, start_y), (end_x, end_y), highlighted) in edges {
-                    let path = if highlighted {
+                for (geometry, highlighted) in edges {
+                    let (path, head) = if highlighted {
                         has_accent = true;
-                        &mut accent_path
+                        (&mut accent_path, &mut accent_head)
                     } else {
                         has_muted = true;
-                        &mut muted_path
+                        (&mut muted_path, &mut muted_head)
                     };
-                    path.move_to(point(px(start_x), px(start_y)));
-                    // A short ease from the parent's right edge into the
-                    // child's left edge; the control point stays level with the
-                    // parent so the fork reads left to right.
-                    let control = point(px((start_x + end_x) / 2.0), px(start_y));
-                    path.curve_to(point(px(end_x), px(end_y)), control);
+                    path.move_to(point(px(geometry.start.0), px(geometry.start.1)));
+                    // A cubic with the first control point level with the
+                    // parent and the second level with the child: both ends
+                    // are horizontal, so the fork reads left to right and
+                    // the head points straight at the child.
+                    path.cubic_bezier_to(
+                        point(px(geometry.stroke_end.0), px(geometry.stroke_end.1)),
+                        point(px(geometry.control_start.0), px(geometry.control_start.1)),
+                        point(px(geometry.control_end.0), px(geometry.control_end.1)),
+                    );
+                    head.move_to(point(px(geometry.tip.0), px(geometry.tip.1)));
+                    head.line_to(point(px(geometry.base_top.0), px(geometry.base_top.1)));
+                    head.line_to(point(
+                        px(geometry.base_bottom.0),
+                        px(geometry.base_bottom.1),
+                    ));
+                    head.close();
                 }
                 if has_muted {
                     if let Ok(path) = muted_path.build() {
                         window.paint_path(path, muted);
                     }
+                    if let Ok(head) = muted_head.build() {
+                        window.paint_path(head, muted);
+                    }
                 }
                 if has_accent {
                     if let Ok(path) = accent_path.build() {
                         window.paint_path(path, accent);
+                    }
+                    if let Ok(head) = accent_head.build() {
+                        window.paint_path(head, accent);
                     }
                 }
             },

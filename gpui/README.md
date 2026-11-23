@@ -170,7 +170,10 @@ draws its task instances as a left-to-right DAG: every node carries its display
 name, status icon + label, `attempt n`/failure summary where applicable, a
 `root` chip for the root instance and a dashed `blocked` outline for a pending
 instance waiting on a `needs` predecessor. Edges follow each instance's
-`parent_id`; parentless and unknown-parent instances are graph roots. A directly
+`parent_id` and end in a filled arrowhead at the child card, so the parent →
+child direction is visible even on fan-out and multi-row edges; the selected
+node's incoming edge and its head turn accent. Parentless and unknown-parent
+instances are graph roots. A directly
 started run is its own root and carries a short explanation; when the snapshot
 has no roots at all the surface explains where roots come from instead of
 showing a blank panel.
@@ -515,6 +518,11 @@ Deviations from the plan are recorded in this file as the chain progresses
 - **Edges join through `tasks.list`.** `workflow.inspect` omits `parent_id`, so
   the parent edge is joined from the cached task rows. A fresh snapshot re-joins
   the open root locally instead of issuing another inspect RPC.
+- **Edges point at the child.** Each lineage edge is a horizontal-tangent cubic
+  that stops at a filled arrowhead whose tip touches the child card's left
+  edge. The head is muted with the stroke, or accent when the child is selected;
+  its geometry lives in a pure `edge_geometry` helper so it is unit-tested
+  without a window.
 - **DAG source, not Graphviz.** `workflow.get` is a catalog-wide DOT string, so
   it stays available as readable monospace source in a collapsed-by-default
   panel with a short spawn/needs/join legend, **Copy DOT** (no text selection in
