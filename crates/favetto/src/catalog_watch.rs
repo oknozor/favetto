@@ -324,6 +324,16 @@ mod tests {
         }
     }
 
+    /// Read one persisted schedule by id.
+    async fn stored_schedule(state: &Arc<State>, id: &str) -> favetto_core::model::Schedule {
+        crate::db::list_schedules(&state.db)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == id)
+            .expect("schedule should exist")
+    }
+
     #[tokio::test]
     async fn reloads_catalog_and_pushes_when_a_file_appears() {
         let dir = temp_dir("appears");
@@ -621,6 +631,122 @@ mod tests {
             Some("0 30 8 * * *")
         );
         assert!(scheduled.iter().any(|s| s.id == "manual"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn disabled_catalog_schedule_stays_disabled_across_reload_and_restart() {
+        let dir = temp_dir("disabled-schedule");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::write(
+            tasks_dir.join("a.md"),
+            "agent = \"x\"\nschedule = \"0 0 8 * * *\"\n---\nprompt\n",
+        )
+        .unwrap();
+
+        let state = test_state(&dir, &tasks_dir).await;
+        crate::scheduler::reconcile_catalog_schedules(&state)
+            .await
+            .unwrap();
+
+        let mut schedule = stored_schedule(&state, "catalog:a").await;
+        assert!(schedule.enabled);
+        assert!(crate::db::get_schedule_job_id(&state.db, "catalog:a")
+            .await
+            .unwrap()
+            .is_some());
+
+        // Disable it through the same path as the RPC/GPUI save.
+        schedule.enabled = false;
+        crate::scheduler::upsert(&state, &schedule).await.unwrap();
+        assert_eq!(
+            crate::db::get_schedule_job_id(&state.db, "catalog:a")
+                .await
+                .unwrap(),
+            None,
+            "disabling a schedule should clear its persisted job id"
+        );
+
+        // A catalog reload (triggered by touching any task file) must not
+        // re-enable the paused schedule.
+        std::fs::write(tasks_dir.join("b.md"), "agent = \"x\"\n---\nprompt\n").unwrap();
+        super::reload(&state).await;
+
+        let schedule = stored_schedule(&state, "catalog:a").await;
+        assert!(
+            !schedule.enabled,
+            "catalog reconcile should preserve the paused state"
+        );
+        assert_eq!(
+            crate::db::get_schedule_job_id(&state.db, "catalog:a")
+                .await
+                .unwrap(),
+            None
+        );
+
+        // The daemon startup path (`start` then reconcile) must preserve it too.
+        crate::scheduler::start(&state).await.unwrap();
+        crate::scheduler::reconcile_catalog_schedules(&state)
+            .await
+            .unwrap();
+
+        let schedule = stored_schedule(&state, "catalog:a").await;
+        assert!(!schedule.enabled);
+        assert_eq!(
+            crate::db::get_schedule_job_id(&state.db, "catalog:a")
+                .await
+                .unwrap(),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn editing_a_disabled_catalog_schedule_preserves_enabled_and_last_run() {
+        let dir = temp_dir("disabled-schedule-edit");
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::write(
+            tasks_dir.join("a.md"),
+            "agent = \"x\"\nschedule = \"0 0 8 * * *\"\n---\nprompt\n",
+        )
+        .unwrap();
+
+        let state = test_state(&dir, &tasks_dir).await;
+        crate::scheduler::reconcile_catalog_schedules(&state)
+            .await
+            .unwrap();
+
+        let last_run = chrono::DateTime::parse_from_rfc3339("2026-01-05T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut schedule = stored_schedule(&state, "catalog:a").await;
+        schedule.enabled = false;
+        schedule.last_run = Some(last_run);
+        crate::scheduler::upsert(&state, &schedule).await.unwrap();
+
+        // Editing the task header updates the cron but keeps the user's paused
+        // state and the last fire timestamp.
+        std::fs::write(
+            tasks_dir.join("a.md"),
+            "agent = \"x\"\nschedule = \"0 30 8 * * *\"\n---\nprompt\n",
+        )
+        .unwrap();
+        super::reload(&state).await;
+
+        let schedule = stored_schedule(&state, "catalog:a").await;
+        assert_eq!(schedule.cron, "0 30 8 * * *");
+        assert!(!schedule.enabled);
+        assert_eq!(schedule.last_run, Some(last_run));
+        assert_eq!(
+            crate::db::get_schedule_job_id(&state.db, "catalog:a")
+                .await
+                .unwrap(),
+            None
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
