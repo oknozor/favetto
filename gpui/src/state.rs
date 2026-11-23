@@ -474,10 +474,10 @@ impl ClientState {
                             .as_ref()
                             .and_then(|detail| detail.task.as_ref())
                             .is_some_and(|existing| existing.attempt != task.attempt);
-                        self.upsert_task(task.clone());
+                        self.upsert_task(task.as_ref().clone());
                         if open {
                             if let Some(detail) = &mut self.detail {
-                                detail.update_summary(task.clone());
+                                detail.update_summary(task.as_ref().clone());
                             }
                             // A finished run persists its output and final
                             // attempt row, and a retry starts a fresh feed;

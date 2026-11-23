@@ -288,6 +288,11 @@ fn trimmed(value: f64) -> String {
 }
 
 /// A cost/token summary for the header and the Runs table, when known.
+///
+/// Unknown values are omitted rather than fabricated: a run with tokens but no
+/// reported cost shows the token totals, and a context-only `usage_update` shows
+/// its context window even when it also reported `$0`. A genuine reported zero
+/// is still rendered as `$0.0000`.
 pub fn usage_summary(usage: Option<&AgentUsage>) -> Option<String> {
     let usage = usage?;
     let mut parts = Vec::new();
@@ -301,20 +306,19 @@ pub fn usage_summary(usage: Option<&AgentUsage>) -> Option<String> {
     let tokens = usage.total_tokens();
     if tokens > 0 {
         parts.push(format_tokens(tokens));
-    }
-    if parts.is_empty() {
-        if let Some(used) = usage.context_used {
-            let size = usage
-                .context_size
-                .map(|size| format!("/{}", format_tokens(size).replace(" tok", "")))
-                .unwrap_or_default();
-            parts.push(format!(
-                "ctx {}{size}",
-                format_tokens(used).replace(" tok", "")
-            ));
-        }
+    } else if let Some(used) = usage.context_used {
+        parts.push(format_context(used, usage.context_size));
     }
     (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// The compact `ctx used/size` label for context-only usage.
+pub fn format_context(used: u64, size: Option<u64>) -> String {
+    let used = format_tokens(used).replace(" tok", "");
+    match size {
+        Some(size) => format!("ctx {used}/{}", format_tokens(size).replace(" tok", "")),
+        None => format!("ctx {used}"),
+    }
 }
 
 /// How a tool call renders in the feed.
@@ -1652,6 +1656,7 @@ mod tests {
             agent: None,
             provider: None,
             model: None,
+            latest_usage: None,
         }
     }
 
@@ -1828,6 +1833,38 @@ mod tests {
         };
         let summary = usage_summary(Some(&credits)).expect("summary");
         assert!(summary.contains("2.5000 credits"));
+        assert!(!summary.contains('$'));
+
+        // Tokens without a cost show the tokens and never a fabricated `$0`.
+        let tokens_only = AgentUsage {
+            input_tokens: 900,
+            output_tokens: 100,
+            ..Default::default()
+        };
+        let summary = usage_summary(Some(&tokens_only)).expect("summary");
+        assert!(summary.contains("1k tok"));
+        assert!(!summary.contains('$'));
+
+        // Context-only usage renders as context even when a zero cost is also
+        // reported; a reported zero is still zero, not unknown.
+        let context_only = AgentUsage {
+            context_used: Some(53_000),
+            context_size: Some(200_000),
+            cost: Some(favetto_wire::model::AgentCost::usd(0.0)),
+            ..Default::default()
+        };
+        let summary = usage_summary(Some(&context_only)).expect("summary");
+        assert!(summary.contains("$0.0000"));
+        assert!(summary.contains("ctx 53k/200k"));
+        assert_eq!(format_context(53_000, Some(200_000)), "ctx 53k/200k");
+        assert_eq!(format_context(53_000, None), "ctx 53k");
+
+        let unknown = AgentUsage {
+            context_used: Some(53_000),
+            ..Default::default()
+        };
+        let summary = usage_summary(Some(&unknown)).expect("summary");
+        assert!(summary.contains("ctx 53k"));
         assert!(!summary.contains('$'));
     }
 

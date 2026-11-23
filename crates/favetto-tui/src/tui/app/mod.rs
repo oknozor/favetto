@@ -2916,7 +2916,16 @@ impl App {
             .or_else(|| stored.and_then(|(a, _)| a.as_ref()));
         let usage = live
             .and_then(|s| s.usage.as_ref())
-            .or_else(|| stored.and_then(|(_, u)| u.as_ref()));
+            .or_else(|| stored.and_then(|(_, u)| u.as_ref()))
+            // A finished run keeps its usage on the task row, so the table still
+            // shows it after the live session leaves the registry or the daemon
+            // restarts.
+            .or_else(|| {
+                self.tasks
+                    .iter()
+                    .find(|task| task.id.to_string() == task_id)
+                    .and_then(|task| task.latest_usage.as_ref())
+            });
         (activity, usage)
     }
 
@@ -4030,15 +4039,27 @@ pub fn activity_cell(activity: Option<&AgentActivity>) -> String {
         .unwrap_or_else(|| "—".to_string())
 }
 
-/// Token cell value: `input/output tok`, or an em dash when nothing was reported.
+/// Token cell value: `input/output tok` when billable counters were reported,
+/// otherwise `ctx used/size` for context-only usage, or an em dash when nothing
+/// was reported. A context snapshot must never render as `0/0 tok`.
 pub fn token_cell(usage: Option<&AgentUsage>) -> String {
     match usage {
-        Some(u) if !u.is_empty() => format!(
+        Some(u) if u.total_tokens() > 0 => format!(
             "{}/{} tok",
             format_tokens(u.input_tokens),
             format_tokens(u.output_tokens)
         ),
-        _ => "—".to_string(),
+        Some(u) => match u.context_used {
+            Some(used) => {
+                let size = u
+                    .context_size
+                    .map(|size| format!("/{}", format_tokens(size)))
+                    .unwrap_or_default();
+                format!("ctx {}{size}", format_tokens(used))
+            }
+            None => "—".to_string(),
+        },
+        None => "—".to_string(),
     }
 }
 
@@ -4052,13 +4073,16 @@ pub fn cost_cell(usage: Option<&AgentUsage>) -> String {
 }
 
 fn format_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
+    let rendered = if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
     } else if n >= 1_000 {
         format!("{:.1}k", n as f64 / 1_000.0)
     } else {
         n.to_string()
-    }
+    };
+    // Keep whole thousands/millions compact (`53k`, not `53.0k`), matching the
+    // GPUI client's formatting.
+    rendered.replace(".0", "")
 }
 
 /// Derive the sound cue for an event, if any.

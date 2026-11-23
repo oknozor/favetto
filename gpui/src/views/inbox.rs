@@ -535,14 +535,12 @@ impl InboxView {
                     .text_color(theme.colors.muted)
                     .child(inbox::format_duration(row.duration)),
             )
-            .when_some(cost, |line, cost| {
-                line.child(
-                    div()
-                        .text_size(px(theme.font.xs))
-                        .text_color(theme.colors.muted)
-                        .child(cost),
-                )
-            })
+            .child(
+                div()
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.muted)
+                    .child(cost.unwrap_or_else(|| "—".to_string())),
+            )
             .on_click(cx.listener(move |this, _event, _window, cx| {
                 this.state.update(cx, |state, cx| {
                     state.select_inbox_row(InboxKey::Task(task_id));

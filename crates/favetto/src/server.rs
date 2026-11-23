@@ -1924,6 +1924,7 @@ async fn start_oneshot_task(
         agent: None,
         provider: None,
         model: None,
+        latest_usage: None,
     };
     db::insert_task(&state.db, &task).await?;
     state.metrics.inc_tasks();

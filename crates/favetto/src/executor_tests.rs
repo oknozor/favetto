@@ -199,6 +199,7 @@ fn render_context_exposes_task_input_and_prev() {
         agent: None,
         provider: None,
         model: None,
+        latest_usage: None,
     };
     let ctx = render_context(&task);
     assert_eq!(crate::template::render("{{ task.name }}", &ctx), "triage");
@@ -228,6 +229,7 @@ fn task_with_session(session_id: Option<&str>, session_title: Option<&str>) -> T
         agent: None,
         provider: None,
         model: None,
+        latest_usage: None,
     }
 }
 
@@ -743,6 +745,7 @@ async fn build_task_output_bounds_every_shape() {
         agent: None,
         provider: None,
         model: None,
+        latest_usage: None,
     };
     crate::db::upsert_task(&pool, &task).await.unwrap();
     let stored = crate::db::get_task(&pool, task.id)
@@ -987,6 +990,7 @@ fn branch_name_slugifies_folder_qualified_task() {
         agent: None,
         provider: None,
         model: None,
+        latest_usage: None,
     };
     let short = &task.id.to_string()[..8];
     assert_eq!(
@@ -1583,6 +1587,7 @@ fn lineage_task(name: &str, status: TaskStatus, root: Option<Uuid>, parent: Opti
         agent: None,
         provider: None,
         model: None,
+        latest_usage: None,
     }
 }
 

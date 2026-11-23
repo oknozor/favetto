@@ -161,6 +161,7 @@ Fetch a single task by id, including its stored output.
 | `agent` | string (optional) | — | no | Optional per-launch agent override. A manual launch can run the task with a different configured agent than the catalog definition pins. The executor resolves it before the definition's `agent` and the global `[agent].default`. Absent for tasks that use the definition default. |
 | `provider` | string (optional) | — | no | Optional per-launch model provider override. Resolved atomically with [`Self::model`]: an override of either field never mixes with the definition's provider/model pair. |
 | `model` | string (optional) | — | no | Optional per-launch model id override (a bare id or `provider/model`). Absent for tasks that use the definition's or the agent's default model. |
+| `latest_usage` | AgentUsage (optional) | — | no | Usage reported by the task's current attempt, hydrated from its run row by `tasks.list` / `tasks.get`. It lets a finished task keep showing its token/cost totals after the live agent session leaves the registry (and after a daemon restart). Absent while the attempt has reported nothing or for payloads written before the field existed. |
 
 ### `tasks.runs`
 
@@ -248,6 +249,7 @@ Cancel a task.
 | `agent` | string (optional) | — | no | Optional per-launch agent override. A manual launch can run the task with a different configured agent than the catalog definition pins. The executor resolves it before the definition's `agent` and the global `[agent].default`. Absent for tasks that use the definition default. |
 | `provider` | string (optional) | — | no | Optional per-launch model provider override. Resolved atomically with [`Self::model`]: an override of either field never mixes with the definition's provider/model pair. |
 | `model` | string (optional) | — | no | Optional per-launch model id override (a bare id or `provider/model`). Absent for tasks that use the definition's or the agent's default model. |
+| `latest_usage` | AgentUsage (optional) | — | no | Usage reported by the task's current attempt, hydrated from its run row by `tasks.list` / `tasks.get`. It lets a finished task keep showing its token/cost totals after the live agent session leaves the registry (and after a daemon restart). Absent while the attempt has reported nothing or for payloads written before the field existed. |
 
 ### `tasks.retry`
 
@@ -283,6 +285,7 @@ Retry a terminal task, preserving its prior run history.
 | `agent` | string (optional) | — | no | Optional per-launch agent override. A manual launch can run the task with a different configured agent than the catalog definition pins. The executor resolves it before the definition's `agent` and the global `[agent].default`. Absent for tasks that use the definition default. |
 | `provider` | string (optional) | — | no | Optional per-launch model provider override. Resolved atomically with [`Self::model`]: an override of either field never mixes with the definition's provider/model pair. |
 | `model` | string (optional) | — | no | Optional per-launch model id override (a bare id or `provider/model`). Absent for tasks that use the definition's or the agent's default model. |
+| `latest_usage` | AgentUsage (optional) | — | no | Usage reported by the task's current attempt, hydrated from its run row by `tasks.list` / `tasks.get`. It lets a finished task keep showing its token/cost totals after the live agent session leaves the registry (and after a daemon restart). Absent while the attempt has reported nothing or for payloads written before the field existed. |
 
 ### `tasks.start`
 
@@ -323,6 +326,7 @@ Start a catalog task by name.
 | `agent` | string (optional) | — | no | Optional per-launch agent override. A manual launch can run the task with a different configured agent than the catalog definition pins. The executor resolves it before the definition's `agent` and the global `[agent].default`. Absent for tasks that use the definition default. |
 | `provider` | string (optional) | — | no | Optional per-launch model provider override. Resolved atomically with [`Self::model`]: an override of either field never mixes with the definition's provider/model pair. |
 | `model` | string (optional) | — | no | Optional per-launch model id override (a bare id or `provider/model`). Absent for tasks that use the definition's or the agent's default model. |
+| `latest_usage` | AgentUsage (optional) | — | no | Usage reported by the task's current attempt, hydrated from its run row by `tasks.list` / `tasks.get`. It lets a finished task keep showing its token/cost totals after the live agent session leaves the registry (and after a daemon restart). Absent while the attempt has reported nothing or for payloads written before the field existed. |
 
 ### `tasks.start_oneshot`
 
@@ -522,6 +526,7 @@ Add one runtime task to an existing workflow root, optionally depending on exist
 | `agent` | string (optional) | — | no | Optional per-launch agent override. A manual launch can run the task with a different configured agent than the catalog definition pins. The executor resolves it before the definition's `agent` and the global `[agent].default`. Absent for tasks that use the definition default. |
 | `provider` | string (optional) | — | no | Optional per-launch model provider override. Resolved atomically with [`Self::model`]: an override of either field never mixes with the definition's provider/model pair. |
 | `model` | string (optional) | — | no | Optional per-launch model id override (a bare id or `provider/model`). Absent for tasks that use the definition's or the agent's default model. |
+| `latest_usage` | AgentUsage (optional) | — | no | Usage reported by the task's current attempt, hydrated from its run row by `tasks.list` / `tasks.get`. It lets a finished task keep showing its token/cost totals after the live agent session leaves the registry (and after a daemon restart). Absent while the attempt has reported nothing or for payloads written before the field existed. |
 
 ### `workflow.cancel`
 
@@ -574,6 +579,7 @@ Retry a terminal task, preserving its prior run history. Single-task alias of `t
 | `agent` | string (optional) | — | no | Optional per-launch agent override. A manual launch can run the task with a different configured agent than the catalog definition pins. The executor resolves it before the definition's `agent` and the global `[agent].default`. Absent for tasks that use the definition default. |
 | `provider` | string (optional) | — | no | Optional per-launch model provider override. Resolved atomically with [`Self::model`]: an override of either field never mixes with the definition's provider/model pair. |
 | `model` | string (optional) | — | no | Optional per-launch model id override (a bare id or `provider/model`). Absent for tasks that use the definition's or the agent's default model. |
+| `latest_usage` | AgentUsage (optional) | — | no | Usage reported by the task's current attempt, hydrated from its run row by `tasks.list` / `tasks.get`. It lets a finished task keep showing its token/cost totals after the live agent session leaves the registry (and after a daemon restart). Absent while the attempt has reported nothing or for payloads written before the field existed. |
 
 ### `events.tail`
 
@@ -1210,6 +1216,7 @@ A task row changed.
 | `agent` | string (optional) | — | no | Optional per-launch agent override. A manual launch can run the task with a different configured agent than the catalog definition pins. The executor resolves it before the definition's `agent` and the global `[agent].default`. Absent for tasks that use the definition default. |
 | `provider` | string (optional) | — | no | Optional per-launch model provider override. Resolved atomically with [`Self::model`]: an override of either field never mixes with the definition's provider/model pair. |
 | `model` | string (optional) | — | no | Optional per-launch model id override (a bare id or `provider/model`). Absent for tasks that use the definition's or the agent's default model. |
+| `latest_usage` | AgentUsage (optional) | — | no | Usage reported by the task's current attempt, hydrated from its run row by `tasks.list` / `tasks.get`. It lets a finished task keep showing its token/cost totals after the live agent session leaves the registry (and after a daemon restart). Absent while the attempt has reported nothing or for payloads written before the field existed. |
 
 ### `catalog.updated`
 

@@ -608,16 +608,18 @@ fn run_prompt<B: BufRead>(
             }
         }
         if cancelled {
-            respond(stdout, id, json!({ "stopReason": "cancelled" }));
+            respond(stdout, id, prompt_response("cancelled"));
         } else {
             emit_echo(stdout, session_id, message, selected_model);
-            respond(stdout, id, json!({ "stopReason": "end_turn" }));
+            emit_final_usage(stdout, session_id);
+            respond(stdout, id, prompt_response("end_turn"));
         }
         return;
     }
 
     emit_echo(stdout, session_id, message, selected_model);
-    respond(stdout, id, json!({ "stopReason": "end_turn" }));
+    emit_final_usage(stdout, session_id);
+    respond(stdout, id, prompt_response("end_turn"));
 }
 
 /// Send one `elicitation/create` and record the client's ACP response.
@@ -893,6 +895,42 @@ fn prompt_text(message: &Value) -> String {
                 .join("")
         })
         .unwrap_or_default()
+}
+
+/// A prompt response, optionally carrying the token usage configured through
+/// `FAKE_ACP_PROMPT_USAGE` (raw ACP `usage` object).
+fn prompt_response(stop_reason: &str) -> Value {
+    let mut response = json!({ "stopReason": stop_reason });
+    if let Ok(raw) = std::env::var("FAKE_ACP_PROMPT_USAGE") {
+        if let Ok(usage) = serde_json::from_str::<Value>(&raw) {
+            response["usage"] = usage;
+        }
+    }
+    response
+}
+
+/// Emit `FAKE_ACP_USAGE_UPDATE` immediately before the prompt response, so a
+/// test can prove a final context snapshot is not lost to the exit race.
+fn emit_final_usage(stdout: &mut std::io::Stdout, session_id: &str) {
+    let Ok(raw) = std::env::var("FAKE_ACP_USAGE_UPDATE") else {
+        return;
+    };
+    let Ok(update) = serde_json::from_str::<Value>(&raw) else {
+        return;
+    };
+    let mut payload = json!({
+        "sessionId": session_id,
+        "update": { "sessionUpdate": "usage_update" }
+    });
+    if let (Some(target), Some(fields)) = (
+        payload.get_mut("update").and_then(Value::as_object_mut),
+        update.as_object(),
+    ) {
+        for (key, value) in fields {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    notify(stdout, payload);
 }
 
 fn respond(stdout: &mut std::io::Stdout, id: Option<Value>, result: Value) {

@@ -1023,6 +1023,7 @@ fn oneshot_task() -> Task {
         agent: None,
         provider: None,
         model: None,
+        latest_usage: None,
     }
 }
 
@@ -1409,6 +1410,7 @@ async fn agents_start_rejects_an_action_task() {
         agent: None,
         provider: None,
         model: None,
+        latest_usage: None,
     };
     db::insert_task(&state.db, &task).await.unwrap();
 
@@ -1615,6 +1617,7 @@ async fn tasks_list_omits_output_and_honours_limit_and_get_returns_it() {
         agent: None,
         provider: None,
         model: None,
+        latest_usage: None,
     };
     let first = make("one");
     let second = make("two");
@@ -1710,6 +1713,7 @@ async fn tasks_runs_returns_history_oldest_first() {
         agent: None,
         provider: None,
         model: None,
+        latest_usage: None,
     };
     db::upsert_task(&state.db, &task).await.unwrap();
 
@@ -1806,6 +1810,7 @@ async fn tasks_retry_requeues_terminal_tasks_and_rejects_live_runs() {
         agent: None,
         provider: None,
         model: None,
+        latest_usage: None,
     };
     let run = |task_id: Uuid, attempt: u32, status: RunStatus| TaskRun {
         id: Uuid::new_v4(),

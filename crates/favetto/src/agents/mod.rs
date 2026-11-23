@@ -312,10 +312,14 @@ impl AgentLiveState {
             AgentStateEvent::Idle { .. } => {
                 self.activity = Some(AgentActivity::Idle);
             }
-            AgentStateEvent::Usage { usage, snapshot } => match self.usage.as_mut() {
-                Some(live) if !snapshot => live.merge(usage),
-                _ => self.usage = Some(usage.clone()),
-            },
+            AgentStateEvent::Usage { usage, snapshot } => {
+                let live = self.usage.get_or_insert_with(AgentUsage::default);
+                if *snapshot {
+                    live.apply_snapshot(usage);
+                } else {
+                    live.merge(usage);
+                }
+            }
             AgentStateEvent::Plan { entries } => self.plan = entries.clone(),
             AgentStateEvent::AvailableCommands { commands } => self.commands = commands.clone(),
             AgentStateEvent::ConfigOptions { options } => self.config_options = options.clone(),
@@ -2094,8 +2098,16 @@ mod live_state_tests {
     use favetto_core::model::AgentCost;
 
     #[test]
-    fn cumulative_usage_snapshots_replace_instead_of_accumulating() {
+    fn cumulative_usage_snapshots_replace_cost_without_erasing_tokens() {
         let mut live = AgentLiveState::default();
+        live.apply(&AgentStateEvent::Usage {
+            usage: AgentUsage {
+                input_tokens: 120,
+                output_tokens: 30,
+                ..Default::default()
+            },
+            snapshot: false,
+        });
         live.apply(&AgentStateEvent::Usage {
             usage: AgentUsage {
                 context_used: Some(1_000),
@@ -2116,6 +2128,8 @@ mod live_state_tests {
         });
 
         let usage = live.usage.expect("usage");
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 30);
         assert_eq!(usage.context_used, Some(2_000));
         assert_eq!(usage.reported_cost(), Some(AgentCost::new(0.02, "credits")));
     }

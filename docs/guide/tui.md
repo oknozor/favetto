@@ -347,11 +347,18 @@ terminal/cron events that do not carry a name.
 ## Usage panel
 
 The **Usage** tab shows where tokens and money went. Each finished attempt
-persists its `AgentUsage` (input/output/reasoning/cache tokens and cost) in flat
-columns on its run row, independent of the `tasks.output` blob, so the data
-survives the retention pass that clears old output. The panel calls the typed
-`usage.stats` RPC, which aggregates finished runs into a fixed number of time
-buckets plus window totals (runs, tokens, cost).
+persists its `AgentUsage` (input/output/reasoning/cache tokens, cost, and the
+model context window when the agent reports one) in flat columns on its run row,
+independent of the `tasks.output` blob, so the data survives the retention pass
+that clears old output. Token totals come from the ACP `session/prompt`
+response; a context-only `usage_update` keeps `context_used`/`context_size` and
+never fabricates zero token counters. The panel calls the typed `usage.stats`
+RPC, which aggregates finished runs into a fixed number of time buckets plus
+window totals (runs, tokens, cost).
+
+Cost is only shown when an agent reported one. A reported `$0.0000` is a genuine
+free run; when no run in the window reported a cost the total and its bars show
+`—` (unknown), not `$0`.
 
 Press **1**–**4** to pick the period; the panel re-fetches and the charts and
 labels update:

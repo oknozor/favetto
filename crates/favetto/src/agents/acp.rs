@@ -45,7 +45,7 @@ use agent_client_protocol::v1::schema::{
     SetSessionConfigOptionRequest, SetSessionModeRequest, StringFormat, TextContent,
     ToolCall as AcpToolCall, ToolCallContent as AcpToolCallContent,
     ToolCallLocation as AcpToolCallLocation, ToolCallStatus as AcpToolCallStatus,
-    ToolCallUpdateFields as AcpToolCallUpdateFields, ToolKind as AcpToolKind,
+    ToolCallUpdateFields as AcpToolCallUpdateFields, ToolKind as AcpToolKind, Usage as AcpUsage,
 };
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::{Agent, Client, Lines};
@@ -744,7 +744,6 @@ pub(crate) fn spawn(
     let setup_deadline = launch.setup_timeout;
     let close_after_turn = launch.close_after_turn;
     let cwd = launch.cwd.clone();
-    let running_task = running.clone();
     let exit_task = exit_code.clone();
     let terminated = Arc::new(AtomicBool::new(false));
     let terminated_task = terminated.clone();
@@ -1673,6 +1672,18 @@ pub(crate) fn spawn(
                                     state.stop_reason = Some(reason.clone());
                                     state.finished = true;
                                 }
+                                // Emit the prompt-response usage before `Idle`:
+                                // the state task folds events in order, so the
+                                // durable summary and live snapshot both carry it
+                                // before a waiter observes the turn boundary.
+                                if let Some(usage) = response.usage.as_ref() {
+                                    let _ = events_tx.send(AcpEvent::State(
+                                        AgentStateEvent::Usage {
+                                            usage: prompt_usage(usage),
+                                            snapshot: false,
+                                        },
+                                    ));
+                                }
                                 (Some(reason), idle)
                             }
                             Err(error) => {
@@ -1775,10 +1786,11 @@ pub(crate) fn spawn(
                 );
             }
         }
-        running_task.store(false, Ordering::SeqCst);
-        // Publish the terminal live state before waking the reaper. The
-        // manager folds it into the session snapshot and forwards the exit
-        // event, so a client never sees a stopped session stuck in Starting.
+        // Do not clear `running` here: the state task clears it only after it
+        // has folded every queued `State` event (including a final
+        // `usage_update`) and processed this exit marker. Clearing it first
+        // would let a waiter read the outcome and live usage before the last
+        // usage event reached them.
         let code = exit_task.load(Ordering::SeqCst);
         if !terminated_task.swap(true, Ordering::SeqCst) {
             let _ = result_events.send(AcpEvent::Exited {
@@ -2859,6 +2871,24 @@ fn tool_name(detail: &ToolCallDetail) -> String {
         .unwrap_or_else(|| "tool".to_string())
 }
 
+/// Map a `session/prompt` response's token totals into normalized usage.
+///
+/// ACP v1 documents these counters as cumulative for the session, while the
+/// shipped `opencode` adapter returns the usage of the turn that just finished.
+/// Headless task runs submit exactly one prompt, so emitting the value as an
+/// incremental step is correct for both. Multi-turn interactive sessions with a
+/// cumulative adapter are a documented follow-up.
+fn prompt_usage(usage: &AcpUsage) -> favetto_core::model::AgentUsage {
+    favetto_core::model::AgentUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        reasoning_tokens: usage.thought_tokens.unwrap_or(0),
+        cache_read_tokens: usage.cached_read_tokens.unwrap_or(0),
+        cache_write_tokens: usage.cached_write_tokens.unwrap_or(0),
+        ..Default::default()
+    }
+}
+
 /// Fold one update into the transcript/outcome and queue its normalized events.
 fn emit_update(
     update: &SessionUpdate,
@@ -3515,6 +3545,23 @@ mod tests {
             }
             other => panic!("expected usage snapshots, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn prompt_response_usage_maps_every_token_class() {
+        let usage = AcpUsage::new(155, 120, 30)
+            .thought_tokens(5)
+            .cached_read_tokens(4)
+            .cached_write_tokens(2);
+        let mapped = prompt_usage(&usage);
+        assert_eq!(mapped.input_tokens, 120);
+        assert_eq!(mapped.output_tokens, 30);
+        assert_eq!(mapped.reasoning_tokens, 5);
+        assert_eq!(mapped.cache_read_tokens, 4);
+        assert_eq!(mapped.cache_write_tokens, 2);
+        // The prompt response never fabricates a cost or a context window.
+        assert_eq!(mapped.reported_cost(), None);
+        assert_eq!(mapped.context_used, None);
     }
 
     #[test]

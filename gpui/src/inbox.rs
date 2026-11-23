@@ -423,7 +423,18 @@ pub fn build(
             name: task_display_name(&task.name).to_string(),
             repo: task_repo(&task.name).map(str::to_string),
             duration: task_duration(task, now),
-            cost: costs.get(task.id.to_string().as_str()).cloned(),
+            // A live session wins; a finished run falls back to the usage
+            // persisted on its latest attempt so the row keeps its cost after
+            // the session leaves the registry.
+            cost: costs
+                .get(task.id.to_string().as_str())
+                .cloned()
+                .or_else(|| {
+                    task.latest_usage
+                        .as_ref()
+                        .and_then(|usage| usage.reported_cost())
+                        .filter(|cost| cost.amount.is_finite())
+                }),
             created_at: task.created_at,
         })
         .collect();
@@ -556,6 +567,7 @@ mod tests {
             agent: None,
             provider: None,
             model: None,
+            latest_usage: None,
         }
     }
 
@@ -880,6 +892,23 @@ mod tests {
         assert_eq!(row.name, "costly");
         assert_eq!(row.duration, Some(Duration::from_secs(7 * 60)));
         assert_eq!(format_cost(row.cost.as_ref()).as_deref(), Some("$0.0123"));
+    }
+
+    #[test]
+    fn recent_cost_falls_back_to_the_task_usage_after_the_session_closes() {
+        let now = at(0);
+        let mut done = task(8, "repo:favetto/finished", TaskStatus::Succeeded, at(-10));
+        done.finished_at = Some(at(-2));
+        done.latest_usage = Some(AgentUsage {
+            input_tokens: 40,
+            output_tokens: 8,
+            cost_usd: Some(0.0312),
+            ..AgentUsage::default()
+        });
+
+        let rows = build(&[done], &[], None, now);
+        let row = rows.recent.first().expect("recent row");
+        assert_eq!(format_cost(row.cost.as_ref()).as_deref(), Some("$0.0312"));
     }
 
     #[test]

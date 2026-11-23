@@ -213,6 +213,7 @@ mod tests {
             agent: None,
             provider: None,
             model: None,
+            latest_usage: None,
         };
         let n = ServerPush::TaskUpdated(Box::new(task))
             .into_notification()
@@ -253,6 +254,7 @@ mod tests {
                 agent: None,
                 provider: None,
                 model: None,
+                latest_usage: None,
             }))
             .event_id(),
             None

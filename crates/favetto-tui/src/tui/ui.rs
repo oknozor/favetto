@@ -2622,11 +2622,13 @@ fn short_tokens(tokens: u64) -> String {
     }
 }
 
-/// Format a cost for a bar label, keeping sub-cent precision.
+/// Format a cost for a bar label, keeping sub-cent precision. `None` means no run
+/// in the bucket reported a cost and must stay visually distinct from a reported
+/// zero, which renders as `$0.0000`.
 fn format_cost(cost: Option<f64>) -> String {
     match cost {
-        Some(cost) if cost.is_finite() && cost > 0.0 => format!("${cost:.4}"),
-        _ => "$0".to_string(),
+        Some(cost) if cost.is_finite() => format!("${cost:.4}"),
+        _ => "—".to_string(),
     }
 }
 

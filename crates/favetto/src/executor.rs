@@ -529,6 +529,7 @@ async fn enqueue_with_id(
         agent: overrides.agent,
         provider: overrides.provider,
         model: overrides.model,
+        latest_usage: None,
     };
     db::insert_task(&state.db, &task).await?;
     state.metrics.inc_tasks();
@@ -761,6 +762,9 @@ async fn run_one(
     let usage = outcome.as_ref().ok().and_then(|run| run.usage.clone());
     let success = record_run_outcome(&mut task, outcome);
     task.finished_at = Some(Utc::now());
+    // The terminal snapshot pushed to attached clients keeps the run's usage,
+    // so a finished row does not lose its cost until the next full refresh.
+    task.latest_usage = usage.clone();
 
     // Compare-and-set the terminal outcome: only write while the task is still
     // active. A `tasks.cancel`/`workflow.cancel` that landed while the agent ran
@@ -1406,6 +1410,7 @@ async fn record_spawn_failure(
         agent: None,
         provider: None,
         model: None,
+        latest_usage: None,
     };
     if let Err(e) = db::insert_task(&state.db, &task).await {
         tracing::warn!(

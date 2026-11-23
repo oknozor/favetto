@@ -1,6 +1,7 @@
 use super::*;
 use chrono::Utc;
 use favetto_core::model::{Event, Failure, FailureKind, RunStatus, TaskRun};
+use sqlx::Row;
 
 #[tokio::test]
 async fn event_replay_resumes_from_cursor() {
@@ -102,6 +103,7 @@ async fn task_session_id_round_trips() {
         agent: None,
         provider: None,
         model: None,
+        latest_usage: None,
     };
     upsert_task(&pool, &task).await.unwrap();
     let got = get_task(&pool, task.id).await.unwrap().unwrap();
@@ -272,6 +274,7 @@ async fn migrate_adds_session_title_to_legacy_database() {
         agent: None,
         provider: None,
         model: None,
+        latest_usage: None,
     };
     upsert_task(&pool, &task).await.unwrap();
     let got = get_task(&pool, task.id).await.unwrap().unwrap();
@@ -321,6 +324,7 @@ fn task_at(
         agent: None,
         provider: None,
         model: None,
+        latest_usage: None,
     }
 }
 
@@ -1612,6 +1616,118 @@ async fn usage_stats_buckets_by_hour_and_sums_cost_and_runs() {
     // A gap hour is present, zeroed.
     assert_eq!(stats.buckets[21].runs, 0);
     assert_eq!(stats.buckets[21].total_tokens(), 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn context_only_usage_persists_context_and_nulls_token_columns() {
+    let (dir, pool) = scratch_pool("usage-context-only").await;
+    let now = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+    let mut task = task_at(now, Some(now), None);
+    upsert_task(&pool, &task).await.unwrap();
+
+    let run = TaskRun {
+        status: RunStatus::Succeeded,
+        finished_at: Some(now),
+        usage: Some(AgentUsage {
+            context_used: Some(53_000),
+            context_size: Some(200_000),
+            ..Default::default()
+        }),
+        ..run_at(task.id, 1)
+    };
+    task.attempt = 1;
+    upsert_task(&pool, &task).await.unwrap();
+    insert_task_run(&pool, &run).await.unwrap();
+
+    let row = sqlx::query(
+        "SELECT input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, \
+                cache_write_tokens, context_used, context_size \
+         FROM task_runs WHERE id = ?",
+    )
+    .bind(run.id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    for column in [
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+    ] {
+        assert!(
+            row.try_get::<Option<i64>, _>(column).unwrap().is_none(),
+            "{column} must stay NULL for context-only usage"
+        );
+    }
+    assert_eq!(row.get::<Option<i64>, _>("context_used"), Some(53_000));
+    assert_eq!(row.get::<Option<i64>, _>("context_size"), Some(200_000));
+
+    let listed = list_task_runs(&pool, task.id).await.unwrap();
+    let usage = listed[0].usage.as_ref().expect("context usage persisted");
+    assert_eq!(usage.context_used, Some(53_000));
+    assert_eq!(usage.context_size, Some(200_000));
+    assert!(!usage.has_token_counts());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn task_rows_expose_the_current_attempt_usage() {
+    let (dir, pool) = scratch_pool("task-latest-usage").await;
+    let now = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+    let mut task = task_at(now, Some(now), None);
+    task.attempt = 2;
+    upsert_task(&pool, &task).await.unwrap();
+
+    // An older attempt must not win over the current one.
+    insert_finished_run(&pool, task.id, now, Some(tokens(1, 0, Some(0.01)))).await;
+    let current = TaskRun {
+        status: RunStatus::Succeeded,
+        attempt: 2,
+        finished_at: Some(now),
+        usage: Some(tokens(7, 3, Some(0.02))),
+        ..run_at(task.id, 2)
+    };
+    insert_task_run(&pool, &current).await.unwrap();
+
+    let got = get_task(&pool, task.id).await.unwrap().unwrap();
+    let usage = got.latest_usage.expect("current attempt usage");
+    assert_eq!(usage.input_tokens, 7);
+    assert_eq!(usage.output_tokens, 3);
+    assert_eq!(usage.reported_cost(), Some(AgentCost::usd(0.02)));
+
+    let listed = list_tasks(&pool, 10).await.unwrap();
+    assert_eq!(
+        listed[0].latest_usage.as_ref().map(|u| u.input_tokens),
+        Some(7)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn usage_stats_keep_unknown_cost_distinct_from_a_reported_zero() {
+    let (dir, pool) = scratch_pool("usage-cost-zero").await;
+    let now = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+    let task = Uuid::new_v4();
+
+    // No cost reported anywhere in the window: the total is unknown.
+    insert_finished_run(&pool, task, now, Some(tokens(3, 1, None))).await;
+    let stats = usage_stats(&pool, UsagePeriod::Day, now).await.unwrap();
+    assert_eq!(stats.totals.usage.cost_usd, None);
+    assert_eq!(stats.totals.usage.reported_cost(), None);
+
+    // A genuine reported zero is preserved as `Some(0.0)`.
+    insert_finished_run(&pool, task, now, Some(tokens(1, 0, Some(0.0)))).await;
+    let stats = usage_stats(&pool, UsagePeriod::Day, now).await.unwrap();
+    assert_eq!(stats.totals.usage.cost_usd, Some(0.0));
+    assert_eq!(
+        stats.totals.usage.reported_cost(),
+        Some(AgentCost::usd(0.0))
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
