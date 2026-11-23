@@ -51,7 +51,7 @@ At the time of the run `repos.list` reported active repo `favetto`, while
 | List tasks | `g t` opened Tasks and loaded **500 shown of 500**; filter counts were All 500 / Running 1 / Awaiting input 0 / Failed 99 / Succeeded 397 at capture time. |
 | Open a task | `Enter` (and a row click) opened the highlighted `gpui/11-verify` run. The pinned header showed status `running`, `repo favetto`, `agent opencode`, `attempt 1`, elapsed time and the live session id. |
 | Switch tabs | Output → Runs both rendered. Output showed the merged live/durable feed (including tool-use rows, or its explicit "No structured output yet" state); Runs showed attempt 1 as running. |
-| Catalog preview | `g c` (and the command palette) opened Catalog with **73 definitions** grouped by repo. The selected `repo:bookman/fx_pr_conflict` preview rendered its raw Markdown source. No launch sheet was submitted. |
+| Catalog preview | `g c` (and the command palette) opened Catalog with **73 definitions** grouped by repo. The selected `repo:bookman/fx_pr_conflict` preview highlighted its TOML front matter, drew the `---` separator and rendered the Markdown body (headings, lists and fenced code); **Copy** still supplied the raw source. No launch sheet was submitted. |
 | Settings | `Ctrl+,` opened Settings. **Test connection** (`Ctrl+T`) reported `✓ http://127.0.0.1:7878 answered in 1 ms · cwd /home/okno`. Agents listed claude/opencode/pi/vibe as available. |
 
 This was the one safe action used: a draft `system.ping` from Settings. No
@@ -88,8 +88,9 @@ added to the repository.
    run, confirm the durable log renders and the **Raw output** disclosure
    toggles to the persisted transcript.
 7. On Catalog: `/` searches, `↑`/`↓` changes the definition, `h` collapses a
-   folder, and the preview pane shows the selected Markdown. Do not submit the
-   launch sheet.
+   folder, and the preview pane shows the selected TOML front matter and
+   rendered Markdown body with its raw source still on **Copy**. Do not submit
+   the launch sheet.
 8. In Settings: test the current connection; edit an endpoint without saving to
    see the normalized preview; `Esc` leaves the fields.
 9. Wrong token: replace `token` in `gpui.toml` with a bad value, relaunch, and

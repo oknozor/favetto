@@ -98,6 +98,10 @@ keyboard-reachable, and motion respects the OS "reduce motion" setting.
   11/13/15/20/28, two themes (dark/light) flipped by the OS appearance.
 - **Semantic colors**: `bg`, `surface`, `border`, `text`, `muted`, `accent`
   (running/open), `warning` (awaiting input), `danger` (failed), `success`.
+- **Rendered text**: agent prose and Catalog task prompts share one Markdown
+  paint path. The Catalog splits the TOML front matter at the first `---` line,
+  highlights it with the `syntax` palette, then renders the Markdown body;
+  **Copy** always returns the exact raw source.
 - **Status model**: icon + label + color, never color alone. `pending`,
   `running`, `awaiting input`, `succeeded`, `failed`, `cancelled`.
 - **Density**: comfortable by default (32 px rows), compact at < 900 px height.

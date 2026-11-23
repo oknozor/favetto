@@ -133,8 +133,13 @@ The Catalog loads one `catalog.list` on connect and whenever the daemon pushes
 then by their folder, then by name; `Global` comes last. Group and folder
 headers collapse, and both the collapsed set and the query survive the session.
 The search field fuzzy-matches definition names and prompt text. Selecting a row
-loads `catalog.get` and shows the raw Markdown in a monospace pane beside the
-list; **Copy** puts the source on the clipboard.
+loads `catalog.get` and splits the task file at the first line whose trimmed
+content is `---`: the TOML front matter is syntax-highlighted, the separator is
+muted, and the Markdown prompt renders with the same headings, lists, tables,
+quotes, rules and fenced-code highlighting as the Output feed. A file without a
+separator is treated as all Markdown. Parsing is cached per definition/source
+revision, so repainting or scrolling does not re-parse it; **Copy** still puts
+the exact raw source, including the front matter, on the clipboard.
 
 The preview's left edge is an invisible 8 px resize handle with a
 column-resize cursor. Dragging it clamps the width to 280–720 px and to the
@@ -425,10 +430,11 @@ Deviations from the plan are recorded in this file as the chain progresses
 ### Step 06 deviations / additions
 
 - **No text selection in this GPUI build.** The pinned `gpui 0.2.2` exposes no
-  selectable-text primitive, so the Output pane is monospace plain text and the
-  **Copy output** action (plus **copy** beside the session id) is the clipboard
-  path. This is the one place the "selectable" wording cannot be met literally
-  in the current framework.
+  selectable-text primitive. Durable agent prose renders as Markdown through the
+  shared Output/Catalog renderer, while a plain/PTY transcript stays monospace;
+  the **Copy output** action (plus **copy** beside the session id) is the
+  clipboard path. This is the one place the "selectable" wording cannot be met
+  literally in the current framework.
 - **Run-status labels.** `RunStatus` has two outcomes the task enum does not
   (`interrupted`, `timed_out`); the Runs table renders those labels directly and
   keeps `StatusKind` for the shared icon/color vocabulary.
@@ -452,10 +458,11 @@ Deviations from the plan are recorded in this file as the chain progresses
 
 ### Step 07 deviations / additions
 
-- **Preview is raw source, with Copy.** As in step 06, this GPUI build has no
-  selectable-text primitive, so `catalog.get` renders a read-only monospace
-  pane with a **Copy** action rather than a Markdown renderer or selectable
-  text.
+- **Preview is rendered, Copy is raw.** As in step 06, this GPUI build has no
+  selectable-text primitive, so the Catalog pane renders the TOML front matter
+  and Markdown body and keeps a **Copy** action for the exact raw source. The
+  Markdown paint path is shared with the Output feed rather than duplicated in
+  the Catalog view.
 - **Form editing is append/backspace at the end.** The launch and one-shot
   sheets reuse the shell's typed-character routing (the same model as the
   palette and Tasks search); there is no cursor movement or marked-text IME

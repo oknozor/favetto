@@ -7,6 +7,7 @@
 pub mod catalog;
 pub mod detail;
 pub mod inbox;
+pub(crate) mod markdown;
 pub mod schedules;
 pub mod settings;
 pub mod tasks;

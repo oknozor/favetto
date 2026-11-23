@@ -11,9 +11,12 @@
 //! - **Working Memory** — collapsed groups and the query survive the session;
 //!   the selected row keeps its preview beside the list.
 
+use std::hash::{Hash, Hasher};
+use std::rc::Rc;
+
 use gpui::{
     div, prelude::*, px, AnyElement, Context, Div, Entity, FocusHandle, Hsla, IntoElement,
-    MouseButton, Render, ScrollHandle, Stateful, Window,
+    MouseButton, Render, ScrollHandle, Stateful, TextStyle, Window,
 };
 
 use crate::catalog::{
@@ -22,10 +25,26 @@ use crate::catalog::{
 };
 use crate::components;
 use crate::layout::clamp_catalog_preview_width;
+use crate::markdown::syntax::{self, Token};
+use crate::markdown::{self, MarkdownDoc};
 use crate::resize::{ResizeDrag, ResizePreview, ResizeStart};
 use crate::routes::Route;
 use crate::state::ClientState;
 use crate::theme::{Theme, CATALOG_PREVIEW_WIDTH, RESIZE_HANDLE, SIDEBAR_WIDTH};
+use crate::views::markdown::{self as markdown_view, Tone};
+
+/// One parsed Catalog source, keyed by definition name and content revision.
+///
+/// A repaint or scroll uses the cached document; only a changed `catalog.get`
+/// source splits the front matter, tokenises the TOML header or re-parses the
+/// Markdown body.
+struct PreviewRender {
+    name: String,
+    revision: u64,
+    header: Option<String>,
+    header_tokens: Vec<Token>,
+    body: Rc<MarkdownDoc>,
+}
 
 /// The Catalog surface.
 pub struct CatalogView {
@@ -34,6 +53,8 @@ pub struct CatalogView {
     preview_scroll: ScrollHandle,
     preview_width: f32,
     preview_resize: Option<ResizeStart>,
+    markdown: markdown::MarkdownCache,
+    preview_render: Option<Rc<PreviewRender>>,
     scrolled_to: Option<String>,
     retry_focus: FocusHandle,
     oneshot_focus: FocusHandle,
@@ -57,6 +78,8 @@ impl CatalogView {
             preview_scroll: ScrollHandle::new(),
             preview_width: CATALOG_PREVIEW_WIDTH,
             preview_resize: None,
+            markdown: markdown::MarkdownCache::default(),
+            preview_render: None,
             scrolled_to: None,
             retry_focus: cx.focus_handle().tab_index(20).tab_stop(true),
             oneshot_focus: cx.focus_handle().tab_index(21).tab_stop(true),
@@ -796,9 +819,52 @@ impl CatalogView {
             .into_any_element()
     }
 
+    /// Parse and split the selected source once per `(name, content)` revision.
+    ///
+    /// The Markdown body comes from the same [`markdown::MarkdownCache`] the
+    /// Events feed uses; the TOML header is tokenised once beside it so a
+    /// repaint never re-parses or re-highlights an unchanged preview.
+    fn prepare_preview(&mut self, name: &str, source: &str) -> Rc<PreviewRender> {
+        let revision = source_revision(source);
+        if let Some(render) = &self.preview_render {
+            if render.name == name && render.revision == revision {
+                return render.clone();
+            }
+        }
+
+        let (header, body) = markdown::split_frontmatter(source);
+        let header = header.map(str::to_string);
+        let header_tokens = header
+            .as_deref()
+            .map(|header| syntax::highlight("toml", header))
+            .unwrap_or_default();
+
+        if self
+            .preview_render
+            .as_ref()
+            .is_some_and(|render| render.name != name)
+        {
+            self.markdown = markdown::MarkdownCache::default();
+        }
+        self.markdown.begin_refresh();
+        let body = self.markdown.doc(body);
+        self.markdown.end_refresh();
+
+        let render = Rc::new(PreviewRender {
+            name: name.to_string(),
+            revision,
+            header,
+            header_tokens,
+            body,
+        });
+        self.preview_render = Some(render.clone());
+        render
+    }
+
     fn preview_pane(
-        &self,
+        &mut self,
         theme: &Theme,
+        base: &TextStyle,
         selected: Option<&str>,
         preview: Option<&CatalogPreview>,
         cx: &mut Context<Self>,
@@ -841,15 +907,38 @@ impl CatalogView {
 
         let body: AnyElement = match (selected, preview) {
             (Some(name), Some(preview)) if preview.name == name => {
-                if let Some(markdown) = &preview.markdown {
-                    div()
+                if let Some(source) = &preview.markdown {
+                    let rendered = self.prepare_preview(&preview.name, source);
+                    let mut body = div()
                         .id("catalog-preview")
-                        .font_family("monospace")
-                        .text_size(px(theme.font.sm))
-                        .text_color(theme.colors.text)
-                        .whitespace_normal()
-                        .child(markdown.clone())
-                        .into_any_element()
+                        .flex()
+                        .flex_col()
+                        .gap(px(theme.spacing.s2))
+                        .min_w_0();
+                    if rendered.header.is_some() {
+                        body = body
+                            .child(markdown_view::highlighted_tokens(
+                                theme,
+                                base,
+                                &rendered.header_tokens,
+                                theme.font.sm,
+                            ))
+                            .child(
+                                div()
+                                    .font_family("monospace")
+                                    .text_size(px(theme.font.sm))
+                                    .text_color(theme.syntax.comment)
+                                    .child("---"),
+                            );
+                    }
+                    body.child(markdown_view::markdown_body(
+                        theme,
+                        base,
+                        &rendered.body,
+                        Tone::Prose,
+                        0,
+                    ))
+                    .into_any_element()
                 } else if let Some(error) = &preview.error {
                     div()
                         .flex()
@@ -978,7 +1067,7 @@ impl CatalogView {
                     .py(px(theme.spacing.s2))
                     .border_t_1()
                     .border_color(theme.colors.border)
-                    .child(hint(theme, "Raw Markdown · read-only"))
+                    .child(hint(theme, "Rendered · Copy keeps raw source"))
                     .when_some(start, |footer, start| footer.child(start)),
             )
             .child(self.preview_resize_handle(cx))
@@ -1659,6 +1748,7 @@ impl CatalogView {
 impl Render for CatalogView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.state.read(cx).theme(window.appearance());
+        let base = window.text_style();
         let (
             status,
             groups,
@@ -1767,11 +1857,24 @@ impl Render for CatalogView {
                 .min_h_0()
                 .child(self.list_pane(theme, &groups, selected.as_deref(), matched, total, cx))
                 .when(total > 0, |split| {
-                    split.child(self.preview_pane(theme, selected.as_deref(), preview.as_ref(), cx))
+                    split.child(self.preview_pane(
+                        theme,
+                        &base,
+                        selected.as_deref(),
+                        preview.as_ref(),
+                        cx,
+                    ))
                 }),
         )
         .when_some(overlays, |root, overlay| root.child(overlay))
     }
+}
+
+/// A fast fingerprint of the raw preview source for the render cache.
+fn source_revision(source: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Left padding for a Catalog row: the list inset plus one spacing step per
