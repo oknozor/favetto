@@ -1270,6 +1270,7 @@ mod tests {
             vars,
             prompt: prompt.to_string(),
             repo: repo.map(str::to_string),
+            mcp: None,
         }
     }
 

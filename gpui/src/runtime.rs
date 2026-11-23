@@ -33,9 +33,9 @@ use favetto_wire::rpc::{
     AgentReplyResult, AgentSetModeParams, AgentSetOptionParams, CatalogEntry, CatalogGetParams,
     EmptyParams, PingParams, PingResult, ReposActivateParams, ReposListResult,
     ScheduleDeleteParams, ScheduleUpsertParams, SchedulesDeleteResult, SessionIdParams,
-    StartOneshotParams, StartOneshotResult, TaskIdParams, TasksEventsParams, TasksListParams,
-    TasksSessionResult, TasksStartParams, WorkflowCancelResultBody, WorkflowGetResult,
-    WorkflowInspectParams, WorkflowRetryParams,
+    StartOneshotParams, StartOneshotResult, TaskIdParams, TasksDeleteResult, TasksEventsParams,
+    TasksListParams, TasksSessionResult, TasksStartParams, WorkflowCancelResultBody,
+    WorkflowGetResult, WorkflowInspectParams, WorkflowRetryParams,
 };
 use favetto_wire::workflow::WorkflowInspect;
 use uuid::Uuid;
@@ -88,6 +88,8 @@ pub enum Command {
         previous: Box<Task>,
         optimistic: Box<Task>,
     },
+    /// Permanently remove one terminal task and its recorded history.
+    DeleteTask { task_id: Uuid },
     /// Fetch `tasks.get`, `tasks.events` and `tasks.runs` for the open detail.
     LoadTaskDetail { task_id: Uuid },
     /// Resolve the agent session associated with one task (`tasks.session`).
@@ -224,6 +226,12 @@ pub enum Update {
         previous: Box<Task>,
         optimistic: Box<Task>,
         result: Result<Box<Task>, ClientError>,
+    },
+    /// A `tasks.delete` round trip completed. `deleted` distinguishes an
+    /// idempotent no-op from a removal; `task_id` keys the rollback snapshot.
+    TaskDeleteFinished {
+        task_id: Uuid,
+        result: Result<TasksDeleteResult, ClientError>,
     },
     /// `tasks.get` completed for the open detail.
     TaskLoaded { task: Box<Task> },
@@ -450,6 +458,11 @@ impl Runtime {
             previous: Box::new(previous),
             optimistic: Box::new(optimistic),
         });
+    }
+
+    /// Permanently delete one terminal task (`tasks.delete`).
+    pub fn delete_task(&self, task_id: Uuid) {
+        self.send(Command::DeleteTask { task_id });
     }
 
     /// Load every part of one task's detail surface.
@@ -710,6 +723,9 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
                     *previous,
                     *optimistic,
                 );
+            }
+            Command::DeleteTask { task_id } => {
+                spawn_delete_task(client.clone(), updates.clone(), task_id);
             }
             Command::LoadTaskDetail { task_id } => {
                 spawn_task_load(client.clone(), updates.clone(), task_id);
@@ -1017,6 +1033,15 @@ fn spawn_task_action(
             optimistic: Box::new(optimistic),
             result,
         });
+    });
+}
+
+/// Spawn one `tasks.delete`; the reply removes the row for good or triggers the
+/// rollback snapshot on failure.
+fn spawn_delete_task(client: Arc<RpcClient>, updates: Sender<Update>, task_id: Uuid) {
+    tokio::spawn(async move {
+        let result = client.tasks_delete(TaskIdParams { id: task_id }).await;
+        let _ = updates.try_send(Update::TaskDeleteFinished { task_id, result });
     });
 }
 

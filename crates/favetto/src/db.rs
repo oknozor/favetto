@@ -2549,6 +2549,85 @@ pub async fn list_worktrees(pool: &SqlitePool) -> anyhow::Result<Vec<WorktreeRec
     Ok(rows.iter().map(row_to_worktree).collect())
 }
 
+/// What [`delete_task`] removed. `deleted` is false when no terminal task row
+/// matched (a missing id, or a terminal task that raced into an active state);
+/// `worktree` is only populated for a row this call actually deleted.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DeleteTaskOutcome {
+    pub deleted: bool,
+    pub worktree: Option<WorktreeRecord>,
+}
+
+/// Permanently delete one terminal task and every Favetto-local row owned by it.
+///
+/// The `tasks` delete is a compare-and-set on terminal status, in the same
+/// transaction as the cascade: a task that races into `pending`/`running` after
+/// the caller read its status is left untouched (and reports `deleted: false`).
+/// SQLite foreign keys are not enabled, so the owned rows are deleted manually:
+///
+/// - `task_runs` (the attempt/usage history),
+/// - `task_dependencies` on either side of the edge,
+/// - `worktrees` tracking,
+/// - `agent_sessions` linked by `task_id` or `run_id`, so `agents.history` and
+///   `tasks.session` cannot restore a deleted run. The provider's own transcript
+///   is never deleted here.
+///
+/// Persisted `events` rows are the append-only audit log and are deliberately
+/// left alone.
+pub async fn delete_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<DeleteTaskOutcome> {
+    let task_id = id.to_string();
+    let mut tx = pool.begin().await?;
+
+    let worktree = sqlx::query(
+        "SELECT task_id, repo, path, branch, created_at FROM worktrees WHERE task_id = ?",
+    )
+    .bind(&task_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .map(|row| row_to_worktree(&row));
+
+    let result = sqlx::query(
+        "DELETE FROM tasks WHERE id = ? AND status IN ('succeeded', 'failed', 'cancelled')",
+    )
+    .bind(&task_id)
+    .execute(&mut *tx)
+    .await?;
+    if result.rows_affected() == 0 {
+        tx.rollback().await?;
+        return Ok(DeleteTaskOutcome::default());
+    }
+
+    // `agent_sessions.run_id` points at a `task_runs` row, so delete the local
+    // session metadata before the runs it references.
+    sqlx::query(
+        "DELETE FROM agent_sessions \
+         WHERE task_id = ? OR run_id IN (SELECT id FROM task_runs WHERE task_id = ?)",
+    )
+    .bind(&task_id)
+    .bind(&task_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM task_runs WHERE task_id = ?")
+        .bind(&task_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM task_dependencies WHERE task_id = ? OR depends_on = ?")
+        .bind(&task_id)
+        .bind(&task_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM worktrees WHERE task_id = ?")
+        .bind(&task_id)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Ok(DeleteTaskOutcome {
+        deleted: true,
+        worktree,
+    })
+}
+
 fn row_to_worktree(row: &SqliteRow) -> WorktreeRecord {
     WorktreeRecord {
         task_id: Uuid::parse_str(&row.get::<String, _>("task_id")).unwrap_or_default(),

@@ -116,6 +116,8 @@ pub mod method {
     pub const TASKS_CANCEL: &str = "tasks.cancel";
     /// Retry a terminal task, preserving its prior run history.
     pub const TASKS_RETRY: &str = "tasks.retry";
+    /// Permanently delete a terminal task and its recorded run history.
+    pub const TASKS_DELETE: &str = "tasks.delete";
     /// Start a catalog task by name.
     pub const TASKS_START: &str = "tasks.start";
     /// Start a one-shot task from an inline definition (not added to the catalog)
@@ -250,6 +252,8 @@ pub mod method {
 pub mod push {
     pub const EVENT: &str = "event";
     pub const TASK_UPDATED: &str = "task.updated";
+    /// A task and its recorded history were permanently deleted.
+    pub const TASK_DELETED: &str = "task.deleted";
     /// The task catalog changed on disk; clients should re-fetch it.
     pub const CATALOG_UPDATED: &str = "catalog.updated";
     /// An agent session's child process exited.
@@ -297,6 +301,11 @@ pub const CLIENT_METHODS: &[(&str, &str)] = &[
     (
         method::TASKS_RETRY,
         "Retry a terminal task, preserving its prior run history.",
+    ),
+    (
+        method::TASKS_DELETE,
+        "Permanently delete a terminal task, its recorded runs and its \
+         dependency edges. Non-terminal tasks are rejected.",
     ),
     (method::TASKS_START, "Start a catalog task by name."),
     (
@@ -526,6 +535,10 @@ pub const SERVER_PUSHES: &[(&str, &str)] = &[
     (push::EVENT, "A persisted event."),
     (push::TASK_UPDATED, "A task row changed."),
     (
+        push::TASK_DELETED,
+        "A task and its recorded run history were permanently deleted.",
+    ),
+    (
         push::CATALOG_UPDATED,
         "The task catalog changed on disk; clients should re-fetch it.",
     ),
@@ -646,6 +659,7 @@ mod tests {
             method::TASKS_SESSION,
             method::TASKS_CANCEL,
             method::TASKS_RETRY,
+            method::TASKS_DELETE,
             method::TASKS_START,
             method::TASKS_START_ONESHOT,
             method::CATALOG_LIST,
@@ -709,6 +723,7 @@ mod tests {
         let pushes: HashSet<&str> = [
             push::EVENT,
             push::TASK_UPDATED,
+            push::TASK_DELETED,
             push::CATALOG_UPDATED,
             push::AGENT_EXIT,
             push::AGENT_STATE,

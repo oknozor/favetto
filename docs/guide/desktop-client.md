@@ -79,6 +79,14 @@ density. **Save** rewrites `gpui.toml` and reconnects.
 Tasks, Catalog and Workflows have surface-local keys for search, cancel, retry
 and launch; the shortcut sheet lists them all.
 
+A finished run's detail header also offers **Delete run**, which permanently
+removes the run, its recorded attempts and its dependency edges after a
+confirmation that names the run. It is only shown for `succeeded`, `failed` and
+`cancelled` runs; the daemon rejects deletion of a `pending`, `running` or
+`awaiting_input` run. Deleting removes that run's usage history, cleans up its
+worktree and branch when one is tracked, and never deletes the agent provider's
+own transcript.
+
 ## Development
 
 Run the client's gates from its standalone workspace:

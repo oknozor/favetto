@@ -3863,6 +3863,21 @@ impl App {
                     self.usage_dirty = true;
                 }
             }
+            push::TASK_DELETED => {
+                if let Some(id) = n
+                    .params
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|id| Uuid::parse_str(id).ok())
+                {
+                    self.tasks.retain(|task| task.id != id);
+                    self.task_state.remove(&id.to_string());
+                }
+                self.mark_workflow_inspect_dirty();
+                if self.tab == Tab::Usage {
+                    self.usage_dirty = true;
+                }
+            }
             push::CATALOG_UPDATED => {
                 // The list is re-fetched by the session loop, which owns the client.
                 self.catalog_dirty = true;

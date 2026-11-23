@@ -173,6 +173,16 @@ pub type TasksCancelResult = Task;
 /// `tasks.retry` result: the re-enqueued task, with `output` omitted.
 pub type TasksRetryResult = Task;
 
+/// `tasks.delete` result: the deleted id and whether a row was removed. The
+/// delete is idempotent, so an unknown or already-deleted id reports
+/// `deleted: false` instead of failing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TasksDeleteResult {
+    pub id: Uuid,
+    pub deleted: bool,
+}
+
 /// `tasks.start` params. `input` defaults to JSON null; `interactive` defaults
 /// to false (headless), so only the TUI opts into the live embedded TUI.
 ///
@@ -1032,6 +1042,14 @@ pub type McpApproveResult = McpServerInfo;
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CatalogUpdatedPush {}
 
+/// `task.deleted` push: the id of a permanently deleted task. Clients remove the
+/// row instead of upserting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TaskDeletedPush {
+    pub id: Uuid,
+}
+
 /// `agent.exit` push: the session's child process exited.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -1117,6 +1135,8 @@ rpc_calls! {
     TasksCancelCall => method::TASKS_CANCEL, TaskIdParams, TasksCancelResult;
     /// Typed call for `tasks.retry`.
     TasksRetryCall => method::TASKS_RETRY, TaskIdParams, TasksRetryResult;
+    /// Typed call for `tasks.delete`.
+    TasksDeleteCall => method::TASKS_DELETE, TaskIdParams, TasksDeleteResult;
     /// Typed call for `tasks.start`.
     TasksStartCall => method::TASKS_START, TasksStartParams, TasksStartResult;
     /// Typed call for `tasks.start_oneshot`.
@@ -1289,6 +1309,11 @@ pub const CLIENT_CALLS: &[RpcCallSpec] = &[
         method: method::TASKS_RETRY,
         params_schema: schema_of::<TaskIdParams>,
         result_schema: schema_of::<TasksRetryResult>,
+    },
+    RpcCallSpec {
+        method: method::TASKS_DELETE,
+        params_schema: schema_of::<TaskIdParams>,
+        result_schema: schema_of::<TasksDeleteResult>,
     },
     RpcCallSpec {
         method: method::TASKS_START,
@@ -1572,6 +1597,10 @@ pub const PUSH_CALLS: &[PushSpec] = &[
     PushSpec {
         method: super::push::TASK_UPDATED,
         params_schema: schema_of::<Task>,
+    },
+    PushSpec {
+        method: super::push::TASK_DELETED,
+        params_schema: schema_of::<TaskDeletedPush>,
     },
     PushSpec {
         method: super::push::CATALOG_UPDATED,

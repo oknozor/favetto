@@ -2039,7 +2039,16 @@ async fn prune_repo(repo: &Path) {
 /// place, which pins the branch as "checked out" and makes `git branch -D`
 /// fail. Prune the stale registration before deleting the branch, and retry
 /// once after another prune, so a tracked removal can never leak the branch.
-async fn remove_worktree(pool: &SqlitePool, task_id: Uuid, repo: &Path, path: &Path, branch: &str) {
+///
+/// Shared with `tasks.delete`, which removes the run's directory eagerly instead
+/// of waiting for the next retention pass.
+pub(crate) async fn remove_worktree(
+    pool: &SqlitePool,
+    task_id: Uuid,
+    repo: &Path,
+    path: &Path,
+    branch: &str,
+) {
     if let Err(e) = Command::new("git")
         .arg("-C")
         .arg(repo)

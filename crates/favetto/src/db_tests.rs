@@ -2564,3 +2564,124 @@ async fn agent_session_mcp_selection_round_trips_and_defaults_none() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn delete_task_cascades_runs_dependencies_worktrees_and_local_sessions() {
+    let (dir, pool) = scratch_pool("delete-cascade").await;
+    let now = Timestamp::now();
+
+    let doomed = task_at(now, Some(now), None);
+    let predecessor = task_at(now, Some(now), None);
+    let dependent = task_at(now, Some(now), None);
+    for task in [&doomed, &predecessor, &dependent] {
+        upsert_task(&pool, task).await.unwrap();
+    }
+
+    let run = run_at(doomed.id, 1);
+    insert_task_run(&pool, &run).await.unwrap();
+    // The doomed task depends on `predecessor`, and `dependent` depends on it.
+    insert_dependency(&pool, doomed.id, predecessor.id, now)
+        .await
+        .unwrap();
+    insert_dependency(&pool, dependent.id, doomed.id, now)
+        .await
+        .unwrap();
+
+    record_worktree(
+        &pool,
+        &WorktreeRecord {
+            task_id: doomed.id,
+            repo: dir.join("repo"),
+            path: dir.join("worktree"),
+            branch: "favetto/doomed-00000000".to_string(),
+            created_at: now,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut task_session = AgentSessionRecord::loading("local-task", "opencode", "/work", now);
+    task_session.task_id = Some(doomed.id.to_string());
+    insert_agent_session(&pool, &task_session).await.unwrap();
+    let mut run_session = AgentSessionRecord::loading("local-run", "opencode", "/work", now);
+    run_session.run_id = Some(run.id.to_string());
+    insert_agent_session(&pool, &run_session).await.unwrap();
+    let unrelated = AgentSessionRecord::loading("local-other", "opencode", "/work", now);
+    insert_agent_session(&pool, &unrelated).await.unwrap();
+
+    let outcome = delete_task(&pool, doomed.id).await.unwrap();
+    assert!(outcome.deleted);
+    assert_eq!(
+        outcome.worktree.as_ref().map(|wt| wt.task_id),
+        Some(doomed.id)
+    );
+
+    assert!(get_task(&pool, doomed.id).await.unwrap().is_none());
+    assert!(list_task_runs(&pool, doomed.id).await.unwrap().is_empty());
+    assert!(list_dependencies(&pool, doomed.id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(
+        list_dependencies(&pool, dependent.id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "an edge where the deleted task is the predecessor is removed"
+    );
+    assert!(list_worktrees(&pool).await.unwrap().is_empty());
+    assert!(get_agent_session(&pool, "local-task")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(
+        get_agent_session(&pool, "local-run")
+            .await
+            .unwrap()
+            .is_none(),
+        "a session linked only by run id is removed too"
+    );
+    assert!(
+        get_agent_session(&pool, "local-other")
+            .await
+            .unwrap()
+            .is_some(),
+        "unrelated sessions survive"
+    );
+    // The neighbouring tasks and the predecessor edge are untouched.
+    assert!(get_task(&pool, predecessor.id).await.unwrap().is_some());
+    assert!(get_task(&pool, dependent.id).await.unwrap().is_some());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn delete_task_refuses_non_terminal_rows_and_is_idempotent_for_missing_ids() {
+    let (dir, pool) = scratch_pool("delete-guard").await;
+    let now = Timestamp::now();
+
+    for status in [
+        TaskStatus::Pending,
+        TaskStatus::Running,
+        TaskStatus::AwaitingInput,
+    ] {
+        let mut task = task_at(now, None, None);
+        task.status = status;
+        upsert_task(&pool, &task).await.unwrap();
+        let run = run_at(task.id, 1);
+        insert_task_run(&pool, &run).await.unwrap();
+
+        let outcome = delete_task(&pool, task.id).await.unwrap();
+        assert!(!outcome.deleted, "{status:?} must not be deleted");
+        assert!(outcome.worktree.is_none());
+        assert!(get_task(&pool, task.id).await.unwrap().is_some());
+        assert_eq!(list_task_runs(&pool, task.id).await.unwrap().len(), 1);
+    }
+
+    let missing = Uuid::new_v4();
+    let outcome = delete_task(&pool, missing).await.unwrap();
+    assert!(!outcome.deleted);
+    assert!(outcome.worktree.is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

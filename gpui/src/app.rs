@@ -43,7 +43,7 @@ use crate::resize::{ResizeDrag, ResizePreview, ResizeStart};
 use crate::routes::Route;
 use crate::schedules::ScheduleField;
 use crate::state::{ClientState, TaskConfirm, Toast, ToastKind};
-use crate::tasks::TaskAction;
+use crate::tasks::TaskCommand;
 use crate::text_element::{TextEditState, TextElement, TextHost};
 use crate::text_input::{TextInput, TextTarget};
 use crate::theme::{
@@ -509,7 +509,7 @@ impl RootView {
 
     /// `c` / `r`: open the confirmation, explaining when the action cannot
     /// apply (a live run cannot be retried, a finished one cannot be cancelled).
-    fn request_task_action(&mut self, action: TaskAction, cx: &mut Context<Self>) {
+    fn request_task_action(&mut self, action: TaskCommand, cx: &mut Context<Self>) {
         self.state.update(cx, |state, cx| {
             state.request_task_action(action, cx);
             cx.notify();
@@ -2822,10 +2822,10 @@ impl Render for RootView {
                 this.test_settings(cx);
             }))
             .on_action(cx.listener(|this, _: &TaskCancel, _window, cx| {
-                this.request_task_action(TaskAction::Cancel, cx);
+                this.request_task_action(TaskCommand::Cancel, cx);
             }))
             .on_action(cx.listener(|this, _: &TaskRetry, _window, cx| {
-                this.request_task_action(TaskAction::Retry, cx);
+                this.request_task_action(TaskCommand::Retry, cx);
             }))
             .on_action(cx.listener(|this, _: &TaskDismissLaunch, _window, cx| {
                 this.state.update(cx, |state, cx| {

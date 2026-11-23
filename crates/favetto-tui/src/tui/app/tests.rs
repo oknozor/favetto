@@ -3796,6 +3796,25 @@ fn task_updated_push_replaces_a_cancelled_row_in_place() {
 }
 
 #[test]
+fn task_deleted_push_drops_the_row_and_marks_usage_dirty() {
+    let mut app = App::new();
+    let gone = task_with("gone", TaskStatus::Succeeded);
+    let keep = task("keep");
+    app.tasks = vec![gone.clone(), keep.clone()];
+    app.set_tab(Tab::Usage);
+    app.usage_dirty = false;
+
+    app.handle_notification(Notification {
+        method: push::TASK_DELETED.to_string(),
+        params: serde_json::json!({ "id": gone.id }),
+    });
+
+    assert_eq!(app.tasks.len(), 1);
+    assert_eq!(app.tasks[0].id, keep.id);
+    assert!(app.usage_dirty, "a deletion changes the usage totals");
+}
+
+#[test]
 fn usage_tab_period_keys_select_and_mark_dirty() {
     let mut app = App::new();
     app.set_tab(Tab::Usage);
