@@ -119,6 +119,26 @@ pub struct InlineText {
     pub spans: Vec<InlineSpan>,
 }
 
+/// Split a catalog task file into its TOML front matter and Markdown body.
+///
+/// The separator is the first line whose trimmed content is exactly `---`
+/// (matching the web and TUI previews). A file with no separator is entirely
+/// body, and an empty header is reported as no header. The returned slices keep
+/// the original bytes apart from the separator line itself.
+pub fn split_frontmatter(raw: &str) -> (Option<&str>, &str) {
+    let mut offset = 0usize;
+    for line in raw.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed == "---" {
+            let header = raw[..offset].trim_end_matches(['\r', '\n']);
+            let header = (!header.is_empty()).then_some(header);
+            return (header, &raw[offset + line.len()..]);
+        }
+        offset += line.len();
+    }
+    (None, raw)
+}
+
 /// Parse a Markdown source into the renderer's block model.
 pub fn parse(source: &str) -> MarkdownDoc {
     let mut options = Options::empty();
@@ -740,6 +760,42 @@ fn content_key(source: &str) -> (u64, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frontmatter_splits_at_the_first_separator_line() {
+        let (header, body) = split_frontmatter("agent = \"x\"\nkind = \"task\"\n---\n\n# Title\n");
+        assert_eq!(header, Some("agent = \"x\"\nkind = \"task\""));
+        assert_eq!(body, "\n# Title\n");
+
+        let (header, body) = split_frontmatter("---\n\n# Title\n");
+        assert_eq!(header, None);
+        assert_eq!(body, "\n# Title\n");
+
+        let (header, body) = split_frontmatter("agent = \"x\"\r\n---\r\n\r\n# Title\r\n");
+        assert_eq!(header, Some("agent = \"x\""));
+        assert_eq!(body, "\r\n# Title\r\n");
+    }
+
+    #[test]
+    fn frontmatter_without_a_separator_is_all_body() {
+        let source = "# Title\n\nno front matter\n";
+        assert_eq!(split_frontmatter(source), (None, source));
+        assert_eq!(split_frontmatter(""), (None, ""));
+    }
+
+    #[test]
+    fn frontmatter_only_looks_at_the_first_separator() {
+        let source = "agent = \"x\"\n---\n## Body\n\n---\n\nmore\n";
+        let (header, body) = split_frontmatter(source);
+        assert_eq!(header, Some("agent = \"x\""));
+        assert_eq!(body, "## Body\n\n---\n\nmore\n");
+
+        // The split is line-based and does not try to understand fences: a
+        // `---` line inside a fenced block still splits if it comes first.
+        let (header, body) = split_frontmatter("```\n---\n```\n");
+        assert_eq!(header, Some("```"));
+        assert_eq!(body, "```\n");
+    }
 
     fn first_paragraph(source: &str) -> Vec<Inline> {
         match parse(source).blocks.into_iter().next() {
