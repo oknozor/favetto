@@ -22,7 +22,7 @@ use favetto_wire::workflow::{WorkflowInspect, WorkflowState};
 use uuid::Uuid;
 
 use crate::inbox::{self, StatusKind};
-use crate::launch;
+use crate::launch::LaunchFailure;
 use crate::tasks;
 
 /// The node card width in the graph canvas.
@@ -685,13 +685,15 @@ pub fn state_kind(state: WorkflowState) -> StatusKind {
 ///
 /// There is no `workflow.list` RPC; the roots a user can inspect are exactly
 /// the roots whose tasks are in the 500-row snapshot the Inbox and Tasks share.
-pub fn roots(tasks: &[Task]) -> Vec<WorkflowRoot> {
+/// `launch_failures` is the already-filtered derivation, so a dismissed warning
+/// disappears from the per-root count and banner too.
+pub fn roots(tasks: &[Task], launch_failures: &[LaunchFailure]) -> Vec<WorkflowRoot> {
     let mut groups: HashMap<Uuid, Vec<&Task>> = HashMap::new();
     for task in tasks {
         groups.entry(task.root_or_self()).or_default().push(task);
     }
     let mut launch_counts: HashMap<Uuid, usize> = HashMap::new();
-    for failure in launch::launch_failures(tasks) {
+    for failure in launch_failures {
         *launch_counts.entry(failure.root_id).or_insert(0) += 1;
     }
 
@@ -855,6 +857,7 @@ impl WorkflowCancelConfirm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::launch;
     use chrono::TimeZone;
 
     fn at(offset_minutes: i64) -> DateTime<Utc> {
@@ -931,7 +934,8 @@ mod tests {
     #[test]
     fn roots_group_by_root_or_self_and_count_progress() {
         let (root, root_task, child) = two_step();
-        let roots = roots(&[root_task, child]);
+        let tasks = [root_task, child];
+        let roots = roots(&tasks, &launch::launch_failures(&tasks));
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].root_id, root);
         assert_eq!(roots[0].name, "build");
@@ -947,7 +951,8 @@ mod tests {
         let older = task(10, "older", TaskStatus::Succeeded, None);
         let mut newer = task(11, "newer", TaskStatus::Failed, None);
         newer.created_at = at(50);
-        let roots = roots(&[older.clone(), newer.clone()]);
+        let tasks = [older.clone(), newer.clone()];
+        let roots = roots(&tasks, &launch::launch_failures(&tasks));
         assert_eq!(roots.len(), 2);
         assert_eq!(roots[0].root_id, newer.id);
         assert_eq!(roots[0].state, WorkflowState::Failed);
@@ -970,9 +975,38 @@ mod tests {
         ));
         child.parent_id = Some(root);
 
-        let roots = roots(&[parent, child]);
+        let tasks = [parent, child];
+        let roots = roots(&tasks, &launch::launch_failures(&tasks));
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].launch_failures, 1);
+        assert_eq!(roots[0].failed, 1);
+    }
+
+    #[test]
+    fn a_dismissed_launch_failure_disappears_from_the_root_count() {
+        use favetto_wire::model::{Failure, FailureKind};
+
+        let (root, mut parent, mut child) = two_step();
+        parent.finished_at = Some(at(0));
+        child.status = TaskStatus::Failed;
+        child.created_at = at(1);
+        child.error = Some("task not found in the catalog".to_string());
+        child.failure = Some(Failure::new(
+            FailureKind::InvalidInput,
+            "task not found in the catalog",
+        ));
+        child.parent_id = Some(root);
+
+        let tasks = [parent, child];
+        let failures = launch::launch_failures(&tasks);
+        let dismissed: HashSet<launch::LaunchKey> = [failures[0].key()].into_iter().collect();
+        let kept = launch::undismissed(&failures, &dismissed);
+
+        let roots = roots(&tasks, &kept);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].launch_failures, 0);
+        // The run's own failure count is unchanged: dismissing the banner must
+        // not hide the failed run.
         assert_eq!(roots[0].failed, 1);
     }
 

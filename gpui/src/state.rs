@@ -14,7 +14,7 @@
 #![allow(dead_code)] // Accessors and `ping()` are consumed by the views in steps 03+.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -243,6 +243,9 @@ pub struct ClientState {
     tasks_selected: Option<uuid::Uuid>,
     /// The last known position, used when the selected id disappears.
     tasks_selected_index: usize,
+    /// Launch failures the user dismissed in this client process, keyed by
+    /// `(task id, attempt)` so a fresh attempt warns again.
+    dismissed_launch_failures: HashSet<launch::LaunchKey>,
     /// The cancel/retry awaiting confirmation.
     task_confirm: Option<TaskConfirm>,
     /// The current toast and its monotonic id.
@@ -352,6 +355,7 @@ impl ClientState {
             tasks_search_active: false,
             tasks_selected: None,
             tasks_selected_index: 0,
+            dismissed_launch_failures: HashSet::new(),
             task_confirm: None,
             toast: None,
             toast_id: 0,
@@ -1680,7 +1684,7 @@ impl ClientState {
 
     /// The roots visible in the shared task snapshot, newest first.
     pub fn workflow_roots(&self) -> Vec<workflow::WorkflowRoot> {
-        workflow::roots(&self.tasks)
+        workflow::roots(&self.tasks, &self.undismissed_launch_failures())
     }
 
     /// The selected root, falling back to the newest one so the surface is
@@ -3310,6 +3314,8 @@ impl ClientState {
             &self.sessions,
             self.active_repo.as_deref(),
             Utc::now(),
+            &launch::launch_failures(&self.tasks),
+            &self.dismissed_launch_failures,
         ));
         derived.revision = self.snapshot_revision;
         derived.inbox = Some(rows.clone());
@@ -3404,11 +3410,12 @@ impl ClientState {
         list
     }
 
-    /// Every launch failure in the latest snapshot, derived from the task rows.
+    /// Every launch failure in the latest snapshot that has not been dismissed.
     ///
     /// Memoized with the rest of the snapshot derivations: the Tasks and
     /// Workflows banners must survive a refresh or a reconnect without relying
-    /// on a transient event, and must never re-derive 500 rows per frame.
+    /// on a transient event, and must never re-derive 500 rows per frame. A
+    /// dismissal clears the cache so the next read filters immediately.
     pub fn launch_failures(&self) -> Rc<Vec<LaunchFailure>> {
         let mut derived = self.derived.borrow_mut();
         if derived.revision == self.snapshot_revision {
@@ -3416,10 +3423,40 @@ impl ClientState {
                 return failures.clone();
             }
         }
-        let failures = Rc::new(launch::launch_failures(&self.tasks));
+        let failures = Rc::new(self.undismissed_launch_failures());
         derived.revision = self.snapshot_revision;
         derived.launch = Some(failures.clone());
         failures
+    }
+
+    /// Derive the current launch failures and drop the dismissed ones.
+    ///
+    /// Unmemoized on purpose: the Inbox and Workflows derivations call it while
+    /// their own cache is borrowed, and the snapshot is small enough that one
+    /// additional pass per read is cheaper than a second cache key.
+    fn undismissed_launch_failures(&self) -> Vec<LaunchFailure> {
+        launch::undismissed(
+            &launch::launch_failures(&self.tasks),
+            &self.dismissed_launch_failures,
+        )
+    }
+
+    /// Acknowledge every launch failure currently shown on the Tasks banner.
+    ///
+    /// Process-local only: no RPC and no mutation of the run. The run's own
+    /// detail and result popup keep showing its failure. Returns whether
+    /// anything was dismissed so the caller can avoid a pointless re-render.
+    pub fn dismiss_launch_failures(&mut self, failures: &[LaunchFailure]) -> bool {
+        let mut changed = false;
+        for failure in failures {
+            changed |= self.dismissed_launch_failures.insert(failure.key());
+        }
+        if changed {
+            let mut derived = self.derived.borrow_mut();
+            derived.launch = None;
+            derived.inbox = None;
+        }
+        changed
     }
 
     /// Note that the task/session snapshot changed so the next read rebuilds

@@ -1306,6 +1306,8 @@ pub fn task_display_name(name: &str) -> &str {
 pub struct LaunchFailure {
     /// The failed child's task id.
     pub task_id: Uuid,
+    /// The failed child's attempt, so a retry is a distinct warning.
+    pub attempt: u32,
     /// The parent that spawned it.
     pub parent_id: Uuid,
     /// The workflow root it belongs to.
@@ -1334,6 +1336,11 @@ impl LaunchFailure {
     /// A compact status-bar line.
     pub fn short(&self) -> String {
         format!("{} — {}", self.target, self.reason)
+    }
+
+    /// The process-local dismissal key (task id plus attempt).
+    pub fn key(&self) -> (Uuid, u32) {
+        (self.task_id, self.attempt)
     }
 }
 
@@ -1452,6 +1459,9 @@ pub struct App {
 
     // Task-list selection.
     pub tasks_selected: usize,
+    /// Launch failures dismissed in this process, keyed by `(task id, attempt)`
+    /// so a retry that fails again warns again. Never sent to the daemon.
+    pub dismissed_launch_failures: HashSet<(Uuid, u32)>,
 
     // Task catalog.
     pub catalog: Vec<CatalogEntry>,
@@ -1652,6 +1662,7 @@ impl App {
             logs: VecDeque::new(),
             should_quit: false,
             tasks_selected: 0,
+            dismissed_launch_failures: HashSet::new(),
             catalog: Vec::new(),
             catalog_selected: 0,
             catalog_collapsed: HashSet::new(),
@@ -2007,7 +2018,8 @@ impl App {
             .collect()
     }
 
-    /// Every launch failure in the current task snapshot.
+    /// Every launch failure in the current task snapshot that has not been
+    /// dismissed in this process.
     ///
     /// The derivation deliberately reads `self.tasks` rather than
     /// [`App::visible_tasks`]: a child enqueued under a casing-mismatched repo
@@ -2015,6 +2027,26 @@ impl App {
     /// yet its failure must still appear under the succeeded parent. A failure
     /// is scoped by its workflow root, not by the child's own namespace.
     pub fn launch_failures(&self) -> Vec<LaunchFailure> {
+        self.all_launch_failures()
+            .into_iter()
+            .filter(|failure| !self.dismissed_launch_failures.contains(&failure.key()))
+            .collect()
+    }
+
+    /// Acknowledge every launch failure the Tasks banner currently shows.
+    ///
+    /// Process-local: no RPC and no run mutation, so the run's detail and
+    /// result popup keep naming its failure. A later attempt of a retried task
+    /// has a new key and warns again.
+    pub fn dismiss_launch_failures(&mut self) {
+        for failure in self.launch_failures() {
+            self.dismissed_launch_failures.insert(failure.key());
+        }
+    }
+
+    /// The unfiltered derivation, used where an explicit lookup must still find
+    /// a failed run (the result popup) even after the banner was dismissed.
+    pub fn all_launch_failures(&self) -> Vec<LaunchFailure> {
         let by_id: HashMap<Uuid, &Task> = self.tasks.iter().map(|task| (task.id, task)).collect();
         let mut failures: Vec<LaunchFailure> = self
             .tasks
@@ -2057,6 +2089,7 @@ impl App {
                     .unwrap_or_else(|| "launch failed".to_string());
                 Some(LaunchFailure {
                     task_id: task.id,
+                    attempt: task.attempt,
                     parent_id: parent.id,
                     root_id,
                     target: task.name.clone(),
@@ -2095,9 +2128,11 @@ impl App {
     }
 
     /// The launch failure for one task, if it is one. Used by the result popup to
-    /// name the full target and reason.
+    /// name the full target and reason. This deliberately reads the unfiltered
+    /// derivation: dismissing the banner must not hide a run's failure when the
+    /// user opens it explicitly.
     pub fn launch_failure_for(&self, task_id: Uuid) -> Option<LaunchFailure> {
-        self.launch_failures()
+        self.all_launch_failures()
             .into_iter()
             .find(|failure| failure.task_id == task_id)
     }

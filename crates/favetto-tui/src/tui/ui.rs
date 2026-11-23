@@ -1654,6 +1654,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
                 "C",
                 "cancel every task in the selected task's workflow root",
             ),
+            ("d", "dismiss the spawn-failure banner"),
             ("x", "show the selected task's error in full"),
         ],
     ),
@@ -2742,7 +2743,7 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
         if let Some(notice) = app.launch_failure_notice() {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    format!(" ⚠ SPAWN FAILED: {notice} "),
+                    format!(" ⚠ SPAWN FAILED · [d] dismiss: {notice} "),
                     Style::default()
                         .fg(theme.danger())
                         .bg(theme.raised(RaisedLevel::Base))

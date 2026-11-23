@@ -26,9 +26,9 @@ use crate::actions::{
     RepoPickerConfirm, RepoPickerDown, RepoPickerUp, ScheduleDelete, ScheduleEdit,
     ScheduleFieldNext, ScheduleFieldPrev, ScheduleNew, ScheduleSubmit, ScheduleToggleEnabled,
     SettingsActivate, SettingsFieldNext, SettingsFieldPrev, SettingsSave, SettingsTest, TaskCancel,
-    TaskConfirmAccept, TaskConfirmReject, TaskFilterNext, TaskFilterPrev, TaskRetry, TaskSearch,
-    TogglePalette, ToggleShortcuts, WorkflowCancelRoot, WorkflowOpenInTasks, WorkflowRetryInstance,
-    WorkflowRootNext, WorkflowRootPrev,
+    TaskConfirmAccept, TaskConfirmReject, TaskDismissLaunch, TaskFilterNext, TaskFilterPrev,
+    TaskRetry, TaskSearch, TogglePalette, ToggleShortcuts, WorkflowCancelRoot, WorkflowOpenInTasks,
+    WorkflowRetryInstance, WorkflowRootNext, WorkflowRootPrev,
 };
 use crate::catalog::OneShotFocus;
 use crate::components;
@@ -1225,6 +1225,7 @@ impl RootView {
             ("Search task names", "/"),
             ("Cancel a run", "c"),
             ("Retry a finished run", "r"),
+            ("Dismiss the spawn failure", "d"),
             ("Previous / next filter", "[ ]"),
             ("Confirm a dialog", "↵"),
         ];
@@ -2424,6 +2425,14 @@ impl Render for RootView {
             }))
             .on_action(cx.listener(|this, _: &TaskRetry, _window, cx| {
                 this.request_task_action(TaskAction::Retry, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TaskDismissLaunch, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    let failures = state.launch_failures();
+                    if state.dismiss_launch_failures(&failures) {
+                        cx.notify();
+                    }
+                });
             }))
             .on_action(cx.listener(|this, _: &WorkflowCancelRoot, _window, cx| {
                 this.state.update(cx, |state, cx| {

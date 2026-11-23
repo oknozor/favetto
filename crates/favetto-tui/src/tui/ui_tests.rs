@@ -645,6 +645,40 @@ fn tasks_surface_shows_a_persistent_spawn_failure_banner() {
         text.contains("which succeeded"),
         "parent context missing: {text:?}"
     );
+    assert!(
+        text.contains("[d] dismiss"),
+        "dismiss hint missing: {text:?}"
+    );
+}
+
+#[test]
+fn dismissing_the_spawn_failure_banner_clears_it_and_the_status_notice() {
+    let mut app = spawn_failure_app();
+    app.tab = Tab::Tasks;
+    app.dismiss_launch_failures();
+    let text = render_text(&mut app, 240, 30);
+    assert!(
+        !text.contains("SPAWN FAILED"),
+        "banner still shown: {text:?}"
+    );
+    assert!(
+        !text.contains("spawn launch failed"),
+        "status notice still shown: {text:?}"
+    );
+
+    // The run's popup keeps naming the failure after dismissal.
+    let child = app
+        .tasks
+        .iter()
+        .find(|task| task.status == TaskStatus::Failed)
+        .expect("failed child")
+        .clone();
+    app.popup = Popup::TaskResult {
+        task: Box::new(child),
+    };
+    let text = render_text(&mut app, 200, 40);
+    assert!(text.contains("Launch failure"), "{text:?}");
+    assert!(text.contains("repo:Favetto/plan_issue"), "{text:?}");
 }
 
 #[test]

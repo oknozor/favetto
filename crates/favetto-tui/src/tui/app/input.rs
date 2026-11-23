@@ -1435,6 +1435,13 @@ impl App {
             KeyCode::Char('r') if self.tab == Tab::Tasks && !ctrl && !alt => {
                 self.confirm_retry_task()
             }
+            // Tasks: `d` acknowledges the spawn-failure banner. It is
+            // process-local and keyed by `(task id, attempt)`; the same failure
+            // stays hidden across refreshes and a new attempt warns again.
+            KeyCode::Char('d') if self.tab == Tab::Tasks && !ctrl && !alt => {
+                self.dismiss_launch_failures();
+                UiAction::None
+            }
             // Usage: `1`..`4` select day/week/month/year. Bare digits only.
             KeyCode::Char(c @ '1'..='4') if self.tab == Tab::Usage && !ctrl && !alt => {
                 let idx = (c as u8 - b'1') as usize;

@@ -4866,6 +4866,60 @@ fn launch_failures_ignore_rows_from_an_earlier_parent_attempt() {
     assert!(app.launch_failures().is_empty());
 }
 
+/// A dismissed banner stays hidden across refreshes and repo switches, but the
+/// run's explicit result popup lookup still finds its failure.
+#[test]
+fn dismissing_launch_failures_hides_them_until_a_new_attempt_fails() {
+    let mut app = App::new();
+    let mut parent = task("repo:favetto/triage_issues");
+    parent.status = TaskStatus::Succeeded;
+    parent.finished_at = Some(Utc::now() - chrono::Duration::seconds(10));
+
+    let mut child = task("repo:Favetto/plan_issue");
+    child.status = TaskStatus::Failed;
+    child.parent_id = Some(parent.id);
+    child.root_id = Some(parent.id);
+    child.error = Some("task not found in the catalog".to_string());
+    child.failure = Some(Failure::new(
+        FailureKind::InvalidInput,
+        "task not found in the catalog",
+    ));
+
+    app.tasks = vec![parent.clone(), child.clone()];
+    assert_eq!(app.launch_failures().len(), 1);
+    assert!(app.launch_failure_notice().is_some());
+
+    app.dismiss_launch_failures();
+    assert!(app.launch_failures().is_empty());
+    assert!(app.launch_failure_notice().is_none());
+
+    // A refresh re-delivers the same rows; the warning stays acknowledged.
+    app.tasks = vec![parent.clone(), child.clone()];
+    assert!(app.launch_failures().is_empty());
+
+    // A new failed launch (a different task) reappears on its own.
+    let mut other = task("repo:favetto/release");
+    other.status = TaskStatus::Failed;
+    other.parent_id = Some(parent.id);
+    other.root_id = Some(parent.id);
+    other.failure = Some(Failure::new(FailureKind::InvalidInput, "missing variable"));
+    app.tasks = vec![parent.clone(), child.clone(), other];
+    let failures = app.launch_failures();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].target, "repo:favetto/release");
+
+    // A retry of the dismissed child is a new attempt, so it warns again.
+    let mut retried = child;
+    retried.attempt = 2;
+    app.tasks = vec![parent, retried.clone()];
+    let failures = app.launch_failures();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].attempt, 2);
+
+    // The explicit popup lookup ignores the dismissal.
+    assert!(app.launch_failure_for(retried.id).is_some());
+}
+
 fn session_option_fixture() -> (
     Vec<favetto_core::model::SessionConfigOption>,
     Option<favetto_core::model::SessionModes>,
