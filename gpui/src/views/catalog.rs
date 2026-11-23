@@ -53,6 +53,7 @@ pub struct CatalogView {
     state: Entity<ClientState>,
     list_scroll: ScrollHandle,
     preview_scroll: ScrollHandle,
+    preview_scrollbar: components::ScrollbarDrag,
     preview_width: f32,
     preview_resize: Option<ResizeStart>,
     markdown: markdown::MarkdownCache,
@@ -78,6 +79,7 @@ impl CatalogView {
             state,
             list_scroll: ScrollHandle::new(),
             preview_scroll: ScrollHandle::new(),
+            preview_scrollbar: components::ScrollbarDrag::new(),
             preview_width: CATALOG_PREVIEW_WIDTH,
             preview_resize: None,
             markdown: markdown::MarkdownCache::default(),
@@ -1017,6 +1019,17 @@ impl CatalogView {
             )
         });
 
+        let preview_view = cx.entity().downgrade();
+        let scrollbar = components::vertical_scrollbar(
+            theme,
+            "catalog-preview",
+            components::ScrollbarSource::Handle(self.preview_scroll.clone()),
+            &self.preview_scrollbar,
+            move |_window, cx| {
+                let _ = preview_view.update(cx, |_this, cx| cx.notify());
+            },
+        );
+
         div()
             .relative()
             .w(px(self.preview_width))
@@ -1030,13 +1043,19 @@ impl CatalogView {
             .child(header)
             .child(
                 div()
-                    .id("catalog-preview-scroll")
+                    .relative()
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.preview_scroll)
-                    .p(px(theme.spacing.s3))
-                    .child(body),
+                    .child(
+                        div()
+                            .id("catalog-preview-scroll")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.preview_scroll)
+                            .p(px(theme.spacing.s3))
+                            .child(body),
+                    )
+                    .when_some(scrollbar, |pane, bar| pane.child(bar)),
             )
             .child(
                 div()

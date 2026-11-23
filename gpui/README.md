@@ -764,6 +764,15 @@ path remains covered by the step-05 live RPC check and its unit tests.
 - **No embedded Graphviz.** `workflow.get` is readable DOT source.
 - **No daemon version.** `system.ping` does not report one; Settings says so.
 - **No container queries.** The responsive breakpoint reads the window width.
+- **Scrollbars are drawn by the client.** The pinned `gpui 0.2.2` paints no
+  scrollbar track or thumb (`scrollbar_width` only reserves layout space), so
+  `components::vertical_scrollbar` overlays its own slim bar on the Catalog
+  `SOURCE` pane, the detail Output feed/raw transcript and the Runs list. It is
+  not a native widget: the bar is a fixed overlay that does not reflow the
+  rendered text, it is hidden while the content fits, and a track click jumps
+  the thumb to the pointer (the thumb centres under it rather than paging).
+  Wheel and keyboard scrolling are unchanged; the thumb follows every source of
+  scrolling and dragging pauses/resumes detail follow like a wheel-up.
 - **The Workflows graph and root list are not virtualized.** They are derived
   from the same 500-row snapshot; the first 500 roots are still painted. The
   graph itself paints one card per instance (roots are tens, not thousands).

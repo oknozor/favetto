@@ -3,11 +3,14 @@
 //! Everything here takes the active [`Theme`] and never hard-codes a color or
 //! a spacing value (docs/design/gpui-client.md §3, Aesthetic-Usability).
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    div, prelude::*, px, transparent_black, Animation, AnimationExt, AnyElement, Div, ElementId,
-    FocusHandle, Hsla, Rgba, Stateful, StyleRefinement,
+    div, point, prelude::*, px, transparent_black, Animation, AnimationExt, AnyElement, App, Div,
+    DragMoveEvent, ElementId, FocusHandle, Hsla, ListState, MouseButton, MouseDownEvent, Render,
+    Rgba, ScrollHandle, Stateful, StyleRefinement, Window,
 };
 
 use crate::state::ConnectionState;
@@ -354,6 +357,366 @@ pub fn copy_button(
     )
 }
 
+/// The visible scrollbar column in px. The pinned `gpui 0.2.2` paints no
+/// scrollbar of its own, so the overlay below draws a slim track and thumb.
+const SCROLLBAR_WIDTH: f32 = 8.0;
+
+/// Inset from the pane's right edge, so the bar reads as an overlay rather
+/// than a border.
+const SCROLLBAR_INSET: f32 = 2.0;
+
+/// The floor for the thumb height: a long document must still leave a target
+/// large enough to grab.
+const SCROLLBAR_MIN_THUMB: f32 = 24.0;
+
+/// Thumb geometry for one viewport/content/offset snapshot, in viewport px.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrollbarThumb {
+    /// Distance from the top of the track.
+    pub top: f32,
+    /// Visible thumb height.
+    pub height: f32,
+}
+
+/// The values a scrollbar needs, normalized to positive pixels from the top.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrollbarMetrics {
+    /// Visible viewport height.
+    pub viewport: f32,
+    /// Total content height (viewport + maximum offset).
+    pub content: f32,
+    /// Current scroll distance from the top, `0..=max_offset`.
+    pub offset: f32,
+}
+
+impl ScrollbarMetrics {
+    /// The furthest the content can scroll.
+    pub fn max_offset(self) -> f32 {
+        (finite(self.content) - finite(self.viewport)).max(0.0)
+    }
+
+    /// The thumb position and height, or `None` while the content fits.
+    pub fn thumb(self, min_height: f32) -> Option<ScrollbarThumb> {
+        let viewport = finite(self.viewport);
+        let max = self.max_offset();
+        if viewport <= 0.0 || max <= 0.0 {
+            return None;
+        }
+        let height = (viewport * viewport / finite(self.content))
+            .max(finite(min_height))
+            .min(viewport);
+        let travel = viewport - height;
+        let offset = finite(self.offset).min(max);
+        let top = if travel > 0.0 {
+            offset / max * travel
+        } else {
+            0.0
+        };
+        Some(ScrollbarThumb { top, height })
+    }
+
+    /// The scroll offset requested by a thumb whose top is `thumb_top`.
+    ///
+    /// Pure so dragging can be unit-tested without a window. Values outside
+    /// the track clamp to the ends instead of overshooting.
+    pub fn offset_for_thumb_top(self, thumb_height: f32, thumb_top: f32) -> f32 {
+        let viewport = finite(self.viewport);
+        let max = self.max_offset();
+        let travel = viewport - finite(thumb_height);
+        if max <= 0.0 || travel <= 0.0 {
+            return 0.0;
+        }
+        (finite(thumb_top) / travel).clamp(0.0, 1.0) * max
+    }
+
+    /// The offset requested by clicking the track at `click_y`: the thumb
+    /// centres under the pointer, so the click lands where the reader aimed.
+    pub fn offset_for_track_click(self, thumb_height: f32, click_y: f32) -> f32 {
+        self.offset_for_thumb_top(thumb_height, finite(click_y) - finite(thumb_height) / 2.0)
+    }
+
+    /// Whether the viewport is within `threshold` px of the tail.
+    pub fn at_bottom(self, threshold: f32) -> bool {
+        let max = self.max_offset();
+        max <= 0.0 || finite(self.offset) >= max - finite(threshold)
+    }
+}
+
+/// The scroll container driving a [`vertical_scrollbar`].
+///
+/// The two GPUI scroll sources expose slightly different offset APIs; the
+/// adapter keeps that difference out of every view.
+#[derive(Clone, Debug)]
+pub enum ScrollbarSource {
+    /// A plain `overflow_y_scroll` pane tracked by a [`ScrollHandle`].
+    Handle(ScrollHandle),
+    /// A virtualized [`ListState`], whose scrollbar helpers freeze the content
+    /// height for the duration of a drag.
+    List(ListState),
+}
+
+impl ScrollbarSource {
+    /// Snapshot the normalized scroll metrics.
+    pub fn metrics(&self) -> ScrollbarMetrics {
+        match self {
+            Self::Handle(handle) => {
+                let viewport = f32::from(handle.bounds().size.height);
+                let max = f32::from(handle.max_offset().height);
+                ScrollbarMetrics {
+                    viewport,
+                    content: viewport + max,
+                    offset: -f32::from(handle.offset().y),
+                }
+                .normalized()
+            }
+            Self::List(list) => {
+                let viewport = f32::from(list.viewport_bounds().size.height);
+                let max = f32::from(list.max_offset_for_scrollbar().height);
+                ScrollbarMetrics {
+                    viewport,
+                    content: viewport + max,
+                    offset: -f32::from(list.scroll_px_offset_for_scrollbar().y),
+                }
+                .normalized()
+            }
+        }
+    }
+
+    /// The scroll viewport bounds in window coordinates, used to map pointer
+    /// positions onto the track.
+    fn viewport_bounds(&self) -> gpui::Bounds<gpui::Pixels> {
+        match self {
+            Self::Handle(handle) => handle.bounds(),
+            Self::List(list) => list.viewport_bounds(),
+        }
+    }
+
+    /// Move the content so `offset` px are scrolled past the top.
+    fn set_offset(&self, offset: f32) {
+        let offset = finite(offset);
+        match self {
+            Self::Handle(handle) => handle.set_offset(point(px(0.0), px(-offset))),
+            Self::List(list) => list.set_offset_from_scrollbar(point(px(0.0), px(-offset))),
+        }
+    }
+
+    fn begin_drag(&self) {
+        if let Self::List(list) = self {
+            list.scrollbar_drag_started();
+        }
+    }
+
+    fn end_drag(&self) {
+        if let Self::List(list) = self {
+            list.scrollbar_drag_ended();
+        }
+    }
+
+    /// Whether the source is within `threshold` px of the tail. The detail view
+    /// uses this to pause/resume follow from a scrollbar drag.
+    pub fn at_bottom(&self, threshold: f32) -> bool {
+        self.metrics().at_bottom(threshold)
+    }
+}
+
+/// The live grab offset shared by a bar's thumb and its drag listeners.
+///
+/// `None` means idle; `Some(grab)` stores where inside the thumb the pointer
+/// grabbed it, so the thumb does not jump on the first move.
+#[derive(Clone, Debug, Default)]
+pub struct ScrollbarDrag(Rc<Cell<Option<f32>>>);
+
+impl ScrollbarDrag {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn begin(&self, grab: f32) {
+        self.0.set(Some(finite(grab)));
+    }
+
+    fn end(&self) -> bool {
+        self.0.take().is_some()
+    }
+
+    fn grab(&self) -> Option<f32> {
+        self.0.get()
+    }
+}
+
+/// The notify callback shared by every scrollbar event handler.
+type ScrollbarChange = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// Zero-sized drag preview: a scrollbar drag has no ghost to paint.
+struct ScrollbarPreview;
+
+impl Render for ScrollbarPreview {
+    fn render(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        div().w(px(0.0)).h(px(0.0))
+    }
+}
+
+/// A slim vertical scrollbar overlay for a pane that already scrolls.
+///
+/// Returns `None` while the content fits, so no track or thumb is painted. The
+/// caller places the result inside a `.relative()` container: the bar is an
+/// absolutely positioned overlay and never reflows or rewraps the pane.
+///
+/// The thumb follows every source of scrolling because its geometry is derived
+/// from the source each render. Dragging, clicking the track and (where the
+/// view wires it) wheel/keyboard scrolling therefore share one scroll offset.
+/// `on_change` runs after a click or drag moves the source so the view can
+/// notify/render and, in the detail Output tab, pause/resume follow.
+pub fn vertical_scrollbar(
+    theme: &Theme,
+    id: impl Into<gpui::SharedString>,
+    source: ScrollbarSource,
+    drag: &ScrollbarDrag,
+    on_change: impl Fn(&mut Window, &mut App) + 'static,
+) -> Option<Div> {
+    let metrics = source.metrics();
+    let thumb = metrics.thumb(SCROLLBAR_MIN_THUMB)?;
+    let viewport_top = f32::from(source.viewport_bounds().origin.y);
+    let bar_name = id.into();
+    let on_change: ScrollbarChange = Rc::new(on_change);
+
+    let track_id = ElementId::Name(gpui::SharedString::new(format!("{bar_name}-track")));
+    let thumb_id = ElementId::Name(gpui::SharedString::new(format!("{bar_name}-thumb")));
+
+    let thumb_grab = drag.clone();
+    let thumb_source = source.clone();
+    let thumb_drag = drag.clone();
+    let thumb_top = thumb.top;
+    let thumb_element = div()
+        .id(thumb_id)
+        .absolute()
+        .top(px(thumb.top))
+        .left(px(1.0))
+        .right(px(1.0))
+        .h(px(thumb.height))
+        .rounded(px(theme.radii.r4))
+        .bg(Hsla::from(theme.colors.muted).opacity(0.75))
+        .cursor_pointer()
+        .hover(|style| style.bg(theme.colors.accent))
+        .on_mouse_down(
+            MouseButton::Left,
+            move |event: &MouseDownEvent, _window, _cx| {
+                thumb_grab.begin(f32::from(event.position.y) - viewport_top - thumb_top);
+                thumb_source.begin_drag();
+            },
+        )
+        .on_drag(thumb_drag, |_drag, _offset, _window, cx| {
+            cx.new(|_| ScrollbarPreview)
+        });
+
+    let track_source = source.clone();
+    let track_drag = drag.clone();
+    let track_click = on_change.clone();
+    let track_element = div()
+        .id(track_id)
+        .absolute()
+        .top(px(0.0))
+        .bottom(px(0.0))
+        .right(px(SCROLLBAR_INSET))
+        .w(px(SCROLLBAR_WIDTH))
+        .rounded(px(theme.radii.r4))
+        .bg(Hsla::from(theme.colors.border).opacity(0.5))
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            move |event: &MouseDownEvent, window, cx| {
+                // The thumb's listener runs first and marks the drag; a press
+                // on the thumb must not also page the track.
+                if track_drag.grab().is_some() {
+                    return;
+                }
+                let click_y = f32::from(event.position.y) - viewport_top;
+                let offset = metrics.offset_for_track_click(thumb.height, click_y);
+                track_source.set_offset(offset);
+                track_click(window, cx);
+            },
+        )
+        .child(thumb_element);
+
+    let end_drag = drag.clone();
+    let end_source = source.clone();
+    let end_change = on_change.clone();
+    let move_drag = drag.clone();
+    let move_source = source.clone();
+    let move_change = on_change.clone();
+    Some(
+        div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right_0()
+            .w(px(SCROLLBAR_WIDTH + SCROLLBAR_INSET))
+            .on_mouse_up(
+                MouseButton::Left,
+                finish_drag(end_drag.clone(), end_source.clone(), end_change.clone()),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                finish_drag(end_drag, end_source, end_change),
+            )
+            .on_drag_move::<ScrollbarDrag>(
+                move |event: &DragMoveEvent<ScrollbarDrag>, window, cx| {
+                    let Some(grab) = move_drag.grab() else {
+                        return;
+                    };
+                    let metrics = move_source.metrics();
+                    let Some(thumb) = metrics.thumb(SCROLLBAR_MIN_THUMB) else {
+                        return;
+                    };
+                    let thumb_top = f32::from(event.event.position.y) - viewport_top - grab;
+                    let offset = metrics.offset_for_thumb_top(thumb.height, thumb_top);
+                    move_source.set_offset(offset);
+                    move_change(window, cx);
+                },
+            )
+            .child(track_element),
+    )
+}
+
+/// Settle a drag once: the `up` and `up_out` listeners share the same logic.
+fn finish_drag(
+    drag: ScrollbarDrag,
+    source: ScrollbarSource,
+    on_change: ScrollbarChange,
+) -> impl Fn(&gpui::MouseUpEvent, &mut Window, &mut App) + 'static {
+    move |_event, window, cx| {
+        if drag.end() {
+            source.end_drag();
+            on_change(window, cx);
+        }
+    }
+}
+
+impl ScrollbarMetrics {
+    fn normalized(self) -> Self {
+        let viewport = finite(self.viewport);
+        let content = finite(self.content).max(viewport);
+        let offset = finite(self.offset).min((content - viewport).max(0.0));
+        Self {
+            viewport,
+            content,
+            offset,
+        }
+    }
+}
+
+fn finite(value: f32) -> f32 {
+    if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,5 +771,81 @@ mod tests {
             motion_id("inbox-spinner", 7),
             "two surfaces showing the same task keep independent phases"
         );
+    }
+
+    fn metrics(viewport: f32, content: f32, offset: f32) -> ScrollbarMetrics {
+        ScrollbarMetrics {
+            viewport,
+            content,
+            offset,
+        }
+    }
+
+    #[test]
+    fn no_thumb_when_the_content_fits() {
+        assert!(metrics(400.0, 400.0, 0.0).thumb(24.0).is_none());
+        assert!(metrics(400.0, 320.0, 0.0).thumb(24.0).is_none());
+        assert!(metrics(0.0, 900.0, 0.0).thumb(24.0).is_none());
+    }
+
+    #[test]
+    fn thumb_is_proportional_and_reaches_both_ends() {
+        let top = metrics(100.0, 400.0, 0.0).thumb(24.0).unwrap();
+        // 1/4 of the content is visible, so the thumb is a quarter of the track.
+        assert_eq!(top.height, 25.0);
+        assert_eq!(top.top, 0.0);
+
+        let middle = metrics(100.0, 400.0, 150.0).thumb(24.0).unwrap();
+        assert_eq!(middle.top, 37.5);
+
+        let bottom = metrics(100.0, 400.0, 300.0).thumb(24.0).unwrap();
+        assert_eq!(bottom.top, 75.0);
+        assert_eq!(bottom.top + bottom.height, 100.0);
+    }
+
+    #[test]
+    fn a_very_long_document_keeps_a_grabbable_thumb() {
+        let thumb = metrics(100.0, 10_000.0, 0.0).thumb(24.0).unwrap();
+        assert_eq!(thumb.height, 24.0);
+        assert!(thumb.height <= 100.0);
+    }
+
+    #[test]
+    fn dragging_maps_the_thumb_back_onto_the_offset() {
+        let metrics = metrics(100.0, 400.0, 0.0);
+        assert_eq!(metrics.offset_for_thumb_top(25.0, 0.0), 0.0);
+        assert_eq!(metrics.offset_for_thumb_top(25.0, 75.0), 300.0);
+        assert_eq!(metrics.offset_for_thumb_top(25.0, 37.5), 150.0);
+        // Overshoot clamps to the ends instead of jumping past them.
+        assert_eq!(metrics.offset_for_thumb_top(25.0, -40.0), 0.0);
+        assert_eq!(metrics.offset_for_thumb_top(25.0, 400.0), 300.0);
+    }
+
+    #[test]
+    fn track_clicks_land_the_thumb_under_the_pointer() {
+        let metrics = metrics(100.0, 400.0, 0.0);
+        // Clicking the middle of the track centres the 25 px thumb there.
+        assert_eq!(metrics.offset_for_track_click(25.0, 50.0), 150.0);
+        assert_eq!(metrics.offset_for_track_click(25.0, 0.0), 0.0);
+        assert_eq!(metrics.offset_for_track_click(25.0, 100.0), 300.0);
+    }
+
+    #[test]
+    fn follow_threshold_only_triggers_at_the_tail() {
+        assert!(metrics(100.0, 100.0, 0.0).at_bottom(24.0));
+        assert!(metrics(100.0, 400.0, 300.0).at_bottom(24.0));
+        assert!(metrics(100.0, 400.0, 280.0).at_bottom(24.0));
+        assert!(!metrics(100.0, 400.0, 200.0).at_bottom(24.0));
+    }
+
+    #[test]
+    fn metrics_clamp_invalid_and_out_of_range_values() {
+        let normalized = metrics(100.0, 400.0, 9_999.0).normalized();
+        assert_eq!(normalized.offset, 300.0);
+        let inverted = metrics(100.0, 20.0, 10.0).normalized();
+        assert_eq!(inverted.content, 100.0);
+        assert_eq!(inverted.offset, 0.0);
+        let nan = metrics(f32::NAN, f32::NAN, f32::NAN).normalized();
+        assert_eq!(nan, metrics(0.0, 0.0, 0.0));
     }
 }

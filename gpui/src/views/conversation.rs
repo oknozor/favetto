@@ -59,8 +59,10 @@ pub struct ConversationPanel {
     raw_output_focus: FocusHandle,
     /// Persisted across renders so live events never jump the reader.
     output_scroll: ScrollHandle,
+    output_scrollbar: components::ScrollbarDrag,
     /// Virtualized feed state: only the visible window is measured/painted.
     events_list: ListState,
+    feed_scrollbar: components::ScrollbarDrag,
     /// The grouped feed, rebuilt only when its source revision changes.
     events_feed: Rc<Vec<FeedRow>>,
     events_feed_key: Option<(ConversationTarget, u8, u64)>,
@@ -104,7 +106,9 @@ impl ConversationPanel {
             error_copy_focus: cx.focus_handle().tab_index(67).tab_stop(true),
             raw_output_focus: cx.focus_handle().tab_index(69).tab_stop(true),
             output_scroll: ScrollHandle::new(),
+            output_scrollbar: components::ScrollbarDrag::new(),
             events_list,
+            feed_scrollbar: components::ScrollbarDrag::new(),
             events_feed: Rc::new(Vec::new()),
             events_feed_key: None,
             markdown: markdown::MarkdownCache::default(),
@@ -1546,14 +1550,35 @@ impl ConversationPanel {
         self.output_rendered = text.len();
         self.sync_follow(self.output_scroll.clone(), cx);
 
+        let output_view = cx.entity().downgrade();
+        let follow_handle = self.output_scroll.clone();
+        let scrollbar = components::vertical_scrollbar(
+            theme,
+            "conversation-output-bar",
+            components::ScrollbarSource::Handle(self.output_scroll.clone()),
+            &self.output_scrollbar,
+            move |_window, cx| {
+                let _ = output_view.update(cx, |this, cx| {
+                    this.sync_follow(follow_handle.clone(), cx);
+                    cx.notify();
+                });
+            },
+        );
+
         div()
-            .id("conversation-output-scroll")
+            .relative()
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
-            .track_scroll(&self.output_scroll)
-            .on_scroll_wheel(cx.listener(Self::on_output_wheel))
-            .child(column)
+            .child(
+                div()
+                    .id("conversation-output-scroll")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.output_scroll)
+                    .on_scroll_wheel(cx.listener(Self::on_output_wheel))
+                    .child(column),
+            )
+            .when_some(scrollbar, |pane, bar| pane.child(bar))
             .into_any_element()
     }
 
@@ -1697,8 +1722,38 @@ impl ConversationPanel {
                 .child(feed_item(&list_theme, &base, index, row))
                 .into_any_element()
         })
-        .flex_1()
-        .min_h_0();
+        .size_full();
+
+        let feed_source = components::ScrollbarSource::List(self.events_list.clone());
+        let follow_source = feed_source.clone();
+        let feed_view = cx.entity().downgrade();
+        let scrollbar = components::vertical_scrollbar(
+            theme,
+            "conversation-events-bar",
+            feed_source,
+            &self.feed_scrollbar,
+            move |_window, cx| {
+                // A scrollbar drag is a deliberate scroll: pause follow when it
+                // leaves the tail and resume when it returns, exactly like the
+                // wheel handler.
+                let at_bottom = follow_source.at_bottom(FOLLOW_THRESHOLD);
+                let _ = feed_view.update(cx, |this, cx| {
+                    this.state.update(cx, |state, cx| {
+                        if state.detail_follow() != at_bottom {
+                            state.set_detail_follow(at_bottom);
+                            cx.notify();
+                        }
+                    });
+                    cx.notify();
+                });
+            },
+        );
+        let feed_area = div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .child(list)
+            .when_some(scrollbar, |pane, bar| pane.child(bar));
 
         let pill = (new_events > 0).then(|| {
             components::with_focus(
@@ -1781,15 +1836,17 @@ impl ConversationPanel {
             );
         }
         let _ = task_id;
-        container.child(list).when_some(pill, |container, pill| {
-            container.child(
-                div()
-                    .absolute()
-                    .right(px(theme.spacing.s3))
-                    .bottom(px(theme.spacing.s3))
-                    .child(pill),
-            )
-        })
+        container
+            .child(feed_area)
+            .when_some(pill, |container, pill| {
+                container.child(
+                    div()
+                        .absolute()
+                        .right(px(theme.spacing.s3))
+                        .bottom(px(theme.spacing.s3))
+                        .child(pill),
+                )
+            })
     }
 
     /// A compact plan card above the output feed.
