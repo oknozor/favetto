@@ -98,6 +98,8 @@ pub async fn upsert(state: &Arc<State>, schedule: &Schedule) -> anyhow::Result<(
     if schedule.enabled {
         let job_id = register(&state.scheduler, state.clone(), schedule).await?;
         db::set_schedule_job_id(&state.db, &schedule.id, &job_id.to_string()).await?;
+    } else {
+        db::clear_schedule_job_id(&state.db, &schedule.id).await?;
     }
     Ok(())
 }
@@ -137,13 +139,17 @@ pub async fn reconcile_catalog_schedules(state: &Arc<State>) -> anyhow::Result<(
     }
 
     // Upsert the desired schedules, skipping ones that are already registered
-    // with the same cron so a reload doesn't re-create unchanged jobs.
+    // with the same cron so a reload doesn't re-create unchanged jobs. Catalog
+    // schedules are user-toggleable: `enabled` and `last_run` belong to the
+    // persisted row, not the catalog header, so a paused schedule stays paused
+    // across reloads and header edits.
     for mut schedule in desired {
         if let Some(old) = existing.iter().find(|s| s.id == schedule.id) {
-            if old.cron == schedule.cron && old.task == schedule.task && old.enabled {
+            schedule.enabled = old.enabled;
+            schedule.last_run = old.last_run;
+            if old.cron == schedule.cron && old.task == schedule.task {
                 continue;
             }
-            schedule.last_run = old.last_run;
         }
         if let Err(e) = upsert(state, &schedule).await {
             tracing::warn!(error = %e, task = %schedule.task, "failed to register catalog schedule");

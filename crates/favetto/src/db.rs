@@ -671,6 +671,14 @@ pub async fn set_schedule_job_id(pool: &SqlitePool, id: &str, job_id: &str) -> a
     Ok(())
 }
 
+pub async fn clear_schedule_job_id(pool: &SqlitePool, id: &str) -> anyhow::Result<()> {
+    sqlx::query("UPDATE schedules SET job_id = NULL WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn get_schedule_job_id(pool: &SqlitePool, id: &str) -> anyhow::Result<Option<String>> {
     let row = sqlx::query("SELECT job_id FROM schedules WHERE id = ?")
         .bind(id)
