@@ -7,6 +7,10 @@ use std::collections::BTreeMap;
 
 use favetto_core::model::{AgentCapabilities, AgentSessionInfo};
 
+fn utc(value: &str) -> Timestamp {
+    value.parse().unwrap()
+}
+
 fn session(id: &str, agent: &str, headless: bool, running: bool) -> AgentSessionInfo {
     AgentSessionInfo {
         id: id.to_string(),
@@ -604,13 +608,12 @@ fn status_line_folds_in_attempt_when_retried() {
 /// A succeeded parent and a failed child whose repo differs only by case. The
 /// Tasks banner and the status bar must name the full target and the reason.
 fn spawn_failure_app() -> App {
-    use chrono::Utc;
     use favetto_core::model::Failure;
 
     let mut app = App::new();
     let mut parent = geom_task("repo:favetto/triage_issues");
     parent.status = TaskStatus::Succeeded;
-    parent.finished_at = Some(Utc::now() - chrono::Duration::seconds(10));
+    parent.finished_at = Some(Timestamp::now() - time::Duration::seconds(10));
 
     let mut child = geom_task("repo:Favetto/plan_issue");
     child.status = TaskStatus::Failed;
@@ -621,7 +624,7 @@ fn spawn_failure_app() -> App {
         FailureKind::InvalidInput,
         "task 'repo:Favetto/plan_issue' not found in the catalog",
     ));
-    child.finished_at = Some(Utc::now());
+    child.finished_at = Some(Timestamp::now());
 
     app.tasks = vec![parent, child];
     app
@@ -698,12 +701,10 @@ fn status_bar_surfaces_failed_spawn_launches() {
 
 #[test]
 fn healthy_workflows_do_not_show_a_launch_failure_warning() {
-    use chrono::Utc;
-
     let mut app = App::new();
     let mut parent = geom_task("repo:favetto/triage_issues");
     parent.status = TaskStatus::Succeeded;
-    parent.finished_at = Some(Utc::now() - chrono::Duration::seconds(10));
+    parent.finished_at = Some(Timestamp::now() - time::Duration::seconds(10));
     let mut child = geom_task("repo:favetto/plan_issue");
     child.status = TaskStatus::Succeeded;
     child.parent_id = Some(parent.id);
@@ -980,38 +981,34 @@ fn task_without_session_title_renders_blank_cell() {
 
 #[test]
 fn started_formats_absolute_time_and_placeholder() {
-    use chrono::TimeZone;
-
     assert_eq!(started(None), "—");
-    let t = Utc.with_ymd_and_hms(2026, 10, 14, 9, 15, 0).unwrap();
+    let t = utc("2026-10-14T09:15:00Z");
     assert_eq!(started(Some(t)), "2026-10-14 09:15");
 }
 
 #[test]
 fn duration_uses_finished_then_live_elapsed_and_placeholder() {
-    use chrono::TimeZone;
-
-    let t0 = Utc.with_ymd_and_hms(2026, 10, 14, 9, 15, 0).unwrap();
-    let now = Utc.with_ymd_and_hms(2026, 10, 14, 9, 15, 45).unwrap();
+    let t0 = utc("2026-10-14T09:15:00Z");
+    let now = utc("2026-10-14T09:15:45Z");
 
     // Never started: both states render the placeholder.
     assert_eq!(duration(None, None, now), "—");
 
     // Finished runs use `finished - started`.
     assert_eq!(
-        duration(Some(t0), Some(t0 + chrono::Duration::seconds(12)), now),
+        duration(Some(t0), Some(t0 + time::Duration::seconds(12)), now),
         "12s"
     );
     assert_eq!(
-        duration(Some(t0), Some(t0 + chrono::Duration::minutes(3)), now),
+        duration(Some(t0), Some(t0 + time::Duration::minutes(3)), now),
         "3m"
     );
     assert_eq!(
-        duration(Some(t0), Some(t0 + chrono::Duration::minutes(80)), now),
+        duration(Some(t0), Some(t0 + time::Duration::minutes(80)), now),
         "1h20m"
     );
     assert_eq!(
-        duration(Some(t0), Some(t0 + chrono::Duration::hours(51)), now),
+        duration(Some(t0), Some(t0 + time::Duration::hours(51)), now),
         "2d3h"
     );
 
@@ -1063,12 +1060,12 @@ fn tasks_table_pending_row_shows_placeholders() {
 
 #[test]
 fn tasks_table_running_and_finished_rows_show_lifecycle() {
-    use chrono::Duration;
+    use time::Duration;
 
     let mut app = App::new();
     app.tab = Tab::Tasks;
 
-    let start = Utc::now() - Duration::minutes(2);
+    let start = Timestamp::now() - Duration::minutes(2);
     let mut running = geom_task("running");
     running.status = TaskStatus::Running;
     running.started_at = Some(start);
@@ -2325,7 +2322,6 @@ fn collapsed_folder_hides_task_in_render() {
 
 #[test]
 fn events_tab_renders_payload_panel() {
-    use chrono::Utc;
     use favetto_core::model::{Event, EventKind};
 
     let mut app = App::new();
@@ -2334,7 +2330,7 @@ fn events_tab_renders_payload_panel() {
         id: 1,
         kind: EventKind::Unknown,
         payload: serde_json::json!({ "hello": "world", "n": 3 }),
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
     });
 
     let backend = TestBackend::new(100, 30);
@@ -2357,7 +2353,6 @@ fn events_tab_renders_payload_panel() {
 }
 
 fn geom_task(name: &str) -> favetto_core::model::Task {
-    use chrono::Utc;
     use favetto_core::model::TaskStatus;
     favetto_core::model::Task {
         id: uuid::Uuid::new_v4(),
@@ -2367,7 +2362,7 @@ fn geom_task(name: &str) -> favetto_core::model::Task {
         input: serde_json::json!({}),
         output: None,
         dedupe_key: None,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         started_at: None,
         finished_at: None,
         error: None,
@@ -2407,7 +2402,6 @@ fn drawn_tasks_record_geometry_and_offset() {
 
 #[test]
 fn drawn_schedules_and_notifications_record_geometry() {
-    use chrono::Utc;
     use favetto_core::model::{NotificationRecord, Schedule};
 
     let mut app = App::new();
@@ -2439,7 +2433,7 @@ fn drawn_schedules_and_notifications_record_geometry() {
         subject: "s".to_string(),
         body: "b".to_string(),
         status: "ok".to_string(),
-        sent_at: Utc::now(),
+        sent_at: Timestamp::now(),
     }];
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -2450,9 +2444,9 @@ fn drawn_schedules_and_notifications_record_geometry() {
 
 #[test]
 fn format_next_run_renders_buckets() {
-    use chrono::{Duration, Utc};
+    use time::Duration;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     assert_eq!(format_next_run(false, Some(now), now), "disabled");
     assert_eq!(format_next_run(true, None, now), "—");
     assert_eq!(
@@ -2484,8 +2478,8 @@ fn format_next_run_renders_buckets() {
 
 #[test]
 fn schedules_tab_renders_next_run_countdown() {
-    use chrono::{Duration, Utc};
     use favetto_core::model::Schedule;
+    use time::Duration;
 
     let mut app = App::new();
     app.tab = Tab::Scheduler;
@@ -2497,7 +2491,7 @@ fn schedules_tab_renders_next_run_countdown() {
             input: serde_json::json!({}),
             enabled: true,
             last_run: None,
-            next_run: Some(Utc::now() + Duration::minutes(90)),
+            next_run: Some(Timestamp::now() + Duration::minutes(90)),
         },
         Schedule {
             id: "off".to_string(),
@@ -2741,10 +2735,10 @@ fn scrolling_body_layout_clamps_scroll() {
 fn usage_stats_for(period: UsagePeriod) -> favetto_core::model::UsageStats {
     use favetto_core::model::{AgentUsage, UsageBucket, UsageStats, UsageTotals};
 
-    let start = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+    let start = Timestamp::from_unix_timestamp_millis(1_700_000_000_000).unwrap();
     let bucket = |offset: i64, input: u64, cost: Option<f64>| UsageBucket {
-        start: start + chrono::Duration::hours(offset),
-        end: start + chrono::Duration::hours(offset + 1),
+        start: start + time::Duration::hours(offset),
+        end: start + time::Duration::hours(offset + 1),
         usage: AgentUsage {
             input_tokens: input,
             output_tokens: input / 2,
@@ -2829,7 +2823,7 @@ fn usage_formatting_helpers_are_compact_and_guarded() {
     assert_eq!(cost_bar_value(None), 0);
     assert_eq!(cost_bar_value(Some(0.5)), 500_000);
 
-    let start = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+    let start = Timestamp::from_unix_timestamp_millis(1_700_000_000_000).unwrap();
     assert_eq!(bucket_label(UsagePeriod::Year, start).len(), 3);
     assert_eq!(bucket_label(UsagePeriod::Day, start).len(), 2);
 }
@@ -2915,7 +2909,6 @@ fn tasks_table_filters_to_the_active_repo() {
 
 #[test]
 fn events_list_shows_repo_column_and_filters_to_the_active_repo() {
-    use chrono::Utc;
     use favetto_core::model::{Event, EventKind};
 
     let mut app = App::new();
@@ -2924,13 +2917,13 @@ fn events_list_shows_repo_column_and_filters_to_the_active_repo() {
         id: 1,
         kind: EventKind::TaskStarted,
         payload: serde_json::json!({ "name": "repo:my-repo/build" }),
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
     });
     app.ingest_event(Event {
         id: 2,
         kind: EventKind::TaskStarted,
         payload: serde_json::json!({ "name": "global_task" }),
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
     });
 
     let text = render_text(&mut app, 120, 30);

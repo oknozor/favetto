@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use chrono::{DateTime, Utc};
+use favetto_core::Timestamp;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -2347,14 +2347,14 @@ fn draw_catalog_preview(frame: &mut Frame, app: &mut App, area: Rect, theme: The
 
 /// `in 3h 12m` / `in 45s` / `in 2d 4h`; `disabled` when the schedule is off,
 /// an em dash when there is no computed next run.
-fn format_next_run(enabled: bool, next_run: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
+fn format_next_run(enabled: bool, next_run: Option<Timestamp>, now: Timestamp) -> String {
     if !enabled {
         return "disabled".to_string();
     }
     let Some(next) = next_run else {
         return "—".to_string();
     };
-    let secs = (next - now).num_seconds().max(0);
+    let secs = (next - now).whole_seconds().max(0);
     if secs < 60 {
         format!("in {secs}s")
     } else if secs < 3_600 {
@@ -2378,7 +2378,7 @@ fn draw_schedules(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     let header = Row::new(vec!["ID", "CRON", "TASK", "ENABLED", "NEXT RUN", "INPUT"])
         .style(theme.table_header());
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     let rows: Vec<Row> = app
         .schedules
         .iter()
@@ -2642,11 +2642,15 @@ fn cost_bar_value(cost: Option<f64>) -> u64 {
 }
 
 /// The x-axis label for one usage bucket.
-fn bucket_label(period: UsagePeriod, start: DateTime<Utc>) -> String {
+fn bucket_label(period: UsagePeriod, start: Timestamp) -> String {
+    let start = start.to_offset_datetime();
+    let format = |items| start.format(items).unwrap_or_default();
     match period {
-        UsagePeriod::Day => start.format("%H").to_string(),
-        UsagePeriod::Week | UsagePeriod::Month => start.format("%d").to_string(),
-        UsagePeriod::Year => start.format("%b").to_string(),
+        UsagePeriod::Day => format(time::macros::format_description!("[hour]")),
+        UsagePeriod::Week | UsagePeriod::Month => {
+            format(time::macros::format_description!("[day]"))
+        }
+        UsagePeriod::Year => format(time::macros::format_description!("[month repr:short]")),
     }
 }
 
@@ -2693,7 +2697,7 @@ fn draw_tasks(frame: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
             .iter()
             .map(|t| {
                 let (activity, usage) = app.task_activity_usage(&t.id.to_string());
-                let now = Utc::now();
+                let now = Timestamp::now();
                 Row::new(vec![
                     Cell::from(short_id(&t.id)),
                     Cell::from(task_display_name(&t.name)),
@@ -3640,8 +3644,8 @@ fn truncate_ellipsis(s: &str, max: usize) -> String {
     )
 }
 
-fn age(ts: DateTime<Utc>) -> String {
-    let secs = (Utc::now() - ts).num_seconds().max(0);
+fn age(ts: Timestamp) -> String {
+    let secs = (Timestamp::now() - ts).whole_seconds().max(0);
     if secs < 60 {
         format!("{secs}s")
     } else if secs < 3600 {
@@ -3652,9 +3656,14 @@ fn age(ts: DateTime<Utc>) -> String {
 }
 
 /// Absolute run start in UTC, or `—` when the run never started.
-fn started(ts: Option<DateTime<Utc>>) -> String {
+fn started(ts: Option<Timestamp>) -> String {
     match ts {
-        Some(ts) => ts.format("%Y-%m-%d %H:%M").to_string(),
+        Some(ts) => ts
+            .to_offset_datetime()
+            .format(time::macros::format_description!(
+                "[year]-[month]-[day] [hour]:[minute]"
+            ))
+            .unwrap_or_default(),
         None => "—".to_string(),
     }
 }
@@ -3662,16 +3671,16 @@ fn started(ts: Option<DateTime<Utc>>) -> String {
 /// Run duration: `finished - started`, or `now - started` while live.
 /// `—` when the run never started.
 fn duration(
-    started_at: Option<DateTime<Utc>>,
-    finished_at: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
+    started_at: Option<Timestamp>,
+    finished_at: Option<Timestamp>,
+    now: Timestamp,
 ) -> String {
     let Some(started_at) = started_at else {
         return "—".to_string();
     };
     compact_duration(
         (finished_at.unwrap_or(now) - started_at)
-            .num_seconds()
+            .whole_seconds()
             .max(0),
     )
 }

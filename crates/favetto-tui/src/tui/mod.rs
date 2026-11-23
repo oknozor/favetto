@@ -2495,7 +2495,7 @@ mod tests {
             capabilities: Default::default(),
             sessions: vec![live],
         }];
-        let now = chrono::Utc::now();
+        let now = favetto_core::Timestamp::now();
         let past = AgentSessionHistoryEntry {
             id: "local-past".to_string(),
             agent: "opencode".to_string(),
@@ -2575,7 +2575,7 @@ mod tests {
 
     #[test]
     fn provider_rows_already_imported_or_unsupported_are_not_duplicated() {
-        let now = chrono::Utc::now();
+        let now = favetto_core::Timestamp::now();
         let local = AgentSessionHistoryEntry {
             id: "local-1".to_string(),
             agent: "opencode".to_string(),

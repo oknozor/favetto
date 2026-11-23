@@ -1,0 +1,13 @@
+[package]
+name = "favetto-cron"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dependency-light cron parser and next-occurrence math over `time`."
+
+[dependencies]
+favetto-wire = { path = "../favetto-wire" }
+thiserror = "2"
+time = { workspace = true }

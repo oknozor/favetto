@@ -261,6 +261,7 @@ mod tests {
 
     use crate::event_bus::EventBus;
     use crate::state::StateInit;
+    use favetto_core::Timestamp;
 
     /// A unique scratch directory for watcher tests.
     fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -291,7 +292,7 @@ mod tests {
         let catalog = Arc::new(parking_lot::RwLock::new(
             crate::tasks::load_catalog(tasks_dir).unwrap(),
         ));
-        let scheduler = tokio_cron_scheduler::JobScheduler::new().await.unwrap();
+        let scheduler = crate::scheduler::Scheduler::new().await.unwrap();
         let config = Arc::new(config);
         Arc::new(State::new(StateInit {
             config_path: std::path::PathBuf::new(),
@@ -720,9 +721,7 @@ mod tests {
             .await
             .unwrap();
 
-        let last_run = chrono::DateTime::parse_from_rfc3339("2026-01-05T00:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let last_run: Timestamp = "2026-01-05T00:00:00Z".parse().unwrap();
         let mut schedule = stored_schedule(&state, "catalog:a").await;
         schedule.enabled = false;
         schedule.last_run = Some(last_run);
@@ -787,7 +786,7 @@ mod repo_tests {
         let catalog = Arc::new(parking_lot::RwLock::new(
             crate::tasks::load_catalog(tasks_dir).unwrap(),
         ));
-        let scheduler = tokio_cron_scheduler::JobScheduler::new().await.unwrap();
+        let scheduler = crate::scheduler::Scheduler::new().await.unwrap();
         let config = Arc::new(config);
         Arc::new(State::new(StateInit {
             config_path: std::path::PathBuf::new(),

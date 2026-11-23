@@ -565,8 +565,8 @@ Deviations from the plan are recorded in this file as the chain progresses
 ### Step 09 deviations / additions
 
 - **Cron validation matches the daemon.** `schedules.upsert` is registered with
-  a `Seconds::Required` parser (`dom_and_dow(true)`, UTC), so the client uses
-  the same configuration via `croner`. A five-field expression is accepted as a
+  a seconds-required parser (`dom_and_dow(true)`, UTC), so the client uses the
+  daemon's own `favetto-cron` parser. A five-field expression is accepted as a
   convenience and normalized by inserting a zero-seconds field before the RPC,
   so a saved schedule always fires on the cadence the hint describes.
 - **Density is a spacing scale, not a second layout.** Comfortable uses the

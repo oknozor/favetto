@@ -186,7 +186,7 @@ fn render_context_exposes_task_input_and_prev() {
         }),
         output: None,
         dedupe_key: None,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         started_at: None,
         finished_at: None,
         error: None,
@@ -216,7 +216,7 @@ fn task_with_session(session_id: Option<&str>, session_title: Option<&str>) -> T
         input: serde_json::json!({}),
         output: None,
         dedupe_key: None,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         started_at: None,
         finished_at: None,
         error: None,
@@ -244,7 +244,7 @@ fn running_run(task_id: Uuid) -> TaskRun {
         agent: None,
         model: None,
         session_id: None,
-        started_at: Some(Utc::now()),
+        started_at: Some(Timestamp::now()),
         finished_at: None,
         exit_code: None,
         error: None,
@@ -732,7 +732,7 @@ async fn build_task_output_bounds_every_shape() {
         input: serde_json::json!({}),
         output: Some(built),
         dedupe_key: None,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         started_at: None,
         finished_at: None,
         error: None,
@@ -977,7 +977,7 @@ fn branch_name_slugifies_folder_qualified_task() {
         input: serde_json::json!({}),
         output: None,
         dedupe_key: None,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         started_at: None,
         finished_at: None,
         error: None,
@@ -999,7 +999,7 @@ fn branch_name_slugifies_folder_qualified_task() {
     );
 }
 
-fn wt_record(task_id: Uuid, created_at: chrono::DateTime<Utc>) -> db::WorktreeRecord {
+fn wt_record(task_id: Uuid, created_at: Timestamp) -> db::WorktreeRecord {
     db::WorktreeRecord {
         task_id,
         repo: PathBuf::from("/repo"),
@@ -1025,10 +1025,10 @@ fn terminal_status_classification() {
 
 #[test]
 fn select_prunable_keeps_active_and_fresh() {
-    let now = Utc::now();
-    let cutoff = Some(now - chrono::Duration::days(30));
+    let now = Timestamp::now();
+    let cutoff = Some(now - time::Duration::days(30));
     let fresh = wt_record(Uuid::new_v4(), now);
-    let active = wt_record(Uuid::new_v4(), now - chrono::Duration::days(60));
+    let active = wt_record(Uuid::new_v4(), now - time::Duration::days(60));
 
     let mut tasks = HashMap::new();
     tasks.insert(fresh.task_id, (TaskStatus::Succeeded, Some(now)));
@@ -1040,17 +1040,14 @@ fn select_prunable_keeps_active_and_fresh() {
 
 #[test]
 fn select_prunable_removes_expired_terminal() {
-    let now = Utc::now();
-    let cutoff = Some(now - chrono::Duration::days(30));
-    let old = wt_record(Uuid::new_v4(), now - chrono::Duration::days(60));
+    let now = Timestamp::now();
+    let cutoff = Some(now - time::Duration::days(30));
+    let old = wt_record(Uuid::new_v4(), now - time::Duration::days(60));
 
     let mut tasks = HashMap::new();
     tasks.insert(
         old.task_id,
-        (
-            TaskStatus::Succeeded,
-            Some(now - chrono::Duration::days(60)),
-        ),
+        (TaskStatus::Succeeded, Some(now - time::Duration::days(60))),
     );
 
     let selected = select_prunable(std::slice::from_ref(&old), &tasks, cutoff, true, 0);
@@ -1059,12 +1056,12 @@ fn select_prunable_removes_expired_terminal() {
 
 #[test]
 fn select_prunable_honors_min_worktrees() {
-    let now = Utc::now();
-    let cutoff = Some(now - chrono::Duration::days(30));
+    let now = Timestamp::now();
+    let cutoff = Some(now - time::Duration::days(30));
     // Three expired, terminal worktrees; the newest one is kept.
-    let newest = wt_record(Uuid::new_v4(), now - chrono::Duration::days(40));
-    let middle = wt_record(Uuid::new_v4(), now - chrono::Duration::days(50));
-    let oldest = wt_record(Uuid::new_v4(), now - chrono::Duration::days(60));
+    let newest = wt_record(Uuid::new_v4(), now - time::Duration::days(40));
+    let middle = wt_record(Uuid::new_v4(), now - time::Duration::days(50));
+    let oldest = wt_record(Uuid::new_v4(), now - time::Duration::days(60));
 
     let mut tasks = HashMap::new();
     for (record, finished) in [(&newest, 40), (&middle, 50), (&oldest, 60)] {
@@ -1072,7 +1069,7 @@ fn select_prunable_honors_min_worktrees() {
             record.task_id,
             (
                 TaskStatus::Failed,
-                Some(now - chrono::Duration::days(finished)),
+                Some(now - time::Duration::days(finished)),
             ),
         );
     }
@@ -1093,8 +1090,8 @@ fn select_prunable_honors_min_worktrees() {
 
 #[test]
 fn select_prunable_removes_orphans_and_non_kept() {
-    let now = Utc::now();
-    let cutoff = Some(now - chrono::Duration::days(30));
+    let now = Timestamp::now();
+    let cutoff = Some(now - time::Duration::days(30));
     let orphan = wt_record(Uuid::new_v4(), now);
     let not_kept = wt_record(Uuid::new_v4(), now);
 
@@ -1117,8 +1114,8 @@ fn select_prunable_removes_orphans_and_non_kept() {
 
 #[test]
 fn select_prunable_days_zero_keeps_kept_worktrees() {
-    let now = Utc::now();
-    let kept = wt_record(Uuid::new_v4(), now - chrono::Duration::days(365));
+    let now = Timestamp::now();
+    let kept = wt_record(Uuid::new_v4(), now - time::Duration::days(365));
     let orphan = wt_record(Uuid::new_v4(), now);
 
     let mut tasks = HashMap::new();
@@ -1237,7 +1234,7 @@ async fn join_state_with_config(
         data_dir: dir.to_path_buf(),
         tasks_dir: dir.to_path_buf(),
         catalog: Arc::new(RwLock::new(catalog)),
-        scheduler: tokio_cron_scheduler::JobScheduler::new().await.unwrap(),
+        scheduler: crate::scheduler::Scheduler::new().await.unwrap(),
         hook_store: Arc::new(RwLock::new(Vec::new())),
     }))
 }
@@ -1574,7 +1571,7 @@ fn lineage_task(name: &str, status: TaskStatus, root: Option<Uuid>, parent: Opti
         input: serde_json::json!({}),
         output: None,
         dedupe_key: None,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         started_at: None,
         finished_at: None,
         error: None,
@@ -1606,7 +1603,7 @@ fn finished_event_at(event_id: i64, name: &str, id: Uuid, success: bool) -> Even
             "task_id": id.to_string(),
             "success": success,
         }),
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
     }
 }
 
@@ -1773,7 +1770,7 @@ async fn enriched_finished_payload_still_starts_dependents() {
         id: 1,
         kind: EventKind::TaskFinished,
         payload: finished_payload(&target, false),
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
     };
     start_dependents(&state, &event).await;
 

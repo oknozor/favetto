@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use chrono::Utc;
+use favetto_core::Timestamp;
 use parking_lot::Mutex;
 use sqlx::SqlitePool;
 use tokio::sync::broadcast;
@@ -686,7 +686,8 @@ impl AgentManager {
         // The durable row exists before the agent does. Only the identity,
         // lifecycle and optional task/run link are stored; the transcript stays
         // with the agent.
-        let mut record = AgentSessionRecord::loading(id.clone(), name, cwd.clone(), Utc::now());
+        let mut record =
+            AgentSessionRecord::loading(id.clone(), name, cwd.clone(), Timestamp::now());
         record.task_id = launch.task_id.clone();
         record.run_id = launch.run_id.clone();
         if let Some(store) = &self.store {
@@ -846,7 +847,7 @@ impl AgentManager {
         let record = match store.find_by_external(name, provider_session_id).await? {
             Some(record) => record,
             None => {
-                let now = Utc::now();
+                let now = Timestamp::now();
                 let cwd = match cwd {
                     Some(cwd) => cwd,
                     None => std::env::current_dir().map_err(|error| {

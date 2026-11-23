@@ -479,7 +479,7 @@ mod tests {
         let tasks_dir = dir.join("tasks");
         std::fs::create_dir_all(&tasks_dir).unwrap();
         let catalog = Arc::new(parking_lot::RwLock::new(Vec::new()));
-        let scheduler = tokio_cron_scheduler::JobScheduler::new().await.unwrap();
+        let scheduler = crate::scheduler::Scheduler::new().await.unwrap();
         let config = Arc::new(config);
         Arc::new(State::new(StateInit {
             config_path: std::path::PathBuf::new(),

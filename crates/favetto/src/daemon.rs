@@ -96,7 +96,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     // Resolve `[git]` (global + per-agent) and materialize any generated scripts
     // once, so a malformed section fails startup like an unknown agent type.
     agents.configure_git(&config, data_dir.clone())?;
-    let scheduler = tokio_cron_scheduler::JobScheduler::new().await?;
+    let scheduler = crate::scheduler::Scheduler::new().await?;
 
     // Resolve webhook secrets from config/env before starting up.
     let webhooks = WebhookSecrets::from_config(&config);

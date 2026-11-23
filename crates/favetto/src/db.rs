@@ -9,11 +9,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, NaiveTime, TimeZone, Utc};
+use favetto_core::Timestamp;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
 };
 use sqlx::{Row, SqlitePool};
+use time::{Date, Duration as TimeDuration, Month, PrimitiveDateTime, Time};
 use uuid::Uuid;
 
 use favetto_core::agent_state::{
@@ -195,12 +196,12 @@ CREATE INDEX IF NOT EXISTS idx_task_runs_status ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_task_runs_finished_at ON task_runs(finished_at);
 "#;
 
-fn ts_ms(dt: DateTime<Utc>) -> i64 {
-    dt.timestamp_millis()
+fn ts_ms(dt: Timestamp) -> i64 {
+    dt.unix_timestamp_millis()
 }
 
-fn from_ms(ms: i64) -> DateTime<Utc> {
-    DateTime::from_timestamp_millis(ms).unwrap_or_else(Utc::now)
+fn from_ms(ms: i64) -> Timestamp {
+    Timestamp::from_unix_timestamp_millis(ms).unwrap_or_else(Timestamp::now)
 }
 
 /// Open (creating if necessary) the SQLite pool.
@@ -736,7 +737,7 @@ pub async fn get_schedule_job_id(pool: &SqlitePool, id: &str) -> anyhow::Result<
 
 pub async fn touch_schedule(pool: &SqlitePool, id: &str) -> anyhow::Result<()> {
     sqlx::query("UPDATE schedules SET last_run = ? WHERE id = ?")
-        .bind(ts_ms(Utc::now()))
+        .bind(ts_ms(Timestamp::now()))
         .bind(id)
         .execute(pool)
         .await?;
@@ -825,7 +826,7 @@ pub async fn insert_repo(
     sqlx::query("INSERT INTO known_repos (name, path, added_at, source) VALUES (?, ?, ?, ?)")
         .bind(name)
         .bind(path)
-        .bind(ts_ms(Utc::now()))
+        .bind(ts_ms(Timestamp::now()))
         .bind(repo_source_str(source))
         .execute(pool)
         .await?;
@@ -893,8 +894,8 @@ pub async fn set_active_repo(pool: &SqlitePool, name: Option<&str>) -> anyhow::R
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserRecord {
     pub username: String,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// Create a user, or replace the password of an existing one.
@@ -905,7 +906,7 @@ pub async fn upsert_user(
     username: &str,
     password_hash: &str,
 ) -> anyhow::Result<()> {
-    let now = ts_ms(Utc::now());
+    let now = ts_ms(Timestamp::now());
     sqlx::query(
         "INSERT INTO users (username, password_hash, created_at, updated_at)
          VALUES (?, ?, ?, ?)
@@ -981,7 +982,7 @@ pub async fn insert_notification(
     .bind(subject)
     .bind(body)
     .bind(status)
-    .bind(ts_ms(Utc::now()))
+    .bind(ts_ms(Timestamp::now()))
     .execute(pool)
     .await?;
     Ok(res.last_insert_rowid())
@@ -1028,7 +1029,7 @@ pub async fn record_delivery(
     )
     .bind(delivery_id)
     .bind(provider)
-    .bind(ts_ms(Utc::now()))
+    .bind(ts_ms(Timestamp::now()))
     .execute(pool)
     .await?;
     Ok(res.rows_affected() == 1)
@@ -1074,7 +1075,7 @@ pub async fn interrupt_run(
         "UPDATE task_runs SET status = 'interrupted', finished_at = ?, error = ?, failure = ? \
          WHERE id = ? AND status IN ('pending', 'running', 'awaiting_input')",
     )
-    .bind(ts_ms(Utc::now()))
+    .bind(ts_ms(Timestamp::now()))
     .bind(error)
     .bind(serde_json::to_string(failure)?)
     .bind(id.to_string())
@@ -1097,7 +1098,7 @@ pub async fn fail_stale_task(
     )
     .bind(error)
     .bind(serde_json::to_string(failure)?)
-    .bind(ts_ms(Utc::now()))
+    .bind(ts_ms(Timestamp::now()))
     .bind(id.to_string())
     .execute(pool)
     .await?;
@@ -1129,7 +1130,7 @@ pub async fn retry_stale_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<boo
 pub async fn schedule_task_retry(
     pool: &SqlitePool,
     id: Uuid,
-    retry_at: DateTime<Utc>,
+    retry_at: Timestamp,
 ) -> anyhow::Result<bool> {
     let result = sqlx::query(
         "UPDATE tasks SET status = 'pending', started_at = NULL, finished_at = NULL, \
@@ -1168,7 +1169,7 @@ pub async fn cancel_active_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<b
         "UPDATE tasks SET status = 'cancelled', finished_at = ? \
          WHERE id = ? AND status IN ('pending', 'running', 'awaiting_input')",
     )
-    .bind(ts_ms(Utc::now()))
+    .bind(ts_ms(Timestamp::now()))
     .bind(id.to_string())
     .execute(pool)
     .await?;
@@ -1236,7 +1237,7 @@ pub async fn fail_pending_task(
     )
     .bind(error)
     .bind(serde_json::to_string(failure)?)
-    .bind(ts_ms(Utc::now()))
+    .bind(ts_ms(Timestamp::now()))
     .bind(id.to_string())
     .execute(pool)
     .await?;
@@ -1264,7 +1265,7 @@ pub async fn next_pending_tasks(pool: &SqlitePool, limit: i64) -> anyhow::Result
            ) \
          ORDER BY t.created_at ASC LIMIT ?",
     )
-    .bind(ts_ms(Utc::now()))
+    .bind(ts_ms(Timestamp::now()))
     .bind(limit.max(1))
     .fetch_all(pool)
     .await?;
@@ -1279,7 +1280,7 @@ pub async fn next_pending_tasks(pool: &SqlitePool, limit: i64) -> anyhow::Result
 /// attempt. Returns the new run, or `None` when the task was already claimed
 /// (e.g. by another dispatcher tick) so a duplicate run is never created.
 pub async fn claim_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<Option<TaskRun>> {
-    let now = Utc::now();
+    let now = Timestamp::now();
     let attempt = task.attempt + 1;
     let mut tx = pool.begin().await?;
     let result = sqlx::query(
@@ -1379,7 +1380,7 @@ pub async fn insert_dependency(
     pool: &SqlitePool,
     task_id: Uuid,
     depends_on: Uuid,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
 ) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT OR IGNORE INTO task_dependencies (task_id, depends_on, kind, created_at)
@@ -1703,8 +1704,8 @@ pub struct AgentSessionRecord {
     pub status: AgentSessionStatus,
     /// Last error, for a `Failed` record.
     pub error: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 #[allow(dead_code)] // wired into session launch/history by the following steps
@@ -1714,7 +1715,7 @@ impl AgentSessionRecord {
         id: impl Into<String>,
         agent: impl Into<String>,
         cwd: impl Into<PathBuf>,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Self {
         Self {
             id: id.into(),
@@ -1805,7 +1806,7 @@ pub async fn set_agent_session_status(
     id: &str,
     status: AgentSessionStatus,
     error: Option<&str>,
-    updated_at: DateTime<Utc>,
+    updated_at: Timestamp,
 ) -> anyhow::Result<bool> {
     let result =
         sqlx::query("UPDATE agent_sessions SET status = ?, error = ?, updated_at = ? WHERE id = ?")
@@ -1827,7 +1828,7 @@ pub async fn mark_agent_session_ready(
     pool: &SqlitePool,
     id: &str,
     external_session_id: &str,
-    updated_at: DateTime<Utc>,
+    updated_at: Timestamp,
 ) -> anyhow::Result<bool> {
     let result = sqlx::query(
         "UPDATE agent_sessions
@@ -1849,7 +1850,7 @@ pub async fn mark_agent_session_ready(
 pub async fn close_agent_session(
     pool: &SqlitePool,
     id: &str,
-    updated_at: DateTime<Utc>,
+    updated_at: Timestamp,
 ) -> anyhow::Result<bool> {
     let result = sqlx::query(
         "UPDATE agent_sessions SET status = 'ended', updated_at = ?
@@ -1870,7 +1871,7 @@ pub async fn fail_agent_session(
     pool: &SqlitePool,
     id: &str,
     error: &str,
-    updated_at: DateTime<Utc>,
+    updated_at: Timestamp,
 ) -> anyhow::Result<bool> {
     let result = sqlx::query(
         "UPDATE agent_sessions SET status = 'failed', error = ?, updated_at = ?
@@ -1908,7 +1909,7 @@ pub async fn set_agent_session_external_id(
     pool: &SqlitePool,
     id: &str,
     external_session_id: &str,
-    updated_at: DateTime<Utc>,
+    updated_at: Timestamp,
 ) -> anyhow::Result<bool> {
     let result = sqlx::query(
         "UPDATE agent_sessions SET external_session_id = ?, updated_at = ? WHERE id = ?",
@@ -1927,7 +1928,7 @@ pub async fn set_agent_session_title(
     pool: &SqlitePool,
     id: &str,
     title: Option<&str>,
-    updated_at: DateTime<Utc>,
+    updated_at: Timestamp,
 ) -> anyhow::Result<bool> {
     let result = sqlx::query("UPDATE agent_sessions SET title = ?, updated_at = ? WHERE id = ?")
         .bind(title)
@@ -2055,7 +2056,7 @@ const DAY_MS: i64 = 86_400_000;
 pub async fn usage_stats(
     pool: &SqlitePool,
     period: UsagePeriod,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> anyhow::Result<UsageStats> {
     let buckets = usage_bucket_bounds(period, now);
     let Some(first) = buckets.first() else {
@@ -2141,17 +2142,14 @@ pub async fn usage_stats(
 }
 
 /// The old-to-new bucket boundaries for a period, ending at `now`.
-fn usage_bucket_bounds(
-    period: UsagePeriod,
-    now: DateTime<Utc>,
-) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+fn usage_bucket_bounds(period: UsagePeriod, now: Timestamp) -> Vec<(Timestamp, Timestamp)> {
     match period {
         UsagePeriod::Day => {
-            let end = floor_to(now, HOUR_MS) + ChronoDuration::hours(1);
+            let end = floor_to(now, HOUR_MS) + TimeDuration::hours(1);
             (0..24)
                 .map(|i| {
-                    let start = end - ChronoDuration::hours(24 - i);
-                    (start, start + ChronoDuration::hours(1))
+                    let start = end - TimeDuration::hours(24 - i);
+                    (start, start + TimeDuration::hours(1))
                 })
                 .collect()
         }
@@ -2163,47 +2161,62 @@ fn usage_bucket_bounds(
 
 /// The bucket key SQLite's `strftime` groups by, mirrored in Rust so a bucket
 /// can be matched without a second query.
-fn usage_bucket_key(period: UsagePeriod, start: DateTime<Utc>) -> String {
+fn usage_bucket_key(period: UsagePeriod, start: Timestamp) -> String {
+    let start = start.to_offset_datetime();
     match period {
-        UsagePeriod::Day => start.format("%Y-%m-%dT%H").to_string(),
-        UsagePeriod::Week | UsagePeriod::Month => start.format("%Y-%m-%d").to_string(),
-        UsagePeriod::Year => start.format("%Y-%m").to_string(),
+        UsagePeriod::Day => start
+            .format(time::macros::format_description!(
+                "[year]-[month]-[day]T[hour]"
+            ))
+            .unwrap_or_default(),
+        UsagePeriod::Week | UsagePeriod::Month => start
+            .format(time::macros::format_description!("[year]-[month]-[day]"))
+            .unwrap_or_default(),
+        UsagePeriod::Year => start
+            .format(time::macros::format_description!("[year]-[month]"))
+            .unwrap_or_default(),
     }
 }
 
 /// Truncate `now` down to a multiple of `step_ms` since the Unix epoch.
-fn floor_to(now: DateTime<Utc>, step_ms: i64) -> DateTime<Utc> {
-    let ms = now.timestamp_millis().div_euclid(step_ms) * step_ms;
-    DateTime::from_timestamp_millis(ms).unwrap_or(now)
+fn floor_to(now: Timestamp, step_ms: i64) -> Timestamp {
+    let ms = now.unix_timestamp_millis().div_euclid(step_ms) * step_ms;
+    Timestamp::from_unix_timestamp_millis(ms).unwrap_or(now)
 }
 
-fn day_buckets(now: DateTime<Utc>, days: i64) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
-    let end = floor_to(now, DAY_MS) + ChronoDuration::days(1);
+fn day_buckets(now: Timestamp, days: i64) -> Vec<(Timestamp, Timestamp)> {
+    let end = floor_to(now, DAY_MS) + TimeDuration::days(1);
     (0..days)
         .map(|i| {
-            let start = end - ChronoDuration::days(days - i);
-            (start, start + ChronoDuration::days(1))
+            let start = end - TimeDuration::days(days - i);
+            (start, start + TimeDuration::days(1))
         })
         .collect()
 }
 
 /// The first instant of `now`'s UTC calendar month.
-fn month_floor(now: DateTime<Utc>) -> DateTime<Utc> {
-    let date =
-        NaiveDate::from_ymd_opt(now.year(), now.month(), 1).unwrap_or_else(|| now.date_naive());
-    Utc.from_utc_datetime(&date.and_time(NaiveTime::MIN))
+fn month_floor(now: Timestamp) -> Timestamp {
+    let dt = now.to_offset_datetime();
+    let date = Date::from_calendar_date(dt.year(), dt.month(), 1).unwrap_or_else(|_| dt.date());
+    PrimitiveDateTime::new(date, Time::MIDNIGHT)
+        .assume_utc()
+        .into()
 }
 
 /// `base` shifted by `delta` whole months (clamped to the first of the month).
-fn add_months(base: DateTime<Utc>, delta: i32) -> DateTime<Utc> {
-    let total = base.year() * 12 + base.month0() as i32 + delta;
+fn add_months(base: Timestamp, delta: i32) -> Timestamp {
+    let dt = base.to_offset_datetime();
+    let total = dt.year() * 12 + i32::from(u8::from(dt.month())) - 1 + delta;
     let year = total.div_euclid(12);
     let month = total.rem_euclid(12) + 1;
-    let date = NaiveDate::from_ymd_opt(year, month as u32, 1).unwrap_or_else(|| base.date_naive());
-    Utc.from_utc_datetime(&date.and_time(NaiveTime::MIN))
+    let month = Month::try_from(month as u8).unwrap_or_else(|_| dt.month());
+    let date = Date::from_calendar_date(year, month, 1).unwrap_or_else(|_| dt.date());
+    PrimitiveDateTime::new(date, Time::MIDNIGHT)
+        .assume_utc()
+        .into()
 }
 
-fn month_buckets(now: DateTime<Utc>, months: i32) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+fn month_buckets(now: Timestamp, months: i32) -> Vec<(Timestamp, Timestamp)> {
     let end = add_months(month_floor(now), 1);
     (0..months)
         .map(|i| {
@@ -2242,7 +2255,7 @@ pub async fn prune(
     if days == 0 {
         return Ok(stats);
     }
-    let cutoff = ts_ms(Utc::now() - ChronoDuration::days(days as i64));
+    let cutoff = ts_ms(Timestamp::now() - TimeDuration::days(days as i64));
     // Clear blobs first: cheap space reclaim, keeps task metadata.
     stats.outputs_cleared = sqlx::query(
         "UPDATE tasks SET output = NULL WHERE output IS NOT NULL \
@@ -2328,7 +2341,7 @@ pub struct WorktreeRecord {
     pub repo: PathBuf,
     pub path: PathBuf,
     pub branch: String,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 /// Insert or refresh the tracking row for a task's worktree.

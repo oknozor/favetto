@@ -13,8 +13,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use favetto_wire::model::{AgentCost, AgentSessionInfo, Task, TaskStatus};
+use favetto_wire::Timestamp;
 use uuid::Uuid;
 
 use crate::inbox::{self, StatusKind};
@@ -151,7 +151,7 @@ pub struct TaskRow {
     /// only same-unit amounts and keeps the reported currency.
     pub cost: Option<AgentCost>,
     /// Creation time, the tie-break for the newest-first order.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 impl TaskRow {
@@ -226,7 +226,7 @@ pub fn build(
     query: &str,
     filter: TaskFilter,
     active_repo: Option<&str>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> TaskList {
     let mut agents: HashMap<&str, &str> = HashMap::new();
     let mut costs: HashMap<&str, AgentCost> = HashMap::new();
@@ -353,12 +353,12 @@ mod tests {
     use super::*;
     use favetto_wire::model::{AgentSessionInfo, AgentUsage};
 
-    fn at(offset_minutes: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp")
-            + chrono::Duration::minutes(offset_minutes)
+    fn at(offset_minutes: i64) -> Timestamp {
+        Timestamp::from_unix_timestamp(1_700_000_000).expect("timestamp")
+            + time::Duration::minutes(offset_minutes)
     }
 
-    fn task(id: u128, name: &str, status: TaskStatus, created: DateTime<Utc>) -> Task {
+    fn task(id: u128, name: &str, status: TaskStatus, created: Timestamp) -> Task {
         Task {
             id: Uuid::from_u128(id),
             name: name.to_string(),

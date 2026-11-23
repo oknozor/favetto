@@ -10,4 +10,11 @@ pub mod elicitation;
 pub mod model;
 pub mod rpc;
 pub mod task_var;
+pub mod timestamp;
 pub mod workflow;
+
+pub use timestamp::Timestamp;
+
+/// Re-exported so every crate in the workspace shares one `time` version and
+/// can name `Duration`/`OffsetDateTime` without declaring the dependency twice.
+pub use time;

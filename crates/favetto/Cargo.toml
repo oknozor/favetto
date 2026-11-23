@@ -24,6 +24,7 @@ test = false
 
 [dependencies]
 favetto-core = { path = "../favetto-core" }
+favetto-cron = { path = "../favetto-cron" }
 favetto-tui = { path = "../favetto-tui" }
 
 agent-client-protocol = { version = "5.4", default-features = false, features = [
@@ -33,10 +34,8 @@ anyhow = "1"
 ascii-dag = "0.11"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.23"
-chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 config = "0.15"
-croner = "3"
 dirs = "7"
 futures-util = { version = "0.3", features = ["std", "sink", "io", "async-await"] }
 glob = "0.3"
@@ -53,8 +52,8 @@ serde_json = { workspace = true }
 sha2 = "0.11"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 subtle = "2"
+time = { workspace = true }
 tokio = { version = "1", features = ["full"] }
-tokio-cron-scheduler = "0.15"
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", features = ["codec", "compat"] }
 toml = "1.1"

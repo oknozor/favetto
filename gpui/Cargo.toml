@@ -25,7 +25,7 @@ serde_json = "1"
 pulldown-cmark = { version = "0.13", default-features = false }
 rmp-serde = "1"
 uuid = { version = "1", features = ["serde"] }
-chrono = "0.4"
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 anyhow = "1"
 thiserror = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
@@ -39,9 +39,9 @@ fuzzy-matcher = "0.3"
 # Grapheme-cluster boundaries for the shared text inputs (emoji, combining
 # marks and IME composition must never be split mid-cluster).
 unicode-segmentation = "1"
-# Cron parsing/validation and next-occurrence math. Pinned to the daemon's own
-# parser configuration so the hint and the schedule it saves cannot disagree.
-croner = "3"
+# Cron parsing/validation and next-occurrence math, shared with the daemon so
+# the hint and the schedule it saves cannot disagree.
+favetto-cron = { path = "../crates/favetto-cron" }
 
 # Workaround for the first `cargo check`/`build` of the gpui graph:
 # `gpui 0.2.2 -> gpui_http_client -> zed-async-tar -> xattr 0.2.3` uses

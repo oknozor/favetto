@@ -16,12 +16,12 @@
 use std::rc::Rc;
 use std::time::Duration;
 
-use chrono::Utc;
 use favetto_wire::model::{
     AgentAuthState, AgentAuthStatus, AgentCommand, AgentPlanEntry, AgentPlanStatus, AgentUsage,
     ContentRole, InputReply, MessageRole, RunSummary, SessionConfigKind, SessionConfigOption,
     SessionConfigValue, SessionModes, Task, TaskRun, TaskStatus,
 };
+use favetto_wire::Timestamp;
 use gpui::{
     div, list, prelude::*, px, AnyElement, Context, Div, Entity, FocusHandle, Hsla, IntoElement,
     ListAlignment, ListState, Render, ScrollHandle, ScrollWheelEvent, Stateful, TextStyle, Window,
@@ -315,7 +315,7 @@ impl DetailView {
         let color = status_color(theme, status);
         let name = inbox::task_display_name(&task.name);
         let repo = inbox::task_repo(&task.name);
-        let elapsed = inbox::task_duration(task, Utc::now())
+        let elapsed = inbox::task_duration(task, Timestamp::now())
             .map(|duration| inbox::format_duration(Some(duration)))
             .unwrap_or_else(|| "—".to_string());
         let usage = detail::usage_summary(data.usage);
@@ -2347,7 +2347,7 @@ impl DetailView {
             .into_any_element();
         }
 
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut column = div()
             .flex()
             .flex_col()
@@ -3241,7 +3241,7 @@ fn runs_header(theme: &Theme) -> Div {
         )
 }
 
-fn run_row(theme: &Theme, run: &TaskRun, current_attempt: u32, now: chrono::DateTime<Utc>) -> Div {
+fn run_row(theme: &Theme, run: &TaskRun, current_attempt: u32, now: Timestamp) -> Div {
     let status = detail::run_status_kind(run.status);
     let color = status_color(theme, status);
     let current = run.attempt == current_attempt;

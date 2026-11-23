@@ -30,4 +30,6 @@ pub mod ws;
 
 // The platform-free wire/domain types now live in `favetto-wire`; re-export the
 // modules so every `favetto_core::{model,agent_state,rpc}::…` import keeps working.
-pub use favetto_wire::{agent_state, elicitation, model, rpc};
+/// The shared `time` version, re-exported so clients and the daemon agree.
+pub use favetto_wire::time;
+pub use favetto_wire::{agent_state, elicitation, model, rpc, Timestamp};

@@ -3,12 +3,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use chrono::Utc;
+use crate::scheduler::Scheduler;
 use favetto_core::auth::Token;
 use favetto_core::model::{Event, EventKind};
+use favetto_core::Timestamp;
 use parking_lot::RwLock;
 use sqlx::SqlitePool;
-use tokio_cron_scheduler::JobScheduler;
 
 use crate::actions::ActionRegistry;
 use crate::agents::{AgentManager, AgentRegistry};
@@ -49,7 +49,7 @@ pub struct State {
     pub tasks_dir: PathBuf,
     /// The live task catalog.
     pub catalog: Arc<RwLock<Vec<TaskDef>>>,
-    pub scheduler: JobScheduler,
+    pub scheduler: Scheduler,
     pub pair: PairStore,
     /// Per-`(username, client)` failed-login throttling for `POST /auth/login`.
     pub login_limiter: LoginLimiter,
@@ -84,7 +84,7 @@ pub struct StateInit {
     pub data_dir: PathBuf,
     pub tasks_dir: PathBuf,
     pub catalog: Arc<RwLock<Vec<TaskDef>>>,
-    pub scheduler: JobScheduler,
+    pub scheduler: Scheduler,
     pub hook_store: Arc<RwLock<Vec<Hook>>>,
 }
 
@@ -135,7 +135,7 @@ impl State {
             id: 0,
             kind,
             payload,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         };
         match db::insert_event(&self.db, &event).await {
             Ok(id) => {
