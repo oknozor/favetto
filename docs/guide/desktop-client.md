@@ -11,8 +11,8 @@ These are the only supported clients. A native Android app is future work.
 
 The desktop client is a native GUI built with [GPUI](https://gpui.rs/), the
 GPU-accelerated Rust UI framework behind Zed. It talks to the same daemon as the
-TUI and shows the same vocabulary: Inbox, Tasks, Catalog, Workflows, Schedules
-and Settings.
+TUI and shows the same vocabulary: Inbox, Tasks, Agent, Catalog, Workflows,
+Schedules and Settings.
 
 ## Prerequisites
 
@@ -71,13 +71,30 @@ density. **Save** rewrites `gpui.toml` and reconnects.
 | Shortcut | Action |
 |----------|--------|
 | `⌘K` / `Ctrl+K` | Command palette |
-| `g i`, `g t`, `g c`, `g w`, `g s` | Jump to Inbox, Tasks, Catalog, Workflows, Schedules |
+| `g i`, `g t`, `g a`, `g c`, `g w`, `g s` | Jump to Inbox, Tasks, Agent, Catalog, Workflows, Schedules |
 | `⌘,` / `Ctrl+,` | Settings |
 | `?` | Shortcut sheet |
 | `Esc` | Close the topmost overlay or step back |
 
-Tasks, Catalog and Workflows have surface-local keys for search, cancel, retry
-and launch; the shortcut sheet lists them all.
+Tasks, Agent, Catalog and Workflows have surface-local keys for search, cancel,
+retry, start, interrupt and launch; the shortcut sheet lists them all.
+
+### Agent panel
+
+**Agent** (`g a`) is a free-standing ACP conversation, not tied to a task or
+run. It resolves the active repository from the top bar and starts `agents.start`
+with that repository's main checkout as `cwd`; it never falls back to the daemon
+cwd or a task worktree. With `repo: global` active, the panel asks you to select
+a repository instead of starting somewhere unexpected.
+
+Pick an available agent, optionally type a model override (a bare id or
+`provider/model`), and press **Start session** (`n` also starts a fresh
+session). The header freezes the start cwd; if you switch repositories while a
+session is live, the existing session keeps its original cwd — start a new one
+for the new checkout. **i** interrupts the current turn, **x** closes the
+session through `agents.close`, and **m** focuses the same slash-command
+composer as the task detail. Model, thinking level and build/plan mode appear in
+the shared session strip whenever the agent advertises them.
 
 A finished run's detail header also offers **Delete run**, which permanently
 removes the run, its recorded attempts and its dependency edges after a

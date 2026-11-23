@@ -107,8 +107,9 @@ daemon keeps the agent process alive and reports an `auth` state on the session
 In the TUI Agent panel, **Ctrl+A** opens the sign-in chooser for sessions that
 advertise an agent-handled method or logout; the panel shows progress and errors
 without printing credentials or raw terminal output. The GPUI client shows the
-same state and actions in the task detail and **Settings → Agents** card. After
-sign-in the daemon retries the paused session setup automatically.
+same state and actions in the task detail, the free-standing Agent surface and
+the **Settings → Agents** card. After sign-in the daemon retries the paused
+session setup automatically.
 
 ## Availability
 
@@ -131,6 +132,23 @@ stays open for a follow-up prompt.
 When the agent asks for permission, the panel shows the request. Answer it with
 **Ctrl+R**; the reply is correlated with the protocol request, not typed as
 terminal bytes.
+
+### Free-standing sessions in the desktop client
+
+The GPUI **Agent** surface (`g a`) starts a session through `agents.start` with
+no `task_id`. Its `cwd` is the active repository's `RepoInfo.path` — the
+daemon-side path of the main working tree. It is never the daemon cwd and never
+a task-generated worktree. With no active repository the panel asks you to pick
+one first; it does not silently start elsewhere.
+
+The agent is fixed for an ACP session, so choosing another agent and starting a
+new session replaces the active one (the previous session is closed). The
+pre-start model field accepts a bare model id or `provider/model`. After start,
+model, thinking level and build/plan mode are changed through the agent's
+advertised config options and modes (`agents.set_option` / `agents.set_mode`);
+the panel does not invent a model selector when the agent advertises none. An
+`agent.exit` push leaves the composer disabled and shows the exit state, and
+**Close** uses `agents.close`.
 
 ## Lifecycle
 

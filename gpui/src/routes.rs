@@ -1,8 +1,9 @@
 //! The route vocabulary of the desktop client (docs/design/gpui-client.md §1).
 //!
-//! The order is not alphabetical on purpose: **Inbox → Tasks → Catalog →
-//! Workflows → Schedules → Settings** follows the Serial Position Effect, so
-//! the two surfaces users need most are first and configuration is last.
+//! The order is not alphabetical on purpose: **Inbox → Tasks → Agent →
+//! Catalog → Workflows → Schedules → Settings** follows the Serial Position
+//! Effect, so the two surfaces users need most are first and configuration is
+//! last.
 //!
 //! [`Route`] is also the single source of truth for the sidebar icon, the
 //! palette label, the `g`-prefix jump hint and the intentional empty state of a
@@ -16,6 +17,8 @@ pub enum Route {
     Inbox,
     /// All runs, filter and search — the Tasks surface.
     Tasks,
+    /// A free-standing agent conversation — the Agent surface.
+    Agent,
     /// Find and launch a definition — the Catalog surface.
     Catalog,
     /// One root's DAG — the Workflows surface.
@@ -28,9 +31,10 @@ pub enum Route {
 
 impl Route {
     /// Navigation order (docs §1, Serial Position Effect).
-    pub const ALL: [Route; 6] = [
+    pub const ALL: [Route; 7] = [
         Route::Inbox,
         Route::Tasks,
+        Route::Agent,
         Route::Catalog,
         Route::Workflows,
         Route::Schedules,
@@ -42,6 +46,7 @@ impl Route {
         match self {
             Route::Inbox => "Inbox",
             Route::Tasks => "Tasks",
+            Route::Agent => "Agent",
             Route::Catalog => "Catalog",
             Route::Workflows => "Workflows",
             Route::Schedules => "Schedules",
@@ -55,6 +60,7 @@ impl Route {
         match self {
             Route::Inbox => "✉",
             Route::Tasks => "☰",
+            Route::Agent => "✦",
             Route::Catalog => "▤",
             Route::Workflows => "⋔",
             Route::Schedules => "◷",
@@ -71,6 +77,7 @@ impl Route {
         match self {
             Route::Inbox => "g i",
             Route::Tasks => "g t",
+            Route::Agent => "g a",
             Route::Catalog => "g c",
             Route::Workflows => "g w",
             Route::Schedules => "g s",
@@ -83,6 +90,7 @@ impl Route {
         match self {
             Route::Inbox => "What needs you now",
             Route::Tasks => "Every run, filtered and searchable",
+            Route::Agent => "An agent conversation without a task",
             Route::Catalog => "Find and launch a task definition",
             Route::Workflows => "One root's DAG and progress",
             Route::Schedules => "Recurring triggers",
@@ -111,10 +119,11 @@ impl Route {
         match self {
             Route::Inbox => 0,
             Route::Tasks => 1,
-            Route::Catalog => 2,
-            Route::Workflows => 3,
-            Route::Schedules => 4,
-            Route::Settings => 5,
+            Route::Agent => 2,
+            Route::Catalog => 3,
+            Route::Workflows => 4,
+            Route::Schedules => 5,
+            Route::Settings => 6,
         }
     }
 
@@ -133,6 +142,7 @@ impl Route {
         match self {
             Route::Inbox => "Nothing needs you right now",
             Route::Tasks => "No runs yet",
+            Route::Agent => "No agent session yet",
             Route::Catalog => "No definitions loaded",
             Route::Workflows => "No workflow selected",
             Route::Schedules => "No schedules yet",
@@ -149,6 +159,9 @@ impl Route {
             }
             Route::Tasks => {
                 "Every run the daemon starts appears here with its status, agent, attempt and elapsed time. Filter by status or search by task name."
+            }
+            Route::Agent => {
+                "Start a free-standing agent conversation in the active repository's main checkout. The session is not tied to a task or worktree."
             }
             Route::Catalog => {
                 "Task definitions discovered by the daemon are grouped by repo. Each definition shows its declared variables before you launch it."
@@ -171,6 +184,7 @@ impl Route {
         match self {
             Route::Inbox => "Open the blocked run",
             Route::Tasks => "Open a run",
+            Route::Agent => "Start a session",
             Route::Catalog => "Start with variables",
             Route::Workflows => "Inspect a root",
             Route::Schedules => "Create a schedule",
@@ -190,6 +204,7 @@ mod tests {
             [
                 Route::Inbox,
                 Route::Tasks,
+                Route::Agent,
                 Route::Catalog,
                 Route::Workflows,
                 Route::Schedules,
@@ -218,8 +233,10 @@ mod tests {
     #[test]
     fn schedules_own_g_s_and_settings_has_its_own_chord() {
         assert_eq!(Route::Schedules.shortcut(), "g s");
+        assert_eq!(Route::Agent.shortcut(), "g a");
         assert_eq!(Route::Settings.shortcut(), "Mod+,");
         assert_ne!(Route::Schedules.shortcut(), Route::Settings.shortcut());
+        assert_ne!(Route::Agent.shortcut(), Route::Settings.shortcut());
     }
 
     #[test]
@@ -230,7 +247,12 @@ mod tests {
         assert!(Route::Inbox.always_reserves_detail_column());
         assert!(Route::Tasks.always_reserves_detail_column());
         assert!(!Route::Workflows.always_reserves_detail_column());
-        for route in [Route::Catalog, Route::Schedules, Route::Settings] {
+        for route in [
+            Route::Agent,
+            Route::Catalog,
+            Route::Schedules,
+            Route::Settings,
+        ] {
             assert!(
                 !route.shows_detail(),
                 "{} has no run detail to show",

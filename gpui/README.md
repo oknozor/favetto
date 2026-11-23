@@ -13,7 +13,7 @@ reduced-motion setting. The plans live in `docs/design/gpui-client.md`.
 
 A native desktop client for a running favetto daemon. GPUI is the GPU
 accelerated Rust UI framework the Zed editor is built on. The client mirrors the
-daemon's vocabulary (`Inbox → Tasks → Catalog → Workflows → Schedules →
+daemon's vocabulary (`Inbox → Tasks → Agent → Catalog → Workflows → Schedules →
 Settings`) so users can move between the TUI and this app without relearning
 anything (docs/design/gpui-client.md §2).
 
@@ -54,8 +54,8 @@ matching the TUI. Stopping the daemon flips the pill to
 shows **● Unauthorized** together with the token file path to fix, and the
 Reconnect action retries after the token/test daemon is corrected.
 
-Keyboard: `⌘K`/`Ctrl+K` opens the command palette, `g i`/`g t`/`g c`/`g w`/
-`g s` jump to Inbox/Tasks/Catalog/Workflows/Schedules, `⌘,`/`Ctrl+,` opens
+Keyboard: `⌘K`/`Ctrl+K` opens the command palette, `g i`/`g t`/`g a`/`g c`/
+`g w`/`g s` jump to Inbox/Tasks/Agent/Catalog/Workflows/Schedules, `⌘,`/`Ctrl+,` opens
 Settings, `?` opens the shortcut sheet, `Esc` closes the topmost overlay or
 steps back from a pushed detail. **Tab** and **Shift+Tab** move real focus
 through the top bar, sidebar, active surface, detail column (Inbox and Tasks
@@ -67,6 +67,15 @@ On the Tasks surface, `↑`/`↓` move (Home/End and PageUp/PageDown jump), `Ent
 opens the run, `c` cancels and `r` retries a finished run (both confirm first,
 then update the row immediately), `/` focuses the search field, `Esc` clears
 the query, and `[`/`]` step the status filter.
+
+On the Agent surface (`g a`), pick an available agent and press `Enter` or `n`
+to start a free-standing `agents.start` session in the active repo's main
+checkout (never the daemon cwd or a task worktree). `i` interrupts the current
+turn, `x` closes the session through `agents.close`, and `m` opens the same
+slash-command composer as the task detail. With `repo: global` active the
+surface asks you to select a repository first. Model, thinking level and
+build/plan mode are exposed by the agent's advertised session options, not a
+hardcoded selector.
 
 On the Catalog surface, `↑`/`↓` move the definition highlight, `Enter` opens
 the launch sheet, `/` focuses the search field, `h` collapses/expands the
@@ -119,6 +128,14 @@ the minimum and, at the maximum, to the viewport less the sidebar and an 8 px
 grab gap: the working list collapses to that gap so the divider stops just short
 of the navigation rail and stays grabbable. The width lasts for the session; the
 narrow pushed page is unchanged.
+
+The task detail's Output tab and the Agent surface use the same conversation
+implementation (`src/conversation.rs` for the model and
+`src/views/conversation.rs` for the view). The detail wraps it with its task row,
+Output/Runs tabs and task-scoped restore; the Agent surface wraps it with a
+task-free header, the agent/model start form and a live session that survives
+route switches. There is no second copy of the feed, composer, permission
+banner, elicitation modal or session-option logic.
 
 A blocked run pins a warning banner with the request message and its options;
 **Allow once**, **Always allow** (when the agent offers it) and **Reject** map to
@@ -284,6 +301,11 @@ field blank keeps the shared token file.
   label, Tasks/Inbox vs Catalog scoping, and the searchable picker (global row,
   active marker, `(missing)` repos, keyboard selection). Unit-tested without a
   window.
+- `src/conversation.rs` — the task-neutral conversation model: feed cursor,
+  plan/command snapshots, prompt draft and slash completion, permission and
+  elicitation correlation; wrapped by `TaskDetail` and `StandaloneAgent`.
+- `src/agent.rs` — the free-standing Agent state: chosen agent/model, frozen
+  main-checkout cwd, session lifecycle and start failures.
 - `src/catalog.rs` — the pure Catalog model: repo/folder grouping, fuzzy
   name-only filtering, session-scoped collapse keys, preview state, and the
   launch/one-shot forms with required/type/choice validation. Unit-tested
@@ -331,7 +353,8 @@ field blank keeps the shared token file.
   copy-error action, shortcut rows and the shared spinner/pulse primitives
   (`animated_icon`, `pulse_dot`, `pulse_glyph`) used by the shell and route
   views. The focus helper enforces the 32 px minimum target.
-- `src/views/` — one entity per route plus the contextual detail view. Tasks
+- `src/views/` — one entity per route plus the shared conversation panel and the
+  contextual detail view. Tasks
   and the detail Output feed are virtualized.
 
 ## Development

@@ -23,22 +23,24 @@ without relearning the product.
 ├──────────┬───────────────────────────────────────┬─────────────────┤
 │ Inbox  ! │  Needs you (2)                        │  Task detail     │
 │ Tasks    │  ┌─────────────────────────────────┐  │  name / status   │
-│ Catalog  │  │ opencode · repo:favetto/plan    │  │  agent  attempt  │
-│ Workflows│  │ awaiting permission  ▶          │  │  ── tabs ──      │
-│ Schedules│  └─────────────────────────────────┘  │  Output          │
-│ Settings │  Recent                               │  Runs            │
-│          │  …                                    │  [Cancel] [Delete]│
+│ Agent    │  │ opencode · repo:favetto/plan    │  │  agent  attempt  │
+│ Catalog  │  │ awaiting permission  ▶          │  │  ── tabs ──      │
+│ Workflows│  └─────────────────────────────────┘  │  Output          │
+│ Schedules│  Recent                               │  Runs            │
+│ Settings │  …                                    │  [Cancel] [Delete]│
+│          │  …                                    │                   │
 └──────────┴───────────────────────────────────────┴─────────────────┘
 ```
 
-- **Navigation order** (Inbox → Tasks → Catalog → Workflows → Schedules →
-  Settings) follows the **Serial Position Effect**: the two surfaces users need
-  most (what needs me, what ran) are first; configuration is last.
+- **Navigation order** (Inbox → Tasks → Agent → Catalog → Workflows →
+  Schedules → Settings) follows the **Serial Position Effect**: the working
+  surfaces users need most (what needs me, what ran, what am I talking to) come
+  first; configuration is last.
 - **Three regions** — navigation, working list, detail — use the **Law of
   Common Region** and **Law of Proximity** to keep related controls inside one
   visual boundary. The detail column always belongs to the run lists (Inbox and
   Tasks); Workflows gains it only while a graph node's detail is open, and
-  Catalog, Schedules and Settings use the full width. On narrow windows the
+  Agent, Catalog, Schedules and Settings use the full width. On narrow windows the
   detail becomes a pushed page instead of a third column (GPUI
   `container_query`); on wide windows the detail/list boundary is a resizable
   divider, and the Catalog's source pane has the same left-edge divider. Both
@@ -55,7 +57,8 @@ without relearning the product.
   attempts and its dependency edges after an explicit, named warning.
 - **Keyboard first** (**Fitts's Law**): every list is operable with ↑/↓/Enter;
   `⌘K` (Ctrl+K) opens a searchable command palette; `g`-prefixed jumps
-  (`g i`, `g t`, `g c`, `g w`) mirror the TUI's muscle memory (**Jakob's Law**).
+  (`g i`, `g t`, `g a`, `g c`, `g w`, `g s`) mirror the TUI's muscle memory
+  (**Jakob's Law**).
 
 ### Surfaces
 
@@ -63,11 +66,21 @@ without relearning the product.
 |---|---|---|
 | **Inbox** | "What needs me now?" | Open the blocked/failed run |
 | **Tasks** | All runs, filter and search | Open detail; cancel/retry |
+| **Agent** | A free-standing ACP conversation | Start, steer, interrupt, close |
 | **Task detail** | Understand and steer one run | Answer permission, cancel, retry, delete |
 | **Catalog** | Find and launch a definition | Start with variables |
 | **Workflows** | One root's DAG and progress | Inspect; cancel root / retry node |
 | **Schedules** | Recurring triggers | Create/edit/delete |
 | **Settings** | Connection, agents, theme | Test connection |
+
+The task detail and the Agent surface share one conversation implementation
+(`gpui/src/conversation.rs` for the model and `gpui/src/views/conversation.rs`
+for the feed, plan, composer, permission/elicitation banners, auth banner and
+session-option strip). `TaskDetail` adds only the task row, attempts, tabs and
+task-scoped restore; the standalone Agent state adds only the start form, the
+frozen main-checkout cwd and the session lifecycle. The Agent route starts a
+session with `agents.start` and **no** `task_id`, using the active repo's
+`RepoInfo.path` as `cwd`; it never uses the daemon cwd or a task worktree.
 
 ---
 

@@ -15,6 +15,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -24,12 +25,13 @@ use favetto_wire::model::{
     AgentSessionInfo, AgentUsage, EventKind, InputReply, RepoInfo, SessionConfigOption,
     SessionConfigValue, SessionModes, Task, TaskStatus,
 };
-use favetto_wire::rpc::AgentEventPush;
 use favetto_wire::Timestamp;
 use gpui::{ClipboardItem, Context, FocusHandle, Task as GpuiTask, WindowAppearance};
 
+use crate::agent::{self, StandaloneAgent};
 use crate::catalog::{AgentChoice, CatalogState, OneShotFocus};
 use crate::config::{self, ClientConfig, Density, ThemeChoice};
+use crate::conversation::{Conversation, ConversationTarget};
 use crate::detail::{DetailTab, PendingElicitation, PendingRequest, TaskDetail};
 use crate::inbox::{self, InboxKey, InboxRows};
 use crate::launch::{self, LaunchFailure};
@@ -282,6 +284,8 @@ pub struct ClientState {
     selected_task: Option<uuid::Uuid>,
     /// The open detail's output, structured feed and attempt table.
     detail: Option<TaskDetail>,
+    /// The free-standing Agent panel, kept alive across route switches.
+    standalone: StandaloneAgent,
     /// The selected workflow root in the Workflows list.
     workflow_root: Option<uuid::Uuid>,
     /// The selected root's runtime inspect joined with cached dependencies.
@@ -393,6 +397,7 @@ impl ClientState {
             toast_id: 0,
             selected_task: None,
             detail: None,
+            standalone: StandaloneAgent::default(),
             workflow_root: None,
             workflow_detail: None,
             workflow_inspect: None,
@@ -540,16 +545,29 @@ impl ClientState {
                         }
                         self.refresh_snapshot();
                     }
-                    // Fold one structured event into the open detail, then
-                    // reconcile the session roster (the permission banner's
-                    // authoritative source).
+                    // Fold one structured event into each open conversation it
+                    // belongs to, then reconcile the session roster (the
+                    // permission banner's authoritative source).
                     Push::AgentEvent(event) => {
-                        if self.event_belongs_to_open_task(event) {
-                            let sessions = self.sessions.clone();
+                        let sessions = self.sessions.clone();
+                        let task_match = self
+                            .detail
+                            .as_ref()
+                            .is_some_and(|detail| detail.accepts_event(event, &sessions));
+                        if task_match {
                             if let Some(detail) = &mut self.detail {
                                 detail.push_event(event.clone());
                                 detail.sync_elicitation(&sessions);
                             }
+                        }
+                        let standalone_match = self
+                            .standalone
+                            .session_id
+                            .as_deref()
+                            .is_some_and(|_| self.standalone.accepts_event(event));
+                        if standalone_match {
+                            self.standalone.conversation.push_event(event.clone());
+                            self.standalone.conversation.sync_elicitation(&sessions);
                         }
                         // The cancelled turn's Idle event is the final feedback
                         // for an interrupt: re-enable the control and confirm
@@ -558,14 +576,22 @@ impl ClientState {
                             event.event,
                             favetto_wire::model::AgentStateEvent::Idle { .. }
                         ) {
-                            let matching = self.detail.as_ref().is_some_and(|detail| {
+                            let task_pending = self.detail.as_ref().is_some_and(|detail| {
                                 detail.turn_cancel_pending.as_deref()
                                     == Some(event.session_id.as_str())
                             });
-                            if matching {
+                            let agent_pending =
+                                self.standalone.conversation.turn_cancel_pending.as_deref()
+                                    == Some(event.session_id.as_str());
+                            if task_pending {
                                 if let Some(detail) = self.detail.as_mut() {
                                     detail.turn_cancel_pending = None;
                                 }
+                            }
+                            if agent_pending {
+                                self.standalone.conversation.turn_cancel_pending = None;
+                            }
+                            if task_pending || agent_pending {
                                 self.show_toast(
                                     ToastKind::Success,
                                     "The agent's current turn stopped.".to_string(),
@@ -600,7 +626,14 @@ impl ClientState {
                             self.refresh_schedules();
                         }
                     }
-                    Push::AgentExit(_) | Push::UnsupportedAgentEvent { .. } => {}
+                    Push::AgentExit(exit) => {
+                        let stopped = self.standalone.record_exit(exit.clone());
+                        if stopped {
+                            self.refresh_snapshot();
+                        }
+                        let _ = &exit;
+                    }
+                    Push::UnsupportedAgentEvent { .. } => {}
                     Push::Unknown(_) => {}
                 }
             }
@@ -648,6 +681,10 @@ impl ClientState {
                 if let Some(detail) = self.detail.as_mut() {
                     detail.sync_elicitation(&sessions);
                 }
+                self.sync_standalone_default_agent();
+                let standalone_session = self.active_agent_session().cloned();
+                self.standalone.sync_status(standalone_session.as_ref());
+                self.standalone.conversation.sync_elicitation(&sessions);
                 // The Workflows root list is derived from this same snapshot,
                 // so a recovered daemon fills it without another RPC. The open
                 // root re-joins its dependency labels against the new rows.
@@ -755,6 +792,67 @@ impl ClientState {
                     }
                 }
             },
+            Update::AgentStartFinished { result } => match result {
+                Ok(attached) => {
+                    let previous = self.standalone.adopt(*attached);
+                    if let Some(previous) = previous {
+                        if let Some(runtime) = &self.runtime {
+                            runtime.close_agent(previous);
+                        }
+                    }
+                    let session = self.active_agent_session().cloned();
+                    self.standalone.sync_status(session.as_ref());
+                    self.refresh_snapshot();
+                    self.show_toast(
+                        ToastKind::Success,
+                        "Started a free-standing agent session.".to_string(),
+                        cx,
+                    );
+                }
+                Err(error) => {
+                    if error.is_unauthorized() {
+                        self.connection = ConnectionState::Unauthorized {
+                            token_path: self.config.token_source.label(),
+                        };
+                    }
+                    self.standalone.starting = false;
+                    self.standalone.start_error =
+                        Some(format!("The daemon could not start the session: {error}."));
+                }
+            },
+            Update::AgentClosed { session_id, result } => {
+                let current = self.standalone.session_id.as_deref() == Some(session_id.as_str());
+                match result {
+                    Ok(_) => {
+                        if current {
+                            self.standalone.clear();
+                        }
+                        self.show_toast(
+                            ToastKind::Success,
+                            "Closed the agent session.".to_string(),
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        if error.is_unauthorized() {
+                            self.connection = ConnectionState::Unauthorized {
+                                token_path: self.config.token_source.label(),
+                            };
+                        }
+                        if current {
+                            self.standalone.closing = false;
+                            self.standalone.close_error =
+                                Some(format!("Could not close the session: {error}."));
+                        }
+                        self.show_toast(
+                            ToastKind::Error,
+                            format!("Could not close the agent session: {error}."),
+                            cx,
+                        );
+                    }
+                }
+                self.refresh_snapshot();
+            }
             Update::TaskLoaded { task } => {
                 if let Some(detail) = self.detail.as_mut() {
                     if detail.task_id == task.id {
@@ -901,20 +999,29 @@ impl ClientState {
                 result,
                 ..
             } => {
-                let open = self.detail.as_ref().is_some_and(|detail| {
+                let task_open = self.detail.as_ref().is_some_and(|detail| {
                     detail.reply_pending.as_deref() == Some(request_id.as_str())
                 });
-                if let Some(detail) = self.detail.as_mut() {
-                    if detail.reply_pending.as_deref() == Some(request_id.as_str()) {
+                let agent_open = self.standalone.conversation.reply_pending.as_deref()
+                    == Some(request_id.as_str());
+                if task_open {
+                    if let Some(detail) = self.detail.as_mut() {
                         detail.reply_pending = None;
                     }
                 }
+                if agent_open {
+                    self.standalone.conversation.reply_pending = None;
+                }
                 match result {
                     Ok(result) if result.replied => {
-                        if open {
+                        if task_open {
                             if let Some(detail) = self.detail.as_mut() {
-                                detail.answered_request = Some(request_id);
+                                detail.answered_request = Some(request_id.clone());
                             }
+                        }
+                        if agent_open {
+                            self.standalone.conversation.answered_request =
+                                Some(request_id.clone());
                         }
                         self.show_toast(ToastKind::Success, reply_done_message(&reply), cx);
                     }
@@ -947,23 +1054,36 @@ impl ClientState {
                 result,
                 ..
             } => {
-                if let Some(detail) = self.detail.as_mut() {
-                    if detail.elicitation_pending.as_deref() == Some(request_id.as_str()) {
+                let task_open = self.detail.as_ref().is_some_and(|detail| {
+                    detail.elicitation_pending.as_deref() == Some(request_id.as_str())
+                });
+                let agent_open = self.standalone.conversation.elicitation_pending.as_deref()
+                    == Some(request_id.as_str());
+                if task_open {
+                    if let Some(detail) = self.detail.as_mut() {
                         detail.elicitation_pending = None;
                     }
                 }
+                if agent_open {
+                    self.standalone.conversation.elicitation_pending = None;
+                }
                 match result {
                     Ok(result) if result.replied => {
-                        if let Some(detail) = self.detail.as_mut() {
-                            if detail
-                                .elicitation
-                                .as_ref()
-                                .map(|form| form.request.id.as_str())
-                                == Some(request_id.as_str())
-                            {
-                                detail.elicitation = None;
+                        if task_open {
+                            if let Some(detail) = self.detail.as_mut() {
+                                if detail
+                                    .elicitation
+                                    .as_ref()
+                                    .map(|form| form.request.id.as_str())
+                                    == Some(request_id.as_str())
+                                {
+                                    detail.elicitation = None;
+                                }
+                                detail.answered_elicitation = Some(request_id.clone());
                             }
-                            detail.answered_elicitation = Some(request_id);
+                        }
+                        if agent_open {
+                            self.standalone.conversation.elicitation_done(&request_id);
                         }
                         self.show_toast(ToastKind::Success, elicitation_done_message(&reply), cx);
                     }
@@ -1004,6 +1124,11 @@ impl ClientState {
                             detail.turn_cancel_pending = None;
                         }
                     }
+                    if self.standalone.conversation.turn_cancel_pending.as_deref()
+                        == Some(session_id.as_str())
+                    {
+                        self.standalone.conversation.turn_cancel_pending = None;
+                    }
                     self.show_toast(
                         ToastKind::Error,
                         "The daemon did not request a turn interrupt.".to_string(),
@@ -1015,6 +1140,11 @@ impl ClientState {
                         if detail.turn_cancel_pending.as_deref() == Some(session_id.as_str()) {
                             detail.turn_cancel_pending = None;
                         }
+                    }
+                    if self.standalone.conversation.turn_cancel_pending.as_deref()
+                        == Some(session_id.as_str())
+                    {
+                        self.standalone.conversation.turn_cancel_pending = None;
                     }
                     if error.is_unauthorized() {
                         self.connection = ConnectionState::Unauthorized {
@@ -1042,24 +1172,44 @@ impl ClientState {
                         detail.prompt_sending = false;
                     }
                 }
+                if self.standalone.conversation.is_session(&session_id) {
+                    self.standalone.conversation.prompt_sending = false;
+                }
                 match result {
                     Ok(result) if result.accepted => {
+                        let mut task_accepted = false;
                         if let Some(detail) = self.detail.as_mut() {
-                            detail.prompt.set_value(String::new());
-                            detail.prompt_selected = None;
-                            detail.prompt_error = None;
+                            if detail.conversation.is_session(&session_id) {
+                                detail.conversation.clear_prompt();
+                                task_accepted = true;
+                            }
+                        }
+                        if self.standalone.conversation.is_session(&session_id) {
+                            self.standalone.conversation.clear_prompt();
                         }
                         // Pull the first plan/command snapshot for the new turn.
-                        if let (Some(runtime), Some(task_id)) = (
-                            &self.runtime,
-                            self.detail.as_ref().map(|detail| detail.task_id),
-                        ) {
-                            runtime.load_task_events(task_id);
+                        if task_accepted {
+                            if let (Some(runtime), Some(task_id)) = (
+                                &self.runtime,
+                                self.detail.as_ref().map(|detail| detail.task_id),
+                            ) {
+                                runtime.load_task_events(task_id);
+                            }
                         }
                     }
                     Ok(_) => {
-                        if let Some(detail) = self.detail.as_mut() {
-                            detail.prompt_error =
+                        if self
+                            .detail
+                            .as_ref()
+                            .is_some_and(|detail| detail.conversation.is_session(&session_id))
+                        {
+                            if let Some(detail) = self.detail.as_mut() {
+                                detail.prompt_error =
+                                    Some("The daemon did not accept the prompt.".to_string());
+                            }
+                        }
+                        if self.standalone.conversation.is_session(&session_id) {
+                            self.standalone.conversation.prompt_error =
                                 Some("The daemon did not accept the prompt.".to_string());
                         }
                         self.show_toast(
@@ -1076,6 +1226,9 @@ impl ClientState {
                         }
                         if let Some(detail) = self.detail.as_mut() {
                             detail.prompt_error = Some(error.to_string());
+                        }
+                        if self.standalone.conversation.is_session(&session_id) {
+                            self.standalone.conversation.prompt_error = Some(error.to_string());
                         }
                         let _ = prompt;
                         self.show_toast(
@@ -2628,8 +2781,32 @@ impl ClientState {
         }
     }
 
+    /// The conversation currently on screen: the task detail on run surfaces
+    /// and the free-standing panel on the Agent route.
+    pub fn active_conversation(&self) -> Option<&Conversation> {
+        if self.active_route == Route::Agent {
+            Some(&self.standalone.conversation)
+        } else {
+            self.detail.as_ref().map(|detail| &detail.conversation)
+        }
+    }
+
+    /// Mutable access to the conversation currently on screen.
+    pub fn active_conversation_mut(&mut self) -> Option<&mut Conversation> {
+        if self.active_route == Route::Agent {
+            Some(&mut self.standalone.conversation)
+        } else {
+            self.detail.as_mut().map(|detail| &mut detail.conversation)
+        }
+    }
+
     /// The selected run's live session authentication state, when any.
     pub fn detail_auth(&self) -> Option<(&AgentSessionInfo, &AgentAuthState)> {
+        if self.active_route == Route::Agent {
+            return self
+                .active_agent_session()
+                .and_then(|session| session.auth.as_ref().map(|auth| (session, auth)));
+        }
         let task_id = self.selected_task?;
         let task_id = task_id.to_string();
         self.sessions
@@ -2740,7 +2917,7 @@ impl ClientState {
     }
 
     /// The daemon's configured agents prepared for a picker.
-    fn agent_choices(&self) -> Vec<AgentChoice> {
+    pub fn agent_choices(&self) -> Vec<AgentChoice> {
         self.agents
             .iter()
             .map(|agent| AgentChoice {
@@ -2754,6 +2931,38 @@ impl ClientState {
                 default: agent.default,
             })
             .collect()
+    }
+
+    /// The agents the Agent panel may offer: available entries only.
+    pub fn available_agent_choices(&self) -> Vec<AgentChoice> {
+        self.agent_choices()
+            .into_iter()
+            .filter(|choice| choice.available)
+            .collect()
+    }
+
+    /// Pick the daemon default (or first available) agent when none is chosen.
+    fn sync_standalone_default_agent(&mut self) {
+        let choices = self.available_agent_choices();
+        let chosen_available = self
+            .standalone
+            .chosen_agent
+            .as_deref()
+            .is_some_and(|chosen| choices.iter().any(|choice| choice.name == chosen));
+        if !chosen_available {
+            self.standalone.chosen_agent = choices
+                .iter()
+                .find(|choice| choice.default)
+                .or_else(|| choices.first())
+                .map(|choice| choice.name.clone());
+        }
+    }
+
+    /// The active repo's daemon-side main checkout path.
+    ///
+    /// The Agent panel never falls back to the daemon cwd or a task worktree.
+    pub fn active_repo_path(&self) -> Option<PathBuf> {
+        repo_checkout(&self.repos, self.active_repo.as_deref())
     }
 
     /// Focus one var in the launch sheet (a field click).
@@ -2942,12 +3151,144 @@ impl ClientState {
         self.catalog.cycle_oneshot_agent(delta);
     }
 
+    /// The free-standing Agent panel state.
+    pub fn standalone_agent(&self) -> &StandaloneAgent {
+        &self.standalone
+    }
+
+    /// The active standalone session from `agents.list`, falling back to the
+    /// attach result until the roster catches up.
+    pub fn active_agent_session(&self) -> Option<&AgentSessionInfo> {
+        let session_id = self.standalone.session_id.as_deref()?;
+        self.sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .or(self.standalone.session.as_ref())
+    }
+
+    /// Select the agent a new standalone session will use.
+    pub fn select_standalone_agent(&mut self, name: &str) {
+        if self
+            .available_agent_choices()
+            .iter()
+            .any(|choice| choice.name == name)
+        {
+            self.standalone.chosen_agent = Some(name.to_string());
+            self.standalone.start_error = None;
+        }
+    }
+
+    /// Cycle the Agent panel's agent picker (↑/↓).
+    pub fn cycle_standalone_agent(&mut self, delta: isize) {
+        let choices = self.available_agent_choices();
+        if choices.is_empty() {
+            return;
+        }
+        let current = self
+            .standalone
+            .chosen_agent
+            .as_deref()
+            .and_then(|name| choices.iter().position(|choice| choice.name == name))
+            .unwrap_or(0);
+        let next = (current as isize + delta).rem_euclid(choices.len() as isize) as usize;
+        self.standalone.chosen_agent = Some(choices[next].name.clone());
+        self.standalone.start_error = None;
+    }
+
+    /// Focus the Agent panel's model override field.
+    pub fn focus_agent_model(&mut self) {
+        self.standalone.model_focused = true;
+        self.standalone.start_error = None;
+    }
+
+    /// The Agent panel's model override buffer.
+    pub fn agent_model_input(&self) -> &TextInput {
+        &self.standalone.model
+    }
+
+    /// The Agent panel's model override buffer, for the shared text host.
+    pub fn agent_model_input_mut(&mut self) -> &mut TextInput {
+        &mut self.standalone.model
+    }
+
+    /// Start a free-standing ACP session in the active repo's main checkout.
+    pub fn start_standalone_agent(&mut self, cx: &mut Context<Self>) {
+        if self.standalone.starting {
+            return;
+        }
+        let Some(cwd) = self.active_repo_path() else {
+            self.standalone.start_error = Some(
+                "Select a repository first: the Agent panel runs in its main checkout, never the daemon cwd."
+                    .to_string(),
+            );
+            return;
+        };
+        let choices = self.available_agent_choices();
+        let Some(agent) = self
+            .standalone
+            .chosen_agent
+            .clone()
+            .filter(|chosen| choices.iter().any(|choice| choice.name == *chosen))
+        else {
+            self.standalone.start_error =
+                Some("Choose an available agent before starting.".to_string());
+            return;
+        };
+        let (provider, model) = agent::model_override(self.standalone.model.value());
+        self.standalone.pending_cwd = Some(cwd.clone());
+        self.standalone.pending_repo = self.active_repo.clone();
+        self.standalone.starting = true;
+        self.standalone.start_error = None;
+        self.standalone.close_error = None;
+        self.standalone.model_focused = false;
+        match &self.runtime {
+            Some(runtime) => runtime.start_agent(Some(agent), provider, model, Some(cwd), true),
+            None => {
+                self.standalone.starting = false;
+                self.standalone.start_error =
+                    Some("The transport is not running, so no session was started.".to_string());
+                self.show_toast(
+                    ToastKind::Error,
+                    "Could not start the agent: the transport is not running.".to_string(),
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Close the active standalone session through `agents.close`.
+    pub fn close_standalone_agent(&mut self, cx: &mut Context<Self>) {
+        if self.standalone.closing {
+            return;
+        }
+        let Some(session_id) = self.standalone.session_id.clone() else {
+            self.standalone.clear();
+            return;
+        };
+        self.standalone.closing = true;
+        self.standalone.close_error = None;
+        match &self.runtime {
+            Some(runtime) => runtime.close_agent(session_id),
+            None => {
+                self.standalone.closing = false;
+                self.standalone.close_error = Some(
+                    "The transport is not running, so the session was not closed.".to_string(),
+                );
+                self.show_toast(
+                    ToastKind::Error,
+                    "Could not close the agent session: the transport is not running.".to_string(),
+                    cx,
+                );
+            }
+        }
+    }
+
     /// Refresh the active surface: its task rows on Inbox/Tasks, the catalog
     /// on Catalog, the schedule table on Schedules, and always the ping (so the
     /// status bar and repo label stay honest).
     pub fn refresh_active(&mut self) {
         match self.active_route {
-            Route::Inbox | Route::Tasks => self.refresh_snapshot(),
+            Route::Inbox | Route::Tasks | Route::Agent => self.refresh_snapshot(),
             Route::Catalog => self.refresh_catalog(),
             Route::Workflows => {
                 self.refresh_snapshot();
@@ -3025,8 +3366,8 @@ impl ClientState {
             self.refresh_schedules();
             // The create/edit sheet's task picker is the same catalog list.
             self.refresh_catalog();
-        } else if route == Route::Settings {
-            // The Agents card is the shared roster; a visit catches it up.
+        } else if route == Route::Settings || route == Route::Agent {
+            // The Agents card and the Agent panel share the session roster.
             self.refresh_snapshot();
         }
     }
@@ -3426,6 +3767,9 @@ impl ClientState {
         if self.detail_prompt_active() {
             return Some(TextTarget::DetailPrompt);
         }
+        if self.active_route == Route::Agent && self.standalone.model_focused {
+            return Some(TextTarget::AgentModel);
+        }
         match self.active_route {
             Route::Tasks => {
                 if self.tasks_search_active && self.task_confirm.is_none() {
@@ -3456,7 +3800,7 @@ impl ClientState {
                 Some(SettingsFocus::Token) => Some(TextTarget::SettingsToken),
                 _ => None,
             },
-            Route::Inbox | Route::Workflows => None,
+            Route::Inbox | Route::Workflows | Route::Agent => None,
         }
     }
 
@@ -3465,6 +3809,7 @@ impl ClientState {
     pub fn text_target_is_multiline(&self, target: TextTarget) -> bool {
         match target {
             TextTarget::DetailPrompt => true,
+            TextTarget::AgentModel => false,
             TextTarget::CatalogLaunchVar(index) => self
                 .catalog
                 .launch()
@@ -3490,7 +3835,10 @@ impl ClientState {
                 .and_then(|editor| editor.text_input()),
             TextTarget::SettingsEndpoint => self.settings.text_input(true),
             TextTarget::SettingsToken => self.settings.text_input(false),
-            TextTarget::DetailPrompt => self.detail.as_ref().map(|detail| &detail.prompt),
+            TextTarget::DetailPrompt => self
+                .active_conversation()
+                .map(|conversation| &conversation.prompt),
+            TextTarget::AgentModel => Some(&self.standalone.model),
             TextTarget::Elicitation(index) => self
                 .detail
                 .as_ref()
@@ -3515,7 +3863,10 @@ impl ClientState {
                 .and_then(|editor| editor.text_input_mut()),
             TextTarget::SettingsEndpoint => self.settings.text_input_mut(true),
             TextTarget::SettingsToken => self.settings.text_input_mut(false),
-            TextTarget::DetailPrompt => self.detail.as_mut().map(|detail| &mut detail.prompt),
+            TextTarget::DetailPrompt => self
+                .active_conversation_mut()
+                .map(|conversation| &mut conversation.prompt),
+            TextTarget::AgentModel => Some(&mut self.standalone.model),
             TextTarget::Elicitation(index) => self
                 .detail
                 .as_mut()
@@ -3543,6 +3894,7 @@ impl ClientState {
                 self.settings.set_focus(Some(SettingsFocus::Token));
             }
             TextTarget::DetailPrompt => self.focus_detail_prompt(),
+            TextTarget::AgentModel => self.focus_agent_model(),
             TextTarget::Elicitation(index) => {
                 if let Some(form) = self
                     .detail
@@ -3588,9 +3940,12 @@ impl ClientState {
                 self.settings.after_edit();
             }
             TextTarget::DetailPrompt => {
-                if let Some(detail) = self.detail.as_mut() {
-                    detail.prompt_selected = None;
+                if let Some(conversation) = self.active_conversation_mut() {
+                    conversation.prompt_selected = None;
                 }
+            }
+            TextTarget::AgentModel => {
+                self.standalone.start_error = None;
             }
             TextTarget::Elicitation(_) => {
                 if let Some(form) = self
@@ -4060,52 +4415,51 @@ impl ClientState {
         }
     }
 
-    /// Whether the detail viewport follows new content.
+    /// Whether the conversation viewport follows new content.
     pub fn detail_follow(&self) -> bool {
-        self.detail
-            .as_ref()
-            .map(|detail| detail.follow)
+        self.active_conversation()
+            .map(|conversation| conversation.follow)
             .unwrap_or(true)
     }
 
     /// Pause or resume tailing. Resuming clears the unseen counter.
     pub fn set_detail_follow(&mut self, follow: bool) {
-        if let Some(detail) = self.detail.as_mut() {
-            detail.follow = follow;
+        if let Some(conversation) = self.active_conversation_mut() {
+            conversation.follow = follow;
             if follow {
-                detail.new_events = 0;
+                conversation.new_events = 0;
             }
         }
     }
 
-    /// Events that arrived while the detail was pinned off the tail.
+    /// Events that arrived while the conversation was pinned off the tail.
     pub fn detail_new_events(&self) -> u64 {
-        self.detail
-            .as_ref()
-            .map(|detail| detail.new_events)
+        self.active_conversation()
+            .map(|conversation| conversation.new_events)
             .unwrap_or(0)
     }
 
     /// The prompt the permission banner should render, when one is open.
     pub fn detail_pending_request(&self) -> Option<PendingRequest> {
-        self.detail.as_ref()?.pending_request(&self.sessions)
+        self.active_conversation()?.pending_request(&self.sessions)
     }
 
-    /// The pending ACP form, if the open run has one.
+    /// The pending ACP form, if the open conversation has one.
     pub fn detail_pending_elicitation(&self) -> Option<PendingElicitation> {
-        self.detail.as_ref()?.pending_elicitation(&self.sessions)
+        self.active_conversation()?
+            .pending_elicitation(&self.sessions)
     }
 
     /// The editable form state for the open elicitation.
     pub fn detail_elicitation(&self) -> Option<&crate::elicitation::ElicitationFormState> {
-        self.detail.as_ref()?.elicitation.as_ref()
+        self.active_conversation()?.elicitation.as_ref()
     }
 
     /// Mutable access for the modal's keyboard actions.
     pub fn detail_elicitation_mut(
         &mut self,
     ) -> Option<&mut crate::elicitation::ElicitationFormState> {
-        self.detail.as_mut()?.elicitation.as_mut()
+        self.active_conversation_mut()?.elicitation.as_mut()
     }
 
     /// Move focus to the next form field.
@@ -4195,20 +4549,19 @@ impl ClientState {
         cx: &mut Context<Self>,
     ) {
         let already_pending = self
-            .detail
-            .as_ref()
-            .is_some_and(|detail| detail.elicitation_pending.is_some());
+            .active_conversation()
+            .is_some_and(|conversation| conversation.elicitation_pending.is_some());
         if already_pending {
             return;
         }
-        if let Some(detail) = self.detail.as_mut() {
-            detail.elicitation_pending = Some(request_id.clone());
+        if let Some(conversation) = self.active_conversation_mut() {
+            conversation.elicitation_pending = Some(request_id.clone());
         }
         match &self.runtime {
             Some(runtime) => runtime.reply_elicitation(session_id, request_id, reply),
             None => {
-                if let Some(detail) = self.detail.as_mut() {
-                    detail.elicitation_pending = None;
+                if let Some(conversation) = self.active_conversation_mut() {
+                    conversation.elicitation_pending = None;
                 }
                 self.show_toast(
                     ToastKind::Error,
@@ -4281,12 +4634,20 @@ impl ClientState {
             })
     }
 
-    /// The Favetto-local id of the live agent session running the open task.
+    /// The Favetto-local id of the live agent session behind the open
+    /// conversation (a task run or the Agent panel).
     ///
     /// This is the routing key for `agents.cancel`; the provider's ACP id
     /// returned by [`detail_session_id`](Self::detail_session_id) is display
     /// metadata and must not be sent to the daemon.
     pub fn detail_live_session_id(&self) -> Option<String> {
+        if self.active_route == Route::Agent {
+            if self.standalone.exit.is_some() {
+                return None;
+            }
+            let session = self.active_agent_session()?;
+            return session.running.then(|| session.id.clone());
+        }
         let detail = self.detail.as_ref()?;
         // A finished run can have a restored, read-only conversation attached;
         // it must never enable the live interrupt/cancel controls.
@@ -4301,8 +4662,15 @@ impl ClientState {
     }
 
     /// The Favetto-local session id used for `agents.prompt`: the live session
-    /// for the selected task, falling back to the session behind the event feed.
+    /// behind the open conversation, falling back to its event feed.
     pub fn detail_agent_session_id(&self) -> Option<String> {
+        if self.active_route == Route::Agent {
+            return self
+                .standalone
+                .session_id
+                .clone()
+                .or_else(|| self.standalone.conversation.events_session.clone());
+        }
         let detail = self.detail.as_ref()?;
         let task_id = detail.task_id.to_string();
         self.sessions
@@ -4313,10 +4681,20 @@ impl ClientState {
             .or_else(|| detail.events_session.clone())
     }
 
-    /// The live/retained session snapshot backing the open detail's option bar.
+    /// The live/retained session snapshot backing the open conversation's
+    /// option bar.
     pub fn detail_session_options(
         &self,
     ) -> Option<(String, Vec<SessionConfigOption>, Option<SessionModes>)> {
+        if self.active_route == Route::Agent {
+            let session_id = self.standalone.session_id.clone()?;
+            let session = self.active_agent_session()?;
+            return Some((
+                session_id,
+                session.config_options.clone(),
+                session.modes.clone(),
+            ));
+        }
         let session_id = self.detail_agent_session_id()?;
         self.sessions
             .iter()
@@ -4330,7 +4708,7 @@ impl ClientState {
             })
     }
 
-    /// Change one advertised option on the open detail's session.
+    /// Change one advertised option on the open conversation's session.
     pub fn set_detail_session_option(
         &mut self,
         option_id: String,
@@ -4340,7 +4718,7 @@ impl ClientState {
         let Some(session_id) = self.detail_agent_session_id() else {
             self.show_toast(
                 ToastKind::Info,
-                "No live agent session is attached to this run.".to_string(),
+                "No live agent session is attached to this conversation.".to_string(),
                 cx,
             );
             return;
@@ -4355,12 +4733,12 @@ impl ClientState {
         }
     }
 
-    /// Switch the open detail's session to an advertised mode.
+    /// Switch the open conversation's session to an advertised mode.
     pub fn set_detail_session_mode(&mut self, mode_id: String, cx: &mut Context<Self>) {
         let Some(session_id) = self.detail_agent_session_id() else {
             self.show_toast(
                 ToastKind::Info,
-                "No live agent session is attached to this run.".to_string(),
+                "No live agent session is attached to this conversation.".to_string(),
                 cx,
             );
             return;
@@ -4378,18 +4756,17 @@ impl ClientState {
     /// Whether an `agents.cancel` round trip is in flight (or the cancelled turn
     /// has not reported idle yet). The Interrupt button is disabled while true.
     pub fn detail_turn_cancel_pending(&self) -> bool {
-        self.detail
-            .as_ref()
-            .is_some_and(|detail| detail.turn_cancel_pending.is_some())
+        self.active_conversation()
+            .is_some_and(|conversation| conversation.turn_cancel_pending.is_some())
     }
 
-    /// Interrupt the current agent turn of the open task, leaving the task and
-    /// its session alive. Distinct from `tasks.cancel`, which is terminal.
+    /// Interrupt the current agent turn, leaving the task/session alive.
+    /// Distinct from `tasks.cancel`, which is terminal.
     pub fn interrupt_detail_turn(&mut self, cx: &mut Context<Self>) {
         let Some(session_id) = self.detail_live_session_id() else {
             self.show_toast(
                 ToastKind::Info,
-                "No live agent turn is running for this task.".to_string(),
+                "No live agent turn is running here.".to_string(),
                 cx,
             );
             return;
@@ -4397,14 +4774,14 @@ impl ClientState {
         if self.detail_turn_cancel_pending() {
             return;
         }
-        if let Some(detail) = self.detail.as_mut() {
-            detail.turn_cancel_pending = Some(session_id.clone());
+        if let Some(conversation) = self.active_conversation_mut() {
+            conversation.turn_cancel_pending = Some(session_id.clone());
         }
         match &self.runtime {
             Some(runtime) => runtime.cancel_turn(session_id),
             None => {
-                if let Some(detail) = self.detail.as_mut() {
-                    detail.turn_cancel_pending = None;
+                if let Some(conversation) = self.active_conversation_mut() {
+                    conversation.turn_cancel_pending = None;
                 }
                 self.show_toast(
                     ToastKind::Error,
@@ -4415,19 +4792,17 @@ impl ClientState {
         }
     }
 
-    /// The current plan for the open detail, preferring its explicit snapshot.
+    /// The current plan for the open conversation, preferring its snapshot.
     pub fn detail_plan(&self) -> Vec<AgentPlanEntry> {
-        self.detail
-            .as_ref()
-            .map(TaskDetail::plan)
+        self.active_conversation()
+            .map(Conversation::plan)
             .unwrap_or_default()
     }
 
-    /// The current advertised command list for the open detail.
+    /// The current advertised command list for the open conversation.
     pub fn detail_commands(&self) -> Vec<AgentCommand> {
-        self.detail
-            .as_ref()
-            .map(TaskDetail::commands)
+        self.active_conversation()
+            .map(Conversation::commands)
             .unwrap_or_default()
     }
 
@@ -4435,18 +4810,23 @@ impl ClientState {
     /// now. A finished run or a run without an attached agent session keeps the
     /// box on screen but read-only.
     pub fn detail_prompt_enabled(&self) -> bool {
-        let Some(detail) = self.detail.as_ref() else {
+        let Some(conversation) = self.active_conversation() else {
             return false;
         };
-        detail.prompt_enabled(self.detail_agent_session_id().is_some())
+        conversation.prompt_enabled(self.detail_agent_session_id().is_some())
     }
 
     /// Why the follow-up composer is read-only, for its placeholder. `None`
     /// while the box can accept a prompt.
     pub fn detail_prompt_disabled_reason(&self) -> Option<&'static str> {
-        let detail = self.detail.as_ref()?;
-        if detail.is_terminal() {
-            Some("This run has finished; it cannot accept a prompt.")
+        let conversation = self.active_conversation()?;
+        if conversation.terminal {
+            Some(match conversation.target {
+                ConversationTarget::Task(_) => "This run has finished; it cannot accept a prompt.",
+                ConversationTarget::Session(_) => {
+                    "This session has ended; start a new one to continue."
+                }
+            })
         } else if self.detail_agent_session_id().is_none() {
             Some("No live agent session is attached.")
         } else {
@@ -4460,14 +4840,22 @@ impl ClientState {
     pub fn detail_prompt_active(&self) -> bool {
         if !matches!(
             self.active_route,
-            Route::Inbox | Route::Tasks | Route::Workflows
+            Route::Inbox | Route::Tasks | Route::Workflows | Route::Agent
         ) {
             return false;
         }
-        let Some(detail) = self.detail.as_ref() else {
+        if self.active_route != Route::Agent {
+            let Some(detail) = self.detail.as_ref() else {
+                return false;
+            };
+            if detail.tab != DetailTab::Output {
+                return false;
+            }
+        }
+        let Some(conversation) = self.active_conversation() else {
             return false;
         };
-        detail.tab == DetailTab::Output && detail.prompt_focused && self.detail_prompt_enabled()
+        conversation.prompt_focused && self.detail_prompt_enabled()
     }
 
     /// Focus the composer and clear any previous error. Used by a click and by
@@ -4477,74 +4865,76 @@ impl ClientState {
         if !self.detail_prompt_enabled() {
             return;
         }
-        if let Some(detail) = self.detail.as_mut() {
-            detail.tab = DetailTab::Output;
-            detail.prompt_focused = true;
-            detail.prompt_error = None;
+        if self.active_route != Route::Agent {
+            if let Some(detail) = self.detail.as_mut() {
+                detail.tab = DetailTab::Output;
+            }
+        }
+        if let Some(conversation) = self.active_conversation_mut() {
+            conversation.prompt_focused = true;
+            conversation.prompt_error = None;
         }
     }
 
     /// Release the composer, returning keyboard focus to the detail/shell
     /// without clearing the draft.
     pub fn blur_detail_prompt(&mut self) {
-        if let Some(detail) = self.detail.as_mut() {
-            detail.prompt_focused = false;
-            detail.prompt_selected = None;
+        if let Some(conversation) = self.active_conversation_mut() {
+            conversation.prompt_focused = false;
+            conversation.prompt_selected = None;
         }
     }
 
     /// Move the highlighted slash-command completion.
     pub fn detail_prompt_move_command(&mut self, delta: isize) {
-        if let Some(detail) = self.detail.as_mut() {
-            detail.move_command(delta);
+        if let Some(conversation) = self.active_conversation_mut() {
+            conversation.move_command(delta);
         }
     }
 
     /// Accept the highlighted (or first) slash-command completion.
     pub fn detail_prompt_complete_command(&mut self) -> bool {
-        self.detail
-            .as_mut()
-            .is_some_and(TaskDetail::complete_command)
+        self.active_conversation_mut()
+            .is_some_and(Conversation::complete_command)
     }
 
     /// Fill a clicked command into the draft (an explicit accept).
     pub fn detail_prompt_choose_command(&mut self, index: usize) {
-        if let Some(detail) = self.detail.as_mut() {
-            detail.prompt_selected = Some(index);
-            detail.complete_command();
+        if let Some(conversation) = self.active_conversation_mut() {
+            conversation.prompt_selected = Some(index);
+            conversation.complete_command();
         }
     }
 
     /// Send the raw draft through `agents.prompt`. Slash commands and unknown
     /// text are never rewritten.
     pub fn send_detail_prompt(&mut self, cx: &mut Context<Self>) {
-        let Some(detail) = self.detail.as_ref() else {
+        let Some(conversation) = self.active_conversation() else {
             return;
         };
-        if detail.prompt_sending {
+        if conversation.prompt_sending {
             return;
         }
-        let prompt = detail.prompt.value().trim().to_string();
+        let prompt = conversation.prompt.value().trim().to_string();
         if prompt.is_empty() {
             return;
         }
         let Some(session_id) = self.detail_agent_session_id() else {
-            if let Some(detail) = self.detail.as_mut() {
-                detail.prompt_error = Some("No live agent session is attached.".to_string());
+            if let Some(conversation) = self.active_conversation_mut() {
+                conversation.prompt_error = Some("No live agent session is attached.".to_string());
             }
             return;
         };
-        let Some(detail) = self.detail.as_mut() else {
-            return;
-        };
-        detail.prompt_sending = true;
-        detail.prompt_error = None;
+        if let Some(conversation) = self.active_conversation_mut() {
+            conversation.prompt_sending = true;
+            conversation.prompt_error = None;
+        }
         match &self.runtime {
             Some(runtime) => runtime.prompt(session_id, prompt),
             None => {
-                if let Some(detail) = self.detail.as_mut() {
-                    detail.prompt_sending = false;
-                    detail.prompt_error = Some("The transport is not running.".to_string());
+                if let Some(conversation) = self.active_conversation_mut() {
+                    conversation.prompt_sending = false;
+                    conversation.prompt_error = Some("The transport is not running.".to_string());
                 }
                 self.show_toast(
                     ToastKind::Error,
@@ -4639,20 +5029,19 @@ impl ClientState {
             return;
         }
         let already_pending = self
-            .detail
-            .as_ref()
-            .is_some_and(|detail| detail.reply_pending.is_some());
+            .active_conversation()
+            .is_some_and(|conversation| conversation.reply_pending.is_some());
         if already_pending {
             return;
         }
-        if let Some(detail) = self.detail.as_mut() {
-            detail.reply_pending = Some(request_id.clone());
+        if let Some(conversation) = self.active_conversation_mut() {
+            conversation.begin_reply(&request_id);
         }
         match &self.runtime {
             Some(runtime) => runtime.reply(request.session_id.clone(), request_id, reply),
             None => {
-                if let Some(detail) = self.detail.as_mut() {
-                    detail.reply_pending = None;
+                if let Some(conversation) = self.active_conversation_mut() {
+                    conversation.fail_reply();
                 }
                 self.show_toast(
                     ToastKind::Error,
@@ -4728,33 +5117,6 @@ impl ClientState {
             task_id: task.id,
             task_name: inbox::task_display_name(&task.name).to_string(),
         });
-    }
-
-    /// Whether a live agent event belongs to the open detail. The daemon marks
-    /// pushes with `task_id`; older pushes only carry the session.
-    fn event_belongs_to_open_task(&self, event: &AgentEventPush) -> bool {
-        let Some(detail) = &self.detail else {
-            return false;
-        };
-        if event
-            .task_id
-            .as_deref()
-            .and_then(|id| uuid::Uuid::parse_str(id).ok())
-            == Some(detail.task_id)
-        {
-            return true;
-        }
-        if detail.events_session.as_deref() == Some(event.session_id.as_str()) {
-            return true;
-        }
-        self.sessions.iter().any(|session| {
-            session.id == event.session_id
-                && session
-                    .task_id
-                    .as_deref()
-                    .and_then(|id| uuid::Uuid::parse_str(id).ok())
-                    == Some(detail.task_id)
-        })
     }
 
     /// The task opened from the Inbox, when there is one.
@@ -4967,6 +5329,17 @@ impl gpui::EntityInputHandler for ClientState {
     }
 }
 
+/// The active repo's main-checkout path, or `None` for the global view and an
+/// unavailable/missing registry entry. It never falls back to the daemon cwd.
+fn repo_checkout(repos: &[RepoInfo], active: Option<&str>) -> Option<PathBuf> {
+    let name = active?;
+    repos
+        .iter()
+        .find(|repo| repo.name == name && repo.available)
+        .map(|repo| PathBuf::from(&repo.path))
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
 /// An id suffix for the rare placeholder whose root task is outside the
 /// snapshot window: short enough for a heading, unique enough to disambiguate.
 fn short_id(id: uuid::Uuid) -> String {
@@ -5103,6 +5476,7 @@ mod tests {
             toast_id: 0,
             selected_task: None,
             detail: None,
+            deleted_task: None,
             workflow_root: None,
             workflow_detail: None,
             workflow_inspect: None,
@@ -5114,6 +5488,7 @@ mod tests {
             workflow_retry_previous: HashMap::new(),
             schedules: SchedulesState::default(),
             settings: SettingsState::new("http://127.0.0.1:4780", None),
+            standalone: StandaloneAgent::default(),
             repos: Vec::new(),
             active_repo: None,
             repos_loaded: false,
@@ -5239,5 +5614,36 @@ mod tests {
             state.repo_picker().error(),
             Some("The daemon rejected the switch: not allowed.")
         );
+    }
+
+    #[test]
+    fn the_agent_checkout_is_the_active_repo_main_path_never_the_daemon_cwd() {
+        let repos = vec![
+            RepoInfo {
+                name: "favetto".to_string(),
+                path: "/code/favetto".to_string(),
+                available: true,
+                active: true,
+                source: Default::default(),
+            },
+            RepoInfo {
+                name: "missing".to_string(),
+                path: "/gone".to_string(),
+                available: false,
+                active: false,
+                source: Default::default(),
+            },
+        ];
+        assert_eq!(
+            repo_checkout(&repos, Some("favetto")),
+            Some(PathBuf::from("/code/favetto"))
+        );
+        assert_eq!(repo_checkout(&repos, None), None, "global has no checkout");
+        assert_eq!(
+            repo_checkout(&repos, Some("missing")),
+            None,
+            "an unavailable repo must block the start"
+        );
+        assert_eq!(repo_checkout(&repos, Some("unknown")), None);
     }
 }

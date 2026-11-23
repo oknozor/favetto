@@ -5,10 +5,12 @@
 //! the action-based keyboard model (docs/design/gpui-client.md §1, §4).
 
 mod actions;
+mod agent;
 mod app;
 mod catalog;
 mod components;
 mod config;
+mod conversation;
 mod detail;
 mod elicitation;
 mod inbox;

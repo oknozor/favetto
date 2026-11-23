@@ -15,20 +15,23 @@
 //!   not an error.
 
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::time::Duration;
 
 use favetto_wire::elicitation::ElicitationRequest;
 use favetto_wire::model::{
-    AgentCommand, AgentPlanEntry, AgentSessionHistoryEntry, AgentSessionInfo, AgentSessionState,
-    AgentStateEvent, AgentUsage, AwaitingInputKind, ContentRole, IdleOutcome, InputRequest,
-    MessageContent, MessageRole, RunStatus, RunSummary, Task, TaskRun, TaskStatus,
+    AgentCommand, AgentPlanEntry, AgentSessionHistoryEntry, AgentSessionState, AgentStateEvent,
+    AgentUsage, AwaitingInputKind, ContentRole, IdleOutcome, InputRequest, MessageContent,
+    MessageRole, RunStatus, RunSummary, Task, TaskRun, TaskStatus,
 };
 use favetto_wire::rpc::{AgentAttachResult, AgentEventPush, RpcCall, TasksEventsParams};
 use favetto_wire::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::text_input::TextInput;
+use crate::conversation::Conversation;
+#[cfg(test)]
+use favetto_wire::model::AgentSessionInfo;
 
 use crate::inbox::{self, StatusKind};
 use crate::search::{self, SearchField, SearchQuery};
@@ -803,6 +806,9 @@ fn bound_transcript(transcript: &str) -> String {
 
 /// The client's per-task detail state. One lives on [`crate::state::ClientState`]
 /// for the selected run and is replaced when another run opens.
+///
+/// Everything task-neutral lives in [`Conversation`]; this wrapper keeps only
+/// the task row, its attempt table, the active tab and the task-scoped restore.
 #[derive(Clone, Debug)]
 pub struct TaskDetail {
     /// The task this detail belongs to.
@@ -813,23 +819,8 @@ pub struct TaskDetail {
     pub task_loading: bool,
     /// The last `tasks.get` failure.
     pub task_error: Option<String>,
-    /// The structured feed, ordered by `seq`.
-    pub events: Vec<AgentEventPush>,
-    /// The session the daemon resolved for `tasks.events`.
-    pub events_session: Option<String>,
-    /// The highest seen per-session `seq`.
-    pub events_cursor: u64,
-    /// Whether the first `tasks.events` backfill is in flight.
-    pub events_loading: bool,
-    /// The last `tasks.events` failure.
-    pub events_error: Option<String>,
-    /// Whether at least one backfill completed (an empty feed is then real).
-    pub events_loaded: bool,
-    /// Event kinds skipped because this client does not know them.
-    pub events_ignored: usize,
-    /// Monotonic revision of [`TaskDetail::events`], used by the virtualized
-    /// feed to rebuild its item list only when the events actually changed.
-    pub events_revision: u64,
+    /// The shared structured conversation.
+    pub conversation: Conversation,
     /// The attempt table from `tasks.runs`.
     pub runs: Vec<TaskRun>,
     /// Whether the first `tasks.runs` fetch is in flight.
@@ -840,37 +831,6 @@ pub struct TaskDetail {
     pub runs_loaded: bool,
     /// The active tab.
     pub tab: DetailTab,
-    /// Whether new content should keep the viewport at the tail.
-    pub follow: bool,
-    /// Events that arrived while the viewport was pinned off the tail.
-    pub new_events: u64,
-    /// The request id with an in-flight `agents.reply`.
-    pub reply_pending: Option<String>,
-    /// The edited form for the current elicitation request.
-    pub elicitation: Option<crate::elicitation::ElicitationFormState>,
-    /// The elicitation request id with an in-flight `agents.reply_elicitation`.
-    pub elicitation_pending: Option<String>,
-    /// The elicitation id most recently answered, hidden until a new one arrives.
-    pub answered_elicitation: Option<String>,
-    /// The live session id whose turn has an in-flight/cancelling
-    /// `agents.cancel`. Cleared when the turn reports idle or the RPC fails.
-    pub turn_cancel_pending: Option<String>,
-    /// The request id most recently answered, hidden until a new request arrives.
-    pub answered_request: Option<String>,
-    /// The current execution plan snapshot from `tasks.events`/live updates.
-    pub plan: Option<Vec<AgentPlanEntry>>,
-    /// The current advertised command snapshot.
-    pub commands: Option<Vec<AgentCommand>>,
-    /// The follow-up prompt draft.
-    pub prompt: TextInput,
-    /// The highlighted command completion in the prompt.
-    pub prompt_selected: Option<usize>,
-    /// Whether an `agents.prompt` is in flight.
-    pub prompt_sending: bool,
-    /// Whether the always-visible follow-up composer owns the keyboard.
-    pub prompt_focused: bool,
-    /// The last prompt-send failure.
-    pub prompt_error: Option<String>,
     /// The task-scoped restoration of the run's agent conversation.
     pub restore: SessionRestore,
     /// Monotonic id of the in-flight restore lookup, used to drop stale replies.
@@ -879,42 +839,36 @@ pub struct TaskDetail {
     pub restore_session: Option<String>,
 }
 
+impl Deref for TaskDetail {
+    type Target = Conversation;
+
+    fn deref(&self) -> &Self::Target {
+        &self.conversation
+    }
+}
+
+impl DerefMut for TaskDetail {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.conversation
+    }
+}
+
 impl TaskDetail {
     /// A fresh detail whose three reads are about to start.
     pub fn new(task_id: Uuid) -> Self {
+        let mut conversation = Conversation::for_task(task_id);
+        conversation.events_loading = true;
         Self {
             task_id,
             task: None,
             task_loading: true,
             task_error: None,
-            events: Vec::new(),
-            events_session: None,
-            events_cursor: 0,
-            events_loading: true,
-            events_error: None,
-            events_loaded: false,
-            events_ignored: 0,
-            events_revision: 0,
+            conversation,
             runs: Vec::new(),
             runs_loading: true,
             runs_error: None,
             runs_loaded: false,
             tab: DetailTab::default(),
-            follow: true,
-            new_events: 0,
-            reply_pending: None,
-            elicitation: None,
-            elicitation_pending: None,
-            answered_elicitation: None,
-            turn_cancel_pending: None,
-            answered_request: None,
-            plan: None,
-            commands: None,
-            prompt: TextInput::default(),
-            prompt_selected: None,
-            prompt_sending: false,
-            prompt_focused: false,
-            prompt_error: None,
             restore: SessionRestore::Checking,
             restore_request: 0,
             restore_session: None,
@@ -925,15 +879,19 @@ impl TaskDetail {
     /// retried/refreshed tab keeps its rows visible (no flicker).
     pub fn reload(&mut self) {
         self.task_loading = true;
-        self.events_loading = true;
+        self.conversation.events_loading = true;
         self.runs_loading = true;
         self.task_error = None;
-        self.events_error = None;
+        self.conversation.events_error = None;
         self.runs_error = None;
     }
 
     /// Fold a full `tasks.get` result in.
     pub fn set_task(&mut self, task: Task) {
+        self.conversation.mark_status(
+            tasks::is_terminal(task.status),
+            task.status == TaskStatus::AwaitingInput,
+        );
         self.task = Some(task);
         self.task_loading = false;
         self.task_error = None;
@@ -948,24 +906,9 @@ impl TaskDetail {
             .as_ref()
             .is_some_and(|existing| existing.attempt != task.attempt);
         if attempt_changed {
-            self.events.clear();
-            self.events_cursor = 0;
-            self.events_loaded = false;
-            self.events_ignored = 0;
-            self.events_revision = self.events_revision.wrapping_add(1);
-            self.new_events = 0;
+            self.conversation.reset_for_new_attempt();
             self.runs.clear();
             self.runs_loaded = false;
-            self.answered_request = None;
-            self.reply_pending = None;
-            self.turn_cancel_pending = None;
-            self.plan = None;
-            self.commands = None;
-            self.prompt.set_value(String::new());
-            self.prompt_selected = None;
-            self.prompt_sending = false;
-            self.prompt_focused = false;
-            self.prompt_error = None;
             // A new attempt owns a new agent conversation; the previous attempt's
             // restored history must never appear under it.
             self.restore = SessionRestore::Checking;
@@ -976,6 +919,10 @@ impl TaskDetail {
                 task.output = existing.output.clone();
             }
         }
+        self.conversation.mark_status(
+            tasks::is_terminal(task.status),
+            task.status == TaskStatus::AwaitingInput,
+        );
         self.task = Some(task);
         self.task_loading = false;
     }
@@ -984,134 +931,6 @@ impl TaskDetail {
     pub fn fail_task(&mut self, message: String) {
         self.task_loading = false;
         self.task_error = Some(message);
-    }
-
-    /// Merge a `tasks.events` backfill with any live events already received.
-    pub fn merge_events(
-        &mut self,
-        session_id: Option<String>,
-        events: Vec<AgentEventPush>,
-        next_cursor: u64,
-        plan: Option<Vec<AgentPlanEntry>>,
-        commands: Option<Vec<AgentCommand>>,
-        ignored: usize,
-    ) {
-        let mut merged: HashMap<(String, u64), AgentEventPush> = HashMap::new();
-        for event in self.events.drain(..) {
-            merged.insert((event.session_id.clone(), event.seq), event);
-        }
-        let mut highest = next_cursor;
-        let mut latest_session = session_id;
-        for event in events {
-            highest = highest.max(event.seq);
-            if latest_session.is_none() {
-                latest_session = Some(event.session_id.clone());
-            }
-            merged.insert((event.session_id.clone(), event.seq), event);
-        }
-        let mut events: Vec<AgentEventPush> = merged.into_values().collect();
-        events.sort_by_key(|event| (event.seq, event.session_id.clone()));
-
-        // The snapshot is the state at `next_cursor`. Replay only later live
-        // events so a plan clearing event trimmed from the retained feed cannot
-        // be undone by an older plan event that is still in the window. When an
-        // older daemon omits the snapshot, derive it from the whole window.
-        let mut live_plan = plan;
-        let mut live_commands = commands;
-        for event in &events {
-            match &event.event {
-                AgentStateEvent::Plan { entries } if event.seq > next_cursor => {
-                    live_plan = Some(entries.clone());
-                }
-                AgentStateEvent::AvailableCommands { commands } if event.seq > next_cursor => {
-                    live_commands = Some(commands.clone());
-                }
-                _ => {}
-            }
-        }
-        // An older daemon omits the snapshot fields; derive them from the whole
-        // retained window instead.
-        if live_plan.is_none() {
-            for event in &events {
-                if let AgentStateEvent::Plan { entries } = &event.event {
-                    live_plan = Some(entries.clone());
-                }
-            }
-        }
-        if live_commands.is_none() {
-            for event in &events {
-                if let AgentStateEvent::AvailableCommands { commands } = &event.event {
-                    live_commands = Some(commands.clone());
-                }
-            }
-        }
-        self.plan = live_plan;
-        self.commands = live_commands;
-
-        self.events = events;
-        self.trim_events();
-        self.events_revision = self.events_revision.wrapping_add(1);
-        if latest_session.is_some() {
-            self.events_session = latest_session;
-        }
-        self.events_cursor = self.events_cursor.max(highest);
-        self.events_loading = false;
-        self.events_error = None;
-        self.events_loaded = true;
-        self.events_ignored = ignored;
-    }
-
-    /// Fold `tasks.events` failure in; loaded events are kept.
-    pub fn fail_events(&mut self, message: String) {
-        self.events_loading = false;
-        self.events_error = Some(message);
-    }
-
-    /// Append one live event, deduplicating by `(session_id, seq)`. Returns
-    /// whether it was new; a new event while the viewport is pinned off the tail
-    /// increments [`TaskDetail::new_events`].
-    pub fn push_event(&mut self, push: AgentEventPush) -> bool {
-        if self
-            .events
-            .iter()
-            .any(|event| event.session_id == push.session_id && event.seq == push.seq)
-        {
-            return false;
-        }
-        self.events_cursor = self.events_cursor.max(push.seq);
-        if self.events_session.is_none() {
-            self.events_session = Some(push.session_id.clone());
-        }
-        match &push.event {
-            AgentStateEvent::Plan { entries } => self.plan = Some(entries.clone()),
-            AgentStateEvent::AvailableCommands { commands } => {
-                self.commands = Some(commands.clone())
-            }
-            _ => {}
-        }
-        self.events.push(push);
-        // The daemon sends live events in order, but a reconnect can replay a
-        // frame; sorting keeps the feed ordered by `seq` either way.
-        self.events.sort_by_key(|event| event.seq);
-        self.trim_events();
-        self.events_revision = self.events_revision.wrapping_add(1);
-        debug_assert!(self
-            .events
-            .windows(2)
-            .all(|pair| pair[0].seq <= pair[1].seq));
-        if !self.follow {
-            self.new_events = self.new_events.saturating_add(1);
-        }
-        true
-    }
-
-    /// Keep the retained feed bounded. The oldest frames go first; an open
-    /// permission prompt is the newest unresolved request, so it survives.
-    fn trim_events(&mut self) {
-        let excess = self.events.len().saturating_sub(MAX_RETAINED_EVENTS);
-        if excess > 0 {
-            self.events.drain(..excess);
-        }
     }
 
     /// Fold a `tasks.runs` result in.
@@ -1181,7 +1000,9 @@ impl TaskDetail {
                 self.restore = SessionRestore::Restored(restored);
                 self.restore_session = None;
                 if changed {
-                    self.reset_events_for_restore();
+                    // Drop the previous attempt's feed so a replayed
+                    // conversation is not filtered out by the old cursor.
+                    self.conversation.reset_events_for_restore();
                 }
                 changed
             }
@@ -1192,28 +1013,9 @@ impl TaskDetail {
         }
     }
 
-    /// Drop the previous attempt's feed so a replayed conversation is not
-    /// filtered out by the old session's cursor.
-    fn reset_events_for_restore(&mut self) {
-        self.events.clear();
-        self.events_session = None;
-        self.events_cursor = 0;
-        self.events_loaded = false;
-        self.events_ignored = 0;
-        self.events_revision = self.events_revision.wrapping_add(1);
-        self.new_events = 0;
-        self.plan = None;
-        self.commands = None;
-    }
-
     /// The persisted output, reduced to plain text.
     pub fn output(&self) -> Option<OutputText> {
         extract_output(self.task.as_ref().and_then(|task| task.output.as_ref()))
-    }
-
-    /// The grouped event feed.
-    pub fn feed(&self) -> Vec<FeedItem> {
-        build_feed(&self.events)
     }
 
     /// The task status, when known.
@@ -1224,283 +1026,6 @@ impl TaskDetail {
     /// Whether the run is finished and will not change again.
     pub fn is_terminal(&self) -> bool {
         self.status().is_some_and(tasks::is_terminal)
-    }
-
-    /// Whether the always-visible follow-up composer can accept a prompt.
-    ///
-    /// A finished run or a run with no attached agent session keeps the
-    /// composer on screen but read-only.
-    pub fn prompt_enabled(&self, has_session: bool) -> bool {
-        has_session && !self.is_terminal()
-    }
-
-    /// The latest unresolved structured prompt in the event feed.
-    fn latest_unresolved_request(&self) -> Option<(&str, &InputRequest)> {
-        let mut pending: Option<(&str, &InputRequest)> = None;
-        for push in &self.events {
-            match &push.event {
-                AgentStateEvent::InputRequested { request } => {
-                    pending = Some((push.session_id.as_str(), request));
-                }
-                AgentStateEvent::InputResolved { id } => {
-                    if pending.is_some_and(|(_, request)| request.id == *id) {
-                        pending = None;
-                    }
-                }
-                AgentStateEvent::Idle { .. } => pending = None,
-                _ => {}
-            }
-        }
-        pending
-    }
-
-    /// The prompt the permission banner should show, if any.
-    ///
-    /// The live `agents.list` session is authoritative: it carries the request's
-    /// exact correlation id, options and `allow_always`. When the session roster
-    /// has not caught up yet, the last unresolved `InputRequested` event in the
-    /// feed is the fallback. A screen-detected prompt with no structured request
-    /// still gets a banner (the run is blocked), but its buttons are disabled
-    /// because `request_id` is absent.
-    pub fn pending_request(&self, sessions: &[AgentSessionInfo]) -> Option<PendingRequest> {
-        if self.is_terminal() {
-            return None;
-        }
-        let task_id = self.task_id.to_string();
-
-        if let Some(session) = sessions
-            .iter()
-            .find(|session| session.task_id.as_deref() == Some(task_id.as_str()))
-        {
-            if let Some(reason) = &session.awaiting_input {
-                let answered = reason.request_id.is_some()
-                    && self.answered_request.as_deref() == reason.request_id.as_deref();
-                if !answered {
-                    return Some(PendingRequest {
-                        session_id: session.id.clone(),
-                        request_id: reason.request_id.clone(),
-                        kind: reason.kind,
-                        message: reason.message.clone(),
-                        options: reason.options.clone(),
-                        allow_always: reason.allow_always,
-                    });
-                }
-                return None;
-            }
-        }
-
-        if let Some((session_id, request)) = self.latest_unresolved_request() {
-            let answered = self.answered_request.as_deref() == Some(request.id.as_str());
-            if !answered {
-                return Some(PendingRequest {
-                    session_id: session_id.to_string(),
-                    request_id: Some(request.id.clone()),
-                    kind: request.kind,
-                    message: request.message.clone(),
-                    options: request.options.clone(),
-                    allow_always: request.allow_always,
-                });
-            }
-            return None;
-        }
-
-        // The task says it is blocked but neither the roster nor the feed has
-        // the prompt (yet). Say so instead of hiding the block.
-        if self.status() == Some(TaskStatus::AwaitingInput) {
-            return Some(PendingRequest {
-                session_id: self.events_session.clone().unwrap_or_default(),
-                request_id: None,
-                kind: AwaitingInputKind::Other,
-                message: "The agent is waiting for input, but its prompt is not available through the structured channel yet.".to_string(),
-                options: Vec::new(),
-                allow_always: false,
-            });
-        }
-
-        None
-    }
-
-    /// The latest unresolved ACP form request in the feed.
-    fn latest_unresolved_elicitation(&self) -> Option<(&str, &ElicitationRequest)> {
-        let mut pending: Option<(&str, &ElicitationRequest)> = None;
-        for push in &self.events {
-            match &push.event {
-                AgentStateEvent::ElicitationRequested { request } => {
-                    pending = Some((push.session_id.as_str(), request));
-                }
-                AgentStateEvent::ElicitationResolved { id, .. } => {
-                    if pending.is_some_and(|(_, request)| request.id == *id) {
-                        pending = None;
-                    }
-                }
-                AgentStateEvent::Idle { .. } => pending = None,
-                _ => {}
-            }
-        }
-        pending
-    }
-
-    /// The pending form, preferring the live roster's `awaiting_input` and
-    /// falling back to the feed. The agent identity comes from the request.
-    pub fn pending_elicitation(&self, sessions: &[AgentSessionInfo]) -> Option<PendingElicitation> {
-        if self.is_terminal() {
-            return None;
-        }
-        let task_id = self.task_id.to_string();
-        if let Some(session) = sessions
-            .iter()
-            .find(|session| session.task_id.as_deref() == Some(task_id.as_str()))
-        {
-            if let Some(reason) = &session.awaiting_input {
-                if reason.kind == AwaitingInputKind::Elicitation {
-                    let form = reason.form.clone()?;
-                    let request_id = reason.request_id.clone()?;
-                    if self.answered_elicitation.as_deref() == Some(request_id.as_str()) {
-                        return None;
-                    }
-                    return Some(PendingElicitation {
-                        session_id: session.id.clone(),
-                        request: ElicitationRequest {
-                            id: request_id,
-                            agent: session.agent.clone(),
-                            tool_call_id: None,
-                            message: reason.message.clone(),
-                            form,
-                        },
-                    });
-                }
-            }
-        }
-        let (session_id, request) = self.latest_unresolved_elicitation()?;
-        if self.answered_elicitation.as_deref() == Some(request.id.as_str()) {
-            return None;
-        }
-        Some(PendingElicitation {
-            session_id: session_id.to_string(),
-            request: request.clone(),
-        })
-    }
-
-    /// Create the editable form once a pending request appears, and clear it
-    /// only when the same request resolves.
-    pub fn sync_elicitation(&mut self, sessions: &[AgentSessionInfo]) {
-        let pending = self.pending_elicitation(sessions);
-        match pending {
-            Some(pending) => {
-                let same = self
-                    .elicitation
-                    .as_ref()
-                    .is_some_and(|form| form.request.id == pending.request.id);
-                if !same {
-                    self.elicitation = Some(crate::elicitation::ElicitationFormState::new(
-                        pending.session_id,
-                        pending.request,
-                    ));
-                }
-            }
-            None => self.elicitation = None,
-        }
-    }
-
-    /// The request id with an in-flight reply, when it matches `request_id`.
-    pub fn reply_in_flight(&self, request_id: Option<&str>) -> bool {
-        match (request_id, self.reply_pending.as_deref()) {
-            (Some(request_id), Some(pending)) => request_id == pending,
-            (None, pending) => pending.is_some(),
-            _ => false,
-        }
-    }
-
-    /// The current plan, falling back to the last matching event for payloads
-    /// from a daemon that predates the explicit snapshot field.
-    pub fn plan(&self) -> Vec<AgentPlanEntry> {
-        if let Some(plan) = &self.plan {
-            return plan.clone();
-        }
-        self.events
-            .iter()
-            .rev()
-            .find_map(|push| match &push.event {
-                AgentStateEvent::Plan { entries } => Some(entries.clone()),
-                _ => None,
-            })
-            .unwrap_or_default()
-    }
-
-    /// The current advertised commands, with the same event fallback as
-    /// [`Self::plan`].
-    pub fn commands(&self) -> Vec<AgentCommand> {
-        if let Some(commands) = &self.commands {
-            return commands.clone();
-        }
-        self.events
-            .iter()
-            .rev()
-            .find_map(|push| match &push.event {
-                AgentStateEvent::AvailableCommands { commands } => Some(commands.clone()),
-                _ => None,
-            })
-            .unwrap_or_default()
-    }
-
-    /// The `/prefix` currently being completed, only for a bare first token.
-    pub fn command_query(&self) -> Option<&str> {
-        command_query(self.prompt.value())
-    }
-
-    /// Advertised commands matching the current query, most relevant first and
-    /// advertised order as the tie-break. Slash completion is case-insensitive.
-    pub fn command_matches(&self) -> Vec<&AgentCommand> {
-        let Some(query_text) = self.command_query() else {
-            return Vec::new();
-        };
-        let Some(commands) = &self.commands else {
-            return Vec::new();
-        };
-        rank_commands(commands, query_text)
-            .into_iter()
-            .map(|(_, command)| command)
-            .collect()
-    }
-
-    /// Move the highlighted completion by `delta`, clamped to the matches.
-    pub fn move_command(&mut self, delta: isize) -> bool {
-        let count = self.command_matches().len();
-        if count == 0 {
-            self.prompt_selected = None;
-            return false;
-        }
-        let current = self.prompt_selected.unwrap_or(0).min(count - 1);
-        let next = (current as isize + delta).clamp(0, count as isize - 1);
-        self.prompt_selected = Some(next as usize);
-        true
-    }
-
-    /// Accept the highlighted (or first) command into the draft. Only an
-    /// explicit accept rewrites the prompt; unknown text is never altered.
-    pub fn complete_command(&mut self) -> bool {
-        let name = self
-            .command_matches()
-            .get(self.prompt_selected.unwrap_or(0))
-            .map(|command| command.name.clone());
-        let Some(name) = name else {
-            return false;
-        };
-        self.prompt.set_value(format!("/{name} "));
-        self.prompt_selected = None;
-        true
-    }
-
-    /// The exact matched command's input hint, when present.
-    #[allow(dead_code)] // Kept on the pure model for parity with the TUI; the view reads it inline.
-    pub fn command_hint(&self) -> Option<&str> {
-        let rest = self.prompt.value().strip_prefix('/')?;
-        let name = rest.split_whitespace().next().unwrap_or_default();
-        self.commands
-            .as_ref()?
-            .iter()
-            .find(|command| command.name == name)
-            .and_then(|command| command.input_hint.as_deref())
     }
 }
 
@@ -2343,52 +1868,6 @@ mod tests {
         let pending = detail.pending_request(&[]).expect("generic banner");
         assert!(!pending.can_reply());
         assert!(pending.message.contains("waiting for input"));
-    }
-
-    #[test]
-    fn the_composer_is_read_only_without_a_live_session_or_after_the_run_ends() {
-        let mut detail = TaskDetail::new(Uuid::from_u128(7));
-        assert!(detail.prompt_enabled(true), "a session can take a prompt");
-        assert!(
-            !detail.prompt_enabled(false),
-            "without a session the box stays read-only"
-        );
-
-        detail.set_task(task(TaskStatus::Running));
-        assert!(detail.prompt_enabled(true));
-        assert!(!detail.prompt_enabled(false));
-
-        detail.set_task(task(TaskStatus::Succeeded));
-        assert!(
-            !detail.prompt_enabled(true),
-            "a finished run cannot accept a prompt, even with a restored session"
-        );
-    }
-
-    #[test]
-    fn a_new_attempt_clears_the_composer_focus_but_a_same_attempt_update_keeps_the_draft() {
-        let mut detail = TaskDetail::new(Uuid::from_u128(7));
-        detail.set_task(task(TaskStatus::Running));
-        detail.prompt.set_value("draft".to_string());
-        detail.prompt_focused = true;
-
-        let mut same = task(TaskStatus::Running);
-        same.output = None;
-        detail.update_summary(same);
-        assert!(
-            detail.prompt_focused,
-            "a live update keeps the composer focused"
-        );
-        assert_eq!(detail.prompt.value(), "draft");
-
-        let mut next = task(TaskStatus::Running);
-        next.attempt = 2;
-        detail.update_summary(next);
-        assert!(
-            !detail.prompt_focused,
-            "a new attempt owns a new conversation"
-        );
-        assert_eq!(detail.prompt.value(), "");
     }
 
     #[test]

@@ -17,6 +17,7 @@
 
 #![allow(dead_code)] // `ping()` and the push accessors are consumed by steps 03+.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -28,14 +29,14 @@ use favetto_wire::model::{
 };
 use favetto_wire::rpc::{
     AgentAttachResult, AgentAuthenticateParams, AgentAuthenticateResult, AgentCancelParams,
-    AgentCancelResult, AgentElicitationReplyParams, AgentElicitationReplyResult, AgentLogoutParams,
-    AgentLogoutResult, AgentOptionsResult, AgentPromptParams, AgentPromptResult, AgentReplyParams,
-    AgentReplyResult, AgentSetModeParams, AgentSetOptionParams, CatalogEntry, CatalogGetParams,
-    EmptyParams, PingParams, PingResult, ReposActivateParams, ReposListResult,
+    AgentCancelResult, AgentCloseResult, AgentElicitationReplyParams, AgentElicitationReplyResult,
+    AgentLogoutParams, AgentLogoutResult, AgentOptionsResult, AgentPromptParams, AgentPromptResult,
+    AgentReplyParams, AgentReplyResult, AgentSetModeParams, AgentSetOptionParams, CatalogEntry,
+    CatalogGetParams, EmptyParams, PingParams, PingResult, ReposActivateParams, ReposListResult,
     ScheduleDeleteParams, ScheduleUpsertParams, SchedulesDeleteResult, SessionIdParams,
-    StartOneshotParams, StartOneshotResult, TaskIdParams, TasksDeleteResult, TasksEventsParams,
-    TasksListParams, TasksSessionResult, TasksStartParams, WorkflowCancelResultBody,
-    WorkflowGetResult, WorkflowInspectParams, WorkflowRetryParams,
+    StartAgentParams, StartOneshotParams, StartOneshotResult, TaskIdParams, TasksDeleteResult,
+    TasksEventsParams, TasksListParams, TasksSessionResult, TasksStartParams,
+    WorkflowCancelResultBody, WorkflowGetResult, WorkflowInspectParams, WorkflowRetryParams,
 };
 use favetto_wire::workflow::WorkflowInspect;
 use uuid::Uuid;
@@ -80,6 +81,16 @@ pub enum Command {
         agent: Option<String>,
         cwd: Option<String>,
     },
+    /// Start a free-standing ACP session (`agents.start`) with no `task_id`.
+    StartAgent {
+        agent: Option<String>,
+        provider: Option<String>,
+        model: Option<String>,
+        cwd: Option<PathBuf>,
+        new: bool,
+    },
+    /// Close one standalone ACP session (`agents.close`).
+    CloseAgent { session_id: String },
     /// Send `tasks.cancel` or `tasks.retry` for one task. `previous` is the row
     /// the UI optimistically replaced and `optimistic` is the replacement, so a
     /// failed RPC can restore the former only if no newer push replaced it.
@@ -217,6 +228,15 @@ pub enum Update {
     /// `tasks.start_oneshot` completed for the one-shot sheet.
     OneshotFinished {
         result: Result<Box<StartOneshotResult>, ClientError>,
+    },
+    /// `agents.start` completed for the Agent panel.
+    AgentStartFinished {
+        result: Result<Box<AgentAttachResult>, ClientError>,
+    },
+    /// `agents.close` completed for one standalone session.
+    AgentClosed {
+        session_id: String,
+        result: Result<AgentCloseResult, ClientError>,
     },
     /// A `tasks.cancel`/`tasks.retry` round trip completed. `previous` is the
     /// pre-optimistic row and `optimistic` the local write, used for the guarded
@@ -449,6 +469,29 @@ impl Runtime {
     /// Open an inline one-shot agent session.
     pub fn start_oneshot(&self, agent: Option<String>, cwd: Option<String>) {
         self.send(Command::StartOneshot { agent, cwd });
+    }
+
+    /// Start a free-standing agent session in `cwd` (the active repo checkout).
+    pub fn start_agent(
+        &self,
+        agent: Option<String>,
+        provider: Option<String>,
+        model: Option<String>,
+        cwd: Option<PathBuf>,
+        new: bool,
+    ) {
+        self.send(Command::StartAgent {
+            agent,
+            provider,
+            model,
+            cwd,
+            new,
+        });
+    }
+
+    /// Close one standalone agent session.
+    pub fn close_agent(&self, session_id: String) {
+        self.send(Command::CloseAgent { session_id });
     }
 
     /// Run `tasks.cancel`/`tasks.retry` for a row the UI already changed.
@@ -711,6 +754,26 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
             Command::StartOneshot { agent, cwd } => {
                 spawn_start_oneshot(client.clone(), updates.clone(), agent, cwd);
             }
+            Command::StartAgent {
+                agent,
+                provider,
+                model,
+                cwd,
+                new,
+            } => {
+                spawn_start_agent(
+                    client.clone(),
+                    updates.clone(),
+                    agent,
+                    provider,
+                    model,
+                    cwd,
+                    new,
+                );
+            }
+            Command::CloseAgent { session_id } => {
+                spawn_close_agent(client.clone(), updates.clone(), session_id);
+            }
             Command::TaskAction {
                 action,
                 previous,
@@ -955,6 +1018,60 @@ fn spawn_start_oneshot(
             .await
             .map(Box::new);
         let _ = updates.try_send(Update::OneshotFinished { result });
+    });
+}
+
+/// Spawn one free-standing `agents.start` for the Agent panel.
+fn spawn_start_agent(
+    client: Arc<RpcClient>,
+    updates: Sender<Update>,
+    agent: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    cwd: Option<PathBuf>,
+    new: bool,
+) {
+    let params = start_agent_params(agent, provider, model, cwd, new);
+    tokio::spawn(async move {
+        let result = client.agents_start(params).await.map(Box::new);
+        let _ = updates.try_send(Update::AgentStartFinished { result });
+    });
+}
+
+/// Build the free-standing `agents.start` params. No `task_id` is ever set: the
+/// Agent panel starts a session in the active repo's main checkout, not a task
+/// or a task worktree.
+fn start_agent_params(
+    agent: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    cwd: Option<PathBuf>,
+    new: bool,
+) -> StartAgentParams {
+    StartAgentParams {
+        agent,
+        task_id: None,
+        prompt: None,
+        session_id: None,
+        rows: None,
+        cols: None,
+        new: Some(new),
+        provider,
+        model,
+        cwd,
+        mcp_servers: None,
+    }
+}
+
+/// Spawn one `agents.close` for a standalone session.
+fn spawn_close_agent(client: Arc<RpcClient>, updates: Sender<Update>, session_id: String) {
+    tokio::spawn(async move {
+        let result = client
+            .agents_close(SessionIdParams {
+                session_id: session_id.clone(),
+            })
+            .await;
+        let _ = updates.try_send(Update::AgentClosed { session_id, result });
     });
 }
 
@@ -1551,6 +1668,25 @@ fn connection_for(status: SseStatus, token_path: &str) -> ConnectionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_free_standing_start_sends_the_checkout_and_no_task() {
+        let params = start_agent_params(
+            Some("opencode".to_string()),
+            Some("opencode-go".to_string()),
+            Some("deepseek".to_string()),
+            Some(PathBuf::from("/code/favetto")),
+            true,
+        );
+        assert_eq!(params.task_id, None);
+        assert_eq!(params.agent.as_deref(), Some("opencode"));
+        assert_eq!(params.provider.as_deref(), Some("opencode-go"));
+        assert_eq!(params.model.as_deref(), Some("deepseek"));
+        assert_eq!(params.cwd, Some(PathBuf::from("/code/favetto")));
+        assert_eq!(params.new, Some(true));
+        assert!(params.prompt.is_none());
+        assert!(params.session_id.is_none());
+    }
 
     #[test]
     fn sse_statuses_map_to_connection_states() {

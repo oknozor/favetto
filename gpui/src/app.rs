@@ -16,23 +16,24 @@ use gpui::{
 };
 
 use crate::actions::{
-    self, CatalogChoiceNext, CatalogChoicePrev, CatalogFieldNext, CatalogFieldPrev,
-    CatalogLaunchSubmit, CatalogNewOneshot, CatalogSearch, CatalogToggleFolder, CloseOverlay,
-    DetailPromptComplete, DetailPromptNext, DetailPromptPrev, DetailPromptSend, ElicitationCancel,
-    ElicitationConfirm, ElicitationDecline, ElicitationEdit, ElicitationLeft, ElicitationNext,
-    ElicitationPrev, ElicitationRight, ElicitationToggle, FocusNext, FocusPrev, GoCatalog, GoInbox,
-    GoSchedules, GoSettings, GoTasks, GoWorkflows, ListDown, ListEnd, ListHome, ListOpen,
-    ListPageDown, ListPageUp, ListUp, PaletteConfirm, PaletteDown, PaletteUp, Refresh,
-    RepoPickerConfirm, RepoPickerDown, RepoPickerUp, ScheduleDelete, ScheduleEdit,
-    ScheduleFieldNext, ScheduleFieldPrev, ScheduleNew, ScheduleSubmit, ScheduleToggleEnabled,
-    SettingsActivate, SettingsFieldNext, SettingsFieldPrev, SettingsSave, SettingsTest, TaskCancel,
-    TaskConfirmAccept, TaskConfirmReject, TaskDismissLaunch, TaskFilterNext, TaskFilterPrev,
-    TaskRetry, TaskSearch, TextBackspace, TextCopy, TextCut, TextDelete, TextDeleteWordBackward,
-    TextDeleteWordForward, TextMoveDown, TextMoveEnd, TextMoveHome, TextMoveLeft, TextMoveRight,
-    TextMoveUp, TextMoveWordLeft, TextMoveWordRight, TextNewline, TextPaste, TextSelectAll,
-    TextSelectDown, TextSelectEnd, TextSelectHome, TextSelectLeft, TextSelectRight, TextSelectUp,
-    TextSelectWordLeft, TextSelectWordRight, TogglePalette, ToggleShortcuts, WorkflowCancelRoot,
-    WorkflowOpenInTasks, WorkflowRetryInstance, WorkflowRootNext, WorkflowRootPrev,
+    self, AgentClose, AgentInterrupt, AgentNewSession, CatalogChoiceNext, CatalogChoicePrev,
+    CatalogFieldNext, CatalogFieldPrev, CatalogLaunchSubmit, CatalogNewOneshot, CatalogSearch,
+    CatalogToggleFolder, CloseOverlay, DetailPromptComplete, DetailPromptNext, DetailPromptPrev,
+    DetailPromptSend, ElicitationCancel, ElicitationConfirm, ElicitationDecline, ElicitationEdit,
+    ElicitationLeft, ElicitationNext, ElicitationPrev, ElicitationRight, ElicitationToggle,
+    FocusNext, FocusPrev, GoAgent, GoCatalog, GoInbox, GoSchedules, GoSettings, GoTasks,
+    GoWorkflows, ListDown, ListEnd, ListHome, ListOpen, ListPageDown, ListPageUp, ListUp,
+    PaletteConfirm, PaletteDown, PaletteUp, Refresh, RepoPickerConfirm, RepoPickerDown,
+    RepoPickerUp, ScheduleDelete, ScheduleEdit, ScheduleFieldNext, ScheduleFieldPrev, ScheduleNew,
+    ScheduleSubmit, ScheduleToggleEnabled, SettingsActivate, SettingsFieldNext, SettingsFieldPrev,
+    SettingsSave, SettingsTest, TaskCancel, TaskConfirmAccept, TaskConfirmReject,
+    TaskDismissLaunch, TaskFilterNext, TaskFilterPrev, TaskRetry, TaskSearch, TextBackspace,
+    TextCopy, TextCut, TextDelete, TextDeleteWordBackward, TextDeleteWordForward, TextMoveDown,
+    TextMoveEnd, TextMoveHome, TextMoveLeft, TextMoveRight, TextMoveUp, TextMoveWordLeft,
+    TextMoveWordRight, TextNewline, TextPaste, TextSelectAll, TextSelectDown, TextSelectEnd,
+    TextSelectHome, TextSelectLeft, TextSelectRight, TextSelectUp, TextSelectWordLeft,
+    TextSelectWordRight, TogglePalette, ToggleShortcuts, WorkflowCancelRoot, WorkflowOpenInTasks,
+    WorkflowRetryInstance, WorkflowRootNext, WorkflowRootPrev,
 };
 use crate::catalog::OneShotFocus;
 use crate::components;
@@ -50,7 +51,8 @@ use crate::theme::{
     Theme, DETAIL_WIDTH, RESIZE_HANDLE, SIDEBAR_WIDTH, STATUS_BAR_HEIGHT, TOP_BAR_HEIGHT,
 };
 use crate::views::{
-    CatalogView, DetailView, InboxView, SchedulesView, SettingsView, TasksView, WorkflowsView,
+    AgentView, CatalogView, DetailView, InboxView, SchedulesView, SettingsView, TasksView,
+    WorkflowsView,
 };
 use crate::workflow::WorkflowCancelConfirm;
 
@@ -66,6 +68,7 @@ enum ListJump {
 struct RouteViews {
     inbox: Entity<InboxView>,
     tasks: Entity<TasksView>,
+    agent: Entity<AgentView>,
     catalog: Entity<CatalogView>,
     workflows: Entity<WorkflowsView>,
     schedules: Entity<SchedulesView>,
@@ -182,6 +185,7 @@ impl RootView {
         let views = RouteViews {
             inbox: cx.new(|cx| InboxView::new(state.clone(), cx)),
             tasks: cx.new(|cx| TasksView::new(state.clone(), cx)),
+            agent: cx.new(|cx| AgentView::new(state.clone(), cx)),
             catalog: cx.new(|cx| CatalogView::new(state.clone(), cx)),
             workflows: cx.new(|cx| WorkflowsView::new(state.clone(), cx)),
             schedules: cx.new(|cx| SchedulesView::new(state.clone(), cx)),
@@ -393,6 +397,12 @@ impl RootView {
                 state.move_tasks_selection(delta);
                 cx.notify();
             }),
+            Route::Agent => self.state.update(cx, |state, cx| {
+                if state.standalone_agent().session_id.is_none() {
+                    state.cycle_standalone_agent(delta);
+                }
+                cx.notify();
+            }),
             Route::Catalog => self.state.update(cx, |state, cx| {
                 if state.catalog().launch().is_some() {
                     state.cycle_catalog_form_focus(delta);
@@ -481,6 +491,10 @@ impl RootView {
             }),
             Route::Tasks => self.state.update(cx, |state, cx| {
                 state.open_tasks_selected();
+                cx.notify();
+            }),
+            Route::Agent => self.state.update(cx, |state, cx| {
+                state.start_standalone_agent(cx);
                 cx.notify();
             }),
             Route::Catalog => self.state.update(cx, |state, cx| {
@@ -712,6 +726,7 @@ impl RootView {
         match self.state.read(cx).active_route() {
             Route::Inbox => self.views.inbox.clone().into_any_element(),
             Route::Tasks => self.views.tasks.clone().into_any_element(),
+            Route::Agent => self.views.agent.clone().into_any_element(),
             Route::Catalog => self.views.catalog.clone().into_any_element(),
             Route::Workflows => self.views.workflows.clone().into_any_element(),
             Route::Schedules => self.views.schedules.clone().into_any_element(),
@@ -1438,7 +1453,7 @@ impl RootView {
         );
 
         let commands = [("Command palette", "⌘K")];
-        let navigation: [(&'static str, &'static str); 6] =
+        let navigation: [(&'static str, &'static str); 7] =
             Route::ALL.map(|route| (route.label(), route.shortcut()));
         let anywhere = [
             ("Shortcut sheet", "?"),
@@ -1481,6 +1496,13 @@ impl RootView {
             ("Next / previous field", "tab"),
             ("Toggle enabled", "⌘E"),
             ("Save schedule", "⌘↵"),
+        ];
+        let agent = [
+            ("New session", "n"),
+            ("Interrupt the turn", "i"),
+            ("Close the session", "x"),
+            ("Send the prompt", "↵"),
+            ("Complete a slash command", "tab"),
         ];
         let detail = [
             ("Send the prompt", "↵"),
@@ -1528,9 +1550,10 @@ impl RootView {
             .child(shortcut_group(
                 theme,
                 layout.columns,
+                shortcut_section(theme, "AGENT", &agent),
                 shortcut_section(theme, "DETAIL", &detail),
-                shortcut_section(theme, "ANYWHERE", &anywhere),
             ))
+            .child(shortcut_section(theme, "ANYWHERE", &anywhere))
             .child(shortcut_section(theme, "TEXT FIELDS", &text_fields));
 
         let panel = div()
@@ -2610,6 +2633,11 @@ impl Render for RootView {
             if confirm_open {
                 key_context.push_str(" Confirm");
             }
+        } else if route == Route::Agent {
+            key_context.push_str(" Agent");
+            if detail_prompt_active {
+                key_context.push_str(" Search");
+            }
         } else if route == Route::Workflows {
             key_context.push_str(" Workflows");
             if workflow_confirm.is_some() {
@@ -2720,6 +2748,9 @@ impl Render for RootView {
                 this.on_jump(action, window, cx);
             }))
             .on_action(cx.listener(|this, action: &GoTasks, window, cx| {
+                this.on_jump(action, window, cx);
+            }))
+            .on_action(cx.listener(|this, action: &GoAgent, window, cx| {
                 this.on_jump(action, window, cx);
             }))
             .on_action(cx.listener(|this, action: &GoCatalog, window, cx| {
@@ -2886,6 +2917,24 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &Refresh, _window, cx| {
                 this.state.update(cx, |state, cx| {
                     state.refresh_active();
+                    cx.notify();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &AgentNewSession, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.start_standalone_agent(cx);
+                    cx.notify();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &AgentInterrupt, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.interrupt_detail_turn(cx);
+                    cx.notify();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &AgentClose, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.close_standalone_agent(cx);
                     cx.notify();
                 });
             }))

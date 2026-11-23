@@ -627,8 +627,10 @@ pub enum TextTarget {
     SettingsEndpoint,
     /// The Settings bearer token.
     SettingsToken,
-    /// The task detail's follow-up composer.
+    /// The task detail's / Agent panel's follow-up composer.
     DetailPrompt,
+    /// The Agent panel's model override before a session starts.
+    AgentModel,
     /// One ACP elicitation text field.
     Elicitation(usize),
 }
