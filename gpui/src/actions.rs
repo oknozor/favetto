@@ -79,6 +79,8 @@ actions!(
         TaskFilterPrev,
         /// Select the next status segment (`]`).
         TaskFilterNext,
+        /// Dismiss the spawn-failure banner for the failures currently shown (`d`).
+        TaskDismissLaunch,
         /// Confirm the pending cancel/retry (`↵`).
         TaskConfirmAccept,
         /// Dismiss the pending cancel/retry (`n`).
@@ -293,6 +295,13 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new(
             "]",
             TaskFilterNext,
+            Some("Tasks && !Palette && !Shortcuts && !Search && !Confirm"),
+        ),
+        // `d` is free on Tasks (it only declines an ACP form), so it dismisses
+        // the visible spawn-failure banner without a confirmation.
+        KeyBinding::new(
+            "d",
+            TaskDismissLaunch,
             Some("Tasks && !Palette && !Shortcuts && !Search && !Confirm"),
         ),
         KeyBinding::new(
@@ -607,6 +616,7 @@ mod tests {
             ("TaskSearch", "/"),
             ("TaskFilterPrev", "["),
             ("TaskFilterNext", "]"),
+            ("TaskDismissLaunch", "d"),
         ] {
             let matches: Vec<_> = bindings()
                 .into_iter()

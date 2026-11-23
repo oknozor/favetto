@@ -211,11 +211,17 @@ fn request_message(request: &AwaitingInputReason) -> Option<String> {
 /// neutrally, so a blocked agent is never hidden just because its task row is
 /// missing. With an active repo, rows whose repo cannot be resolved are treated
 /// as global and hidden, matching the TUI's task/event scoping.
+///
+/// `launch_failures` is the unfiltered derivation; `dismissed_launch_failures`
+/// removes the acknowledged ones. A dismissed launch failure no longer keeps its
+/// old row in Needs you, while the run itself still appears in Recent.
 pub fn build(
     tasks: &[Task],
     sessions: &[AgentSessionInfo],
     active_repo: Option<&str>,
     now: DateTime<Utc>,
+    launch_failures: &[launch::LaunchFailure],
+    dismissed_launch_failures: &HashSet<launch::LaunchKey>,
 ) -> InboxRows {
     let mut session_by_task: HashMap<&str, &AgentSessionInfo> = HashMap::new();
     let mut awaiting_by_task: HashMap<&str, &AgentSessionInfo> = HashMap::new();
@@ -230,9 +236,14 @@ pub fn build(
     }
 
     let cutoff = now - chrono::Duration::hours(FAILED_WINDOW_HOURS);
-    let launch_by_task: HashMap<Uuid, launch::LaunchFailure> = launch::launch_failures(tasks)
-        .into_iter()
+    let all_launch_by_task: HashMap<Uuid, &launch::LaunchFailure> = launch_failures
+        .iter()
         .map(|failure| (failure.task_id, failure))
+        .collect();
+    let launch_by_task: HashMap<Uuid, &launch::LaunchFailure> = all_launch_by_task
+        .iter()
+        .filter(|(_, failure)| !dismissed_launch_failures.contains(&failure.key()))
+        .map(|(task_id, failure)| (*task_id, *failure))
         .collect();
     let mut needs = Vec::new();
     let mut needs_task_ids = HashSet::new();
@@ -265,7 +276,12 @@ pub fn build(
             }
             TaskStatus::Failed => {
                 let since = task.finished_at.unwrap_or(task.created_at);
-                let launch_failure = launch_by_task.get(&task.id);
+                let launch_failure = launch_by_task.get(&task.id).copied();
+                // An acknowledged launch failure no longer forces a Needs you
+                // row; the run stays available in Recent (and in Tasks).
+                if launch_failure.is_none() && all_launch_by_task.contains_key(&task.id) {
+                    continue;
+                }
                 // A launch failure is a broken workflow, not a transient run
                 // failure: keep it in Needs you regardless of the 24h window.
                 if launch_failure.is_some() || since >= cutoff {
@@ -496,6 +512,23 @@ mod tests {
     use super::*;
     use favetto_wire::model::{AgentUsage, AwaitingInputReason, Failure, FailureKind};
 
+    /// The default test path: no launch failure has been dismissed.
+    fn build(
+        tasks: &[Task],
+        sessions: &[AgentSessionInfo],
+        active_repo: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> InboxRows {
+        super::build(
+            tasks,
+            sessions,
+            active_repo,
+            now,
+            &launch::launch_failures(tasks),
+            &HashSet::new(),
+        )
+    }
+
     fn at(offset_minutes: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp")
             + chrono::Duration::minutes(offset_minutes)
@@ -652,6 +685,85 @@ mod tests {
         assert!(detail.contains("repo:Favetto/plan_issue"));
         assert!(detail.contains("not found in the catalog"));
         assert!(detail.contains("which succeeded"));
+    }
+
+    /// Once the user acknowledges the banner, the old launch failure stops
+    /// keeping its row in Needs you; the run itself stays in Recent.
+    #[test]
+    fn a_dismissed_launch_failure_leaves_needs_you() {
+        let now = at(0);
+        let mut parent = task(
+            1,
+            "repo:favetto/triage_issues",
+            TaskStatus::Succeeded,
+            at(-4_000),
+        );
+        parent.finished_at = Some(at(-3_999));
+        let mut child = task(2, "repo:Favetto/plan_issue", TaskStatus::Failed, at(-3_998));
+        child.parent_id = Some(parent.id);
+        child.root_id = Some(parent.id);
+        child.finished_at = Some(at(-(FAILED_WINDOW_HOURS * 60 + 5)));
+        child.failure = Some(Failure::new(
+            FailureKind::InvalidInput,
+            "task 'repo:Favetto/plan_issue' not found in the catalog",
+        ));
+
+        let tasks = [parent, child];
+        let failures = launch::launch_failures(&tasks);
+        assert_eq!(failures.len(), 1);
+        let dismissed: HashSet<launch::LaunchKey> = [failures[0].key()].into_iter().collect();
+
+        let rows = super::build(&tasks, &[], None, now, &failures, &dismissed);
+        assert!(
+            !rows
+                .needs
+                .iter()
+                .any(|row| row.key.task_id() == Some(Uuid::from_u128(2))),
+            "dismissed launch failure must leave Needs you"
+        );
+        assert!(
+            rows.recent
+                .iter()
+                .any(|row| row.task_id == Uuid::from_u128(2)),
+            "the run itself must remain available"
+        );
+    }
+
+    /// Even inside the 24-hour window, a dismissed launch failure is not a
+    /// recurring "needs you" obligation; the run stays in Recent.
+    #[test]
+    fn a_dismissed_recent_launch_failure_leaves_needs_you() {
+        let now = at(0);
+        let mut parent = task(
+            1,
+            "repo:favetto/triage_issues",
+            TaskStatus::Succeeded,
+            at(-30),
+        );
+        parent.finished_at = Some(at(-25));
+        let mut child = task(2, "repo:favetto/plan_issue", TaskStatus::Failed, at(-20));
+        child.parent_id = Some(parent.id);
+        child.root_id = Some(parent.id);
+        child.finished_at = Some(at(-19));
+        child.failure = Some(Failure::new(
+            FailureKind::InvalidInput,
+            "task not found in the catalog",
+        ));
+
+        let tasks = [parent, child];
+        let failures = launch::launch_failures(&tasks);
+        assert!(!build(&tasks, &[], None, now).needs.is_empty());
+
+        let dismissed: HashSet<launch::LaunchKey> = [failures[0].key()].into_iter().collect();
+        let rows = super::build(&tasks, &[], None, now, &failures, &dismissed);
+        assert!(!rows
+            .needs
+            .iter()
+            .any(|row| row.key.task_id() == Some(Uuid::from_u128(2))));
+        assert!(rows
+            .recent
+            .iter()
+            .any(|row| row.task_id == Uuid::from_u128(2)));
     }
 
     #[test]

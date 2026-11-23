@@ -13,16 +13,25 @@
 //! failures left behind by an earlier parent attempt: only children created
 //! after the succeeded parent's `finished_at` belong to the latest launch.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use favetto_wire::model::{Failure, FailureKind, Task, TaskStatus};
 use uuid::Uuid;
+
+/// The process-local dismissal key for a launch failure.
+///
+/// A retried task keeps its id but gets a new `attempt`, so keying on both lets
+/// a fresh failure reappear under the dismissed banner instead of staying
+/// hidden for the rest of the client session.
+pub type LaunchKey = (Uuid, u32);
 
 /// A child that failed before its agent started, under a parent that succeeded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaunchFailure {
     /// The failed child's task id.
     pub task_id: Uuid,
+    /// The failed child's attempt, so a retry is a distinct warning.
+    pub attempt: u32,
     /// The direct parent that spawned it.
     pub parent_id: Uuid,
     /// The workflow root the failed launch belongs to.
@@ -48,6 +57,27 @@ impl LaunchFailure {
             self.target, self.reason, self.parent
         )
     }
+
+    /// The process-local dismissal key (task id plus attempt).
+    pub fn key(&self) -> LaunchKey {
+        (self.task_id, self.attempt)
+    }
+}
+
+/// Drop failures the user has already dismissed in this client process.
+///
+/// Filtering on read (rather than folding the set into the derivation) keeps a
+/// `tasks.list` refresh or an SSE reconnect from resurrecting an acknowledged
+/// warning.
+pub fn undismissed(
+    failures: &[LaunchFailure],
+    dismissed: &HashSet<LaunchKey>,
+) -> Vec<LaunchFailure> {
+    failures
+        .iter()
+        .filter(|failure| !dismissed.contains(&failure.key()))
+        .cloned()
+        .collect()
 }
 
 /// Whether a typed failure is one that happens before an agent launch.
@@ -112,6 +142,7 @@ pub fn launch_failures(tasks: &[Task]) -> Vec<LaunchFailure> {
                 .unwrap_or_else(|| "launch failed".to_string());
             Some(LaunchFailure {
                 task_id: task.id,
+                attempt: task.attempt,
                 parent_id: parent.id,
                 root_id,
                 target: task.name.clone(),
@@ -232,12 +263,43 @@ mod tests {
             assert_eq!(failure.parent, "repo:favetto/triage_issues");
             assert_eq!(failure.parent_id, parent.id);
             assert_eq!(failure.root, "repo:favetto/triage_issues");
+            assert_eq!(failure.attempt, 1);
             assert!(failure.reason.contains("plan_issue"));
             assert_eq!(failure.kind, Some(FailureKind::InvalidInput));
             let detail = failure.detail();
             assert!(detail.contains(&failure.target));
             assert!(detail.contains("which succeeded"));
         }
+    }
+
+    #[test]
+    fn dismissals_are_keyed_by_task_and_attempt() {
+        let parent = succeeded_parent(1, "repo:favetto/triage_issues");
+        let mut child = failed_child(
+            2,
+            "repo:favetto/plan_issue",
+            &parent,
+            FailureKind::InvalidInput,
+            "task not found in the catalog",
+        );
+        let failures = launch_failures(&[parent.clone(), child.clone()]);
+        assert_eq!(failures.len(), 1);
+
+        // Dismissing the current attempt hides it across a refresh of the same
+        // rows, but a retried child (same id, new attempt) warns again.
+        let dismissed: HashSet<LaunchKey> = [failures[0].key()].into_iter().collect();
+        assert!(undismissed(&failures, &dismissed).is_empty());
+        assert!(undismissed(
+            &launch_failures(&[parent.clone(), child.clone()]),
+            &dismissed
+        )
+        .is_empty());
+
+        child.attempt = 2;
+        let retried = launch_failures(&[parent, child]);
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].attempt, 2);
+        assert_eq!(undismissed(&retried, &dismissed).len(), 1);
     }
 
     #[test]

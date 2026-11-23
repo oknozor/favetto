@@ -38,6 +38,7 @@ pub struct TasksView {
     reset_focus: FocusHandle,
     error_copy_focus: FocusHandle,
     search_clear_focus: FocusHandle,
+    launch_dismiss_focus: FocusHandle,
 }
 
 impl TasksView {
@@ -51,6 +52,7 @@ impl TasksView {
             reset_focus: cx.focus_handle().tab_index(22).tab_stop(true),
             error_copy_focus: cx.focus_handle().tab_index(23).tab_stop(true),
             search_clear_focus: cx.focus_handle().tab_index(20).tab_stop(true),
+            launch_dismiss_focus: cx.focus_handle().tab_index(24).tab_stop(true),
         }
     }
 
@@ -90,7 +92,9 @@ impl TasksView {
                     .child(components::keycap(theme, "c"))
                     .child(hint(theme, "cancel"))
                     .child(components::keycap(theme, "r"))
-                    .child(hint(theme, "retry")),
+                    .child(hint(theme, "retry"))
+                    .child(components::keycap(theme, "d"))
+                    .child(hint(theme, "dismiss")),
             )
     }
 
@@ -452,8 +456,41 @@ impl TasksView {
 
     /// A persistent warning derived from the task rows, not a toast: a succeeded
     /// parent whose spawned work never launched stays visible across refreshes.
-    fn launch_banner(&self, theme: &Theme, failures: &[LaunchFailure]) -> Div {
+    /// The user can acknowledge it with the header's Dismiss control (or `d`);
+    /// the dismissal is process-local and keyed by `(task id, attempt)`.
+    fn launch_banner(
+        &self,
+        theme: &Theme,
+        failures: &[LaunchFailure],
+        cx: &mut Context<Self>,
+    ) -> Div {
         let lines = launch::banner_lines(failures);
+        let dismiss_failures = failures.to_vec();
+        let dismiss = components::with_focus(
+            div()
+                .id("tasks-launch-dismiss")
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap(px(theme.spacing.s2))
+                .h(px(theme.controls.primary))
+                .px(px(theme.spacing.s2))
+                .rounded(px(theme.radii.r4))
+                .text_size(px(theme.font.xs))
+                .text_color(theme.colors.text)
+                .cursor_pointer()
+                .track_focus(&self.launch_dismiss_focus)
+                .child(components::keycap(theme, "d"))
+                .child("Dismiss")
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.state.update(cx, |state, cx| {
+                        if state.dismiss_launch_failures(&dismiss_failures) {
+                            cx.notify();
+                        }
+                    });
+                })),
+            theme,
+        );
         div()
             .flex()
             .flex_col()
@@ -481,7 +518,9 @@ impl TasksView {
                             .text_size(px(theme.font.xs))
                             .text_color(theme.colors.muted)
                             .child("the parent succeeded, but its spawned work did not start"),
-                    ),
+                    )
+                    .child(div().flex_1())
+                    .child(dismiss),
             )
             .children(lines.into_iter().map(|line| {
                 div()
@@ -817,7 +856,7 @@ impl Render for TasksView {
             list_header = list_header.child(self.error_banner(theme, message, cx));
         }
         if !launch_failures.is_empty() {
-            list_header = list_header.child(self.launch_banner(theme, &launch_failures));
+            list_header = list_header.child(self.launch_banner(theme, &launch_failures, cx));
         }
         if show_rows {
             list_header = list_header.child(
