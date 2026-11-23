@@ -127,6 +127,10 @@ fn all_popups_render_without_panic() {
                 current: 0,
                 values: vec![TextBuffer::new("draft")],
                 choice_selected: vec![0],
+                show_overrides: false,
+                agent: TextBuffer::default(),
+                provider: TextBuffer::default(),
+                model: TextBuffer::default(),
                 error: None,
             }),
             Popup::Help { scroll: 0 },
@@ -2339,6 +2343,9 @@ fn geom_task(name: &str) -> favetto_core::model::Task {
         parent_id: None,
         root_id: None,
         interactive: false,
+        agent: None,
+        provider: None,
+        model: None,
     }
 }
 
@@ -2495,6 +2502,10 @@ fn task_vars_popup_renders_prompts_and_task_name() {
         current: 0,
         values: vec![TextBuffer::new("placeholder")],
         choice_selected: vec![0],
+        show_overrides: false,
+        agent: TextBuffer::default(),
+        provider: TextBuffer::default(),
+        model: TextBuffer::default(),
         error: None,
     });
     let text = render_text(&mut app, 100, 30);
@@ -2535,6 +2546,10 @@ fn task_vars_popup_keeps_cursor_visible_for_long_multiline_value() {
         current: 0,
         values: vec![TextBuffer::new(value)],
         choice_selected: vec![0],
+        show_overrides: false,
+        agent: TextBuffer::default(),
+        provider: TextBuffer::default(),
+        model: TextBuffer::default(),
         error: None,
     });
 
@@ -2563,6 +2578,10 @@ fn task_vars_short_value_keeps_fixed_height() {
         current: 0,
         values: vec![TextBuffer::new("hi")],
         choice_selected: vec![0],
+        show_overrides: false,
+        agent: TextBuffer::default(),
+        provider: TextBuffer::default(),
+        model: TextBuffer::default(),
         error: None,
     });
 
@@ -2605,6 +2624,10 @@ fn task_vars_renders_caret_in_the_middle_of_a_value() {
         current: 0,
         values: vec![buffer],
         choice_selected: vec![0],
+        show_overrides: false,
+        agent: TextBuffer::default(),
+        provider: TextBuffer::default(),
+        model: TextBuffer::default(),
         error: None,
     });
     let text = render_text(&mut app, 100, 40);

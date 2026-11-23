@@ -157,6 +157,9 @@ Fetch a single task by id, including its stored output.
 | `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
 | `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
 | `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
+| `agent` | string (optional) | — | no | Optional per-launch agent override. A manual launch can run the task with a different configured agent than the catalog definition pins. The executor resolves it before the definition's `agent` and the global `[agent].default`. Absent for tasks that use the definition default. |
+| `provider` | string (optional) | — | no | Optional per-launch model provider override. Resolved atomically with [`Self::model`]: an override of either field never mixes with the definition's provider/model pair. |
+| `model` | string (optional) | — | no | Optional per-launch model id override (a bare id or `provider/model`). Absent for tasks that use the definition's or the agent's default model. |
 
 ### `tasks.runs`
 
@@ -225,6 +228,9 @@ Cancel a task.
 | `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
 | `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
 | `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
+| `agent` | string (optional) | — | no | Optional per-launch agent override. A manual launch can run the task with a different configured agent than the catalog definition pins. The executor resolves it before the definition's `agent` and the global `[agent].default`. Absent for tasks that use the definition default. |
+| `provider` | string (optional) | — | no | Optional per-launch model provider override. Resolved atomically with [`Self::model`]: an override of either field never mixes with the definition's provider/model pair. |
+| `model` | string (optional) | — | no | Optional per-launch model id override (a bare id or `provider/model`). Absent for tasks that use the definition's or the agent's default model. |
 
 ### `tasks.retry`
 
@@ -257,6 +263,9 @@ Retry a terminal task, preserving its prior run history.
 | `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
 | `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
 | `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
+| `agent` | string (optional) | — | no | Optional per-launch agent override. A manual launch can run the task with a different configured agent than the catalog definition pins. The executor resolves it before the definition's `agent` and the global `[agent].default`. Absent for tasks that use the definition default. |
+| `provider` | string (optional) | — | no | Optional per-launch model provider override. Resolved atomically with [`Self::model`]: an override of either field never mixes with the definition's provider/model pair. |
+| `model` | string (optional) | — | no | Optional per-launch model id override (a bare id or `provider/model`). Absent for tasks that use the definition's or the agent's default model. |
 
 ### `tasks.start`
 
@@ -269,6 +278,9 @@ Start a catalog task by name.
 | `name` | string | — | yes |  |
 | `input` | any | null | no |  |
 | `interactive` | boolean (optional) | null | no |  |
+| `agent` | string (optional) | null | no |  |
+| `provider` | string (optional) | null | no |  |
+| `model` | string (optional) | null | no |  |
 
 **Response**
 
@@ -291,6 +303,9 @@ Start a catalog task by name.
 | `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
 | `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
 | `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
+| `agent` | string (optional) | — | no | Optional per-launch agent override. A manual launch can run the task with a different configured agent than the catalog definition pins. The executor resolves it before the definition's `agent` and the global `[agent].default`. Absent for tasks that use the definition default. |
+| `provider` | string (optional) | — | no | Optional per-launch model provider override. Resolved atomically with [`Self::model`]: an override of either field never mixes with the definition's provider/model pair. |
+| `model` | string (optional) | — | no | Optional per-launch model id override (a bare id or `provider/model`). Absent for tasks that use the definition's or the agent's default model. |
 
 ### `tasks.start_oneshot`
 
@@ -487,6 +502,9 @@ Add one runtime task to an existing workflow root, optionally depending on exist
 | `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
 | `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
 | `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
+| `agent` | string (optional) | — | no | Optional per-launch agent override. A manual launch can run the task with a different configured agent than the catalog definition pins. The executor resolves it before the definition's `agent` and the global `[agent].default`. Absent for tasks that use the definition default. |
+| `provider` | string (optional) | — | no | Optional per-launch model provider override. Resolved atomically with [`Self::model`]: an override of either field never mixes with the definition's provider/model pair. |
+| `model` | string (optional) | — | no | Optional per-launch model id override (a bare id or `provider/model`). Absent for tasks that use the definition's or the agent's default model. |
 
 ### `workflow.cancel`
 
@@ -536,6 +554,9 @@ Retry a terminal task, preserving its prior run history. Single-task alias of `t
 | `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
 | `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
 | `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
+| `agent` | string (optional) | — | no | Optional per-launch agent override. A manual launch can run the task with a different configured agent than the catalog definition pins. The executor resolves it before the definition's `agent` and the global `[agent].default`. Absent for tasks that use the definition default. |
+| `provider` | string (optional) | — | no | Optional per-launch model provider override. Resolved atomically with [`Self::model`]: an override of either field never mixes with the definition's provider/model pair. |
+| `model` | string (optional) | — | no | Optional per-launch model id override (a bare id or `provider/model`). Absent for tasks that use the definition's or the agent's default model. |
 
 ### `events.tail`
 
@@ -1169,6 +1190,9 @@ A task row changed.
 | `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
 | `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
 | `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
+| `agent` | string (optional) | — | no | Optional per-launch agent override. A manual launch can run the task with a different configured agent than the catalog definition pins. The executor resolves it before the definition's `agent` and the global `[agent].default`. Absent for tasks that use the definition default. |
+| `provider` | string (optional) | — | no | Optional per-launch model provider override. Resolved atomically with [`Self::model`]: an override of either field never mixes with the definition's provider/model pair. |
+| `model` | string (optional) | — | no | Optional per-launch model id override (a bare id or `provider/model`). Absent for tasks that use the definition's or the agent's default model. |
 
 ### `catalog.updated`
 

@@ -7,13 +7,28 @@
 //! task falls back to the free-form JSON textarea.
 
 use dioxus::prelude::*;
-use favetto_wire::model::Task;
+use favetto_wire::model::{AgentCatalogEntry, Task};
 use favetto_wire::rpc::{EmptyParams, TasksStartParams};
 use favetto_wire::task_var::{TaskVar, VarType};
 
 use crate::client::RpcClient;
 use crate::components::dialog::Dialog;
 use crate::state::AppState;
+
+/// Compose an agent's default model selector from its provider/model pair.
+fn initial_model(provider: Option<&str>, model: Option<&str>) -> String {
+    match (provider, model) {
+        (Some(provider), Some(model)) if !provider.is_empty() => format!("{provider}/{model}"),
+        (_, Some(model)) => model.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Normalize an optional override input: blank becomes `None`.
+fn override_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
 
 /// Parse the start dialog's free-form `input` textarea. Empty/whitespace means
 /// "no input"; anything else must be valid JSON.
@@ -81,6 +96,19 @@ pub fn StartTaskDialog(
     name: String,
     /// The catalog entry's `[[vars]]`, if any.
     vars: Vec<TaskVar>,
+    /// The catalog entry's pinned agent, used to seed the override selector.
+    #[props(default)]
+    agent: Option<String>,
+    /// The catalog entry's pinned provider, used to seed the model input.
+    #[props(default)]
+    provider: Option<String>,
+    /// The catalog entry's pinned model, used to seed the model input.
+    #[props(default)]
+    model: Option<String>,
+    /// The catalog entry's kind (`agent`/`action`). Action tasks hide the
+    /// agent/model controls because they never launch an agent.
+    #[props(default = String::new())]
+    kind: String,
     on_close: EventHandler<()>,
     on_started: EventHandler<Task>,
 ) -> Element {
@@ -101,6 +129,26 @@ pub fn StartTaskDialog(
     let submit_vars = vars.clone();
     let mut error = use_signal(|| None::<String>);
     let mut submitting = use_signal(|| false);
+    let show_overrides = kind != "action";
+    let seeded_model = initial_model(provider.as_deref(), model.as_deref());
+    let seeded_model_value = seeded_model.clone();
+    let mut agent = use_signal(move || agent.unwrap_or_default());
+    let mut model = use_signal(move || seeded_model_value);
+
+    // Configured agents power the override selector. A failure is not fatal: the
+    // select is simply empty and the task runs with its definition/default.
+    let agents = use_resource(move || {
+        let base = (state.daemon_url)();
+        let token = (state.token)();
+        async move {
+            RpcClient::new(base)
+                .with_token(token)
+                .agents_list(EmptyParams {})
+                .await
+                .unwrap_or_default()
+        }
+    });
+    let agent_choices: Vec<AgentCatalogEntry> = agents().unwrap_or_default();
 
     // Catalog names power the `<datalist>` autocomplete. A failure here is not
     // fatal: the user can still type any task name. Repo-local names are
@@ -156,6 +204,19 @@ pub fn StartTaskDialog(
                 name: trimmed,
                 input: parsed,
                 interactive: None,
+                agent: if show_overrides {
+                    override_value(&agent())
+                } else {
+                    None
+                },
+                // The model input accepts a bare id or `provider/model`, exactly
+                // like the daemon's model selector.
+                provider: None,
+                model: if show_overrides {
+                    override_value(&model())
+                } else {
+                    None
+                },
             };
             match client.tasks_start(params).await {
                 Ok(task) => {
@@ -189,6 +250,51 @@ pub fn StartTaskDialog(
             datalist { id: "favetto-catalog-names",
                 for task_name in names {
                     option { key: "{task_name}", value: "{task_name}" }
+                }
+            }
+            if show_overrides {
+                label { class: "field",
+                    span { class: "field-label", "Agent" }
+                    select {
+                        class: "input",
+                        onchange: move |event| agent.set(event.value()),
+                        option { value: "", selected: agent().is_empty(), "Definition / daemon default" }
+                        if !agent().is_empty()
+                            && !agent_choices.iter().any(|choice| choice.name == agent())
+                        {
+                            option {
+                                value: "{agent()}",
+                                selected: true,
+                                "{agent()} (not configured)"
+                            }
+                        }
+                        for choice in agent_choices {
+                            option {
+                                key: "{choice.name}",
+                                value: "{choice.name}",
+                                selected: agent() == choice.name,
+                                disabled: !choice.available,
+                                if choice.default {
+                                    "{choice.name} (default)"
+                                } else if !choice.available {
+                                    "{choice.name} (unavailable)"
+                                } else {
+                                    "{choice.name}"
+                                }
+                            }
+                        }
+                    }
+                }
+                label { class: "field",
+                    span { class: "field-label", "Model (optional)" }
+                    input {
+                        class: "input",
+                        // Uncontrolled like the other text fields: the signal
+                        // tracks edits for submit without rewriting the DOM.
+                        initial_value: "{seeded_model}",
+                        placeholder: "Definition default, or provider/model",
+                        oninput: move |event| model.set(event.value()),
+                    }
                 }
             }
             if has_vars {
@@ -287,6 +393,21 @@ mod tests {
             var_type,
             choices: None,
         }
+    }
+
+    #[test]
+    fn initial_model_composes_the_definition_pair() {
+        assert_eq!(initial_model(Some("jev"), Some("1.13")), "jev/1.13");
+        assert_eq!(initial_model(None, Some("1.13")), "1.13");
+        assert_eq!(initial_model(Some("jev"), None), "");
+        assert_eq!(initial_model(None, None), "");
+    }
+
+    #[test]
+    fn override_value_normalizes_blank_inputs() {
+        assert_eq!(override_value("  "), None);
+        assert_eq!(override_value(""), None);
+        assert_eq!(override_value(" agent "), Some("agent".to_string()));
     }
 
     #[test]

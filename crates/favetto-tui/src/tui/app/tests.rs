@@ -45,6 +45,9 @@ fn task(name: &str) -> Task {
         parent_id: None,
         root_id: None,
         interactive: false,
+        agent: None,
+        provider: None,
+        model: None,
     }
 }
 
@@ -3017,6 +3020,77 @@ fn enter_on_catalog_entry_without_vars_returns_start_task() {
         _ => panic!("expected StartTask"),
     }
     assert!(matches!(app.popup, Popup::None));
+}
+
+#[test]
+fn alt_enter_on_catalog_entry_without_vars_opens_launch_options() {
+    let mut app = App::new();
+    app.tab = Tab::Catalog;
+    let mut entry = catalog_entry("a");
+    entry.agent = Some("def-agent".to_string());
+    entry.provider = Some("def-provider".to_string());
+    entry.model = Some("def-model".to_string());
+    app.catalog = vec![entry];
+    let action = app.handle_key(key(KeyCode::Enter, KeyModifiers::ALT));
+    assert!(matches!(action, UiAction::None));
+    let Popup::TaskVars(form) = &app.popup else {
+        panic!("expected TaskVars");
+    };
+    assert!(form.show_overrides);
+    assert_eq!(form.agent.value(), "def-agent");
+    assert_eq!(form.provider.value(), "def-provider");
+    assert_eq!(form.model.value(), "def-model");
+    // The override fields are focusable after the (empty) var list.
+    assert_eq!(form.field_count(), 3);
+}
+
+#[test]
+fn submission_includes_edited_agent_and_model_overrides() {
+    let mut app = App::new();
+    app.tab = Tab::Catalog;
+    let mut entry = catalog_entry("a");
+    entry.agent = Some("def-agent".to_string());
+    entry.model = Some("def-model".to_string());
+    app.catalog = vec![entry];
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::ALT));
+    let Popup::TaskVars(form) = &mut app.popup else {
+        panic!("expected TaskVars");
+    };
+    form.agent = TextBuffer::new("other-agent");
+    form.provider = TextBuffer::new("other-provider");
+    form.model = TextBuffer::new("other-model");
+    match app.handle_key(key(KeyCode::Enter, KeyModifiers::CONTROL)) {
+        UiAction::StartTaskWithOptions {
+            name,
+            agent,
+            provider,
+            model,
+            ..
+        } => {
+            assert_eq!(name, "a");
+            assert_eq!(agent.as_deref(), Some("other-agent"));
+            assert_eq!(provider.as_deref(), Some("other-provider"));
+            assert_eq!(model.as_deref(), Some("other-model"));
+        }
+        _ => panic!("expected StartTaskWithOptions"),
+    }
+}
+
+#[test]
+fn action_tasks_hide_the_agent_and_model_overrides() {
+    let mut app = App::new();
+    app.tab = Tab::Catalog;
+    let mut entry = catalog_entry("gate");
+    entry.kind = "action".to_string();
+    app.catalog = vec![entry];
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::ALT));
+    let Popup::TaskVars(form) = &app.popup else {
+        panic!("expected TaskVars");
+    };
+    assert!(!form.show_overrides);
+    assert_eq!(form.field_count(), 0);
+    // No override is sent even if a stale value is present.
+    assert_eq!(form.overrides(), (None, None, None));
 }
 
 #[test]

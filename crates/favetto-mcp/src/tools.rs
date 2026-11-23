@@ -88,7 +88,10 @@ pub fn list() -> Vec<ToolSpec> {
             input_schema: object(
                 json!({
                     "name": {"type": "string", "description": "Catalog task name."},
-                    "input": {"description": "Optional JSON input passed to the task."}
+                    "input": {"description": "Optional JSON input passed to the task."},
+                    "agent": {"type": "string", "description": "Optional agent override for this launch."},
+                    "provider": {"type": "string", "description": "Optional model provider override for this launch."},
+                    "model": {"type": "string", "description": "Optional model id override (bare id or provider/model)."}
                 }),
                 &["name"],
             ),
@@ -297,7 +300,9 @@ pub fn resolve(name: &str, args: &Value) -> Result<ToolCall, ToolError> {
             let name = require_str(args, "name")?;
             let mut params = Map::new();
             params.insert("name".to_string(), json!(name));
-            copy_optional(args, "input", &mut params);
+            for key in ["input", "agent", "provider", "model"] {
+                copy_optional(args, key, &mut params);
+            }
             Ok(rpc(method::TASKS_START, Value::Object(params)))
         }
         "favetto_spawn" => {
@@ -615,6 +620,24 @@ mod tests {
             assert_eq!(m, expected_method, "{name}");
             assert_eq!(p, expected_params, "{name}");
         }
+    }
+
+    #[test]
+    fn start_task_forwards_agent_and_model_overrides() {
+        let (method_name, params) = resolve_method(
+            "favetto_start_task",
+            &json!({
+                "name": "triage",
+                "agent": "opencode",
+                "provider": "opencode-go",
+                "model": "deepseek",
+            }),
+        );
+        assert_eq!(method_name, method::TASKS_START);
+        assert_eq!(params["name"], "triage");
+        assert_eq!(params["agent"], "opencode");
+        assert_eq!(params["provider"], "opencode-go");
+        assert_eq!(params["model"], "deepseek");
     }
 
     #[test]

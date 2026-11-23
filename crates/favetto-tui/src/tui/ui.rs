@@ -1528,6 +1528,58 @@ fn draw_task_vars(frame: &mut Frame, form: &TaskVarsForm, theme: Theme) -> Rect 
         }
     }
 
+    if form.show_overrides {
+        content.push(Line::from(""));
+        content.push(Line::from(Span::styled(
+            " Launch overrides ",
+            theme.title(),
+        )));
+        for (offset, (label, buffer)) in [
+            ("Agent", &form.agent),
+            ("Provider", &form.provider),
+            ("Model", &form.model),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let index = form.vars.len() + offset;
+            let current = index == form.current;
+            let label = format!("{}{}: ", if current { "> " } else { "  " }, label);
+            let label_style = if current {
+                Style::default()
+                    .fg(theme.accent())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let lines = display_lines(buffer);
+            for (k, line) in lines.iter().enumerate() {
+                if current && line.caret {
+                    focus_line = content.len();
+                }
+                let mut spans: Vec<Span> = Vec::new();
+                if k == 0 {
+                    spans.push(Span::styled(label.clone(), label_style));
+                } else {
+                    spans.push(Span::raw("    "));
+                }
+                if buffer.is_empty() && !current && lines.len() == 1 {
+                    spans.push(Span::styled(
+                        "(definition default)",
+                        Style::default().fg(theme.muted()),
+                    ));
+                } else {
+                    spans.push(Span::raw(line.before.clone()));
+                    if current && line.caret {
+                        spans.push(Span::styled("█", Style::default().fg(theme.accent())));
+                    }
+                    spans.push(Span::raw(line.after.clone()));
+                }
+                content.push(Line::from(spans));
+            }
+        }
+    }
+
     if let Some(err) = &form.error {
         content.push(Line::from(Span::styled(
             err.clone(),

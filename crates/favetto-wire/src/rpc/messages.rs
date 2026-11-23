@@ -165,6 +165,12 @@ pub type TasksRetryResult = Task;
 
 /// `tasks.start` params. `input` defaults to JSON null; `interactive` defaults
 /// to false (headless), so only the TUI opts into the live embedded TUI.
+///
+/// `agent`, `provider`, and `model` are optional per-launch overrides. They take
+/// precedence over the catalog definition's front-matter and the daemon defaults
+/// for this task, and are persisted on the task row so retries keep them.
+/// `provider`/`model` are treated as one pair: overriding either never mixes an
+/// overridden model with the definition's provider. Action tasks reject them.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TasksStartParams {
@@ -173,6 +179,12 @@ pub struct TasksStartParams {
     pub input: Option<serde_json::Value>,
     #[serde(default, deserialize_with = "lenient")]
     pub interactive: Option<bool>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub agent: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub provider: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub model: Option<String>,
 }
 
 /// `tasks.start` result: the enqueued task.

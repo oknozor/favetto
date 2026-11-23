@@ -40,6 +40,82 @@ fn def_with_vars() -> TaskDef {
 }
 
 #[test]
+fn launch_resolution_prefers_overrides_and_keeps_the_model_pair_atomic() {
+    let mut def = def_with_vars();
+    def.agent = Some("definition-agent".to_string());
+    def.provider = Some("definition-provider".to_string());
+    def.model = Some("definition-model".to_string());
+
+    let mut task = lineage_task("t", TaskStatus::Pending, None, None);
+    task.agent = None;
+    task.provider = None;
+    task.model = None;
+
+    // No override: the definition supplies the agent and the full pair.
+    assert_eq!(
+        resolve_launch(Some(&task), Some(&def), None, None, None, Some("default")),
+        (
+            Some("definition-agent".to_string()),
+            Some("definition-provider/definition-model".to_string())
+        )
+    );
+
+    // A launch agent override drops the definition's model pair, which belonged
+    // to the original agent, unless the launch also pins a model.
+    task.agent = Some("launch-agent".to_string());
+    assert_eq!(
+        resolve_launch(Some(&task), Some(&def), None, None, None, Some("default")),
+        (Some("launch-agent".to_string()), None)
+    );
+
+    // A model-only override is never prefixed with the definition's provider.
+    task.agent = Some("definition-agent".to_string());
+    task.model = Some("launch-model".to_string());
+    assert_eq!(
+        resolve_launch(Some(&task), Some(&def), None, None, None, Some("default")),
+        (
+            Some("definition-agent".to_string()),
+            Some("launch-model".to_string())
+        )
+    );
+
+    // A stored provider/model pair wins over the definition and is recorded
+    // exactly as requested.
+    task.provider = Some("launch-provider".to_string());
+    task.model = Some("launch-model".to_string());
+    assert_eq!(
+        resolve_launch(Some(&task), Some(&def), None, None, None, Some("default")),
+        (
+            Some("definition-agent".to_string()),
+            Some("launch-provider/launch-model".to_string())
+        )
+    );
+
+    // A per-call request (agents.start) wins over the stored task override.
+    assert_eq!(
+        resolve_launch(
+            Some(&task),
+            Some(&def),
+            Some("request-agent".to_string()),
+            None,
+            Some("request-model".to_string()),
+            Some("default")
+        ),
+        (
+            Some("request-agent".to_string()),
+            Some("request-model".to_string())
+        )
+    );
+
+    // Without any definition the global default agent applies and there is no
+    // model selector.
+    assert_eq!(
+        resolve_launch(None, None, None, None, None, Some("default")),
+        (Some("default".to_string()), None)
+    );
+}
+
+#[test]
 fn missing_required_vars_detects_absent_null_and_empty() {
     let def = def_with_vars();
     assert_eq!(
@@ -120,6 +196,9 @@ fn render_context_exposes_task_input_and_prev() {
         parent_id: None,
         root_id: None,
         interactive: false,
+        agent: None,
+        provider: None,
+        model: None,
     };
     let ctx = render_context(&task);
     assert_eq!(crate::template::render("{{ task.name }}", &ctx), "triage");
@@ -146,6 +225,9 @@ fn task_with_session(session_id: Option<&str>, session_title: Option<&str>) -> T
         parent_id: None,
         root_id: None,
         interactive: false,
+        agent: None,
+        provider: None,
+        model: None,
     }
 }
 
@@ -658,6 +740,9 @@ async fn build_task_output_bounds_every_shape() {
         parent_id: None,
         root_id: None,
         interactive: false,
+        agent: None,
+        provider: None,
+        model: None,
     };
     crate::db::upsert_task(&pool, &task).await.unwrap();
     let stored = crate::db::get_task(&pool, task.id)
@@ -899,6 +984,9 @@ fn branch_name_slugifies_folder_qualified_task() {
         parent_id: None,
         root_id: None,
         interactive: false,
+        agent: None,
+        provider: None,
+        model: None,
     };
     let short = &task.id.to_string()[..8];
     assert_eq!(
@@ -1492,6 +1580,9 @@ fn lineage_task(name: &str, status: TaskStatus, root: Option<Uuid>, parent: Opti
         parent_id: parent,
         root_id: root,
         interactive: false,
+        agent: None,
+        provider: None,
+        model: None,
     }
 }
 

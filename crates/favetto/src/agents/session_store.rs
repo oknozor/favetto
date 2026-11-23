@@ -228,6 +228,9 @@ mod tests {
             parent_id: None,
             root_id: None,
             interactive: false,
+            agent: None,
+            provider: None,
+            model: None,
         };
         db::insert_task(&pool, &task).await.unwrap();
         let run = TaskRun {

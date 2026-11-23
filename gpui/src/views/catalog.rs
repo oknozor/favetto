@@ -1093,14 +1093,6 @@ impl CatalogView {
     fn launch_sheet(&self, theme: &Theme, form: &LaunchForm, cx: &mut Context<Self>) -> Div {
         let entry = &form.entry;
         let mut metadata = div().flex().flex_wrap().gap(px(theme.spacing.s1 + 2.0));
-        if let Some(agent) = &entry.agent {
-            metadata = metadata.child(self.metadata_chip(theme, format!("agent {agent}")));
-        }
-        if entry.provider.is_some() || entry.model.is_some() {
-            let provider = entry.provider.as_deref().unwrap_or("default provider");
-            let model = entry.model.as_deref().unwrap_or("default model");
-            metadata = metadata.child(self.metadata_chip(theme, format!("{provider} · {model}")));
-        }
         if let Some(cwd) = &entry.cwd {
             metadata = metadata.child(self.metadata_chip(theme, format!("cwd {cwd}")));
         }
@@ -1112,6 +1104,177 @@ impl CatalogView {
         }
         if !entry.kind.is_empty() {
             metadata = metadata.child(self.metadata_chip(theme, format!("kind {}", entry.kind)));
+        }
+
+        let mut controls = div().flex().flex_col().gap(px(theme.spacing.s3));
+        if form.show_overrides() {
+            let mut agent_box = div().flex().flex_col().gap(px(theme.spacing.s2)).child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s2))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(theme.font.sm))
+                            .text_color(theme.colors.text)
+                            .child("Agent"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(theme.font.xs))
+                            .text_color(theme.colors.muted)
+                            .child("overrides the definition for this launch"),
+                    ),
+            );
+            if form.agents.is_empty() {
+                agent_box = agent_box.child(
+                    div()
+                        .text_size(px(theme.font.sm))
+                        .text_color(theme.colors.muted)
+                        .child("Using the definition or daemon default agent."),
+                );
+            } else {
+                let mut chips = div().flex().flex_wrap().gap(px(theme.spacing.s1));
+                for (choice_index, choice) in form.agents.iter().enumerate() {
+                    let selected = form.agent.as_deref() == Some(choice.name.as_str());
+                    let available = choice.available;
+                    let name = choice.name.clone();
+                    let label = if choice.display_name.is_empty() {
+                        choice.name.clone()
+                    } else {
+                        choice.display_name.clone()
+                    };
+                    let state = self.state.clone();
+                    chips = chips.child(
+                        div()
+                            .id(("catalog-agent", choice_index))
+                            .flex()
+                            .items_center()
+                            .gap(px(theme.spacing.s1))
+                            .h(px(theme.controls.min))
+                            .px(px(theme.spacing.s2))
+                            .rounded(px(theme.radii.r4))
+                            .border_1()
+                            .border_color(if selected {
+                                theme.colors.accent
+                            } else if !available {
+                                theme.colors.danger
+                            } else {
+                                theme.colors.border
+                            })
+                            .when(selected, |chip| {
+                                chip.bg(Hsla::from(theme.colors.accent).opacity(0.16))
+                                    .text_color(theme.colors.accent)
+                            })
+                            .when(!selected, |chip| {
+                                chip.text_color(if available {
+                                    theme.colors.muted
+                                } else {
+                                    theme.colors.danger
+                                })
+                            })
+                            .text_size(px(theme.font.xs))
+                            .when(available, |chip| chip.cursor_pointer())
+                            .when(selected, |chip| chip.child("✓"))
+                            .child(label)
+                            .when(!available, |chip| chip.child("unavailable"))
+                            .when(available, |chip| {
+                                chip.on_click(cx.listener(move |_this, _event, _window, cx| {
+                                    state.update(cx, |state, cx| {
+                                        state.set_catalog_agent(&name);
+                                        cx.notify();
+                                    });
+                                }))
+                            }),
+                    );
+                }
+                agent_box = agent_box.child(chips);
+            }
+            controls = controls.child(
+                div()
+                    .id("catalog-launch-agent")
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme.spacing.s2))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.state.update(cx, |state, cx| {
+                            state.focus_catalog_agent();
+                            cx.notify();
+                        });
+                    }))
+                    .child(agent_box),
+            );
+
+            let model_focused = form.model_index() == Some(form.focused);
+            let model_value = form.model.clone();
+            controls = controls.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme.spacing.s1))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(theme.spacing.s2))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(px(theme.font.sm))
+                                    .text_color(theme.colors.text)
+                                    .child("Model"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(theme.font.xs))
+                                    .text_color(theme.colors.muted)
+                                    .child("bare id or provider/model"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("catalog-launch-model")
+                            .flex()
+                            .items_center()
+                            .min_h(px(36.0))
+                            .px(px(theme.spacing.s3))
+                            .rounded(px(theme.radii.r8))
+                            .border_1()
+                            .border_color(if model_focused {
+                                theme.colors.accent
+                            } else {
+                                theme.colors.border
+                            })
+                            .bg(theme.colors.bg)
+                            .cursor_text()
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.state.update(cx, |state, cx| {
+                                    state.focus_catalog_model();
+                                    cx.notify();
+                                });
+                            }))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(theme.font.sm))
+                                    .text_color(if model_value.is_empty() {
+                                        theme.colors.muted
+                                    } else {
+                                        theme.colors.text
+                                    })
+                                    .child(if model_value.is_empty() {
+                                        "Definition or agent default".to_string()
+                                    } else {
+                                        model_value.clone()
+                                    }),
+                            )
+                            .when(model_focused, |line| {
+                                line.child(div().text_color(theme.colors.accent).child("▌"))
+                            }),
+                    ),
+            );
         }
 
         let mut fields = div().flex().flex_col().gap(px(theme.spacing.s3));
@@ -1407,6 +1570,7 @@ impl CatalogView {
                     .flex_col()
                     .gap(px(theme.spacing.s3))
                     .p(px(theme.spacing.s4))
+                    .child(controls)
                     .child(fields)
                     .when_some(server_error, |body, error| body.child(error)),
             )

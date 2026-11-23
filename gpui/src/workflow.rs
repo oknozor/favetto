@@ -828,6 +828,9 @@ mod tests {
             parent_id: None,
             root_id: root,
             interactive: false,
+            agent: None,
+            provider: None,
+            model: None,
         }
     }
 

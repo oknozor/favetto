@@ -138,6 +138,15 @@ pub enum UiAction {
         name: String,
         input: Value,
     },
+    /// Start a catalog task with input and per-launch agent/provider/model
+    /// overrides collected from the options form.
+    StartTaskWithOptions {
+        name: String,
+        input: Value,
+        agent: Option<String>,
+        provider: Option<String>,
+        model: Option<String>,
+    },
     /// Open the selected Catalog task's Markdown in the user's editor.
     EditCatalog(String),
     /// Open the one-shot task wizard.
@@ -810,7 +819,65 @@ pub struct TaskVarsForm {
     pub values: Vec<TextBuffer>,
     /// Selected index into each variable's `choices` (0 when absent).
     pub choice_selected: Vec<usize>,
+    /// Whether the agent/provider/model override fields are part of the form.
+    /// Hidden for action tasks, which never launch an agent.
+    pub show_overrides: bool,
+    /// Launch-time agent override, pre-seeded from the catalog entry.
+    pub agent: TextBuffer,
+    /// Launch-time model provider override, pre-seeded from the catalog entry.
+    pub provider: TextBuffer,
+    /// Launch-time model id override, pre-seeded from the catalog entry.
+    pub model: TextBuffer,
     pub error: Option<String>,
+}
+
+impl TaskVarsForm {
+    /// Number of focusable fields: the declared vars plus the optional agent,
+    /// provider, and model override fields.
+    fn field_count(&self) -> usize {
+        self.vars.len() + if self.show_overrides { 3 } else { 0 }
+    }
+
+    /// The buffer for the focused override field (`0` agent, `1` provider,
+    /// `2` model), or `None` when a declared variable is focused.
+    fn override_buffer_mut(&mut self, index: usize) -> Option<&mut TextBuffer> {
+        if !self.show_overrides || index < self.vars.len() {
+            return None;
+        }
+        match index - self.vars.len() {
+            0 => Some(&mut self.agent),
+            1 => Some(&mut self.provider),
+            2 => Some(&mut self.model),
+            _ => None,
+        }
+    }
+
+    /// The focused field's text buffer, for a declared variable or an override.
+    fn current_buffer_mut(&mut self) -> Option<&mut TextBuffer> {
+        let current = self.current;
+        if current < self.vars.len() {
+            return self.values.get_mut(current);
+        }
+        self.override_buffer_mut(current)
+    }
+
+    /// The launch overrides currently typed into the form, normalized to
+    /// `None` when blank.
+    fn overrides(&self) -> (Option<String>, Option<String>, Option<String>) {
+        let value = |buffer: &TextBuffer| {
+            let value = buffer.value().trim().to_string();
+            (!value.is_empty()).then_some(value)
+        };
+        if self.show_overrides {
+            (
+                value(&self.agent),
+                value(&self.provider),
+                value(&self.model),
+            )
+        } else {
+            (None, None, None)
+        }
+    }
 }
 
 /// State for the Ctrl+R prompt that answers a session's structured input request.
@@ -2202,7 +2269,7 @@ impl App {
 
     /// Launch the task highlighted in the picker through [`App::begin_catalog_task`]
     /// (a `[[vars]]` task opens its variable form; every other task starts).
-    fn activate_task_picker_selection(&mut self) -> UiAction {
+    fn activate_task_picker_selection(&mut self, with_options: bool) -> UiAction {
         let selected = match &self.popup {
             Popup::TaskPicker { selected, .. } => *selected,
             _ => return UiAction::None,
@@ -2215,7 +2282,11 @@ impl App {
             return UiAction::None;
         };
         self.popup = Popup::None;
-        self.begin_catalog_task(&entry)
+        if with_options {
+            self.begin_catalog_task_with_options(&entry)
+        } else {
+            self.begin_catalog_task(&entry)
+        }
     }
 
     /// Store the fetched workflow graph (DOT + persisted path) and, when the
@@ -3475,6 +3546,20 @@ impl App {
         if entry.vars.is_empty() {
             return UiAction::StartTask(entry.name.clone());
         }
+        self.open_task_form(entry, false);
+        UiAction::None
+    }
+
+    /// Open the launch form even when the task declares no variables, so the
+    /// user can override the agent or model before starting (Alt+Enter).
+    fn begin_catalog_task_with_options(&mut self, entry: &CatalogEntry) -> UiAction {
+        self.open_task_form(entry, true);
+        UiAction::None
+    }
+
+    /// Build the `[[vars]]` + agent/model override form for a catalog entry.
+    fn open_task_form(&mut self, entry: &CatalogEntry, with_overrides: bool) {
+        let overrides = with_overrides && entry.kind != "action";
         let values = entry
             .vars
             .iter()
@@ -3496,9 +3581,24 @@ impl App {
             current: 0,
             values,
             choice_selected,
+            show_overrides: overrides,
+            agent: TextBuffer::new(if overrides {
+                entry.agent.clone().unwrap_or_default()
+            } else {
+                String::new()
+            }),
+            provider: TextBuffer::new(if overrides {
+                entry.provider.clone().unwrap_or_default()
+            } else {
+                String::new()
+            }),
+            model: TextBuffer::new(if overrides {
+                entry.model.clone().unwrap_or_default()
+            } else {
+                String::new()
+            }),
             error: None,
         });
-        UiAction::None
     }
 
     fn handle_form_key(&mut self, key: KeyEvent) -> UiAction {

@@ -922,6 +922,25 @@ async fn run_session(
                                 )
                                 .await;
                             }
+                            UiAction::StartTaskWithOptions {
+                                name,
+                                input,
+                                agent,
+                                provider,
+                                model,
+                            } => {
+                                let mut params = serde_json::json!({ "name": name, "input": input });
+                                if let Some(agent) = agent {
+                                    params["agent"] = serde_json::json!(agent);
+                                }
+                                if let Some(provider) = provider {
+                                    params["provider"] = serde_json::json!(provider);
+                                }
+                                if let Some(model) = model {
+                                    params["model"] = serde_json::json!(model);
+                                }
+                                start_task(client, app, params).await;
+                            }
                             UiAction::EditCatalog(name) => {
                                 edit_catalog_task(
                                     client, app, &name, terminal, ev_rx, input, editor,

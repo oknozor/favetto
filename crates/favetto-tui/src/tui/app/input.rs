@@ -999,7 +999,8 @@ impl App {
                 self.clamp_task_picker_selection();
                 UiAction::None
             }
-            KeyCode::Enter => self.activate_task_picker_selection(),
+            KeyCode::Enter if alt => self.activate_task_picker_selection(true),
+            KeyCode::Enter => self.activate_task_picker_selection(false),
             _ => UiAction::None,
         }
     }
@@ -1372,6 +1373,16 @@ impl App {
                         self.scroll_catalog_preview(page);
                     }
                     _ => {}
+                }
+                UiAction::None
+            }
+            KeyCode::Enter if alt && self.tab == Tab::Catalog => {
+                if !self.toggle_catalog_folder() {
+                    if let Some(index) = self.selected_catalog_task() {
+                        if let Some(entry) = self.catalog.get(index).cloned() {
+                            return self.begin_catalog_task_with_options(&entry);
+                        }
+                    }
                 }
                 UiAction::None
             }

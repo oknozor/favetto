@@ -1020,6 +1020,9 @@ fn oneshot_task() -> Task {
         parent_id: None,
         root_id: None,
         interactive: false,
+        agent: None,
+        provider: None,
+        model: None,
     }
 }
 
@@ -1284,6 +1287,9 @@ async fn agents_start_rejects_an_action_task() {
         parent_id: None,
         root_id: None,
         interactive: false,
+        agent: None,
+        provider: None,
+        model: None,
     };
     db::insert_task(&state.db, &task).await.unwrap();
 
@@ -1366,6 +1372,103 @@ async fn tasks_start_marks_the_task_interactive_only_when_requested() {
 }
 
 #[tokio::test]
+async fn tasks_start_persists_agent_and_model_overrides_across_retry() {
+    let dir = temp_dir("tasks-start-overrides");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    std::fs::write(
+        tasks_dir.join("issue.md"),
+        "agent = \"x\"\nprovider = \"p\"\nmodel = \"m\"\n---\nbody\n",
+    )
+    .unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+
+    let started = call_ok(
+        &state,
+        method::TASKS_START,
+        serde_json::json!({
+            "name": "issue",
+            "agent": "y",
+            "provider": "q",
+            "model": "z",
+        }),
+    )
+    .await;
+    assert_eq!(started["agent"], "y");
+    assert_eq!(started["provider"], "q");
+    assert_eq!(started["model"], "z");
+
+    let id = Uuid::parse_str(started["id"].as_str().expect("task id")).expect("uuid");
+    let stored = db::get_task(&state.db, id).await.unwrap().unwrap();
+    assert_eq!(stored.agent.as_deref(), Some("y"));
+    assert_eq!(stored.provider.as_deref(), Some("q"));
+    assert_eq!(stored.model.as_deref(), Some("z"));
+
+    // Retry re-enqueues the same row; the launch overrides must survive.
+    let mut terminal = stored.clone();
+    terminal.status = TaskStatus::Failed;
+    terminal.error = Some("boom".to_string());
+    terminal.failure = Some(favetto_core::model::Failure::new(
+        favetto_core::model::FailureKind::Agent,
+        "boom",
+    ));
+    db::upsert_task(&state.db, &terminal).await.unwrap();
+    let retried = call_ok(&state, method::TASKS_RETRY, serde_json::json!({ "id": id })).await;
+    assert_eq!(retried["agent"], "y");
+    assert_eq!(retried["provider"], "q");
+    assert_eq!(retried["model"], "z");
+
+    // Blank overrides are normalized away rather than stored as empty strings.
+    let blank = call_ok(
+        &state,
+        method::TASKS_START,
+        serde_json::json!({ "name": "issue", "agent": "  ", "model": "" }),
+    )
+    .await;
+    assert!(blank.get("agent").is_none(), "{blank}");
+    assert!(blank.get("model").is_none(), "{blank}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn tasks_start_rejects_agent_overrides_for_action_tasks() {
+    let dir = temp_dir("tasks-start-action-overrides");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    std::fs::write(
+        tasks_dir.join("gate.md"),
+        "kind = \"action\"\n[action]\nid = \"http.request\"\n---\nbody\n",
+    )
+    .unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 1,
+            method: method::TASKS_START.to_string(),
+            params: serde_json::json!({ "name": "gate", "agent": "y" }),
+        },
+    )
+    .await;
+    let error = resp.error.expect("action override rejected");
+    assert_eq!(error.code, favetto_core::rpc::error_code::INVALID_PARAMS);
+    assert!(error.message.contains("action task"), "{error:?}");
+
+    // Without overrides the same action task starts normally.
+    let ok = call_ok(
+        &state,
+        method::TASKS_START,
+        serde_json::json!({ "name": "gate" }),
+    )
+    .await;
+    assert_eq!(ok["name"], "gate");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn tasks_list_omits_output_and_honours_limit_and_get_returns_it() {
     let dir = temp_dir("tasks-list-get");
     let tasks_dir = dir.join("tasks");
@@ -1390,6 +1493,9 @@ async fn tasks_list_omits_output_and_honours_limit_and_get_returns_it() {
         parent_id: None,
         root_id: None,
         interactive: false,
+        agent: None,
+        provider: None,
+        model: None,
     };
     let first = make("one");
     let second = make("two");
@@ -1482,6 +1588,9 @@ async fn tasks_runs_returns_history_oldest_first() {
         parent_id: None,
         root_id: None,
         interactive: false,
+        agent: None,
+        provider: None,
+        model: None,
     };
     db::upsert_task(&state.db, &task).await.unwrap();
 
@@ -1575,6 +1684,9 @@ async fn tasks_retry_requeues_terminal_tasks_and_rejects_live_runs() {
         parent_id: None,
         root_id: None,
         interactive: false,
+        agent: None,
+        provider: None,
+        model: None,
     };
     let run = |task_id: Uuid, attempt: u32, status: RunStatus| TaskRun {
         id: Uuid::new_v4(),

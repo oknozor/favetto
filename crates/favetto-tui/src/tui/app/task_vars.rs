@@ -14,7 +14,7 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-        let last = form.vars.len().saturating_sub(1);
+        let last = form.field_count().saturating_sub(1);
         let has_choices = form
             .vars
             .get(form.current)
@@ -47,12 +47,12 @@ impl App {
                 *selected = selected.saturating_sub(1);
             }
             KeyCode::Down if multiline => {
-                if let Some(value) = form.values.get_mut(form.current) {
+                if let Some(value) = form.current_buffer_mut() {
                     value.line_down();
                 }
             }
             KeyCode::Up if multiline => {
-                if let Some(value) = form.values.get_mut(form.current) {
+                if let Some(value) = form.current_buffer_mut() {
                     value.line_up();
                 }
             }
@@ -72,12 +72,12 @@ impl App {
             // many terminals report the same byte for Enter, hence the plain
             // Enter fallback below.
             KeyCode::Enter if multiline && (shift || alt) => {
-                if let Some(value) = form.values.get_mut(form.current) {
+                if let Some(value) = form.current_buffer_mut() {
                     value.insert_char('\n');
                 }
             }
             KeyCode::Enter if multiline => {
-                if let Some(value) = form.values.get_mut(form.current) {
+                if let Some(value) = form.current_buffer_mut() {
                     value.insert_char('\n');
                 }
             }
@@ -90,77 +90,77 @@ impl App {
                 }
             }
             KeyCode::Backspace if !has_choices && alt => {
-                if let Some(value) = form.values.get_mut(form.current) {
+                if let Some(value) = form.current_buffer_mut() {
                     value.delete_word_before();
                 }
             }
             KeyCode::Backspace if !has_choices => {
-                if let Some(value) = form.values.get_mut(form.current) {
+                if let Some(value) = form.current_buffer_mut() {
                     value.backspace();
                 }
             }
             KeyCode::Delete if !has_choices => {
-                if let Some(value) = form.values.get_mut(form.current) {
+                if let Some(value) = form.current_buffer_mut() {
                     value.delete();
                 }
             }
             KeyCode::Left if !has_choices && (alt || ctrl) => {
-                if let Some(value) = form.values.get_mut(form.current) {
+                if let Some(value) = form.current_buffer_mut() {
                     value.move_word_left();
                 }
             }
             KeyCode::Left if !has_choices => {
-                if let Some(value) = form.values.get_mut(form.current) {
+                if let Some(value) = form.current_buffer_mut() {
                     value.move_left();
                 }
             }
             KeyCode::Right if !has_choices && (alt || ctrl) => {
-                if let Some(value) = form.values.get_mut(form.current) {
+                if let Some(value) = form.current_buffer_mut() {
                     value.move_word_right();
                 }
             }
             KeyCode::Right if !has_choices => {
-                if let Some(value) = form.values.get_mut(form.current) {
+                if let Some(value) = form.current_buffer_mut() {
                     value.move_right();
                 }
             }
             KeyCode::Home if !has_choices => {
-                if let Some(value) = form.values.get_mut(form.current) {
+                if let Some(value) = form.current_buffer_mut() {
                     value.home();
                 }
             }
             KeyCode::End if !has_choices => {
-                if let Some(value) = form.values.get_mut(form.current) {
+                if let Some(value) = form.current_buffer_mut() {
                     value.end();
                 }
             }
             KeyCode::Char('a') if !has_choices && ctrl => {
-                if let Some(value) = form.values.get_mut(form.current) {
+                if let Some(value) = form.current_buffer_mut() {
                     value.home();
                 }
             }
             KeyCode::Char('e') if !has_choices && ctrl => {
-                if let Some(value) = form.values.get_mut(form.current) {
+                if let Some(value) = form.current_buffer_mut() {
                     value.end();
                 }
             }
             KeyCode::Char('u') if !has_choices && ctrl => {
-                if let Some(value) = form.values.get_mut(form.current) {
+                if let Some(value) = form.current_buffer_mut() {
                     value.delete_to_line_start();
                 }
             }
             KeyCode::Char('k') if !has_choices && ctrl => {
-                if let Some(value) = form.values.get_mut(form.current) {
+                if let Some(value) = form.current_buffer_mut() {
                     value.delete_to_line_end();
                 }
             }
             KeyCode::Char('w') if !has_choices && ctrl => {
-                if let Some(value) = form.values.get_mut(form.current) {
+                if let Some(value) = form.current_buffer_mut() {
                     value.delete_word_before();
                 }
             }
             KeyCode::Char(c) if !ctrl && !alt && !has_choices => {
-                if let Some(value) = form.values.get_mut(form.current) {
+                if let Some(value) = form.current_buffer_mut() {
                     value.insert_char(c);
                 }
             }
@@ -175,7 +175,18 @@ impl App {
         match submit_task_vars(form) {
             Ok(input) => {
                 let name = form.task.clone();
-                UiAction::StartTaskWithInput { name, input }
+                let (agent, provider, model) = form.overrides();
+                if agent.is_some() || provider.is_some() || model.is_some() {
+                    UiAction::StartTaskWithOptions {
+                        name,
+                        input,
+                        agent,
+                        provider,
+                        model,
+                    }
+                } else {
+                    UiAction::StartTaskWithInput { name, input }
+                }
             }
             Err(e) => {
                 form.error = Some(e);

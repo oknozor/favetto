@@ -593,7 +593,32 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
             let p: TasksStartParams = parse_params(&req.method, &req.params)?;
             let input = p.input.unwrap_or(serde_json::Value::Null);
             let interactive = p.interactive.unwrap_or(false);
-            match crate::executor::enqueue_task(state, p.name, input, None, interactive).await {
+            let overrides = crate::executor::TaskOverrides::new(p.agent, p.provider, p.model);
+            // Agent/model overrides do not apply to action tasks: they never
+            // launch an agent, so surface the mismatch instead of silently
+            // storing fields that can never take effect.
+            let kind = state
+                .catalog
+                .read()
+                .iter()
+                .find(|def| def.name == p.name)
+                .map(|def| def.kind);
+            if kind == Some(crate::tasks::TaskKind::Action) && !overrides.is_empty() {
+                return Err(RpcError::InvalidParams(format!(
+                    "task '{}' is an action task and does not accept agent, provider, or model overrides",
+                    p.name
+                )));
+            }
+            match crate::executor::enqueue_task_with_overrides(
+                state,
+                p.name,
+                input,
+                None,
+                interactive,
+                overrides,
+            )
+            .await
+            {
                 Ok(task) => to_value(task),
                 Err(e) => Err(RpcError::Internal(e.to_string())),
             }
@@ -1713,17 +1738,31 @@ async fn start_agent(
         }
     }
 
-    // Resolve the agent: a request wins over the configured default.
-    let name = requested
-        .or_else(|| state.config.agent.default.clone())
-        .ok_or_else(|| {
-            anyhow::anyhow!("no agent given and no default configured ([agent].default)")
-        })?;
+    // Resolve the agent: a request wins over the task's stored launch override,
+    // the configured definition, and finally the configured default. The same
+    // helper the headless executor uses keeps provider/model atomic.
+    let (resolved_agent, model) = {
+        let (task, def) = match &resolved {
+            Some((task, def)) => (Some(task), Some(def)),
+            None => (None, None),
+        };
+        crate::executor::resolve_launch(
+            task,
+            def,
+            requested,
+            requested_provider,
+            requested_model,
+            state.config.agent.default.as_deref(),
+        )
+    };
+    let name = resolved_agent.ok_or_else(|| {
+        anyhow::anyhow!("no agent given and no default configured ([agent].default)")
+    })?;
     let agent = state.registry.get_checked(&name)?;
 
     // A catalog task's prompt is a template over its collected `input`. Render it
     // here so a freshly seeded session sees the same text a headless run would.
-    let (prompt, permission, task_provider, task_model) = match resolved {
+    let (prompt, permission) = match resolved {
         Some((task, def)) => {
             let rendered = crate::executor::render_task_prompt(&def, &task);
             (
@@ -1733,14 +1772,10 @@ async fn start_agent(
                     Some(rendered)
                 },
                 def.permission,
-                def.provider,
-                def.model,
             )
         }
-        None => (prompt, None, None, None),
+        None => (prompt, None),
     };
-    let provider = requested_provider.or(task_provider);
-    let model = requested_model.or(task_model);
 
     let cwd = cwd
         .filter(|path| !path.as_os_str().is_empty())
@@ -1757,7 +1792,7 @@ async fn start_agent(
                 prompt,
                 cwd,
                 permission,
-                model: crate::agents::model_selector(provider.as_deref(), model.as_deref()),
+                model,
                 headless: false,
                 git_env: Default::default(),
             },
@@ -1843,6 +1878,9 @@ async fn start_oneshot_task(
         parent_id: None,
         root_id: None,
         interactive: false,
+        agent: None,
+        provider: None,
+        model: None,
     };
     db::insert_task(&state.db, &task).await?;
     state.metrics.inc_tasks();
