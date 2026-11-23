@@ -234,6 +234,8 @@ typed_calls! {
     tasks_runs => TasksRunsCall,
     /// `tasks.events`.
     tasks_events => TasksEventsCall,
+    /// `tasks.session`.
+    tasks_session => TasksSessionCall,
     /// `tasks.cancel`.
     tasks_cancel => TasksCancelCall,
     /// `tasks.retry`.
@@ -248,8 +250,6 @@ typed_calls! {
     catalog_get => CatalogGetCall,
     /// `agents.list`.
     agents_list => AgentsListCall,
-    /// `agents.history`.
-    agents_history => AgentsHistoryCall,
     /// `agents.load`.
     agents_load => AgentsLoadCall,
     /// `agents.prompt`.
@@ -266,12 +266,6 @@ typed_calls! {
     agents_set_option => AgentsSetOptionCall,
     /// `agents.set_mode`.
     agents_set_mode => AgentsSetModeCall,
-    /// `agents.provider_sessions`.
-    agents_provider_sessions => AgentsProviderSessionsCall,
-    /// `agents.provider_resume`.
-    agents_provider_resume => AgentsProviderResumeCall,
-    /// `agents.provider_delete`.
-    agents_provider_delete => AgentsProviderDeleteCall,
     /// `agents.authenticate`.
     agents_authenticate => AgentsAuthenticateCall,
     /// `agents.logout`.
@@ -432,10 +426,10 @@ mod tests {
     }
 
     #[test]
-    fn agent_history_and_load_requests_use_the_favetto_local_id() {
-        let history =
-            encode_request::<AgentsHistoryCall>(20, &AgentsHistoryParams { limit: Some(25) })
-                .expect("encode history");
+    fn task_session_and_load_requests_use_the_favetto_local_id() {
+        let task_id = uuid::Uuid::from_u128(7);
+        let session = encode_request::<TasksSessionCall>(20, &TaskIdParams { id: task_id })
+            .expect("encode session");
         let load = encode_request::<AgentsLoadCall>(
             21,
             &SessionIdParams {
@@ -444,12 +438,11 @@ mod tests {
         )
         .expect("encode load");
 
-        let frame: Frame = rmp_serde::from_slice(&history).expect("decode history");
+        let frame: Frame = rmp_serde::from_slice(&session).expect("decode session");
         match frame {
             Frame::Request(request) => {
-                assert_eq!(request.method, method::AGENTS_HISTORY);
-                assert_eq!(request.params["limit"], 25);
-                assert!(request.params.get("agent").is_none());
+                assert_eq!(request.method, method::TASKS_SESSION);
+                assert_eq!(request.params["id"], task_id.to_string());
             }
             other => panic!("expected a request frame, got {other:?}"),
         }

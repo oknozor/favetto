@@ -215,13 +215,12 @@ connection** runs `system.ping` against the draft and reports the round-trip
 latency and daemon cwd, or the exact transport error. **Save** rewrites
 `gpui.toml` and restarts the transport; **Use defaults** restores
 `http://127.0.0.1:7878` and the shared token file. **Agents** is the read-only
-`agents.list` roster (availability, command, `acp`/`pty` backend, live sessions)
-plus **Past sessions** from `agents.history`: active, ended, loading, failed and
-cannot-load rows are labelled, and a loadable row restores the provider's
-conversation through `agents.load` by Favetto-local id. A load never starts a
-fresh session; progress and errors are shown inline and as a toast, and the
-replayed transcript appears under the row only after the load succeeds (a
-bounded preview; the full conversation stays with the agent).
+`agents.list` roster (availability, command, `acp`/`pty` backend, live sessions).
+There is no global session browser: opening a task resolves its own agent
+conversation on demand through `tasks.session` and restores it with `agents.load`
+when it ended loadable. Restoration never starts a session, sends a prompt or
+changes the task row; the replayed conversation appears in the task detail's
+Output surface, labelled with its Favetto-local session id, agent and state.
 **Appearance** switches System/Dark/Light and Comfortable/Compact live and
 persists both. **About** shows the client version, daemon cwd, endpoint, config
 path and a docs link, and states that no telemetry is collected.
@@ -294,18 +293,14 @@ field blank keeps the shared token file.
   with the daemon's parser configuration, plain-language cadence and next-fire
   hints, the sorted table, the create/edit sheet and the delete confirmation.
   Unit-tested without a window.
-- `src/sessions.rs` — the pure persisted-session model: the `agents.history`
-  snapshot, load states (active/loading/ready/failed/cannot-load), load by
-  Favetto-local id, and the restored transcript preview. Unit-tested without a
-  window.
+- `src/detail.rs` — the pure detail model: output-envelope extraction and ANSI
+  stripping, usage/cost formatting, event-feed grouping (text, reasoning,
+  tools, usage, errors, boundaries), the permission-request resolver, the
+  task-scoped conversation restore state, and a tolerant `tasks.events` decoder
+  that skips unknown event kinds. Unit-tested without a window.
 - `src/settings.rs` — the pure Settings model: the endpoint/token draft, the
   precise normalization preview, the connection-test result and the logical
   Tab order. Unit-tested without a window.
-- `src/detail.rs` — the pure detail model: output-envelope extraction and ANSI
-  stripping, usage/cost formatting, event-feed grouping (text, reasoning,
-  tools, usage, errors, boundaries), the permission-request resolver, and a
-  tolerant `tasks.events` decoder that skips unknown event kinds. Unit-tested
-  without a window.
 - `src/routes.rs` — the route vocabulary, labels, icons, jump hints and empty
   copy in one place.
 - `src/actions.rs` — actions plus the keymap; every shortcut is bound to an

@@ -24,20 +24,18 @@ use std::time::{Duration, Instant};
 use async_channel::{Receiver, Sender};
 use favetto_wire::elicitation::ElicitationReply;
 use favetto_wire::model::{
-    AgentCatalogEntry, AgentSessionHistoryEntry, AgentSessionInfo, InputReply,
-    ProviderSessionsResult, Schedule, SessionConfigValue, Task, TaskRun,
+    AgentCatalogEntry, AgentSessionInfo, InputReply, Schedule, SessionConfigValue, Task, TaskRun,
 };
 use favetto_wire::rpc::{
     AgentAttachResult, AgentAuthenticateParams, AgentAuthenticateResult, AgentCancelParams,
     AgentCancelResult, AgentElicitationReplyParams, AgentElicitationReplyResult, AgentLogoutParams,
     AgentLogoutResult, AgentOptionsResult, AgentPromptParams, AgentPromptResult, AgentReplyParams,
-    AgentReplyResult, AgentSetModeParams, AgentSetOptionParams, AgentsHistoryParams, CatalogEntry,
-    CatalogGetParams, EmptyParams, PingParams, PingResult, ProviderDeleteParams,
-    ProviderResumeParams, ProviderSessionsParams, ReposActivateParams, ReposListResult,
+    AgentReplyResult, AgentSetModeParams, AgentSetOptionParams, CatalogEntry, CatalogGetParams,
+    EmptyParams, PingParams, PingResult, ReposActivateParams, ReposListResult,
     ScheduleDeleteParams, ScheduleUpsertParams, SchedulesDeleteResult, SessionIdParams,
     StartOneshotParams, StartOneshotResult, TaskIdParams, TasksEventsParams, TasksListParams,
-    TasksStartParams, WorkflowCancelResultBody, WorkflowGetResult, WorkflowInspectParams,
-    WorkflowRetryParams,
+    TasksSessionResult, TasksStartParams, WorkflowCancelResultBody, WorkflowGetResult,
+    WorkflowInspectParams, WorkflowRetryParams,
 };
 use favetto_wire::workflow::WorkflowInspect;
 use uuid::Uuid;
@@ -61,14 +59,10 @@ pub enum Command {
     Ping,
     /// Drop the SSE stream, start a fresh one, and re-validate the connection.
     Reconnect,
-    /// Re-fetch `tasks.list`, `agents.list` and `agents.history` for the Inbox,
-    /// Tasks and Settings views. Loads coalesce, so a burst of pushes costs one
-    /// round trip, not one per frame.
+    /// Re-fetch `tasks.list` and `agents.list` for the Inbox, Tasks and Settings
+    /// views. Loads coalesce, so a burst of pushes costs one round trip, not one
+    /// per frame.
     RefreshSnapshot,
-    /// Re-fetch provider-owned ACP history. This launches one short-lived ACP
-    /// connection per available agent, so it is requested on demand (when the
-    /// Settings route opens or after a provider action), never on every push.
-    RefreshProviderSessions,
     /// Re-fetch `catalog.list` (connect, Retry or a `catalog.updated` push).
     RefreshCatalog,
     /// Fetch one definition's raw Markdown for the preview pane.
@@ -96,6 +90,9 @@ pub enum Command {
     },
     /// Fetch `tasks.get`, `tasks.events` and `tasks.runs` for the open detail.
     LoadTaskDetail { task_id: Uuid },
+    /// Resolve the agent session associated with one task (`tasks.session`).
+    /// The request id lets the UI drop a reply for a superseded open/attempt.
+    LoadTaskSession { task_id: Uuid, request_id: u64 },
     /// Fetch only the detail's persisted output (the Output tab's Retry).
     LoadTask { task_id: Uuid },
     /// Re-run the structured-event backfill (the output tab's Retry).
@@ -137,14 +134,6 @@ pub enum Command {
     },
     /// Sign an ACP session out when the agent advertised logout (`agents.logout`).
     Logout { session_id: String },
-    /// Resume a provider-owned session by its ACP id (`agents.provider_resume`).
-    ResumeProviderSession {
-        agent: String,
-        session_id: String,
-        cwd: Option<std::path::PathBuf>,
-    },
-    /// Delete a provider-owned session (`agents.provider_delete`).
-    DeleteProviderSession { agent: String, session_id: String },
     /// Fetch one root's runtime workflow graph (`workflow.inspect`).
     LoadWorkflowInspect { root_id: Uuid },
     /// Fetch the catalog DAG source (`workflow.get`).
@@ -206,8 +195,6 @@ pub enum Update {
         sessions: Vec<AgentSessionInfo>,
         /// The agent roster, used by the one-shot picker.
         agents: Vec<AgentCatalogEntry>,
-        /// Durable Favetto-created ACP sessions for the Settings Agents card.
-        history: Vec<AgentSessionHistoryEntry>,
     },
     /// The Inbox/Tasks fetch failed (`tasks.list` is required; a failing agents
     /// list keeps the task rows and drops the session overlay).
@@ -253,6 +240,12 @@ pub enum Update {
     RunsLoaded { task_id: Uuid, runs: Vec<TaskRun> },
     /// `tasks.runs` failed.
     RunsFailed { task_id: Uuid, error: ClientError },
+    /// `tasks.session` completed for one task-scoped restore lookup.
+    TaskSessionLoaded {
+        task_id: Uuid,
+        request_id: u64,
+        result: Result<TasksSessionResult, ClientError>,
+    },
     /// `agents.reply` completed for one correlated request.
     ReplyFinished {
         session_id: String,
@@ -287,22 +280,6 @@ pub enum Update {
     AgentOptionsChanged {
         session_id: String,
         result: Result<Box<AgentOptionsResult>, ClientError>,
-    },
-    /// Provider-session history refreshed through `agents.provider_sessions`.
-    ProviderSessionsLoaded {
-        provider_sessions: Vec<ProviderSessionsResult>,
-    },
-    /// `agents.provider_resume` completed for one provider row.
-    ProviderSessionResumed {
-        agent: String,
-        session_id: String,
-        result: Result<Box<AgentAttachResult>, ClientError>,
-    },
-    /// `agents.provider_delete` completed for one provider row.
-    ProviderSessionDeleted {
-        agent: String,
-        session_id: String,
-        result: Result<(), ClientError>,
     },
     /// `agents.authenticate` completed for one session.
     AuthFinished {
@@ -485,6 +462,14 @@ impl Runtime {
         self.send(Command::LoadTask { task_id });
     }
 
+    /// Resolve the agent session associated with one task (`tasks.session`).
+    pub fn load_task_session(&self, task_id: Uuid, request_id: u64) {
+        self.send(Command::LoadTaskSession {
+            task_id,
+            request_id,
+        });
+    }
+
     /// Re-run the structured-event backfill for the open detail.
     pub fn load_task_events(&self, task_id: Uuid) {
         self.send(Command::LoadTaskEvents { task_id });
@@ -566,30 +551,6 @@ impl Runtime {
     /// Sign a session out when the agent advertised ACP logout.
     pub fn logout(&self, session_id: String) {
         self.send(Command::Logout { session_id });
-    }
-
-    /// Re-list provider-owned sessions for the Settings Past sessions card.
-    pub fn refresh_provider_sessions(&self) {
-        self.send(Command::RefreshProviderSessions);
-    }
-
-    /// Resume a provider-owned session by its agent and ACP id.
-    pub fn resume_provider_session(
-        &self,
-        agent: String,
-        session_id: String,
-        cwd: Option<std::path::PathBuf>,
-    ) {
-        self.send(Command::ResumeProviderSession {
-            agent,
-            session_id,
-            cwd,
-        });
-    }
-
-    /// Delete a provider-owned session by its agent and ACP id.
-    pub fn delete_provider_session(&self, agent: String, session_id: String) {
-        self.send(Command::DeleteProviderSession { agent, session_id });
     }
 
     /// Fetch one root's runtime workflow view.
@@ -715,9 +676,6 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
                 let _ = schedule_trigger.try_send(());
                 let _ = repo_trigger.try_send(());
             }
-            Command::RefreshProviderSessions => {
-                spawn_provider_sessions_loader(client.clone(), updates.clone());
-            }
             Command::RefreshSnapshot => {
                 // Capacity one: if a load is already queued/running, this is a
                 // no-op rather than a second overlapping RPC pair.
@@ -757,6 +715,12 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
                 spawn_task_load(client.clone(), updates.clone(), task_id);
                 spawn_events_load(client.clone(), updates.clone(), task_id);
                 spawn_runs_load(client.clone(), updates.clone(), task_id);
+            }
+            Command::LoadTaskSession {
+                task_id,
+                request_id,
+            } => {
+                spawn_task_session(client.clone(), updates.clone(), task_id, request_id);
             }
             Command::LoadTask { task_id } => {
                 spawn_task_load(client.clone(), updates.clone(), task_id);
@@ -829,16 +793,6 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
             }
             Command::Logout { session_id } => {
                 spawn_agent_logout(client.clone(), updates.clone(), session_id);
-            }
-            Command::ResumeProviderSession {
-                agent,
-                session_id,
-                cwd,
-            } => {
-                spawn_provider_resume(client.clone(), updates.clone(), agent, session_id, cwd);
-            }
-            Command::DeleteProviderSession { agent, session_id } => {
-                spawn_provider_delete(client.clone(), updates.clone(), agent, session_id);
             }
             Command::LoadWorkflowInspect { root_id } => {
                 spawn_workflow_inspect(client.clone(), updates.clone(), root_id);
@@ -993,6 +947,9 @@ fn spawn_start_oneshot(
 /// burst of `task.updated` / `agent.state` / `agent.event` pushes (or several
 /// `r` presses) collapses into at most one follow-up load. That keeps the SSE
 /// tick responsive without letting a chatty agent starve the daemon's RPC path.
+///
+/// Durable session history is never fetched here: a task's conversation is
+/// restored on demand from its detail with the task-scoped `tasks.session`.
 fn spawn_inbox_loader(client: Arc<RpcClient>, updates: Sender<Update>, triggers: Receiver<()>) {
     tokio::spawn(async move {
         while triggers.recv().await.is_ok() {
@@ -1000,14 +957,12 @@ fn spawn_inbox_loader(client: Arc<RpcClient>, updates: Sender<Update>, triggers:
             while triggers.try_recv().is_ok() {}
 
             // The reads are independent; run them concurrently so the snapshot
-            // lands within one UI tick on a local daemon. History is additive:
-            // an older daemon without `agents.history` keeps the rest working.
-            let (tasks, agents, history) = tokio::join!(
+            // lands within one UI tick on a local daemon.
+            let (tasks, agents) = tokio::join!(
                 client.tasks_list(TasksListParams {
                     limit: Some(TASK_LIST_LIMIT),
                 }),
-                client.agents_list(EmptyParams {}),
-                client.agents_history(AgentsHistoryParams { limit: Some(100) })
+                client.agents_list(EmptyParams {})
             );
 
             let update = match tasks {
@@ -1025,12 +980,10 @@ fn spawn_inbox_loader(client: Arc<RpcClient>, updates: Sender<Update>, triggers:
                         }
                         Err(_) => (Vec::new(), Vec::new()),
                     };
-                    let history = history.unwrap_or_default();
                     Update::SnapshotLoaded {
                         tasks,
                         sessions,
                         agents,
-                        history,
                     }
                 }
                 Err(error) => Update::SnapshotFailed { error },
@@ -1038,101 +991,6 @@ fn spawn_inbox_loader(client: Arc<RpcClient>, updates: Sender<Update>, triggers:
             let _ = updates.try_send(update);
         }
     });
-}
-
-/// Refresh provider-owned history without refreshing the whole inbox snapshot.
-///
-/// This launches short-lived ACP connections, so it is deliberately separate
-/// from [`spawn_inbox_loader`] and only runs when the Settings route asks for it.
-fn spawn_provider_sessions_loader(client: Arc<RpcClient>, updates: Sender<Update>) {
-    tokio::spawn(async move {
-        let agents = match client.agents_list(EmptyParams {}).await {
-            Ok(agents) => agents,
-            Err(error) => {
-                let _ = updates.try_send(Update::ProviderSessionsLoaded {
-                    provider_sessions: vec![ProviderSessionsResult {
-                        agent: String::new(),
-                        supported: false,
-                        can_resume: false,
-                        can_delete: false,
-                        sessions: Vec::new(),
-                        next_cursor: None,
-                        error: Some(format!("agents.list failed: {error}")),
-                    }],
-                });
-                return;
-            }
-        };
-        let provider_sessions = fetch_provider_sessions(&client, &agents).await;
-        let _ = updates.try_send(Update::ProviderSessionsLoaded { provider_sessions });
-    });
-}
-
-/// How many provider pages one refresh follows per agent.
-const PROVIDER_PAGE_LIMIT: usize = 20;
-
-/// Fetch provider-owned sessions for every available ACP agent.
-///
-/// Each agent's opaque cursor is followed up to [`PROVIDER_PAGE_LIMIT`] and its
-/// pages are merged. An unsupported or failing agent yields one structured
-/// result with `error` set, so the Settings card can explain it without hiding
-/// Favetto's own durable history.
-async fn fetch_provider_sessions(
-    client: &RpcClient,
-    agents: &[AgentCatalogEntry],
-) -> Vec<ProviderSessionsResult> {
-    let mut results = Vec::new();
-    for agent in agents
-        .iter()
-        .filter(|agent| agent.available && agent.capabilities.acp)
-    {
-        let mut merged: Option<ProviderSessionsResult> = None;
-        let mut cursor: Option<String> = None;
-        let mut seen_cursors = std::collections::HashSet::new();
-        for _ in 0..PROVIDER_PAGE_LIMIT {
-            let params = ProviderSessionsParams {
-                agent: Some(agent.name.clone()),
-                cwd: None,
-                cursor: cursor.clone(),
-            };
-            let pages = match client.agents_provider_sessions(params).await {
-                Ok(pages) => pages,
-                Err(error) => {
-                    results.push(ProviderSessionsResult {
-                        agent: agent.name.clone(),
-                        supported: false,
-                        can_resume: false,
-                        can_delete: false,
-                        sessions: Vec::new(),
-                        next_cursor: None,
-                        error: Some(format!("agents.provider_sessions failed: {error}")),
-                    });
-                    merged = None;
-                    break;
-                }
-            };
-            let Some(page) = pages.into_iter().find(|page| page.agent == agent.name) else {
-                break;
-            };
-            let next = page.next_cursor.clone();
-            match &mut merged {
-                Some(aggregate) => {
-                    aggregate.sessions.extend(page.sessions);
-                    aggregate.next_cursor = next.clone();
-                }
-                None => merged = Some(page),
-            }
-            let Some(next) = next else { break };
-            if !seen_cursors.insert(next.clone()) {
-                break;
-            }
-            cursor = Some(next);
-        }
-        if let Some(result) = merged {
-            results.push(result);
-        }
-    }
-    results
 }
 
 /// Spawn one `tasks.cancel` / `tasks.retry`; the reply is a
@@ -1172,6 +1030,26 @@ fn spawn_task_load(client: Arc<RpcClient>, updates: Sender<Update>, task_id: Uui
             Err(error) => Update::TaskLoadFailed { task_id, error },
         };
         let _ = updates.try_send(update);
+    });
+}
+
+/// Spawn one `tasks.session` lookup for the open detail.
+///
+/// This is a single indexed, task-scoped read. It never lists global or
+/// provider-owned histories.
+fn spawn_task_session(
+    client: Arc<RpcClient>,
+    updates: Sender<Update>,
+    task_id: Uuid,
+    request_id: u64,
+) {
+    tokio::spawn(async move {
+        let result = client.tasks_session(TaskIdParams { id: task_id }).await;
+        let _ = updates.try_send(Update::TaskSessionLoaded {
+            task_id,
+            request_id,
+            result,
+        });
     });
 }
 
@@ -1405,31 +1283,6 @@ fn spawn_agent_set_mode(
     });
 }
 
-/// Spawn one `agents.provider_resume` for a provider-owned session.
-fn spawn_provider_resume(
-    client: Arc<RpcClient>,
-    updates: Sender<Update>,
-    agent: String,
-    session_id: String,
-    cwd: Option<std::path::PathBuf>,
-) {
-    tokio::spawn(async move {
-        let result = client
-            .agents_provider_resume(ProviderResumeParams {
-                agent: Some(agent.clone()),
-                provider_session_id: session_id.clone(),
-                cwd,
-            })
-            .await
-            .map(Box::new);
-        let _ = updates.try_send(Update::ProviderSessionResumed {
-            agent,
-            session_id,
-            result,
-        });
-    });
-}
-
 /// Spawn one `agents.authenticate` for an advertised agent-handled method.
 fn spawn_agent_authenticate(
     client: Arc<RpcClient>,
@@ -1448,29 +1301,6 @@ fn spawn_agent_authenticate(
         let _ = updates.try_send(Update::AuthFinished {
             session_id,
             method_id,
-            result,
-        });
-    });
-}
-
-/// Spawn one `agents.provider_delete` for a provider-owned session.
-fn spawn_provider_delete(
-    client: Arc<RpcClient>,
-    updates: Sender<Update>,
-    agent: String,
-    session_id: String,
-) {
-    tokio::spawn(async move {
-        let result = client
-            .agents_provider_delete(ProviderDeleteParams {
-                agent: Some(agent.clone()),
-                provider_session_id: session_id.clone(),
-            })
-            .await
-            .map(|_| ());
-        let _ = updates.try_send(Update::ProviderSessionDeleted {
-            agent,
-            session_id,
             result,
         });
     });

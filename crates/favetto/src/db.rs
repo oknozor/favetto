@@ -1931,6 +1931,31 @@ pub async fn list_agent_sessions(
     Ok(rows.iter().map(row_to_agent_session).collect())
 }
 
+/// List durable sessions belonging to one task, most recently updated first.
+///
+/// The query is backed by `idx_agent_sessions_task_id` and is intentionally
+/// scoped: callers that restore a run's conversation must never enumerate the
+/// global session history.
+pub async fn list_agent_sessions_for_task(
+    pool: &SqlitePool,
+    task_id: &str,
+    limit: i64,
+) -> anyhow::Result<Vec<AgentSessionRecord>> {
+    let rows = sqlx::query(
+        "SELECT id, agent, external_session_id, cwd, task_id, run_id, title, status, error,
+                created_at, updated_at
+         FROM agent_sessions
+         WHERE task_id = ?
+         ORDER BY updated_at DESC, created_at DESC, id ASC
+         LIMIT ?",
+    )
+    .bind(task_id)
+    .bind(limit.max(1))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(row_to_agent_session).collect())
+}
+
 #[allow(dead_code)] // wired into session launch/history by the following steps
 fn row_to_agent_session(row: &SqliteRow) -> AgentSessionRecord {
     AgentSessionRecord {

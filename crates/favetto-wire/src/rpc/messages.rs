@@ -157,6 +157,15 @@ pub struct TasksEventsResult {
     pub commands: Option<Vec<AgentCommand>>,
 }
 
+/// `tasks.session` result: the Favetto-created agent session associated with the
+/// task, or `None` when the task never launched one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TasksSessionResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<AgentSessionHistoryEntry>,
+}
+
 /// `tasks.cancel` result: the cancelled task, with `output` omitted.
 pub type TasksCancelResult = Task;
 
@@ -1002,6 +1011,8 @@ rpc_calls! {
     TasksRunsCall => method::TASKS_RUNS, TaskIdParams, TasksRunsResult;
     /// Typed call for `tasks.events`.
     TasksEventsCall => method::TASKS_EVENTS, TasksEventsParams, TasksEventsResult;
+    /// Typed call for `tasks.session`.
+    TasksSessionCall => method::TASKS_SESSION, TaskIdParams, TasksSessionResult;
     /// Typed call for `tasks.cancel`.
     TasksCancelCall => method::TASKS_CANCEL, TaskIdParams, TasksCancelResult;
     /// Typed call for `tasks.retry`.
@@ -1149,6 +1160,11 @@ pub const CLIENT_CALLS: &[RpcCallSpec] = &[
         method: method::TASKS_EVENTS,
         params_schema: schema_of::<TasksEventsParams>,
         result_schema: schema_of::<TasksEventsResult>,
+    },
+    RpcCallSpec {
+        method: method::TASKS_SESSION,
+        params_schema: schema_of::<TaskIdParams>,
+        result_schema: schema_of::<TasksSessionResult>,
     },
     RpcCallSpec {
         method: method::TASKS_CANCEL,

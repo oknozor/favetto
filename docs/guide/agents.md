@@ -182,10 +182,15 @@ The TUI's **Ctrl+O** picker lists both kinds. A live row attaches; an ended,
 loadable row previews its local id, agent, title, directory and state, then
 loads when selected. Rows that are loading, failed, or cannot be loaded explain
 why and do nothing rather than opening a blank session. The web Settings page
-and the desktop **Settings → Agents → Past sessions** card use the same
-`agents.history` / `agents.load` contract. The desktop card shows the restored
-transcript under a row only after `agents.load` succeeds; while the replay is in
-flight the row reads `loading` and no transcript is shown.
+uses the same `agents.history` / `agents.load` contract.
+
+The desktop client does not enumerate history. Opening a task issues one
+indexed, task-scoped `tasks.session` lookup; a live associated session is
+attached and an ended, loadable one is restored once with `agents.load`. The
+replayed conversation appears in the task detail's Output surface, labelled with
+its Favetto-local id, agent and state, and a finished run stays finished: the
+restore never starts a session, sends a prompt, retries the task or changes its
+status/output.
 
 Restoring is durable across daemon restarts and store reopens. The daemon looks
 up the stored ACP id from its own record, passes it to `session/load`, and keeps
@@ -218,11 +223,11 @@ It deletes the provider transcript only — Favetto's local metadata is a distin
 lifecycle and stays in `agents.history`. Deleting an active provider transcript
 is refused; close its local session first.
 
-The TUI **Ctrl+O** picker and the desktop **Settings → Agents → Past sessions**
-card show both local and provider rows. Provider rows are labelled `provider`;
-they can be resumed when load/resume is advertised and deleted (Ctrl+D in the
-TUI) when delete is advertised. Unsupported actions are absent or disabled with
-an inline explanation.
+The TUI **Ctrl+O** picker shows both local and provider rows. Provider rows are
+labelled `provider`; they can be resumed when load/resume is advertised and
+deleted (Ctrl+D in the TUI) when delete is advertised. Unsupported actions are
+absent or disabled with an inline explanation. The desktop client does not list
+either kind: it restores only the session associated with the task being opened.
 
 Whether a local past session is loadable also depends on the agent advertising
 the ACP `loadSession` capability. An unsupported capability, an agent-reported
@@ -248,9 +253,9 @@ and is never used as one when loading a past session.
   durable record and the agent's own persisted session survive, and the agent
   advertises ACP `loadSession`. A session created entirely outside Favetto is
   not discoverable or importable.
-- The GPUI **Past sessions** card shows a bounded (4,000-character) preview of
-  the restored transcript; open the session from the TUI to read the full
-  replay. A session whose daemon died before it recorded an ACP id remains
-  `loading` and is not loadable.
+- The GPUI task detail shows a bounded (8,000-character) preview of the restored
+  conversation; open the session from the TUI to read the full replay. A session
+  whose daemon died before it recorded an ACP id remains `loading` and is not
+  loadable.
 - The provider catalog (`providers.list`) is empty: ACP agents expose model
   choices through session options rather than a catalog.

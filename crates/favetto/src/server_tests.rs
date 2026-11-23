@@ -1082,6 +1082,125 @@ fn available_agent_config() -> crate::config::FavettoConfig {
 }
 
 #[tokio::test]
+async fn tasks_session_resolves_the_most_recent_record_for_the_task() {
+    let dir = temp_dir("tasks-session");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state_with_config(&dir, &tasks_dir, available_agent_config()).await;
+    let now = Utc::now();
+    let task_id = Uuid::new_v4();
+    let task_id_text = task_id.to_string();
+
+    let mut older =
+        crate::db::AgentSessionRecord::loading("local-older", "opencode", dir.join("work"), now);
+    older.task_id = Some(task_id_text.clone());
+    older.external_session_id = Some("provider-acp-secret".to_string());
+    older.status = crate::db::AgentSessionStatus::Ended;
+    crate::db::insert_agent_session(&state.db, &older)
+        .await
+        .unwrap();
+
+    let mut newer = crate::db::AgentSessionRecord::loading(
+        "local-newer",
+        "opencode",
+        dir.join("work"),
+        now + chrono::Duration::seconds(1),
+    );
+    newer.task_id = Some(task_id_text.clone());
+    newer.external_session_id = Some("provider-acp-newer".to_string());
+    newer.status = crate::db::AgentSessionStatus::Ended;
+    crate::db::insert_agent_session(&state.db, &newer)
+        .await
+        .unwrap();
+
+    let mut unrelated = crate::db::AgentSessionRecord::loading(
+        "local-unrelated",
+        "opencode",
+        dir.join("work"),
+        now + chrono::Duration::seconds(2),
+    );
+    unrelated.task_id = Some(Uuid::new_v4().to_string());
+    crate::db::insert_agent_session(&state.db, &unrelated)
+        .await
+        .unwrap();
+
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 1,
+            method: method::TASKS_SESSION.to_string(),
+            params: serde_json::json!({ "id": task_id }),
+        },
+    )
+    .await;
+    let result = resp.result.expect("tasks.session result");
+    assert_eq!(result["session"]["id"], "local-newer");
+    assert_eq!(result["session"]["task_id"], task_id_text);
+    assert_eq!(result["session"]["state"], "ended");
+    assert_eq!(result["session"]["loadable"], true);
+    assert!(
+        !result.to_string().contains("provider-acp"),
+        "tasks.session must not expose the provider ACP id"
+    );
+
+    let empty = dispatch(
+        &state,
+        Request {
+            id: 2,
+            method: method::TASKS_SESSION.to_string(),
+            params: serde_json::json!({ "id": Uuid::new_v4() }),
+        },
+    )
+    .await;
+    let empty = empty.result.expect("empty tasks.session result");
+    assert!(empty["session"].is_null(), "{empty}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn tasks_session_reuses_history_loadability_derivation() {
+    let dir = temp_dir("tasks-session-unloadable");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state_with_config(&dir, &tasks_dir, available_agent_config()).await;
+    let task_id = Uuid::new_v4();
+
+    let mut unlinked = crate::db::AgentSessionRecord::loading(
+        "local-no-id",
+        "opencode",
+        dir.join("work"),
+        Utc::now(),
+    );
+    unlinked.task_id = Some(task_id.to_string());
+    unlinked.status = crate::db::AgentSessionStatus::Ended;
+    crate::db::insert_agent_session(&state.db, &unlinked)
+        .await
+        .unwrap();
+
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 1,
+            method: method::TASKS_SESSION.to_string(),
+            params: serde_json::json!({ "id": task_id }),
+        },
+    )
+    .await;
+    let result = resp.result.expect("tasks.session result");
+    assert_eq!(result["session"]["id"], "local-no-id");
+    assert_eq!(result["session"]["loadable"], false);
+    assert!(
+        result["session"]["load_error"]
+            .as_str()
+            .is_some_and(|message| message.contains("no ACP session id")),
+        "{result}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn agents_history_lists_persisted_metadata_and_loadability() {
     let dir = temp_dir("agents-history");
     let tasks_dir = dir.join("tasks");

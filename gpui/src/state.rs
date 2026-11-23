@@ -39,7 +39,6 @@ use crate::runtime::{PingSnapshot, Runtime, Update};
 use crate::schedules::{
     self, ScheduleDeleteConfirm, ScheduleEditor, ScheduleField, SchedulesState,
 };
-use crate::sessions::SessionHistory;
 use crate::settings::{SettingsActivate, SettingsFocus, SettingsState};
 use crate::sse::Push;
 use crate::tasks::{self, TaskAction, TaskFilter, TaskList};
@@ -225,8 +224,6 @@ pub struct ClientState {
     derived: RefCell<DerivedSnapshot>,
     /// The configured agent roster (the one-shot picker).
     agents: Vec<AgentCatalogEntry>,
-    /// Durable Favetto-created ACP sessions plus this client's load state.
-    session_history: SessionHistory,
     /// The Catalog surface: entries, filter, preview and the launch sheets.
     catalog: CatalogState,
     /// First-fetch skeleton / error state for the shared task snapshot.
@@ -346,7 +343,6 @@ impl ClientState {
             snapshot_revision: 0,
             derived: RefCell::new(DerivedSnapshot::default()),
             agents: Vec::new(),
-            session_history: SessionHistory::default(),
             catalog: CatalogState::default(),
             snapshot_status: snapshot_status.clone(),
             inbox_selected: None,
@@ -481,6 +477,11 @@ impl ClientState {
                             {
                                 self.load_detail(task.id);
                             }
+                            if attempt_changed {
+                                // A retry owns a fresh agent conversation; resolve
+                                // it again instead of showing the previous one.
+                                self.start_session_restore(task.id);
+                            }
                         }
                         self.refresh_snapshot();
                     }
@@ -554,12 +555,10 @@ impl ClientState {
                 tasks,
                 sessions,
                 agents,
-                history,
             } => {
                 self.tasks = tasks;
                 self.sessions = sessions;
                 self.agents = agents;
-                self.session_history.set_entries(history);
                 self.touch_snapshot();
                 self.snapshot_status = SnapshotStatus::Loaded;
                 // A cancelled turn that has already stopped may never deliver
@@ -768,6 +767,79 @@ impl ClientState {
                     }
                 }
             }
+            Update::TaskSessionLoaded {
+                task_id,
+                request_id,
+                result,
+            } => {
+                // Drop replies for a closed run or a superseded attempt.
+                let current = self
+                    .detail
+                    .as_ref()
+                    .is_some_and(|detail| detail.accepts_restore_reply(task_id, request_id));
+                if !current {
+                    return;
+                }
+                match result {
+                    Ok(result) => match result.session {
+                        None => {
+                            if let Some(detail) = self.detail.as_mut() {
+                                detail.mark_restore_unavailable(
+                                    "No agent conversation is associated with this task."
+                                        .to_string(),
+                                );
+                            }
+                        }
+                        Some(entry) => {
+                            let restorable = matches!(
+                                entry.state,
+                                favetto_wire::model::AgentSessionState::Active
+                                    | favetto_wire::model::AgentSessionState::Loading
+                            ) || (entry.state
+                                == favetto_wire::model::AgentSessionState::Ended
+                                && entry.loadable);
+                            if restorable {
+                                let session_id = entry.id.clone();
+                                if let Some(detail) = self.detail.as_mut() {
+                                    detail.attach_restore(&entry);
+                                }
+                                match &self.runtime {
+                                    Some(runtime) => runtime.load_agent_session(session_id),
+                                    None => {
+                                        if let Some(detail) = self.detail.as_mut() {
+                                            detail.fail_restore(
+                                                "the transport is not running".to_string(),
+                                            );
+                                        }
+                                    }
+                                }
+                            } else {
+                                let reason = entry.load_error.clone().unwrap_or_else(|| {
+                                    "This conversation cannot be restored.".to_string()
+                                });
+                                if let Some(detail) = self.detail.as_mut() {
+                                    if entry.state == favetto_wire::model::AgentSessionState::Failed
+                                    {
+                                        detail.fail_restore(reason);
+                                    } else {
+                                        detail.mark_restore_unavailable(reason);
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    Err(error) => {
+                        if error.is_unauthorized() {
+                            self.connection = ConnectionState::Unauthorized {
+                                token_path: self.config.token_source.label(),
+                            };
+                        }
+                        if let Some(detail) = self.detail.as_mut() {
+                            detail.fail_restore(error.to_string());
+                        }
+                    }
+                }
+            }
             Update::ReplyFinished {
                 request_id,
                 reply,
@@ -960,32 +1032,39 @@ impl ClientState {
                 }
             }
             Update::AgentSessionLoaded { session_id, result } => {
-                match result {
-                    Ok(attached) => {
-                        let label = format!(
-                            "Restored session '{}' and its replay.",
-                            session_id.chars().take(8).collect::<String>()
-                        );
-                        self.session_history.finish_load(&session_id, Ok(*attached));
-                        self.show_toast(ToastKind::Success, label, cx);
-                    }
-                    Err(error) => {
-                        if error.is_unauthorized() {
-                            self.connection = ConnectionState::Unauthorized {
-                                token_path: self.config.token_source.label(),
-                            };
-                        }
-                        self.session_history
-                            .finish_load(&session_id, Err(error.to_string()));
-                        self.show_toast(
-                            ToastKind::Error,
-                            format!("Could not load session '{session_id}': {error}."),
-                            cx,
-                        );
+                // Only the open detail's own attach may change restore state; a
+                // reply for a closed run or a superseded attempt is dropped.
+                let task_id = self
+                    .detail
+                    .as_ref()
+                    .filter(|detail| detail.restore_session.as_deref() == Some(session_id.as_str()))
+                    .map(|detail| detail.task_id);
+                let Some(task_id) = task_id else {
+                    return;
+                };
+                if let Err(error) = &result {
+                    if error.is_unauthorized() {
+                        self.connection = ConnectionState::Unauthorized {
+                            token_path: self.config.token_source.label(),
+                        };
                     }
                 }
-                // The load changes the live roster (`agents.list`) and the
-                // durable lifecycle (`agents.history`); reconcile both.
+                let result = result
+                    .map(|attached| *attached)
+                    .map_err(|error| error.to_string());
+                let reload_events = self
+                    .detail
+                    .as_mut()
+                    .map(|detail| detail.finish_restore(result))
+                    .unwrap_or(false);
+                if reload_events {
+                    // The replayed conversation belongs to a different session
+                    // than the previous feed cursor; backfill it exactly once.
+                    if let Some(runtime) = &self.runtime {
+                        runtime.load_task_events(task_id);
+                    }
+                }
+                // The load changed the live roster (`agents.list`).
                 self.refresh_snapshot();
             }
             Update::AgentOptionsChanged { session_id, result } => match result {
@@ -1059,95 +1138,6 @@ impl ClientState {
                 }
                 let _ = session_id;
                 self.refresh_snapshot();
-            }
-            Update::ProviderSessionsLoaded { provider_sessions } => {
-                self.session_history
-                    .set_provider_snapshot(provider_sessions);
-                self.touch_snapshot();
-            }
-            Update::ProviderSessionResumed {
-                agent,
-                session_id,
-                result,
-            } => {
-                match result {
-                    Ok(attached) => {
-                        let local = attached.session.id.clone();
-                        self.session_history.finish_provider_resume(
-                            &agent,
-                            &session_id,
-                            Ok(*attached),
-                        );
-                        self.show_toast(
-                            ToastKind::Success,
-                            format!(
-                                "Resumed provider session as Favetto session '{}'.",
-                                local.chars().take(8).collect::<String>()
-                            ),
-                            cx,
-                        );
-                    }
-                    Err(error) => {
-                        if error.is_unauthorized() {
-                            self.connection = ConnectionState::Unauthorized {
-                                token_path: self.config.token_source.label(),
-                            };
-                        }
-                        self.session_history.finish_provider_resume(
-                            &agent,
-                            &session_id,
-                            Err(error.to_string()),
-                        );
-                        self.show_toast(
-                            ToastKind::Error,
-                            format!("Could not resume provider session '{session_id}': {error}."),
-                            cx,
-                        );
-                    }
-                }
-                // The import changed both the live roster and the durable
-                // history; the provider row needs a fresh listing too.
-                self.refresh_snapshot();
-                self.refresh_provider_sessions();
-            }
-            Update::ProviderSessionDeleted {
-                agent,
-                session_id,
-                result,
-            } => {
-                match result {
-                    Ok(()) => {
-                        self.session_history
-                            .finish_provider_delete(&agent, &session_id, Ok(()));
-                        self.show_toast(
-                            ToastKind::Success,
-                            "Provider session deleted; Favetto-local metadata is unchanged."
-                                .to_string(),
-                            cx,
-                        );
-                    }
-                    Err(error) => {
-                        if error.is_unauthorized() {
-                            self.connection = ConnectionState::Unauthorized {
-                                token_path: self.config.token_source.label(),
-                            };
-                        }
-                        self.session_history.finish_provider_delete(
-                            &agent,
-                            &session_id,
-                            Err(error.to_string()),
-                        );
-                        self.show_toast(
-                            ToastKind::Error,
-                            format!("Could not delete provider session '{session_id}': {error}."),
-                            cx,
-                        );
-                    }
-                }
-                // Re-list so a successful delete disappears from the provider's
-                // own history rather than being removed optimistically.
-                self.refresh_snapshot();
-                self.refresh_provider_sessions();
             }
             Update::LogoutFinished { session_id, result } => {
                 match result {
@@ -1516,13 +1506,6 @@ impl ClientState {
     pub fn ping(&mut self) {
         if let Some(runtime) = &self.runtime {
             runtime.ping();
-        }
-    }
-
-    /// Ask for a fresh provider-owned history snapshot (Settings card).
-    pub fn refresh_provider_sessions(&mut self) {
-        if let Some(runtime) = &self.runtime {
-            runtime.refresh_provider_sessions();
         }
     }
 
@@ -2540,124 +2523,6 @@ impl ClientState {
         &self.agents
     }
 
-    /// Persisted-session history and this client's load state.
-    pub fn session_history(&self) -> &SessionHistory {
-        &self.session_history
-    }
-
-    /// Request `agents.load` for a persisted session by its Favetto-local id.
-    ///
-    /// The row must still be loadable; an unsupported/failed row is never
-    /// turned into a fresh session. Progress and errors live in
-    /// [`SessionHistory`] and the toast.
-    pub fn load_session(&mut self, id: &str, cx: &mut Context<Self>) {
-        if !self.session_history.begin_load(id) {
-            self.show_toast(
-                ToastKind::Error,
-                "That session cannot be loaded. Only ended, loadable sessions can be restored."
-                    .to_string(),
-                cx,
-            );
-            return;
-        }
-        match &self.runtime {
-            Some(runtime) => runtime.load_agent_session(id.to_string()),
-            None => {
-                self.session_history
-                    .finish_load(id, Err("the transport is not running".to_string()));
-                self.show_toast(
-                    ToastKind::Error,
-                    "The transport is not running, so the session was not loaded.".to_string(),
-                    cx,
-                );
-            }
-        }
-    }
-
-    /// Resume a provider-owned session through `agents.provider_resume`.
-    ///
-    /// The daemon imports it into a Favetto-local record and returns that id;
-    /// only rows whose agent advertises `session/load` or `session/resume` are
-    /// actionable.
-    pub fn resume_provider_session(
-        &mut self,
-        agent: &str,
-        session_id: &str,
-        cwd: Option<std::path::PathBuf>,
-        cx: &mut Context<Self>,
-    ) {
-        if !self
-            .session_history
-            .begin_provider_resume(agent, session_id)
-        {
-            self.show_toast(
-                ToastKind::Error,
-                "That provider session cannot be resumed here.".to_string(),
-                cx,
-            );
-            return;
-        }
-        match &self.runtime {
-            Some(runtime) => {
-                runtime.resume_provider_session(agent.to_string(), session_id.to_string(), cwd)
-            }
-            None => {
-                self.session_history.finish_provider_resume(
-                    agent,
-                    session_id,
-                    Err("the transport is not running".to_string()),
-                );
-                self.show_toast(
-                    ToastKind::Error,
-                    "The transport is not running, so the provider session was not resumed."
-                        .to_string(),
-                    cx,
-                );
-            }
-        }
-    }
-
-    /// Delete a provider-owned session through `agents.provider_delete`.
-    ///
-    /// Only the provider transcript is removed; Favetto's local metadata is a
-    /// separate lifecycle and remains.
-    pub fn delete_provider_session(
-        &mut self,
-        agent: &str,
-        session_id: &str,
-        cx: &mut Context<Self>,
-    ) {
-        if !self
-            .session_history
-            .begin_provider_delete(agent, session_id)
-        {
-            self.show_toast(
-                ToastKind::Error,
-                "That provider session cannot be deleted here.".to_string(),
-                cx,
-            );
-            return;
-        }
-        match &self.runtime {
-            Some(runtime) => {
-                runtime.delete_provider_session(agent.to_string(), session_id.to_string())
-            }
-            None => {
-                self.session_history.finish_provider_delete(
-                    agent,
-                    session_id,
-                    Err("the transport is not running".to_string()),
-                );
-                self.show_toast(
-                    ToastKind::Error,
-                    "The transport is not running, so the provider session was not deleted."
-                        .to_string(),
-                    cx,
-                );
-            }
-        }
-    }
-
     /// Complete an agent-handled ACP sign-in. Only an advertised, daemon-
     /// supported method can reach here; the method id is metadata, not a secret.
     pub fn authenticate(&mut self, session_id: String, method_id: String, cx: &mut Context<Self>) {
@@ -3123,9 +2988,6 @@ impl ClientState {
         } else if route == Route::Settings {
             // The Agents card is the shared roster; a visit catches it up.
             self.refresh_snapshot();
-            // Provider history launches one ACP connection per agent, so it is
-            // refreshed on demand instead of on every inbox push.
-            self.refresh_provider_sessions();
         }
     }
 
@@ -3785,6 +3647,33 @@ impl ClientState {
         self.selected_task = Some(task_id);
         self.detail_open = true;
         self.load_detail(task_id);
+        self.start_session_restore(task_id);
+    }
+
+    /// Resolve and restore the agent conversation associated with one task.
+    ///
+    /// Runs once per open or attempt: a single indexed `tasks.session` read
+    /// followed by at most one `agents.load`. It never starts a session, sends a
+    /// prompt, or changes the task row.
+    fn start_session_restore(&mut self, task_id: uuid::Uuid) {
+        let request_id = self
+            .detail
+            .as_mut()
+            .filter(|detail| detail.task_id == task_id)
+            .map(TaskDetail::begin_restore);
+        let Some(request_id) = request_id else {
+            return;
+        };
+        match &self.runtime {
+            Some(runtime) => runtime.load_task_session(task_id, request_id),
+            None => {
+                if let Some(detail) = self.detail.as_mut() {
+                    if detail.task_id == task_id && detail.restore_request == request_id {
+                        detail.fail_restore("the transport is not running".to_string());
+                    }
+                }
+            }
+        }
     }
 
     /// Fetch every part of one task's detail (initial open, terminal transition
@@ -4064,6 +3953,11 @@ impl ClientState {
     /// metadata and must not be sent to the daemon.
     pub fn detail_live_session_id(&self) -> Option<String> {
         let detail = self.detail.as_ref()?;
+        // A finished run can have a restored, read-only conversation attached;
+        // it must never enable the live interrupt/cancel controls.
+        if detail.status().is_some_and(tasks::is_terminal) {
+            return None;
+        }
         let task_id = detail.task_id.to_string();
         self.sessions
             .iter()

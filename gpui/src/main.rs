@@ -23,7 +23,6 @@ mod routes;
 mod runtime;
 mod schedules;
 mod search;
-mod sessions;
 mod settings;
 mod sse;
 mod state;
