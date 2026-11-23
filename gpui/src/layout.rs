@@ -9,8 +9,7 @@
 use gpui::{px, Pixels};
 
 use crate::theme::{
-    CATALOG_PREVIEW_MAX_WIDTH, CATALOG_PREVIEW_MIN_WIDTH, DETAIL_MAX_WIDTH, DETAIL_MIN_WIDTH,
-    NARROW_BREAKPOINT, RESIZE_HANDLE, SIDEBAR_WIDTH, WORKING_LIST_MIN_WIDTH,
+    CATALOG_PREVIEW_MIN_WIDTH, DETAIL_MIN_WIDTH, NARROW_BREAKPOINT, PANE_MIN_GAP, SIDEBAR_WIDTH,
 };
 
 /// Which layout the current width calls for.
@@ -32,30 +31,29 @@ pub fn container_query(width: Pixels) -> LayoutMode {
     }
 }
 
-/// Clamp a requested detail-column width to the token bounds and to the space
-/// left by the sidebar and a usable working list.
+/// Clamp a requested detail-column width to the viewport.
 ///
-/// The detail column is the rightmost region, so the viewport cap is
-/// `viewport - sidebar - working-list floor - resize handle`. The lower bound
-/// wins if a (narrow) viewport leaves less than `DETAIL_MIN_WIDTH`; the wide
-/// layout never reaches that case, but the helper stays total and testable.
+/// The detail column is the rightmost region, so its cap is
+/// `viewport - sidebar - pane gap`: expanding it collapses the working list to
+/// the grab gap rather than preserving a fixed list floor. The gap keeps the
+/// invisible resize handle (centred on the pane's left border) fully clear of
+/// the navigation rail. The lower bound wins if a (narrow) viewport leaves less
+/// than `DETAIL_MIN_WIDTH`; the wide layout never reaches that case, but the
+/// helper stays total and testable.
 pub fn clamp_detail_width(desired: f32, viewport_width: f32) -> f32 {
-    let viewport_cap = viewport_width - SIDEBAR_WIDTH - WORKING_LIST_MIN_WIDTH - RESIZE_HANDLE;
-    let max = DETAIL_MAX_WIDTH.min(viewport_cap).max(DETAIL_MIN_WIDTH);
+    let viewport_cap = viewport_width - SIDEBAR_WIDTH - PANE_MIN_GAP;
+    let max = viewport_cap.max(DETAIL_MIN_WIDTH);
     desired.clamp(DETAIL_MIN_WIDTH, max)
 }
 
-/// Clamp a requested Catalog source-preview width to the token bounds and to
-/// the space left for the definition list.
+/// Clamp a requested Catalog source-preview width to the space available.
 ///
 /// `available_width` is the Catalog's content region: the window viewport minus
-/// the sidebar and the resize handle. Unlike the detail column there is no
-/// third region to its right, so the list floor is the only competing region.
+/// the sidebar. Unlike the detail column there is no third region to its right,
+/// so the preview may grow until only [`PANE_MIN_GAP`] is left for the
+/// definition list — the same grab gap that keeps its resize handle clear.
 pub fn clamp_catalog_preview_width(desired: f32, available_width: f32) -> f32 {
-    let list_cap = available_width - WORKING_LIST_MIN_WIDTH;
-    let max = CATALOG_PREVIEW_MAX_WIDTH
-        .min(list_cap)
-        .max(CATALOG_PREVIEW_MIN_WIDTH);
+    let max = (available_width - PANE_MIN_GAP).max(CATALOG_PREVIEW_MIN_WIDTH);
     desired.clamp(CATALOG_PREVIEW_MIN_WIDTH, max)
 }
 
@@ -75,8 +73,8 @@ mod tests {
     }
 
     #[test]
-    fn detail_width_clamps_to_the_tokens_and_the_viewport() {
-        use crate::theme::DETAIL_WIDTH;
+    fn detail_width_clamps_to_the_viewport_and_the_grab_gap() {
+        use crate::theme::{DETAIL_WIDTH, RESIZE_HANDLE};
 
         // The default survives on a normal wide window.
         assert_eq!(clamp_detail_width(DETAIL_WIDTH, 1280.0), DETAIL_WIDTH);
@@ -84,27 +82,39 @@ mod tests {
         // The lower token bound wins for a too-small request.
         assert_eq!(clamp_detail_width(1.0, 1280.0), DETAIL_MIN_WIDTH);
 
-        // The upper token bound wins when the viewport has room for it.
-        assert_eq!(clamp_detail_width(10_000.0, 1920.0), DETAIL_MAX_WIDTH);
-
-        // A narrower viewport caps the detail before the token maximum.
+        // There is no fixed ceiling: a wide viewport lets the detail column
+        // grow until only the grab gap is left beside the sidebar.
         assert_eq!(
-            clamp_detail_width(10_000.0, 1280.0),
-            1280.0 - SIDEBAR_WIDTH - WORKING_LIST_MIN_WIDTH - RESIZE_HANDLE
+            clamp_detail_width(10_000.0, 1920.0),
+            1920.0 - SIDEBAR_WIDTH - PANE_MIN_GAP
         );
 
-        // A tiny viewport still leaves the detail readable.
-        assert_eq!(clamp_detail_width(10_000.0, 800.0), DETAIL_MIN_WIDTH);
+        // A narrower viewport caps the detail the same way.
+        assert_eq!(
+            clamp_detail_width(10_000.0, 1280.0),
+            1280.0 - SIDEBAR_WIDTH - PANE_MIN_GAP
+        );
 
-        // At the breakpoint the cap sits between the two token bounds.
-        let at_breakpoint = clamp_detail_width(DETAIL_MAX_WIDTH, NARROW_BREAKPOINT);
-        assert!(at_breakpoint > DETAIL_MIN_WIDTH);
-        assert!(at_breakpoint < DETAIL_MAX_WIDTH);
+        // The gap never drops below the handle's width, so the divider stays
+        // grabbable against the navigation rail.
+        let expanded = clamp_detail_width(10_000.0, 1920.0);
+        let gap = 1920.0 - SIDEBAR_WIDTH - expanded;
+        assert_eq!(gap, PANE_MIN_GAP);
+        assert!(gap >= RESIZE_HANDLE);
+
+        // A tiny viewport still leaves the detail readable.
+        assert_eq!(clamp_detail_width(10_000.0, 400.0), DETAIL_MIN_WIDTH);
+
+        // At the breakpoint the whole content region is available to the pane.
+        assert_eq!(
+            clamp_detail_width(10_000.0, NARROW_BREAKPOINT),
+            NARROW_BREAKPOINT - SIDEBAR_WIDTH - PANE_MIN_GAP
+        );
     }
 
     #[test]
-    fn catalog_preview_width_clamps_to_the_tokens_and_the_list_floor() {
-        use crate::theme::CATALOG_PREVIEW_WIDTH;
+    fn catalog_preview_width_clamps_to_the_available_width_and_the_grab_gap() {
+        use crate::theme::{CATALOG_PREVIEW_WIDTH, RESIZE_HANDLE};
 
         // The default survives on a normal wide window.
         assert_eq!(
@@ -118,23 +128,29 @@ mod tests {
             CATALOG_PREVIEW_MIN_WIDTH
         );
 
-        // The upper token bound wins when the viewport has room for it.
+        // There is no fixed ceiling: the preview grows until only the grab gap
+        // is left for the definition list.
         assert_eq!(
             clamp_catalog_preview_width(10_000.0, 1920.0 - SIDEBAR_WIDTH),
-            CATALOG_PREVIEW_MAX_WIDTH
+            1920.0 - SIDEBAR_WIDTH - PANE_MIN_GAP
         );
 
-        // The definition-list floor caps a moderate viewport before the token
-        // maximum; the Catalog has no third region to reserve.
-        let available = 1120.0 - SIDEBAR_WIDTH;
+        // A narrower content region caps the preview the same way.
+        let available = 1280.0 - SIDEBAR_WIDTH;
         assert_eq!(
             clamp_catalog_preview_width(10_000.0, available),
-            available - WORKING_LIST_MIN_WIDTH
+            available - PANE_MIN_GAP
         );
+
+        // The gap never drops below the handle's width.
+        let expanded = clamp_catalog_preview_width(10_000.0, 1920.0 - SIDEBAR_WIDTH);
+        let gap = 1920.0 - SIDEBAR_WIDTH - expanded;
+        assert_eq!(gap, PANE_MIN_GAP);
+        assert!(gap >= RESIZE_HANDLE);
 
         // A tiny viewport still leaves the preview readable.
         assert_eq!(
-            clamp_catalog_preview_width(10_000.0, 800.0 - SIDEBAR_WIDTH - RESIZE_HANDLE),
+            clamp_catalog_preview_width(10_000.0, 400.0 - SIDEBAR_WIDTH),
             CATALOG_PREVIEW_MIN_WIDTH
         );
     }
