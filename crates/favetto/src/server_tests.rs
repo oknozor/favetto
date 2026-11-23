@@ -2484,10 +2484,14 @@ async fn rpc_state(tag: &str) -> (std::path::PathBuf, Arc<State>, axum::Router) 
 }
 
 fn request_frame(id: u64, method_name: &str) -> Vec<u8> {
+    request_frame_with_params(id, method_name, serde_json::json!({}))
+}
+
+fn request_frame_with_params(id: u64, method_name: &str, params: serde_json::Value) -> Vec<u8> {
     favetto_core::wire::encode(&Frame::Request(Request {
         id,
         method: method_name.to_string(),
-        params: serde_json::json!({}),
+        params,
     }))
     .unwrap()
 }
@@ -2577,6 +2581,107 @@ async fn http_rpc_reports_protocol_errors_inside_the_response() {
             assert!(resp.result.is_none());
             let error = resp.error.expect("an error frame");
             assert_eq!(error.code, error_code::METHOD_NOT_FOUND);
+        }
+        other => panic!("expected a response frame, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The stateful agent/task methods are intercepted by `handle_request` so they
+/// can subscribe a socket/WebSocket connection. HTTP `POST /rpc` has no
+/// connection scope, so they must still dispatch through the shared helpers
+/// instead of falling through to `METHOD_NOT_FOUND`.
+#[tokio::test]
+async fn http_rpc_dispatches_connection_scoped_methods() {
+    let (dir, state, app) = rpc_state("http-rpc-scoped-methods").await;
+    let token = state.token.as_str().to_string();
+
+    // Each entry is (method, params, expected error code). The calls fail
+    // cheaply on missing agents/sessions, but they must be *dispatched*.
+    let cases: Vec<(&str, serde_json::Value, i32)> = vec![
+        (
+            method::AGENTS_START,
+            serde_json::json!({ "agent": "missing" }),
+            error_code::INVALID_PARAMS,
+        ),
+        (
+            method::AGENTS_ATTACH,
+            serde_json::json!({ "session_id": "missing" }),
+            error_code::INTERNAL,
+        ),
+        (
+            method::AGENTS_LOAD,
+            serde_json::json!({ "session_id": "missing" }),
+            error_code::INVALID_PARAMS,
+        ),
+        (
+            method::AGENTS_PROVIDER_RESUME,
+            serde_json::json!({ "agent": "missing", "provider_session_id": "missing" }),
+            error_code::INVALID_PARAMS,
+        ),
+        (
+            method::TASKS_START_ONESHOT,
+            serde_json::json!({}),
+            error_code::INTERNAL,
+        ),
+    ];
+
+    for (index, (name, params, expected)) in cases.into_iter().enumerate() {
+        let body = request_frame_with_params(index as u64, name, params);
+        let (status, _, bytes) = post_rpc(app.clone(), body, Some(&token)).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{name}");
+
+        match favetto_core::wire::decode(&bytes).expect("response frame decodes") {
+            Frame::Response(resp) => {
+                assert_eq!(resp.id, index as u64, "{name}");
+                let error = resp
+                    .error
+                    .unwrap_or_else(|| panic!("{name} should report a domain error"));
+                assert_ne!(
+                    error.code,
+                    error_code::METHOD_NOT_FOUND,
+                    "{name} must be dispatched over HTTP"
+                );
+                assert_eq!(error.code, expected, "{name}: {error:?}");
+            }
+            other => panic!("{name}: expected a response frame, got {other:?}"),
+        }
+    }
+
+    // `agents.close` is idempotent: closing an unknown id still succeeds and
+    // echoes the id back, so it too is dispatched rather than unknown.
+    let body = request_frame_with_params(
+        98,
+        method::AGENTS_CLOSE,
+        serde_json::json!({ "session_id": "missing" }),
+    );
+    let (status, _, bytes) = post_rpc(app.clone(), body, Some(&token)).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    match favetto_core::wire::decode(&bytes).expect("response frame decodes") {
+        Frame::Response(resp) => {
+            assert!(resp.error.is_none(), "{:?}", resp.error);
+            assert_eq!(
+                resp.result.expect("agents.close result")["closed"],
+                serde_json::json!("missing")
+            );
+        }
+        other => panic!("expected a response frame, got {other:?}"),
+    }
+
+    // `events.subscribe` has no replay to stream over a one-shot request, but
+    // it must still acknowledge the subscription.
+    let body = request_frame(99, method::EVENTS_SUBSCRIBE);
+    let (status, _, bytes) = post_rpc(app, body, Some(&token)).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    match favetto_core::wire::decode(&bytes).expect("response frame decodes") {
+        Frame::Response(resp) => {
+            assert_eq!(resp.id, 99);
+            assert!(resp.error.is_none(), "{:?}", resp.error);
+            assert_eq!(
+                resp.result.expect("events.subscribe result")["subscribed"],
+                serde_json::json!(true)
+            );
         }
         other => panic!("expected a response frame, got {other:?}"),
     }

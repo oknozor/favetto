@@ -30,6 +30,7 @@ const POLL: Duration = Duration::from_millis(25);
 struct Daemon {
     root: PathBuf,
     socket: PathBuf,
+    listen: String,
     child: Child,
 }
 
@@ -84,10 +85,12 @@ impl Daemon {
         .unwrap();
 
         let socket = root.join("favetto.sock");
-        let child = spawn_daemon_child(&root, &socket);
+        let listen = format!("127.0.0.1:{}", free_port());
+        let child = spawn_daemon_child(&root, &socket, &listen);
         Self {
             root,
             socket,
+            listen,
             child,
         }
     }
@@ -117,7 +120,7 @@ fn scratch_root(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("favetto-{tag}-{}-{nanos}", std::process::id()))
 }
 
-fn spawn_daemon_child(root: &Path, socket: &Path) -> Child {
+fn spawn_daemon_child(root: &Path, socket: &Path, listen: &str) -> Child {
     let log = std::fs::File::create(root.join("daemon.log")).unwrap();
     Command::new(env!("CARGO_BIN_EXE_favetto"))
         .arg("daemon")
@@ -130,7 +133,7 @@ fn spawn_daemon_child(root: &Path, socket: &Path) -> Child {
         .arg("--socket")
         .arg(socket)
         .arg("--listen")
-        .arg("127.0.0.1:0")
+        .arg(listen)
         .current_dir(root)
         .stdout(Stdio::from(log.try_clone().unwrap()))
         .stderr(Stdio::from(log))
@@ -138,6 +141,13 @@ fn spawn_daemon_child(root: &Path, socket: &Path) -> Child {
         .env_remove("FAVETTO_DATA_DIR")
         .spawn()
         .expect("spawn favetto daemon")
+}
+
+/// A free loopback port. The listener is dropped immediately, so a small race
+/// remains; acceptable for a test.
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
 }
 
 async fn wait_for_socket(path: &Path) {
@@ -150,6 +160,65 @@ async fn wait_for_socket(path: &Path) {
             }
             Err(error) => panic!("daemon socket never became ready: {error}"),
         }
+    }
+}
+
+/// Block until the daemon's HTTP/WebSocket listener accepts connections.
+async fn wait_for_tcp(listen: &str) {
+    let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        match tokio::net::TcpStream::connect(listen).await {
+            Ok(_) => return,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!("daemon HTTP listener {listen} never became ready: {error}"),
+        }
+    }
+}
+
+/// The bearer token the daemon wrote to its data directory.
+fn daemon_token(daemon: &Daemon) -> String {
+    std::fs::read_to_string(daemon.root.join("data/token"))
+        .expect("daemon token")
+        .trim()
+        .to_string()
+}
+
+/// Send one MessagePack `Frame::Request` to `POST /rpc` and decode the response.
+async fn http_rpc(
+    http: &reqwest::Client,
+    listen: &str,
+    token: &str,
+    id: u64,
+    method_name: &str,
+    params: serde_json::Value,
+) -> favetto_core::rpc::Response {
+    let body = favetto_core::wire::encode(&favetto_core::rpc::Frame::Request(
+        favetto_core::rpc::Request {
+            id,
+            method: method_name.to_string(),
+            params,
+        },
+    ))
+    .expect("encode request frame");
+    let response = http
+        .post(format!("http://{listen}/rpc"))
+        .header("content-type", "application/x-msgpack")
+        .bearer_auth(token)
+        .body(body)
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("POST /rpc ({method_name}): {error}"));
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "{method_name}: HTTP status"
+    );
+    let bytes = response.bytes().await.expect("rpc response body");
+    match favetto_core::wire::decode(&bytes).expect("decode response frame") {
+        favetto_core::rpc::Frame::Response(resp) => resp,
+        other => panic!("{method_name}: expected a response frame, got {other:?}"),
     }
 }
 
@@ -370,6 +439,67 @@ async fn provider_resume_imports_a_local_record_and_reuses_it() {
             .slow_request(method::AGENTS_CLOSE, json!({ "session_id": local }))
             .await
             .unwrap(),
+        method::AGENTS_CLOSE,
+    );
+}
+
+/// `agents.provider_resume` used to be connection-scoped only, so HTTP
+/// `POST /rpc` (the GPUI transport) reported `unknown method`. It must import
+/// and attach through the shared helper.
+#[tokio::test]
+async fn http_rpc_can_resume_a_provider_session() {
+    let daemon = Daemon::spawn();
+    wait_for_socket(&daemon.socket).await;
+    wait_for_tcp(&daemon.listen).await;
+    let http = reqwest::Client::new();
+    let token = daemon_token(&daemon);
+    let pool = open_db(&daemon.db_path()).await;
+
+    let resumed = result(
+        http_rpc(
+            &http,
+            &daemon.listen,
+            &token,
+            1,
+            method::AGENTS_PROVIDER_RESUME,
+            json!({
+                "agent": "echo",
+                "provider_session_id": "provider-ses-0",
+                "cwd": daemon.work(),
+            }),
+        )
+        .await,
+        method::AGENTS_PROVIDER_RESUME,
+    );
+    let local = resumed["session"]["id"]
+        .as_str()
+        .expect("local session id")
+        .to_string();
+    assert_ne!(local, "provider-ses-0", "the provider id is not the key");
+    assert_eq!(resumed["session"]["session_id"], "provider-ses-0");
+    assert_eq!(resumed["session"]["load_state"], "ready");
+    assert_eq!(
+        attach_text(&resumed),
+        "provider oneprovider two",
+        "the HTTP resume attaches the provider replay"
+    );
+
+    let row = session_row(&pool, &local)
+        .await
+        .expect("the provider session was imported");
+    assert_eq!(row.1, "echo");
+    assert_eq!(row.2.as_deref(), Some("provider-ses-0"));
+
+    result(
+        http_rpc(
+            &http,
+            &daemon.listen,
+            &token,
+            2,
+            method::AGENTS_CLOSE,
+            json!({ "session_id": local }),
+        )
+        .await,
         method::AGENTS_CLOSE,
     );
 }
