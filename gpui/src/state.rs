@@ -3457,7 +3457,7 @@ impl ClientState {
             TextTarget::SettingsToken => {
                 self.settings.set_focus(Some(SettingsFocus::Token));
             }
-            TextTarget::DetailPrompt => self.start_detail_reply(),
+            TextTarget::DetailPrompt => self.focus_detail_prompt(),
             TextTarget::Elicitation(index) => {
                 if let Some(form) = self
                     .detail
@@ -4251,33 +4251,64 @@ impl ClientState {
             .unwrap_or_default()
     }
 
-    /// Whether the follow-up composer can accept a prompt right now.
+    /// Whether the always-visible follow-up composer can accept a prompt right
+    /// now. A finished run or a run without an attached agent session keeps the
+    /// box on screen but read-only.
+    pub fn detail_prompt_enabled(&self) -> bool {
+        let Some(detail) = self.detail.as_ref() else {
+            return false;
+        };
+        detail.prompt_enabled(self.detail_agent_session_id().is_some())
+    }
+
+    /// Why the follow-up composer is read-only, for its placeholder. `None`
+    /// while the box can accept a prompt.
+    pub fn detail_prompt_disabled_reason(&self) -> Option<&'static str> {
+        let detail = self.detail.as_ref()?;
+        if detail.is_terminal() {
+            Some("This run has finished; it cannot accept a prompt.")
+        } else if self.detail_agent_session_id().is_none() {
+            Some("No live agent session is attached.")
+        } else {
+            None
+        }
+    }
+
+    /// Whether typed text belongs to the follow-up composer. The composer is
+    /// always visible, but it only takes the keyboard once focused (click or
+    /// Tab), so list and shell shortcuts stay live while it is merely shown.
     pub fn detail_prompt_active(&self) -> bool {
-        if !matches!(self.active_route, Route::Inbox | Route::Tasks) {
+        if !matches!(
+            self.active_route,
+            Route::Inbox | Route::Tasks | Route::Workflows
+        ) {
             return false;
         }
         let Some(detail) = self.detail.as_ref() else {
             return false;
         };
-        if detail.tab != DetailTab::Output || detail.is_terminal() {
-            return false;
-        }
-        detail.prompt_open && self.detail_agent_session_id().is_some()
+        detail.tab == DetailTab::Output && detail.prompt_focused && self.detail_prompt_enabled()
     }
 
-    /// Activate the composer and clear any previous error.
-    pub fn start_detail_reply(&mut self) {
+    /// Focus the composer and clear any previous error. Used by a click and by
+    /// Tab landing on the composer's focus handle; a read-only composer never
+    /// takes focus.
+    pub fn focus_detail_prompt(&mut self) {
+        if !self.detail_prompt_enabled() {
+            return;
+        }
         if let Some(detail) = self.detail.as_mut() {
             detail.tab = DetailTab::Output;
-            detail.prompt_open = true;
+            detail.prompt_focused = true;
             detail.prompt_error = None;
         }
     }
 
-    /// Close the composer without sending, returning keyboard focus to the shell.
-    pub fn close_detail_prompt(&mut self) {
+    /// Release the composer, returning keyboard focus to the detail/shell
+    /// without clearing the draft.
+    pub fn blur_detail_prompt(&mut self) {
         if let Some(detail) = self.detail.as_mut() {
-            detail.prompt_open = false;
+            detail.prompt_focused = false;
             detail.prompt_selected = None;
         }
     }

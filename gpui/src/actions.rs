@@ -135,8 +135,6 @@ actions!(
         SettingsSave,
         /// Test the draft connection (`⌘T` / `Ctrl+T`).
         SettingsTest,
-        /// Focus the task detail's follow-up prompt composer (`m`).
-        DetailReply,
         /// Send the follow-up prompt (`↵` inside the composer).
         DetailPromptSend,
         /// Accept the highlighted slash-command completion (Tab).
@@ -540,14 +538,9 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("tab", RepoPickerDown, Some("RepoPicker")),
         KeyBinding::new("shift-tab", RepoPickerUp, Some("RepoPicker")),
         KeyBinding::new("enter", RepoPickerConfirm, Some("RepoPicker")),
-        // Detail follow-up composer. `m` opens it from a detail-capable surface;
-        // the prompt-scoped bindings are registered last so they win over list
-        // navigation and generic Enter while the composer owns the keyboard.
-        KeyBinding::new(
-            "m",
-            DetailReply,
-            Some("Root && !Palette && !Shortcuts && !Search && !Confirm && !Sheet"),
-        ),
+        // Detail follow-up composer. The composer is always visible; the
+        // prompt-scoped bindings are registered last so they win over list
+        // navigation and generic Enter while it owns the keyboard.
         KeyBinding::new(
             "enter",
             DetailPromptSend,
@@ -937,6 +930,44 @@ mod tests {
         let repo_confirm = order.iter().position(|name| name == "RepoPickerConfirm");
         assert!(list_open.is_some() && repo_confirm.is_some());
         assert!(repo_confirm > list_open);
+    }
+
+    #[test]
+    fn the_detail_composer_has_no_open_shortcut() {
+        // `m` used to focus the composer; the box is always visible now, so
+        // neither the binding nor the action may survive.
+        let all = bindings();
+        assert!(
+            !all.iter()
+                .any(|binding| binding.action().name().ends_with("DetailReply")),
+            "DetailReply must be removed"
+        );
+        assert!(
+            !all.iter().any(|binding| binding
+                .keystrokes()
+                .iter()
+                .any(|stroke| stroke.key() == "m")),
+            "no key may open the composer"
+        );
+
+        // The composer's own keys remain scoped to its focused context.
+        for action in [
+            "DetailPromptSend",
+            "DetailPromptComplete",
+            "DetailPromptNext",
+            "DetailPromptPrev",
+        ] {
+            let binding = all
+                .iter()
+                .find(|binding| binding.action().name().ends_with(action))
+                .unwrap_or_else(|| panic!("{action} has no binding"));
+            assert!(
+                binding
+                    .predicate()
+                    .is_some_and(|predicate| predicate.to_string().contains("DetailPrompt")),
+                "{action} must be scoped to the focused composer"
+            );
+        }
     }
 
     #[test]
