@@ -240,8 +240,18 @@ impl SettingsView {
             )
             .into_any_element(),
             ConnectionTest::Running { endpoint } => div()
+                .flex()
+                .items_center()
+                .gap(px(theme.spacing.s1))
                 .text_size(px(theme.font.xs))
                 .text_color(theme.colors.warning)
+                .child(components::animated_icon(
+                    "◐",
+                    true,
+                    theme.colors.warning,
+                    theme.font.xs,
+                    "settings-test",
+                ))
                 .child(format!("Testing {endpoint}…"))
                 .into_any_element(),
             ConnectionTest::Ok {

@@ -665,7 +665,13 @@ fn task_row(
                 .gap(px(2.0))
                 .text_size(px(theme.font.xs))
                 .text_color(color)
-                .child(status.icon())
+                .child(components::animated_icon(
+                    status.icon(),
+                    status == StatusKind::Running,
+                    color,
+                    theme.font.xs,
+                    components::motion_id("task-spinner", row.id),
+                ))
                 .child(status.label()),
         )
         .child(

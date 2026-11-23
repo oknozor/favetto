@@ -12,12 +12,9 @@
 //! collapsed by default because it describes the definition graph, not this
 //! run.
 
-use std::time::Duration;
-
 use gpui::{
-    canvas, div, point, prelude::*, px, Animation, AnimationExt, AnyElement, Context, Div,
-    ElementId, Entity, FocusHandle, Hsla, IntoElement, PathBuilder, Render, ScrollHandle, Stateful,
-    Window,
+    canvas, div, point, prelude::*, px, AnyElement, Context, Div, ElementId, Entity, FocusHandle,
+    Hsla, IntoElement, PathBuilder, Render, ScrollHandle, Stateful, Window,
 };
 
 use crate::components;
@@ -252,7 +249,16 @@ impl WorkflowsView {
                                     .gap(px(2.0))
                                     .text_size(px(theme.font.xs))
                                     .text_color(state_color)
-                                    .child(state_kind.icon())
+                                    .child(components::animated_icon(
+                                        state_kind.icon(),
+                                        state_kind == StatusKind::Running,
+                                        state_color,
+                                        theme.font.xs,
+                                        components::motion_id(
+                                            "workflow-root-spinner",
+                                            root.root_id,
+                                        ),
+                                    ))
                                     .child(state_kind.label()),
                             ),
                     )
@@ -545,7 +551,16 @@ impl WorkflowsView {
                                     .bg(Hsla::from(color).opacity(0.12))
                                     .text_size(px(theme.font.xs))
                                     .text_color(color)
-                                    .child(kind.icon())
+                                    .child(components::animated_icon(
+                                        kind.icon(),
+                                        kind == StatusKind::Running,
+                                        color,
+                                        theme.font.xs,
+                                        components::motion_id(
+                                            "workflow-root-header-spinner",
+                                            detail.root_id,
+                                        ),
+                                    ))
                                     .child(kind.label()),
                             ),
                     )
@@ -984,7 +999,15 @@ impl WorkflowsView {
             Hsla::from(theme.colors.surface)
         };
 
-        let pulse = row.is_active().then(|| pulse_dot(color, task_id));
+        // One signal per meaning: the running glyph turns, while the pulse is
+        // reserved for the attention state that needs an answer.
+        let pulse = (kind == StatusKind::AwaitingInput).then(|| {
+            components::pulse_dot(
+                color,
+                components::motion_id("workflow-node-pulse", task_id),
+                true,
+            )
+        });
 
         div()
             .id(ElementId::Uuid(task_id))
@@ -1033,13 +1056,13 @@ impl WorkflowsView {
                     .gap(px(3.0))
                     .min_w_0()
                     .when_some(pulse, |line, pulse| line.child(pulse))
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_size(px(theme.font.xs))
-                            .text_color(color)
-                            .child(kind.icon()),
-                    )
+                    .child(components::animated_icon(
+                        kind.icon(),
+                        kind == StatusKind::Running,
+                        color,
+                        theme.font.xs,
+                        components::motion_id("workflow-node-spinner", task_id),
+                    ))
                     .child(
                         div()
                             .flex_1()
@@ -1533,33 +1556,6 @@ fn node_chip(theme: &Theme, label: &str) -> Div {
         .text_size(px(theme.font.xs))
         .text_color(theme.colors.muted)
         .child(label.to_string())
-}
-
-/// The pulsing status dot for a live node.
-///
-/// The icon and label already carry the status, so reduced motion removes only
-/// the pulse and keeps a fully readable static dot. The element id is stable per
-/// task id, so a re-render does not restart the phase.
-fn pulse_dot(color: gpui::Rgba, id: uuid::Uuid) -> AnyElement {
-    let dot = div()
-        .w(px(6.0))
-        .h(px(6.0))
-        .flex_shrink_0()
-        .rounded_full()
-        .bg(color);
-    if crate::motion::prefers_reduced_motion() {
-        return dot.into_any_element();
-    }
-    dot.with_animation(
-        (ElementId::Uuid(id), "workflow-node-spin"),
-        Animation::new(Duration::from_millis(1200)).repeat(),
-        |dot, delta| {
-            // A triangle wave: fade down and back up on every repeat.
-            let triangle = 1.0 - (delta * 2.0 - 1.0).abs();
-            dot.opacity(0.3 + 0.7 * triangle)
-        },
-    )
-    .into_any_element()
 }
 
 /// A token-sized progress bar. The fill is `done / total`; an unknown total is

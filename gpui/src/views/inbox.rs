@@ -509,7 +509,13 @@ impl InboxView {
                     .gap(px(2.0))
                     .text_size(px(theme.font.xs))
                     .text_color(color)
-                    .child(row.status.icon())
+                    .child(components::animated_icon(
+                        row.status.icon(),
+                        row.status == StatusKind::Running,
+                        color,
+                        theme.font.xs,
+                        components::motion_id("inbox-spinner", task_id),
+                    ))
                     .child(row.status.label()),
             )
             .child(

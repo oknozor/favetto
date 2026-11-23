@@ -198,7 +198,13 @@ impl DetailView {
         self.sync_follow(self.output_scroll.clone(), cx);
     }
 
-    fn follow_toggle(&self, theme: &Theme, follow: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn follow_toggle(
+        &self,
+        theme: &Theme,
+        follow: bool,
+        live: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         components::with_focus(
             div()
                 .id("detail-follow")
@@ -222,7 +228,22 @@ impl DetailView {
                 })
                 .cursor_pointer()
                 .track_focus(&self.follow_focus)
-                .child(if follow { "◉" } else { "○" })
+                .child(if follow {
+                    components::pulse_glyph(
+                        "◉",
+                        theme.colors.accent,
+                        theme.font.xs,
+                        "detail-follow-pulse",
+                        live,
+                    )
+                } else {
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(theme.font.xs))
+                        .text_color(theme.colors.muted)
+                        .child("○")
+                        .into_any_element()
+                })
                 .child(if follow { "Following" } else { "Follow tail" })
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     let follow = this.state.read(cx).detail_follow();
@@ -448,7 +469,13 @@ impl DetailView {
                             .bg(Hsla::from(color).opacity(0.12))
                             .text_size(px(theme.font.xs))
                             .text_color(color)
-                            .child(status.icon())
+                            .child(components::animated_icon(
+                                status.icon(),
+                                status == StatusKind::Running,
+                                color,
+                                theme.font.xs,
+                                components::motion_id("detail-header-spinner", task.id),
+                            ))
                             .child(status.label()),
                     )
                     .child(
@@ -793,6 +820,7 @@ impl DetailView {
         tab: DetailTab,
         new_events: u64,
         follow: bool,
+        live: bool,
         cx: &mut Context<Self>,
     ) -> Div {
         let mut bar = div()
@@ -857,7 +885,7 @@ impl DetailView {
         }
 
         bar.child(div().flex_1())
-            .child(self.follow_toggle(theme, follow, cx))
+            .child(self.follow_toggle(theme, follow, live, cx))
     }
 
     /// The pinned ACP sign-in banner. The daemon performs the flow; the client
@@ -2490,7 +2518,14 @@ impl Render for DetailView {
         let elicitation_modal = elicitation
             .as_ref()
             .map(|form| self.elicitation_modal(theme, form, cx));
-        let tabs = self.tabs(theme, tab, new_events, follow, cx);
+        let tabs = self.tabs(
+            theme,
+            tab,
+            new_events,
+            follow,
+            !tasks::is_terminal(task.status),
+            cx,
+        );
         let current_attempt = task.attempt;
 
         let body = match tab {
@@ -2980,6 +3015,7 @@ fn feed_item(theme: &Theme, base: &TextStyle, index: usize, row: &FeedRow) -> Di
                     .child(content.placeholder()),
             ),
         FeedItem::Tool {
+            id,
             name,
             input,
             status,
@@ -3011,12 +3047,13 @@ fn feed_item(theme: &Theme, base: &TextStyle, index: usize, row: &FeedRow) -> Di
                         .flex()
                         .items_center()
                         .gap(px(theme.spacing.s1))
-                        .child(
-                            div()
-                                .text_size(px(theme.font.xs))
-                                .text_color(color)
-                                .child(status.icon()),
-                        )
+                        .child(components::animated_icon(
+                            status.icon(),
+                            *status == ToolStatus::Running,
+                            color,
+                            theme.font.xs,
+                            components::motion_id("tool-spinner", id),
+                        ))
                         .child(
                             div()
                                 .flex_1()
@@ -3251,7 +3288,13 @@ fn run_row(theme: &Theme, run: &TaskRun, current_attempt: u32, now: chrono::Date
                         .items_center()
                         .gap(px(2.0))
                         .text_color(color)
-                        .child(status.icon())
+                        .child(components::animated_icon(
+                            status.icon(),
+                            status == StatusKind::Running,
+                            color,
+                            theme.font.xs,
+                            components::motion_id("run-spinner", run.id),
+                        ))
                         .child(detail::run_status_label(run.status)),
                 )
                 .child(
