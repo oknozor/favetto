@@ -1,4 +1,4 @@
-//! The task detail surface: a pinned header, three tabs and the permission
+//! The task detail surface: a pinned header, two tabs and the permission
 //! banner (docs/design/gpui-client.md §1, §2, §5 step 06).
 //!
 //! This is the client's core surface, so it follows three rules:
@@ -20,8 +20,8 @@ use std::time::Duration;
 use chrono::Utc;
 use favetto_wire::model::{
     AgentAuthState, AgentAuthStatus, AgentCommand, AgentPlanEntry, AgentPlanStatus, AgentUsage,
-    ContentRole, InputReply, MessageRole, SessionConfigKind, SessionConfigOption,
-    SessionConfigValue, SessionModes, Task, TaskRun,
+    ContentRole, InputReply, MessageRole, RunSummary, SessionConfigKind, SessionConfigOption,
+    SessionConfigValue, SessionModes, Task, TaskRun, TaskStatus,
 };
 use gpui::{
     div, list, prelude::*, px, AnyElement, Context, Div, ElementId, Entity, FocusHandle, FontStyle,
@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use crate::components;
 use crate::detail::{
-    self, DetailTab, FeedItem, OutputText, PendingRequest, TaskDetail, ToolStatus,
+    self, DetailTab, FeedItem, OutputSource, OutputText, PendingRequest, TaskDetail, ToolStatus,
 };
 use crate::elicitation::ElicitationStage;
 use crate::inbox::{self, StatusKind};
@@ -72,9 +72,9 @@ pub struct DetailView {
     output_scroll: ScrollHandle,
     /// Virtualized feed state: only the visible window is measured/painted.
     events_list: ListState,
-    /// The grouped feed, rebuilt only when the event revision changes.
+    /// The grouped feed, rebuilt only when its source revision changes.
     events_feed: Rc<Vec<FeedRow>>,
-    events_feed_key: Option<(Uuid, u64)>,
+    events_feed_key: Option<(Uuid, u8, u64)>,
     /// Parsed Markdown for the message/reasoning rows, keyed by content and
     /// kept across feed revisions until a row disappears.
     markdown: markdown::MarkdownCache,
@@ -82,6 +82,11 @@ pub struct DetailView {
     /// The content length at the last tail scroll, so auto-follow only reacts to
     /// growth (and never fights a deliberate scroll).
     output_rendered: usize,
+    /// Whether the merged output tab shows the plain raw transcript instead of
+    /// the structured log.
+    raw_output_open: bool,
+    raw_output_task: Option<Uuid>,
+    raw_output_focus: FocusHandle,
 }
 
 impl DetailView {
@@ -130,6 +135,9 @@ impl DetailView {
             markdown: markdown::MarkdownCache::default(),
             markdown_task: None,
             output_rendered: 0,
+            raw_output_open: false,
+            raw_output_task: None,
+            raw_output_focus: cx.focus_handle().tab_index(69).tab_stop(true),
         };
         view.start_clock(cx);
         view
@@ -230,6 +238,45 @@ impl DetailView {
                         this.events_list.reset(this.events_list.item_count());
                         this.output_rendered = 0;
                     }
+                })),
+            theme,
+        )
+    }
+
+    /// Toggle the merged output tab between the structured log and the plain
+    /// persisted transcript. The raw text is only rendered on demand, never
+    /// duplicated underneath the feed.
+    fn output_mode_toggle(
+        &self,
+        theme: &Theme,
+        raw_open: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        components::with_focus(
+            div()
+                .id("detail-output-mode")
+                .flex()
+                .items_center()
+                .gap(px(theme.spacing.s1))
+                .px(px(theme.spacing.s2))
+                .py(px(theme.spacing.s1))
+                .rounded(px(theme.radii.r4))
+                .border_1()
+                .border_color(theme.colors.border)
+                .text_size(px(theme.font.xs))
+                .text_color(theme.colors.muted)
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.colors.bg))
+                .track_focus(&self.raw_output_focus)
+                .child(if raw_open { "▤" } else { "≡" })
+                .child(if raw_open {
+                    "Structured log"
+                } else {
+                    "Raw output"
+                })
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.raw_output_open = !raw_open;
+                    cx.notify();
                 })),
             theme,
         )
@@ -761,7 +808,7 @@ impl DetailView {
         for (index, candidate) in DetailTab::ALL.iter().enumerate() {
             let selected = *candidate == tab;
             let candidate = *candidate;
-            let badge = (candidate == DetailTab::Events && new_events > 0).then(|| {
+            let badge = (candidate == DetailTab::Output && new_events > 0).then(|| {
                 div()
                     .flex()
                     .items_center()
@@ -1358,6 +1405,188 @@ impl DetailView {
             )
     }
 
+    /// The merged output tab: choose the live feed, the durable run summary, or
+    /// the plain persisted transcript, and keep the raw transcript one click
+    /// away whenever a structured log is available.
+    fn merged_output_body(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let (
+            task_id,
+            status,
+            terminal,
+            live_present,
+            output,
+            task_loading,
+            task_error,
+            events_loading,
+            events_loaded,
+            events_error,
+            session,
+            ignored,
+            events_revision,
+            plan,
+            commands,
+            prompt,
+            prompt_selected,
+            prompt_open,
+            prompt_sending,
+            prompt_error,
+            summary,
+        ) = {
+            let state = self.state.read(cx);
+            let detail = state.detail();
+            let task = detail.and_then(|detail| detail.task.as_ref());
+            (
+                detail.map(|detail| detail.task_id),
+                detail
+                    .and_then(TaskDetail::status)
+                    .unwrap_or(TaskStatus::Pending),
+                detail.is_some_and(TaskDetail::is_terminal),
+                detail.is_some_and(|detail| !detail.events.is_empty() || !detail.plan().is_empty()),
+                detail.and_then(TaskDetail::output),
+                detail.is_some_and(|detail| detail.task_loading && detail.task.is_none()),
+                detail.and_then(|detail| detail.task_error.clone()),
+                detail.is_some_and(|detail| detail.events_loading),
+                detail.is_some_and(|detail| detail.events_loaded),
+                detail.and_then(|detail| detail.events_error.clone()),
+                detail.and_then(|detail| detail.events_session.clone()),
+                detail.map(|detail| detail.events_ignored).unwrap_or(0),
+                detail.map(|detail| detail.events_revision).unwrap_or(0),
+                state.detail_plan(),
+                state.detail_commands(),
+                detail
+                    .map(|detail| detail.prompt.clone())
+                    .unwrap_or_default(),
+                detail.and_then(|detail| detail.prompt_selected),
+                detail.is_some_and(|detail| detail.prompt_open),
+                detail.is_some_and(|detail| detail.prompt_sending),
+                detail.and_then(|detail| detail.prompt_error.clone()),
+                task.and_then(|task| task.output.as_ref())
+                    .and_then(detail::extract_run_summary),
+            )
+        };
+        let Some(task_id) = task_id else {
+            return div().into_any_element();
+        };
+        let source = detail::output_source(status, live_present, summary.is_some());
+        let raw_available = output.is_some();
+        if self.raw_output_open && !raw_available {
+            // A retried attempt starts without a persisted blob; don't reopen
+            // the raw view automatically when the next run finishes.
+            self.raw_output_open = false;
+        }
+        let raw_open = self.raw_output_open && source != OutputSource::Plain && raw_available;
+
+        if raw_open {
+            let mut column = div().flex().flex_col().flex_1().min_h_0();
+            column = column.child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .px(px(theme.spacing.s3))
+                    .pt(px(theme.spacing.s2))
+                    .child(self.output_mode_toggle(theme, true, cx)),
+            );
+            if let Some(message) = task_error.as_deref() {
+                column = column.child(
+                    div()
+                        .px(px(theme.spacing.s3))
+                        .pt(px(theme.spacing.s2))
+                        .child(self.error_banner(theme, message, cx)),
+                );
+            }
+            if let Some(output) = output {
+                column =
+                    column.child(self.output_body(theme, Some(output), false, None, terminal, cx));
+            }
+            return column.into_any_element();
+        }
+
+        if source == OutputSource::Plain {
+            if output.is_none() {
+                if task_loading || (events_loading && !events_loaded) {
+                    return self.loading(theme, "OUTPUT").into_any_element();
+                }
+                if let Some(message) = events_error {
+                    return self
+                        .error_body(
+                            theme,
+                            ErrorBody {
+                                label: "OUTPUT",
+                                title: "The output log could not load",
+                                message: &message,
+                                focus: &self.events_retry_focus,
+                                copy_focus: &self.error_copy_focus,
+                            },
+                            |this, cx| {
+                                this.state.update(cx, |state, cx| {
+                                    state.retry_detail_events();
+                                    cx.notify();
+                                });
+                            },
+                            cx,
+                        )
+                        .into_any_element();
+                }
+                if let Some(message) = task_error {
+                    return self
+                        .error_body(
+                            theme,
+                            ErrorBody {
+                                label: "OUTPUT",
+                                title: "The run output could not load",
+                                message: &message,
+                                focus: &self.output_retry_focus,
+                                copy_focus: &self.error_copy_focus,
+                            },
+                            |this, cx| {
+                                this.state.update(cx, |state, cx| {
+                                    state.retry_detail_task();
+                                    cx.notify();
+                                });
+                            },
+                            cx,
+                        )
+                        .into_any_element();
+                }
+            }
+            return self
+                .output_body(theme, output, false, task_error, terminal, cx)
+                .into_any_element();
+        }
+
+        let revision = match source {
+            OutputSource::Live => events_revision,
+            OutputSource::Summary => summary.as_ref().map(summary_revision).unwrap_or(0),
+            OutputSource::Plain => 0,
+        };
+        let feed = self.feed_for(task_id, source, revision, summary.as_ref(), cx);
+        let events_error = (source == OutputSource::Live)
+            .then_some(events_error)
+            .flatten();
+        self.events_body(
+            theme,
+            EventsBody {
+                feed,
+                loading: events_loading,
+                loaded: events_loaded,
+                error: events_error,
+                task_error,
+                session,
+                ignored,
+                plan,
+                commands,
+                prompt,
+                prompt_selected,
+                prompt_open,
+                prompt_sending,
+                prompt_error,
+                raw_available,
+            },
+            cx,
+        )
+        .into_any_element()
+    }
+
     fn output_body(
         &mut self,
         theme: &Theme,
@@ -1403,9 +1632,9 @@ impl DetailView {
                 "OUTPUT",
                 title,
                 if terminal {
-                    "The daemon has no output blob for this run. The Events and Runs tabs keep the structured record."
+                    "The daemon has no output blob for this run. The Runs tab keeps the attempt record."
                 } else {
-                    "The daemon persists output when the run produces it. Follow the Events tab while it runs."
+                    "The daemon persists output when the run produces it. Live events appear here while it runs."
                 },
             )
             .into_any_element();
@@ -1474,18 +1703,29 @@ impl DetailView {
     fn feed_for(
         &mut self,
         task_id: Uuid,
+        source: OutputSource,
         revision: u64,
+        summary: Option<&RunSummary>,
         cx: &mut Context<Self>,
     ) -> Rc<Vec<FeedRow>> {
-        let key = (task_id, revision);
+        let source_key = match source {
+            OutputSource::Live => 0,
+            OutputSource::Summary => 1,
+            OutputSource::Plain => 2,
+        };
+        let key = (task_id, source_key, revision);
         if self.events_feed_key != Some(key) {
-            let feed = {
-                let state = self.state.read(cx);
-                state
-                    .detail()
-                    .filter(|detail| detail.task_id == task_id)
-                    .map(TaskDetail::feed)
-                    .unwrap_or_default()
+            let feed = match source {
+                OutputSource::Live => {
+                    let state = self.state.read(cx);
+                    state
+                        .detail()
+                        .filter(|detail| detail.task_id == task_id)
+                        .map(TaskDetail::feed)
+                        .unwrap_or_default()
+                }
+                OutputSource::Summary => summary.map(detail::summary_feed).unwrap_or_default(),
+                OutputSource::Plain => Vec::new(),
             };
 
             if self.markdown_task != Some(task_id) {
@@ -1528,6 +1768,7 @@ impl DetailView {
             loading,
             loaded,
             error: events_error,
+            task_error,
             session,
             ignored,
             plan,
@@ -1537,17 +1778,18 @@ impl DetailView {
             prompt_open,
             prompt_sending,
             prompt_error,
+            raw_available,
         } = data;
         let has_plan = !plan.is_empty();
         if loading && feed.is_empty() && !loaded && !has_plan && !prompt_open {
-            return self.loading(theme, "EVENTS");
+            return self.loading(theme, "OUTPUT");
         }
         if feed.is_empty() && events_error.is_some() && !has_plan && !prompt_open {
             return self.error_body(
                 theme,
                 ErrorBody {
-                    label: "EVENTS",
-                    title: "The event feed could not load",
+                    label: "OUTPUT",
+                    title: "The output log could not load",
                     message: events_error.as_deref().unwrap_or_default(),
                     focus: &self.events_retry_focus,
                     copy_focus: &self.error_copy_focus,
@@ -1566,8 +1808,8 @@ impl DetailView {
                 return self.empty_body(
                     theme,
                     "≋",
-                    "EVENTS",
-                    "Events from a newer daemon",
+                    "OUTPUT",
+                    "Output from a newer daemon",
                     &format!(
                         "{ignored} event{} used a kind this client does not render yet. Upgrade the client to see them.",
                         if ignored == 1 { "" } else { "s" }
@@ -1576,16 +1818,16 @@ impl DetailView {
             }
             let (title, body) = if session.is_some() {
                 (
-                    "No events yet",
+                    "No structured output yet",
                     "The session is attached but has not reported a structured event yet. Live events land here as they arrive.",
                 )
             } else {
                 (
-                    "No structured feed",
-                    "This session does not report structured events (a PTY-backed agent). The Output tab is its durable view.",
+                    "No structured log",
+                    "This run does not report structured events (a PTY-backed agent). Its persisted output appears here when available.",
                 )
             };
-            return self.empty_body(theme, "≋", "EVENTS", title, body);
+            return self.empty_body(theme, "≋", "OUTPUT", title, body);
         }
 
         let new_events = self.state.read(cx).detail_new_events();
@@ -1654,10 +1896,26 @@ impl DetailView {
                 cx,
             )
         });
+        let raw_toggle = raw_available.then(|| {
+            div()
+                .flex()
+                .justify_end()
+                .px(px(theme.spacing.s3))
+                .pt(px(theme.spacing.s2))
+                .child(self.output_mode_toggle(theme, false, cx))
+        });
 
         let mut container = div().relative().flex_1().min_h_0().flex().flex_col();
         if let Some(plan) = plan_card {
             container = container.child(plan);
+        }
+        if let Some(message) = task_error {
+            container = container.child(
+                div()
+                    .px(px(theme.spacing.s3))
+                    .pt(px(theme.spacing.s2))
+                    .child(self.error_banner(theme, &message, cx)),
+            );
         }
         if let Some(message) = events_error {
             container = container.child(
@@ -1666,6 +1924,9 @@ impl DetailView {
                     .pt(px(theme.spacing.s2))
                     .child(self.error_banner(theme, &message, cx)),
             );
+        }
+        if let Some(toggle) = raw_toggle {
+            container = container.child(toggle);
         }
         if ignored > 0 {
             container = container.child(
@@ -1694,7 +1955,7 @@ impl DetailView {
             .when_some(composer, |container, composer| container.child(composer))
     }
 
-    /// A compact plan card above the Events feed.
+    /// A compact plan card above the output feed.
     fn plan_card(&self, theme: &Theme, plan: &[AgentPlanEntry]) -> Div {
         const MAX_PLAN_ROWS: usize = 12;
         let completed = plan
@@ -1976,12 +2237,13 @@ struct ErrorBody<'a> {
     copy_focus: &'a FocusHandle,
 }
 
-/// Everything the Events tab body needs, extracted from the state in one go.
+/// Everything the merged output feed needs, extracted from the state in one go.
 struct EventsBody {
     feed: Rc<Vec<FeedRow>>,
     loading: bool,
     loaded: bool,
     error: Option<String>,
+    task_error: Option<String>,
     session: Option<String>,
     ignored: usize,
     plan: Vec<AgentPlanEntry>,
@@ -1991,6 +2253,7 @@ struct EventsBody {
     prompt_open: bool,
     prompt_sending: bool,
     prompt_error: Option<String>,
+    raw_available: bool,
 }
 
 /// The follow-up composer's view data.
@@ -2006,6 +2269,17 @@ struct PromptBody<'a> {
 struct FeedRow {
     item: FeedItem,
     body: Option<Rc<MarkdownDoc>>,
+}
+
+/// A stable fingerprint for a durable summary, so the grouped feed is rebuilt
+/// only when the persisted log actually changes.
+fn summary_revision(summary: &RunSummary) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(summary)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Everything the Runs tab body needs, extracted from the state in one go.
@@ -2048,10 +2322,15 @@ impl Render for DetailView {
                     "◎",
                     "RUN",
                     "No run selected",
-                    "Open a run in the list to see its status, agent and attempt here. Output, Events and Runs stay one tab away.",
+                    "Open a run in the list to see its status, agent and attempt here. Its output and attempt history stay one tab away.",
                     "Open a row to inspect it",
                 ));
         };
+
+        if self.raw_output_task != Some(task.id) {
+            self.raw_output_task = Some(task.id);
+            self.raw_output_open = false;
+        }
 
         let header = self.header(
             theme,
@@ -2092,77 +2371,7 @@ impl Render for DetailView {
         let current_attempt = task.attempt;
 
         let body = match tab {
-            DetailTab::Output => {
-                let (output, loading, error, terminal) = {
-                    let state = self.state.read(cx);
-                    let detail = state.detail();
-                    (
-                        detail.and_then(TaskDetail::output),
-                        detail.is_some_and(|detail| detail.task_loading && detail.task.is_none()),
-                        detail.and_then(|detail| detail.task_error.clone()),
-                        detail.is_some_and(TaskDetail::is_terminal),
-                    )
-                };
-                self.output_body(theme, output, loading, error, terminal, cx)
-            }
-            DetailTab::Events => {
-                let (
-                    revision,
-                    loading,
-                    loaded,
-                    error,
-                    session,
-                    ignored,
-                    plan,
-                    commands,
-                    prompt,
-                    prompt_selected,
-                    prompt_open,
-                    prompt_sending,
-                    prompt_error,
-                ) = {
-                    let state = self.state.read(cx);
-                    let detail = state.detail();
-                    (
-                        detail.map(|detail| detail.events_revision).unwrap_or(0),
-                        detail.is_some_and(|detail| detail.events_loading),
-                        detail.is_some_and(|detail| detail.events_loaded),
-                        detail.and_then(|detail| detail.events_error.clone()),
-                        detail.and_then(|detail| detail.events_session.clone()),
-                        detail.map(|detail| detail.events_ignored).unwrap_or(0),
-                        state.detail_plan(),
-                        state.detail_commands(),
-                        detail
-                            .map(|detail| detail.prompt.clone())
-                            .unwrap_or_default(),
-                        detail.and_then(|detail| detail.prompt_selected),
-                        detail.is_some_and(|detail| detail.prompt_open),
-                        detail.is_some_and(|detail| detail.prompt_sending),
-                        detail.and_then(|detail| detail.prompt_error.clone()),
-                    )
-                };
-                let feed = self.feed_for(task.id, revision, cx);
-                self.events_body(
-                    theme,
-                    EventsBody {
-                        feed,
-                        loading,
-                        loaded,
-                        error,
-                        session,
-                        ignored,
-                        plan,
-                        commands,
-                        prompt,
-                        prompt_selected,
-                        prompt_open,
-                        prompt_sending,
-                        prompt_error,
-                    },
-                    cx,
-                )
-                .into_any_element()
-            }
+            DetailTab::Output => self.merged_output_body(theme, cx),
             DetailTab::Runs => {
                 let (runs, loading, loaded, error) = {
                     let state = self.state.read(cx);

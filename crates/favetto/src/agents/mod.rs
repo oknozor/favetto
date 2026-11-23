@@ -1583,6 +1583,10 @@ fn spawn_state_task(
                 let mut live = session.live.lock();
                 live.apply(&event);
             }
+            // Fold the same event into the durable run log. This lives in the
+            // session state task (not the bounded feed) so a long run keeps its
+            // complete text, reasoning, tool calls and usage.
+            session.handles.outcome.lock().summary.apply_event(&event);
             match &event {
                 AgentStateEvent::InputRequested { request } => {
                     *session.awaiting_input.lock() = Some(AwaitingInputReason {

@@ -50,7 +50,7 @@ At the time of the run `repos.list` reported active repo `favetto`, while
 | Inbox load | Inbox showed **86 Needs you** rows (recent failures), with the sidebar badge matching. |
 | List tasks | `g t` opened Tasks and loaded **500 shown of 500**; filter counts were All 500 / Running 1 / Awaiting input 0 / Failed 99 / Succeeded 397 at capture time. |
 | Open a task | `Enter` (and a row click) opened the highlighted `gpui/11-verify` run. The pinned header showed status `running`, `repo favetto`, `agent opencode`, `attempt 1`, elapsed time and the live session id. |
-| Switch tabs | Output → Events → Runs all rendered. Output showed its explicit "No output yet" state; Events rendered the structured feed (including tool-use rows); Runs showed attempt 1 as running. |
+| Switch tabs | Output → Runs both rendered. Output showed the merged live/durable feed (including tool-use rows, or its explicit "No structured output yet" state); Runs showed attempt 1 as running. |
 | Catalog preview | `g c` (and the command palette) opened Catalog with **73 definitions** grouped by repo. The selected `repo:bookman/fx_pr_conflict` preview rendered its raw Markdown source. No launch sheet was submitted. |
 | Settings | `Ctrl+,` opened Settings. **Test connection** (`Ctrl+T`) reported `✓ http://127.0.0.1:7878 answered in 1 ms · cwd /home/okno`. Agents listed claude/opencode/pi/vibe as available. |
 
@@ -83,8 +83,10 @@ added to the repository.
 4. In Inbox: `↑`/`↓` moves the highlight; `Enter` or a row click opens the run.
 5. On Tasks: `↑`/`↓`, Home/End and PageUp/PageDown move the list; `[`/`]` cycle
    the filters; `/` focuses search; `Enter` opens the run. Do not press `c`/`r`.
-6. In the open detail: switch Output/Events/Runs; the header stays pinned and
-   Follow stays on unless the viewport is scrolled away from the tail.
+6. In the open detail: switch Output/Runs; the header stays pinned and Follow
+   stays on unless the viewport is scrolled away from the tail. On a terminal
+   run, confirm the durable log renders and the **Raw output** disclosure
+   toggles to the persisted transcript.
 7. On Catalog: `/` searches, `↑`/`↓` changes the definition, `h` collapses a
    folder, and the preview pane shows the selected Markdown. Do not submit the
    launch sheet.
@@ -112,7 +114,7 @@ These are framework or current-scope limits, not regressions from this pass:
   (`src/views/settings.rs`).
 - **No container queries.** The responsive breakpoint reads the window width
   (`src/layout.rs`, `src/theme.rs`).
-- **Workflows roots/buckets are not virtualized.** Tasks and the detail Events
+- **Workflows roots/buckets are not virtualized.** Tasks and the detail Output
   feed are; this is unchanged from step 10 (`gpui/README.md`).
 - **No live permission-banner pass in this smoke run.** The live daemon had no
   `awaiting_input` run at the time (Failed 99, Awaiting input 0). The banner and
@@ -127,7 +129,8 @@ These are framework or current-scope limits, not regressions from this pass:
    (`src/state.rs::reply_to_pending`, `src/views/detail.rs::banner`).
 2. **Revisit list virtualization for Workflows/Schedules** if those surfaces
    routinely exceed the 500-row snapshot; the same lazy-window approach used by
-   Tasks and Events applies (`src/views/tasks.rs`, `src/views/detail.rs`).
+   Tasks and the detail Output feed applies (`src/views/tasks.rs`,
+   `src/views/detail.rs`).
 3. **Keep this check repeatable.** The commands and the disposable-daemon setup
    above assume a live local daemon; a future verification step could wrap the
    stop/restart portion in a script under `gpui/` without changing the client.

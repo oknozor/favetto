@@ -96,7 +96,7 @@ pub enum Command {
     LoadTaskDetail { task_id: Uuid },
     /// Fetch only the detail's persisted output (the Output tab's Retry).
     LoadTask { task_id: Uuid },
-    /// Re-run the structured-event backfill (the Events tab's Retry).
+    /// Re-run the structured-event backfill (the output tab's Retry).
     LoadTaskEvents { task_id: Uuid },
     /// Re-fetch the attempt table (the Runs tab's Retry).
     LoadTaskRuns { task_id: Uuid },

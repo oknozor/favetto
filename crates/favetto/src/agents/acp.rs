@@ -64,7 +64,7 @@ use favetto_core::model::{
     AgentAuthMethod, AgentAuthMethodKind, AgentAuthState, AgentAuthStatus, AgentCommand,
     AgentLoadState, AgentPlanEntry, AgentPlanPriority, AgentPlanStatus, AgentStateEvent,
     AwaitingInputKind, ContentRole, InputReply, InputRequest, MessageContent, MessageRole,
-    PermissionPolicy, SessionConfigChoice, SessionConfigChoices, SessionConfigGroup,
+    PermissionPolicy, RunSummary, SessionConfigChoice, SessionConfigChoices, SessionConfigGroup,
     SessionConfigKind, SessionConfigOption, SessionConfigValue, SessionMode, SessionModes,
     ToolCallDetail, ToolCallStatus, ToolContent, ToolKind, ToolLocation,
 };
@@ -466,6 +466,11 @@ pub struct AcpOutcome {
     pub assistant_text: String,
     pub tool_calls: usize,
     pub failed_tools: usize,
+    /// Durable structured log folded from every normalized event. Unlike the
+    /// bounded live feed this keeps the whole run (text, reasoning, tools,
+    /// usage, outcome and error), so a finished task can render it after a
+    /// reload or daemon restart.
+    pub summary: RunSummary,
 }
 
 impl AcpOutcome {

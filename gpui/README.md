@@ -82,24 +82,31 @@ The Inbox grouping and the filtered Tasks list are memoized on the snapshot
 revision plus the search/filter, and handed to the views as `Rc` values, so a
 render never clones or re-sorts the 500-row snapshot. The Tasks table is a
 `uniform_list`: only the visible row window is measured and painted. The
-detail's Events tab uses GPUI's variable-height `list` with the same lazy
+detail's Output tab uses GPUI's variable-height `list` with the same lazy
 window, and the live feed is capped at 2,000 retained frames.
 
 Opening a run (Enter or a row click) fills the detail column. The header stays
 pinned while the tab body scrolls:
 
-- **Output** shows the persisted `tasks.get` blob as plain monospace text, with
-  a notice when the daemon truncated it. **Copy output** (and **copy** beside
-  the session id) is the clipboard path, because this GPUI build has no text
-  selection primitive.
-- **Events** backfills `tasks.events` (up to 2000 events) and appends live
-  `agent.event` pushes in `seq` order. Consecutive text/reasoning deltas become
-  one block, tool start/finish events merge into one card, usage and errors keep
-  their own rows. Unknown event kinds are skipped and counted, never fatal.
-  Agent messages and reasoning render as Markdown — headings, lists, tables and
-  fenced code with language highlighting — and links open `http(s)` targets in
-  the browser. Parsing is cached per feed revision, so completed blocks are not
-  re-parsed on every delta.
+- **Output** is one merged view. While the run is non-terminal it backfills
+  `tasks.events` (up to 2000 events) and appends live `agent.event` pushes in
+  `seq` order. Once the task is terminal it switches to the structured
+  `RunSummary` persisted in `task.output`, so the same log survives a reload or
+  daemon restart; a cached live feed stays visible until that summary decodes.
+  A run without structured events falls back to the plain persisted transcript,
+  with a notice when the daemon truncated it, and a **Raw output** disclosure
+  keeps that transcript one click away when a structured log exists. **Copy
+  output** (and **copy** beside the session id) is the clipboard path, because
+  this GPUI build has no text selection primitive.
+- Live and durable rows share one model: consecutive text/reasoning deltas
+  become one block, tool start/finish events merge into one card, usage and
+  errors keep their own rows, and a durable summary renders as
+  session → message → reasoning → tools → usage → error → run boundary.
+  Unknown event kinds are skipped and counted, never fatal. Agent messages and
+  reasoning render as Markdown — headings, lists, tables and fenced code with
+  language highlighting — and links open `http(s)` targets in the browser.
+  Parsing is cached per feed revision, so completed blocks are not re-parsed on
+  every delta.
 - **Runs** is the `tasks.runs` attempt table: attempt, status, exit code,
   duration and usage.
 
@@ -117,9 +124,9 @@ be answered in the agent's terminal instead of guessing.
 **Follow tail** (in the tab bar) keeps the viewport at the newest content. A
 wheel/trackpad scroll toward the top pauses it; when live events arrive while
 pinned off the tail, the tab count and a **new events** pill appear. Clicking
-the pill (or re-enabling Follow) jumps back to live. Empty Output/Events/Runs
-states and per-tab Retry buttons are explicit; a failed read never hides an
-older feed.
+the pill (or re-enabling Follow) jumps back to live. Empty Output/Runs states
+and per-tab Retry buttons are explicit; a failed read never hides an older
+feed.
 
 The Catalog loads one `catalog.list` on connect and whenever the daemon pushes
 `catalog.updated`. Definitions are grouped by repo namespace (`repo:<name>`),
@@ -300,7 +307,7 @@ field blank keeps the shared token file.
   copy-error action and shortcut rows shared by the shell and route views. The
   focus helper enforces the 32 px minimum target.
 - `src/views/` — one entity per route plus the contextual detail view. Tasks
-  and the detail Events tab are virtualized.
+  and the detail Output feed are virtualized.
 
 ## Development
 
@@ -614,9 +621,10 @@ text/icon changes, and no message is conveyed by motion alone.
   longer re-groups or clones the 500-row snapshot.
 - The Tasks table is a `uniform_list` (38 px rows); only the visible range is
   measured and painted, and keyboard selection reveals the row.
-- The detail Events tab is GPUI's variable-height `list`, rebuilt only when the
-  event revision changes. A paused reader keeps their logical position; a
-  following reader stays at the tail.
+- The detail Output feed is GPUI's variable-height `list`, rebuilt only when the
+  selected source (live events or durable summary) or its revision changes. A
+  paused reader keeps their logical position; a following reader stays at the
+  tail.
 - The live feed is capped at `MAX_RETAINED_EVENTS = 2_000`; the oldest frames
   are trimmed first, so the newest permission/error frames survive.
 
@@ -682,7 +690,8 @@ path remains covered by the step-05 live RPC check and its unit tests.
 - **No container queries.** The responsive breakpoint reads the window width.
 - **The Workflows root and bucket lists are not virtualized.** They are derived
   from the same 500-row snapshot; the first 500 roots are still painted. The
-  Tasks and Events lists, which are the long scroll surfaces, are virtualized.
+  Tasks table and the detail Output feed, which are the long scroll surfaces,
+  are virtualized.
 - **The toast fade is the only animation.** If a future surface adds motion, it
   must call `motion::prefers_reduced_motion()` and preserve the final-state
   information.
