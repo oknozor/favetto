@@ -90,6 +90,10 @@ ignored. Only `main` receives version bumps (`branch_whitelist = ["main"]` in
   - `crates/favetto-tui` — the dependency-light terminal client binary.
   - `crates/favetto-mcp` — the stdio MCP supervisor server for the workflow plane.
   - `crates/favetto` — the daemon binary and doc generator.
+- `gpui/` — the native GPUI desktop client. It is a standalone cargo workspace,
+  excluded from the root workspace (`exclude = ["gpui"]`), with its own
+  `cargo fmt`/`clippy`/`test` gates. The supported clients are the TUI and GPUI
+  desktop app.
 - Rust edition 2021, `rust-version = 1.94`, workspace resolver `2`.
 - Tests are inline `#[cfg(test)]` modules next to the code they cover, often
   using `#[tokio::test]`; add cases there.

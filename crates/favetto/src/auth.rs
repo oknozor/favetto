@@ -1,7 +1,7 @@
 //! Username/password login (`POST /auth/login`).
 //!
-//! A remote client that cannot run `favetto pair` on the daemon host (a phone,
-//! a browser) can exchange a username and password for the same bearer
+//! A remote client that cannot run `favetto pair` on the daemon host (another
+//! machine) can exchange a username and password for the same bearer
 //! [`Token`](favetto_core::auth::Token) the pairing flow returns. Passwords are
 //! verified with argon2id in constant time ([`favetto_core::auth`]) and failed
 //! attempts are throttled per `(username, client)`.

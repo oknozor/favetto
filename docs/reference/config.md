@@ -16,8 +16,7 @@ Every section is optional; favetto falls back to built-in defaults for anything 
 | `git` | GitSettings | `{}` | no | Non-interactive git provisioning for agent processes. Defaults to `signing = "off"`, which forces `commit.gpgsign = false` so an agent commit can never block on an interactive pinentry/askpass prompt. |
 | `webhook` | WebhookSettings | `{"github":{"enabled":false,"rules":[]}}` | no | Webhook trigger rules (currently GitHub). |
 | `tui` | TuiSettings | `{"sound":{"enabled":true,"player":"auto","min_interval_ms":400,"only_when_unfocused":false,"events":{"attention":"none","awaiting_input":"attention","task_failed":"failure","task_finished":"success","task_started":"none"}},"theme":"opencode","theme_mode":"system","show_header":true,"show_footer":true}` | no | Client-side TUI settings. Ignored by the daemon, which reads the same file. |
-| `web` | WebSettings | `{"enabled":true,"dir":"","heartbeat_secs":15}` | no | Web client (embedded SPA) settings. |
-| `auth` | AuthSettings | `{"ticket_ttl_secs":30,"login_rate_limit":5,"login_window_secs":300,"require_tls":false}` | no | Short-lived authentication ticket settings. |
+| `auth` | AuthSettings | `{"login_rate_limit":5,"login_window_secs":300,"require_tls":false}` | no | Authentication settings for the username/password login policy. |
 
 ## AgentSettings
 
@@ -306,35 +305,16 @@ defaults. Sounds are played on the machine running `favetto tui`.
 | `only_when_unfocused` | boolean | `false` | no | Only play while the terminal is unfocused (best-effort focus reporting). |
 | `events` | Map<String, string> | `{"attention":"none","awaiting_input":"attention","task_failed":"failure","task_finished":"success","task_started":"none"}` | no | Cue key -> sound spec (`success`/`failure`/`attention`/`started`/`bell`, a `.wav` path, or `none`). Unset keys use the built-in default. |
 
-## WebSettings
-
-Web client (embedded SPA) settings.
-
-`dir` overrides the assets embedded in the binary with a directory on disk
-(development); leave it empty to serve the embedded assets. `heartbeat_secs`
-is the interval of the SSE keep-alive comments that defeat idle proxy
-timeouts.
-
-| Field | Type | Default | Required | Description |
-|-------|------|---------|----------|-------------|
-| `enabled` | boolean | `true` | no | Serve the embedded web client from the daemon. |
-| `dir` | string | `` | no | Asset directory override; empty serves the embedded assets. |
-| `heartbeat_secs` | integer | `15` | no | SSE keep-alive interval, in seconds. |
-
 ## AuthSettings
 
-Authentication settings: short-lived tickets for header-less clients
-(browser WebSocket/SSE auth) plus the username/password login policy.
+Authentication settings: the username/password login policy.
 
-A ticket is minted over authenticated HTTP and then presented in a query
-string, where an `Authorization` header cannot go. Login attempts are
-rate-limited per `(username, client)`; `require_tls` rejects non-loopback
-logins that did not arrive over HTTPS (directly or via a proxy that sets
-`X-Forwarded-Proto: https`).
+Login attempts are rate-limited per `(username, client)`; `require_tls`
+rejects non-loopback logins that did not arrive over HTTPS (directly or via
+a proxy that sets `X-Forwarded-Proto: https`).
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `ticket_ttl_secs` | integer | `30` | no | Ticket lifetime, in seconds. |
 | `login_rate_limit` | integer | `5` | no | Failed `POST /auth/login` attempts allowed per `(username, client)` in `login_window_secs` before the client is locked out (0 disables the limit). |
 | `login_window_secs` | integer | `300` | no | Window, in seconds, over which `login_rate_limit` failures accumulate. |
 | `require_tls` | boolean | `false` | no | Reject non-loopback logins that did not arrive over HTTPS. |

@@ -181,8 +181,7 @@ interchangeable:
 The TUI's **Ctrl+O** picker lists both kinds. A live row attaches; an ended,
 loadable row previews its local id, agent, title, directory and state, then
 loads when selected. Rows that are loading, failed, or cannot be loaded explain
-why and do nothing rather than opening a blank session. The web Settings page
-uses the same `agents.history` / `agents.load` contract.
+why and do nothing rather than opening a blank session.
 
 The desktop client does not enumerate history. Opening a task issues one
 indexed, task-scoped `tasks.session` lookup; a live associated session is

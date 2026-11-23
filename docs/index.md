@@ -23,7 +23,7 @@ features:
   - title: Agents as workers
     details: favetto orchestrates; the coding loop is an external agent CLI embedded as a live PTY session that can be attached, reattached, and keystroke-driven from the TUI.
   - title: Remote-TUI-first
-    details: The TUI client and the daemon are decoupled over a single wire protocol; local attach is just a special case of remote attach.
+    details: The TUI and the native GPUI desktop client are decoupled from the daemon over a single wire protocol; local attach is just a special case of remote attach.
   - title: Declarative tasks
     details: Each task is a Markdown file with a TOML header and a prompt body, chainable with schedules, dependencies, and spawned children.
   - title: Crash-resilient
@@ -74,7 +74,7 @@ step.
   [Embedded agents](/guide/agents),
   [Schedules & dependencies](/guide/schedules-and-dependencies),
   [Webhooks](/guide/webhooks), [Remote access](/guide/remote-access),
-  [Web & Android client](/guide/web-client), [TUI](/guide/tui).
+  [TUI](/guide/tui), [GPUI desktop client](/guide/desktop-client).
 - **Reference** — [CLI](/reference/cli), [Configuration](/reference/config),
   [Task file format](/reference/tasks), [Event kinds](/reference/events),
   [Environment](/reference/environment), [Remote API](/reference/remote-api),

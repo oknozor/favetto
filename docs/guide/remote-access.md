@@ -1,8 +1,10 @@
 # Remote access
 
-The daemon and the TUI speak the same wire protocol over either a Unix socket or
-a token-authenticated WebSocket, so "remote" is just a transport choice. This
-page covers attaching from another machine.
+The daemon, the TUI and the GPUI desktop client speak the same wire protocol over
+either a Unix socket or a token-authenticated WebSocket, so "remote" is just a
+transport choice. This page covers attaching the TUI from another machine; the
+desktop client uses the same HTTP/SSE endpoint (see the
+[GPUI desktop client](./desktop-client) page).
 
 ## Token attach
 
@@ -56,8 +58,8 @@ scheme to `https://` and strips the `/rpc` path for the one-off
 
 ## Username & password login
 
-Copying the token works for a trusted machine, but a phone or browser cannot run
-a command on the daemon host. Create an account there once:
+Copying the token works for a trusted machine, but a client on another machine
+cannot run a command on the daemon host. Create an account there once:
 
 ```bash
 favetto user add alice
@@ -85,9 +87,6 @@ arrive over HTTPS (directly or via a proxy that sets `X-Forwarded-Proto:
 https`). If no user exists yet, the daemon refuses remote logins and tells the
 client to run `favetto user add`.
 
-The web/Android client uses the same endpoint: its `/pair` screen signs in with
-username + password, with the pairing code behind a toggle.
-
 ## Pairing
 
 Copying the token is fine for a trusted machine. For a one-off session, ask the
@@ -112,9 +111,8 @@ from `<data_dir>/token` or `--token-file`); the client calls
 `POST /pair/exchange` with the code to obtain the token. Use `--token-file` when
 the token lives somewhere other than the default.
 
-A `?pair=CODE` web deep link still works, and the whole pairing flow remains the
-local/one-off option; username + password login is the self-service path for a
-fresh device.
+The whole pairing flow remains the local/one-off option; username + password
+login is the self-service path for a fresh device.
 
 ## Rotate the token
 

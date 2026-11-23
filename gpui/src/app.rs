@@ -1968,8 +1968,8 @@ impl RootView {
             .child(panel)
     }
 
-    /// The searchable repository switcher, modelled on the TUI Ctrl+P picker
-    /// and the web switcher. The global row is always first; unavailable
+    /// The searchable repository switcher, modelled on the TUI Ctrl+P picker.
+    /// The global row is always first; unavailable
     /// checkouts stay visible but inert and marked `(missing)`.
     fn repo_overlay(
         &self,

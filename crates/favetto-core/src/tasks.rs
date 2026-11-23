@@ -595,8 +595,7 @@ pub fn split_repo(name: &str) -> Option<(&str, &str)> {
 /// Used by the TUI (and any `favetto-core` consumer) so the storage-only repo
 /// namespace does not leak into listings. Bare/global names and malformed
 /// prefixes (`repo:`, `repo:noslash`, `repo:/rel`, `repo:name/`) are returned
-/// unchanged. The web client links only `favetto-wire` and keeps an identical
-/// mirror in `web/src/state.rs::task_display_name`.
+/// unchanged.
 pub fn display_name(name: &str) -> &str {
     match split_repo(name) {
         Some((_, rel)) => rel,

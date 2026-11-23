@@ -24,7 +24,7 @@ and continue to use the existing MessagePack RPC.
 4. Route agent permission requests through Favetto's policy and user interface.
 5. Keep MessagePack as the client-to-daemon transport while evolving its API
    freely in coordinated changes.
-6. Keep the agent runtime independent of whether the connected UI is Dioxus,
+6. Keep the agent runtime independent of whether the connected UI is the TUI,
    GPUI, or another Favetto client.
 7. Use one generic ACP implementation and command configuration to unlock the
    broader ACP agent ecosystem, rather than implementing a Favetto adapter for
@@ -162,8 +162,8 @@ For ACP pushes:
    persistence; live ACP events remain live session state unless explicitly
    persisted.
 
-The wire API remains the boundary between UI and daemon. A GPUI frontend should
-consume the same API as Dioxus and must not need ACP-specific process logic.
+The wire API remains the boundary between UI and daemon. The TUI and GPUI
+frontends consume the same API and must not need ACP-specific process logic.
 
 ---
 
@@ -297,8 +297,8 @@ servers pass end-to-end session tests.
 - Add structured prompt/cancel/permission RPC operations.
 - Forward ACP events over the existing authenticated event channel and support
   reconnect/backfill.
-- Update Dioxus to render ACP conversation and tool state and to return
-  permission decisions.
+- Update the TUI and GPUI clients to render ACP conversation and tool state and
+  to return permission decisions.
 - Keep any temporary PTY bridge isolated behind a migration flag; do not expose
   PTY-specific controls as part of the target client API.
 - Add the same contract tests for any GPUI client; do not add ACP handling to
@@ -389,7 +389,7 @@ workflows use ACP, and PTY-specific runtime and API code is removed.
 5. **Headless execution:** model a prompt turn as task execution, not process
    lifetime. An ACP server may remain alive after a turn finishes.
 6. **Pre-alpha API changes:** backward compatibility is not a requirement.
-   Update the daemon, Dioxus/GPUI clients, and tests in coordinated changes;
+   Update the daemon, TUI/GPUI clients, and tests in coordinated changes;
    remove obsolete PTY methods and event shapes rather than retaining shims.
 7. **Zed native agent:** using ACP does not make Zed's built-in agent available.
    Running or extracting Zed's `NativeAgent` would be a separate project with
@@ -434,7 +434,7 @@ The cutover is complete in the daemon:
   `agents.input`/`agents.resize`; `agent.output` (base64 terminal frames) is
   gone. Clients render `agent.event` and `agents.attach` returns the transcript.
 - **Clients.** The TUI renders structured events into its agent panel and sends
-  composed prompts on Enter; the web client uses the new typed calls.
+  composed prompts on Enter; the GPUI client uses the new typed calls.
 
 Per-task model selection is implemented through ACP's `session/set_config_option`
 (the agent's model selector), so a task's `provider`/`model` is applied

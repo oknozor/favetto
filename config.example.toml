@@ -91,21 +91,10 @@ vacuum = true      # reclaim disk space after a prune
 # known = [{ path = "~/code/favetto" }]
 # known = [{ path = "/srv/web", name = "web" }]
 
-# Web client (embedded SPA) served by the daemon. `dir` overrides the assets
-# embedded in the binary with a directory on disk for development; leave it empty
-# in normal operation. `heartbeat_secs` is the SSE keep-alive interval.
-[web]
-enabled = true        # serve the embedded web client (default true)
-dir = ""              # empty = embedded assets; a path = serve from disk (dev)
-heartbeat_secs = 15   # SSE keep-alive interval, in seconds
-
-# Authentication: short-lived, single-use tickets for header-less clients
-# (browser WebSocket/SSE auth), plus the username/password login policy.
-# The ticket is minted over authenticated HTTP, then presented in a query string
-# where an Authorization header cannot go. User accounts are managed with
+# Authentication: username/password login policy for remote clients that cannot
+# run `favetto pair` on the daemon host. User accounts are managed with
 # `favetto user add|passwd|list|remove` and stored (hashed) in SQLite.
 [auth]
-ticket_ttl_secs = 30     # ticket lifetime, in seconds
 login_rate_limit = 5     # failed logins per (username, client) before lockout (0 = unlimited)
 login_window_secs = 300  # window over which login failures accumulate
 require_tls = false      # reject non-loopback logins that did not arrive over HTTPS

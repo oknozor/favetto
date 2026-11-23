@@ -1,13 +1,15 @@
 # favetto
 
 A long-running, LLM-driven agent orchestrator with a **remote-TUI-first** design.
+Two clients are supported: the terminal UI (`crates/favetto-tui`) and the native
+GPUI desktop app (`gpui/`).
 It schedules and runs declarative tasks by delegating to external coding agents
 over the **Agent Client Protocol (ACP)** — the orchestrator never implements its
 own agent loop, and there are no per-vendor adapters.
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
-│                  TUI Client (ratatui)                         │
+│         TUI (ratatui) · GPUI desktop client                   │
 │   local attach  ─► unix:///tmp/favetto.sock                   │
 │   remote attach ─► ws://host:7878/rpc?token=…                 │
 │   (same MessagePack wire protocol over both)                  │
@@ -87,7 +89,7 @@ The published site is the manual:
 | [Event kinds](https://oknozor.github.io/favetto/reference/events) | Every event on the bus, generated from the enum. |
 | [Remote API](https://oknozor.github.io/favetto/reference/remote-api) | Methods, pushes, and error codes, generated from the RPC constants. |
 | [Architecture](https://oknozor.github.io/favetto/reference/architecture) | Design and milestones. |
-| [Web & Android client](https://oknozor.github.io/favetto/guide/web-client) | Using, developing, and packaging the Dioxus web/Android client. |
+| [GPUI desktop client](https://oknozor.github.io/favetto/guide/desktop-client) | Building, running, and pointing the native desktop client at a daemon. |
 
 The [annotated `config.example.toml`](config.example.toml) is the canonical
 starting configuration.
@@ -102,7 +104,7 @@ crates/
   favetto-tui/           dependency-light terminal client binary
   favetto-mcp/           MCP supervisor server (stdio)
   favetto/               daemon binary + doc generator
-web/                     Dioxus client (web SPA + Android app), standalone workspace
+gpui/                    GPUI desktop client, standalone workspace
 tasks/                   task catalog: `*.md` files with TOML header + prompt
 skills/                  portable agent skills (e.g. favetto-task-authoring)
 docs/                    VitePress site (guide + generated reference)

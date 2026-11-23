@@ -21,7 +21,6 @@ use crate::metrics::Metrics;
 use crate::pair::PairStore;
 use crate::repos::KnownRepo;
 use crate::tasks::TaskDef;
-use crate::ticket::TicketStore;
 use crate::webhooks::WebhookSecrets;
 
 /// Everything the daemon owns that connections and background tasks need access to.
@@ -54,8 +53,6 @@ pub struct State {
     pub pair: PairStore,
     /// Per-`(username, client)` failed-login throttling for `POST /auth/login`.
     pub login_limiter: LoginLimiter,
-    /// Short-lived, single-use tickets for header-less WebSocket upgrades.
-    pub tickets: TicketStore,
     /// Live hook list (mutable so the TUI can add notification hooks).
     pub hook_store: Arc<RwLock<Vec<Hook>>>,
     /// Cached provider/model catalogs, keyed by agent name (fetched lazily).
@@ -93,7 +90,6 @@ pub struct StateInit {
 
 impl State {
     pub fn new(init: StateInit) -> Self {
-        let tickets = TicketStore::new(init.config.auth.ticket_ttl_secs);
         let login_limiter = LoginLimiter::new(
             init.config.auth.login_rate_limit,
             init.config.auth.login_window_secs,
@@ -120,7 +116,6 @@ impl State {
             scheduler: init.scheduler,
             pair: PairStore::new(),
             login_limiter,
-            tickets,
             hook_store: init.hook_store,
             metrics: Metrics::default(),
             repos: Arc::new(RwLock::new(Vec::new())),

@@ -116,6 +116,7 @@ fn docs_pages_cover_the_manual() {
         "docs/guide/parallel-worktrees.md",
         "docs/guide/git-signing.md",
         "docs/guide/remote-access.md",
+        "docs/guide/desktop-client.md",
         "docs/guide/configuration.md",
         "docs/guide/tui.md",
         "docs/guide/troubleshooting.md",
@@ -249,7 +250,7 @@ fn generated_schema_lists_every_section() {
         .and_then(|v| v.as_object())
         .expect("schema must have top-level properties");
     for section in [
-        "agent", "agents", "auth", "daemon", "executor", "git", "repos", "webhook", "web", "tui",
+        "agent", "agents", "auth", "daemon", "executor", "git", "repos", "webhook", "tui",
     ] {
         assert!(
             properties.contains_key(section),

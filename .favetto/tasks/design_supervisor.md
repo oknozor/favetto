@@ -18,7 +18,7 @@ spawn_new_root = true
 [[vars]]
 name = "design"
 prompt = "Design document to implement (docs/design/)"
-choices = ["acp-migration.md", "durable-workflow-orchestration.md", "panic-safety.md", "web-client.md"]
+choices = ["acp-migration.md", "durable-workflow-orchestration.md", "panic-safety.md", "gpui-client.md"]
 required = true
 
 [[vars]]
@@ -118,11 +118,11 @@ first) as a JSON array, highest priority first:
 ```json
 [
   {
-    "key": "web-client-wire-crate",
-    "title": "Extract favetto-wire and make favetto-core wasm-safe",
+    "key": "example-wire-crate",
+    "title": "Extract the shared wire crate",
     "summary": "One-line intent.",
     "files": ["crates/favetto-core/src/lib.rs", "crates/favetto-wire/"],
-    "acceptance": "wasm32-unknown-unknown build passes; existing tests green",
+    "acceptance": "workspace build passes; existing tests green",
     "depends_on": [],
     "autonomous": true
   }
