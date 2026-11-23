@@ -2286,6 +2286,7 @@ mod tests {
             config_options: Vec::new(),
             modes: None,
             auth: None,
+            mcp: None,
         };
         let pending = detail
             .pending_request(std::slice::from_ref(&session))
@@ -2521,6 +2522,7 @@ mod tests {
                 config_options: Vec::new(),
                 modes: None,
                 auth: None,
+                mcp: None,
             },
             data: base64::Engine::encode(
                 &base64::engine::general_purpose::STANDARD,
