@@ -229,34 +229,12 @@ async fn handle_request(
     // `agents.start` spawns the PTY and immediately attaches, returning the current
     // full-screen frame so the client starts in sync.
     if req.method == method::AGENTS_START {
-        let resp = match parse_params::<StartAgentParams>(&req.method, &req.params) {
-            Ok(params) => match start_agent(state, params).await {
-                Ok(session) => match state.agents.attach(&session.id) {
-                    Ok(AttachedAgent {
-                        session,
-                        data,
-                        seq,
-                        plan,
-                        commands,
-                    }) => {
-                        subscribed.lock().insert(session.id.clone());
-                        Response::ok(
-                            id,
-                            encode(AgentAttachResult {
-                                session,
-                                data: base64::engine::general_purpose::STANDARD.encode(&data),
-                                seq,
-                                plan,
-                                commands,
-                            }),
-                        )
-                    }
-                    Err(e) => Response::error(id, RpcError::Internal(e.to_string())),
-                },
-                Err(e) => Response::error(id, RpcError::InvalidParams(e.to_string())),
-            },
-            Err(error) => Response::error(id, error),
-        };
+        let resp = respond_to(&req, |params: StartAgentParams| async move {
+            let result = start_agent_attached(state, params).await?;
+            subscribed.lock().insert(result.session.id.clone());
+            Ok(result)
+        })
+        .await;
         let _ = out_tx.send(Frame::Response(resp)).await;
         return;
     }
@@ -264,47 +242,24 @@ async fn handle_request(
     // `tasks.start_oneshot` creates an inline task and opens its interactive
     // session; subscribe this connection so the Agent panel receives its frames.
     if req.method == method::TASKS_START_ONESHOT {
-        let resp = match parse_params::<StartOneshotParams>(&req.method, &req.params) {
-            Ok(params) => match start_oneshot_task(state, params).await {
-                Ok(result) => {
-                    subscribed.lock().insert(result.session.id.clone());
-                    Response::ok(id, encode(result))
-                }
-                Err(e) => Response::error(id, RpcError::Internal(e.to_string())),
-            },
-            Err(error) => Response::error(id, error),
-        };
+        let resp = respond_to(&req, |params: StartOneshotParams| async move {
+            let result = start_oneshot(state, params).await?;
+            subscribed.lock().insert(result.session.id.clone());
+            Ok(result)
+        })
+        .await;
         let _ = out_tx.send(Frame::Response(resp)).await;
         return;
     }
 
     // `agents.attach` subscribes this connection; `agents.close` unsubscribes.
     if req.method == method::AGENTS_ATTACH {
-        let resp = match parse_params::<SessionIdParams>(&req.method, &req.params) {
-            Ok(p) => match state.agents.attach(&p.session_id) {
-                Ok(AttachedAgent {
-                    session,
-                    data,
-                    seq,
-                    plan,
-                    commands,
-                }) => {
-                    subscribed.lock().insert(p.session_id);
-                    Response::ok(
-                        id,
-                        encode(AgentAttachResult {
-                            session,
-                            data: base64::engine::general_purpose::STANDARD.encode(&data),
-                            seq,
-                            plan,
-                            commands,
-                        }),
-                    )
-                }
-                Err(e) => Response::error(id, RpcError::Internal(e.to_string())),
-            },
-            Err(error) => Response::error(id, error),
-        };
+        let resp = respond_to(&req, |p: SessionIdParams| async move {
+            let result = attach_agent(state, &p.session_id)?;
+            subscribed.lock().insert(result.session.id.clone());
+            Ok(result)
+        })
+        .await;
         let _ = out_tx.send(Frame::Response(resp)).await;
         return;
     }
@@ -314,34 +269,12 @@ async fn handle_request(
     // never accepted here, and a failed restore is reported instead of opening
     // a fresh session.
     if req.method == method::AGENTS_LOAD {
-        let resp = match parse_params::<AgentLoadParams>(&req.method, &req.params) {
-            Ok(p) => match load_agent(state, &p.session_id, None).await {
-                Ok(session) => match state.agents.attach(&session.id) {
-                    Ok(AttachedAgent {
-                        session,
-                        data,
-                        seq,
-                        plan,
-                        commands,
-                    }) => {
-                        subscribed.lock().insert(session.id.clone());
-                        Response::ok(
-                            id,
-                            encode(AgentAttachResult {
-                                session,
-                                data: base64::engine::general_purpose::STANDARD.encode(&data),
-                                seq,
-                                plan,
-                                commands,
-                            }),
-                        )
-                    }
-                    Err(e) => Response::error(id, RpcError::Internal(e.to_string())),
-                },
-                Err(e) => Response::error(id, RpcError::InvalidParams(e.to_string())),
-            },
-            Err(error) => Response::error(id, error),
-        };
+        let resp = respond_to(&req, |p: AgentLoadParams| async move {
+            let result = load_agent_attached(state, &p.session_id).await?;
+            subscribed.lock().insert(result.session.id.clone());
+            Ok(result)
+        })
+        .await;
         let _ = out_tx.send(Frame::Response(resp)).await;
         return;
     }
@@ -350,60 +283,129 @@ async fn handle_request(
     // imports it into a Favetto-local record, and subscribes this connection.
     // The local id in the result is the only routing key for follow-up calls.
     if req.method == method::AGENTS_PROVIDER_RESUME {
-        let resp = match parse_params::<ProviderResumeParams>(&req.method, &req.params) {
-            Ok(p) => match resume_provider_session(state, p).await {
-                Ok(session) => match state.agents.attach(&session.id) {
-                    Ok(AttachedAgent {
-                        session,
-                        data,
-                        seq,
-                        plan,
-                        commands,
-                    }) => {
-                        subscribed.lock().insert(session.id.clone());
-                        Response::ok(
-                            id,
-                            encode(AgentAttachResult {
-                                session,
-                                data: base64::engine::general_purpose::STANDARD.encode(&data),
-                                seq,
-                                plan,
-                                commands,
-                            }),
-                        )
-                    }
-                    Err(e) => Response::error(id, RpcError::Internal(e.to_string())),
-                },
-                Err(e) => Response::error(id, RpcError::InvalidParams(e.to_string())),
-            },
-            Err(error) => Response::error(id, error),
-        };
+        let resp = respond_to(&req, |p: ProviderResumeParams| async move {
+            let result = resume_provider_attached(state, p).await?;
+            subscribed.lock().insert(result.session.id.clone());
+            Ok(result)
+        })
+        .await;
         let _ = out_tx.send(Frame::Response(resp)).await;
         return;
     }
 
     if req.method == method::AGENTS_CLOSE {
-        let resp = match parse_params::<SessionIdParams>(&req.method, &req.params) {
-            Ok(p) => {
-                subscribed.lock().remove(&p.session_id);
-                match state.agents.close(&p.session_id).await {
-                    Ok(()) => Response::ok(
-                        id,
-                        encode(AgentCloseResult {
-                            closed: p.session_id,
-                        }),
-                    ),
-                    Err(e) => Response::error(id, RpcError::Internal(e.to_string())),
-                }
-            }
-            Err(error) => Response::error(id, error),
-        };
+        let resp = respond_to(&req, |p: SessionIdParams| async move {
+            subscribed.lock().remove(&p.session_id);
+            close_agent(state, &p.session_id).await
+        })
+        .await;
         let _ = out_tx.send(Frame::Response(resp)).await;
         return;
     }
 
     let resp = dispatch(state, req).await;
     let _ = out_tx.send(Frame::Response(resp)).await;
+}
+
+/// Parse a request's typed params and turn a typed handler result into a
+/// response, mapping malformed params and handler errors onto [`RpcError`].
+///
+/// This is the shared shape behind every connection-scoped handler: the
+/// transport-specific part (subscribing the connection) stays in
+/// [`handle_request`], while the stateful work lives in the helpers below and is
+/// also reachable through [`dispatch_method`] (HTTP `POST /rpc`).
+async fn respond_to<P, R, F, Fut>(req: &Request, handler: F) -> Response
+where
+    P: DeserializeOwned,
+    R: serde::Serialize,
+    F: FnOnce(P) -> Fut,
+    Fut: std::future::Future<Output = Result<R, RpcError>>,
+{
+    let id = req.id;
+    match parse_params::<P>(&req.method, &req.params) {
+        Ok(params) => match handler(params).await {
+            Ok(result) => Response::ok(id, encode(result)),
+            Err(error) => Response::error(id, error),
+        },
+        Err(error) => Response::error(id, error),
+    }
+}
+
+/// Encode an attached session snapshot for the wire.
+fn attach_result(agent: AttachedAgent) -> AgentAttachResult {
+    AgentAttachResult {
+        session: agent.session,
+        data: base64::engine::general_purpose::STANDARD.encode(&agent.data),
+        seq: agent.seq,
+        plan: agent.plan,
+        commands: agent.commands,
+    }
+}
+
+/// `agents.start`: spawn (or reattach/restore) and snapshot in one step.
+async fn start_agent_attached(
+    state: &Arc<State>,
+    params: StartAgentParams,
+) -> Result<AgentAttachResult, RpcError> {
+    let session = start_agent(state, params)
+        .await
+        .map_err(|e| RpcError::InvalidParams(e.to_string()))?;
+    attach_agent(state, &session.id)
+}
+
+/// `agents.attach`: snapshot an existing session for a client.
+fn attach_agent(state: &Arc<State>, session_id: &str) -> Result<AgentAttachResult, RpcError> {
+    state
+        .agents
+        .attach(session_id)
+        .map(attach_result)
+        .map_err(|e| RpcError::Internal(e.to_string()))
+}
+
+/// `agents.load`: restore a persisted session by its Favetto-local id and
+/// snapshot it. A failed restore is reported; it never falls back to a fresh
+/// session.
+async fn load_agent_attached(
+    state: &Arc<State>,
+    local_id: &str,
+) -> Result<AgentAttachResult, RpcError> {
+    let session = load_agent(state, local_id, None)
+        .await
+        .map_err(|e| RpcError::InvalidParams(e.to_string()))?;
+    attach_agent(state, &session.id)
+}
+
+/// `agents.provider_resume`: import a provider-owned session and snapshot it.
+async fn resume_provider_attached(
+    state: &Arc<State>,
+    params: ProviderResumeParams,
+) -> Result<AgentAttachResult, RpcError> {
+    let session = resume_provider_session(state, params)
+        .await
+        .map_err(|e| RpcError::InvalidParams(e.to_string()))?;
+    attach_agent(state, &session.id)
+}
+
+/// `agents.close`: terminate a session and report its local id.
+async fn close_agent(state: &Arc<State>, session_id: &str) -> Result<AgentCloseResult, RpcError> {
+    state
+        .agents
+        .close(session_id)
+        .await
+        .map(|()| AgentCloseResult {
+            closed: session_id.to_string(),
+        })
+        .map_err(|e| RpcError::Internal(e.to_string()))
+}
+
+/// `tasks.start_oneshot`: create the inline task and open its session.
+async fn start_oneshot(
+    state: &Arc<State>,
+    params: StartOneshotParams,
+) -> Result<StartOneshotResult, RpcError> {
+    start_oneshot_task(state, params)
+        .await
+        .map_err(|e| RpcError::Internal(e.to_string()))
 }
 
 /// `GET /events` query string. `Last-Event-ID` is the canonical SSE resume
@@ -624,6 +626,11 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
             }
         }
 
+        method::TASKS_START_ONESHOT => {
+            let p: StartOneshotParams = parse_params(&req.method, &req.params)?;
+            start_oneshot(state, p).await.and_then(to_value)
+        }
+
         method::CATALOG_LIST => {
             let catalog = state.catalog.read().clone();
             let list: Vec<CatalogEntry> = catalog
@@ -745,6 +752,16 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
             }
         }
 
+        // A one-shot HTTP request cannot stream replayed events, so it only
+        // acknowledges the subscription; durable replay stays on `GET /events`
+        // and the WebSocket `events.subscribe` handler. Malformed params degrade
+        // to "no replay", like the connection-scoped handler.
+        method::EVENTS_SUBSCRIBE => {
+            let _: EventsSubscribeParams =
+                parse_params(&req.method, &req.params).unwrap_or_default();
+            to_value(EventsSubscribeResult { subscribed: true })
+        }
+
         method::TASKS_EVENTS => {
             let p: TasksEventsParams = parse_params(&req.method, &req.params)?;
             let limit = p.limit.unwrap_or(500).min(2000) as usize;
@@ -791,6 +808,36 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
                 Ok(()) => to_value(ProviderDeleteResult { deleted: true }),
                 Err(e) => Err(RpcError::Internal(e.to_string())),
             }
+        }
+
+        // Connection-scoped over the socket/WebSocket transports (where
+        // `handle_request` subscribes the connection), but stateless for HTTP
+        // `POST /rpc` clients, which attach through these same helpers.
+        method::AGENTS_START => {
+            let p: StartAgentParams = parse_params(&req.method, &req.params)?;
+            start_agent_attached(state, p).await.and_then(to_value)
+        }
+
+        method::AGENTS_ATTACH => {
+            let p: SessionIdParams = parse_params(&req.method, &req.params)?;
+            attach_agent(state, &p.session_id).and_then(to_value)
+        }
+
+        method::AGENTS_LOAD => {
+            let p: AgentLoadParams = parse_params(&req.method, &req.params)?;
+            load_agent_attached(state, &p.session_id)
+                .await
+                .and_then(to_value)
+        }
+
+        method::AGENTS_PROVIDER_RESUME => {
+            let p: ProviderResumeParams = parse_params(&req.method, &req.params)?;
+            resume_provider_attached(state, p).await.and_then(to_value)
+        }
+
+        method::AGENTS_CLOSE => {
+            let p: SessionIdParams = parse_params(&req.method, &req.params)?;
+            close_agent(state, &p.session_id).await.and_then(to_value)
         }
 
         method::AGENTS_LIST => {
