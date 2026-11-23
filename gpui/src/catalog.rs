@@ -93,33 +93,14 @@ impl CatalogEntryView {
             .unwrap_or(&self.label)
     }
 
-    /// The searchable fields, weighted so the visible path outranks the prompt
-    /// and metadata. The fully-qualified `name` is deliberately absent: its
-    /// hidden `repo:<name>/` prefix must not make every definition in a repo
-    /// match a namespace query.
-    fn search_fields(&self) -> Vec<SearchField<'_>> {
-        let mut fields = vec![
-            SearchField::new(&self.label, search::weight::LABEL),
-            SearchField::new(&self.folder, search::weight::NAMESPACE),
-            SearchField::new(&self.prompt, search::weight::BODY),
-            SearchField::new(&self.kind, search::weight::META),
-        ];
-        for text in [
-            self.agent.as_deref(),
-            self.provider.as_deref(),
-            self.model.as_deref(),
-            self.schedule.as_deref(),
-            self.needs.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            fields.push(SearchField::new(text, search::weight::META));
-        }
-        for var in &self.vars {
-            fields.push(SearchField::new(&var.name, search::weight::META));
-        }
-        fields
+    /// The one searchable field: the visible basename.
+    ///
+    /// The prompt, metadata, folder and fully-qualified `name` are deliberately
+    /// absent. Matching the prompt buried the definition the user was looking
+    /// for under unrelated rows, and the hidden `repo:<name>/` prefix would make
+    /// every definition in a repo match its namespace.
+    fn search_field(&self) -> SearchField<'_> {
+        SearchField::new(self.basename(), search::weight::LABEL)
     }
 }
 
@@ -688,8 +669,7 @@ impl CatalogState {
                 let score = if query.is_empty() {
                     0
                 } else {
-                    let fields = view.search_fields();
-                    query.score(&matcher, &fields)?.score
+                    query.score(&matcher, &[view.search_field()])?.score
                 };
                 Some((score, view))
             })
@@ -1320,7 +1300,7 @@ mod tests {
     }
 
     #[test]
-    fn search_filters_names_and_prompts_fuzzily() {
+    fn search_matches_only_the_definition_basename() {
         let mut state = CatalogState {
             entries: vec![
                 entry(
@@ -1340,32 +1320,42 @@ mod tests {
             ..CatalogState::default()
         };
         assert_eq!(state.matched_count(), 2);
-        state.push_search_char('t');
-        state.push_search_char('r');
-        state.push_search_char('i');
+        for character in "tri".chars() {
+            state.push_search_char(character);
+        }
         assert_eq!(state.matched_count(), 1);
         assert_eq!(state.selected(), Some("repo:favetto/triage"));
 
         state.clear_search();
-        state.push_search_char('c');
-        state.push_search_char('h');
-        state.push_search_char('a');
-        assert_eq!(state.selected(), Some("repo:favetto/release"));
+        for character in "cha".chars() {
+            state.push_search_char(character);
+        }
+        assert_eq!(state.matched_count(), 0, "a prompt-only hit must not match");
+        assert_eq!(state.selected(), None);
     }
 
     #[test]
-    fn the_hidden_repo_prefix_is_not_searchable() {
+    fn the_hidden_repo_prefix_and_folder_are_not_searchable() {
         let mut state = CatalogState {
-            entries: vec![entry(
-                "repo:favetto/triage",
-                Some("favetto"),
-                "sort the inbox",
-                vec![],
-            )],
+            entries: vec![
+                entry(
+                    "repo:favetto/triage",
+                    Some("favetto"),
+                    "sort the inbox",
+                    vec![],
+                ),
+                entry(
+                    "repo:favetto/gpui/01-scaffold",
+                    Some("favetto"),
+                    "shell",
+                    vec![],
+                ),
+            ],
             status: CatalogStatus::Loaded,
             ..CatalogState::default()
         };
-        assert_eq!(state.total_count(), 1);
+        assert_eq!(state.total_count(), 2);
+
         for character in "favetto".chars() {
             state.push_search_char(character);
         }
@@ -1374,10 +1364,20 @@ mod tests {
             0,
             "repo:favetto is hidden on the row"
         );
+
+        state.clear_search();
+        for character in "gpui".chars() {
+            state.push_search_char(character);
+        }
+        assert_eq!(
+            state.matched_count(),
+            0,
+            "the gpui folder header is not part of the row's title"
+        );
     }
 
     #[test]
-    fn multi_term_queries_match_across_fields_in_any_order() {
+    fn prompts_and_metadata_are_not_searchable() {
         let mut triage = entry(
             "repo:favetto/triage",
             Some("favetto"),
@@ -1385,6 +1385,7 @@ mod tests {
             vec![],
         );
         triage.model = Some("opus".to_string());
+        triage.agent = Some("claude".to_string());
 
         let mut state = CatalogState {
             entries: vec![
@@ -1399,21 +1400,25 @@ mod tests {
             status: CatalogStatus::Loaded,
             ..CatalogState::default()
         };
-        for character in "opus triage".chars() {
-            state.push_search_char(character);
-        }
-        assert_eq!(state.matched_count(), 1);
-        assert_eq!(state.selected(), Some("repo:favetto/triage"));
 
+        for query in ["inbox", "opus", "claude", "agent"] {
+            state.clear_search();
+            for character in query.chars() {
+                state.push_search_char(character);
+            }
+            assert_eq!(state.matched_count(), 0, "{query} is not a title");
+        }
+
+        // Every term still has to land on the single title field.
         state.clear_search();
-        for character in "triage opus".chars() {
+        for character in "triage release".chars() {
             state.push_search_char(character);
         }
-        assert_eq!(state.selected(), Some("repo:favetto/triage"));
+        assert_eq!(state.matched_count(), 0);
     }
 
     #[test]
-    fn label_hits_rank_above_prompt_only_hits() {
+    fn prompt_and_metadata_hits_no_longer_outrank_a_title() {
         let mut state = CatalogState {
             entries: vec![
                 entry(
@@ -1437,8 +1442,8 @@ mod tests {
         }
         assert_eq!(
             state.visible_names(),
-            vec!["repo:favetto/changelog", "repo:favetto/release-notes"],
-            "the label hit sorts before the prompt-only hit"
+            vec!["repo:favetto/changelog"],
+            "the prompt-only hit is filtered out instead of ranked"
         );
     }
 

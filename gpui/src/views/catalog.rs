@@ -5,7 +5,7 @@
 //!
 //! Layout follows docs/design/gpui-client.md §2:
 //! - **Choice Overload** — one repo namespace, then one folder, then rows; the
-//!   search field filters names and prompt text.
+//!   search field filters definition names.
 //! - **Hick's Law** — the primary action is *Start with variables*; the
 //!   one-shot session is a secondary toolbar action.
 //! - **Working Memory** — collapsed groups and the query survive the session;
@@ -248,7 +248,7 @@ impl CatalogView {
                                 theme.colors.text
                             })
                             .child(if query.is_empty() {
-                                "Search definition names or prompts…".to_string()
+                                "Search definition names…".to_string()
                             } else {
                                 query.to_string()
                             }),

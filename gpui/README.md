@@ -132,7 +132,7 @@ The Catalog loads one `catalog.list` on connect and whenever the daemon pushes
 `catalog.updated`. Definitions are grouped by repo namespace (`repo:<name>`),
 then by their folder, then by name; `Global` comes last. Group and folder
 headers collapse, and both the collapsed set and the query survive the session.
-The search field fuzzy-matches definition names and prompt text. Selecting a row
+The search field fuzzy-matches definition names only. Selecting a row
 loads `catalog.get` and splits the task file at the first line whose trimmed
 content is `---`: the TOML front matter is syntax-highlighted, the separator is
 muted, and the Markdown prompt renders with the same headings, lists, tables,
@@ -275,14 +275,14 @@ field blank keeps the shared token file.
   active marker, `(missing)` repos, keyboard selection). Unit-tested without a
   window.
 - `src/catalog.rs` — the pure Catalog model: repo/folder grouping, fuzzy
-  name+prompt filtering, session-scoped collapse keys, preview state, and the
+  name-only filtering, session-scoped collapse keys, preview state, and the
   launch/one-shot forms with required/type/choice validation. Unit-tested
   without a window.
 - `src/inbox.rs` — the pure Inbox model: Needs you vs Recent grouping, the
   24-hour failure window, oldest-first fair-queue order, status fallbacks and
   the compact duration/cost formatters. Unit-tested without a window.
 - `src/tasks.rs` — the pure Tasks model: the five-segment filter with
-  query-scoped counts, fuzzy matching over name/agent/repo, newest-first and
+  query-scoped counts, fuzzy matching over the task name, newest-first and
   relevance ordering, selection resolution, and the terminal/cancellable
   helpers behind `c`/`r`. Unit-tested without a window.
 - `src/workflow.rs` — the pure Workflows model: roots grouped by

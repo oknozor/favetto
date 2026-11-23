@@ -182,7 +182,7 @@ impl TasksView {
                                 theme.colors.text
                             })
                             .child(if query.is_empty() {
-                                "Search name, agent or repo…".to_string()
+                                "Search task names…".to_string()
                             } else {
                                 query.to_string()
                             }),
