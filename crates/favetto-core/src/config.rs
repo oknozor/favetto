@@ -59,56 +59,18 @@ pub struct FavettoConfig {
     /// Client-side TUI settings. Ignored by the daemon, which reads the same file.
     #[serde(default)]
     pub tui: TuiSettings,
-    /// Web client (embedded SPA) settings.
-    #[serde(default)]
-    pub web: WebSettings,
-    /// Short-lived authentication ticket settings.
+    /// Authentication settings for the username/password login policy.
     #[serde(default)]
     pub auth: AuthSettings,
 }
 
-/// Web client (embedded SPA) settings.
+/// Authentication settings: the username/password login policy.
 ///
-/// `dir` overrides the assets embedded in the binary with a directory on disk
-/// (development); leave it empty to serve the embedded assets. `heartbeat_secs`
-/// is the interval of the SSE keep-alive comments that defeat idle proxy
-/// timeouts.
-#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
-pub struct WebSettings {
-    /// Serve the embedded web client from the daemon.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Asset directory override; empty serves the embedded assets.
-    #[serde(default)]
-    pub dir: PathBuf,
-    /// SSE keep-alive interval, in seconds.
-    #[serde(default = "default_web_heartbeat_secs")]
-    pub heartbeat_secs: u64,
-}
-
-impl Default for WebSettings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            dir: PathBuf::new(),
-            heartbeat_secs: default_web_heartbeat_secs(),
-        }
-    }
-}
-
-/// Authentication settings: short-lived tickets for header-less clients
-/// (browser WebSocket/SSE auth) plus the username/password login policy.
-///
-/// A ticket is minted over authenticated HTTP and then presented in a query
-/// string, where an `Authorization` header cannot go. Login attempts are
-/// rate-limited per `(username, client)`; `require_tls` rejects non-loopback
-/// logins that did not arrive over HTTPS (directly or via a proxy that sets
-/// `X-Forwarded-Proto: https`).
+/// Login attempts are rate-limited per `(username, client)`; `require_tls`
+/// rejects non-loopback logins that did not arrive over HTTPS (directly or via
+/// a proxy that sets `X-Forwarded-Proto: https`).
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 pub struct AuthSettings {
-    /// Ticket lifetime, in seconds.
-    #[serde(default = "default_ticket_ttl_secs")]
-    pub ticket_ttl_secs: u64,
     /// Failed `POST /auth/login` attempts allowed per `(username, client)` in
     /// `login_window_secs` before the client is locked out (0 disables the
     /// limit).
@@ -125,7 +87,6 @@ pub struct AuthSettings {
 impl Default for AuthSettings {
     fn default() -> Self {
         Self {
-            ticket_ttl_secs: default_ticket_ttl_secs(),
             login_rate_limit: default_login_rate_limit(),
             login_window_secs: default_login_window_secs(),
             require_tls: false,
@@ -534,14 +495,6 @@ fn default_sound_player() -> String {
 
 fn default_min_interval_ms() -> u64 {
     400
-}
-
-fn default_web_heartbeat_secs() -> u64 {
-    15
-}
-
-fn default_ticket_ttl_secs() -> u64 {
-    30
 }
 
 fn default_login_rate_limit() -> u32 {
@@ -1206,15 +1159,6 @@ mod tests {
     }
 
     #[test]
-    fn auth_ticket_ttl_defaults_and_parses() {
-        let cfg: FavettoConfig = toml::from_str("").unwrap();
-        assert_eq!(cfg.auth.ticket_ttl_secs, 30);
-
-        let overridden: FavettoConfig = toml::from_str("[auth]\nticket_ttl_secs = 5\n").unwrap();
-        assert_eq!(overridden.auth.ticket_ttl_secs, 5);
-    }
-
-    #[test]
     fn auth_login_defaults_and_parses() {
         let cfg: FavettoConfig = toml::from_str("").unwrap();
         assert_eq!(cfg.auth.login_rate_limit, 5);
@@ -1245,9 +1189,9 @@ mod tests {
     }
 
     #[test]
-    fn web_and_auth_defaults_apply_to_a_legacy_config() {
-        // A config written before `[web]`/`[auth]` existed must still decode,
-        // with the documented defaults filled in.
+    fn auth_defaults_apply_to_a_legacy_config() {
+        // A config written before `[auth]` existed must still decode, with the
+        // documented defaults filled in.
         let cfg: FavettoConfig = toml::from_str(
             r#"
             [daemon]
@@ -1258,34 +1202,20 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert!(cfg.web.enabled);
-        assert_eq!(cfg.web.dir, PathBuf::new());
-        assert_eq!(cfg.web.heartbeat_secs, 15);
-        assert_eq!(cfg.auth.ticket_ttl_secs, 30);
         assert_eq!(cfg.auth.login_rate_limit, 5);
         assert_eq!(cfg.auth.login_window_secs, 300);
         assert!(!cfg.auth.require_tls);
     }
 
     #[test]
-    fn parses_web_and_auth_overrides() {
+    fn parses_auth_overrides() {
         let cfg: FavettoConfig = toml::from_str(
             r#"
-            [web]
-            enabled = false
-            dir = "/srv/favetto/web"
-            heartbeat_secs = 5
-
             [auth]
-            ticket_ttl_secs = 60
             login_rate_limit = 10
             "#,
         )
         .unwrap();
-        assert!(!cfg.web.enabled);
-        assert_eq!(cfg.web.dir, PathBuf::from("/srv/favetto/web"));
-        assert_eq!(cfg.web.heartbeat_secs, 5);
-        assert_eq!(cfg.auth.ticket_ttl_secs, 60);
         assert_eq!(cfg.auth.login_rate_limit, 10);
     }
 

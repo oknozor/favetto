@@ -14,8 +14,8 @@ live in `docs/design/gpui-client.md`.
 A native desktop client for a running favetto daemon. GPUI is the GPU
 accelerated Rust UI framework the Zed editor is built on. The client mirrors the
 daemon's vocabulary (`Inbox → Tasks → Catalog → Workflows → Schedules →
-Settings`) so users can move between the TUI, the web client and this app
-without relearning anything (docs/design/gpui-client.md §2).
+Settings`) so users can move between the TUI and this app without relearning
+anything (docs/design/gpui-client.md §2).
 
 ## Prerequisites
 
@@ -250,7 +250,7 @@ density = "comfortable"
 ```
 
 Without a file the client uses `http://127.0.0.1:7878` and the token at
-`~/.local/share/favetto/token` (the same file the TUI and web client use).
+`~/.local/share/favetto/token` (the same file the TUI uses).
 Endpoint input is normalized (Postel's Law): trailing slashes, a pasted `/rpc`
 or `/events` path, and a missing scheme are all accepted. An address that cannot
 name a host is refused with the specific reason in Settings rather than silently

@@ -448,7 +448,7 @@ pub struct AgentManager {
     next_order: AtomicU64,
     git: GitRuntime,
     /// The daemon event bus, attached in `State::new` so normalized events are
-    /// published as `agent.event` pushes for the web feed.
+    /// published as `agent.event` pushes to streaming clients.
     bus: Option<EventBus>,
     /// Durable session metadata, attached in `State::new`.
     store: Option<SessionStore>,

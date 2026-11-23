@@ -1,16 +1,14 @@
 //! MessagePack RPC client over `POST {endpoint}/rpc`.
 //!
 //! The client links `favetto-wire`, so it produces and consumes the exact same
-//! [`Frame`] bytes as the Unix-socket, WebSocket and browser transports: a
+//! [`Frame`] bytes as the Unix-socket and WebSocket transports: a
 //! `Frame::Request` encoded with `rmp_serde::to_vec_named` is the request body,
 //! and the response body is one `Frame::Response`. Authentication is a bearer
 //! header.
 //!
 //! Every method has a typed wrapper generated from the [`RpcCall`] registry, so
 //! a call site names the method once and the compiler checks both the params and
-//! the decoded result. The wrappers deliberately mirror the web client's
-//! (`web/src/client.rs`); this crate only depends on `favetto-wire`, never on
-//! `web`.
+//! the decoded result. This crate only depends on `favetto-wire`.
 
 #![allow(dead_code)] // The typed wrappers are the client API surface; views land in steps 03–09.
 

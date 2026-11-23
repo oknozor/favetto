@@ -36,7 +36,7 @@ folders are distinct tasks.
 
 A task's `agent`, `provider`, and `model` headers are defaults for every run. A
 manual launch can override them for one run without editing the file: use the
-agent and model controls in the GPUI, Web, or TUI launch surfaces, or pass
+agent and model controls in the GPUI or TUI launch surfaces, or pass
 `agent`, `provider`, and `model` to `tasks.start`. The override is stored on the
 task row, so a retry keeps it, and the effective agent/model is recorded on the
 attempt's run history. `provider`/`model` are one pair: overriding either never
@@ -154,7 +154,7 @@ task sets its own `cwd`.
 
 Only the *active* repo scopes the default target of a task added through the TUI
 form. The active repo also scopes the **Catalog**: with a specific repo selected,
-the TUI and web catalogs list that repo's local tasks together with the global
+the TUI and GPUI catalogs list that repo's local tasks together with the global
 (unscoped) ones, hiding every other repo. With no active repo (the global view)
 the full catalog is listed, grouped under a `repo:<name>` folder; a repo with no
 local tasks contributes only its global tasks, with no empty folder. The active

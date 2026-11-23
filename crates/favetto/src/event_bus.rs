@@ -24,7 +24,7 @@ pub enum ServerPush {
     /// The task catalog changed on disk; clients should re-fetch it.
     CatalogUpdated,
     /// One normalized agent-state event (non-durable). Carried on the bus so it
-    /// reaches every client, including the stateless HTTP/SSE web client; the
+    /// reaches every client, including the stateless HTTP/SSE client; the
     /// bounded per-session ring buffer behind `tasks.events` serves backfill.
     AgentEvent(AgentEventPush),
 }

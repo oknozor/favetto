@@ -14,17 +14,14 @@
 # `--no-github-token` is passed; it never overwrites an existing value.
 #
 # Usage:
-#   scripts/install.sh                 # build the web UI, install + enable + start
-#   scripts/install.sh --no-web        # skip building the embedded web client
+#   scripts/install.sh                 # install + enable + start
 #   scripts/install.sh --no-start      # install but do not enable/start
 #   scripts/install.sh --uninstall     # stop, disable and remove the unit
 #   scripts/install.sh --uninstall --purge
 #                                      # ... and delete config + data too
 #
-# The Dioxus web client is built into `web/dist` first, because the daemon embeds
-# that directory with `rust-embed` at compile time. It therefore needs the
-# `dioxus-cli` (`dx`) and the `wasm32-unknown-unknown` target; pass `--no-web` to
-# install the daemon without the embedded UI (it then serves a placeholder page).
+# This is a plain daemon install: no `dx`, WASM, or embedded web UI. Attach with
+# the `favetto tui` client, or run the GPUI desktop client from `gpui/`.
 #
 # Environment overrides honoured: XDG_CONFIG_HOME, XDG_DATA_HOME, CARGO_HOME.
 set -euo pipefail
@@ -56,14 +53,11 @@ Options:
   --uninstall   Stop, disable and remove the unit (keeps user data).
   --purge       With --uninstall, also delete the config and data directories.
   --no-start    Install the unit but do not run `systemctl --user enable --now`.
-  --no-web      Skip building the Dioxus web client; the daemon then embeds a
-                placeholder page instead of the real UI.
   --no-github-token
                 Do not seed GITHUB_TOKEN in ~/.config/favetto/env from `gh`.
   -h, --help    Show this help and exit.
 
-The script builds the Dioxus web client into web/dist (so the daemon embeds it),
-builds and installs the `favetto` binary with cargo, seeds
+The script builds and installs the `favetto` binary with cargo, seeds
 ~/.config/favetto/config.toml from config.example.toml when missing, creates the
 private ~/.config/favetto/env secrets file (mode 600, loaded by the unit via
 EnvironmentFile=), installs the unit from packaging/systemd/favetto.service,
@@ -82,7 +76,6 @@ die() {
 uninstall=0
 purge=0
 no_start=0
-no_web=0
 seed_github_token=1
 
 while [ "$#" -gt 0 ]; do
@@ -90,7 +83,6 @@ while [ "$#" -gt 0 ]; do
         --uninstall) uninstall=1 ;;
         --purge) purge=1 ;;
         --no-start) no_start=1 ;;
-        --no-web) no_web=1 ;;
         --no-github-token) seed_github_token=0 ;;
         -h | --help)
             usage
@@ -175,48 +167,6 @@ uninstall_service() {
     log "uninstalled $SERVICE_NAME"
 }
 
-# Build the Dioxus web client into `web/dist` so the daemon embeds the real UI.
-#
-# `rust-embed` reads `web/dist` at proc-macro expansion time, so the bundle must
-# exist before `cargo install` compiles the daemon. Skipped with `--no-web`.
-build_web_client() {
-    web_dir="$repo_root/web"
-
-    if [ ! -f "$web_dir/Dioxus.toml" ]; then
-        warn "no web client sources at $web_dir; the daemon will embed the placeholder page"
-        return 0
-    fi
-
-    if ! command -v dx >/dev/null 2>&1; then
-        die "dioxus-cli (dx) not found on PATH, needed to build the web client.
-       Install it with: cargo install dioxus-cli --version 0.7.10 --locked
-       Or re-run with --no-web to install the daemon without the embedded UI."
-    fi
-
-    if command -v rustup >/dev/null 2>&1 &&
-        ! rustup target list --installed 2>/dev/null | grep -qx 'wasm32-unknown-unknown'; then
-        log "adding the wasm32-unknown-unknown Rust target"
-        rustup target add wasm32-unknown-unknown
-    fi
-
-    log "building the web client (dx bundle --release --platform web)"
-    (
-        cd "$web_dir"
-        dx bundle --locked --release --platform web
-    )
-
-    # Dioxus 0.7 emits the bundle under dist/public; flatten it into dist/ so
-    # rust-embed finds index.html and assets/ at its crate-relative path.
-    rm -rf "$web_dir/dist/assets"
-    cp -R "$web_dir/dist/public/." "$web_dir/dist/"
-    rm -rf "$web_dir/dist/public"
-
-    if [ ! -f "$web_dir/dist/index.html" ]; then
-        die "web client build did not produce $web_dir/dist/index.html"
-    fi
-    log "web client built into $web_dir/dist"
-}
-
 # Create the daemon's private env file (mode 600) if it does not exist. The unit
 # loads it with `EnvironmentFile=`, so scheduled/action tasks can interpolate
 # secrets such as `GITHUB_TOKEN` without them living in the unit or the config.
@@ -257,12 +207,6 @@ install_service() {
 
     if ! command -v cargo >/dev/null 2>&1; then
         die "cargo not found on PATH; install Rust from https://rustup.rs first"
-    fi
-
-    if [ "$no_web" -eq 1 ]; then
-        log "skipping the web client build (--no-web)"
-    else
-        build_web_client
     fi
 
     log "installing the favetto binary (cargo install --locked)"
@@ -330,8 +274,9 @@ favetto is installed as a systemd user service.
   stop:    systemctl --user stop $SERVICE_NAME
   attach:  favetto tui
 
-The daemon serves the embedded web client at its listen address (the
-[daemon].listen setting in $cfg_file); open that URL in a browser to sign in.
+Clients: run `favetto tui` for the terminal UI, or the GPUI desktop client from
+gpui/ (see docs/guide/desktop-client.md). Remote clients connect to the daemon
+at its listen address (the [daemon].listen setting in $cfg_file).
 
 Agent CLIs must be reachable from the unit's PATH; edit the Environment=PATH
 line in $unit_dst if they live elsewhere.

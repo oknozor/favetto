@@ -20,7 +20,7 @@ is removed. Schedules created by hand through the Ctrl+P menu or RPC are left
 alone.
 
 The daemon computes each schedule's `next_run` (UTC) for the `schedules.list`
-and `schedules.upsert` responses. The TUI Scheduler tab and the web `/schedules`
+and `schedules.upsert` responses. The TUI Scheduler tab and the GPUI Schedules
 table render it as a live countdown; disabled schedules (and expressions the
 daemon cannot parse) report no next run.
 

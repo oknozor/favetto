@@ -1,8 +1,8 @@
 //! Connection settings: endpoint and bearer token.
 //!
 //! The desktop client reads `~/.config/favetto/gpui.toml` (optional) and falls
-//! back to the daemon's default local endpoint and the token file the TUI and
-//! web client already use (`~/.local/share/favetto/token`).
+//! back to the daemon's default local endpoint and the token file the TUI
+//! already uses (`~/.local/share/favetto/token`).
 //!
 //! Endpoint input follows **Postel's Law** (docs/design/gpui-client.md §2): the
 //! user may type `127.0.0.1:7878`, `http://127.0.0.1:7878/`, or paste the full

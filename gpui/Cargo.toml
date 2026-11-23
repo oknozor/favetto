@@ -7,10 +7,10 @@ license = "MIT OR Apache-2.0"
 publish = false
 description = "Native GPUI desktop client for the favetto daemon."
 
-# Standalone cargo workspace (same pattern as `web/`): the GPUI client has
-# its own toolchain, and the pinned `gpui` version may churn independently —
-# so the root workspace's `exclude` list keeps this out of the daemon's
-# native clippy/nextest gates (see the root `Cargo.toml`).
+# Standalone cargo workspace: the GPUI client has its own GUI toolchain, and
+# the pinned `gpui` version may churn independently — so the root workspace's
+# `exclude` list keeps this out of the daemon's native clippy/nextest gates
+# (see the root `Cargo.toml`).
 [workspace]
 
 [dependencies]
@@ -20,8 +20,8 @@ gpui = "=0.2.2"
 favetto-wire = { path = "../crates/favetto-wire" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Same major as `web/`; the desktop renderer only needs the event parser, not
-# the HTML or CLI features.
+# The desktop renderer only needs the event parser, not the HTML or CLI
+# features.
 pulldown-cmark = { version = "0.13", default-features = false }
 rmp-serde = "1"
 uuid = { version = "1", features = ["serde"] }

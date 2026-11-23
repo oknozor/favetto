@@ -54,7 +54,5 @@ mod repos;
 mod scheduler;
 mod server;
 mod state;
-mod ticket;
 mod transport;
-mod web;
 mod webhooks;

@@ -122,7 +122,7 @@ pub struct InlineText {
 /// Split a catalog task file into its TOML front matter and Markdown body.
 ///
 /// The separator is the first line whose trimmed content is exactly `---`
-/// (matching the web and TUI previews). A file with no separator is entirely
+/// (matching the TUI preview). A file with no separator is entirely
 /// body, and an empty header is reported as no header. The returned slices keep
 /// the original bytes apart from the separator line itself.
 pub fn split_frontmatter(raw: &str) -> (Option<&str>, &str) {

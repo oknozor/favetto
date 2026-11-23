@@ -8,11 +8,10 @@ members = [
     "crates/favetto-mcp",
     "crates/favetto",
 ]
-# The Dioxus client is a standalone workspace with its own toolchain (`dx`);
-# excluding it keeps the native clippy/nextest gates off the WASM/Android deps.
-# `gpui` is excluded for the same reason: its standalone workspace must not
-# join the root workspace's native gates (see `docs/design/gpui-client.md`).
-exclude = ["web", "gpui"]
+# `gpui` is a standalone workspace with its own GUI toolchain; excluding it
+# keeps it out of the root workspace's native clippy/nextest gates (see
+# `docs/design/gpui-client.md`).
+exclude = ["gpui"]
 
 [workspace.package]
 version = "0.1.0"

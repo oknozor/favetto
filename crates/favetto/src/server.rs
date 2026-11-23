@@ -47,8 +47,8 @@ type Attached = Arc<Mutex<HashSet<String>>>;
 pub type BoxIn = Pin<Box<dyn Stream<Item = Result<Frame, WireError>> + Send>>;
 pub type BoxOut = Pin<Box<dyn Sink<Frame, Error = WireError> + Send>>;
 
-/// SSE keep-alive interval. `[web].heartbeat_secs` (#221) will make this
-/// configurable; the default matches `docs/design/web-client.md` §6.2.
+/// SSE keep-alive interval, chosen to defeat idle proxy timeouts on the
+/// streaming client transports.
 const SSE_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Replay page size, shared with the WS `events.subscribe` path.

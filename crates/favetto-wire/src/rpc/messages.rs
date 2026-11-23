@@ -136,9 +136,9 @@ pub struct TasksEventsParams {
 
 /// `tasks.events` result: the task's structured feed, oldest-first. `session_id`
 /// is the resolved live (or most recent) session, `None` when the task has no
-/// structured state source. This buffer is in-memory only; after a reload the
-/// web renders the durable `RunSummary` persisted in `task.output` instead (and
-/// falls back to the plain output view when there is none).
+/// structured state source. This buffer is in-memory only; after a reload a
+/// client renders the durable `RunSummary` persisted in `task.output` instead
+/// (and falls back to the plain output view when there is none).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TasksEventsResult {

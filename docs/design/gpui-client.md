@@ -2,8 +2,8 @@
 
 Status: proposed (implemented through the `gpui/*` task chain)
 Scope: a **native desktop client** for a running favetto daemon.
-Non-goals: replacing the Dioxus web/Android client, embedding an editor, or
-re-implementing the agent runtime.
+Non-goals: replacing the TUI, embedding an editor, or re-implementing the
+agent runtime.
 
 GPUI is a GPU-accelerated Rust UI framework (the one behind Zed). This client is
 a second presentation layer over the existing daemon API: the MessagePack RPC
@@ -14,8 +14,8 @@ for commands and the authenticated SSE stream for pushes.
 ## 1. Product shape
 
 The daemon already defines the vocabulary. The GPUI client mirrors it rather
-than inventing a new one, so users can move between the TUI, the web client and
-the desktop app without relearning the product.
+than inventing a new one, so users can move between the TUI and the desktop app
+without relearning the product.
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
@@ -71,7 +71,7 @@ Each row names the element, the change, and the expected effect.
 
 | Law | Decision | Tradeoff |
 |---|---|---|
-| **Jakob's Law** | Same IA, terminology and status badges as the TUI/web (`awaiting input`, `repo:<name>/<task>`, `attempt`). | Less freedom for novel layouts; no learning cost. |
+| **Jakob's Law** | Same IA, terminology and status badges as the TUI (`awaiting input`, `repo:<name>/<task>`, `attempt`). | Less freedom for novel layouts; no learning cost. |
 | **Hick's Law** | One primary button per screen; secondary actions in a `⋯` menu or the palette. | Advanced actions are one step deeper. |
 | **Choice Overload** | Catalog groups by repo and filters by text; the launch form only shows declared `[[vars]]`. | Users can't launch with ad-hoc JSON (intentional). |
 | **Fitts's Law** | Rows ≥ 32 px high, primary buttons ≥ 40 px, destructive actions separated by ≥ 8 px; keyboard equivalents for every command. | Slightly airier lists. |
@@ -111,8 +111,8 @@ keyboard-reachable, and motion respects the OS "reduce motion" setting.
 
 ## 4. Architecture
 
-`gpui/` is a **standalone cargo workspace** (like `web/`), excluded from the
-root workspace so the daemon's native `clippy`/`nextest` gates stay fast.
+`gpui/` is a **standalone cargo workspace**, excluded from the root workspace
+so the daemon's native `clippy`/`nextest` gates stay fast.
 
 ```
 gpui/
@@ -130,7 +130,7 @@ gpui/
 
 - **Transport**: reuse the `favetto-wire` types. `POST /rpc` carries one
   MessagePack `Frame::Request`; the response is one `Frame::Response`. `GET
-  /events` is SSE with `Last-Event-ID` resume (the same protocol the web client
+  /events` is SSE with `Last-Event-ID` resume (the same protocol the TUI
   uses).
 - **Concurrency**: a dedicated `tokio` runtime on a background thread owns
   `reqwest`. The UI talks to it through `async-channel`; a GPUI background task
@@ -170,8 +170,8 @@ same checkout) and `permission = "allow"` (unattended edits). Firing
 
 1. Use the daemon API only; never read SQLite or the filesystem for product
    data (the token/config files are the exception).
-2. Keep the existing TUI, web and daemon crates untouched except for the
-   documented `gpui/` additions and the root `exclude` list.
+2. Keep the existing TUI and daemon crates untouched except for the documented
+   `gpui/` additions and the root `exclude` list.
 3. Run `cargo fmt --check`, `cargo clippy -- -D warnings` and `cargo test` in
    `gpui/` before declaring a step done.
 4. Record any deviation from this plan in `gpui/README.md`.

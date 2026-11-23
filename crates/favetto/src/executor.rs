@@ -85,7 +85,7 @@ fn record_run_outcome(task: &mut Task, outcome: Result<RunOutcome, RunError>) ->
                     task.error = Some(failure.message.clone());
                     task.failure = Some(failure);
                     // Keep the run's output on failure too, so a structured
-                    // `RunSummary` survives to the web's post-run agent log.
+                    // `RunSummary` survives to the client's post-run log.
                     task.output = Some(run.output);
                     false
                 }

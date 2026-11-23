@@ -105,20 +105,10 @@
         "show_footer": true
       }
     },
-    "web": {
-      "description": "Web client (embedded SPA) settings.",
-      "$ref": "#/$defs/WebSettings",
-      "default": {
-        "enabled": true,
-        "dir": "",
-        "heartbeat_secs": 15
-      }
-    },
     "auth": {
-      "description": "Short-lived authentication ticket settings.",
+      "description": "Authentication settings for the username/password login policy.",
       "$ref": "#/$defs/AuthSettings",
       "default": {
-        "ticket_ttl_secs": 30,
         "login_rate_limit": 5,
         "login_window_secs": 300,
         "require_tls": false
@@ -840,40 +830,10 @@
         }
       }
     },
-    "WebSettings": {
-      "description": "Web client (embedded SPA) settings.\n\n`dir` overrides the assets embedded in the binary with a directory on disk\n(development); leave it empty to serve the embedded assets. `heartbeat_secs`\nis the interval of the SSE keep-alive comments that defeat idle proxy\ntimeouts.",
-      "type": "object",
-      "properties": {
-        "enabled": {
-          "description": "Serve the embedded web client from the daemon.",
-          "type": "boolean",
-          "default": true
-        },
-        "dir": {
-          "description": "Asset directory override; empty serves the embedded assets.",
-          "type": "string",
-          "default": ""
-        },
-        "heartbeat_secs": {
-          "description": "SSE keep-alive interval, in seconds.",
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0,
-          "default": 15
-        }
-      }
-    },
     "AuthSettings": {
-      "description": "Authentication settings: short-lived tickets for header-less clients\n(browser WebSocket/SSE auth) plus the username/password login policy.\n\nA ticket is minted over authenticated HTTP and then presented in a query\nstring, where an `Authorization` header cannot go. Login attempts are\nrate-limited per `(username, client)`; `require_tls` rejects non-loopback\nlogins that did not arrive over HTTPS (directly or via a proxy that sets\n`X-Forwarded-Proto: https`).",
+      "description": "Authentication settings: the username/password login policy.\n\nLogin attempts are rate-limited per `(username, client)`; `require_tls`\nrejects non-loopback logins that did not arrive over HTTPS (directly or via\na proxy that sets `X-Forwarded-Proto: https`).",
       "type": "object",
       "properties": {
-        "ticket_ttl_secs": {
-          "description": "Ticket lifetime, in seconds.",
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0,
-          "default": 30
-        },
         "login_rate_limit": {
           "description": "Failed `POST /auth/login` attempts allowed per `(username, client)` in\n`login_window_secs` before the client is locked out (0 disables the\nlimit).",
           "type": "integer",
