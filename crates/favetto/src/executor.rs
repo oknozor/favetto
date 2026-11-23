@@ -393,6 +393,38 @@ impl Lineage {
     }
 }
 
+/// Optional per-launch agent/provider/model overrides.
+///
+/// A manual launch can run a task with a different configured agent or model
+/// than the catalog definition pins. The overrides are stored on the task row so
+/// retries keep them. Blank/whitespace values are normalized away.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskOverrides {
+    pub agent: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+}
+
+impl TaskOverrides {
+    pub fn new(agent: Option<String>, provider: Option<String>, model: Option<String>) -> Self {
+        Self {
+            agent: normalized(agent),
+            provider: normalized(provider),
+            model: normalized(model),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.agent.is_none() && self.provider.is_none() && self.model.is_none()
+    }
+}
+
+fn normalized(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 /// Enqueue a task (idle), announcing it on the bus and emitting `TaskIdle`. The
 /// task is its own workflow root (no lineage). `interactive` marks a
 /// user-started run that should execute in the agent's real TUI.
@@ -403,6 +435,26 @@ pub async fn enqueue_task(
     dedupe_key: Option<String>,
     interactive: bool,
 ) -> anyhow::Result<Task> {
+    enqueue_task_with_overrides(
+        state,
+        name,
+        input,
+        dedupe_key,
+        interactive,
+        TaskOverrides::default(),
+    )
+    .await
+}
+
+/// Enqueue a task with per-launch agent/provider/model overrides.
+pub async fn enqueue_task_with_overrides(
+    state: &State,
+    name: String,
+    input: serde_json::Value,
+    dedupe_key: Option<String>,
+    interactive: bool,
+    overrides: TaskOverrides,
+) -> anyhow::Result<Task> {
     enqueue_with_lineage(
         state,
         name,
@@ -410,6 +462,7 @@ pub async fn enqueue_task(
         dedupe_key,
         Lineage::default(),
         interactive,
+        overrides,
     )
     .await
 }
@@ -423,6 +476,7 @@ async fn enqueue_with_lineage(
     dedupe_key: Option<String>,
     lineage: Lineage,
     interactive: bool,
+    overrides: TaskOverrides,
 ) -> anyhow::Result<Task> {
     enqueue_with_id(
         state,
@@ -432,6 +486,7 @@ async fn enqueue_with_lineage(
         dedupe_key,
         lineage,
         interactive,
+        overrides,
     )
     .await
 }
@@ -439,6 +494,10 @@ async fn enqueue_with_lineage(
 /// Enqueue a task under a caller-assigned id, announcing it on the bus and
 /// emitting `TaskIdle`. `workflow.create` needs a stable id so dependency rows
 /// can reference it before the insert.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the enqueue path threads the task identity, lineage, and launch flags explicitly"
+)]
 async fn enqueue_with_id(
     state: &State,
     id: Uuid,
@@ -447,6 +506,7 @@ async fn enqueue_with_id(
     dedupe_key: Option<String>,
     lineage: Lineage,
     interactive: bool,
+    overrides: TaskOverrides,
 ) -> anyhow::Result<Task> {
     let task = Task {
         id,
@@ -466,6 +526,9 @@ async fn enqueue_with_id(
         parent_id: lineage.parent_id,
         root_id: lineage.root_id,
         interactive,
+        agent: overrides.agent,
+        provider: overrides.provider,
+        model: overrides.model,
     };
     db::insert_task(&state.db, &task).await?;
     state.metrics.inc_tasks();
@@ -509,6 +572,7 @@ pub async fn enqueue_dynamic(state: &State, node: DynamicNode) -> anyhow::Result
         node.dedupe_key,
         lineage,
         false,
+        TaskOverrides::default(),
     )
     .await?;
     record_dependencies(state, task.id, &node.depends_on).await?;
@@ -545,6 +609,7 @@ pub async fn spawn_dynamic(
         dedupe_key,
         lineage,
         false,
+        TaskOverrides::default(),
     )
     .await?;
     record_dependencies(state, task.id, depends_on).await?;
@@ -562,6 +627,52 @@ async fn record_dependencies(
         db::insert_dependency(&state.db, task_id, *predecessor, now).await?;
     }
     Ok(())
+}
+
+/// Resolve the effective agent and model selector for a launch.
+///
+/// Precedence is **requested override → task row override → catalog definition →
+/// global default**. The provider/model pair is atomic: when either half is
+/// overridden the definition's pair is ignored wholesale, so an overridden model
+/// is never prefixed with a stale `def.provider`. Overriding the agent away from
+/// the definition's pinned agent also drops the definition's provider/model,
+/// which belong to the original agent.
+pub(crate) fn resolve_launch(
+    task: Option<&Task>,
+    def: Option<&TaskDef>,
+    requested_agent: Option<String>,
+    requested_provider: Option<String>,
+    requested_model: Option<String>,
+    default_agent: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let def_agent = def.and_then(|def| def.agent.clone());
+    let agent = requested_agent
+        .or_else(|| task.and_then(|task| task.agent.clone()))
+        .or(def_agent.clone())
+        .or_else(|| default_agent.map(str::to_string));
+
+    let definition_selector = || {
+        crate::agents::model_selector(
+            def.and_then(|def| def.provider.as_deref()),
+            def.and_then(|def| def.model.as_deref()),
+        )
+    };
+
+    let model = if requested_provider.is_some() || requested_model.is_some() {
+        crate::agents::model_selector(requested_provider.as_deref(), requested_model.as_deref())
+    } else if let Some(task) = task.filter(|task| task.provider.is_some() || task.model.is_some()) {
+        crate::agents::model_selector(task.provider.as_deref(), task.model.as_deref())
+    } else {
+        let agent_changed = def_agent
+            .as_deref()
+            .is_some_and(|definition| agent.as_deref() != Some(definition));
+        if agent_changed {
+            None
+        } else {
+            definition_selector()
+        }
+    };
+    (agent, model)
 }
 
 async fn run_one(
@@ -595,7 +706,14 @@ async fn run_one(
         TaskKind::Action => String::new(),
     };
 
-    let agent_name = def.agent.clone().or_else(|| config.agent.default.clone());
+    let (agent_name, model_selector) = resolve_launch(
+        Some(&task),
+        Some(&def),
+        None,
+        None,
+        None,
+        config.agent.default.as_deref(),
+    );
     // The run is attributed to the action id for an action task, else to the
     // resolved agent. Kept separate from `agent_name` so run history shows both.
     let runner = match def.kind {
@@ -607,9 +725,18 @@ async fn run_one(
         TaskKind::Agent => match agent_name.as_deref() {
             Some(name) => match state.registry.get_checked(name) {
                 Ok(agent) => {
-                    run_agent_task(state, &task, &run, agent, &def, &prompt, &plan.cwd)
-                        .await
-                        .map_err(|e| RunError::new(FailureKind::Infrastructure, e.to_string()))
+                    run_agent_task(
+                        state,
+                        &task,
+                        &run,
+                        agent,
+                        &def,
+                        &prompt,
+                        &plan.cwd,
+                        model_selector.clone(),
+                    )
+                    .await
+                    .map_err(|e| RunError::new(FailureKind::Infrastructure, e.to_string()))
                 }
                 Err(e) => Err(RunError::new(FailureKind::Agent, e.to_string())),
             },
@@ -664,11 +791,12 @@ async fn run_one(
     finished_run.error = task.error.clone();
     finished_run.failure = task.failure.clone();
     // Attribute the run and persist its per-attempt usage. `runner` is the
-    // resolved agent name or the action id; `model` is the task's configured
-    // model, if any (action tasks never set one).
+    // resolved agent name or the action id; `model_selector` is the effective
+    // `provider/model` (or bare model) actually requested for this attempt, so a
+    // launch override is recorded rather than the static definition value.
     finished_run.agent = runner.clone();
     finished_run.model = match def.kind {
-        TaskKind::Agent => def.model.clone(),
+        TaskKind::Agent => model_selector,
         TaskKind::Action => None,
     };
     finished_run.usage = usage;
@@ -1275,6 +1403,9 @@ async fn record_spawn_failure(
         parent_id: Some(parent.id),
         root_id: Some(parent.root_or_self()),
         interactive: false,
+        agent: None,
+        provider: None,
+        model: None,
     };
     if let Err(e) = db::insert_task(&state.db, &task).await {
         tracing::warn!(
@@ -1349,6 +1480,7 @@ async fn spawn_from_manifest(
             Some(dedupe),
             lineage,
             false,
+            TaskOverrides::default(),
         )
         .await
         {
@@ -1504,6 +1636,10 @@ async fn run_action_task(
 /// itself after the turn, and success is decided by [`AcpOutcome::succeeded`]
 /// (normal stop reason, no recorded error, and an actual answer) rather than by
 /// `stop_reason` alone.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the headless run path threads task, run, agent, definition, prompt, cwd, and model"
+)]
 async fn run_agent_task(
     state: &Arc<State>,
     task: &Task,
@@ -1512,6 +1648,7 @@ async fn run_agent_task(
     def: &TaskDef,
     prompt: &str,
     cwd: &Path,
+    model: Option<String>,
 ) -> anyhow::Result<RunOutcome> {
     let agent_name = agent.descriptor().id.clone();
     let info = state
@@ -1525,7 +1662,7 @@ async fn run_agent_task(
                 prompt: Some(prompt.to_string()),
                 cwd: cwd.to_path_buf(),
                 permission: def.permission,
-                model: crate::agents::model_selector(def.provider.as_deref(), def.model.as_deref()),
+                model,
                 headless: true,
                 git_env: Default::default(),
             },
@@ -2283,8 +2420,16 @@ async fn start_dependents(state: &Arc<State>, ev: &Event) {
         for dep in finished {
             tracing::info!(task = %dep, trigger = %name, "auto-starting dependent task");
             let dedupe = format!("needs:{}:{}", dep, ev.id);
-            if let Err(e) =
-                enqueue_with_lineage(state, dep, input.clone(), Some(dedupe), lineage, false).await
+            if let Err(e) = enqueue_with_lineage(
+                state,
+                dep,
+                input.clone(),
+                Some(dedupe),
+                lineage,
+                false,
+                TaskOverrides::default(),
+            )
+            .await
             {
                 tracing::warn!(error = %e, "failed to enqueue dependent task");
             }
@@ -2369,6 +2514,7 @@ async fn maybe_start_join(
             root_id: Some(root_id),
         },
         false,
+        TaskOverrides::default(),
     )
     .await
     {

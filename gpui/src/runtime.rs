@@ -77,6 +77,8 @@ pub enum Command {
     StartCatalogTask {
         name: String,
         input: serde_json::Value,
+        agent: Option<String>,
+        model: Option<String>,
     },
     /// Open an inline one-shot agent session (the Catalog toolbar's secondary
     /// action).
@@ -442,9 +444,21 @@ impl Runtime {
         self.send(Command::LoadCatalogEntry { name });
     }
 
-    /// Enqueue a catalog definition with its collected input.
-    pub fn start_catalog_task(&self, name: String, input: serde_json::Value) {
-        self.send(Command::StartCatalogTask { name, input });
+    /// Enqueue a catalog definition with its collected input and optional
+    /// per-launch agent/model overrides.
+    pub fn start_catalog_task(
+        &self,
+        name: String,
+        input: serde_json::Value,
+        agent: Option<String>,
+        model: Option<String>,
+    ) {
+        self.send(Command::StartCatalogTask {
+            name,
+            input,
+            agent,
+            model,
+        });
     }
 
     /// Open an inline one-shot agent session.
@@ -715,8 +729,13 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
             Command::LoadCatalogEntry { name } => {
                 spawn_catalog_entry(client.clone(), updates.clone(), name);
             }
-            Command::StartCatalogTask { name, input } => {
-                spawn_start_catalog(client.clone(), updates.clone(), name, input);
+            Command::StartCatalogTask {
+                name,
+                input,
+                agent,
+                model,
+            } => {
+                spawn_start_catalog(client.clone(), updates.clone(), name, input, agent, model);
             }
             Command::StartOneshot { agent, cwd } => {
                 spawn_start_oneshot(client.clone(), updates.clone(), agent, cwd);
@@ -924,6 +943,8 @@ fn spawn_start_catalog(
     updates: Sender<Update>,
     name: String,
     input: serde_json::Value,
+    agent: Option<String>,
+    model: Option<String>,
 ) {
     tokio::spawn(async move {
         let result = client
@@ -933,6 +954,9 @@ fn spawn_start_catalog(
                 // The desktop client runs the task headlessly and renders its
                 // structured events; the embedded TUI stays a TUI feature.
                 interactive: None,
+                agent,
+                provider: None,
+                model,
             })
             .await
             .map(Box::new);

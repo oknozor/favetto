@@ -210,6 +210,9 @@ mod tests {
             parent_id: None,
             root_id: None,
             interactive: false,
+            agent: None,
+            provider: None,
+            model: None,
         };
         let n = ServerPush::TaskUpdated(Box::new(task))
             .into_notification()
@@ -247,6 +250,9 @@ mod tests {
                 parent_id: None,
                 root_id: None,
                 interactive: false,
+                agent: None,
+                provider: None,
+                model: None,
             }))
             .event_id(),
             None

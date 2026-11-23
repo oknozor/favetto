@@ -2727,7 +2727,8 @@ impl ClientState {
         }
         self.ensure_catalog_preview();
         if let Some(name) = self.catalog.selected().map(str::to_string) {
-            self.catalog.open_launch(&name);
+            let agents = self.agent_choices();
+            self.catalog.open_launch(&name, agents);
         }
     }
 
@@ -2816,7 +2817,8 @@ impl ClientState {
 
     /// Open the launch sheet for one definition.
     pub fn open_catalog_launch(&mut self, name: &str, cx: &mut Context<Self>) -> bool {
-        if self.catalog.open_launch(name) {
+        let agents = self.agent_choices();
+        if self.catalog.open_launch(name, agents) {
             true
         } else {
             self.show_toast(
@@ -2828,6 +2830,23 @@ impl ClientState {
         }
     }
 
+    /// The daemon's configured agents prepared for a picker.
+    fn agent_choices(&self) -> Vec<AgentChoice> {
+        self.agents
+            .iter()
+            .map(|agent| AgentChoice {
+                name: agent.name.clone(),
+                display_name: if agent.display_name.is_empty() {
+                    agent.name.clone()
+                } else {
+                    agent.display_name.clone()
+                },
+                available: agent.available,
+                default: agent.default,
+            })
+            .collect()
+    }
+
     /// Focus one var in the launch sheet (a field click).
     pub fn focus_catalog_field(&mut self, index: usize) {
         if let Some(form) = self.catalog.launch_mut() {
@@ -2835,6 +2854,21 @@ impl ClientState {
                 form.focused = index;
             }
         }
+    }
+
+    /// Focus the launch sheet's agent picker.
+    pub fn focus_catalog_agent(&mut self) {
+        self.catalog.focus_launch_agent();
+    }
+
+    /// Focus the launch sheet's model input.
+    pub fn focus_catalog_model(&mut self) {
+        self.catalog.focus_launch_model();
+    }
+
+    /// Select an agent override from the launch sheet's picker.
+    pub fn set_catalog_agent(&mut self, name: &str) {
+        self.catalog.set_launch_agent(name);
     }
 
     /// Set a var value from a declared choice chip.
@@ -2881,20 +2915,20 @@ impl ClientState {
     /// Validate the launch sheet and send `tasks.start`. A validation failure
     /// stays inline; a transport failure is attached to the form too.
     pub fn submit_catalog_launch(&mut self) {
-        // A declared agent the daemon does not offer is caught here as well as
+        // A selected agent the daemon does not offer is caught here as well as
         // on the server: the roster is the same `agents.list` the daemon uses,
-        // so the sheet can explain the typo without a round trip.
-        let missing_agent = self
-            .catalog
-            .launch()
-            .and_then(|form| form.entry.agent.clone())
-            .filter(|agent| {
-                !self.agents.is_empty()
+        // so the sheet can explain the typo without a round trip. The selected
+        // override, not the definition's pinned agent, is what runs.
+        let missing_agent = self.catalog.launch().and_then(|form| {
+            form.agent.clone().filter(|agent| {
+                form.show_overrides()
+                    && !self.agents.is_empty()
                     && !self
                         .agents
                         .iter()
                         .any(|choice| &choice.name == agent && choice.available)
-            });
+            })
+        });
         if let Some(agent) = missing_agent {
             if let Some(form) = self.catalog.launch_mut() {
                 form.submitting = false;
@@ -2917,10 +2951,11 @@ impl ClientState {
             return;
         };
         let name = form.entry.name.clone();
+        let (agent, model) = form.overrides();
         form.submitting = true;
         form.server_error = None;
         match &self.runtime {
-            Some(runtime) => runtime.start_catalog_task(name, input),
+            Some(runtime) => runtime.start_catalog_task(name, input, agent, model),
             None => {
                 if let Some(form) = self.catalog.launch_mut() {
                     form.submitting = false;
@@ -2938,20 +2973,7 @@ impl ClientState {
 
     /// Open the secondary one-shot sheet with the daemon's agent roster.
     pub fn open_oneshot(&mut self) {
-        let agents = self
-            .agents
-            .iter()
-            .map(|agent| AgentChoice {
-                name: agent.name.clone(),
-                display_name: if agent.display_name.is_empty() {
-                    agent.name.clone()
-                } else {
-                    agent.display_name.clone()
-                },
-                available: agent.available,
-                default: agent.default,
-            })
-            .collect();
+        let agents = self.agent_choices();
         self.catalog.open_oneshot(agents);
     }
 

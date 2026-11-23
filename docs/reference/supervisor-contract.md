@@ -175,7 +175,7 @@ the four read/mutate actions map onto daemon RPCs, while `wait`, `complete`,
 | `inspect` | Refresh the observation. | `workflow.inspect` | `{ "root_id": uuid }` |
 | `spawn` | Add work to a root. | `workflow.spawn` | `{ "root_id"?: uuid, "name": string, "input"?: json, "depends_on"?: uuid[], "dedupe_key"?: string }` |
 | | Create a whole DAG at once. | `workflow.create` | `{ "idempotency_key": string, "root_id"?: uuid, "tasks": [{ "key": string, "name": string, "input"?: json, "depends_on"?: string[] }] }` |
-| | Start a brand-new root. | `tasks.start` | `{ "name": string, "input"?: json }` |
+| | Start a brand-new root. | `tasks.start` | `{ "name": string, "input"?: json, "agent"?: string, "provider"?: string, "model"?: string }` |
 | `cancel` | Abandon a whole root. | `workflow.cancel` | `{ "root_id": uuid }` |
 | | Abandon a single task. | `tasks.cancel` | `{ "id": uuid }` |
 | `retry` | Re-run a terminal task, preserving prior run history. | `workflow.retry` | `{ "task_id": uuid }` |

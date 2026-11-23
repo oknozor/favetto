@@ -99,11 +99,45 @@ async fn task_session_id_round_trips() {
         parent_id: None,
         root_id: None,
         interactive: false,
+        agent: None,
+        provider: None,
+        model: None,
     };
     upsert_task(&pool, &task).await.unwrap();
     let got = get_task(&pool, task.id).await.unwrap().unwrap();
     assert_eq!(got.session_id.as_deref(), Some("ses_123"));
     assert_eq!(got.session_title.as_deref(), Some("Fix the widget"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn task_launch_overrides_round_trip_through_the_database() {
+    let (dir, pool) = scratch_pool("overrides-roundtrip").await;
+
+    let mut task = task_at(Utc::now(), None, None);
+    task.agent = Some("other-agent".to_string());
+    task.provider = Some("other-provider".to_string());
+    task.model = Some("other-model".to_string());
+    upsert_task(&pool, &task).await.unwrap();
+
+    let got = get_task(&pool, task.id).await.unwrap().unwrap();
+    assert_eq!(got.agent.as_deref(), Some("other-agent"));
+    assert_eq!(got.provider.as_deref(), Some("other-provider"));
+    assert_eq!(got.model.as_deref(), Some("other-model"));
+
+    // Every list SELECT carries the columns too.
+    let listed = list_tasks(&pool, 10).await.unwrap();
+    assert_eq!(listed[0].agent.as_deref(), Some("other-agent"));
+    assert_eq!(listed[0].provider.as_deref(), Some("other-provider"));
+    assert_eq!(listed[0].model.as_deref(), Some("other-model"));
+
+    // Re-enqueueing for a retry keeps them.
+    assert!(requeue_terminal_task(&pool, task.id).await.unwrap());
+    let retried = get_task(&pool, task.id).await.unwrap().unwrap();
+    assert_eq!(retried.agent.as_deref(), Some("other-agent"));
+    assert_eq!(retried.provider.as_deref(), Some("other-provider"));
+    assert_eq!(retried.model.as_deref(), Some("other-model"));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -235,6 +269,9 @@ async fn migrate_adds_session_title_to_legacy_database() {
         parent_id: Some(Uuid::new_v4()),
         root_id: Some(Uuid::new_v4()),
         interactive: false,
+        agent: None,
+        provider: None,
+        model: None,
     };
     upsert_task(&pool, &task).await.unwrap();
     let got = get_task(&pool, task.id).await.unwrap().unwrap();
@@ -281,6 +318,9 @@ fn task_at(
         parent_id: None,
         root_id: None,
         interactive: false,
+        agent: None,
+        provider: None,
+        model: None,
     }
 }
 

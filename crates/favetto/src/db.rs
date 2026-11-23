@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     parent_id   TEXT,
     root_id     TEXT,
     interactive INTEGER NOT NULL DEFAULT 0,
+    agent       TEXT,
+    provider    TEXT,
+    model       TEXT,
     retry_at    INTEGER
 );
 
@@ -255,6 +258,16 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN retry_at INTEGER")
         .execute(pool)
         .await;
+    // Per-launch agent/provider/model overrides. Legacy rows keep NULL and
+    // resolve from the catalog definition and global config as before.
+    for column in ["agent TEXT", "provider TEXT", "model TEXT"] {
+        // `column` is one of the fixed literals above, never user input.
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE tasks ADD COLUMN {column}"
+        )))
+        .execute(pool)
+        .await;
+    }
     // Per-run token/cost usage and the configured model, stored on `task_runs`
     // (not inside the `tasks.output` blob) so `usage.stats` can aggregate it and
     // so it survives the retention pass that clears output blobs. Legacy rows
@@ -298,8 +311,8 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
 /// Insert a task, silently ignoring a duplicate dedupe key.
 pub async fn insert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT OR IGNORE INTO tasks (id, name, status, attempt, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title, parent_id, root_id, interactive, failure)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO tasks (id, name, status, attempt, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title, parent_id, root_id, interactive, agent, provider, model, failure)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(task.id.to_string())
     .bind(&task.name)
@@ -317,6 +330,9 @@ pub async fn insert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
     .bind(task.parent_id.map(|id| id.to_string()))
     .bind(task.root_id.map(|id| id.to_string()))
     .bind(task.interactive as i64)
+    .bind(&task.agent)
+    .bind(&task.provider)
+    .bind(&task.model)
     .bind(task.failure.as_ref().map(serde_json::to_string).transpose()?)
     .execute(pool)
     .await?;
@@ -331,8 +347,8 @@ pub async fn insert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
 #[cfg(test)]
 pub async fn upsert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO tasks (id, name, status, attempt, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title, parent_id, root_id, interactive, failure)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "INSERT INTO tasks (id, name, status, attempt, input, output, dedupe_key, created_at, started_at, finished_at, error, session_id, session_title, parent_id, root_id, interactive, agent, provider, model, failure)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
              status = excluded.status,
              attempt = excluded.attempt,
@@ -360,6 +376,9 @@ pub async fn upsert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
     .bind(task.parent_id.map(|id| id.to_string()))
     .bind(task.root_id.map(|id| id.to_string()))
     .bind(task.interactive as i64)
+    .bind(&task.agent)
+    .bind(&task.provider)
+    .bind(&task.model)
     .bind(task.failure.as_ref().map(serde_json::to_string).transpose()?)
     .execute(pool)
     .await?;
@@ -369,7 +388,7 @@ pub async fn upsert_task(pool: &SqlitePool, task: &Task) -> anyhow::Result<()> {
 /// Fetch a single task by id.
 pub async fn get_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Option<Task>> {
     let row = sqlx::query(
-        "SELECT id, name, status, attempt, input, output, dedupe_key, created_at, started_at, finished_at, error, failure, session_id, session_title, parent_id, root_id, interactive \
+        "SELECT id, name, status, attempt, input, output, dedupe_key, created_at, started_at, finished_at, error, failure, session_id, session_title, parent_id, root_id, interactive, agent, provider, model \
          FROM tasks WHERE id = ?",
     )
     .bind(id.to_string())
@@ -384,7 +403,7 @@ pub async fn get_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Option<Task
 /// `INSERT OR IGNORE` would have produced.
 pub async fn get_task_by_dedupe_key(pool: &SqlitePool, key: &str) -> anyhow::Result<Option<Task>> {
     let row = sqlx::query(
-        "SELECT id, name, status, attempt, input, output, dedupe_key, created_at, started_at, finished_at, error, failure, session_id, session_title, parent_id, root_id, interactive \
+        "SELECT id, name, status, attempt, input, output, dedupe_key, created_at, started_at, finished_at, error, failure, session_id, session_title, parent_id, root_id, interactive, agent, provider, model \
          FROM tasks WHERE dedupe_key = ?",
     )
     .bind(key)
@@ -397,7 +416,7 @@ pub async fn get_task_by_dedupe_key(pool: &SqlitePool, key: &str) -> anyhow::Res
 /// is fetched on demand with [`get_task`].
 pub async fn list_tasks(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec<Task>> {
     let rows = sqlx::query(
-        "SELECT id, name, status, attempt, input, dedupe_key, created_at, started_at, finished_at, error, failure, session_id, session_title, parent_id, root_id, interactive \
+        "SELECT id, name, status, attempt, input, dedupe_key, created_at, started_at, finished_at, error, failure, session_id, session_title, parent_id, root_id, interactive, agent, provider, model \
          FROM tasks ORDER BY created_at DESC LIMIT ?",
     )
     .bind(limit.max(1))
@@ -491,6 +510,9 @@ fn row_to_task(row: &SqliteRow) -> Task {
             .try_get::<i64, _>("interactive")
             .map(|v| v != 0)
             .unwrap_or(false),
+        agent: row.try_get::<Option<String>, _>("agent").ok().flatten(),
+        provider: row.try_get::<Option<String>, _>("provider").ok().flatten(),
+        model: row.try_get::<Option<String>, _>("model").ok().flatten(),
     }
 }
 
@@ -964,7 +986,7 @@ pub async fn record_delivery(
 /// Every `pending` task, oldest first (for the startup reconciler).
 pub async fn list_pending_tasks(pool: &SqlitePool) -> anyhow::Result<Vec<Task>> {
     let rows = sqlx::query(
-        "SELECT id, name, status, attempt, input, dedupe_key, created_at, started_at, finished_at, error, failure, session_id, session_title, parent_id, root_id, interactive \
+        "SELECT id, name, status, attempt, input, dedupe_key, created_at, started_at, finished_at, error, failure, session_id, session_title, parent_id, root_id, interactive, agent, provider, model \
          FROM tasks WHERE status = 'pending' ORDER BY created_at ASC",
     )
     .fetch_all(pool)
@@ -976,7 +998,7 @@ pub async fn list_pending_tasks(pool: &SqlitePool) -> anyhow::Result<Vec<Task>> 
 /// tasks a previous daemon left in flight, for the startup reconciler.
 pub async fn list_active_tasks(pool: &SqlitePool) -> anyhow::Result<Vec<Task>> {
     let rows = sqlx::query(
-        "SELECT id, name, status, attempt, input, dedupe_key, created_at, started_at, finished_at, error, failure, session_id, session_title, parent_id, root_id, interactive \
+        "SELECT id, name, status, attempt, input, dedupe_key, created_at, started_at, finished_at, error, failure, session_id, session_title, parent_id, root_id, interactive, agent, provider, model \
          FROM tasks WHERE status IN ('running', 'awaiting_input') ORDER BY created_at ASC",
     )
     .fetch_all(pool)
@@ -1175,7 +1197,7 @@ pub async fn fail_pending_task(
 /// dependency rows, so their dispatch is unchanged.
 pub async fn next_pending_tasks(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec<Task>> {
     let rows = sqlx::query(
-        "SELECT t.id, t.name, t.status, t.attempt, t.input, t.dedupe_key, t.created_at, t.started_at, t.finished_at, t.error, t.failure, t.session_id, t.session_title, t.parent_id, t.root_id, t.interactive \
+        "SELECT t.id, t.name, t.status, t.attempt, t.input, t.dedupe_key, t.created_at, t.started_at, t.finished_at, t.error, t.failure, t.session_id, t.session_title, t.parent_id, t.root_id, t.interactive, t.agent, t.provider, t.model \
          FROM tasks t \
          WHERE t.status = 'pending' \
            AND (t.retry_at IS NULL OR t.retry_at <= ?) \
@@ -1247,7 +1269,7 @@ pub async fn list_tasks_in_root(
     name: &str,
 ) -> anyhow::Result<Vec<Task>> {
     let rows = sqlx::query(
-        "SELECT id, name, status, attempt, input, output, dedupe_key, created_at, started_at, finished_at, error, failure, session_id, session_title, parent_id, root_id, interactive \
+        "SELECT id, name, status, attempt, input, output, dedupe_key, created_at, started_at, finished_at, error, failure, session_id, session_title, parent_id, root_id, interactive, agent, provider, model \
          FROM tasks WHERE (root_id = ? OR id = ?) AND name = ? ORDER BY created_at ASC",
     )
     .bind(root_id.to_string())
@@ -1266,7 +1288,7 @@ pub async fn list_active_tasks_in_root(
     name: &str,
 ) -> anyhow::Result<Vec<Task>> {
     let rows = sqlx::query(
-        "SELECT id, name, status, attempt, input, dedupe_key, created_at, started_at, finished_at, error, failure, session_id, session_title, parent_id, root_id, interactive \
+        "SELECT id, name, status, attempt, input, dedupe_key, created_at, started_at, finished_at, error, failure, session_id, session_title, parent_id, root_id, interactive, agent, provider, model \
          FROM tasks WHERE (root_id = ? OR id = ?) AND name = ? AND status IN ('pending', 'running', 'awaiting_input') ORDER BY created_at ASC",
     )
     .bind(root_id.to_string())
@@ -1282,7 +1304,7 @@ pub async fn list_active_tasks_in_root(
 /// Runtime view for `workflow.inspect`.
 pub async fn list_root_tasks(pool: &SqlitePool, root_id: Uuid) -> anyhow::Result<Vec<Task>> {
     let rows = sqlx::query(
-        "SELECT id, name, status, attempt, input, dedupe_key, created_at, started_at, finished_at, error, failure, session_id, session_title, parent_id, root_id, interactive \
+        "SELECT id, name, status, attempt, input, dedupe_key, created_at, started_at, finished_at, error, failure, session_id, session_title, parent_id, root_id, interactive, agent, provider, model \
          FROM tasks WHERE root_id = ? OR id = ? ORDER BY created_at ASC",
     )
     .bind(root_id.to_string())

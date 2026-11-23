@@ -32,6 +32,23 @@ extension, with `/` separators. Use that identity everywhere a task is named:
 Because the identity is the relative path, two files named `plan.md` in different
 folders are distinct tasks.
 
+## Agent and model per launch
+
+A task's `agent`, `provider`, and `model` headers are defaults for every run. A
+manual launch can override them for one run without editing the file: use the
+agent and model controls in the GPUI, Web, or TUI launch surfaces, or pass
+`agent`, `provider`, and `model` to `tasks.start`. The override is stored on the
+task row, so a retry keeps it, and the effective agent/model is recorded on the
+attempt's run history. `provider`/`model` are one pair: overriding either never
+mixes it with the definition's other half. Action tasks (`kind = "action"`) never
+launch an agent, so they reject these overrides.
+
+The resolution order is **launch override → task definition → global
+`[agent].default`** for the agent, and **launch override → definition → the
+agent's default** for the model. Overriding the agent also drops the definition's
+pinned provider/model unless the launch pins its own, so a model is never paired
+with the wrong provider.
+
 ::: warning Renaming is a new task
 Moving `triage.md` to `pipeline/triage.md` changes its identity from `triage` to
 `pipeline/triage`. The old `catalog:triage` schedule is dropped and recreated,

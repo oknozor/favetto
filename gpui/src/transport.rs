@@ -499,6 +499,9 @@ mod tests {
                 name: "repo:favetto/triage".to_string(),
                 input: Some(serde_json::json!({ "issue": 7, "note": "hi" })),
                 interactive: None,
+                agent: Some("opencode".to_string()),
+                provider: None,
+                model: Some("opencode-go/deepseek".to_string()),
             },
         )
         .expect("encode start");
@@ -508,6 +511,8 @@ mod tests {
                 assert_eq!(request.method, method::TASKS_START);
                 assert_eq!(request.params["name"], "repo:favetto/triage");
                 assert_eq!(request.params["input"]["issue"], 7);
+                assert_eq!(request.params["agent"], "opencode");
+                assert_eq!(request.params["model"], "opencode-go/deepseek");
             }
             other => panic!("expected a request frame, got {other:?}"),
         }

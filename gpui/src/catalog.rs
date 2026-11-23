@@ -177,6 +177,13 @@ pub struct LaunchForm {
     pub entry: CatalogEntry,
     pub fields: Vec<VarField>,
     pub focused: usize,
+    /// Selectable configured agents for a per-launch override.
+    pub agents: Vec<AgentChoice>,
+    /// The selected agent override. Seeded from the definition (or the daemon
+    /// default), and changeable before launch.
+    pub agent: Option<String>,
+    /// The model override typed into the sheet: a bare id or `provider/model`.
+    pub model: String,
     /// The daemon's rejection, kept attached to the form (never a toast-only
     /// error: the user must be able to correct the input).
     pub server_error: Option<String>,
@@ -184,31 +191,87 @@ pub struct LaunchForm {
 }
 
 impl LaunchForm {
-    fn new(entry: CatalogEntry) -> Self {
-        let fields = entry.vars.iter().map(VarField::new).collect();
+    /// Build a launch form without an agent roster (used by unit tests).
+    #[cfg(test)]
+    pub fn new(entry: CatalogEntry) -> Self {
+        Self::with_agents(entry, Vec::new())
+    }
+
+    /// Build a launch form with the daemon's configured agents.
+    pub fn with_agents(entry: CatalogEntry, agents: Vec<AgentChoice>) -> Self {
+        let fields: Vec<VarField> = entry.vars.iter().map(VarField::new).collect();
+        let agent = if entry.kind == "action" {
+            None
+        } else {
+            entry.agent.clone().or_else(|| {
+                agents
+                    .iter()
+                    .find(|choice| choice.default && choice.available)
+                    .or_else(|| agents.iter().find(|choice| choice.available))
+                    .map(|choice| choice.name.clone())
+            })
+        };
+        let model = if entry.kind == "action" {
+            String::new()
+        } else {
+            match (entry.provider.as_deref(), entry.model.as_deref()) {
+                (Some(provider), Some(model)) if !provider.is_empty() => {
+                    format!("{provider}/{model}")
+                }
+                (_, Some(model)) => model.to_string(),
+                _ => String::new(),
+            }
+        };
         Self {
             entry,
             fields,
             focused: 0,
+            agents,
+            agent,
+            model,
             server_error: None,
             submitting: false,
         }
     }
 
+    /// Whether this launch has agent/model overrides at all. Action tasks never
+    /// launch an agent, so they hide the controls.
+    pub fn show_overrides(&self) -> bool {
+        self.entry.kind != "action"
+    }
+
+    /// Number of focusable controls: declared vars, then agent and model.
+    fn field_count(&self) -> usize {
+        self.fields.len() + if self.show_overrides() { 2 } else { 0 }
+    }
+
+    pub fn agent_index(&self) -> Option<usize> {
+        self.show_overrides().then_some(self.fields.len())
+    }
+
+    pub fn model_index(&self) -> Option<usize> {
+        self.show_overrides().then_some(self.fields.len() + 1)
+    }
+
     /// Move the focus, wrapping at both ends (Tab / Shift+Tab).
     pub fn cycle_focus(&mut self, delta: isize) {
-        if self.fields.is_empty() {
+        let count = self.field_count();
+        if count == 0 {
             self.focused = 0;
             return;
         }
-        let count = self.fields.len() as isize;
-        self.focused = (self.focused as isize + delta).rem_euclid(count) as usize;
+        self.focused = (self.focused as isize + delta).rem_euclid(count as isize) as usize;
     }
 
     /// Cycle the focused field's fixed choice list (←/→). Returns whether the
     /// focused field actually offered choices. Typing an exact value still
-    /// works; this is the discoverable keyboard path for a declared enum.
+    /// works; this is the discoverable keyboard path for a declared enum. The
+    /// agent picker is also cycled with arrows.
     pub fn cycle_choice(&mut self, delta: isize) -> bool {
+        if self.agent_index() == Some(self.focused) {
+            self.cycle_agent(delta);
+            return true;
+        }
         let Some(field) = self.fields.get_mut(self.focused) else {
             return false;
         };
@@ -232,6 +295,79 @@ impl LaunchForm {
         field.value = next_value;
         field.error = None;
         true
+    }
+
+    /// Step the agent selection, wrapping. Only available agents are offered.
+    pub fn cycle_agent(&mut self, delta: isize) {
+        let available: Vec<&AgentChoice> = self
+            .agents
+            .iter()
+            .filter(|choice| choice.available)
+            .collect();
+        if available.is_empty() {
+            return;
+        }
+        let current = self
+            .agent
+            .as_ref()
+            .and_then(|name| available.iter().position(|choice| &choice.name == name))
+            .unwrap_or(0);
+        let count = available.len() as isize;
+        let next = (current as isize + delta).rem_euclid(count) as usize;
+        self.agent = Some(available[next].name.clone());
+        self.server_error = None;
+    }
+
+    /// Set the agent override from a click, clearing any stale error.
+    pub fn set_agent(&mut self, name: &str) {
+        self.agent = Some(name.to_string());
+        self.server_error = None;
+    }
+
+    /// Append one typed character to the focused text control.
+    pub fn push_char(&mut self, character: char) {
+        if character.is_control() {
+            return;
+        }
+        let focused = self.focused;
+        if self.model_index() == Some(focused) {
+            self.model.push(character);
+            self.server_error = None;
+            return;
+        }
+        let Some(field) = self.fields.get_mut(focused) else {
+            return;
+        };
+        field.value.push(character);
+        field.error = None;
+        self.server_error = None;
+    }
+
+    pub fn pop_char(&mut self) {
+        let focused = self.focused;
+        if self.model_index() == Some(focused) {
+            self.model.pop();
+            self.server_error = None;
+            return;
+        }
+        let Some(field) = self.fields.get_mut(focused) else {
+            return;
+        };
+        field.value.pop();
+        field.error = None;
+        self.server_error = None;
+    }
+
+    /// The per-launch overrides to send. Empty values become `None`.
+    pub fn overrides(&self) -> (Option<String>, Option<String>) {
+        if !self.show_overrides() {
+            return (None, None);
+        }
+        let model = self.model.trim();
+        (
+            self.agent.clone(),
+            (!model.is_empty()).then(|| model.to_string()),
+        )
     }
 
     /// Validate every field inline. Returns true when the form can be sent.
@@ -763,7 +899,7 @@ impl CatalogState {
         self.launch.as_mut()
     }
 
-    pub fn open_launch(&mut self, name: &str) -> bool {
+    pub fn open_launch(&mut self, name: &str, agents: Vec<AgentChoice>) -> bool {
         let Some(entry) = self
             .entries
             .iter()
@@ -772,7 +908,7 @@ impl CatalogState {
         else {
             return false;
         };
-        self.launch = Some(LaunchForm::new(entry));
+        self.launch = Some(LaunchForm::with_agents(entry, agents));
         true
     }
 
@@ -780,33 +916,18 @@ impl CatalogState {
         self.launch = None;
     }
 
-    /// Append one typed character to the focused var (multiline values accept
-    /// newlines through [`CatalogState::push_launch_newline`]).
+    /// Append one typed character to the focused text control (a var or the
+    /// model override). The agent picker is changed with arrows/clicks.
     pub fn push_launch_char(&mut self, character: char) {
-        let Some(form) = self.launch.as_mut() else {
-            return;
-        };
-        let Some(field) = form.fields.get_mut(form.focused) else {
-            return;
-        };
-        if character.is_control() {
-            return;
+        if let Some(form) = self.launch.as_mut() {
+            form.push_char(character);
         }
-        field.value.push(character);
-        field.error = None;
-        form.server_error = None;
     }
 
     pub fn backspace_launch(&mut self) {
-        let Some(form) = self.launch.as_mut() else {
-            return;
-        };
-        let Some(field) = form.fields.get_mut(form.focused) else {
-            return;
-        };
-        field.value.pop();
-        field.error = None;
-        form.server_error = None;
+        if let Some(form) = self.launch.as_mut() {
+            form.pop_char();
+        }
     }
 
     /// Enter inside a multiline var inserts a line break instead of submitting.
@@ -824,6 +945,34 @@ impl CatalogState {
         field.error = None;
         form.server_error = None;
         true
+    }
+
+    /// Focus the launch sheet's agent picker.
+    pub fn focus_launch_agent(&mut self) {
+        if let Some(form) = self.launch.as_mut() {
+            if let Some(index) = form.agent_index() {
+                form.focused = index;
+            }
+        }
+    }
+
+    /// Focus the launch sheet's model input.
+    pub fn focus_launch_model(&mut self) {
+        if let Some(form) = self.launch.as_mut() {
+            if let Some(index) = form.model_index() {
+                form.focused = index;
+            }
+        }
+    }
+
+    /// Set the launch agent override from a click.
+    pub fn set_launch_agent(&mut self, name: &str) {
+        if let Some(form) = self.launch.as_mut() {
+            form.set_agent(name);
+            if let Some(index) = form.agent_index() {
+                form.focused = index;
+            }
+        }
     }
 
     pub fn cycle_launch_focus(&mut self, delta: isize) {
@@ -1359,6 +1508,86 @@ mod tests {
         assert_eq!(state.visible_names(), vec!["repo:favetto/release"]);
         assert_eq!(state.display_index_of("repo:favetto/release"), Some(3));
         assert_eq!(state.display_index_of("repo:favetto/gpui/one"), None);
+    }
+
+    fn agent(name: &str, available: bool, default: bool) -> AgentChoice {
+        AgentChoice {
+            name: name.to_string(),
+            display_name: name.to_string(),
+            available,
+            default,
+        }
+    }
+
+    #[test]
+    fn launch_form_seeds_agent_and_model_from_the_definition() {
+        let form = LaunchForm::with_agents(
+            entry("plan", None, "plan", vec![]),
+            vec![agent("opencode", true, true)],
+        );
+        assert!(form.show_overrides());
+        assert_eq!(form.agent.as_deref(), Some("opencode"));
+        assert_eq!(form.model, "opencode-go/deepseek");
+        assert_eq!(
+            form.overrides(),
+            (
+                Some("opencode".to_string()),
+                Some("opencode-go/deepseek".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn launch_form_falls_back_to_the_daemon_default_agent() {
+        let mut e = entry("plan", None, "plan", vec![]);
+        e.agent = None;
+        e.provider = None;
+        e.model = None;
+        let form = LaunchForm::with_agents(
+            e,
+            vec![
+                agent("unavailable", false, true),
+                agent("fallback", true, true),
+            ],
+        );
+        assert_eq!(form.agent.as_deref(), Some("fallback"));
+        assert_eq!(form.model, "");
+        assert_eq!(form.overrides(), (Some("fallback".to_string()), None));
+    }
+
+    #[test]
+    fn launch_form_cycles_the_agent_and_types_a_model_override() {
+        let mut form = LaunchForm::with_agents(
+            entry("plan", None, "plan", vec![]),
+            vec![agent("one", true, true), agent("two", true, false)],
+        );
+        assert_eq!(form.agent_index(), Some(0));
+        assert_eq!(form.model_index(), Some(1));
+        // With no vars the agent picker is focused first; arrows choose an
+        // agent and Tab moves on to the model input.
+        assert_eq!(form.focused, 0);
+        assert!(form.cycle_choice(1));
+        assert_eq!(form.agent.as_deref(), Some("two"));
+        form.cycle_focus(1);
+        assert_eq!(form.focused, 1);
+        form.push_char('x');
+        assert_eq!(form.model, "opencode-go/deepseekx");
+        form.pop_char();
+        assert_eq!(form.model, "opencode-go/deepseek");
+        form.cycle_focus(1);
+        assert_eq!(form.focused, 0);
+    }
+
+    #[test]
+    fn action_launch_forms_hide_the_overrides() {
+        let mut e = entry("gate", None, "gate", vec![]);
+        e.kind = "action".to_string();
+        let mut form = LaunchForm::with_agents(e, vec![agent("one", true, true)]);
+        assert!(!form.show_overrides());
+        assert_eq!(form.overrides(), (None, None));
+        assert!(!form.cycle_choice(1));
+        form.push_char('x');
+        assert_eq!(form.focused, 0);
     }
 
     #[test]

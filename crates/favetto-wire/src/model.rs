@@ -299,6 +299,21 @@ pub struct Task {
     /// headless. Defaults to false so older payloads and rows decode unchanged.
     #[serde(default)]
     pub interactive: bool,
+    /// Optional per-launch agent override. A manual launch can run the task with
+    /// a different configured agent than the catalog definition pins. The
+    /// executor resolves it before the definition's `agent` and the global
+    /// `[agent].default`. Absent for tasks that use the definition default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Optional per-launch model provider override. Resolved atomically with
+    /// [`Self::model`]: an override of either field never mixes with the
+    /// definition's provider/model pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Optional per-launch model id override (a bare id or `provider/model`).
+    /// Absent for tasks that use the definition's or the agent's default model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl Task {
@@ -1147,6 +1162,9 @@ mod tests {
             parent_id: None,
             root_id: None,
             interactive: false,
+            agent: None,
+            provider: None,
+            model: None,
         };
         let json = serde_json::to_value(&task).unwrap();
         assert_eq!(json["session_title"], "Fix the widget");
@@ -1196,6 +1214,9 @@ mod tests {
             parent_id: None,
             root_id: None,
             interactive: false,
+            agent: None,
+            provider: None,
+            model: None,
         };
         let json = serde_json::to_value(&task).unwrap();
         assert_eq!(json["attempt"], 3);
@@ -1240,6 +1261,9 @@ mod tests {
             parent_id: None,
             root_id: None,
             interactive: true,
+            agent: None,
+            provider: None,
+            model: None,
         };
         let json = serde_json::to_value(&task).unwrap();
         assert_eq!(json["interactive"], true);
@@ -1286,6 +1310,9 @@ mod tests {
             parent_id: Some(parent),
             root_id: Some(root),
             interactive: false,
+            agent: None,
+            provider: None,
+            model: None,
         };
         let json = serde_json::to_value(&task).unwrap();
         assert_eq!(json["parent_id"], parent.to_string());
@@ -1617,6 +1644,9 @@ mod tests {
             parent_id: None,
             root_id: None,
             interactive: false,
+            agent: None,
+            provider: None,
+            model: None,
         };
         let json = serde_json::to_value(&task).unwrap();
         assert_eq!(json["failure"]["kind"], "agent");
@@ -1952,6 +1982,9 @@ mod tests {
             parent_id: None,
             root_id: None,
             interactive: false,
+            agent: None,
+            provider: None,
+            model: None,
         };
         let n = task.into_notification().expect("task serialization");
         assert_eq!(n.method, push::TASK_UPDATED);

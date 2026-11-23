@@ -282,6 +282,10 @@ pub fn Catalog() -> Element {
                 StartTaskDialog {
                     name: entry.name.clone(),
                     vars: entry.vars.clone(),
+                    agent: entry.agent.clone(),
+                    provider: entry.provider.clone(),
+                    model: entry.model.clone(),
+                    kind: entry.kind.clone(),
                     on_close: move |_| start_for.set(None),
                     on_started: move |_task: Task| {
                         start_for.set(None);

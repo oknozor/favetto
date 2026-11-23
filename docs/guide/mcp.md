@@ -66,7 +66,7 @@ passthrough, and mutations are limited to the supervisor vocabulary.
 | Tool | RPC | Arguments |
 |------|-----|-----------|
 | `favetto_inspect` | `workflow.inspect` | `{ root_id }` |
-| `favetto_start_task` | `tasks.start` | `{ name, input? }` |
+| `favetto_start_task` | `tasks.start` | `{ name, input?, agent?, provider?, model? }` |
 | `favetto_spawn` | `workflow.spawn` | `{ root_id?, name, input?, depends_on?, dedupe_key? }` |
 | `favetto_create_workflow` | `workflow.create` | `{ idempotency_key, root_id?, tasks: [{ key, name, input?, depends_on? }] }` |
 | `favetto_cancel_workflow` | `workflow.cancel` | `{ root_id }` |
