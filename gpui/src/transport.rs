@@ -250,6 +250,10 @@ typed_calls! {
     catalog_get => CatalogGetCall,
     /// `agents.list`.
     agents_list => AgentsListCall,
+    /// `agents.start`.
+    agents_start => AgentsStartCall,
+    /// `agents.close`.
+    agents_close => AgentsCloseCall,
     /// `agents.load`.
     agents_load => AgentsLoadCall,
     /// `agents.prompt`.

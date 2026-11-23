@@ -31,6 +31,14 @@ actions!(
         GoInbox,
         /// Jump to Tasks.
         GoTasks,
+        /// Jump to the free-standing Agent panel.
+        GoAgent,
+        /// Start a fresh standalone agent session (`n` on the Agent surface).
+        AgentNewSession,
+        /// Interrupt the standalone agent's current turn (`i`).
+        AgentInterrupt,
+        /// Close the standalone agent session (`x`).
+        AgentClose,
         /// Jump to the Catalog.
         GoCatalog,
         /// Jump to Workflows.
@@ -249,6 +257,26 @@ pub fn bindings() -> Vec<KeyBinding> {
             "g t",
             GoTasks,
             Some("Root && !Palette && !Shortcuts && !Search && !Confirm"),
+        ),
+        KeyBinding::new(
+            "g a",
+            GoAgent,
+            Some("Root && !Palette && !Shortcuts && !Search && !Confirm"),
+        ),
+        KeyBinding::new(
+            "n",
+            AgentNewSession,
+            Some("Agent && !Palette && !Shortcuts && !Search && !Confirm && !TextField"),
+        ),
+        KeyBinding::new(
+            "i",
+            AgentInterrupt,
+            Some("Agent && !Palette && !Shortcuts && !Search && !Confirm && !TextField"),
+        ),
+        KeyBinding::new(
+            "x",
+            AgentClose,
+            Some("Agent && !Palette && !Shortcuts && !Search && !Confirm && !TextField"),
         ),
         KeyBinding::new(
             "g c",
@@ -678,6 +706,8 @@ pub fn route_for_action(action: &dyn Action) -> Option<Route> {
         Some(Route::Inbox)
     } else if action.partial_eq(&GoTasks) {
         Some(Route::Tasks)
+    } else if action.partial_eq(&GoAgent) {
+        Some(Route::Agent)
     } else if action.partial_eq(&GoCatalog) {
         Some(Route::Catalog)
     } else if action.partial_eq(&GoWorkflows) {
@@ -717,6 +747,7 @@ mod tests {
     fn every_jump_action_maps_to_its_route() {
         assert_eq!(route_for_action(&GoInbox), Some(Route::Inbox));
         assert_eq!(route_for_action(&GoTasks), Some(Route::Tasks));
+        assert_eq!(route_for_action(&GoAgent), Some(Route::Agent));
         assert_eq!(route_for_action(&GoCatalog), Some(Route::Catalog));
         assert_eq!(route_for_action(&GoWorkflows), Some(Route::Workflows));
         assert_eq!(route_for_action(&GoSchedules), Some(Route::Schedules));
@@ -1058,6 +1089,33 @@ mod tests {
             .iter()
             .rposition(|name| matches!(name.as_str(), "ElicitationCancel" | "DetailPromptPrev"));
         assert!(first_text > last_shell);
+    }
+
+    #[test]
+    fn agent_shortcuts_are_scoped_to_the_agent_surface() {
+        for (action, key) in [
+            ("AgentNewSession", "n"),
+            ("AgentInterrupt", "i"),
+            ("AgentClose", "x"),
+        ] {
+            let matches: Vec<_> = bindings()
+                .into_iter()
+                .filter(|binding| {
+                    binding.action().name().ends_with(action)
+                        && binding
+                            .keystrokes()
+                            .iter()
+                            .any(|stroke| stroke.key() == key)
+                })
+                .collect();
+            assert_eq!(matches.len(), 1, "{action} must have one binding");
+            assert!(
+                matches[0]
+                    .predicate()
+                    .is_some_and(|predicate| predicate.to_string().contains("Agent")),
+                "{action} must be scoped to Agent"
+            );
+        }
     }
 
     #[test]

@@ -40,7 +40,7 @@ pub struct Command {
 }
 
 /// The palette's commands, in canonical (Serial Position) order.
-pub const COMMANDS: [Command; 9] = [
+pub const COMMANDS: [Command; 10] = [
     Command {
         id: "nav-inbox",
         label: "Go to Inbox",
@@ -54,6 +54,13 @@ pub const COMMANDS: [Command; 9] = [
         keywords: "tasks runs list filter search navigation jump",
         shortcut: Some("g t"),
         kind: CommandKind::Navigate(Route::Tasks),
+    },
+    Command {
+        id: "nav-agent",
+        label: "Go to Agent",
+        keywords: "agent session conversation acp free-standing navigation jump",
+        shortcut: Some("g a"),
+        kind: CommandKind::Navigate(Route::Agent),
     },
     Command {
         id: "nav-catalog",
@@ -290,6 +297,7 @@ mod tests {
             ("inbox", "nav-inbox"),
             ("inb", "nav-inbox"),
             ("tasks", "nav-tasks"),
+            ("agent", "nav-agent"),
             ("catalog", "nav-catalog"),
             ("workflows", "nav-workflows"),
             ("schedules", "nav-schedules"),
@@ -402,6 +410,7 @@ mod tests {
         for (query, expected) in [
             ("inbox", "nav-inbox"),
             ("tasks", "nav-tasks"),
+            ("agent", "nav-agent"),
             ("catalog", "nav-catalog"),
             ("workflows", "nav-workflows"),
             ("schedules", "nav-schedules"),
@@ -411,7 +420,7 @@ mod tests {
             palette.activate();
             assert!(palette.is_recent(expected));
         }
-        // Six distinct activations, but only five are remembered; the newest is first.
+        // Seven distinct activations, but only five are remembered; the newest is first.
         assert_eq!(
             palette.recent.to_vec(),
             vec![
@@ -419,7 +428,7 @@ mod tests {
                 "nav-schedules",
                 "nav-workflows",
                 "nav-catalog",
-                "nav-tasks"
+                "nav-agent"
             ]
         );
         // Re-activating an existing recent moves it to the front without duplicating.
