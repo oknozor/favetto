@@ -57,6 +57,53 @@ pub fn clamp_catalog_preview_width(desired: f32, available_width: f32) -> f32 {
     desired.clamp(CATALOG_PREVIEW_MIN_WIDTH, max)
 }
 
+/// The widest the shortcut sheet grows on a large window.
+pub const SHORTCUT_SHEET_MAX_WIDTH: f32 = 640.0;
+
+/// Breathing room between the shortcut sheet and the window edge.
+pub const SHORTCUT_SHEET_GUTTER: f32 = 24.0;
+
+/// Below this sheet width the shortcut groups stack into one column.
+///
+/// This is the panel width, not the viewport: a window narrower than
+/// [`SHORTCUT_SHEET_MAX_WIDTH`] plus two gutters already produces a narrower
+/// sheet even before the window drops below the breakpoint itself.
+pub const SHORTCUT_SHEET_SINGLE_COLUMN_WIDTH: f32 = 560.0;
+
+/// The size and column count of the shortcut sheet for a viewport.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShortcutSheetLayout {
+    /// The panel width, capped by the viewport minus a gutter on each side.
+    pub width: f32,
+    /// The panel height ceiling, leaving a gutter above and below.
+    pub max_height: f32,
+    /// `2` side by side, or `1` when the panel is too narrow.
+    pub columns: usize,
+}
+
+/// Bound the shortcut sheet to the viewport.
+///
+/// The sheet never grows wider than [`SHORTCUT_SHEET_MAX_WIDTH`] or taller than
+/// the space left after a [`SHORTCUT_SHEET_GUTTER`] on every side. The panel
+/// width also decides the column count so a narrow window reflows instead of
+/// crushing labels against their keycaps.
+pub fn shortcut_sheet_layout(viewport_width: f32, viewport_height: f32) -> ShortcutSheetLayout {
+    let gutter = 2.0 * SHORTCUT_SHEET_GUTTER;
+    let width = (viewport_width - gutter).clamp(0.0, SHORTCUT_SHEET_MAX_WIDTH);
+    let max_height = (viewport_height - gutter).max(0.0);
+    let columns = if width < SHORTCUT_SHEET_SINGLE_COLUMN_WIDTH {
+        1
+    } else {
+        2
+    };
+
+    ShortcutSheetLayout {
+        width,
+        max_height,
+        columns,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +200,60 @@ mod tests {
             clamp_catalog_preview_width(10_000.0, 400.0 - SIDEBAR_WIDTH),
             CATALOG_PREVIEW_MIN_WIDTH
         );
+    }
+
+    #[test]
+    fn the_shortcut_sheet_stays_inside_a_large_and_a_minimum_window() {
+        // The documented default remains the previous 640 px two-column panel,
+        // and an 800 px-tall window has room to spare below the 24 px gutters.
+        let large = shortcut_sheet_layout(1280.0, 800.0);
+        assert_eq!(large.width, SHORTCUT_SHEET_MAX_WIDTH);
+        assert_eq!(large.max_height, 800.0 - 2.0 * SHORTCUT_SHEET_GUTTER);
+        assert_eq!(large.columns, 2);
+
+        // At the supported 900x600 minimum the sheet still fits with a gutter
+        // on each edge instead of being centered past both of them.
+        let minimum = shortcut_sheet_layout(900.0, 600.0);
+        assert_eq!(minimum.width, SHORTCUT_SHEET_MAX_WIDTH);
+        assert_eq!(minimum.max_height, 600.0 - 2.0 * SHORTCUT_SHEET_GUTTER);
+        assert!(minimum.width < 900.0 - SHORTCUT_SHEET_GUTTER);
+        assert!(minimum.max_height < 600.0);
+
+        // A capped panel still leaves at least the gutter free on both sides,
+        // and the height ceiling leaves exactly one gutter above and below.
+        assert!(large.width + 2.0 * SHORTCUT_SHEET_GUTTER <= 1280.0);
+        assert_eq!(large.max_height + 2.0 * SHORTCUT_SHEET_GUTTER, 800.0);
+    }
+
+    #[test]
+    fn the_shortcut_sheet_shrinks_and_reflows_below_the_column_breakpoint() {
+        // A forced/tiled window narrower than the sheet: the panel follows the
+        // available width and the paired groups become one column.
+        let narrow = shortcut_sheet_layout(500.0, 600.0);
+        assert_eq!(narrow.width, 500.0 - 2.0 * SHORTCUT_SHEET_GUTTER);
+        assert_eq!(narrow.columns, 1);
+
+        // The transition is measured on the panel width: 559 px is still one
+        // column, 560 px has room for two.
+        let one_column = shortcut_sheet_layout(
+            SHORTCUT_SHEET_SINGLE_COLUMN_WIDTH + 2.0 * SHORTCUT_SHEET_GUTTER - 1.0,
+            600.0,
+        );
+        assert_eq!(one_column.width, SHORTCUT_SHEET_SINGLE_COLUMN_WIDTH - 1.0);
+        assert_eq!(one_column.columns, 1);
+
+        let two_columns = shortcut_sheet_layout(
+            SHORTCUT_SHEET_SINGLE_COLUMN_WIDTH + 2.0 * SHORTCUT_SHEET_GUTTER,
+            600.0,
+        );
+        assert_eq!(two_columns.width, SHORTCUT_SHEET_SINGLE_COLUMN_WIDTH);
+        assert_eq!(two_columns.columns, 2);
+
+        // A viewport smaller than the gutter itself never yields a negative
+        // size, so layout maths cannot overflow the window in either axis.
+        let tiny = shortcut_sheet_layout(10.0, 10.0);
+        assert_eq!(tiny.width, 0.0);
+        assert_eq!(tiny.max_height, 0.0);
+        assert_eq!(tiny.columns, 1);
     }
 }

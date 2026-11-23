@@ -36,7 +36,7 @@ use crate::actions::{
 };
 use crate::catalog::OneShotFocus;
 use crate::components;
-use crate::layout::{clamp_detail_width, container_query, LayoutMode};
+use crate::layout::{clamp_detail_width, container_query, shortcut_sheet_layout, LayoutMode};
 use crate::palette::{CommandKind, CommandPalette};
 use crate::repos::RepoOption;
 use crate::resize::{ResizeDrag, ResizePreview, ResizeStart};
@@ -1414,7 +1414,10 @@ impl RootView {
             .child(panel)
     }
 
-    fn shortcuts_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
+    fn shortcuts_overlay(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> Div {
+        let viewport = window.viewport_size();
+        let layout = shortcut_sheet_layout(f32::from(viewport.width), f32::from(viewport.height));
+
         let close = components::with_focus(
             div()
                 .id("shortcuts-close")
@@ -1497,10 +1500,47 @@ impl RootView {
             ("Newline (multiline)", "⇧↵"),
         ];
 
-        let panel = div()
-            .w(px(640.0))
+        let body = div()
+            .id("shortcut-sheet-body")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
             .flex()
             .flex_col()
+            .gap(px(theme.spacing.s3))
+            .child(shortcut_group(
+                theme,
+                layout.columns,
+                shortcut_section(theme, "COMMANDS", &commands),
+                shortcut_section(theme, "NAVIGATION", &navigation),
+            ))
+            .child(shortcut_group(
+                theme,
+                layout.columns,
+                shortcut_section(theme, "TASKS", &tasks),
+                shortcut_section(theme, "CATALOG", &catalog),
+            ))
+            .child(shortcut_group(
+                theme,
+                layout.columns,
+                shortcut_section(theme, "WORKFLOWS", &workflows),
+                shortcut_section(theme, "SCHEDULES", &schedules),
+            ))
+            .child(shortcut_group(
+                theme,
+                layout.columns,
+                shortcut_section(theme, "DETAIL", &detail),
+                shortcut_section(theme, "ANYWHERE", &anywhere),
+            ))
+            .child(shortcut_section(theme, "TEXT FIELDS", &text_fields));
+
+        let panel = div()
+            .w(px(layout.width))
+            .max_h(px(layout.max_height))
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
             .gap(px(theme.spacing.s3))
             .p(px(theme.spacing.s4))
             .rounded(px(theme.radii.r12))
@@ -1510,6 +1550,7 @@ impl RootView {
             .shadow_lg()
             .child(
                 div()
+                    .flex_none()
                     .flex()
                     .items_center()
                     .justify_between()
@@ -1522,45 +1563,7 @@ impl RootView {
                     )
                     .child(close),
             )
-            .child(
-                div()
-                    .flex()
-                    .gap(px(theme.spacing.s6))
-                    .items_start()
-                    .child(shortcut_section(theme, "COMMANDS", &commands))
-                    .child(shortcut_section(theme, "NAVIGATION", &navigation)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap(px(theme.spacing.s6))
-                    .items_start()
-                    .child(shortcut_section(theme, "TASKS", &tasks))
-                    .child(shortcut_section(theme, "CATALOG", &catalog)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap(px(theme.spacing.s6))
-                    .items_start()
-                    .child(shortcut_section(theme, "WORKFLOWS", &workflows))
-                    .child(shortcut_section(theme, "SCHEDULES", &schedules)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap(px(theme.spacing.s6))
-                    .items_start()
-                    .child(shortcut_section(theme, "DETAIL", &detail))
-                    .child(shortcut_section(theme, "ANYWHERE", &anywhere)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap(px(theme.spacing.s6))
-                    .items_start()
-                    .child(shortcut_section(theme, "TEXT FIELDS", &text_fields)),
-            );
+            .child(body);
 
         div()
             .absolute()
@@ -2339,7 +2342,6 @@ fn backend_hint(theme: &Theme) -> Div {
 /// One column of the shortcut sheet.
 fn shortcut_section(theme: &Theme, title: &str, rows: &[(&str, &str)]) -> Div {
     div()
-        .flex_1()
         .min_w_0()
         .flex()
         .flex_col()
@@ -2349,6 +2351,20 @@ fn shortcut_section(theme: &Theme, title: &str, rows: &[(&str, &str)]) -> Div {
             rows.iter()
                 .map(|(label, keys)| components::shortcut_row(theme, label, keys)),
         )
+}
+
+/// Place a pair of shortcut sections side by side, or stack them when the
+/// sheet is too narrow for two readable columns.
+fn shortcut_group(theme: &Theme, columns: usize, left: Div, right: Div) -> Div {
+    let group = div().flex().gap(px(theme.spacing.s6));
+    if columns == 1 {
+        group.flex_col().child(left).child(right)
+    } else {
+        group
+            .items_start()
+            .child(div().flex_1().min_w_0().child(left))
+            .child(div().flex_1().min_w_0().child(right))
+    }
 }
 
 impl TextHost for RootView {
@@ -3079,7 +3095,7 @@ impl Render for RootView {
         if palette_open {
             root.child(self.palette_overlay(theme, window, cx, cx.entity()))
         } else if shortcuts_open {
-            root.child(self.shortcuts_overlay(theme, cx))
+            root.child(self.shortcuts_overlay(theme, window, cx))
         } else {
             let mut root = root;
             if let Some(toast) = &toast {
