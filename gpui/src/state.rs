@@ -41,7 +41,7 @@ use crate::schedules::{
 };
 use crate::settings::{SettingsActivate, SettingsFocus, SettingsState};
 use crate::sse::Push;
-use crate::tasks::{self, TaskAction, TaskFilter, TaskList};
+use crate::tasks::{self, TaskAction, TaskCommand, TaskFilter, TaskList};
 use crate::text_element::{TextEditState, TextHost};
 use crate::text_input::{TextInput, TextTarget};
 use crate::theme::Theme;
@@ -134,12 +134,12 @@ pub struct Toast {
     id: u64,
 }
 
-/// A cancel/retry awaiting explicit confirmation (docs §2, Hick's Law: the
-/// destructive action is separated from the row and names the task).
+/// A cancel/retry/delete awaiting explicit confirmation (docs §2, Hick's Law:
+/// the destructive action is separated from the row and names the task).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskConfirm {
     /// Which RPC will run.
-    pub action: TaskAction,
+    pub action: TaskCommand,
     /// The task the action applies to.
     pub task_id: uuid::Uuid,
     /// The display name shown in the dialog.
@@ -150,38 +150,63 @@ impl TaskConfirm {
     /// The dialog title.
     pub fn title(&self) -> &'static str {
         match self.action {
-            TaskAction::Cancel => "Cancel task",
-            TaskAction::Retry => "Retry task",
+            TaskCommand::Cancel => "Cancel task",
+            TaskCommand::Retry => "Retry task",
+            TaskCommand::Delete => "Delete run",
         }
     }
 
     /// The confirm button label.
     pub fn confirm_label(&self) -> &'static str {
         match self.action {
-            TaskAction::Cancel => "Cancel task",
-            TaskAction::Retry => "Retry task",
+            TaskCommand::Cancel => "Cancel task",
+            TaskCommand::Retry => "Retry task",
+            TaskCommand::Delete => "Delete run",
         }
     }
 
-    /// Whether the confirm button uses the destructive style. Cancel is the
-    /// only danger-colored control on the surface (docs §2, Von Restorff).
+    /// Whether the confirm button uses the destructive style. Cancel and delete
+    /// are mutually exclusive by status, so at most one visible control is
+    /// danger-colored (docs §2, Von Restorff).
     pub fn danger(&self) -> bool {
-        self.action == TaskAction::Cancel
+        matches!(self.action, TaskCommand::Cancel | TaskCommand::Delete)
     }
 
     /// The consequence, with the task name in quotes.
     pub fn body(&self) -> String {
         match self.action {
-            TaskAction::Cancel => format!(
+            TaskCommand::Cancel => format!(
                 "Cancel '{}'? Any in-flight agent process is stopped.",
                 self.task_name
             ),
-            TaskAction::Retry => format!(
+            TaskCommand::Retry => format!(
                 "Retry '{}'? Its prior run history is preserved.",
+                self.task_name
+            ),
+            TaskCommand::Delete => format!(
+                "Delete '{}'? This permanently removes the run and all of its recorded \
+                 attempts from Favetto history. Their token and cost usage disappears from \
+                 usage stats, any worktree and branch is cleaned up, and workflow members \
+                 lose this dependency edge. The agent provider's own transcript is not \
+                 deleted. This cannot be undone.",
                 self.task_name
             ),
         }
     }
+}
+
+/// The row and detail snapshot an optimistic `tasks.delete` removed. Kept only
+/// until the RPC replies, so a failure can restore the exact prior surface.
+#[derive(Debug)]
+struct DeletedTaskSnapshot {
+    /// The removed task row, re-inserted at `index` on rollback.
+    task: Task,
+    /// The row's position in the snapshot at removal time.
+    index: usize,
+    /// The detail that was open for this task, if any.
+    detail: Option<TaskDetail>,
+    /// Whether the narrow layout was showing that detail page.
+    detail_open: bool,
 }
 
 /// Cached derivations of the task/session snapshot.
@@ -245,8 +270,11 @@ pub struct ClientState {
     /// Launch failures the user dismissed in this client process, keyed by
     /// `(task id, attempt)` so a fresh attempt warns again.
     dismissed_launch_failures: HashSet<launch::LaunchKey>,
-    /// The cancel/retry awaiting confirmation.
+    /// The cancel/retry/delete awaiting confirmation.
     task_confirm: Option<TaskConfirm>,
+    /// The snapshot an in-flight optimistic delete removed, for a guarded
+    /// rollback if the RPC fails.
+    deleted_task: Option<DeletedTaskSnapshot>,
     /// The current toast and its monotonic id.
     toast: Option<Toast>,
     toast_id: u64,
@@ -360,6 +388,7 @@ impl ClientState {
             tasks_selected_index: 0,
             dismissed_launch_failures: HashSet::new(),
             task_confirm: None,
+            deleted_task: None,
             toast: None,
             toast_id: 0,
             selected_task: None,
@@ -490,6 +519,23 @@ impl ClientState {
                                 // A retry owns a fresh agent conversation; resolve
                                 // it again instead of showing the previous one.
                                 self.start_session_restore(task.id);
+                            }
+                        }
+                        self.refresh_snapshot();
+                    }
+                    // A run was permanently deleted. Remove it from every
+                    // client surface instead of upserting a row that no longer
+                    // exists; an open detail is closed.
+                    Push::TaskDeleted(push) => {
+                        let id = push.id;
+                        let workflow_root = self.workflow_detail.as_ref().and_then(|detail| {
+                            (detail.root_id == id || detail.rows.iter().any(|row| row.id == id))
+                                .then_some(detail.root_id)
+                        });
+                        let _ = self.remove_task_for_delete(id);
+                        if self.active_route == Route::Workflows {
+                            if let Some(root_id) = workflow_root {
+                                self.load_workflow_inspect(root_id);
                             }
                         }
                         self.refresh_snapshot();
@@ -1222,6 +1268,45 @@ impl ClientState {
                     .is_some_and(|detail| detail.task_id == previous.id)
                 {
                     self.load_detail(previous.id);
+                }
+                self.refresh_snapshot();
+            }
+            Update::TaskDeleteFinished { task_id, result } => {
+                let name = self
+                    .deleted_task
+                    .as_ref()
+                    .map(|snapshot| inbox::task_display_name(&snapshot.task.name).to_string())
+                    .unwrap_or_else(|| task_id.to_string());
+                match result {
+                    Ok(result) => {
+                        self.deleted_task = None;
+                        if result.deleted {
+                            self.show_toast(ToastKind::Success, format!("Deleted '{name}'."), cx);
+                        } else {
+                            // Another client (or retention) already removed it;
+                            // the optimistic removal is still correct.
+                            self.show_toast(
+                                ToastKind::Info,
+                                format!("'{name}' was already removed."),
+                                cx,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        if error.is_unauthorized() {
+                            self.connection = ConnectionState::Unauthorized {
+                                token_path: self.config.token_source.label(),
+                            };
+                        }
+                        if let Some(snapshot) = self.deleted_task.take() {
+                            self.restore_deleted_task(snapshot);
+                        }
+                        self.show_toast(
+                            ToastKind::Error,
+                            format!("Could not delete '{name}': {error}. The run was restored."),
+                            cx,
+                        );
+                    }
                 }
                 self.refresh_snapshot();
             }
@@ -3621,9 +3706,10 @@ impl ClientState {
         Some(task_id)
     }
 
-    /// Open the cancel/retry confirmation for the highlighted row. Actions that
-    /// cannot apply are explained instead of silently doing nothing.
-    pub fn request_task_action(&mut self, action: TaskAction, cx: &mut Context<Self>) {
+    /// Open the cancel/retry/delete confirmation for the highlighted row.
+    /// Actions that cannot apply are explained instead of silently doing
+    /// nothing.
+    pub fn request_task_action(&mut self, action: TaskCommand, cx: &mut Context<Self>) {
         let list = self.task_list();
         let Some(task_id) = list.selected_id(self.tasks_selected, self.tasks_selected_index) else {
             self.show_toast(ToastKind::Info, "Select a run first.".to_string(), cx);
@@ -3632,17 +3718,19 @@ impl ClientState {
         let Some(row) = list.rows.iter().find(|row| row.id == task_id) else {
             return;
         };
-        let allowed = match action {
-            TaskAction::Cancel => tasks::can_cancel(row.status),
-            TaskAction::Retry => tasks::can_retry(row.status),
-        };
-        if !allowed {
+        if !action.can_apply(row.status) {
             let message = match action {
-                TaskAction::Cancel => {
+                TaskCommand::Cancel => {
                     format!("'{}' has already finished. Press r to retry it.", row.name)
                 }
-                TaskAction::Retry => {
+                TaskCommand::Retry => {
                     format!("'{}' is still active. Cancel it before retrying.", row.name)
+                }
+                TaskCommand::Delete => {
+                    format!(
+                        "'{}' is still active. Only finished runs can be deleted.",
+                        row.name
+                    )
                 }
             };
             self.show_toast(ToastKind::Info, message, cx);
@@ -3686,8 +3774,12 @@ impl ClientState {
             return true;
         };
 
+        let Some(action) = confirm.action.action() else {
+            return self.accept_delete_confirm(confirm, cx);
+        };
+
         let mut optimistic = previous.clone();
-        match confirm.action {
+        match action {
             TaskAction::Cancel => {
                 optimistic.status = TaskStatus::Cancelled;
                 optimistic.finished_at = Some(Timestamp::now());
@@ -3707,7 +3799,7 @@ impl ClientState {
                 detail.task = Some(optimistic_snapshot.clone());
                 detail.task_loading = false;
                 detail.task_error = None;
-                if confirm.action == TaskAction::Retry {
+                if action == TaskAction::Retry {
                     // A retry starts a new attempt: the prior feed and attempt
                     // rows belong to the old run, so clear them until the
                     // reconciling reload lands.
@@ -3726,7 +3818,7 @@ impl ClientState {
         }
 
         if let Some(runtime) = &self.runtime {
-            runtime.task_action(confirm.action, previous, optimistic_snapshot);
+            runtime.task_action(action, previous, optimistic_snapshot);
         } else {
             self.rollback_task(&previous, &optimistic_snapshot);
             if let Some(detail) = self.detail.as_mut() {
@@ -3741,6 +3833,94 @@ impl ClientState {
             );
         }
         true
+    }
+
+    /// Confirm a delete: remove the row and its detail immediately, then send
+    /// `tasks.delete`. The snapshot stays in `deleted_task` so
+    /// [`Update::TaskDeleteFinished`] can restore it on failure.
+    fn accept_delete_confirm(&mut self, confirm: TaskConfirm, cx: &mut Context<Self>) -> bool {
+        let Some(snapshot) = self.remove_task_for_delete(confirm.task_id) else {
+            self.show_toast(
+                ToastKind::Error,
+                "That run is no longer in the list.".to_string(),
+                cx,
+            );
+            return true;
+        };
+        self.deleted_task = Some(snapshot);
+
+        if let Some(runtime) = &self.runtime {
+            runtime.delete_task(confirm.task_id);
+        } else if let Some(snapshot) = self.deleted_task.take() {
+            self.restore_deleted_task(snapshot);
+            self.show_toast(
+                ToastKind::Error,
+                "The transport is not running. The run was restored.".to_string(),
+                cx,
+            );
+        }
+        true
+    }
+
+    /// Remove one task row (and its open detail) without an RPC. Returns the
+    /// snapshot needed for a rollback, or `None` when the row is already gone
+    /// (a `task.deleted` push then still closes a matching stale detail).
+    fn remove_task_for_delete(&mut self, task_id: uuid::Uuid) -> Option<DeletedTaskSnapshot> {
+        let position = self.tasks.iter().position(|task| task.id == task_id);
+
+        let detail_open = self
+            .detail
+            .as_ref()
+            .is_some_and(|detail| detail.task_id == task_id && self.selected_task == Some(task_id));
+        let detail = self
+            .detail
+            .as_ref()
+            .filter(|detail| detail.task_id == task_id)
+            .cloned();
+        if detail.is_some() {
+            self.detail = None;
+            self.selected_task = None;
+            self.detail_open = false;
+        }
+
+        let Some(index) = position else {
+            self.touch_snapshot();
+            return None;
+        };
+        let task = self.tasks.remove(index);
+
+        // Keep the list highlight on an adjacent row when the selected row was
+        // the deleted one; resolve against the shortened list.
+        if self.tasks_selected == Some(task_id) {
+            let next = index.min(self.tasks.len().saturating_sub(1));
+            self.tasks_selected = self.tasks.get(next).map(|task| task.id);
+            self.tasks_selected_index = next;
+        }
+        self.touch_snapshot();
+
+        Some(DeletedTaskSnapshot {
+            task,
+            index,
+            detail,
+            detail_open,
+        })
+    }
+
+    /// Undo an optimistic delete after the RPC failed. A newer push or refresh
+    /// that already restored the row wins, so this never duplicates it.
+    fn restore_deleted_task(&mut self, snapshot: DeletedTaskSnapshot) {
+        if !self.tasks.iter().any(|task| task.id == snapshot.task.id) {
+            let index = snapshot.index.min(self.tasks.len());
+            self.tasks.insert(index, snapshot.task);
+        }
+        if let Some(detail) = snapshot.detail {
+            if self.detail.is_none() {
+                self.selected_task = Some(detail.task_id);
+                self.detail_open = snapshot.detail_open;
+                self.detail = Some(detail);
+            }
+        }
+        self.touch_snapshot();
     }
 
     /// The current toast, if one is visible.
@@ -4519,25 +4699,25 @@ impl ClientState {
         self.show_toast(ToastKind::Success, "Copied the session id.".to_string(), cx);
     }
 
-    /// Cancel/retry for the open detail, with the same confirmation and
-    /// validation as the list rows (docs §2, Von Restorff: one danger control).
-    pub fn request_detail_action(&mut self, action: TaskAction, cx: &mut Context<Self>) {
+    /// Cancel/retry/delete for the open detail, with the same confirmation and
+    /// validation as the list rows (docs §2, Von Restorff: one visible danger
+    /// control).
+    pub fn request_detail_action(&mut self, action: TaskCommand, cx: &mut Context<Self>) {
         let Some(task) = self.selected_task().cloned() else {
             self.show_toast(ToastKind::Info, "Select a run first.".to_string(), cx);
             return;
         };
-        let allowed = match action {
-            TaskAction::Cancel => tasks::can_cancel(task.status),
-            TaskAction::Retry => tasks::can_retry(task.status),
-        };
-        if !allowed {
+        if !action.can_apply(task.status) {
             let name = inbox::task_display_name(&task.name);
             let message = match action {
-                TaskAction::Cancel => {
+                TaskCommand::Cancel => {
                     format!("'{name}' has already finished. Retry it instead.")
                 }
-                TaskAction::Retry => {
+                TaskCommand::Retry => {
                     format!("'{name}' is still active. Cancel it before retrying.")
+                }
+                TaskCommand::Delete => {
+                    format!("'{name}' is still active. Only finished runs can be deleted.")
                 }
             };
             self.show_toast(ToastKind::Info, message, cx);
@@ -4849,7 +5029,7 @@ mod tests {
     #[test]
     fn the_confirmation_names_the_task_and_its_consequence() {
         let cancel = TaskConfirm {
-            action: TaskAction::Cancel,
+            action: TaskCommand::Cancel,
             task_id: uuid::Uuid::from_u128(1),
             task_name: "triage".to_string(),
         };
@@ -4860,7 +5040,7 @@ mod tests {
         assert!(cancel.body().contains("agent process"));
 
         let retry = TaskConfirm {
-            action: TaskAction::Retry,
+            action: TaskCommand::Retry,
             task_id: uuid::Uuid::from_u128(2),
             task_name: "release".to_string(),
         };
@@ -4868,6 +5048,21 @@ mod tests {
         assert!(!retry.danger());
         assert!(retry.body().contains("'release'"));
         assert!(retry.body().contains("prior run history"));
+
+        let delete = TaskConfirm {
+            action: TaskCommand::Delete,
+            task_id: uuid::Uuid::from_u128(3),
+            task_name: "noisy".to_string(),
+        };
+        assert_eq!(delete.title(), "Delete run");
+        assert_eq!(delete.confirm_label(), "Delete run");
+        assert!(delete.danger(), "delete uses the destructive style");
+        let body = delete.body();
+        assert!(body.contains("'noisy'"), "{body}");
+        assert!(body.contains("cannot be undone"), "{body}");
+        assert!(body.contains("usage stats"), "{body}");
+        assert!(body.contains("worktree"), "{body}");
+        assert!(body.contains("transcript is not deleted"), "{body}");
     }
 
     fn test_state() -> ClientState {

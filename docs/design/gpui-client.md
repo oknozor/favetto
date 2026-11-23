@@ -27,7 +27,7 @@ without relearning the product.
 │ Workflows│  │ awaiting permission  ▶          │  │  ── tabs ──      │
 │ Schedules│  └─────────────────────────────────┘  │  Output          │
 │ Settings │  Recent                               │  Runs            │
-│          │  …                                    │  [Cancel] [Retry]│
+│          │  …                                    │  [Cancel] [Delete]│
 └──────────┴───────────────────────────────────────┴─────────────────┘
 ```
 
@@ -46,7 +46,13 @@ without relearning the product.
   short of the navigation rail, and the list beside it collapses to that gap.
 - **One primary action per view** (**Hick's Law**, **Choice Overload**). Inbox
   rows: *open*. Task detail: *answer permission* when blocked, otherwise
-  *cancel/retry*. Everything else lives behind the command palette or a menu.
+  *cancel* while live and *retry/delete* once terminal. Everything else lives
+  behind the command palette or a menu.
+- **Delete is terminal-only and confirmed.** A finished run's detail header
+  exposes a danger-styled **Delete run** action, separated from the
+  non-destructive controls. Live, pending and awaiting-input runs never show it
+  (the daemon rejects them too), and confirming permanently removes the row, its
+  attempts and its dependency edges after an explicit, named warning.
 - **Keyboard first** (**Fitts's Law**): every list is operable with ↑/↓/Enter;
   `⌘K` (Ctrl+K) opens a searchable command palette; `g`-prefixed jumps
   (`g i`, `g t`, `g c`, `g w`) mirror the TUI's muscle memory (**Jakob's Law**).
@@ -57,7 +63,7 @@ without relearning the product.
 |---|---|---|
 | **Inbox** | "What needs me now?" | Open the blocked/failed run |
 | **Tasks** | All runs, filter and search | Open detail; cancel/retry |
-| **Task detail** | Understand and steer one run | Answer permission, cancel, retry |
+| **Task detail** | Understand and steer one run | Answer permission, cancel, retry, delete |
 | **Catalog** | Find and launch a definition | Start with variables |
 | **Workflows** | One root's DAG and progress | Inspect; cancel root / retry node |
 | **Schedules** | Recurring triggers | Create/edit/delete |

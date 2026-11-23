@@ -32,6 +32,7 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | `tasks.session` | Resolve the Favetto-created agent session associated with a task, by Favetto-local id, preferring a live record over the most recently updated ended one. Returns `null` when the task has no session. |
 | `tasks.cancel` | Cancel a task. |
 | `tasks.retry` | Retry a terminal task, preserving its prior run history. |
+| `tasks.delete` | Permanently delete a terminal task, its recorded runs and its dependency edges. Non-terminal tasks are rejected. |
 | `tasks.start` | Start a catalog task by name. |
 | `tasks.start_oneshot` | Start a one-shot task from an inline definition (not added to the catalog) and open its interactive agent session. |
 | `catalog.list` | List the task catalog. |
@@ -293,6 +294,23 @@ Retry a terminal task, preserving its prior run history.
 | `provider` | string (optional) | — | no | Optional per-launch model provider override. Resolved atomically with [`Self::model`]: an override of either field never mixes with the definition's provider/model pair. |
 | `model` | string (optional) | — | no | Optional per-launch model id override (a bare id or `provider/model`). Absent for tasks that use the definition's or the agent's default model. |
 | `latest_usage` | AgentUsage (optional) | — | no | Usage reported by the task's current attempt, hydrated from its run row by `tasks.list` / `tasks.get`. It lets a finished task keep showing its token/cost totals after the live agent session leaves the registry (and after a daemon restart). Absent while the attempt has reported nothing or for payloads written before the field existed. |
+
+### `tasks.delete`
+
+Permanently delete a terminal task, its recorded runs and its dependency edges. Non-terminal tasks are rejected.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `id` | string | — | yes |  |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `id` | string | — | yes |  |
+| `deleted` | boolean | — | yes |  |
 
 ### `tasks.start`
 
@@ -1350,6 +1368,7 @@ Approve (or revoke) launching a stdio MCP command at the current definition fing
 |--------|---------|
 | `event` | A persisted event. |
 | `task.updated` | A task row changed. |
+| `task.deleted` | A task and its recorded run history were permanently deleted. |
 | `catalog.updated` | The task catalog changed on disk; clients should re-fetch it. |
 | `agent.exit` | An agent session's child process exited. |
 | `agent.state` | A session's folded live state (activity/usage) changed. |
@@ -1401,6 +1420,16 @@ A task row changed.
 | `provider` | string (optional) | — | no | Optional per-launch model provider override. Resolved atomically with [`Self::model`]: an override of either field never mixes with the definition's provider/model pair. |
 | `model` | string (optional) | — | no | Optional per-launch model id override (a bare id or `provider/model`). Absent for tasks that use the definition's or the agent's default model. |
 | `latest_usage` | AgentUsage (optional) | — | no | Usage reported by the task's current attempt, hydrated from its run row by `tasks.list` / `tasks.get`. It lets a finished task keep showing its token/cost totals after the live agent session leaves the registry (and after a daemon restart). Absent while the attempt has reported nothing or for payloads written before the field existed. |
+
+### `task.deleted`
+
+A task and its recorded run history were permanently deleted.
+
+**Payload**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `id` | string | — | yes |  |
 
 ### `catalog.updated`
 

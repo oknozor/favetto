@@ -238,6 +238,8 @@ typed_calls! {
     tasks_cancel => TasksCancelCall,
     /// `tasks.retry`.
     tasks_retry => TasksRetryCall,
+    /// `tasks.delete`.
+    tasks_delete => TasksDeleteCall,
     /// `tasks.start`.
     tasks_start => TasksStartCall,
     /// `tasks.start_oneshot`.
@@ -361,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn cancel_and_retry_requests_carry_the_task_id_and_method() {
+    fn cancel_retry_and_delete_requests_carry_the_task_id_and_method() {
         let id = uuid::Uuid::from_u128(42);
         let params = TaskIdParams { id };
         for (bytes, method_name) in [
@@ -372,6 +374,10 @@ mod tests {
             (
                 encode_request::<TasksRetryCall>(2, &params).expect("encode retry"),
                 method::TASKS_RETRY,
+            ),
+            (
+                encode_request::<TasksDeleteCall>(3, &params).expect("encode delete"),
+                method::TASKS_DELETE,
             ),
         ] {
             let frame: Frame = rmp_serde::from_slice(&bytes).expect("decode frame");

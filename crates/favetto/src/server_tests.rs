@@ -3252,3 +3252,141 @@ async fn tasks_start_accepts_a_repo_qualified_name() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `tasks.delete` removes terminal runs, rejects every non-terminal status, and
+/// is idempotent for an unknown id. It also publishes `task.deleted`.
+#[tokio::test]
+async fn tasks_delete_removes_terminal_runs_and_rejects_active_ones() {
+    use favetto_core::model::{RunStatus, TaskRun};
+
+    let dir = temp_dir("tasks-delete");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+
+    let make = |name: &str, status: TaskStatus| Task {
+        id: Uuid::new_v4(),
+        name: name.to_string(),
+        status,
+        attempt: 1,
+        input: serde_json::json!({}),
+        output: None,
+        dedupe_key: None,
+        created_at: Timestamp::now(),
+        started_at: Some(Timestamp::now()),
+        finished_at: Some(Timestamp::now()),
+        error: None,
+        failure: None,
+        session_id: None,
+        session_title: None,
+        parent_id: None,
+        root_id: None,
+        interactive: false,
+        agent: None,
+        provider: None,
+        model: None,
+        latest_usage: None,
+    };
+    let run = |task_id: Uuid| TaskRun {
+        id: Uuid::new_v4(),
+        task_id,
+        attempt: 1,
+        status: RunStatus::Succeeded,
+        agent: None,
+        model: None,
+        session_id: None,
+        started_at: Some(Timestamp::now()),
+        finished_at: Some(Timestamp::now()),
+        exit_code: Some(0),
+        error: None,
+        usage: None,
+        failure: None,
+    };
+
+    let done = make("done", TaskStatus::Succeeded);
+    let predecessor = make("predecessor", TaskStatus::Succeeded);
+    db::upsert_task(&state.db, &done).await.unwrap();
+    db::upsert_task(&state.db, &predecessor).await.unwrap();
+    db::insert_task_run(&state.db, &run(done.id)).await.unwrap();
+    db::insert_dependency(&state.db, done.id, predecessor.id, Timestamp::now())
+        .await
+        .unwrap();
+
+    let mut pushes = state.bus.subscribe();
+
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 1,
+            method: method::TASKS_DELETE.to_string(),
+            params: serde_json::json!({ "id": done.id }),
+        },
+    )
+    .await;
+    let result = resp.result.expect("delete result");
+    assert_eq!(result["id"], serde_json::json!(done.id));
+    assert_eq!(result["deleted"], serde_json::json!(true));
+    assert!(db::get_task(&state.db, done.id).await.unwrap().is_none());
+    assert!(db::list_task_runs(&state.db, done.id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(db::list_dependencies(&state.db, done.id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(
+        db::get_task(&state.db, predecessor.id)
+            .await
+            .unwrap()
+            .is_some(),
+        "the predecessor is untouched"
+    );
+
+    let push = tokio::time::timeout(std::time::Duration::from_secs(1), pushes.recv())
+        .await
+        .expect("task.deleted push timed out")
+        .expect("a push");
+    match push {
+        ServerPush::TaskDeleted(id) => assert_eq!(id, done.id),
+        other => panic!("expected task.deleted, got {other:?}"),
+    }
+
+    // Every non-terminal status is rejected without touching the row.
+    for status in [
+        TaskStatus::Pending,
+        TaskStatus::Running,
+        TaskStatus::AwaitingInput,
+    ] {
+        let active = make("active", status);
+        db::upsert_task(&state.db, &active).await.unwrap();
+        let resp = dispatch(
+            &state,
+            Request {
+                id: 2,
+                method: method::TASKS_DELETE.to_string(),
+                params: serde_json::json!({ "id": active.id }),
+            },
+        )
+        .await;
+        let error = resp.error.expect("non-terminal delete rejected");
+        assert_eq!(error.code, error_code::INVALID_PARAMS);
+        assert!(error.message.contains("not terminal"), "{}", error.message);
+        assert!(db::get_task(&state.db, active.id).await.unwrap().is_some());
+    }
+
+    // An unknown id is an idempotent no-op, not an error.
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 3,
+            method: method::TASKS_DELETE.to_string(),
+            params: serde_json::json!({ "id": Uuid::new_v4() }),
+        },
+    )
+    .await;
+    let result = resp.result.expect("idempotent delete result");
+    assert_eq!(result["deleted"], serde_json::json!(false));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

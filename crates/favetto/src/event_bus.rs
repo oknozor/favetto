@@ -21,6 +21,9 @@ pub enum ServerPush {
     /// output on demand with `tasks.get`. Boxed so the (much smaller) `Event`
     /// and `CatalogUpdated` pushes do not inherit `Task`'s size.
     TaskUpdated(Box<Task>),
+    /// A task and its recorded history were permanently deleted. Clients remove
+    /// the row; they must not upsert it as a `task.updated` would.
+    TaskDeleted(uuid::Uuid),
     /// The task catalog changed on disk; clients should re-fetch it.
     CatalogUpdated,
     /// One normalized agent-state event (non-durable). Carried on the bus so it
@@ -38,6 +41,10 @@ impl ServerPush {
         match self {
             ServerPush::Event(ev) => ev.into_notification(),
             ServerPush::TaskUpdated(t) => (*t).into_notification(),
+            ServerPush::TaskDeleted(id) => Ok(Notification {
+                method: push::TASK_DELETED.to_string(),
+                params: serde_json::to_value(favetto_core::rpc::TaskDeletedPush { id })?,
+            }),
             ServerPush::CatalogUpdated => Ok(Notification {
                 method: push::CATALOG_UPDATED.to_string(),
                 params: serde_json::json!({}),
@@ -189,6 +196,18 @@ mod tests {
 
     fn push_method() -> &'static str {
         favetto_core::rpc::push::AGENT_EVENT
+    }
+
+    #[test]
+    fn task_deleted_push_carries_only_the_id() {
+        let id = uuid::Uuid::new_v4();
+        let push = ServerPush::TaskDeleted(id);
+        assert_eq!(push.event_id(), None);
+        let n = push
+            .into_notification()
+            .expect("task deleted serialization");
+        assert_eq!(n.method, push::TASK_DELETED);
+        assert_eq!(n.params, serde_json::json!({ "id": id }));
     }
 
     #[test]

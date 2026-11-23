@@ -591,6 +591,11 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
             retry_task(state, p.id).await.and_then(to_value)
         }
 
+        method::TASKS_DELETE => {
+            let p: TaskIdParams = parse_params(&req.method, &req.params)?;
+            delete_task(state, p.id).await.and_then(to_value)
+        }
+
         method::TASKS_START => {
             let p: TasksStartParams = parse_params(&req.method, &req.params)?;
             let input = p.input.unwrap_or(serde_json::Value::Null);
@@ -2380,6 +2385,72 @@ fn upsert_hook(state: &Arc<State>, params: HookUpsertParams) -> anyhow::Result<(
     state.hook_store.write().push(hook);
     tracing::info!("added notification hook");
     Ok(())
+}
+
+/// Permanently delete a terminal task and its Favetto-local history.
+///
+/// `tasks.delete` is the single-run counterpart to the retention sweep. The
+/// status check is repeated twice on purpose: once here for a clear
+/// `InvalidParams` message, and again as a compare-and-set inside
+/// [`db::delete_task`] so a task that races into `pending`/`running` after this
+/// read can never be removed. An unknown or already-deleted id is idempotent
+/// (`deleted: false`) rather than an error.
+///
+/// A live interactive session blocks deletion: its process still writes to the
+/// run's worktree and would outlive the row. Headless leftovers are closed.
+async fn delete_task(state: &State, id: Uuid) -> Result<TasksDeleteResult, RpcError> {
+    let Some(task) = db::get_task(&state.db, id)
+        .await
+        .map_err(|e| RpcError::Internal(e.to_string()))?
+    else {
+        return Ok(TasksDeleteResult { id, deleted: false });
+    };
+    if !crate::executor::is_terminal(task.status) {
+        return Err(RpcError::InvalidParams(format!(
+            "task '{}' is not terminal (status '{}'); only succeeded, failed or cancelled runs can be deleted",
+            task.name,
+            task.status.as_str()
+        )));
+    }
+    if state.agents.has_live_interactive(&id.to_string()) {
+        return Err(RpcError::InvalidParams(format!(
+            "task '{}' still has a live interactive session; close it before deleting the run",
+            task.name
+        )));
+    }
+
+    let outcome = db::delete_task(&state.db, id)
+        .await
+        .map_err(|e| RpcError::Internal(e.to_string()))?;
+    if !outcome.deleted {
+        // The compare-and-set lost: either the row vanished (another delete) or
+        // it stopped being terminal. Distinguish them for the client.
+        return match db::get_task(&state.db, id).await {
+            Ok(None) => Ok(TasksDeleteResult { id, deleted: false }),
+            Ok(Some(fresh)) => Err(RpcError::InvalidParams(format!(
+                "task '{}' is no longer terminal (status '{}')",
+                fresh.name,
+                fresh.status.as_str()
+            ))),
+            Err(e) => Err(RpcError::Internal(e.to_string())),
+        };
+    }
+
+    // A headless session for a terminal run should already be gone; close any
+    // leftover so it cannot keep writing after its metadata was removed.
+    state.agents.close_by_task(&id.to_string()).await;
+    if let Some(worktree) = outcome.worktree {
+        crate::executor::remove_worktree(
+            &state.db,
+            id,
+            &worktree.repo,
+            &worktree.path,
+            &worktree.branch,
+        )
+        .await;
+    }
+    state.bus.publish(ServerPush::TaskDeleted(id));
+    Ok(TasksDeleteResult { id, deleted: true })
 }
 
 /// Re-enqueue a terminal task for a fresh attempt, preserving its run history.

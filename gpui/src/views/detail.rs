@@ -8,7 +8,8 @@
 //! - **Peak-End** — a finished run ends with its outcome and usage in the
 //!   header, and every tab has an explicit empty/error state with Retry.
 //! - **Von Restorff** — a blocked run gets the only warning-colored surface
-//!   (the permission banner), and Cancel is the only danger-colored action.
+//!   (the permission banner); Cancel (live) and Delete (terminal) are mutually
+//!   exclusive by status, so at most one danger-colored action is visible.
 //!
 //! The aggregation and feed grouping live in [`crate::detail`] (pure and
 //! unit-tested); this file only paints them.
@@ -56,6 +57,7 @@ pub struct DetailView {
     interrupt_focus: FocusHandle,
     retry_focus: FocusHandle,
     copy_focus: FocusHandle,
+    delete_focus: FocusHandle,
     workflow_focus: FocusHandle,
     session_focus: FocusHandle,
     follow_focus: FocusHandle,
@@ -122,6 +124,7 @@ impl DetailView {
             interrupt_focus: cx.focus_handle().tab_index(68).tab_stop(true),
             retry_focus: cx.focus_handle().tab_index(54).tab_stop(true),
             copy_focus: cx.focus_handle().tab_index(55).tab_stop(true),
+            delete_focus: cx.focus_handle().tab_index(49).tab_stop(true),
             session_focus: cx.focus_handle().tab_index(51).tab_stop(true),
             follow_focus: cx.focus_handle().tab_index(62).tab_stop(true),
             output_retry_focus: cx.focus_handle().tab_index(63).tab_stop(true),
@@ -401,7 +404,7 @@ impl DetailView {
             &self.cancel_focus,
             cx.listener(|this, _event, _window, cx| {
                 this.state.update(cx, |state, cx| {
-                    state.request_detail_action(tasks::TaskAction::Cancel, cx);
+                    state.request_detail_action(tasks::TaskCommand::Cancel, cx);
                     cx.notify();
                 });
             }),
@@ -414,7 +417,7 @@ impl DetailView {
             &self.retry_focus,
             cx.listener(|this, _event, _window, cx| {
                 this.state.update(cx, |state, cx| {
-                    state.request_detail_action(tasks::TaskAction::Retry, cx);
+                    state.request_detail_action(tasks::TaskCommand::Retry, cx);
                     cx.notify();
                 });
             }),
@@ -432,6 +435,23 @@ impl DetailView {
                 });
             }),
         );
+        // Delete is terminal-only and sits apart from the non-destructive
+        // controls, so a live run can never be removed by mistake.
+        let delete = tasks::can_delete(task.status).then(|| {
+            self.action_button(
+                theme,
+                "detail-delete",
+                "Delete run",
+                true,
+                &self.delete_focus,
+                cx.listener(|this, _event, _window, cx| {
+                    this.state.update(cx, |state, cx| {
+                        state.request_detail_action(tasks::TaskCommand::Delete, cx);
+                        cx.notify();
+                    });
+                }),
+            )
+        });
 
         let session_row = data.session_id.map(|session_id| {
             let value = session_id.to_string();
@@ -553,7 +573,17 @@ impl DetailView {
                     .child(workflow)
                     .child(cancel)
                     .child(retry)
-                    .child(copy),
+                    .child(copy)
+                    .when_some(delete, |row, delete| {
+                        row.child(
+                            div()
+                                .flex_shrink_0()
+                                .w(px(1.0))
+                                .h(px(18.0))
+                                .bg(theme.colors.border),
+                        )
+                        .child(delete)
+                    }),
             )
     }
 

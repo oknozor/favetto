@@ -30,6 +30,39 @@ pub enum TaskAction {
     Retry,
 }
 
+/// A command offered by the confirmation dialog. Deletion is kept separate from
+/// [`TaskAction`] because its RPC returns no task row: it removes the row
+/// locally instead of applying a `Task`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskCommand {
+    /// `tasks.cancel` on a live (non-terminal) task.
+    Cancel,
+    /// `tasks.retry` on a terminal task.
+    Retry,
+    /// `tasks.delete` on a terminal task.
+    Delete,
+}
+
+impl TaskCommand {
+    /// The cancel/retry RPC this command maps to, if it is not a delete.
+    pub fn action(self) -> Option<TaskAction> {
+        match self {
+            Self::Cancel => Some(TaskAction::Cancel),
+            Self::Retry => Some(TaskAction::Retry),
+            Self::Delete => None,
+        }
+    }
+
+    /// Whether the daemon accepts this command for `status`.
+    pub fn can_apply(self, status: TaskStatus) -> bool {
+        match self {
+            Self::Cancel => can_cancel(status),
+            Self::Retry => can_retry(status),
+            Self::Delete => can_delete(status),
+        }
+    }
+}
+
 /// The status of a row, as the list renders it. The typed [`TaskStatus`] cannot
 /// carry an unknown value, so this never hides a row or panics (docs §2,
 /// Postel's Law for the agent string, which is arbitrary text).
@@ -52,6 +85,13 @@ pub fn can_cancel(status: TaskStatus) -> bool {
 
 /// `tasks.retry` is accepted for a terminal run, matching the daemon's check.
 pub fn can_retry(status: TaskStatus) -> bool {
+    is_terminal(status)
+}
+
+/// `tasks.delete` is accepted only for a terminal run. "Not running" is not
+/// enough: a pending run may be queued and an awaiting-input run still has a
+/// live executor writing to it.
+pub fn can_delete(status: TaskStatus) -> bool {
     is_terminal(status)
 }
 
@@ -566,6 +606,7 @@ mod tests {
         ] {
             assert!(can_cancel(status));
             assert!(!can_retry(status));
+            assert!(!can_delete(status));
             assert!(!is_terminal(status));
         }
         for status in [
@@ -575,7 +616,26 @@ mod tests {
         ] {
             assert!(!can_cancel(status));
             assert!(can_retry(status));
+            assert!(can_delete(status));
             assert!(is_terminal(status));
+        }
+    }
+
+    #[test]
+    fn task_commands_map_to_their_rpc_and_status_guard() {
+        assert_eq!(TaskCommand::Cancel.action(), Some(TaskAction::Cancel));
+        assert_eq!(TaskCommand::Retry.action(), Some(TaskAction::Retry));
+        assert_eq!(TaskCommand::Delete.action(), None);
+
+        assert!(TaskCommand::Delete.can_apply(TaskStatus::Succeeded));
+        assert!(TaskCommand::Delete.can_apply(TaskStatus::Failed));
+        assert!(TaskCommand::Delete.can_apply(TaskStatus::Cancelled));
+        for status in [
+            TaskStatus::Pending,
+            TaskStatus::Running,
+            TaskStatus::AwaitingInput,
+        ] {
+            assert!(!TaskCommand::Delete.can_apply(status), "{status:?}");
         }
     }
 

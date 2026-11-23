@@ -15,7 +15,7 @@
 //! [`run`] touches the network.
 
 use favetto_wire::model::{AgentStateEvent, Event, Task};
-use favetto_wire::rpc::{push, AgentEventPush, AgentExitPush, AgentStatePush};
+use favetto_wire::rpc::{push, AgentEventPush, AgentExitPush, AgentStatePush, TaskDeletedPush};
 use serde::Deserialize;
 
 /// The outer shape of an `agent.event` push. The event itself stays raw until
@@ -61,6 +61,9 @@ pub enum Push {
     Event(Event),
     /// A task row changed (`task.updated`).
     TaskUpdated(Box<Task>),
+    /// A task and its history were deleted (`task.deleted`). Clients remove the
+    /// row; this is deliberately not a `task.updated`.
+    TaskDeleted(TaskDeletedPush),
     /// The catalog changed on disk; re-fetch it (`catalog.updated`).
     CatalogUpdated,
     /// One normalized agent-state event (`agent.event`).
@@ -88,6 +91,7 @@ impl Push {
         match self {
             Self::Event(event) => format!("event #{}", event.id),
             Self::TaskUpdated(task) => format!("task {} ({:?})", task.name, task.status),
+            Self::TaskDeleted(push) => format!("task {} deleted", push.id),
             Self::CatalogUpdated => "catalog updated".to_string(),
             Self::AgentEvent(event) => format!("agent event {} #{}", event.session_id, event.seq),
             Self::UnsupportedAgentEvent { session_id, seq } => {
@@ -138,6 +142,9 @@ pub fn decode_push(event: &SseEvent) -> Result<Option<Push>, PushError> {
         push::EVENT => serde_json::from_value::<Event>(params).map(Push::Event),
         push::TASK_UPDATED => {
             serde_json::from_value::<Task>(params).map(|task| Push::TaskUpdated(Box::new(task)))
+        }
+        push::TASK_DELETED => {
+            serde_json::from_value::<TaskDeletedPush>(params).map(Push::TaskDeleted)
         }
         push::AGENT_EVENT => return decode_agent_event(params).map(Some).map_err(failure),
         push::AGENT_STATE => serde_json::from_value::<AgentStatePush>(params).map(Push::AgentState),
@@ -571,6 +578,20 @@ mod tests {
             ..SseEvent::default()
         };
         assert!(decode_push(&anonymous).expect("ignored").is_none());
+    }
+
+    #[test]
+    fn task_deleted_decodes_the_id_without_a_row() {
+        let id = uuid::Uuid::new_v4();
+        let event = SseEvent {
+            event: Some(push::TASK_DELETED.to_string()),
+            data: serde_json::json!({ "id": id }).to_string(),
+            ..SseEvent::default()
+        };
+        match decode_push(&event).expect("decode") {
+            Some(Push::TaskDeleted(push)) => assert_eq!(push.id, id),
+            other => panic!("expected a deleted task push, got {other:?}"),
+        }
     }
 
     #[test]
