@@ -1774,18 +1774,10 @@ impl DetailView {
             sending,
             error,
         } = data;
-        let query = prompt
-            .strip_prefix('/')
-            .filter(|rest| !rest.chars().any(char::is_whitespace));
-        let matches: Vec<(usize, &AgentCommand)> = match query {
-            Some(query) => commands
-                .iter()
-                .enumerate()
-                .filter(|(_, command)| command.name.starts_with(query))
-                .take(5)
-                .collect(),
-            None => Vec::new(),
-        };
+        let matches: Vec<(usize, &AgentCommand)> = detail::matching_commands(commands, prompt)
+            .into_iter()
+            .take(5)
+            .collect();
         let exact = prompt
             .strip_prefix('/')
             .and_then(|rest| rest.split_whitespace().next())
@@ -1838,8 +1830,8 @@ impl DetailView {
                             .child("↵ send · tab complete · esc close"),
                     ),
             );
-        for (index, command) in matches {
-            let active = selected.unwrap_or(0) == index;
+        for (position, (index, command)) in matches.into_iter().enumerate() {
+            let active = selected.unwrap_or(0) == position;
             let row = div()
                 .id(("detail-command", index))
                 .flex()

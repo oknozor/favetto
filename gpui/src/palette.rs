@@ -7,10 +7,8 @@
 //! Ordering follows docs §2: a recent command is one keystroke away (Working
 //! Memory), and an empty query lists recents first before the canonical order.
 
-use fuzzy_matcher::skim::SkimMatcherV2;
-use fuzzy_matcher::FuzzyMatcher;
-
 use crate::routes::Route;
+use crate::search::{self, SearchField, SearchQuery};
 
 /// What running a command does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,30 +169,22 @@ impl CommandPalette {
     /// The commands matching the current query. With an empty query this is
     /// recents first, then every command in canonical order, each exactly once.
     pub fn filtered(&self) -> Vec<&'static Command> {
-        let query = self.query.trim();
+        let query = SearchQuery::new(&self.query);
         if query.is_empty() {
             return self.recent_first();
         }
 
-        let matcher = SkimMatcherV2::default();
+        let matcher = search::matcher();
         let mut scored = Vec::new();
         for (position, command) in COMMANDS.iter().enumerate() {
-            let label_score = matcher.fuzzy_match(command.label, query);
-            let keyword_score = matcher.fuzzy_match(command.keywords, query);
-            let mut score = 0i64;
-            let mut matched = false;
-            // A label hit outranks a keyword-only hit.
-            if let Some(label) = label_score {
-                matched = true;
-                score += label.saturating_add(100);
-            }
-            if let Some(keyword) = keyword_score {
-                matched = true;
-                score += keyword;
-            }
-            if !matched {
+            let fields = [
+                SearchField::new(command.label, search::weight::LABEL),
+                SearchField::new(command.keywords, search::weight::META),
+            ];
+            let Some(mut score) = query.score(&matcher, &fields).map(|matched| matched.score)
+            else {
                 continue;
-            }
+            };
             // Recents win ties and near-ties, so a command used moments ago is
             // immediately at hand even with a short query.
             if let Some(recent_position) = self.recent.iter().position(|id| *id == command.id) {
