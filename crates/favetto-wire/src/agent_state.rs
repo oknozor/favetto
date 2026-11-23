@@ -1047,6 +1047,145 @@ impl RunSummary {
             && self.outcome.is_none()
             && self.error.is_none()
     }
+
+    /// Fold one normalized event into the durable summary.
+    ///
+    /// This is the server-side counterpart of the clients' live feed grouping:
+    /// assistant text and reasoning accumulate, tool events update the card
+    /// opened by `ToolStarted`, usage follows the same merge/replace rule as
+    /// the live client state, and the last error/outcome win. Events with no
+    /// summary representation are ignored.
+    pub fn apply_event(&mut self, event: &AgentStateEvent) {
+        match event {
+            AgentStateEvent::Session {
+                session_id, title, ..
+            } => {
+                if let Some(session_id) = session_id.as_deref().filter(|id| !id.is_empty()) {
+                    self.session_id = Some(session_id.to_string());
+                }
+                if let Some(title) = title.as_deref().filter(|title| !title.trim().is_empty()) {
+                    self.title = Some(title.to_string());
+                }
+            }
+            AgentStateEvent::Title { title } => self.title = Some(title.clone()),
+            AgentStateEvent::TextDelta {
+                role: MessageRole::Assistant,
+                text,
+            } => self.text.push_str(text),
+            AgentStateEvent::ReasoningDelta { text } => self.reasoning.push_str(text),
+            AgentStateEvent::ToolStarted {
+                id,
+                name,
+                input,
+                detail,
+                ..
+            } => self.upsert_tool(id, name, input.clone(), false, None, detail.clone()),
+            AgentStateEvent::ToolUpdated { id, detail, .. } => {
+                if let Some(call) = self.tool_calls.iter_mut().find(|call| call.id == *id) {
+                    if let Some(detail) = detail {
+                        if call.name.is_empty() {
+                            call.name = detail
+                                .name
+                                .clone()
+                                .or_else(|| detail.title.clone())
+                                .unwrap_or_default();
+                        }
+                        if let Some(input) = &detail.input {
+                            call.input = input.clone();
+                        }
+                        call.output = detail.output.clone().or_else(|| call.output.take());
+                        call.detail = Some(detail.clone());
+                    }
+                } else {
+                    let (name, input, ok, output) = match detail {
+                        Some(detail) => (
+                            detail
+                                .name
+                                .clone()
+                                .or_else(|| detail.title.clone())
+                                .unwrap_or_default(),
+                            detail.input.clone().unwrap_or(serde_json::Value::Null),
+                            false,
+                            detail.output.clone(),
+                        ),
+                        None => (String::new(), serde_json::Value::Null, false, None),
+                    };
+                    self.upsert_tool(id, &name, input, ok, output, detail.clone());
+                }
+            }
+            AgentStateEvent::ToolFinished {
+                id,
+                name,
+                ok,
+                output,
+                detail,
+            } => self.upsert_tool(
+                id,
+                name,
+                serde_json::Value::Null,
+                *ok,
+                output.clone(),
+                detail.clone(),
+            ),
+            AgentStateEvent::Usage { usage, snapshot } => {
+                if *snapshot || self.usage.is_empty() {
+                    self.usage = usage.clone();
+                } else {
+                    self.usage.merge(usage);
+                }
+            }
+            AgentStateEvent::Idle { outcome } => self.outcome = Some(*outcome),
+            AgentStateEvent::Error { message } => self.error = Some(message.clone()),
+            AgentStateEvent::TurnStarted
+            | AgentStateEvent::TextDelta { .. }
+            | AgentStateEvent::ContentBlock { .. }
+            | AgentStateEvent::InputRequested { .. }
+            | AgentStateEvent::InputResolved { .. }
+            | AgentStateEvent::ElicitationRequested { .. }
+            | AgentStateEvent::ElicitationResolved { .. }
+            | AgentStateEvent::Plan { .. }
+            | AgentStateEvent::AvailableCommands { .. }
+            | AgentStateEvent::ConfigOptions { .. }
+            | AgentStateEvent::Modes { .. }
+            | AgentStateEvent::CurrentMode { .. }
+            | AgentStateEvent::Auth { .. } => {}
+        }
+    }
+
+    fn upsert_tool(
+        &mut self,
+        id: &str,
+        name: &str,
+        input: serde_json::Value,
+        ok: bool,
+        output: Option<serde_json::Value>,
+        detail: Option<Box<ToolCallDetail>>,
+    ) {
+        if let Some(call) = self.tool_calls.iter_mut().find(|call| call.id == id) {
+            if !name.is_empty() {
+                call.name = name.to_string();
+            }
+            if !input.is_null() {
+                call.input = input;
+            }
+            call.ok = ok;
+            if output.is_some() {
+                call.output = output;
+            }
+            if detail.is_some() {
+                call.detail = detail;
+            }
+        } else {
+            self.tool_calls.push(ToolCall {
+                id: id.to_string(),
+                name: name.to_string(),
+                input,
+                ok,
+                output,
+                detail,
+            });
+        }
+    }
 }
 
 /// Shared `is_false` predicate for `skip_serializing_if`.
@@ -1221,6 +1360,73 @@ mod tests {
             ..Default::default()
         }
         .is_empty());
+    }
+
+    #[test]
+    fn run_summary_folds_events_into_a_durable_log() {
+        let mut summary = RunSummary::default();
+        summary.apply_event(&AgentStateEvent::Session {
+            session_id: Some("ses_1".to_string()),
+            title: Some("Fix it".to_string()),
+            model: None,
+        });
+        summary.apply_event(&AgentStateEvent::TextDelta {
+            role: MessageRole::User,
+            text: "ignore me".to_string(),
+        });
+        summary.apply_event(&AgentStateEvent::TextDelta {
+            role: MessageRole::Assistant,
+            text: "done".to_string(),
+        });
+        summary.apply_event(&AgentStateEvent::ReasoningDelta {
+            text: "because".to_string(),
+        });
+        summary.apply_event(&AgentStateEvent::ToolStarted {
+            id: "call_1".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({ "command": "ls" }),
+            detail: None,
+        });
+        summary.apply_event(&AgentStateEvent::ToolFinished {
+            id: "call_1".to_string(),
+            name: "bash".to_string(),
+            ok: true,
+            output: Some(serde_json::json!("a\nb\n")),
+            detail: None,
+        });
+        summary.apply_event(&AgentStateEvent::Usage {
+            usage: AgentUsage {
+                input_tokens: 3,
+                ..Default::default()
+            },
+            snapshot: false,
+        });
+        summary.apply_event(&AgentStateEvent::Idle {
+            outcome: IdleOutcome::Succeeded,
+        });
+
+        assert_eq!(summary.session_id.as_deref(), Some("ses_1"));
+        assert_eq!(summary.title.as_deref(), Some("Fix it"));
+        assert_eq!(summary.text, "done");
+        assert_eq!(summary.reasoning, "because");
+        assert_eq!(summary.tool_calls.len(), 1);
+        assert!(summary.tool_calls[0].ok);
+        assert_eq!(
+            summary.tool_calls[0].output,
+            Some(serde_json::json!("a\nb\n"))
+        );
+        assert_eq!(summary.usage.input_tokens, 3);
+        assert_eq!(summary.outcome, Some(IdleOutcome::Succeeded));
+
+        // A title event and an error are the last-writer winners.
+        summary.apply_event(&AgentStateEvent::Title {
+            title: "Renamed".to_string(),
+        });
+        summary.apply_event(&AgentStateEvent::Error {
+            message: "boom".to_string(),
+        });
+        assert_eq!(summary.title.as_deref(), Some("Renamed"));
+        assert_eq!(summary.error.as_deref(), Some("boom"));
     }
 
     #[test]

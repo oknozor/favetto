@@ -21,8 +21,8 @@ use chrono::{DateTime, Utc};
 use favetto_wire::elicitation::ElicitationRequest;
 use favetto_wire::model::{
     AgentCommand, AgentPlanEntry, AgentSessionInfo, AgentStateEvent, AgentUsage, AwaitingInputKind,
-    ContentRole, IdleOutcome, InputRequest, MessageContent, MessageRole, RunStatus, Task, TaskRun,
-    TaskStatus,
+    ContentRole, IdleOutcome, InputRequest, MessageContent, MessageRole, RunStatus, RunSummary,
+    Task, TaskRun, TaskStatus,
 };
 use favetto_wire::rpc::{AgentEventPush, RpcCall, TasksEventsParams};
 use serde::{Deserialize, Serialize};
@@ -37,30 +37,126 @@ use crate::tasks;
 /// growing without bound while the window stays open.
 pub const MAX_RETAINED_EVENTS: usize = 2_000;
 
-/// The three tabs of the detail surface (docs §2, Miller's Law: three chunks).
+/// The two tabs of the detail surface (docs §2): one merged output/feed view
+/// plus the attempt table.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DetailTab {
-    /// The persisted `tasks.get` output.
+    /// The merged output view: the live feed while running, the durable
+    /// `RunSummary` once terminal, or the plain persisted blob as a fallback.
     #[default]
     Output,
-    /// The structured `tasks.events` feed plus live `agent.event` pushes.
-    Events,
     /// The `tasks.runs` attempt table.
     Runs,
 }
 
 impl DetailTab {
     /// Every tab, in bar order.
-    pub const ALL: [DetailTab; 3] = [DetailTab::Output, DetailTab::Events, DetailTab::Runs];
+    pub const ALL: [DetailTab; 2] = [DetailTab::Output, DetailTab::Runs];
 
     /// The tab label.
     pub fn label(self) -> &'static str {
         match self {
             DetailTab::Output => "Output",
-            DetailTab::Events => "Events",
             DetailTab::Runs => "Runs",
         }
     }
+}
+
+/// Where the merged output tab gets its rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputSource {
+    /// The ephemeral live `agent.event` feed, while the task is non-terminal.
+    Live,
+    /// The durable `RunSummary` decoded from `task.output`.
+    Summary,
+    /// No structured source: the plain persisted output.
+    Plain,
+}
+
+/// Pick the merged output tab's source.
+///
+/// While a task is non-terminal a live feed wins; once terminal the persisted
+/// summary wins. A terminal task that still has a cached live feed but no
+/// summary yet keeps showing the feed, so the tab never blanks during the
+/// transition.
+pub fn output_source(status: TaskStatus, has_live: bool, has_summary: bool) -> OutputSource {
+    if has_summary && (tasks::is_terminal(status) || !has_live) {
+        OutputSource::Summary
+    } else if has_live {
+        OutputSource::Live
+    } else if has_summary {
+        OutputSource::Summary
+    } else {
+        OutputSource::Plain
+    }
+}
+
+/// Extract the structured [`RunSummary`] stored in a `tasks.get` output value.
+///
+/// The executor stores it under `result`; a run that reported nothing stores
+/// `null`, and a legacy result may be a different shape. An empty summary is
+/// treated as absent so the caller keeps the plain-text fallback.
+pub fn extract_run_summary(value: &serde_json::Value) -> Option<RunSummary> {
+    let candidate = value
+        .get("result")
+        .filter(|result| !result.is_null())
+        .unwrap_or(value);
+    let summary: RunSummary = serde_json::from_value(candidate.clone()).ok()?;
+    (!summary.is_empty()).then_some(summary)
+}
+
+/// Map a persisted [`RunSummary`] onto the feed view model, so a finished run's
+/// log renders after a reload or daemon restart when the live feed is gone.
+///
+/// The summary is already coalesced, so this emits a canonical order — session,
+/// message, reasoning, tool cards, usage, error, run boundary — matching how a
+/// coding-agent transcript reads top to bottom.
+pub fn summary_feed(summary: &RunSummary) -> Vec<FeedItem> {
+    let mut items = Vec::new();
+    if let Some(title) = summary
+        .title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+    {
+        items.push(FeedItem::Session {
+            title: Some(title.to_string()),
+        });
+    }
+    if !summary.text.trim().is_empty() {
+        items.push(FeedItem::Message {
+            role: MessageRole::Assistant,
+            text: summary.text.clone(),
+        });
+    }
+    if !summary.reasoning.trim().is_empty() {
+        items.push(FeedItem::Reasoning {
+            text: summary.reasoning.clone(),
+            streaming: false,
+        });
+    }
+    for call in &summary.tool_calls {
+        items.push(FeedItem::Tool {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            input: call.input.clone(),
+            status: if call.ok {
+                ToolStatus::Ok
+            } else {
+                ToolStatus::Error
+            },
+            output: call.output.clone(),
+        });
+    }
+    if !summary.usage.is_empty() {
+        items.push(FeedItem::Usage(summary.usage.clone()));
+    }
+    if let Some(error) = &summary.error {
+        items.push(FeedItem::Error(error.clone()));
+    }
+    if let Some(outcome) = summary.outcome {
+        items.push(FeedItem::Boundary(outcome));
+    }
+    items
 }
 
 /// The persisted output blob, already reduced to plain text.
@@ -1387,6 +1483,128 @@ mod tests {
         // A truncated empty body still earns the notice.
         let empty = serde_json::json!({ "output": "", "truncated": true });
         assert!(extract_output(Some(&empty)).expect("output").truncated);
+    }
+
+    #[test]
+    fn extract_run_summary_reads_the_result_and_rejects_empty_stubs() {
+        let value = serde_json::json!({
+            "agent": "opencode",
+            "output": "raw jsonl",
+            "result": {
+                "session_id": "ses_1",
+                "title": "Fix it",
+                "text": "done",
+                "reasoning": "because",
+                "tool_calls": [{ "id": "c1", "name": "read", "ok": true }],
+                "usage": { "input_tokens": 3 },
+                "outcome": "succeeded",
+            },
+        });
+        let summary = extract_run_summary(&value).expect("structured summary");
+        assert_eq!(summary.text, "done");
+        assert_eq!(summary.tool_calls.len(), 1);
+        assert_eq!(summary.outcome, Some(IdleOutcome::Succeeded));
+
+        // A bare summary is accepted too.
+        let bare = serde_json::json!({ "text": "hello" });
+        assert_eq!(extract_run_summary(&bare).unwrap().text, "hello");
+
+        // `result: null`, an oversized stub, and a title-only summary are not
+        // renderable logs, so the plain fallback stays.
+        assert!(extract_run_summary(&serde_json::json!({
+            "output": "raw",
+            "result": serde_json::Value::Null,
+        }))
+        .is_none());
+        assert!(extract_run_summary(&serde_json::json!({
+            "result": { "preview": "…", "truncated": true },
+        }))
+        .is_none());
+        assert!(extract_run_summary(&serde_json::json!({
+            "result": { "title": "Fix it" },
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn summary_feed_emits_the_canonical_durable_log_order() {
+        let summary = RunSummary {
+            session_id: Some("ses_1".to_string()),
+            title: Some("Fix it".to_string()),
+            text: "done".to_string(),
+            reasoning: "because".to_string(),
+            tool_calls: vec![favetto_wire::model::ToolCall {
+                id: "c1".to_string(),
+                name: "bash".to_string(),
+                input: serde_json::json!({ "command": "ls" }),
+                ok: true,
+                output: Some(serde_json::json!("a.txt")),
+                detail: None,
+            }],
+            usage: AgentUsage {
+                input_tokens: 2,
+                ..Default::default()
+            },
+            outcome: Some(IdleOutcome::Succeeded),
+            error: Some("note".to_string()),
+        };
+        let feed = summary_feed(&summary);
+        assert!(matches!(&feed[0], FeedItem::Session { title: Some(title) } if title == "Fix it"));
+        assert!(matches!(
+            &feed[1],
+            FeedItem::Message { role: MessageRole::Assistant, text } if text == "done"
+        ));
+        assert!(matches!(
+            &feed[2],
+            FeedItem::Reasoning { text, streaming: false } if text == "because"
+        ));
+        assert!(matches!(
+            &feed[3],
+            FeedItem::Tool { name, status: ToolStatus::Ok, .. } if name == "bash"
+        ));
+        assert!(matches!(&feed[4], FeedItem::Usage(_)));
+        assert!(matches!(&feed[5], FeedItem::Error(message) if message == "note"));
+        assert!(matches!(
+            &feed[6],
+            FeedItem::Boundary(IdleOutcome::Succeeded)
+        ));
+        assert!(summary_feed(&RunSummary::default()).is_empty());
+    }
+
+    #[test]
+    fn output_source_switches_live_to_summary_without_blanking_the_transition() {
+        // Non-terminal: a live feed wins; without one, the durable summary.
+        for status in [
+            TaskStatus::Pending,
+            TaskStatus::Running,
+            TaskStatus::AwaitingInput,
+        ] {
+            assert_eq!(output_source(status, true, false), OutputSource::Live);
+            assert_eq!(output_source(status, true, true), OutputSource::Live);
+            assert_eq!(output_source(status, false, true), OutputSource::Summary);
+        }
+
+        // Terminal: the persisted summary wins even with a cached feed.
+        for status in [
+            TaskStatus::Succeeded,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+        ] {
+            assert_eq!(output_source(status, true, true), OutputSource::Summary);
+            assert_eq!(output_source(status, false, true), OutputSource::Summary);
+            // Transition: cached feed, summary not decoded yet -> keep the feed.
+            assert_eq!(output_source(status, true, false), OutputSource::Live);
+        }
+
+        // Nothing structured: the plain persisted output.
+        assert_eq!(
+            output_source(TaskStatus::Pending, false, false),
+            OutputSource::Plain
+        );
+        assert_eq!(
+            output_source(TaskStatus::Succeeded, false, false),
+            OutputSource::Plain
+        );
     }
 
     #[test]

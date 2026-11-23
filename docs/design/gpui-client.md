@@ -25,7 +25,7 @@ the desktop app without relearning the product.
 │ Tasks    │  ┌─────────────────────────────────┐  │  name / status   │
 │ Catalog  │  │ opencode · repo:favetto/plan    │  │  agent  attempt  │
 │ Workflows│  │ awaiting permission  ▶          │  │  ── tabs ──      │
-│ Schedules│  └─────────────────────────────────┘  │  Output Events   │
+│ Schedules│  └─────────────────────────────────┘  │  Output          │
 │ Settings │  Recent                               │  Runs            │
 │          │  …                                    │  [Cancel] [Retry]│
 └──────────┴───────────────────────────────────────┴─────────────────┘
@@ -77,7 +77,7 @@ Each row names the element, the change, and the expected effect.
 | **Peak-End Rule** | Task detail ends with a clear outcome block (succeeded/failed/cancelled + duration + usage); errors carry a copyable message and a retry action. | More vertical space in the detail pane. |
 | **Law of Common Region** | Sidebar, list and detail are three bounded surfaces with 1 px separators and consistent 12/16 px insets. | Less "edge-to-edge" density. |
 | **Law of Proximity** | Status, agent and repo form one metadata cluster; actions are separated by a spacer. | Requires consistent spacing tokens. |
-| **Miller's Law / Chunking** | Inbox groups "Needs you" vs "Recent"; task detail uses three tabs (Output, Events, Runs); settings split into Connection / Agents / Appearance. | Some content is one click away. |
+| **Miller's Law / Chunking** | Inbox groups "Needs you" vs "Recent"; task detail uses two tabs (Output, Runs) because the live feed and the durable run log are the same view; settings split into Connection / Agents / Appearance. | Some content is one click away. |
 | **Von Restorff** | Awaiting-input rows use an accent stripe + icon; destructive buttons are the only danger-colored control on screen. | Accent must remain accessible in both themes. |
 | **Goal-Gradient** | Workflows show `done / total` and a progress bar; the task header shows `attempt n of m` when retries are configured. | Progress must not be faked when totals are unknown. |
 | **Working Memory** | The detail header stays pinned with name, status, agent, repo and elapsed time; the palette remembers the last query per session. | Slightly taller header. |

@@ -1,4 +1,4 @@
-//! Markdown parsing for the task Events feed.
+//! Markdown parsing for the task output feed.
 //!
 //! The desktop client renders agent messages and reasoning as Markdown, but the
 //! GPUI paint path must stay cheap: only the trailing streaming block changes

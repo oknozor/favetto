@@ -25,8 +25,8 @@ use tokio::sync::{OwnedMutexGuard, Semaphore};
 use uuid::Uuid;
 
 use favetto_core::model::{
-    AgentUsage, Event, EventKind, Failure, FailureKind, RunStatus, RunSummary, Task, TaskRun,
-    TaskStatus,
+    AgentUsage, Event, EventKind, Failure, FailureKind, IdleOutcome, RunStatus, RunSummary, Task,
+    TaskRun, TaskStatus,
 };
 
 use crate::actions::{evaluate_when, ActionContext};
@@ -1072,6 +1072,101 @@ fn bounded_prev_value(value: Option<&serde_json::Value>, cap: usize) -> serde_js
     serde_json::Value::String(capped)
 }
 
+/// Whether a result value looks like a serialized [`RunSummary`].
+///
+/// `RunSummary` decodes from any object because every field defaults, so the
+/// marker checks for fields a summary writer emits rather than accepting an
+/// arbitrary `{ "text": … }` result. This keeps agent envelopes and legacy
+/// ad-hoc results on their existing path.
+fn is_serialized_run_summary(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object
+        .get("tool_calls")
+        .is_some_and(serde_json::Value::is_array)
+        || object
+            .get("reasoning")
+            .is_some_and(serde_json::Value::is_string)
+        || object
+            .get("usage")
+            .is_some_and(serde_json::Value::is_object)
+        || object.get("outcome").is_some_and(|value| !value.is_null())
+        || object.get("error").is_some_and(|value| !value.is_null())
+}
+
+/// Bound one arbitrary tool value: strings keep a head+tail slice, other JSON
+/// becomes a bounded string when it exceeds the cap.
+fn bound_tool_value(value: &serde_json::Value, cap: usize) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => serde_json::Value::String(truncate_text(text, cap).0),
+        other => {
+            let serialized = other.to_string();
+            if serialized.len() <= cap {
+                other.clone()
+            } else {
+                serde_json::Value::String(truncate_text(&serialized, cap).0)
+            }
+        }
+    }
+}
+
+/// Keep a [`RunSummary`] decodable while bounding its size.
+///
+/// A whole-result fallback (`{ preview, truncated }`) cannot be rendered as a
+/// structured log, so each field is bounded instead: text/reasoning keep a
+/// head+tail slice, each tool input/output is capped, an oversized tool detail
+/// is dropped, and the tool list is halved only when the serialized summary is
+/// still over budget. Returns `None` when the value is not a summary or carries
+/// nothing worth rendering.
+fn bounded_summary_result(value: &serde_json::Value, max: usize) -> Option<serde_json::Value> {
+    let mut summary: RunSummary = serde_json::from_value(value.clone()).ok()?;
+    if summary.is_empty() {
+        return None;
+    }
+    let field_cap = (max / 4).max(64);
+    summary.session_id = summary
+        .session_id
+        .map(|text| truncate_text(&text, field_cap).0);
+    summary.title = summary.title.map(|text| truncate_text(&text, field_cap).0);
+    summary.text = truncate_text(&summary.text, field_cap).0;
+    summary.reasoning = truncate_text(&summary.reasoning, field_cap).0;
+    summary.error = summary.error.map(|text| truncate_text(&text, field_cap).0);
+    let call_cap = (max / 8).max(64);
+    for call in &mut summary.tool_calls {
+        call.input = bound_tool_value(&call.input, call_cap);
+        if let Some(output) = call.output.as_mut() {
+            *output = bound_tool_value(output, call_cap);
+        }
+        if let Some(detail) = call.detail.as_mut() {
+            if let Some(input) = detail.input.as_mut() {
+                *input = bound_tool_value(input, call_cap);
+            }
+            if let Some(output) = detail.output.as_mut() {
+                *output = bound_tool_value(output, call_cap);
+            }
+            let oversized = serde_json::to_string(detail)
+                .map(|serialized| serialized.len() > call_cap)
+                .unwrap_or(true);
+            if oversized {
+                call.detail = None;
+            }
+        }
+    }
+    let mut result = serde_json::to_value(&summary).ok()?;
+    let limit = max.saturating_mul(2).max(256);
+    while serde_json::to_string(&result)
+        .map(|serialized| serialized.len() > limit)
+        .unwrap_or(true)
+        && !summary.tool_calls.is_empty()
+    {
+        let keep = summary.tool_calls.len() / 2;
+        summary.tool_calls.truncate(keep);
+        result = serde_json::to_value(&summary).ok()?;
+    }
+    Some(result)
+}
+
 /// Build the persisted `task.output` value from a finished run. Caps the raw
 /// text, records the original size, and drops the default parser's
 /// `{"text": raw}` duplicate.
@@ -1098,6 +1193,19 @@ fn build_task_output(
         || structured.as_ref() == Some(parsed)
     {
         serde_json::Value::Null
+    } else if is_serialized_run_summary(parsed) {
+        // A durable run log stays decodable even when it had to be bounded;
+        // the plain `{ preview, truncated }` stub would force the clients back
+        // to the raw transcript after a reload.
+        bounded_summary_result(parsed, max).unwrap_or_else(|| {
+            let serialized = parsed.to_string();
+            if serialized.len() > max {
+                let (preview, _) = truncate_text(&serialized, max);
+                serde_json::json!({ "preview": preview, "truncated": true })
+            } else {
+                parsed.clone()
+            }
+        })
     } else {
         let serialized = parsed.to_string();
         if serialized.len() > max {
@@ -1435,19 +1543,36 @@ async fn run_agent_task(
 
     let succeeded = outcome.succeeded() && code == Some(0);
     let max = state.config.executor.max_output_bytes;
-    let parsed = serde_json::json!({
-        "text": raw,
-        "stop_reason": outcome.stop_reason,
-        "tool_calls": outcome.tool_calls,
-        "failed_tools": outcome.failed_tools,
-        "succeeded": succeeded,
+    // Persist the whole structured run, not just counts, so the post-run log is
+    // still renderable after a reload or daemon restart. The session id/title
+    // may not be in the event stream; fill them from the live snapshot.
+    let mut summary = outcome.summary.clone();
+    if summary.session_id.is_none() {
+        summary.session_id = session_id.clone();
+    }
+    if summary.outcome.is_none() {
+        summary.outcome = Some(if succeeded {
+            IdleOutcome::Succeeded
+        } else {
+            IdleOutcome::Failed
+        });
+    }
+    let session_title = summary.title.clone();
+    let parsed = serde_json::to_value(&summary).unwrap_or_else(|_| {
+        serde_json::json!({
+            "text": raw,
+            "stop_reason": outcome.stop_reason,
+            "tool_calls": Vec::<serde_json::Value>::new(),
+            "failed_tools": outcome.failed_tools,
+            "succeeded": succeeded,
+        })
     });
     let output = build_task_output(
         &raw,
         &parsed,
         Some(agent_name.as_str()),
         session_id.clone(),
-        None,
+        session_title.clone(),
         max,
     );
     let failure = if succeeded {
@@ -1467,7 +1592,7 @@ async fn run_agent_task(
     Ok(RunOutcome {
         output,
         session_id,
-        session_title: None,
+        session_title,
         exit_code: code,
         usage: reported_usage(&parsed, live_usage),
         failure,

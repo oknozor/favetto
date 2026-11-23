@@ -693,6 +693,65 @@ fn build_task_output_keeps_structured_result() {
 }
 
 #[test]
+fn build_task_output_keeps_a_truncated_run_summary_decodable() {
+    let big = "x".repeat(20_000);
+    let summary = RunSummary {
+        session_id: Some("ses_1".to_string()),
+        title: Some("Fix it".to_string()),
+        text: big.clone(),
+        reasoning: big.clone(),
+        tool_calls: vec![favetto_core::model::ToolCall {
+            id: "call_1".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({ "command": big }),
+            ok: true,
+            output: Some(serde_json::json!(big)),
+            detail: None,
+        }],
+        usage: AgentUsage {
+            input_tokens: 5,
+            ..Default::default()
+        },
+        outcome: Some(IdleOutcome::Succeeded),
+        error: None,
+    };
+    let parsed = serde_json::to_value(&summary).unwrap();
+    let max = 1_000;
+    let value = build_task_output(
+        &big,
+        &parsed,
+        Some("acp-agent"),
+        Some("ses_1".to_string()),
+        Some("Fix it".to_string()),
+        max,
+    );
+
+    // The summary is bounded field-by-field and stays a decodable run log; a
+    // `{ preview, truncated }` stub would force the plain fallback.
+    assert!(value["result"].get("tool_calls").is_some());
+    let decoded: RunSummary =
+        serde_json::from_value(value["result"].clone()).expect("decodable summary");
+    assert!(!decoded.is_empty());
+    assert!(decoded.text.contains("truncated"));
+    assert_eq!(decoded.session_id.as_deref(), Some("ses_1"));
+    assert_eq!(decoded.tool_calls.len(), 1);
+    assert_eq!(decoded.outcome, Some(IdleOutcome::Succeeded));
+    assert_eq!(value["truncated"], true);
+    assert_eq!(value["session_title"], "Fix it");
+    let encoded = serde_json::to_string(&value).unwrap();
+    assert!(encoded.len() < 4 * max, "bounded blob: {}", encoded.len());
+}
+
+#[test]
+fn build_task_output_leaves_legacy_result_shapes_alone() {
+    // An old ad-hoc result (`{text, session_id}`) is not a serialized summary;
+    // it keeps the pre-existing pass-through so old rows still render.
+    let parsed = serde_json::json!({ "text": "plain answer", "session_id": "ses_1" });
+    let value = build_task_output("plain answer", &parsed, Some("pty"), None, None, 1_000);
+    assert_eq!(value["result"], parsed);
+}
+
+#[test]
 fn bounded_prev_value_truncates_large_shape_and_keeps_small_verbatim() {
     let small = serde_json::json!({ "ok": true });
     assert_eq!(

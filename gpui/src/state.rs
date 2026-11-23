@@ -3726,11 +3726,12 @@ impl ClientState {
             .unwrap_or_default()
     }
 
-    /// Switch tabs. Selecting Events while following consumes the unseen count.
+    /// Switch tabs. Selecting the output tab while following consumes the
+    /// unseen event count.
     pub fn set_detail_tab(&mut self, tab: DetailTab) {
         if let Some(detail) = self.detail.as_mut() {
             detail.tab = tab;
-            if tab == DetailTab::Events && detail.follow {
+            if tab == DetailTab::Output && detail.follow {
                 detail.new_events = 0;
             }
         }
@@ -4110,7 +4111,7 @@ impl ClientState {
         let Some(detail) = self.detail.as_ref() else {
             return false;
         };
-        if detail.tab != DetailTab::Events || detail.is_terminal() {
+        if detail.tab != DetailTab::Output || detail.is_terminal() {
             return false;
         }
         detail.prompt_open && self.detail_agent_session_id().is_some()
@@ -4119,7 +4120,7 @@ impl ClientState {
     /// Activate the composer and clear any previous error.
     pub fn start_detail_reply(&mut self) {
         if let Some(detail) = self.detail.as_mut() {
-            detail.tab = DetailTab::Events;
+            detail.tab = DetailTab::Output;
             detail.prompt_open = true;
             detail.prompt_error = None;
         }
