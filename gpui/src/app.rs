@@ -1222,7 +1222,7 @@ impl RootView {
             ("First / last", "Home End"),
             ("Page up / down", "PgUp PgDn"),
             ("Open the run", "↵"),
-            ("Search name, agent, repo", "/"),
+            ("Search task names", "/"),
             ("Cancel a run", "c"),
             ("Retry a finished run", "r"),
             ("Previous / next filter", "[ ]"),

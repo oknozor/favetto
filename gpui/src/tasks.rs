@@ -136,10 +136,9 @@ pub struct TaskRow {
     pub id: Uuid,
     /// The display status (icon + label always accompany the color).
     pub status: TaskStatus,
-    /// The task name with only a well-formed repo prefix stripped.
+    /// The task name with only a well-formed repo prefix stripped. The fuzzy
+    /// search scores this title and nothing else.
     pub name: String,
-    /// The full wire name (`repo:favetto/triage`), used by the fuzzy search.
-    pub full_name: String,
     /// The repo namespace of a repo-local task.
     pub repo: Option<String>,
     /// The agent that owns a session for this task, when there is one.
@@ -214,9 +213,10 @@ impl TaskList {
 
 /// Build the Tasks rows from a snapshot.
 ///
-/// `query` matches fuzzily over the task name (full and display form), the
-/// agent and the repo; every whitespace-separated term must match at least one
-/// field. An empty query keeps the daemon's newest-first order. The filter is
+/// `query` matches fuzzily over the task display name only; every
+/// whitespace-separated term must match the title. The repo, agent and
+/// fully-qualified name stay visible metadata, never search haystacks. An empty
+/// query keeps the daemon's newest-first order. The filter is
 /// applied after matching, so the counts stay search-scoped and always agree
 /// with the rows a segment shows. `active_repo` applies the TUI's visibility
 /// rule first, so the totals describe the rows in scope.
@@ -270,7 +270,7 @@ pub fn build(
         let name = inbox::task_display_name(&task.name).to_string();
         let agent = agents.get(key.as_str()).map(|agent| (*agent).to_string());
 
-        let score = match score_row(&matcher, &query, &task.name, &name, &repo, &agent) {
+        let score = match score_row(&matcher, &query, &name) {
             Some(score) => score,
             None => continue,
         };
@@ -289,7 +289,6 @@ pub fn build(
                 id: task.id,
                 status: task.status,
                 name,
-                full_name: task.name.clone(),
                 repo,
                 agent,
                 attempt: task.attempt,
@@ -328,29 +327,17 @@ pub fn build(
     }
 }
 
-/// Score one task against every whitespace term with the shared matcher. The
-/// display name outranks the qualified name/repo and the agent, while every
-/// term must hit at least one field.
+/// Score one task title against every whitespace term with the shared matcher.
+/// Only the display name is searchable; metadata is never a fallback haystack.
 fn score_row(
     matcher: &fuzzy_matcher::skim::SkimMatcherV2,
     query: &SearchQuery<'_>,
-    full_name: &str,
     name: &str,
-    repo: &Option<String>,
-    agent: &Option<String>,
 ) -> Option<i64> {
     if query.is_empty() {
         return Some(0);
     }
-    let fields = [
-        SearchField::new(name, search::weight::LABEL),
-        SearchField::new(full_name, search::weight::NAMESPACE),
-        SearchField::new(
-            repo.as_deref().unwrap_or_default(),
-            search::weight::NAMESPACE,
-        ),
-        SearchField::new(agent.as_deref().unwrap_or_default(), search::weight::META),
-    ];
+    let fields = [SearchField::new(name, search::weight::LABEL)];
     query.score(matcher, &fields).map(|matched| matched.score)
 }
 
@@ -463,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn search_matches_name_agent_repo_and_multiple_terms() {
+    fn search_matches_only_the_task_title() {
         let tasks = fixture();
         let sessions = vec![
             session("s1", Some(Uuid::from_u128(1)), "opencode"),
@@ -476,18 +463,19 @@ mod tests {
         assert_eq!(triage.len(), 1);
         assert_eq!(triage[0].id, Uuid::from_u128(1));
 
-        let by_agent = query("claude");
-        assert_eq!(by_agent.len(), 1);
-        assert_eq!(by_agent[0].id, Uuid::from_u128(4));
-        assert_eq!(by_agent[0].agent.as_deref(), Some("claude"));
+        assert!(
+            query("claude").is_empty(),
+            "the agent is metadata, not a title"
+        );
+        assert!(query("web").is_empty(), "the repo is metadata, not a title");
+        assert!(
+            query("web release").is_empty(),
+            "every term must match the title"
+        );
 
-        let by_repo = query("web");
-        assert_eq!(by_repo.len(), 2);
-        assert!(by_repo.iter().all(|row| row.repo.as_deref() == Some("web")));
-
-        let multi = query("web release");
-        assert_eq!(multi.len(), 1);
-        assert_eq!(multi[0].id, Uuid::from_u128(5));
+        let release = query("release");
+        assert_eq!(release.len(), 1);
+        assert_eq!(release[0].name, "release");
 
         assert!(query("zzz-not-a-run").is_empty());
     }
@@ -592,7 +580,7 @@ mod tests {
             session("s1", Some(Uuid::from_u128(1)), ""),
             session("s2", Some(Uuid::from_u128(2)), "agent/with spaces ⚙"),
         ];
-        let list = build(&tasks, &sessions, "agent", TaskFilter::All, None, at(0));
+        let list = build(&tasks, &sessions, "second", TaskFilter::All, None, at(0));
         assert_eq!(list.rows.len(), 1);
         assert_eq!(list.rows[0].agent.as_deref(), Some("agent/with spaces ⚙"));
         assert_eq!(list.rows[0].status_kind(), StatusKind::Running);

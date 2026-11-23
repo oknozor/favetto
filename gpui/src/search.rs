@@ -3,9 +3,12 @@
 //! One [`SkimMatcherV2`] scores every whitespace-separated query term against a
 //! weighted list of fields. A row matches only when *all* terms match at least
 //! one field, so `triage favetto` finds a row whose label has one term and whose
-//! prompt has the other. The field weights establish the relative hierarchy
-//! (label > namespace > body > metadata) while the matcher's own score still
-//! orders rows inside one field.
+//! namespace has the other. The field weights establish the relative hierarchy
+//! (label > namespace > metadata) while the matcher's own score still orders
+//! rows inside one field.
+//!
+//! The Catalog and Tasks surfaces deliberately pass one field: the visible
+//! title. Prompts and row metadata are documentation here, not haystacks.
 //!
 //! The Catalog, Tasks, command palette, repo picker and slash completion all
 //! use this module so their normalization, term rules and case folding cannot
@@ -15,15 +18,13 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 
 /// Relative weights for the search fields. The gaps are wider than the raw
-/// matcher's score range, so a label hit always outranks a body-only or
+/// matcher's score range, so a label hit always outranks a namespace-only or
 /// metadata-only hit.
 pub mod weight {
     /// A visible row label, task name or repository name.
     pub const LABEL: i64 = 10_000;
     /// A visible namespace, folder or repository path.
     pub const NAMESPACE: i64 = 5_000;
-    /// Prompt/body/description text.
-    pub const BODY: i64 = 2_500;
     /// Agent, model, kind, var names and other metadata.
     pub const META: i64 = 1_000;
 }
@@ -124,7 +125,7 @@ mod tests {
         let matcher = matcher();
         let fields = [
             SearchField::new("gpui/01-scaffold", weight::LABEL),
-            SearchField::new("wire the transport", weight::BODY),
+            SearchField::new("wire/transport", weight::NAMESPACE),
         ];
 
         let both = SearchQuery::new("scaffold transport");
@@ -141,22 +142,22 @@ mod tests {
     }
 
     #[test]
-    fn labels_outrank_body_and_metadata_hits() {
+    fn labels_outrank_namespace_and_metadata_hits() {
         let matcher = matcher();
         let label = SearchQuery::new("release")
             .score(&matcher, &[SearchField::new("release", weight::LABEL)])
             .unwrap();
-        let body = SearchQuery::new("release")
+        let namespace = SearchQuery::new("release")
             .score(
                 &matcher,
-                &[SearchField::new("publish a release", weight::BODY)],
+                &[SearchField::new("releases/release", weight::NAMESPACE)],
             )
             .unwrap();
         let meta = SearchQuery::new("release")
             .score(&matcher, &[SearchField::new("release", weight::META)])
             .unwrap();
-        assert!(label.score > body.score);
-        assert!(body.score > meta.score);
+        assert!(label.score > namespace.score);
+        assert!(namespace.score > meta.score);
     }
 
     #[test]
@@ -189,7 +190,7 @@ mod tests {
         let matcher = matcher();
         let fields = [
             SearchField::new("triage favetto", weight::LABEL),
-            SearchField::new("sort the inbox", weight::BODY),
+            SearchField::new("sort/inbox", weight::NAMESPACE),
         ];
         let one = SearchQuery::new("triage").score(&matcher, &fields).unwrap();
         let two = SearchQuery::new("triage favetto")
