@@ -32,6 +32,7 @@ fn def_with_vars() -> TaskDef {
         spawn_file: None,
         spawn_new_root: false,
         sign: None,
+        mcp: None,
         permission: None,
         worktree: None,
         vars: vec![var("required_one", true), var("optional_one", false)],

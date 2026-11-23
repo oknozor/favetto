@@ -2466,3 +2466,101 @@ async fn migrate_creates_agent_sessions_without_touching_existing_data() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn mcp_servers_round_trip_without_secret_values() {
+    let dir = std::env::temp_dir().join(format!(
+        "favetto-mcp-db-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let pool = open(&dir.join("test.db")).await.unwrap();
+    migrate(&pool).await.unwrap();
+
+    let now = from_ms(ts_ms(Timestamp::now()));
+    let row = McpServerRow {
+        name: "files".to_string(),
+        transport: McpTransport::Stdio,
+        command: Some("/bin/sh".to_string()),
+        args: vec!["-c".to_string(), "true".to_string()],
+        url: None,
+        env: vec![McpSecret::new("TOKEN")],
+        headers: Vec::new(),
+        enabled: true,
+        approved: true,
+        fingerprint: "fingerprint".to_string(),
+        source: McpSource::Manual,
+        created_at: now,
+        updated_at: now,
+    };
+    upsert_mcp_server(&pool, &row).await.unwrap();
+    assert_eq!(get_mcp_server(&pool, "files").await.unwrap().unwrap(), row);
+
+    // Upsert replaces the definition and keeps the original creation time.
+    let later = now + time::Duration::seconds(30);
+    let updated = McpServerRow {
+        enabled: false,
+        approved: false,
+        updated_at: later,
+        ..row.clone()
+    };
+    upsert_mcp_server(&pool, &updated).await.unwrap();
+    let stored = list_mcp_servers(&pool).await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert!(!stored[0].enabled);
+    assert!(!stored[0].approved);
+    assert_eq!(stored[0].created_at, now);
+
+    assert!(delete_mcp_server(&pool, "files").await.unwrap());
+    assert!(!delete_mcp_server(&pool, "files").await.unwrap());
+    assert!(list_mcp_servers(&pool).await.unwrap().is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn agent_session_mcp_selection_round_trips_and_defaults_none() {
+    let dir = std::env::temp_dir().join(format!(
+        "favetto-mcp-session-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let pool = open(&dir.join("test.db")).await.unwrap();
+    migrate(&pool).await.unwrap();
+
+    let now = from_ms(ts_ms(Timestamp::now()));
+    let mut record = AgentSessionRecord::loading("local-mcp", "opencode", "/work", now);
+    record.mcp_servers = Some(vec!["files".to_string()]);
+    insert_agent_session(&pool, &record).await.unwrap();
+    assert_eq!(
+        get_agent_session(&pool, "local-mcp")
+            .await
+            .unwrap()
+            .unwrap(),
+        record
+    );
+
+    // An explicit empty selection is distinct from a legacy NULL row.
+    let mut empty = AgentSessionRecord::loading("local-empty", "opencode", "/work", now);
+    empty.mcp_servers = Some(Vec::new());
+    insert_agent_session(&pool, &empty).await.unwrap();
+    let loaded = get_agent_session(&pool, "local-empty")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.mcp_servers, Some(Vec::new()));
+
+    let legacy = AgentSessionRecord::loading("local-none", "opencode", "/work", now);
+    insert_agent_session(&pool, &legacy).await.unwrap();
+    let loaded = get_agent_session(&pool, "local-none")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.mcp_servers, None);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

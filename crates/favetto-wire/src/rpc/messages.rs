@@ -27,6 +27,7 @@ use crate::agent_state::{
     SessionConfigOption, SessionConfigValue, SessionModes, UsagePeriod, UsageStats,
 };
 use crate::elicitation::ElicitationReply;
+use crate::mcp::{McpServerInfo, McpServerInput};
 use crate::model::{
     AgentAuthState, AgentCatalogEntry, AgentSessionHistoryEntry, AgentSessionInfo, Event,
     NotificationRecord, ProviderSessionsResult, RepoInfo, Schedule, Task, TaskRun,
@@ -215,6 +216,10 @@ pub struct StartOneshotParams {
     pub rows: Option<u64>,
     #[serde(default, deserialize_with = "lenient")]
     pub cols: Option<u64>,
+    /// Registered MCP server names to forward to the agent. Absent means every
+    /// enabled + approved definition; an explicit empty list sends none.
+    #[serde(default, deserialize_with = "lenient")]
+    pub mcp_servers: Option<Vec<String>>,
 }
 
 /// `tasks.start_oneshot` result: the inline task, its live session, and the
@@ -250,6 +255,10 @@ pub struct CatalogEntry {
     #[serde(default)]
     pub kind: String,
     pub needs: Option<String>,
+    /// Optional MCP server selection from the task header. `None` uses every
+    /// enabled + approved definition; `Some(empty)` sends none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<Vec<String>>,
     /// Manual input variables declared with `[[vars]]`.
     pub vars: Vec<TaskVar>,
     /// The raw prompt template.
@@ -502,6 +511,10 @@ pub struct StartAgentParams {
     pub model: Option<String>,
     #[serde(default, deserialize_with = "lenient")]
     pub cwd: Option<PathBuf>,
+    /// Registered MCP server names to forward to the agent. Absent means every
+    /// enabled + approved definition; an explicit empty list sends none.
+    #[serde(default, deserialize_with = "lenient")]
+    pub mcp_servers: Option<Vec<String>>,
 }
 
 /// `agents.start` / `agents.attach` result: the session plus a replay of its
@@ -924,6 +937,93 @@ pub type ReposActivateResult = ReposListResult;
 pub type ReposRefreshResult = ReposListResult;
 
 // ---------------------------------------------------------------------------
+// mcp
+// ---------------------------------------------------------------------------
+
+/// `mcp.list` result: registered MCP server definitions, sorted by name. Secret
+/// values are never present; each secret reports its source and `has_value`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct McpListResult {
+    pub servers: Vec<McpServerInfo>,
+}
+
+/// `mcp.get` params: the definition name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct McpGetParams {
+    pub name: String,
+}
+
+/// `mcp.get` result: the redacted definition.
+pub type McpGetResult = McpServerInfo;
+
+/// `mcp.add` params: the definition plus explicit stdio launch consent.
+///
+/// `approve` is required for a stdio definition to be launched; an unapproved
+/// entry is still listed and editable so the UI can present the consent dialog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct McpAddParams {
+    pub server: McpServerInput,
+    #[serde(default, deserialize_with = "lenient")]
+    pub approve: Option<bool>,
+}
+
+/// `mcp.add` result: the stored, redacted definition.
+pub type McpAddResult = McpServerInfo;
+
+/// `mcp.update` params. `name` is the existing key; `server.name` is ignored.
+/// A command/args change revokes approval unless `approve` is set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct McpUpdateParams {
+    pub name: String,
+    pub server: McpServerInput,
+    #[serde(default, deserialize_with = "lenient")]
+    pub approve: Option<bool>,
+}
+
+/// `mcp.update` result: the stored, redacted definition.
+pub type McpUpdateResult = McpServerInfo;
+
+/// `mcp.remove` params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct McpRemoveParams {
+    pub name: String,
+}
+
+/// `mcp.remove` result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct McpRemoveResult {
+    pub removed: bool,
+}
+
+/// `mcp.set_enabled` params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct McpSetEnabledParams {
+    pub name: String,
+    pub enabled: bool,
+}
+
+/// `mcp.set_enabled` result: the updated definition.
+pub type McpSetEnabledResult = McpServerInfo;
+
+/// `mcp.approve` params. `approved = false` revokes consent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct McpApproveParams {
+    pub name: String,
+    pub approved: bool,
+}
+
+/// `mcp.approve` result: the updated definition.
+pub type McpApproveResult = McpServerInfo;
+
+// ---------------------------------------------------------------------------
 // push payloads
 // ---------------------------------------------------------------------------
 
@@ -1107,6 +1207,20 @@ rpc_calls! {
     ReposActivateCall => method::REPOS_ACTIVATE, ReposActivateParams, ReposActivateResult;
     /// Typed call for `repos.refresh`.
     ReposRefreshCall => method::REPOS_REFRESH, EmptyParams, ReposRefreshResult;
+    /// Typed call for `mcp.list`.
+    McpListCall => method::MCP_LIST, EmptyParams, McpListResult;
+    /// Typed call for `mcp.get`.
+    McpGetCall => method::MCP_GET, McpGetParams, McpGetResult;
+    /// Typed call for `mcp.add`.
+    McpAddCall => method::MCP_ADD, McpAddParams, McpAddResult;
+    /// Typed call for `mcp.update`.
+    McpUpdateCall => method::MCP_UPDATE, McpUpdateParams, McpUpdateResult;
+    /// Typed call for `mcp.remove`.
+    McpRemoveCall => method::MCP_REMOVE, McpRemoveParams, McpRemoveResult;
+    /// Typed call for `mcp.set_enabled`.
+    McpSetEnabledCall => method::MCP_SET_ENABLED, McpSetEnabledParams, McpSetEnabledResult;
+    /// Typed call for `mcp.approve`.
+    McpApproveCall => method::MCP_APPROVE, McpApproveParams, McpApproveResult;
 }
 
 /// The JSON Schema of a type, as a plain JSON value. Used by the doc generator.
@@ -1401,6 +1515,41 @@ pub const CLIENT_CALLS: &[RpcCallSpec] = &[
         params_schema: schema_of::<EmptyParams>,
         result_schema: schema_of::<ReposRefreshResult>,
     },
+    RpcCallSpec {
+        method: method::MCP_LIST,
+        params_schema: schema_of::<EmptyParams>,
+        result_schema: schema_of::<McpListResult>,
+    },
+    RpcCallSpec {
+        method: method::MCP_GET,
+        params_schema: schema_of::<McpGetParams>,
+        result_schema: schema_of::<McpGetResult>,
+    },
+    RpcCallSpec {
+        method: method::MCP_ADD,
+        params_schema: schema_of::<McpAddParams>,
+        result_schema: schema_of::<McpAddResult>,
+    },
+    RpcCallSpec {
+        method: method::MCP_UPDATE,
+        params_schema: schema_of::<McpUpdateParams>,
+        result_schema: schema_of::<McpUpdateResult>,
+    },
+    RpcCallSpec {
+        method: method::MCP_REMOVE,
+        params_schema: schema_of::<McpRemoveParams>,
+        result_schema: schema_of::<McpRemoveResult>,
+    },
+    RpcCallSpec {
+        method: method::MCP_SET_ENABLED,
+        params_schema: schema_of::<McpSetEnabledParams>,
+        result_schema: schema_of::<McpSetEnabledResult>,
+    },
+    RpcCallSpec {
+        method: method::MCP_APPROVE,
+        params_schema: schema_of::<McpApproveParams>,
+        result_schema: schema_of::<McpApproveResult>,
+    },
 ];
 
 /// One server → client push's typed metadata.
@@ -1637,6 +1786,7 @@ mod tests {
             schedule: None,
             kind: "action".to_string(),
             needs: None,
+            mcp: None,
             vars: Vec::new(),
             prompt: "p".to_string(),
             repo: None,
@@ -1680,6 +1830,7 @@ mod tests {
             schedule: None,
             kind: "agent".to_string(),
             needs: None,
+            mcp: None,
             vars: Vec::new(),
             prompt: "p".to_string(),
             repo: None,

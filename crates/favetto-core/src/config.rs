@@ -27,6 +27,7 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::mcp::McpTransport;
 use crate::model::{Failure, FailureKind, PermissionPolicy};
 
 #[derive(Debug, Clone, Default, JsonSchema, Serialize, Deserialize)]
@@ -45,6 +46,10 @@ pub struct FavettoConfig {
     /// clients; the daemon persists changes in SQLite.
     #[serde(default)]
     pub repos: ReposSettings,
+    /// MCP servers Favetto may forward to ACP agents. The daemon persists edits
+    /// in SQLite; this section only seeds the registry at startup.
+    #[serde(default)]
+    pub mcp: McpSettings,
     /// Task executor concurrency / isolation.
     #[serde(default)]
     pub executor: ExecutorSettings,
@@ -388,6 +393,57 @@ impl Default for ReposSettings {
             depth: default_scan_depth(),
         }
     }
+}
+
+/// MCP server registry seed (`[mcp]`).
+///
+/// Every entry is operator-authored and therefore treated as pre-approved. The
+/// daemon copies seeds into its persisted registry at startup; later app edits
+/// survive restarts. Favetto never installs or upgrades the server.
+#[derive(Debug, Clone, Default, JsonSchema, Serialize, Deserialize)]
+pub struct McpSettings {
+    #[serde(default)]
+    pub servers: Vec<McpServerSeed>,
+}
+
+/// One `[[mcp.servers]]` entry.
+///
+/// `env`/`headers` hold literal secret values (stored by the daemon in its
+/// `0600` secrets file, not in this config file); `env_from`/`headers_from` map
+/// the entry name to the daemon env var carrying the value.
+#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
+pub struct McpServerSeed {
+    /// Unique registry name, also used as the ACP server name.
+    pub name: String,
+    /// `stdio` (default), `http`, or `sse`.
+    #[serde(default)]
+    pub transport: McpTransport,
+    /// Stdio executable; a bare name is resolved on `PATH` at seed time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Literal environment values.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Environment entries read from a daemon env var (name -> source var).
+    #[serde(default)]
+    pub env_from: BTreeMap<String, String>,
+    /// HTTP/SSE endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Literal HTTP header values.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// HTTP header entries read from a daemon env var (name -> source var).
+    #[serde(default)]
+    pub headers_from: BTreeMap<String, String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Operator-authored seeds are pre-approved; consent can still be revoked
+    /// through `mcp.approve`.
+    #[serde(default = "default_true")]
+    pub approved: bool,
 }
 
 /// One `[[repos.known]]` entry: a repository path and an optional display name.
@@ -1113,6 +1169,54 @@ mod tests {
         // Other retention defaults still apply.
         assert_eq!(cfg.daemon.retention.min_tasks, 1000);
         assert!(cfg.daemon.retention.vacuum);
+    }
+
+    #[test]
+    fn load_from_keeps_mcp_seed_env_values() {
+        let path = std::env::temp_dir().join(format!(
+            "favetto-mcp-config-{}-{}.toml",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            "[[mcp.servers]]\nname = \"seeded\"\ncommand = \"/bin/sh\"\nenv = { SEED_TOKEN = \"seed-secret\" }\n",
+        )
+        .unwrap();
+        let cfg = FavettoConfig::load_from(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            cfg.mcp.servers[0].env.get("SEED_TOKEN").map(String::as_str),
+            Some("seed-secret")
+        );
+    }
+
+    #[test]
+    fn parses_mcp_server_seeds() {
+        let cfg: FavettoConfig = toml::from_str(
+            r#"
+            [[mcp.servers]]
+            name = "seeded"
+            command = "/bin/sh"
+            args = ["-c", "true"]
+            env = { SEED_TOKEN = "seed-secret" }
+
+            [[mcp.servers]]
+            name = "web"
+            transport = "http"
+            url = "https://example.com/mcp"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.mcp.servers.len(), 2);
+        let seeded = &cfg.mcp.servers[0];
+        assert_eq!(
+            seeded.env.get("SEED_TOKEN").map(String::as_str),
+            Some("seed-secret")
+        );
+        assert!(seeded.enabled);
+        assert!(seeded.approved);
+        assert_eq!(cfg.mcp.servers[1].transport, McpTransport::Http);
     }
 
     #[test]

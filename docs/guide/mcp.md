@@ -1,4 +1,14 @@
-# MCP supervisor
+# MCP
+
+Favetto uses MCP in two independent directions:
+
+- **Favetto as an MCP server** — `favetto-mcp` exposes a daemon to an MCP client
+  so the model can supervise a workflow (this page's main subject).
+- **Favetto as an ACP client** — the daemon passes user-owned MCP servers to an
+  ACP agent through `mcpServers`. See [MCP servers for agents](#mcp-servers-for-agents)
+  below.
+
+## MCP supervisor
 
 `favetto-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io)
 (MCP) server that exposes a favetto daemon to an MCP-capable agent — Claude
@@ -121,3 +131,72 @@ surface. `agents.reply` is the only agent-input tool; `agents.input`,
 `notifications.*`, and `hooks.upsert` are not available. The daemon and
 `favetto-core` are unchanged: this is another external supervisor, like the
 reference example in the [supervisor contract](../reference/supervisor-contract).
+
+## MCP servers for agents
+
+ACP v1 sessions accept an `mcpServers` list. Favetto forwards registered
+definitions on `session/new`, and replays the same selection on `session/load`
+and `session/resume`. It never installs or probes packages: you install the
+server yourself and register its command or URL.
+
+### Register a definition
+
+The daemon persists definitions in SQLite. A `[[mcp.servers]]` config entry seeds
+the registry at startup only; later app edits survive restarts.
+
+```toml
+[[mcp.servers]]
+name = "files"
+command = "npx"                       # resolved on PATH, stored absolute
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/work"]
+enabled = true
+approved = true                       # operator-authored seeds are pre-approved
+env = { GITHUB_TOKEN = "..." }        # literal, stored in a 0600 secrets file
+
+[[mcp.servers]]
+name = "remote"
+transport = "http"
+url = "https://example.com/mcp"
+headers = { Authorization = "Bearer ..." }
+```
+
+Prefer `env_from` / `headers_from` to keep the config free of secrets:
+
+```toml
+[mcp.servers.env_from]
+GITHUB_TOKEN = "GITHUB_TOKEN"         # entry name -> daemon env var
+```
+
+The management RPCs are:
+
+| Method | Purpose |
+|---|---|
+| `mcp.list` / `mcp.get` | Redacted definitions, sorted by name. |
+| `mcp.add` / `mcp.update` | Register or replace. Changing the command/args fingerprint revokes approval unless `approve: true`. |
+| `mcp.remove` | Delete the definition and its stored literals. |
+| `mcp.set_enabled` | Enable/disable without deleting. |
+| `mcp.approve` | Record or revoke stdio launch consent. |
+
+Only stdio needs approval: enabling a command is not consent to run it with the
+daemon's privileges. HTTP/SSE definitions are gated on the agent's advertised
+`mcpCapabilities` instead.
+
+### Secrets
+
+Secret values are resolved in memory at launch. `env`/`header` declarations name
+a source (`env`, `command`, or a write-only `literal`). RPC responses return only
+the declaration and `has_value`; values are never logged, embedded in errors, or
+included in session payloads. Literal values live in
+`<data_dir>/mcp-secrets.json` with mode `0600`.
+
+### Selection and fallback
+
+- `agents.start` / `tasks.start_oneshot` take `mcp_servers: ["name"]`.
+- A catalog task header can set `mcp = ["name"]`.
+- Unset means every enabled + approved definition; an explicit empty list sends
+  none.
+
+The session's `mcp` field reports `selected`, `active`, and `warnings`. Removed,
+disabled, unapproved, unresolvable or unsupported transports are omitted with an
+actionable warning and the session still starts. An unknown name in an explicit
+request is an `InvalidParams` error rather than a silent change.

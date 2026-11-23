@@ -121,6 +121,16 @@ fn main() {
                 let mut capabilities = json!({
                     "loadSession": load_supported()
                 });
+                let mut mcp_capabilities = serde_json::Map::new();
+                if std::env::var("FAKE_ACP_MCP_HTTP").as_deref() == Ok("1") {
+                    mcp_capabilities.insert("http".to_string(), json!(true));
+                }
+                if std::env::var("FAKE_ACP_MCP_SSE").as_deref() == Ok("1") {
+                    mcp_capabilities.insert("sse".to_string(), json!(true));
+                }
+                if !mcp_capabilities.is_empty() {
+                    capabilities["mcpCapabilities"] = Value::Object(mcp_capabilities);
+                }
                 let mut session_capabilities = serde_json::Map::new();
                 if close_advertised() {
                     session_capabilities.insert("close".to_string(), json!({}));
@@ -147,6 +157,7 @@ fn main() {
                 respond(&mut stdout, id, response);
             }
             "session/new" => {
+                record_mcp("session/new", &message);
                 if !authenticated {
                     if let Some(id) = id {
                         error(&mut stdout, id, -32000, "Authentication required");
@@ -193,6 +204,7 @@ fn main() {
                 respond(&mut stdout, id, json!({}));
             }
             "session/load" => {
+                record_mcp("session/load", &message);
                 if !authenticated {
                     if let Some(id) = id {
                         error(&mut stdout, id, -32000, "Authentication required");
@@ -310,6 +322,7 @@ fn main() {
                 respond(&mut stdout, id, result);
             }
             "session/resume" => {
+                record_mcp("session/resume", &message);
                 let resumed = message
                     .get("params")
                     .and_then(|params| params.get("sessionId"))
@@ -440,6 +453,26 @@ fn main() {
                 }
             }
         }
+    }
+}
+
+/// Append the request's `mcpServers` params to `FAKE_ACP_MCP_MARKER`, one JSON
+/// object per request, so tests can assert exactly what Favetto forwarded.
+fn record_mcp(method: &str, message: &Value) {
+    let Some(marker) = std::env::var_os("FAKE_ACP_MCP_MARKER") else {
+        return;
+    };
+    let servers = message
+        .get("params")
+        .and_then(|params| params.get("mcpServers"))
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(marker)
+    {
+        let _ = writeln!(file, "{}", json!({ "method": method, "servers": servers }));
     }
 }
 

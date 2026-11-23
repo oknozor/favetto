@@ -12,6 +12,7 @@ Every section is optional; favetto falls back to built-in defaults for anything 
 | `agents` | Map<String, AgentConfig> | `{}` | no | External coding agents by name (e.g. `claude`, `opencode`, `pi`, `vibe`). |
 | `daemon` | DaemonSettings | `{"listen":null,"socket":null,"tasks_dir":null,"data_dir":null,"retention":{"days":30,"min_tasks":1000,"vacuum":true}}` | no | Daemon defaults (overridable by CLI flags). |
 | `repos` | ReposSettings | `{"known":[],"depth":1}` | no | Repo-local task catalogs: the known-repos registry seed, the active repo, and the optional base directory scanned for repositories. Ignored by clients; the daemon persists changes in SQLite. |
+| `mcp` | McpSettings | `{"servers":[]}` | no | MCP servers Favetto may forward to ACP agents. The daemon persists edits in SQLite; this section only seeds the registry at startup. |
 | `executor` | ExecutorSettings | `{"parallel":false,"max_concurrency":4,"worktree":true,"worktree_retention":{"days":30,"min_worktrees":0},"keep_worktree":false,"max_output_bytes":262144,"detect_awaiting_input":true,"awaiting_input_quiet_ms":8000,"stale_run":"fail","retry":{"max_attempts":1,"backoff":"exponential","initial_ms":5000,"max_ms":300000,"retry_on":["infrastructure","timeout"]}}` | no | Task executor concurrency / isolation. |
 | `git` | GitSettings | `{}` | no | Non-interactive git provisioning for agent processes. Defaults to `signing = "off"`, which forces `commit.gpgsign = false` so an agent commit can never block on an interactive pinentry/askpass prompt. |
 | `webhook` | WebhookSettings | `{"github":{"enabled":false,"rules":[]}}` | no | Webhook trigger rules (currently GitHub). |
@@ -144,6 +145,49 @@ One `[[repos.known]]` entry: a repository path and an optional display name.
 |-------|------|---------|----------|-------------|
 | `path` | string | — | yes | Absolute (or `~`-expanded) path to the repository on the daemon host. |
 | `name` | string (optional) | — | no | Display name used as the namespace key; defaults to the directory basename. |
+
+## McpSettings
+
+MCP server registry seed (`[mcp]`).
+
+Every entry is operator-authored and therefore treated as pre-approved. The
+daemon copies seeds into its persisted registry at startup; later app edits
+survive restarts. Favetto never installs or upgrades the server.
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `servers` | McpServerSeed[] | `[]` | no |  |
+
+## McpServerSeed
+
+One `[[mcp.servers]]` entry.
+
+`env`/`headers` hold literal secret values (stored by the daemon in its
+`0600` secrets file, not in this config file); `env_from`/`headers_from` map
+the entry name to the daemon env var carrying the value.
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `name` | string | — | yes | Unique registry name, also used as the ACP server name. |
+| `transport` | McpTransport | `stdio` | no | `stdio` (default), `http`, or `sse`. |
+| `command` | string (optional) | — | no | Stdio executable; a bare name is resolved on `PATH` at seed time. |
+| `args` | string[] | `[]` | no |  |
+| `env` | Map<String, string> | `{}` | no | Literal environment values. |
+| `env_from` | Map<String, string> | `{}` | no | Environment entries read from a daemon env var (name -> source var). |
+| `url` | string (optional) | — | no | HTTP/SSE endpoint. |
+| `headers` | Map<String, string> | `{}` | no | Literal HTTP header values. |
+| `headers_from` | Map<String, string> | `{}` | no | HTTP header entries read from a daemon env var (name -> source var). |
+| `enabled` | boolean | `true` | no |  |
+| `approved` | boolean | `true` | no | Operator-authored seeds are pre-approved; consent can still be revoked through `mcp.approve`. |
+
+## McpTransport
+
+How Favetto connects to an MCP server.
+
+Stdio is mandatory for every ACP agent; HTTP and SSE are opt-in through the
+agent's advertised `mcpCapabilities`.
+
+string
 
 ## ExecutorSettings
 

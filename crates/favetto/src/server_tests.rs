@@ -1051,6 +1051,7 @@ fn live_session(running: bool, headless: bool, awaiting: bool) -> AgentSessionIn
         config_options: Vec::new(),
         modes: None,
         auth: None,
+        mcp: None,
     }
 }
 

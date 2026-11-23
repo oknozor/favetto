@@ -62,6 +62,31 @@ permission = "deny"
 Update the changelog.
 ```
 
+## MCP servers
+
+Favetto can pass user-installed [MCP](../guide/mcp#mcp-servers-for-agents)
+servers to an ACP agent through the protocol's `mcpServers` session field. It
+never downloads, installs or supervises them: you register a command (stdio) or a
+URL (HTTP/SSE), and the agent connects directly.
+
+Register definitions through `mcp.add` (the app/Settings surface uses the same
+RPCs) or seed them from `[[mcp.servers]]` in `config.toml`. Stdio launches
+require explicit approval bound to a fingerprint of the command/args; editing
+those revokes it. Secret env/header values come from a daemon env var, a secret
+command, or a write-only literal stored in a `0600` file, and are never returned
+by the RPCs.
+
+Selection is separate from registration:
+
+- `agents.start` / `tasks.start_oneshot` accept `mcp_servers: ["name"]`.
+- A catalog task can set `mcp = ["name"]` in its header.
+- Absent means every enabled + approved definition; `[]` sends none.
+
+The session's `mcp` field reports the `selected`, `active` and any `warnings`
+(e.g. an HTTP server omitted because the agent did not advertise
+`mcpCapabilities.http`). A bad entry never blocks the run; an unknown *explicit*
+name is an error.
+
 ## Authentication
 
 ACP v1 agents can advertise authentication methods during initialization. When

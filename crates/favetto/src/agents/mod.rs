@@ -21,6 +21,7 @@ use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 
 use favetto_core::elicitation::ElicitationReply;
+use favetto_core::mcp::McpSessionState;
 use favetto_core::model::{
     AgentActivity, AgentAuthMethodKind, AgentAuthState, AgentAuthStatus, AgentBackend,
     AgentCapabilities, AgentCommand, AgentLoadState, AgentPlanEntry, AgentSessionInfo,
@@ -187,6 +188,9 @@ pub struct Launch {
     /// `[git]` provisioning variables (signing identity, no interactive
     /// signers) for the agent's child environment.
     pub git_env: BTreeMap<String, String>,
+    /// Resolved MCP server selection, including its selected names and any
+    /// pre-launch warnings.
+    pub mcp: crate::mcp::McpSelection,
 }
 
 /// A session event broadcast to attached connections.
@@ -360,6 +364,8 @@ struct Session {
     lifecycle: Arc<Mutex<SessionLifecycle>>,
     /// Session-scoped ACP authentication state shared with the runtime.
     auth: Arc<Mutex<Option<AgentAuthState>>>,
+    /// MCP servers selected for this session and what the agent received.
+    mcp: Arc<Mutex<McpSessionState>>,
     responder: Arc<acp::AcpResponder>,
     /// Durable metadata writer, when the manager has a database attached.
     store: Option<SessionStore>,
@@ -390,6 +396,14 @@ impl Session {
             config_options: live.config_options.clone(),
             modes: live.modes.clone(),
             auth: self.auth.lock().clone(),
+            mcp: {
+                let mcp = self.mcp.lock().clone();
+                if mcp.selected.is_empty() {
+                    None
+                } else {
+                    Some(mcp)
+                }
+            },
         }
     }
 
@@ -690,6 +704,7 @@ impl AgentManager {
             AgentSessionRecord::loading(id.clone(), name, cwd.clone(), Timestamp::now());
         record.task_id = launch.task_id.clone();
         record.run_id = launch.run_id.clone();
+        record.mcp_servers = Some(launch.mcp.recorded_names());
         if let Some(store) = &self.store {
             store.create(&record).await.map_err(|error| {
                 anyhow::anyhow!("agent '{name}': cannot record ACP session '{id}': {error}")
@@ -700,6 +715,8 @@ impl AgentManager {
             id: id.clone(),
             run_id: record.run_id.clone(),
         });
+        let mcp_state = Arc::new(Mutex::new(launch.mcp.state()));
+        let mcp_servers = launch.mcp.servers.clone();
 
         let (handles, events) = match acp::spawn(acp::AcpLaunch {
             agent: name.to_string(),
@@ -721,6 +738,8 @@ impl AgentManager {
             session: binding,
             start_gate: None,
             lifecycle: None,
+            mcp_servers,
+            mcp_state,
         }) {
             Ok(spawned) => spawned,
             Err(error) => {
@@ -757,6 +776,7 @@ impl AgentManager {
             })),
             lifecycle: Arc::new(Mutex::new(SessionLifecycle::ready())),
             auth: handles.auth.clone(),
+            mcp: handles.mcp.clone(),
             responder: handles.responder.clone(),
             store: self.store.clone(),
             state_tx: state_tx.clone(),
@@ -782,6 +802,7 @@ impl AgentManager {
         name: &str,
         agent: Arc<Agent>,
         record: AgentSessionRecord,
+        mcp: crate::mcp::McpSelection,
     ) -> anyhow::Result<AgentSessionInfo> {
         if record.agent != name {
             anyhow::bail!(
@@ -803,6 +824,7 @@ impl AgentManager {
             acp::AcpSessionMode::Load {
                 external_session_id,
             },
+            mcp,
         )
         .await
     }
@@ -823,6 +845,7 @@ impl AgentManager {
         agent: Arc<Agent>,
         provider_session_id: &str,
         cwd: Option<PathBuf>,
+        mcp: crate::mcp::McpSelection,
     ) -> anyhow::Result<AgentSessionInfo> {
         // Reattaching to a live process is not a resume.
         let live = self
@@ -860,6 +883,7 @@ impl AgentManager {
                 let id = uuid::Uuid::new_v4().to_string();
                 let mut record = AgentSessionRecord::loading(id.clone(), name, cwd, now);
                 record.external_session_id = Some(provider_session_id.to_string());
+                record.mcp_servers = Some(mcp.recorded_names());
                 store.create(&record).await.map_err(|error| {
                     anyhow::anyhow!(
                         "agent '{name}': cannot import provider session \
@@ -876,6 +900,7 @@ impl AgentManager {
             acp::AcpSessionMode::ProviderResume {
                 external_session_id: provider_session_id.to_string(),
             },
+            mcp,
         )
         .await
     }
@@ -887,6 +912,7 @@ impl AgentManager {
         agent: Arc<Agent>,
         record: AgentSessionRecord,
         mode: acp::AcpSessionMode,
+        mcp: crate::mcp::McpSelection,
     ) -> anyhow::Result<AgentSessionInfo> {
         // Reattaching to a live process is not a restore. Replace only a
         // terminal entry left behind by an earlier process.
@@ -921,6 +947,8 @@ impl AgentManager {
         // snapshot clients read and gates the restore behind registration.
         let lifecycle = Arc::new(Mutex::new(SessionLifecycle::loading()));
         let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let mcp_state = Arc::new(Mutex::new(mcp.state()));
+        let mcp_servers = mcp.servers.clone();
 
         let (mut handles, events) = match acp::spawn(acp::AcpLaunch {
             agent: name.to_string(),
@@ -942,6 +970,8 @@ impl AgentManager {
             session: Some(binding),
             start_gate: Some(start_rx),
             lifecycle: Some(lifecycle.clone()),
+            mcp_servers,
+            mcp_state,
         }) {
             Ok(spawned) => spawned,
             Err(error) => {
@@ -979,6 +1009,7 @@ impl AgentManager {
             })),
             lifecycle: lifecycle.clone(),
             auth: handles.auth.clone(),
+            mcp: handles.mcp.clone(),
             responder: handles.responder.clone(),
             store: self.store.clone(),
             state_tx: state_tx.clone(),
@@ -1954,6 +1985,7 @@ mod session_launch_tests {
             model: None,
             headless: true,
             git_env: Default::default(),
+            mcp: crate::mcp::McpSelection::default(),
         }
     }
 

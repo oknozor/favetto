@@ -48,6 +48,7 @@ mod event_bus;
 mod executor;
 mod git;
 mod hooks;
+mod mcp;
 mod metrics;
 mod notify;
 mod repos;

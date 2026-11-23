@@ -785,6 +785,11 @@ pub struct AgentSessionInfo {
     /// neither advertise auth methods nor logout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<AgentAuthState>,
+    /// Which registered MCP servers this session selected and actually
+    /// forwarded to the agent, plus any omissions. Additive: older clients
+    /// ignore the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<crate::mcp::McpSessionState>,
 }
 
 /// The lifecycle of a persisted ACP session, as shown by `agents.history`.
@@ -1810,6 +1815,7 @@ mod tests {
                 config_options: Vec::new(),
                 modes: None,
                 auth: None,
+                mcp: None,
             };
             let json = serde_json::to_value(&info).unwrap();
             assert_eq!(json["load_state"], serde_json::json!(state));
@@ -1836,6 +1842,7 @@ mod tests {
             config_options: Vec::new(),
             modes: None,
             auth: None,
+            mcp: None,
         };
         let json = serde_json::to_value(&failed).unwrap();
         assert_eq!(json["load_state"], "failed");

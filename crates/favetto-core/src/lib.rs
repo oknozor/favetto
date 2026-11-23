@@ -32,4 +32,4 @@ pub mod ws;
 // modules so every `favetto_core::{model,agent_state,rpc}::…` import keeps working.
 /// The shared `time` version, re-exported so clients and the daemon agree.
 pub use favetto_wire::time;
-pub use favetto_wire::{agent_state, elicitation, model, rpc, Timestamp};
+pub use favetto_wire::{agent_state, elicitation, mcp, model, rpc, Timestamp};

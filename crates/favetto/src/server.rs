@@ -637,6 +637,7 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
                     schedule: d.schedule.clone(),
                     kind: d.kind.as_str().to_string(),
                     needs: d.needs.clone(),
+                    mcp: d.mcp.clone(),
                     vars: d.vars.clone(),
                     prompt: d.prompt.clone(),
                     repo: crate::tasks::split_repo(&d.name).map(|(repo, _)| repo.to_string()),
@@ -1036,6 +1037,57 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
             }),
             Err(e) => Err(RpcError::Internal(e.to_string())),
         },
+
+        method::MCP_LIST => to_value(McpListResult {
+            servers: crate::mcp::list(state),
+        }),
+
+        method::MCP_GET => {
+            let p: McpGetParams = parse_params(&req.method, &req.params)?;
+            crate::mcp::get(state, &p.name)
+                .map_err(|e| RpcError::InvalidParams(e.to_string()))
+                .and_then(to_value)
+        }
+
+        method::MCP_ADD => {
+            let p: McpAddParams = parse_params(&req.method, &req.params)?;
+            crate::mcp::add(state, &p.server, p.approve)
+                .await
+                .map_err(|e| RpcError::InvalidParams(e.to_string()))
+                .and_then(to_value)
+        }
+
+        method::MCP_UPDATE => {
+            let p: McpUpdateParams = parse_params(&req.method, &req.params)?;
+            crate::mcp::update(state, &p.name, &p.server, p.approve)
+                .await
+                .map_err(|e| RpcError::InvalidParams(e.to_string()))
+                .and_then(to_value)
+        }
+
+        method::MCP_REMOVE => {
+            let p: McpRemoveParams = parse_params(&req.method, &req.params)?;
+            match crate::mcp::remove(state, &p.name).await {
+                Ok(removed) => to_value(McpRemoveResult { removed }),
+                Err(e) => Err(RpcError::Internal(e.to_string())),
+            }
+        }
+
+        method::MCP_SET_ENABLED => {
+            let p: McpSetEnabledParams = parse_params(&req.method, &req.params)?;
+            crate::mcp::set_enabled(state, &p.name, p.enabled)
+                .await
+                .map_err(|e| RpcError::InvalidParams(e.to_string()))
+                .and_then(to_value)
+        }
+
+        method::MCP_APPROVE => {
+            let p: McpApproveParams = parse_params(&req.method, &req.params)?;
+            crate::mcp::approve(state, &p.name, p.approved)
+                .await
+                .map_err(|e| RpcError::InvalidParams(e.to_string()))
+                .and_then(to_value)
+        }
 
         _ => Err(RpcError::MethodNotFound(format!(
             "unknown method: {}",
@@ -1618,7 +1670,8 @@ async fn load_agent(
 
     let name = record.agent.clone();
     let agent = state.registry.get_checked(&name)?;
-    state.agents.load(&name, agent, record).await
+    let mcp = crate::mcp::resolve_for_restore(state, record.mcp_servers.as_deref());
+    state.agents.load(&name, agent, record, mcp).await
 }
 
 /// Resolve a configured agent, either by name or the daemon default.
@@ -1696,9 +1749,17 @@ async fn resume_provider_session(
     params: ProviderResumeParams,
 ) -> anyhow::Result<AgentSessionInfo> {
     let (name, agent) = resolve_agent(state, params.agent.as_deref())?;
+    // An already-imported provider session replays its recorded selection; a
+    // first-time import uses the current default (all enabled + approved).
+    let stored =
+        db::get_agent_session_by_external(&state.db, &name, &params.provider_session_id).await?;
+    let mcp = match &stored {
+        Some(record) => crate::mcp::resolve_for_restore(state, record.mcp_servers.as_deref()),
+        None => crate::mcp::resolve_for_launch(state, None, None)?,
+    };
     state
         .agents
-        .resume_provider(&name, agent, &params.provider_session_id, params.cwd)
+        .resume_provider(&name, agent, &params.provider_session_id, params.cwd, mcp)
         .await
 }
 
@@ -1735,6 +1796,7 @@ async fn start_agent(
         cwd,
         provider: requested_provider,
         model: requested_model,
+        mcp_servers,
         ..
     } = params;
     let force_new = force_new.unwrap_or(false);
@@ -1780,6 +1842,14 @@ async fn start_agent(
             );
         }
     }
+
+    // Resolve MCP registration separately from selection: an explicit request
+    // wins over the catalog header, then every enabled + approved definition.
+    let mcp = crate::mcp::resolve_for_launch(
+        state,
+        mcp_servers.as_deref(),
+        resolved.as_ref().and_then(|(_, def)| def.mcp.as_deref()),
+    )?;
 
     // Resolve the agent: a request wins over the task's stored launch override,
     // the configured definition, and finally the configured default. The same
@@ -1838,6 +1908,7 @@ async fn start_agent(
                 model,
                 headless: false,
                 git_env: Default::default(),
+                mcp,
             },
         )
         .await
@@ -1880,6 +1951,7 @@ async fn start_oneshot_task(
         provider,
         model,
         cwd,
+        mcp_servers,
         ..
     } = params;
     let cwd = cwd
@@ -1891,6 +1963,7 @@ async fn start_oneshot_task(
             anyhow::anyhow!("no agent given and no default configured ([agent].default)")
         })?;
     let agent = state.registry.get_checked(&name)?;
+    let mcp = crate::mcp::resolve_for_launch(state, mcp_servers.as_deref(), None)?;
     let cwd_path = cwd
         .as_ref()
         .map(std::path::PathBuf::from)
@@ -1959,6 +2032,7 @@ async fn start_oneshot_task(
                 model: crate::agents::model_selector(provider.as_deref(), model.as_deref()),
                 headless: false,
                 git_env: Default::default(),
+                mcp,
             },
         )
         .await
@@ -2150,6 +2224,7 @@ async fn add_catalog_task(
         spawn_file,
         spawn_new_root,
         sign: None,
+        mcp: None,
         permission: None,
         worktree: None,
         vars: Vec::new(),

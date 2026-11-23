@@ -125,6 +125,12 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     crate::repos::seed_from_config(&state, &state.config).await;
     crate::repos::refresh(&state).await?;
 
+    // Load the MCP registry seed and its `0600` literal secrets. Config seeds
+    // are idempotent and never overwrite app-managed edits.
+    state.mcp.write().load_secrets();
+    crate::mcp::seed_from_config(&state, &state.config).await;
+    crate::mcp::refresh(&state).await?;
+
     // Discover `[repos].base_dir` children before resolving the active repo, so a
     // vanished active repo is cleared and falls back to the global catalog.
     *state.active_repo.write() = db::get_active_repo(&state.db).await?;

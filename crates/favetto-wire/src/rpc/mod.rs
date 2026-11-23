@@ -230,6 +230,20 @@ pub mod method {
     pub const REPOS_ACTIVATE: &str = "repos.activate";
     /// Re-scan the base directory and reconcile the repository registry.
     pub const REPOS_REFRESH: &str = "repos.refresh";
+    /// List registered MCP server definitions with secrets redacted.
+    pub const MCP_LIST: &str = "mcp.list";
+    /// Fetch one registered MCP server definition.
+    pub const MCP_GET: &str = "mcp.get";
+    /// Register an MCP server (stdio command or HTTP/SSE URL).
+    pub const MCP_ADD: &str = "mcp.add";
+    /// Replace an existing MCP server definition.
+    pub const MCP_UPDATE: &str = "mcp.update";
+    /// Remove an MCP server definition.
+    pub const MCP_REMOVE: &str = "mcp.remove";
+    /// Enable or disable an MCP server definition.
+    pub const MCP_SET_ENABLED: &str = "mcp.set_enabled";
+    /// Approve (or revoke) launching a stdio MCP command.
+    pub const MCP_APPROVE: &str = "mcp.approve";
 }
 
 /// Well-known server → client push (notification) method names.
@@ -472,6 +486,38 @@ pub const CLIENT_METHODS: &[(&str, &str)] = &[
         method::REPOS_REFRESH,
         "Re-scan the base directory and reconcile the repository registry.",
     ),
+    (
+        method::MCP_LIST,
+        "List registered MCP server definitions. Secret values are never \
+         returned; each entry reports only its source and `has_value`.",
+    ),
+    (
+        method::MCP_GET,
+        "Fetch one registered MCP server definition by name (secrets redacted).",
+    ),
+    (
+        method::MCP_ADD,
+        "Register an already-installed MCP server by stdio command or HTTP/SSE \
+         URL. `approve` records stdio launch consent.",
+    ),
+    (
+        method::MCP_UPDATE,
+        "Replace a registered MCP server definition. A changed command/args \
+         fingerprint revokes prior approval unless `approve` is set.",
+    ),
+    (
+        method::MCP_REMOVE,
+        "Remove a registered MCP server by name.",
+    ),
+    (
+        method::MCP_SET_ENABLED,
+        "Enable or disable a registered MCP server. Disabling never removes it.",
+    ),
+    (
+        method::MCP_APPROVE,
+        "Approve (or revoke) launching a stdio MCP command at the current \
+         definition fingerprint.",
+    ),
 ];
 
 /// Every server → client push (notification), paired with a one-line purpose.
@@ -645,6 +691,13 @@ mod tests {
             method::REPOS_REMOVE,
             method::REPOS_ACTIVATE,
             method::REPOS_REFRESH,
+            method::MCP_LIST,
+            method::MCP_GET,
+            method::MCP_ADD,
+            method::MCP_UPDATE,
+            method::MCP_REMOVE,
+            method::MCP_SET_ENABLED,
+            method::MCP_APPROVE,
         ]
         .into_iter()
         .collect();

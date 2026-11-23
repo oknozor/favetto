@@ -91,6 +91,28 @@ vacuum = true      # reclaim disk space after a prune
 # known = [{ path = "~/code/favetto" }]
 # known = [{ path = "/srv/web", name = "web" }]
 
+# MCP servers forwarded to ACP agents through `mcpServers`. Favetto never
+# installs, downloads or supervises them: register a server you already have.
+# Entries seed the persisted registry at startup; app edits survive restarts.
+# Literal secret values are stored in `<data_dir>/mcp-secrets.json` (mode 0600)
+# and are never returned by the RPCs. Prefer `env_from`/`headers_from` to keep
+# secrets out of this file.
+#
+# [[mcp.servers]]
+# name = "files"
+# command = "npx"                 # a bare name is resolved on PATH, stored absolute
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/work"]
+# enabled = true
+# approved = true                 # operator seeds are pre-approved
+# env = { GITHUB_TOKEN = "..." }
+#
+# [[mcp.servers]]
+# name = "remote"
+# transport = "http"              # "stdio" (default), "http", or "sse"
+# url = "https://example.com/mcp"
+# headers_from = { Authorization = "MCP_AUTH_HEADER" }
+[mcp]
+
 # Authentication: username/password login policy for remote clients that cannot
 # run `favetto pair` on the daemon host. User accounts are managed with
 # `favetto user add|passwd|list|remove` and stored (hashed) in SQLite.

@@ -216,6 +216,7 @@ fn session_with_backend(
         config_options: Vec::new(),
         modes: None,
         auth: None,
+        mcp: None,
     }
 }
 

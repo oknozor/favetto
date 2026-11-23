@@ -17,6 +17,7 @@ use crate::config::FavettoConfig;
 use crate::db;
 use crate::event_bus::{EventBus, ServerPush};
 use crate::hooks::Hook;
+use crate::mcp::McpRegistry;
 use crate::metrics::Metrics;
 use crate::pair::PairStore;
 use crate::repos::KnownRepo;
@@ -62,6 +63,8 @@ pub struct State {
     pub repos: Arc<RwLock<Vec<KnownRepo>>>,
     /// The daemon-wide active repo name; `None` means the global catalog.
     pub active_repo: Arc<RwLock<Option<String>>>,
+    /// Registered MCP server definitions plus in-memory literal secrets.
+    pub mcp: Arc<RwLock<McpRegistry>>,
     /// Control signal to the catalog watcher: sent when the set of watched roots
     /// changes (a repo was added/removed). The watcher re-targets and reloads.
     pub watch_tx: tokio::sync::mpsc::UnboundedSender<()>,
@@ -95,6 +98,7 @@ impl State {
             init.config.auth.login_window_secs,
         );
         let (watch_tx, watch_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mcp = Arc::new(RwLock::new(McpRegistry::new(&init.data_dir)));
         // Attach the bus to the agent manager before it is stored, so every
         // normalized event is published as an `agent.event` push.
         let mut agents = init.agents;
@@ -120,6 +124,7 @@ impl State {
             metrics: Metrics::default(),
             repos: Arc::new(RwLock::new(Vec::new())),
             active_repo: Arc::new(RwLock::new(None)),
+            mcp,
             watch_tx,
             watch_rx: parking_lot::Mutex::new(Some(watch_rx)),
         }

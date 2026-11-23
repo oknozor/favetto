@@ -30,12 +30,12 @@ use agent_client_protocol::v1::schema::{
     ContentBlock, CreateElicitationRequest, CreateElicitationResponse, DeleteSessionRequest,
     ElicitationAcceptAction, ElicitationAction, ElicitationCapabilities, ElicitationContentValue,
     ElicitationFormCapabilities, ElicitationMode, ElicitationPropertySchema, ElicitationSchema,
-    ElicitationScope, EmbeddedResourceResource, InitializeRequest, ListSessionsRequest,
-    LoadSessionRequest, LogoutRequest, NewSessionRequest, PermissionOptionKind,
-    PlanEntry as AcpPlanEntry, PlanEntryPriority as AcpPlanPriority,
-    PlanEntryStatus as AcpPlanStatus, PromptRequest, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
-    SelectedPermissionOutcome, SessionConfigId as AcpSessionConfigId,
+    ElicitationScope, EmbeddedResourceResource, EnvVariable, HttpHeader, InitializeRequest,
+    ListSessionsRequest, LoadSessionRequest, LogoutRequest, McpServer, McpServerHttp, McpServerSse,
+    McpServerStdio, NewSessionRequest, PermissionOptionKind, PlanEntry as AcpPlanEntry,
+    PlanEntryPriority as AcpPlanPriority, PlanEntryStatus as AcpPlanStatus, PromptRequest,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigId as AcpSessionConfigId,
     SessionConfigKind as AcpSessionConfigKind, SessionConfigOption as AcpSessionConfigOption,
     SessionConfigOptionCategory as AcpSessionConfigCategory,
     SessionConfigOptionValue as AcpSessionConfigValue,
@@ -60,6 +60,7 @@ use favetto_core::elicitation::{
     ElicitationReply, ElicitationRequest, ElicitationStringFormat, ElicitationValidationError,
     ElicitationValue, MAX_ELICITATION_FIELDS, MAX_ELICITATION_OPTIONS,
 };
+use favetto_core::mcp::{McpSessionState, McpTransport};
 use favetto_core::model::{
     AgentAuthMethod, AgentAuthMethodKind, AgentAuthState, AgentAuthStatus, AgentCommand,
     AgentLoadState, AgentPlanEntry, AgentPlanPriority, AgentPlanStatus, AgentStateEvent,
@@ -214,6 +215,99 @@ pub(crate) struct AcpLaunch {
     pub start_gate: Option<oneshot::Receiver<()>>,
     /// The restore lifecycle shared with the manager's session snapshot.
     pub lifecycle: Option<Arc<Mutex<SessionLifecycle>>>,
+    /// Resolved MCP definitions to forward once the agent advertises which
+    /// transports it supports.
+    pub mcp_servers: Vec<crate::mcp::McpCandidate>,
+    /// What the session selected and actually received, shared with the manager
+    /// snapshot.
+    pub mcp_state: Arc<Mutex<McpSessionState>>,
+}
+
+/// Convert one resolved candidate into an ACP `mcpServers` entry.
+fn acp_mcp_server(candidate: &crate::mcp::McpCandidate) -> Option<McpServer> {
+    match candidate.transport {
+        McpTransport::Stdio => {
+            let command = candidate.command.clone()?;
+            Some(McpServer::Stdio(
+                McpServerStdio::new(candidate.name.clone(), command)
+                    .args(candidate.args.clone())
+                    .env(
+                        candidate
+                            .env
+                            .iter()
+                            .map(|(name, value)| EnvVariable::new(name.clone(), value.clone()))
+                            .collect(),
+                    ),
+            ))
+        }
+        McpTransport::Http => {
+            let url = candidate.url.clone()?;
+            Some(McpServer::Http(
+                McpServerHttp::new(candidate.name.clone(), url).headers(
+                    candidate
+                        .headers
+                        .iter()
+                        .map(|(name, value)| HttpHeader::new(name.clone(), value.clone()))
+                        .collect(),
+                ),
+            ))
+        }
+        McpTransport::Sse => {
+            let url = candidate.url.clone()?;
+            Some(McpServer::Sse(
+                McpServerSse::new(candidate.name.clone(), url).headers(
+                    candidate
+                        .headers
+                        .iter()
+                        .map(|(name, value)| HttpHeader::new(name.clone(), value.clone()))
+                        .collect(),
+                ),
+            ))
+        }
+    }
+}
+
+/// Filter the resolved definitions by the agent's advertised `mcpCapabilities`
+/// and record what was actually forwarded.
+///
+/// ACP v1 mandates stdio support; HTTP and SSE are opt-in. Unsupported entries
+/// are omitted with an actionable warning rather than failing the session.
+fn filter_mcp_servers(
+    candidates: &[crate::mcp::McpCandidate],
+    capabilities: &AgentCapabilities,
+    state: &mut McpSessionState,
+) -> Vec<McpServer> {
+    let mut servers = Vec::new();
+    let mut active = Vec::new();
+    for candidate in candidates {
+        let supported = match candidate.transport {
+            McpTransport::Stdio => true,
+            McpTransport::Http => capabilities.mcp_capabilities.http,
+            McpTransport::Sse => capabilities.mcp_capabilities.sse,
+        };
+        if !supported {
+            state.warnings.push(format!(
+                "MCP server '{}' uses the {} transport, which this agent did not advertise; \
+                 omitting it",
+                candidate.name,
+                candidate.transport.as_str()
+            ));
+            continue;
+        }
+        match acp_mcp_server(candidate) {
+            Some(server) => {
+                active.push(candidate.name.clone());
+                servers.push(server);
+            }
+            None => state.warnings.push(format!(
+                "MCP server '{}' is missing its {} endpoint; omitting it",
+                candidate.name,
+                candidate.transport.as_str()
+            )),
+        }
+    }
+    state.active = active;
+    servers
 }
 
 /// Internal messages from the ACP runtime to the manager's state task.
@@ -533,6 +627,9 @@ pub(crate) struct AcpHandles {
     /// run's captured output.
     pub transcript: Arc<Mutex<String>>,
     pub outcome: Arc<Mutex<AcpOutcome>>,
+    /// MCP servers selected for this session and what the agent actually
+    /// received after capability filtering.
+    pub mcp: Arc<Mutex<McpSessionState>>,
     /// Kept so a forced shutdown can still publish the terminal exit marker,
     /// even after the runtime task is aborted.
     events: mpsc::UnboundedSender<AcpEvent>,
@@ -750,6 +847,9 @@ pub(crate) fn spawn(
     let session_id_slot = external_session_id.clone();
     let ready_binding = launch.session.clone();
     let end_binding = launch.session;
+    let mcp_candidates = launch.mcp_servers;
+    let mcp_state = launch.mcp_state;
+    let handle_mcp = mcp_state.clone();
     let mut start_gate = launch.start_gate;
     let lifecycle = launch.lifecycle.clone();
 
@@ -880,6 +980,23 @@ pub(crate) fn spawn(
                     .await
                     .map_err(|error| anyhow::anyhow!("agent '{agent_name}': {error}"))?;
                     *capability_slot.lock() = Some(init.agent_capabilities.clone());
+                    // Resolve which MCP transports this agent supports before
+                    // any session setup request carries the list.
+                    let mut mcp_snapshot = mcp_state.lock().clone();
+                    let mcp_servers = filter_mcp_servers(
+                        &mcp_candidates,
+                        &init.agent_capabilities,
+                        &mut mcp_snapshot,
+                    );
+                    *mcp_state.lock() = mcp_snapshot;
+                    for warning in &mcp_state.lock().warnings {
+                        tracing::warn!(
+                            target: "favetto::acp",
+                            agent = %agent_name,
+                            warning = %warning,
+                            "omitting MCP server from ACP session setup"
+                        );
+                    }
                     // `session/close` is optional. Only call it when the agent
                     // advertised `sessionCapabilities.close`; process teardown
                     // below is the cleanup path otherwise.
@@ -1119,10 +1236,13 @@ pub(crate) fn spawn(
                                         "session/load",
                                         setup_deadline,
                                         connection
-                                            .send_request(LoadSessionRequest::new(
-                                                SessionId::new(known.clone()),
-                                                cwd.clone(),
-                                            ))
+                                            .send_request(
+                                                LoadSessionRequest::new(
+                                                    SessionId::new(known.clone()),
+                                                    cwd.clone(),
+                                                )
+                                                .mcp_servers(mcp_servers.clone()),
+                                            )
                                             .block_task(),
                                     )
                                     .await?;
@@ -1180,10 +1300,13 @@ pub(crate) fn spawn(
                                         "session/load",
                                         setup_deadline,
                                         connection
-                                            .send_request(LoadSessionRequest::new(
-                                                SessionId::new(known.clone()),
-                                                cwd.clone(),
-                                            ))
+                                            .send_request(
+                                                LoadSessionRequest::new(
+                                                    SessionId::new(known.clone()),
+                                                    cwd.clone(),
+                                                )
+                                                .mcp_servers(mcp_servers.clone()),
+                                            )
                                             .block_task(),
                                     )
                                     .await?;
@@ -1230,10 +1353,13 @@ pub(crate) fn spawn(
                                         "session/resume",
                                         setup_deadline,
                                         connection
-                                            .send_request(ResumeSessionRequest::new(
-                                                SessionId::new(known.clone()),
-                                                cwd.clone(),
-                                            ))
+                                            .send_request(
+                                                ResumeSessionRequest::new(
+                                                    SessionId::new(known.clone()),
+                                                    cwd.clone(),
+                                                )
+                                                .mcp_servers(mcp_servers.clone()),
+                                            )
                                             .block_task(),
                                     )
                                     .await?;
@@ -1287,7 +1413,10 @@ pub(crate) fn spawn(
                                     "session/new",
                                     setup_deadline,
                                     connection
-                                        .send_request(NewSessionRequest::new(cwd.clone()))
+                                        .send_request(
+                                            NewSessionRequest::new(cwd.clone())
+                                                .mcp_servers(mcp_servers.clone()),
+                                        )
                                         .block_task(),
                                 )
                                 .await?;
@@ -1817,6 +1946,7 @@ pub(crate) fn spawn(
             last_activity,
             transcript,
             outcome,
+            mcp: handle_mcp,
             events: handle_events,
             terminated,
             task,
@@ -4404,6 +4534,8 @@ mod tests {
             session: None,
             start_gate: None,
             lifecycle: None,
+            mcp_servers: Vec::new(),
+            mcp_state: Arc::new(Mutex::new(McpSessionState::default())),
         };
         let error = match spawn(launch) {
             Ok(_) => panic!("a missing cwd must not spawn"),

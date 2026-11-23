@@ -77,6 +77,13 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | `repos.remove` | Remove a known repository by name. |
 | `repos.activate` | Set (or clear) the daemon-wide active repository. |
 | `repos.refresh` | Re-scan the base directory and reconcile the repository registry. |
+| `mcp.list` | List registered MCP server definitions. Secret values are never returned; each entry reports only its source and `has_value`. |
+| `mcp.get` | Fetch one registered MCP server definition by name (secrets redacted). |
+| `mcp.add` | Register an already-installed MCP server by stdio command or HTTP/SSE URL. `approve` records stdio launch consent. |
+| `mcp.update` | Replace a registered MCP server definition. A changed command/args fingerprint revokes prior approval unless `approve` is set. |
+| `mcp.remove` | Remove a registered MCP server by name. |
+| `mcp.set_enabled` | Enable or disable a registered MCP server. Disabling never removes it. |
+| `mcp.approve` | Approve (or revoke) launching a stdio MCP command at the current definition fingerprint. |
 
 ## Client → server request & response types
 
@@ -342,6 +349,7 @@ Start a one-shot task from an inline definition (not added to the catalog) and o
 | `cwd` | string (optional) | null | no |  |
 | `rows` | integer (optional) | null | no |  |
 | `cols` | integer (optional) | null | no |  |
+| `mcp_servers` | string[] (optional) | null | no | Registered MCP server names to forward to the agent. Absent means every enabled + approved definition; an explicit empty list sends none. |
 
 **Response**
 
@@ -655,6 +663,7 @@ Start an external agent session, or attach to the task's existing live session. 
 | `provider` | string (optional) | null | no |  |
 | `model` | string (optional) | null | no |  |
 | `cwd` | string (optional) | null | no |  |
+| `mcp_servers` | string[] (optional) | null | no | Registered MCP server names to forward to the agent. Absent means every enabled + approved definition; an explicit empty list sends none. |
 
 **Response**
 
@@ -1159,6 +1168,181 @@ object
 |-------|------|---------|----------|-------------|
 | `repos` | RepoInfo[] | — | yes |  |
 | `active` | string (optional) | null | no |  |
+
+### `mcp.list`
+
+List registered MCP server definitions. Secret values are never returned; each entry reports only its source and `has_value`.
+
+**Request**
+
+object
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `servers` | McpServerInfo[] | — | yes |  |
+
+### `mcp.get`
+
+Fetch one registered MCP server definition by name (secrets redacted).
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `name` | string | — | yes |  |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `name` | string | — | yes |  |
+| `transport` | McpTransport | — | yes |  |
+| `command` | string (optional) | — | no | Absolute stdio executable path. |
+| `args` | string[] | — | no |  |
+| `env` | McpSecret[] | — | no |  |
+| `url` | string (optional) | — | no |  |
+| `headers` | McpSecret[] | — | no |  |
+| `enabled` | boolean | — | yes |  |
+| `approved` | boolean | — | yes | Whether a stdio command may be launched. Editing the command/args clears this until the operator approves the new fingerprint. |
+| `fingerprint` | string | — | yes | SHA-256 over the launch-relevant definition (never secret values). |
+| `source` | McpSource | `manual` | no | How the entry entered the registry. |
+| `created_at` | string | — | yes |  |
+| `updated_at` | string | — | yes |  |
+
+### `mcp.add`
+
+Register an already-installed MCP server by stdio command or HTTP/SSE URL. `approve` records stdio launch consent.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `server` | McpServerInput | — | yes |  |
+| `approve` | boolean (optional) | null | no |  |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `name` | string | — | yes |  |
+| `transport` | McpTransport | — | yes |  |
+| `command` | string (optional) | — | no | Absolute stdio executable path. |
+| `args` | string[] | — | no |  |
+| `env` | McpSecret[] | — | no |  |
+| `url` | string (optional) | — | no |  |
+| `headers` | McpSecret[] | — | no |  |
+| `enabled` | boolean | — | yes |  |
+| `approved` | boolean | — | yes | Whether a stdio command may be launched. Editing the command/args clears this until the operator approves the new fingerprint. |
+| `fingerprint` | string | — | yes | SHA-256 over the launch-relevant definition (never secret values). |
+| `source` | McpSource | `manual` | no | How the entry entered the registry. |
+| `created_at` | string | — | yes |  |
+| `updated_at` | string | — | yes |  |
+
+### `mcp.update`
+
+Replace a registered MCP server definition. A changed command/args fingerprint revokes prior approval unless `approve` is set.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `name` | string | — | yes |  |
+| `server` | McpServerInput | — | yes |  |
+| `approve` | boolean (optional) | null | no |  |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `name` | string | — | yes |  |
+| `transport` | McpTransport | — | yes |  |
+| `command` | string (optional) | — | no | Absolute stdio executable path. |
+| `args` | string[] | — | no |  |
+| `env` | McpSecret[] | — | no |  |
+| `url` | string (optional) | — | no |  |
+| `headers` | McpSecret[] | — | no |  |
+| `enabled` | boolean | — | yes |  |
+| `approved` | boolean | — | yes | Whether a stdio command may be launched. Editing the command/args clears this until the operator approves the new fingerprint. |
+| `fingerprint` | string | — | yes | SHA-256 over the launch-relevant definition (never secret values). |
+| `source` | McpSource | `manual` | no | How the entry entered the registry. |
+| `created_at` | string | — | yes |  |
+| `updated_at` | string | — | yes |  |
+
+### `mcp.remove`
+
+Remove a registered MCP server by name.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `name` | string | — | yes |  |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `removed` | boolean | — | yes |  |
+
+### `mcp.set_enabled`
+
+Enable or disable a registered MCP server. Disabling never removes it.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `name` | string | — | yes |  |
+| `enabled` | boolean | — | yes |  |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `name` | string | — | yes |  |
+| `transport` | McpTransport | — | yes |  |
+| `command` | string (optional) | — | no | Absolute stdio executable path. |
+| `args` | string[] | — | no |  |
+| `env` | McpSecret[] | — | no |  |
+| `url` | string (optional) | — | no |  |
+| `headers` | McpSecret[] | — | no |  |
+| `enabled` | boolean | — | yes |  |
+| `approved` | boolean | — | yes | Whether a stdio command may be launched. Editing the command/args clears this until the operator approves the new fingerprint. |
+| `fingerprint` | string | — | yes | SHA-256 over the launch-relevant definition (never secret values). |
+| `source` | McpSource | `manual` | no | How the entry entered the registry. |
+| `created_at` | string | — | yes |  |
+| `updated_at` | string | — | yes |  |
+
+### `mcp.approve`
+
+Approve (or revoke) launching a stdio MCP command at the current definition fingerprint.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `name` | string | — | yes |  |
+| `approved` | boolean | — | yes |  |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `name` | string | — | yes |  |
+| `transport` | McpTransport | — | yes |  |
+| `command` | string (optional) | — | no | Absolute stdio executable path. |
+| `args` | string[] | — | no |  |
+| `env` | McpSecret[] | — | no |  |
+| `url` | string (optional) | — | no |  |
+| `headers` | McpSecret[] | — | no |  |
+| `enabled` | boolean | — | yes |  |
+| `approved` | boolean | — | yes | Whether a stdio command may be launched. Editing the command/args clears this until the operator approves the new fingerprint. |
+| `fingerprint` | string | — | yes | SHA-256 over the launch-relevant definition (never secret values). |
+| `source` | McpSource | `manual` | no | How the entry entered the registry. |
+| `created_at` | string | — | yes |  |
+| `updated_at` | string | — | yes |  |
 
 ## Server → client pushes
 

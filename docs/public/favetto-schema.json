@@ -39,6 +39,13 @@
         "depth": 1
       }
     },
+    "mcp": {
+      "description": "MCP servers Favetto may forward to ACP agents. The daemon persists edits\nin SQLite; this section only seeds the registry at startup.",
+      "$ref": "#/$defs/McpSettings",
+      "default": {
+        "servers": []
+      }
+    },
     "executor": {
       "description": "Task executor concurrency / isolation.",
       "$ref": "#/$defs/ExecutorSettings",
@@ -386,6 +393,119 @@
       },
       "required": [
         "path"
+      ]
+    },
+    "McpSettings": {
+      "description": "MCP server registry seed (`[mcp]`).\n\nEvery entry is operator-authored and therefore treated as pre-approved. The\ndaemon copies seeds into its persisted registry at startup; later app edits\nsurvive restarts. Favetto never installs or upgrades the server.",
+      "type": "object",
+      "properties": {
+        "servers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/McpServerSeed"
+          },
+          "default": []
+        }
+      }
+    },
+    "McpServerSeed": {
+      "description": "One `[[mcp.servers]]` entry.\n\n`env`/`headers` hold literal secret values (stored by the daemon in its\n`0600` secrets file, not in this config file); `env_from`/`headers_from` map\nthe entry name to the daemon env var carrying the value.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Unique registry name, also used as the ACP server name.",
+          "type": "string"
+        },
+        "transport": {
+          "description": "`stdio` (default), `http`, or `sse`.",
+          "$ref": "#/$defs/McpTransport",
+          "default": "stdio"
+        },
+        "command": {
+          "description": "Stdio executable; a bare name is resolved on `PATH` at seed time.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "env": {
+          "description": "Literal environment values.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "env_from": {
+          "description": "Environment entries read from a daemon env var (name -> source var).",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "url": {
+          "description": "HTTP/SSE endpoint.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "headers": {
+          "description": "Literal HTTP header values.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "headers_from": {
+          "description": "HTTP header entries read from a daemon env var (name -> source var).",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "approved": {
+          "description": "Operator-authored seeds are pre-approved; consent can still be revoked\nthrough `mcp.approve`.",
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "McpTransport": {
+      "description": "How Favetto connects to an MCP server.\n\nStdio is mandatory for every ACP agent; HTTP and SSE are opt-in through the\nagent's advertised `mcpCapabilities`.",
+      "oneOf": [
+        {
+          "description": "A child process spoken to over stdin/stdout.",
+          "type": "string",
+          "const": "stdio"
+        },
+        {
+          "description": "Streamable HTTP.",
+          "type": "string",
+          "const": "http"
+        },
+        {
+          "description": "Server-sent events.",
+          "type": "string",
+          "const": "sse"
+        }
       ]
     },
     "ExecutorSettings": {

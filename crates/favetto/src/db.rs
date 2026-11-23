@@ -20,6 +20,7 @@ use uuid::Uuid;
 use favetto_core::agent_state::{
     AgentCost, AgentUsage, UsageBucket, UsagePeriod, UsageStats, UsageTotals,
 };
+use favetto_core::mcp::{McpSecret, McpSource, McpTransport};
 use favetto_core::model::{
     Event, EventKind, Failure, NotificationRecord, RepoSource, RunStatus, Schedule, Task, TaskRun,
     TaskStatus,
@@ -105,6 +106,28 @@ CREATE TABLE IF NOT EXISTS known_repos (
     source   TEXT NOT NULL DEFAULT 'manual'
 );
 
+-- Registered MCP server definitions forwarded to ACP agents. Secret *values*
+-- never live here: `env`/`headers` hold only the declaration (source kind,
+-- source env var or argv, and whether a literal exists); literal values live in
+-- `<data_dir>/mcp-secrets.json` with mode 0600. `fingerprint` covers the
+-- launch-relevant definition and `approved` is bound to it, so editing the
+-- command/args revokes consent.
+CREATE TABLE IF NOT EXISTS mcp_servers (
+    name        TEXT PRIMARY KEY,
+    transport   TEXT NOT NULL DEFAULT 'stdio',
+    command     TEXT,
+    args        TEXT NOT NULL DEFAULT '[]',
+    url         TEXT,
+    env         TEXT NOT NULL DEFAULT '[]',
+    headers     TEXT NOT NULL DEFAULT '[]',
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    approved    INTEGER NOT NULL DEFAULT 0,
+    fingerprint TEXT NOT NULL DEFAULT '',
+    source      TEXT NOT NULL DEFAULT 'manual',
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+
 -- Small key/value store for daemon-wide settings that survive restarts (the
 -- active repo is key `active_repo`).
 CREATE TABLE IF NOT EXISTS daemon_state (
@@ -175,6 +198,7 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
     title               TEXT,
     status              TEXT NOT NULL,
     error               TEXT,
+    mcp_servers         TEXT,
     created_at          INTEGER NOT NULL,
     updated_at          INTEGER NOT NULL
 );
@@ -308,6 +332,12 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     // Registry origin. Legacy rows default to `manual`, so a database created
     // before the base-directory scan existed never has its repos reclaimed.
     let _ = sqlx::query("ALTER TABLE known_repos ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
+        .execute(pool)
+        .await;
+    // MCP selection recorded on a session so `session/load` replays the same
+    // set. Stored as a JSON array of registry names; NULL means the row predates
+    // the registry and restores with the current default selection.
+    let _ = sqlx::query("ALTER TABLE agent_sessions ADD COLUMN mcp_servers TEXT")
         .execute(pool)
         .await;
     Ok(())
@@ -855,6 +885,118 @@ pub async fn delete_repo(pool: &SqlitePool, name: &str) -> anyhow::Result<bool> 
         .execute(pool)
         .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// One persisted MCP server definition, without secret literal values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerRow {
+    pub name: String,
+    pub transport: McpTransport,
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub url: Option<String>,
+    pub env: Vec<McpSecret>,
+    pub headers: Vec<McpSecret>,
+    pub enabled: bool,
+    pub approved: bool,
+    pub fingerprint: String,
+    pub source: McpSource,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+}
+
+fn json_vec<T: serde::de::DeserializeOwned>(raw: &str) -> Vec<T> {
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
+/// List MCP definitions, sorted by name.
+pub async fn list_mcp_servers(pool: &SqlitePool) -> anyhow::Result<Vec<McpServerRow>> {
+    let rows = sqlx::query(
+        "SELECT name, transport, command, args, url, env, headers, enabled, approved,
+                fingerprint, source, created_at, updated_at
+         FROM mcp_servers ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(row_to_mcp_server).collect())
+}
+
+/// Fetch one MCP definition by name.
+pub async fn get_mcp_server(pool: &SqlitePool, name: &str) -> anyhow::Result<Option<McpServerRow>> {
+    let row = sqlx::query(
+        "SELECT name, transport, command, args, url, env, headers, enabled, approved,
+                fingerprint, source, created_at, updated_at
+         FROM mcp_servers WHERE name = ?",
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.as_ref().map(row_to_mcp_server))
+}
+
+/// Insert-or-replace an MCP definition.
+pub async fn upsert_mcp_server(pool: &SqlitePool, row: &McpServerRow) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO mcp_servers
+            (name, transport, command, args, url, env, headers, enabled, approved,
+             fingerprint, source, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(name) DO UPDATE SET
+             transport = excluded.transport,
+             command = excluded.command,
+             args = excluded.args,
+             url = excluded.url,
+             env = excluded.env,
+             headers = excluded.headers,
+             enabled = excluded.enabled,
+             approved = excluded.approved,
+             fingerprint = excluded.fingerprint,
+             source = excluded.source,
+             updated_at = excluded.updated_at",
+    )
+    .bind(&row.name)
+    .bind(row.transport.as_str())
+    .bind(&row.command)
+    .bind(serde_json::to_string(&row.args)?)
+    .bind(&row.url)
+    .bind(serde_json::to_string(&row.env)?)
+    .bind(serde_json::to_string(&row.headers)?)
+    .bind(row.enabled as i64)
+    .bind(row.approved as i64)
+    .bind(&row.fingerprint)
+    .bind(row.source.as_str())
+    .bind(ts_ms(row.created_at))
+    .bind(ts_ms(row.updated_at))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Delete an MCP definition by name. Returns whether a row was removed.
+pub async fn delete_mcp_server(pool: &SqlitePool, name: &str) -> anyhow::Result<bool> {
+    let result = sqlx::query("DELETE FROM mcp_servers WHERE name = ?")
+        .bind(name)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+fn row_to_mcp_server(row: &SqliteRow) -> McpServerRow {
+    McpServerRow {
+        name: row.get("name"),
+        transport: McpTransport::parse(&row.get::<String, _>("transport")),
+        command: row.try_get::<Option<String>, _>("command").ok().flatten(),
+        args: json_vec(&row.get::<String, _>("args")),
+        url: row.try_get::<Option<String>, _>("url").ok().flatten(),
+        env: json_vec(&row.get::<String, _>("env")),
+        headers: json_vec(&row.get::<String, _>("headers")),
+        enabled: row.get::<i64, _>("enabled") != 0,
+        approved: row.get::<i64, _>("approved") != 0,
+        fingerprint: row.get("fingerprint"),
+        source: McpSource::parse(&row.get::<String, _>("source")),
+        created_at: from_ms(row.get::<i64, _>("created_at")),
+        updated_at: from_ms(row.get::<i64, _>("updated_at")),
+    }
 }
 
 /// The daemon-wide active repo name, if set.
@@ -1700,6 +1842,10 @@ pub struct AgentSessionRecord {
     pub run_id: Option<String>,
     /// Display title, when the agent reports one.
     pub title: Option<String>,
+    /// Registered MCP server names forwarded to the agent. `None` means the row
+    /// predates the registry and restores with the current default selection;
+    /// `Some(empty)` means the session explicitly used none.
+    pub mcp_servers: Option<Vec<String>>,
     /// Current lifecycle state.
     pub status: AgentSessionStatus,
     /// Last error, for a `Failed` record.
@@ -1725,6 +1871,7 @@ impl AgentSessionRecord {
             task_id: None,
             run_id: None,
             title: None,
+            mcp_servers: None,
             status: AgentSessionStatus::Loading,
             error: None,
             created_at: now,
@@ -1741,9 +1888,9 @@ pub async fn insert_agent_session(
 ) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO agent_sessions
-            (id, agent, external_session_id, cwd, task_id, run_id, title, status, error,
-             created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (id, agent, external_session_id, cwd, task_id, run_id, title, mcp_servers, status,
+             error, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&session.id)
     .bind(&session.agent)
@@ -1752,6 +1899,13 @@ pub async fn insert_agent_session(
     .bind(&session.task_id)
     .bind(&session.run_id)
     .bind(&session.title)
+    .bind(
+        session
+            .mcp_servers
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+    )
     .bind(session.status.as_str())
     .bind(&session.error)
     .bind(ts_ms(session.created_at))
@@ -1779,6 +1933,7 @@ pub async fn update_agent_session(
              task_id = ?,
              run_id = ?,
              title = ?,
+             mcp_servers = ?,
              status = ?,
              error = ?,
              updated_at = ?
@@ -1790,6 +1945,13 @@ pub async fn update_agent_session(
     .bind(&session.task_id)
     .bind(&session.run_id)
     .bind(&session.title)
+    .bind(
+        session
+            .mcp_servers
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+    )
     .bind(session.status.as_str())
     .bind(&session.error)
     .bind(ts_ms(session.updated_at))
@@ -1946,8 +2108,8 @@ pub async fn get_agent_session(
     id: &str,
 ) -> anyhow::Result<Option<AgentSessionRecord>> {
     let row = sqlx::query(
-        "SELECT id, agent, external_session_id, cwd, task_id, run_id, title, status, error,
-                created_at, updated_at
+        "SELECT id, agent, external_session_id, cwd, task_id, run_id, title, mcp_servers,
+                status, error, created_at, updated_at
          FROM agent_sessions WHERE id = ?",
     )
     .bind(id)
@@ -1967,8 +2129,8 @@ pub async fn get_agent_session_by_external(
     external_session_id: &str,
 ) -> anyhow::Result<Option<AgentSessionRecord>> {
     let row = sqlx::query(
-        "SELECT id, agent, external_session_id, cwd, task_id, run_id, title, status, error,
-                created_at, updated_at
+        "SELECT id, agent, external_session_id, cwd, task_id, run_id, title, mcp_servers,
+                status, error, created_at, updated_at
          FROM agent_sessions WHERE agent = ? AND external_session_id = ?",
     )
     .bind(agent)
@@ -1985,8 +2147,8 @@ pub async fn list_agent_sessions(
     limit: i64,
 ) -> anyhow::Result<Vec<AgentSessionRecord>> {
     let rows = sqlx::query(
-        "SELECT id, agent, external_session_id, cwd, task_id, run_id, title, status, error,
-                created_at, updated_at
+        "SELECT id, agent, external_session_id, cwd, task_id, run_id, title, mcp_servers,
+                status, error, created_at, updated_at
          FROM agent_sessions
          ORDER BY updated_at DESC, created_at DESC, id ASC
          LIMIT ?",
@@ -2008,8 +2170,8 @@ pub async fn list_agent_sessions_for_task(
     limit: i64,
 ) -> anyhow::Result<Vec<AgentSessionRecord>> {
     let rows = sqlx::query(
-        "SELECT id, agent, external_session_id, cwd, task_id, run_id, title, status, error,
-                created_at, updated_at
+        "SELECT id, agent, external_session_id, cwd, task_id, run_id, title, mcp_servers,
+                status, error, created_at, updated_at
          FROM agent_sessions
          WHERE task_id = ?
          ORDER BY updated_at DESC, created_at DESC, id ASC
@@ -2035,6 +2197,11 @@ fn row_to_agent_session(row: &SqliteRow) -> AgentSessionRecord {
         task_id: row.try_get::<Option<String>, _>("task_id").ok().flatten(),
         run_id: row.try_get::<Option<String>, _>("run_id").ok().flatten(),
         title: row.try_get::<Option<String>, _>("title").ok().flatten(),
+        mcp_servers: row
+            .try_get::<Option<String>, _>("mcp_servers")
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str(&raw).ok()),
         status: AgentSessionStatus::from_db(&row.get::<String, _>("status")),
         error: row.try_get::<Option<String>, _>("error").ok().flatten(),
         created_at: from_ms(row.get("created_at")),

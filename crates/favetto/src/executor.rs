@@ -1656,6 +1656,7 @@ async fn run_agent_task(
     model: Option<String>,
 ) -> anyhow::Result<RunOutcome> {
     let agent_name = agent.descriptor().id.clone();
+    let mcp = crate::mcp::resolve_for_launch(state, None, def.mcp.as_deref())?;
     let info = state
         .agents
         .start(
@@ -1670,6 +1671,7 @@ async fn run_agent_task(
                 model,
                 headless: true,
                 git_env: Default::default(),
+                mcp,
             },
         )
         .await?;

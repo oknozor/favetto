@@ -204,6 +204,9 @@ pub struct TaskDef {
     pub spawn_new_root: bool,
     /// Optional per-task override of the `[git] signing` mode for this run.
     pub sign: Option<GitSigning>,
+    /// Optional MCP server selection for this task. `None` uses every enabled +
+    /// approved definition; `Some(empty)` sends none.
+    pub mcp: Option<Vec<String>>,
     /// How an ACP session answers tool-permission requests for this task.
     /// `None` inherits the agent entry's `permission`, then `ask`.
     pub permission: Option<PermissionPolicy>,
@@ -245,6 +248,8 @@ struct Header {
     spawn_new_root: bool,
     #[serde(default)]
     sign: Option<GitSigning>,
+    #[serde(default)]
+    mcp: Option<Vec<String>>,
     #[serde(default)]
     permission: Option<PermissionPolicy>,
     #[serde(default)]
@@ -445,6 +450,7 @@ pub fn parse_task_md(name: &str, content: &str) -> anyhow::Result<TaskDef> {
         spawn_file: header.spawn_file,
         spawn_new_root: header.spawn_new_root,
         sign: header.sign,
+        mcp: header.mcp,
         permission: header.permission,
         worktree: header.worktree,
         vars: header.vars,
@@ -484,6 +490,10 @@ pub fn to_markdown(def: &TaskDef) -> String {
     }
     if def.spawn_new_root {
         out.push_str("spawn_new_root = true\n");
+    }
+    if let Some(mcp) = &def.mcp {
+        let rendered: Vec<String> = mcp.iter().map(|name| format!("{name:?}")).collect();
+        out.push_str(&format!("mcp = [{}]\n", rendered.join(", ")));
     }
     if let Some(sign) = &def.sign {
         let sign = match sign {
@@ -848,6 +858,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_and_serializes_mcp_selection() {
+        let def = parse_task_md(
+            "with-mcp",
+            "agent = \"x\"\nmcp = [\"files\", \"remote\"]\n---\nbody\n",
+        )
+        .unwrap();
+        assert_eq!(
+            def.mcp,
+            Some(vec!["files".to_string(), "remote".to_string()])
+        );
+        let markdown = to_markdown(&def);
+        assert!(
+            markdown.contains("mcp = [\"files\", \"remote\"]"),
+            "{markdown}"
+        );
+        assert_eq!(parse_task_md("with-mcp", &markdown).unwrap().mcp, def.mcp);
+
+        // An explicit empty selection is preserved and distinct from absent.
+        let empty = parse_task_md("empty", "agent = \"x\"\nmcp = []\n---\nbody\n").unwrap();
+        assert_eq!(empty.mcp, Some(Vec::new()));
+        assert!(to_markdown(&empty).contains("mcp = []"));
+    }
+
+    #[test]
     fn parses_task_worktree_header() {
         // Explicit opt-out parses and is the only value serialized.
         let def = parse_task_md("t", "worktree = false\n---\nbody\n").unwrap();
@@ -1093,6 +1127,7 @@ mod tests {
             spawn_file: Some(".favetto/{{ input.id }}/manifest.json".to_string()),
             spawn_new_root: true,
             sign: Some(GitSigning::Off),
+            mcp: None,
             permission: None,
             worktree: None,
             vars: vec![
@@ -1324,6 +1359,7 @@ mod tests {
             spawn_file: None,
             spawn_new_root: false,
             sign: None,
+            mcp: None,
             permission: None,
             worktree: None,
             vars: Vec::new(),
@@ -1493,6 +1529,7 @@ mod tests {
             spawn_file: None,
             spawn_new_root: false,
             sign: None,
+            mcp: None,
             permission: None,
             worktree: None,
             vars: Vec::new(),

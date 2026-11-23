@@ -2485,6 +2485,7 @@ mod tests {
             config_options: Vec::new(),
             modes: None,
             auth: None,
+            mcp: None,
         };
         let agents = vec![AgentCatalogEntry {
             name: "opencode".to_string(),
