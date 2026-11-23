@@ -12,8 +12,8 @@
 //!   the selected row keeps its preview beside the list.
 
 use gpui::{
-    div, prelude::*, px, AnyElement, Context, Div, Entity, FocusHandle, Hsla, IntoElement, Render,
-    ScrollHandle, Stateful, Window,
+    div, prelude::*, px, AnyElement, Context, Div, Entity, FocusHandle, Hsla, IntoElement,
+    MouseButton, Render, ScrollHandle, Stateful, Window,
 };
 
 use crate::catalog::{
@@ -21,18 +21,19 @@ use crate::catalog::{
     OneShotFocus, OneShotForm,
 };
 use crate::components;
+use crate::layout::clamp_catalog_preview_width;
+use crate::resize::{ResizeDrag, ResizePreview, ResizeStart};
 use crate::routes::Route;
 use crate::state::ClientState;
-use crate::theme::Theme;
-
-/// Width of the preview pane beside the list.
-const PREVIEW_WIDTH: f32 = 350.0;
+use crate::theme::{Theme, CATALOG_PREVIEW_WIDTH, RESIZE_HANDLE, SIDEBAR_WIDTH};
 
 /// The Catalog surface.
 pub struct CatalogView {
     state: Entity<ClientState>,
     list_scroll: ScrollHandle,
     preview_scroll: ScrollHandle,
+    preview_width: f32,
+    preview_resize: Option<ResizeStart>,
     scrolled_to: Option<String>,
     retry_focus: FocusHandle,
     oneshot_focus: FocusHandle,
@@ -54,6 +55,8 @@ impl CatalogView {
             state,
             list_scroll: ScrollHandle::new(),
             preview_scroll: ScrollHandle::new(),
+            preview_width: CATALOG_PREVIEW_WIDTH,
+            preview_resize: None,
             scrolled_to: None,
             retry_focus: cx.focus_handle().tab_index(20).tab_stop(true),
             oneshot_focus: cx.focus_handle().tab_index(21).tab_stop(true),
@@ -726,6 +729,63 @@ impl CatalogView {
         scroll
     }
 
+    /// The invisible 8 px hit area on the preview pane's left border. Drag
+    /// moves are handled by `on_drag_move` so the width keeps following the
+    /// pointer after it leaves the handle.
+    fn preview_resize_handle(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("catalog-resize")
+            .absolute()
+            .left(px(-(RESIZE_HANDLE / 2.0)))
+            .top_0()
+            .h_full()
+            .w(px(RESIZE_HANDLE))
+            .cursor_col_resize()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseDownEvent, _window, _cx| {
+                    this.preview_resize = Some(ResizeStart::new(
+                        f32::from(event.position.x),
+                        this.preview_width,
+                    ));
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, _cx| {
+                    this.preview_resize = None;
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, _cx| {
+                    this.preview_resize = None;
+                }),
+            )
+            .on_drag(ResizeDrag, |_drag, _offset, _window, cx| {
+                cx.new(|_| ResizePreview)
+            })
+            .on_drag_move::<ResizeDrag>(cx.listener(
+                |this, event: &gpui::DragMoveEvent<ResizeDrag>, window, cx| {
+                    let Some(start) = this.preview_resize else {
+                        return;
+                    };
+                    let pointer_x = f32::from(event.event.position.x);
+                    let available_width =
+                        f32::from(window.viewport_size().width) - SIDEBAR_WIDTH - RESIZE_HANDLE;
+                    let width = clamp_catalog_preview_width(
+                        start.requested_width(pointer_x),
+                        available_width,
+                    );
+                    if width != this.preview_width {
+                        this.preview_width = width;
+                        cx.notify();
+                    }
+                },
+            ))
+            .into_any_element()
+    }
+
     fn preview_pane(
         &self,
         theme: &Theme,
@@ -878,7 +938,8 @@ impl CatalogView {
         });
 
         div()
-            .w(px(PREVIEW_WIDTH))
+            .relative()
+            .w(px(self.preview_width))
             .flex_shrink_0()
             .min_h_0()
             .flex()
@@ -910,6 +971,7 @@ impl CatalogView {
                     .child(hint(theme, "Raw Markdown · read-only"))
                     .when_some(start, |footer, start| footer.child(start)),
             )
+            .child(self.preview_resize_handle(cx))
     }
 
     fn metadata_chip(&self, theme: &Theme, label: String) -> Div {
@@ -1663,6 +1725,12 @@ impl Render for CatalogView {
                     .when_some(overlays, |root, overlay| root.child(overlay));
             }
         }
+
+        // Re-clamp on every render, like the detail column, so shrinking the
+        // window cannot leave an oversized preview.
+        let available_width =
+            f32::from(window.viewport_size().width) - SIDEBAR_WIDTH - RESIZE_HANDLE;
+        self.preview_width = clamp_catalog_preview_width(self.preview_width, available_width);
 
         let mut root = div()
             .relative()

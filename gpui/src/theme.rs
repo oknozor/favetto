@@ -30,12 +30,21 @@ pub const DETAIL_MIN_WIDTH: f32 = 280.0;
 /// Widest the task-detail column may grow before it dwarfs the working list.
 pub const DETAIL_MAX_WIDTH: f32 = 720.0;
 
-/// Invisible horizontal hit area centred on the detail column's left border.
+/// Invisible horizontal hit area centred on a resizable pane's left border.
 /// Wide enough to grab with a mouse without widening the visible 1 px divider.
-pub const DETAIL_RESIZE_HANDLE: f32 = 8.0;
+pub const RESIZE_HANDLE: f32 = 8.0;
 
-/// Minimum width reserved for the working list between the sidebar and detail.
+/// Minimum width reserved for the working list beside a right-hand pane.
 pub const WORKING_LIST_MIN_WIDTH: f32 = 360.0;
+
+/// Catalog source-preview width in px.
+pub const CATALOG_PREVIEW_WIDTH: f32 = 350.0;
+
+/// Narrowest readable Catalog source preview.
+pub const CATALOG_PREVIEW_MIN_WIDTH: f32 = 280.0;
+
+/// Widest the Catalog source preview may grow before it dwarfs the list.
+pub const CATALOG_PREVIEW_MAX_WIDTH: f32 = 720.0;
 
 /// Below this viewport width the detail region becomes a pushed page instead
 /// of a third column (docs §1, "Responsive layout").

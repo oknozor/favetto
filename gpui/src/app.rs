@@ -35,12 +35,13 @@ use crate::components;
 use crate::layout::{clamp_detail_width, container_query, LayoutMode};
 use crate::palette::{CommandKind, CommandPalette};
 use crate::repos::RepoOption;
+use crate::resize::{ResizeDrag, ResizePreview, ResizeStart};
 use crate::routes::Route;
 use crate::schedules::ScheduleField;
 use crate::state::{ClientState, TaskConfirm, Toast, ToastKind};
 use crate::tasks::TaskAction;
 use crate::theme::{
-    Theme, DETAIL_RESIZE_HANDLE, DETAIL_WIDTH, SIDEBAR_WIDTH, STATUS_BAR_HEIGHT, TOP_BAR_HEIGHT,
+    Theme, DETAIL_WIDTH, RESIZE_HANDLE, SIDEBAR_WIDTH, STATUS_BAR_HEIGHT, TOP_BAR_HEIGHT,
 };
 use crate::views::{
     CatalogView, DetailView, InboxView, SchedulesView, SettingsView, TasksView, WorkflowsView,
@@ -53,28 +54,6 @@ enum ListJump {
     End,
     PageUp,
     PageDown,
-}
-
-/// Pointer and width captured when a detail-resize drag starts.
-#[derive(Clone, Copy)]
-struct DetailResizeStart {
-    pointer_x: f32,
-    width: f32,
-}
-
-/// Marker payload for the detail-resize drag; no data is needed because the
-/// start state lives in `DetailResizeStart`.
-#[derive(Clone, Copy)]
-struct DetailResizeDrag;
-
-/// Zero-sized drag preview. `on_drag` requires a view to render while dragging;
-/// a resize has no ghost, so this renders nothing.
-struct DetailResizePreview;
-
-impl Render for DetailResizePreview {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().w(px(0.0)).h(px(0.0))
-    }
 }
 
 /// The route entities, created once with the shell.
@@ -111,7 +90,7 @@ pub struct RootView {
     toast_copy_focus: FocusHandle,
     shortcuts_close_focus: FocusHandle,
     detail_width: f32,
-    detail_resize: Option<DetailResizeStart>,
+    detail_resize: Option<ResizeStart>,
 }
 
 /// The full-window frame every route lives in.
@@ -2060,18 +2039,18 @@ impl RootView {
         div()
             .id("detail-resize")
             .absolute()
-            .left(px(-(DETAIL_RESIZE_HANDLE / 2.0)))
+            .left(px(-(RESIZE_HANDLE / 2.0)))
             .top_0()
             .h_full()
-            .w(px(DETAIL_RESIZE_HANDLE))
+            .w(px(RESIZE_HANDLE))
             .cursor_col_resize()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseDownEvent, _window, _cx| {
-                    this.detail_resize = Some(DetailResizeStart {
-                        pointer_x: f32::from(event.position.x),
-                        width: this.detail_width,
-                    });
+                    this.detail_resize = Some(ResizeStart::new(
+                        f32::from(event.position.x),
+                        this.detail_width,
+                    ));
                 }),
             )
             .on_mouse_up(
@@ -2086,16 +2065,16 @@ impl RootView {
                     this.detail_resize = None;
                 }),
             )
-            .on_drag(DetailResizeDrag, |_drag, _offset, _window, cx| {
-                cx.new(|_| DetailResizePreview)
+            .on_drag(ResizeDrag, |_drag, _offset, _window, cx| {
+                cx.new(|_| ResizePreview)
             })
-            .on_drag_move::<DetailResizeDrag>(cx.listener(
-                |this, event: &gpui::DragMoveEvent<DetailResizeDrag>, window, cx| {
+            .on_drag_move::<ResizeDrag>(cx.listener(
+                |this, event: &gpui::DragMoveEvent<ResizeDrag>, window, cx| {
                     let Some(start) = this.detail_resize else {
                         return;
                     };
                     let pointer_x = f32::from(event.event.position.x);
-                    let desired = start.width + (start.pointer_x - pointer_x);
+                    let desired = start.requested_width(pointer_x);
                     let viewport_width = f32::from(window.viewport_size().width);
                     let width = clamp_detail_width(desired, viewport_width);
                     if width != this.detail_width {

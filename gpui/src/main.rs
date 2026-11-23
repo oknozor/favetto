@@ -18,6 +18,7 @@ mod markdown;
 mod motion;
 mod palette;
 mod repos;
+mod resize;
 mod routes;
 mod runtime;
 mod schedules;
