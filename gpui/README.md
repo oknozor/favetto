@@ -173,8 +173,13 @@ name, status icon + label, `attempt n`/failure summary where applicable, a
 `root` chip for the root instance and a dashed `blocked` outline for a pending
 instance waiting on a `needs` predecessor. Edges follow each instance's
 `parent_id` and end in a filled arrowhead at the child card, so the parent →
-child direction is visible even on fan-out and multi-row edges; the selected
-node's incoming edge and its head turn accent. Parentless and unknown-parent
+child direction is visible even on fan-out and multi-row edges; a parent with
+several children fans out from evenly spread ports on its right edge, and the
+selected node's incoming edge and its head turn accent. Columns are filled by a
+preorder walk of each parent's subtree (siblings keep creation-time order), so
+edges between different parents do not cross. Edges are painted in window
+space with the canvas bounds origin added, so they stay on the cards while the
+graph scrolls or the window resizes. Parentless and unknown-parent
 instances are graph roots. A directly
 started run is its own root and carries a short explanation; when the snapshot
 has no roots at all the surface explains where roots come from instead of
@@ -498,8 +503,10 @@ Deviations from the plan are recorded in this file as the chain progresses
   500-row window keeps working and is named after its first visible instance.
 - **The runtime graph replaces the bucket list.** One node per
   `workflow.inspect` instance is placed by longest distance from a graph root,
-  then by creation time (`created_at`, then id) so a status push never
-  reshuffles the picture. Edges come from `parent_id`; a missing, self-referential
+  then by a preorder walk of the parent/subtree forest with creation-time order
+  (`created_at`, then id) among siblings, so a status push never reshuffles the
+  picture and children of an earlier parent stay above children of a later one.
+  Edges come from `parent_id`; a missing, self-referential
   or cyclic parent is dropped and the node becomes a root, so layout is a forest
   and can never hang. Nodes show their live status as icon + label (never
   color-only), the root chip and a dashed `blocked` marker for a pending
@@ -517,9 +524,11 @@ Deviations from the plan are recorded in this file as the chain progresses
   the open root locally instead of issuing another inspect RPC.
 - **Edges point at the child.** Each lineage edge is a horizontal-tangent cubic
   that stops at a filled arrowhead whose tip touches the child card's left
-  edge. The head is muted with the stroke, or accent when the child is selected;
-  its geometry lives in a pure `edge_geometry` helper so it is unit-tested
-  without a window.
+  edge. A fan-out spreads its start points over the parent's right edge, and
+  the canvas adds its paint bounds origin so the edges track the cards while
+  the graph scrolls. The head is muted with the stroke, or accent when the
+  child is selected; its geometry lives in a pure `edge_geometry` helper so it
+  is unit-tested without a window.
 - **DAG source, not Graphviz.** `workflow.get` is a catalog-wide DOT string, so
   it stays available as readable monospace source in a collapsed-by-default
   panel with a short spawn/needs/join legend, **Copy DOT** (no text selection in

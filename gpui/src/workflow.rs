@@ -39,6 +39,8 @@ pub const GRAPH_MARGIN: f32 = 24.0;
 pub const ARROW_LENGTH: f32 = 8.0;
 /// Half the base width of the arrowhead, so the visible head is twice as wide.
 pub const ARROW_HALF_WIDTH: f32 = 4.0;
+/// Distance from a card's top/bottom edge to the outermost fan-out port.
+pub const PORT_INSET: f32 = 10.0;
 
 /// One node placed on the graph canvas.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -90,11 +92,25 @@ pub struct EdgeGeometry {
 
 /// Compute the stroke and arrowhead geometry for a parent → child edge.
 ///
-/// The tip sits on the child's left edge at its vertical center; the base is
-/// [`ARROW_LENGTH`] behind it and [`ARROW_HALF_WIDTH`] above and below, so the
-/// head never covers the card's text or status chips.
-pub fn edge_geometry(parent: &WorkflowNode, child: &WorkflowNode) -> EdgeGeometry {
-    let start = (parent.x + NODE_WIDTH, parent.y + NODE_HEIGHT / 2.0);
+/// The edge leaves the parent's right edge at one of `port_count` ports
+/// spread evenly over the card's vertical extent (`port` is the zero-based
+/// index in child order), so a fan-out never stacks every stroke on the same
+/// point. The tip sits on the child's left edge at its vertical center; the
+/// base is [`ARROW_LENGTH`] behind it and [`ARROW_HALF_WIDTH`] above and
+/// below, so the head never covers the card's text or status chips.
+pub fn edge_geometry(
+    parent: &WorkflowNode,
+    child: &WorkflowNode,
+    port: usize,
+    port_count: usize,
+) -> EdgeGeometry {
+    // A single outgoing edge keeps the old card-center port. The inset keeps
+    // the outermost port of a wide fan-out clear of the rounded corners.
+    let port_count = port_count.max(1);
+    let port = port.min(port_count - 1);
+    let fraction = (port as f32 + 1.0) / (port_count as f32 + 1.0);
+    let start_y = parent.y + PORT_INSET + (NODE_HEIGHT - PORT_INSET * 2.0) * fraction;
+    let start = (parent.x + NODE_WIDTH, start_y);
     let tip = (child.x, child.y + NODE_HEIGHT / 2.0);
     // Neighbouring columns are at least COLUMN_GAP apart; clamping keeps the
     // base on the parent side even if a future layout ever gets tighter.
@@ -129,6 +145,24 @@ impl WorkflowGraphLayout {
     /// The placed box for one task id.
     pub fn node(&self, id: Uuid) -> Option<&WorkflowNode> {
         self.nodes.iter().find(|node| node.id == id)
+    }
+
+    /// The zero-based port index and the parent's total outgoing edge count for
+    /// one edge. Children are already in graph order, so the index matches the
+    /// row order and the ports never cross each other.
+    pub fn port_of(&self, edge: &WorkflowEdge) -> (usize, usize) {
+        let mut index = 0;
+        let mut count = 0;
+        for candidate in &self.edges {
+            if candidate.parent != edge.parent {
+                continue;
+            }
+            if candidate.child == edge.child {
+                index = count;
+            }
+            count += 1;
+        }
+        (index, count.max(1))
     }
 
     /// The parent drawn for one child, when it has a valid edge (tests assert
@@ -201,10 +235,14 @@ impl WorkflowRow {
 /// Lay out one root's rows as a left-to-right forest.
 ///
 /// Every node gets a column by its longest distance from a graph root, then a
-/// row inside that column. Parents that are missing from the inspect set, point
-/// at the node itself or form an accidental cycle are dropped, so the result is
-/// always a forest and layout can never hang. The runtime data makes cycles
-/// impossible in practice; this is a defensive guard, not a feature.
+/// row inside that column. Columns are filled by a preorder walk of the
+/// parent/subtree forest (siblings keep their creation-time order), so the
+/// children of an earlier parent always sit above the children of a later one
+/// and edges in a column gap cannot cross. Parents that are missing from the
+/// inspect set, point at the node itself or form an accidental cycle are
+/// dropped, so the result is always a forest and layout can never hang. The
+/// runtime data makes cycles impossible in practice; this is a defensive
+/// guard, not a feature.
 pub fn layout_graph(rows: &[WorkflowRow]) -> WorkflowGraphLayout {
     if rows.is_empty() {
         return WorkflowGraphLayout::default();
@@ -263,8 +301,30 @@ pub fn layout_graph(rows: &[WorkflowRow]) -> WorkflowGraphLayout {
         depth
     };
 
-    let mut columns: Vec<Vec<&WorkflowRow>> = Vec::new();
+    let mut children_of: HashMap<Uuid, Vec<&WorkflowRow>> = HashMap::new();
+    let mut roots: Vec<&WorkflowRow> = Vec::new();
     for row in &ordered {
+        match parent_of.get(&row.id) {
+            Some(parent) => children_of.entry(*parent).or_default().push(*row),
+            None => roots.push(*row),
+        }
+    }
+
+    // Preorder over the forest, visiting each parent's children in creation
+    // order. Appending to the columns in this order keeps every subtree's
+    // rows contiguous, so edges in a column gap never have to cross: parent A
+    // above parent B always maps to A's children above B's children.
+    let mut preorder: Vec<&WorkflowRow> = Vec::with_capacity(rows.len());
+    let mut stack: Vec<&WorkflowRow> = roots.iter().rev().copied().collect();
+    while let Some(row) = stack.pop() {
+        preorder.push(row);
+        if let Some(children) = children_of.get(&row.id) {
+            stack.extend(children.iter().rev().copied());
+        }
+    }
+
+    let mut columns: Vec<Vec<&WorkflowRow>> = Vec::new();
+    for row in &preorder {
         let column = depth(row.id);
         if columns.len() <= column {
             columns.resize_with(column + 1, Vec::new);
@@ -1207,7 +1267,7 @@ mod tests {
             x: GRAPH_MARGIN + NODE_WIDTH + COLUMN_GAP,
             y: GRAPH_MARGIN + 2.0 * (NODE_HEIGHT + ROW_GAP),
         };
-        let geometry = edge_geometry(&parent, &child);
+        let geometry = edge_geometry(&parent, &child, 0, 1);
 
         assert_eq!(
             geometry.start,
@@ -1231,6 +1291,108 @@ mod tests {
         assert_eq!(geometry.control_end.1, geometry.stroke_end.1);
         assert!(geometry.stroke_end.0 > geometry.start.0);
         assert!(geometry.stroke_end.0 < geometry.tip.0);
+    }
+
+    #[test]
+    fn edge_geometry_spreads_fan_out_ports_down_the_parent_edge() {
+        let parent = WorkflowNode {
+            id: Uuid::from_u128(1),
+            column: 0,
+            row: 0,
+            x: GRAPH_MARGIN,
+            y: GRAPH_MARGIN,
+        };
+        let child = |row: usize| WorkflowNode {
+            id: Uuid::from_u128(2 + row as u128),
+            column: 1,
+            row,
+            x: GRAPH_MARGIN + NODE_WIDTH + COLUMN_GAP,
+            y: GRAPH_MARGIN + row as f32 * (NODE_HEIGHT + ROW_GAP),
+        };
+
+        let ports: Vec<f32> = (0..3)
+            .map(|port| edge_geometry(&parent, &child(port), port, 3).start.1)
+            .collect();
+
+        // Every outgoing edge leaves at its own y, strictly down the card.
+        assert!(ports[0] < ports[1] && ports[1] < ports[2]);
+        // The outermost ports stay inset from the card's rounded corners.
+        assert!(ports[0] >= parent.y + PORT_INSET);
+        assert!(ports[2] <= parent.y + NODE_HEIGHT - PORT_INSET);
+        // The single-edge case still uses the card's vertical center.
+        let center = edge_geometry(&parent, &child(0), 0, 1).start.1;
+        assert_eq!(center, parent.y + NODE_HEIGHT / 2.0);
+    }
+
+    #[test]
+    fn layout_orders_columns_by_parent_subtree_to_avoid_crossing_edges() {
+        // A and B are siblings under root; A is older than B. Their children
+        // are created in the opposite order (B1 before A1). Ordering the
+        // columns by global creation time would put B1 above A1 and cross the
+        // two edges; preorder keeps each parent's subtree together.
+        let root = Uuid::from_u128(1);
+        let a = Uuid::from_u128(2);
+        let b = Uuid::from_u128(3);
+        let b1 = Uuid::from_u128(4);
+        let a1 = Uuid::from_u128(5);
+
+        let mut root_task = task(1, "root", TaskStatus::Running, None);
+        root_task.created_at = at(0);
+        let mut a_task = task(2, "a", TaskStatus::Pending, Some(root));
+        a_task.parent_id = Some(root);
+        a_task.created_at = at(10);
+        let mut b_task = task(3, "b", TaskStatus::Pending, Some(root));
+        b_task.parent_id = Some(root);
+        b_task.created_at = at(20);
+        let mut b1_task = task(4, "b1", TaskStatus::Pending, Some(root));
+        b1_task.parent_id = Some(b);
+        b1_task.created_at = at(30);
+        let mut a1_task = task(5, "a1", TaskStatus::Pending, Some(root));
+        a1_task.parent_id = Some(a);
+        a1_task.created_at = at(40);
+
+        let inspect = inspect_with(
+            root,
+            "root".to_string(),
+            vec![
+                view(root, "root", TaskStatus::Running, 1, None),
+                view(a, "a", TaskStatus::Pending, 1, None),
+                view(b, "b", TaskStatus::Pending, 1, None),
+                view(b1, "b1", TaskStatus::Pending, 1, None),
+                view(a1, "a1", TaskStatus::Pending, 1, None),
+            ],
+            vec![],
+        );
+        let detail = WorkflowDetail::from_inspect(
+            &inspect,
+            &[root_task, a_task, b_task, b1_task, a1_task],
+            None,
+        );
+        let layout = detail.layout();
+
+        // Sibling order within each parent's column is still creation order.
+        assert!(layout.node(a).unwrap().row < layout.node(b).unwrap().row);
+        // A's child stays above B's child, matching the parents above.
+        assert!(layout.node(a1).unwrap().row < layout.node(b1).unwrap().row);
+
+        let edge = |parent, child| {
+            let edge = layout
+                .edges
+                .iter()
+                .find(|edge| edge.parent == parent && edge.child == child)
+                .unwrap();
+            let (port, ports) = layout.port_of(edge);
+            edge_geometry(
+                layout.node(parent).unwrap(),
+                layout.node(child).unwrap(),
+                port,
+                ports,
+            )
+        };
+        let a_edge = edge(a, a1);
+        let b_edge = edge(b, b1);
+        assert!(a_edge.start.1 < b_edge.start.1);
+        assert!(a_edge.tip.1 < b_edge.tip.1);
     }
 
     #[test]
