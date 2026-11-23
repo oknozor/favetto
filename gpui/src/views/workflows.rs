@@ -38,6 +38,12 @@ type GraphSignature = Vec<(uuid::Uuid, Option<uuid::Uuid>, Option<i64>)>;
 /// node is the child (so the path and head are accent colored).
 type PaintedEdge = (workflow::EdgeGeometry, bool);
 
+/// Translate a layout-local point into window space by the canvas paint bounds
+/// origin. The graph layout stays window-free; only painting adds the offset.
+fn window_point(origin: gpui::Point<gpui::Pixels>, local: (f32, f32)) -> gpui::Point<gpui::Pixels> {
+    point(origin.x + px(local.0), origin.y + px(local.1))
+}
+
 /// The Workflows surface.
 pub struct WorkflowsView {
     state: Entity<ClientState>,
@@ -875,8 +881,9 @@ impl WorkflowsView {
             .filter_map(|edge| {
                 let parent = layout.node(edge.parent)?;
                 let child = layout.node(edge.child)?;
+                let (port, ports) = layout.port_of(edge);
                 Some((
-                    workflow::edge_geometry(parent, child),
+                    workflow::edge_geometry(parent, child, port, ports),
                     selected == Some(edge.child),
                 ))
             })
@@ -888,7 +895,11 @@ impl WorkflowsView {
 
         canvas(
             move |_bounds, _window, _cx| edges,
-            move |_bounds, edges, window, _cx| {
+            move |bounds, edges, window, _cx| {
+                // The layout is window-free; the canvas and `paint_path` are
+                // window-space. Adding the paint bounds origin here keeps the
+                // edges on the cards at every scroll offset and window size.
+                let to_window = |local: (f32, f32)| window_point(bounds.origin, local);
                 let mut muted_path = PathBuilder::stroke(px(1.5));
                 let mut accent_path = PathBuilder::stroke(px(1.5));
                 let mut muted_head = PathBuilder::fill();
@@ -903,22 +914,19 @@ impl WorkflowsView {
                         has_muted = true;
                         (&mut muted_path, &mut muted_head)
                     };
-                    path.move_to(point(px(geometry.start.0), px(geometry.start.1)));
+                    path.move_to(to_window(geometry.start));
                     // A cubic with the first control point level with the
                     // parent and the second level with the child: both ends
                     // are horizontal, so the fork reads left to right and
                     // the head points straight at the child.
                     path.cubic_bezier_to(
-                        point(px(geometry.stroke_end.0), px(geometry.stroke_end.1)),
-                        point(px(geometry.control_start.0), px(geometry.control_start.1)),
-                        point(px(geometry.control_end.0), px(geometry.control_end.1)),
+                        to_window(geometry.stroke_end),
+                        to_window(geometry.control_start),
+                        to_window(geometry.control_end),
                     );
-                    head.move_to(point(px(geometry.tip.0), px(geometry.tip.1)));
-                    head.line_to(point(px(geometry.base_top.0), px(geometry.base_top.1)));
-                    head.line_to(point(
-                        px(geometry.base_bottom.0),
-                        px(geometry.base_bottom.1),
-                    ));
+                    head.move_to(to_window(geometry.tip));
+                    head.line_to(to_window(geometry.base_top));
+                    head.line_to(to_window(geometry.base_bottom));
                     head.close();
                 }
                 if has_muted {
@@ -1586,5 +1594,23 @@ fn status_color(theme: &Theme, status: StatusKind) -> gpui::Rgba {
         StatusKind::Running => theme.colors.accent,
         StatusKind::Succeeded => theme.colors.success,
         StatusKind::Pending | StatusKind::Cancelled | StatusKind::Neutral => theme.colors.muted,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::window_point;
+    use gpui::{point, px};
+
+    #[test]
+    fn window_point_adds_the_canvas_origin_to_layout_coordinates() {
+        let origin = point(px(120.0), px(48.0));
+        // A node painted at the top-left of the scroll content still lands at
+        // the canvas origin in window space, not at (0, 0).
+        assert_eq!(window_point(origin, (0.0, 0.0)), origin);
+        assert_eq!(
+            window_point(origin, (24.0, 80.0)),
+            point(px(144.0), px(128.0))
+        );
     }
 }
