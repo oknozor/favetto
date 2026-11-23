@@ -81,6 +81,18 @@ impl CatalogEntryView {
             prompt: entry.prompt.clone(),
         }
     }
+
+    /// The label painted under a folder header: the last path segment.
+    ///
+    /// The folder header already names the directory, so repeating the whole
+    /// relative path on every child row (as `label` does) reads as a flat list
+    /// rather than a tree.
+    pub fn basename(&self) -> &str {
+        self.label
+            .rsplit_once('/')
+            .map(|(_, name)| name)
+            .unwrap_or(&self.label)
+    }
 }
 
 /// One directory inside a namespace.
@@ -886,6 +898,60 @@ fn namespace_label(namespace: &str) -> String {
     }
 }
 
+/// The three levels of the Catalog tree. Each level is indented one step
+/// further from the list edge, so a folder owns the rows painted under it
+/// (docs/design/gpui-client.md §2, one dimension at a time).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogTreeLevel {
+    /// A repo namespace (`repo:<name>`) or `Global`.
+    Namespace,
+    /// One directory inside a namespace.
+    Folder,
+    /// A task-definition or action row inside its folder.
+    Entry,
+}
+
+impl CatalogTreeLevel {
+    /// The zero-based indent step. The view multiplies this by its spacing
+    /// step so the tree grows with the theme (and shrinks in compact mode).
+    pub fn depth(self) -> usize {
+        match self {
+            CatalogTreeLevel::Namespace => 0,
+            CatalogTreeLevel::Folder => 1,
+            CatalogTreeLevel::Entry => 2,
+        }
+    }
+}
+
+/// The disclosure triangle for a collapsible namespace or folder.
+pub fn disclosure_glyph(collapsed: bool) -> &'static str {
+    if collapsed {
+        "▸"
+    } else {
+        "▾"
+    }
+}
+
+/// The icon that marks a folder row.
+pub const FOLDER_GLYPH: &str = "▣";
+
+/// The icon that marks a task-definition row.
+pub const TASK_GLYPH: &str = "▤";
+
+/// The icon that marks an action row. Deliberately not `⚙`, which is the
+/// Settings route icon.
+pub const ACTION_GLYPH: &str = "⚡";
+
+/// The icon before a definition row: actions get a bolt, everything else is a
+/// task definition.
+pub fn entry_glyph(kind: &str) -> &'static str {
+    if kind == "action" {
+        ACTION_GLYPH
+    } else {
+        TASK_GLYPH
+    }
+}
+
 fn fuzzy_score(entry: &CatalogEntry, query: &str, matcher: &SkimMatcherV2) -> Option<i64> {
     let name = matcher
         .fuzzy_match(&entry.name, query)
@@ -1221,5 +1287,51 @@ mod tests {
         ]);
         assert_eq!(form.agent.as_deref(), Some("opencode"));
         assert_eq!(form.focused, OneShotFocus::Cwd);
+    }
+
+    #[test]
+    fn tree_levels_indent_one_step_at_a_time() {
+        assert_eq!(CatalogTreeLevel::Namespace.depth(), 0);
+        assert_eq!(CatalogTreeLevel::Folder.depth(), 1);
+        assert_eq!(CatalogTreeLevel::Entry.depth(), 2);
+    }
+
+    #[test]
+    fn folder_and_definition_rows_use_distinct_glyphs() {
+        assert_eq!(disclosure_glyph(false), "▾");
+        assert_eq!(disclosure_glyph(true), "▸");
+        assert_eq!(FOLDER_GLYPH, "▣");
+        assert_eq!(entry_glyph("agent"), TASK_GLYPH);
+        assert_eq!(entry_glyph(""), TASK_GLYPH);
+        assert_eq!(entry_glyph("action"), ACTION_GLYPH);
+        assert_eq!(TASK_GLYPH, "▤");
+        assert_eq!(ACTION_GLYPH, "⚡");
+        assert_ne!(
+            entry_glyph("action"),
+            "⚙",
+            "the Settings route icon must not mean an action here"
+        );
+    }
+
+    #[test]
+    fn child_rows_show_the_basename_under_their_folder() {
+        let nested = CatalogEntryView::new(&entry(
+            "repo:favetto/gpui/01-scaffold",
+            Some("favetto"),
+            "shell",
+            vec![],
+        ));
+        assert_eq!(nested.folder, "gpui");
+        assert_eq!(nested.label, "gpui/01-scaffold");
+        assert_eq!(nested.basename(), "01-scaffold");
+
+        let root = CatalogEntryView::new(&entry(
+            "repo:favetto/release",
+            Some("favetto"),
+            "ship",
+            vec![],
+        ));
+        assert_eq!(root.folder, "");
+        assert_eq!(root.basename(), "release");
     }
 }

@@ -17,8 +17,8 @@ use gpui::{
 };
 
 use crate::catalog::{
-    var_type_label, CatalogEntryView, CatalogGroup, CatalogPreview, CatalogStatus, LaunchForm,
-    OneShotFocus, OneShotForm,
+    disclosure_glyph, entry_glyph, var_type_label, CatalogEntryView, CatalogGroup, CatalogPreview,
+    CatalogStatus, CatalogTreeLevel, LaunchForm, OneShotFocus, OneShotForm, FOLDER_GLYPH,
 };
 use crate::components;
 use crate::layout::clamp_catalog_preview_width;
@@ -432,7 +432,8 @@ impl CatalogView {
             .gap(px(theme.spacing.s2))
             .w_full()
             .h(px(32.0))
-            .px(px(theme.spacing.s2))
+            .pl(px(tree_indent(theme, CatalogTreeLevel::Namespace)))
+            .pr(px(theme.spacing.s2))
             .rounded(px(theme.radii.r4))
             .cursor_pointer()
             .hover(|style| style.bg(theme.colors.surface))
@@ -441,7 +442,7 @@ impl CatalogView {
                     .w(px(14.0))
                     .text_center()
                     .text_color(theme.colors.muted)
-                    .child(if collapsed { "▸" } else { "▾" }),
+                    .child(disclosure_glyph(collapsed)),
             )
             .child(
                 div()
@@ -488,7 +489,7 @@ impl CatalogView {
             .gap(px(theme.spacing.s2))
             .w_full()
             .h(px(theme.controls.min))
-            .pl(px(theme.spacing.s6))
+            .pl(px(tree_indent(theme, CatalogTreeLevel::Folder)))
             .pr(px(theme.spacing.s2))
             .cursor_pointer()
             .hover(|style| style.bg(theme.colors.surface))
@@ -498,7 +499,15 @@ impl CatalogView {
                     .text_center()
                     .text_color(theme.colors.muted)
                     .text_size(px(theme.font.xs))
-                    .child(if collapsed { "▸" } else { "▾" }),
+                    .child(disclosure_glyph(collapsed)),
+            )
+            .child(
+                div()
+                    .w(px(14.0))
+                    .text_center()
+                    .text_color(theme.colors.muted)
+                    .text_size(px(theme.font.xs))
+                    .child(FOLDER_GLYPH),
             )
             .child(
                 div()
@@ -553,7 +562,7 @@ impl CatalogView {
                 ),
             )
         });
-        let kind = if entry.kind == "action" { "⚙" } else { "✳" };
+        let kind = entry_glyph(&entry.kind);
 
         div()
             .id(("catalog-row", index))
@@ -562,7 +571,8 @@ impl CatalogView {
             .gap(px(theme.spacing.s2))
             .w_full()
             .min_h(px(36.0))
-            .px(px(theme.spacing.s2))
+            .pl(px(tree_indent(theme, CatalogTreeLevel::Entry)))
+            .pr(px(theme.spacing.s2))
             .py(px(theme.spacing.s1))
             .rounded(px(theme.radii.r4))
             .border_1()
@@ -600,7 +610,7 @@ impl CatalogView {
                     .font_family("monospace")
                     .text_size(px(theme.font.sm))
                     .text_color(theme.colors.text)
-                    .child(entry.label.clone()),
+                    .child(entry.basename().to_string()),
             )
             .when_some(required, |row, badge| row.child(badge))
             .when_some(vars, |row, badge| row.child(badge))
@@ -1762,6 +1772,13 @@ impl Render for CatalogView {
         )
         .when_some(overlays, |root, overlay| root.child(overlay))
     }
+}
+
+/// Left padding for a Catalog row: the list inset plus one spacing step per
+/// tree level, so namespaces sit at the edge, folders one step in and entries
+/// under their folder (like `tree`).
+fn tree_indent(theme: &Theme, level: CatalogTreeLevel) -> f32 {
+    theme.spacing.s2 + level.depth() as f32 * theme.spacing.s4
 }
 
 fn overlay(theme: &Theme, panel: Div) -> Div {
