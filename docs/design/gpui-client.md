@@ -91,6 +91,15 @@ Accessibility is a constraint, not a tradeoff: focus rings are always visible,
 status is never color-only (icon + label), all interactive elements are
 keyboard-reachable, and motion respects the OS "reduce motion" setting.
 
+**Motion policy.** Animate only progress, live-follow and retry states: the
+running status glyph, the armed Follow dot on a live run, the connection retry
+ring and the Settings connection test. Everything else changes immediately —
+terminal glyphs, skeletons, progress bars, focus rings, selected rows and
+workflow edges stay still. Reduced motion always wins: every animation returns
+its static state, and the icon, label and color keep carrying the meaning. A
+repeating animation never receives a zero duration (the pinned GPUI build
+divides by it); the helper early-returns instead.
+
 ---
 
 ## 3. Visual system
@@ -105,6 +114,12 @@ keyboard-reachable, and motion respects the OS "reduce motion" setting.
   **Copy** always returns the exact raw source.
 - **Status model**: icon + label + color, never color alone. `pending`,
   `running`, `awaiting input`, `succeeded`, `failed`, `cancelled`.
+- **Motion vocabulary**: two primitives in `components.rs` — the quadrant
+  spinner (`◐ ◓ ◑ ◒`, ~520 ms per turn) for `Running`, and a 1.2 s opacity
+  pulse for live/attention states. Both keep a fixed-width slot so labels do
+  not jitter, both call `motion::prefers_reduced_motion()`, and both take a
+  stable per-task/tool element id so a re-render keeps the phase while
+  virtualized rows never inherit another row's animation.
 - **Density**: comfortable by default (32 px rows), compact at < 900 px height.
 
 ---

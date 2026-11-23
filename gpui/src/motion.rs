@@ -1,10 +1,17 @@
 //! OS "reduce motion" detection.
 //!
 //! The pinned GPUI build exposes no reduced-motion query, so this module reads
-//! the same desktop setting GTK applications use. The client deliberately ships
-//! no decorative animation; if a future surface adds one it must call
-//! [`prefers_reduced_motion`] (or [`duration`]) and keep any essential
-//! information in the text, never in the motion alone.
+//! the same desktop setting GTK applications use.
+//!
+//! Motion policy: only progress, live-follow and retry states animate — the
+//! running spinner, the armed Follow dot, the connection retry ring and the
+//! Settings connection test. Everything else changes immediately, and every
+//! animation renders its static state under reduced motion. The icon, label and
+//! color always carry the meaning, so motion is never the only signal.
+//!
+//! Never pass [`duration`]'s zero result to a repeating `Animation`: the pinned
+//! GPUI build divides by the duration. Callers early-return the static element
+//! instead (see `components::animated_icon` and `components::pulse_dot`).
 //!
 //! Detection order:
 //! 1. `FAVETTO_REDUCE_MOTION` (`1`/`true`/`yes`/`on` or the inverse).

@@ -5,9 +5,9 @@ state-coverage pass. Every surface has loading, empty, error and unauthorized
 states; errors carry an actionable message plus a **Copy error** control; Tab
 traverses the real tab stops in visual order with a visible focus ring; all
 targets meet the 32 px floor (40 px for primary actions); long task and event
-lists are virtualized; the live event feed is capped; and the one decorative
-animation (the toast fade) respects the OS reduced-motion setting. The plans
-live in `docs/design/gpui-client.md`.
+lists are virtualized; the live event feed is capped; and the small motion
+vocabulary (running spinner, live-follow pulse, retry ring) respects the OS
+reduced-motion setting. The plans live in `docs/design/gpui-client.md`.
 
 ## What it is
 
@@ -191,10 +191,11 @@ column, narrow windows push it; `Esc` returns to the graph), `⇧↵` still open
 node in the Tasks route, `c` opens the root-cancel confirmation (it names the
 number of non-terminal instances) and `r` retries the highlighted failed
 instance. `[`/`]` move the root highlight without a mouse and close any open
-node detail. The same actions are available as buttons. Running and awaiting
-nodes get a small repeating status pulse; `FAVETTO_REDUCE_MOTION=1` (or the GTK
-setting) renders the same static icon and label, and no frames are requested
-when nothing is active. **Refresh** (or the palette's Refresh data) reloads the
+node detail. The same actions are available as buttons. Running nodes spin the
+status glyph; awaiting nodes get a small repeating attention pulse;
+`FAVETTO_REDUCE_MOTION=1` (or the GTK setting) renders the same static icon and
+label, and no frames are requested when nothing is active. **Refresh** (or the
+palette's Refresh data) reloads the
 inspect and the DAG source. Cancel marks every non-terminal row immediately and
 retry moves its row back to pending, then both reconcile with the RPC response
 and the next `task.updated` push. `workflow.get` remains available as readable
@@ -320,11 +321,13 @@ field blank keeps the shared token file.
   and Catalog preview dividers: pointer math, the drag marker and the zero-sized
   drag preview.
 - `src/motion.rs` — OS reduced-motion detection (GTK settings plus
-  `FAVETTO_REDUCE_MOTION`/`GTK_ENABLE_ANIMATIONS`). The only decorative motion
-  is the toast fade; everything else changes state immediately.
+  `FAVETTO_REDUCE_MOTION`/`GTK_ENABLE_ANIMATIONS`). Motion is limited to
+  progress, live-follow and retry states; everything else changes state
+  immediately.
 - `src/components.rs` — focus ring, keycaps, connection pill, empty state,
-  copy-error action and shortcut rows shared by the shell and route views. The
-  focus helper enforces the 32 px minimum target.
+  copy-error action, shortcut rows and the shared spinner/pulse primitives
+  (`animated_icon`, `pulse_dot`, `pulse_glyph`) used by the shell and route
+  views. The focus helper enforces the 32 px minimum target.
 - `src/views/` — one entity per route plus the contextual detail view. Tasks
   and the detail Output feed are virtualized.
 
@@ -652,10 +655,13 @@ window creation, which is not network data).
 
 The shell reads the OS setting through `motion::prefers_reduced_motion()`:
 `FAVETTO_REDUCE_MOTION` first, then `GTK_ENABLE_ANIMATIONS`, then
-`gtk-enable-animations` in the GTK 3/GTK 4 `settings.ini`. The only decorative
-motion is the 140 ms toast fade; reduced motion removes the fade and renders the
-same final panel immediately. Skeleton rows are static, status changes are
-text/icon changes, and no message is conveyed by motion alone.
+`gtk-enable-animations` in the GTK 3/GTK 4 `settings.ini`. Motion is reserved
+for three meanings: a running status glyph spins, an armed Follow dot on a live
+run pulses, and the connection retry ring / Settings "Testing…" spinner turn
+while the client is actually retrying or testing. The 140 ms toast fade is the
+only one-shot transition. Reduced motion renders every final state immediately
+and requests no frames; skeleton rows stay static, terminal glyphs never move,
+and no message is conveyed by motion alone.
 
 #### Performance
 
@@ -709,7 +715,7 @@ path remains covered by the step-05 live RPC check and its unit tests.
 | 2 | What must the user remember? | The detail header, palette recents and catalog collapse were already persistent. | Memoized derivations and kept the selection/scroll position across live refreshes. |
 | 3 | Are related things grouped and unrelated separated? | Three regions and cards were sound; error actions were scattered as text. | Copy + Retry now form one action cluster on every failure surface; spacing follows `theme.rs`. |
 | 4 | Is the primary action the most distinct thing? | Launch/Save were 40 px, but the Catalog “Start with variables” and permission buttons were smaller and quieter. | Raised both to the 40 px primary token; danger remains the only danger-colored action. |
-| 5 | What is seen in the first 400 ms and while waiting? | Optimistic actions and skeletons existed; the toast was the only motion. | Kept static skeletons, added the reduced-motion switch and preserved optimistic reconciliation. |
+| 5 | What is seen in the first 400 ms and while waiting? | Optimistic actions and skeletons existed; motion was limited to a toast and a node pulse. | Kept static skeletons, added the running spinner / live-follow pulse / retry ring vocabulary, and preserved optimistic reconciliation. |
 | 6 | Does the flow match conventions? | `g` jumps and arrows did, but Tab did nothing because GPUI has no built-in traversal. | Added explicit `FocusNext`/`FocusPrev`, visible rings and shell focus after navigation. |
 | 7 | What happens at the peak and the end, especially after error? | The outcome block existed, but a failure could end in a bare string. | Every failure now ends with Copy error + Retry; the transport keeps the older feed. |
 | 8 | What input might be rejected unnecessarily? | Endpoint forms and typed values were liberal; choice-only vars required typing an exact string. | `←`/`→` cycles declared choices; the schedule task picker uses `↑`/`↓`. |
@@ -737,7 +743,9 @@ path remains covered by the step-05 live RPC check and its unit tests.
   graph itself paints one card per instance (roots are tens, not thousands).
   The Tasks table and the detail Output feed, which are the long scroll
   surfaces, are virtualized.
-- **The toast fade and the live-node pulse are the only animations.** Both call
+- **Motion is limited to live state.** The toast fade, the running glyph
+  spinner, the armed Follow dot, the connection retry ring and the Settings
+  test spinner are the only animations. All call
   `motion::prefers_reduced_motion()` and preserve the final-state information;
-  the pulse is attached only to running/awaiting nodes and only animates the
-  small status dot, never the node card or its layout.
+  the spinner and pulse attach to the small glyph or dot, never the row (and so
+  never its layout), and reduced motion renders the static icon immediately.

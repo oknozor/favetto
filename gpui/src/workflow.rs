@@ -215,11 +215,6 @@ impl WorkflowRow {
         self.blocked && self.status == TaskStatus::Pending
     }
 
-    /// Running or awaiting input: the states that animate while live.
-    pub fn is_active(&self) -> bool {
-        matches!(self.status, TaskStatus::Running | TaskStatus::AwaitingInput)
-    }
-
     /// Deterministic sibling order: creation time first, then id. A status
     /// change can never reshuffle the picture.
     fn order_key(&self) -> (i64, Uuid) {
@@ -1110,7 +1105,7 @@ mod tests {
             .unwrap();
         assert_eq!(child_row.parent_id, Some(root));
         assert!(child_row.is_blocked());
-        assert!(!child_row.is_active());
+        assert_ne!(child_row.status, TaskStatus::Running);
 
         let layout = detail.layout();
         assert_eq!(layout.nodes.len(), 2);
@@ -1532,7 +1527,7 @@ mod tests {
             .find(|row| row.id == running_child.id)
             .unwrap();
         assert_eq!(row.attempt, 3);
-        assert!(row.is_active());
+        assert_eq!(row.status, TaskStatus::Running);
         assert_eq!(detail.layout().parent_of(row.id), Some(root));
     }
 
