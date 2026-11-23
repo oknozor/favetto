@@ -43,10 +43,13 @@ the daemon running locally, the top bar shows the daemon's active repo
 live event cursor. Clicking the repo label (or running **Switch repository** in
 the command palette) opens a searchable picker with a leading `global` row, the
 known repos filtered by name or path, the active marker and a `(missing)` suffix
-for unavailable checkouts. Selecting a row calls `repos.activate` and updates
-the bar and lists immediately; a switch made by another client arrives through
-`catalog.updated`. Tasks/Inbox show only the active repo's rows, while Catalog
-also keeps global definitions visible, matching the TUI. Stopping the daemon flips the pill to
+for unavailable checkouts. Selecting a row calls `repos.activate`, closes the
+picker once the daemon reports the requested repo active (from the activation
+reply or the `catalog.updated`-driven refresh) and updates the bar and lists
+immediately; a rejection keeps the picker open with the error inline. A switch
+made by another client arrives through `catalog.updated`. Tasks/Inbox show only
+the active repo's rows, while Catalog also keeps global definitions visible,
+matching the TUI. Stopping the daemon flips the pill to
 **◌ Reconnecting (n)**; restarting recovers automatically. A rejected token
 shows **● Unauthorized** together with the token file path to fix, and the
 Reconnect action retries after the token/test daemon is corrected.

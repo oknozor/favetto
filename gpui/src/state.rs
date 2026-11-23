@@ -1467,10 +1467,7 @@ impl ClientState {
                 }
             },
             Update::RepoActivated { result } => match result {
-                Ok(result) => {
-                    self.set_repos(result.repos, result.active);
-                    self.repo_picker.close();
-                }
+                Ok(result) => self.set_repos(result.repos, result.active),
                 Err(error) => {
                     if error.is_unauthorized() {
                         self.connection = ConnectionState::Unauthorized {
@@ -2986,6 +2983,18 @@ impl ClientState {
         self.active_repo = active;
         self.repos_loaded = true;
         self.catalog.set_active_repo(self.active_repo.clone());
+        // A switch requested from the picker is confirmed by whichever response
+        // first reports the requested repo active: the `repos.activate` reply
+        // or the `catalog.updated`-driven `repos.list` (a dropped reply must
+        // not leave a stale modal). Rejections go through `RepoPicker::fail`,
+        // which clears the pending target and keeps the modal for its error.
+        let requested_active = self
+            .repo_picker
+            .pending_target()
+            .is_some_and(|target| target == self.active_repo.as_deref());
+        if requested_active {
+            self.repo_picker.close();
+        }
         self.repo_picker.clamp_selection(&self.repos);
         if active_changed {
             self.touch_snapshot();
@@ -3096,12 +3105,13 @@ impl ClientState {
     }
 
     /// Send `repos.activate` (`None` clears the active repo). The modal stays
-    /// open while the call is in flight so a rejection can be shown inline.
+    /// open while the call is in flight so a rejection can be shown inline; it
+    /// closes from [`Self::set_repos`] once the requested repo is active.
     pub fn activate_repo(&mut self, name: Option<String>) {
         if self.repo_picker.is_submitting() {
             return;
         }
-        self.repo_picker.begin_submit();
+        self.repo_picker.begin_submit(name.clone());
         match &self.runtime {
             Some(runtime) => runtime.activate_repo(name),
             None => self.repo_picker.fail(
@@ -4827,5 +4837,181 @@ mod tests {
         assert!(!retry.danger());
         assert!(retry.body().contains("'release'"));
         assert!(retry.body().contains("prior run history"));
+    }
+
+    fn test_state() -> ClientState {
+        ClientState {
+            connection: ConnectionState::default(),
+            config: ClientConfig {
+                endpoint: "http://127.0.0.1:4780".to_string(),
+                token: None,
+                token_source: config::TokenSource::Missing(std::path::PathBuf::new()),
+                config_path: std::path::PathBuf::new(),
+                theme: ThemeChoice::default(),
+                density: Density::default(),
+                warnings: Vec::new(),
+            },
+            last_ping: None,
+            cursor: None,
+            push_count: 0,
+            last_push: None,
+            last_error: None,
+            active_route: Route::default(),
+            detail_open: false,
+            tasks: Vec::new(),
+            sessions: Vec::new(),
+            snapshot_revision: 0,
+            derived: RefCell::new(DerivedSnapshot::default()),
+            agents: Vec::new(),
+            catalog: CatalogState::default(),
+            snapshot_status: SnapshotStatus::default(),
+            inbox_selected: None,
+            tasks_filter: TaskFilter::default(),
+            tasks_query: TextInput::default(),
+            tasks_search_active: false,
+            tasks_selected: None,
+            tasks_selected_index: 0,
+            dismissed_launch_failures: HashSet::new(),
+            task_confirm: None,
+            toast: None,
+            toast_id: 0,
+            selected_task: None,
+            detail: None,
+            workflow_root: None,
+            workflow_detail: None,
+            workflow_inspect: None,
+            workflow_loading: false,
+            workflow_dirty: false,
+            workflow_graph: WorkflowGraphState::default(),
+            workflow_confirm: None,
+            workflow_cancel_previous: None,
+            workflow_retry_previous: HashMap::new(),
+            schedules: SchedulesState::default(),
+            settings: SettingsState::new("http://127.0.0.1:4780", None),
+            repos: Vec::new(),
+            active_repo: None,
+            repos_loaded: false,
+            repo_picker: RepoPicker::default(),
+            shell_focus: None,
+            text_edit: TextEditState::default(),
+            drain: None,
+            runtime: None,
+        }
+    }
+
+    fn repo(name: &str, active: bool) -> RepoInfo {
+        RepoInfo {
+            name: name.to_string(),
+            path: format!("/code/{name}"),
+            available: true,
+            active,
+            source: favetto_wire::model::RepoSource::Manual,
+        }
+    }
+
+    #[test]
+    fn set_repos_closes_the_picker_once_the_requested_repo_is_active() {
+        let mut state = test_state();
+        state.repos = vec![repo("favetto", true), repo("web", false)];
+        state.active_repo = Some("favetto".to_string());
+        state.repos_loaded = true;
+        state.open_repo_picker();
+        assert!(state.repo_picker_open());
+
+        state.repo_picker.begin_submit(Some("web".to_string()));
+        state.set_repos(
+            vec![repo("favetto", false), repo("web", true)],
+            Some("web".to_string()),
+        );
+
+        assert_eq!(state.active_repo(), Some("web"));
+        assert!(!state.repo_picker_open());
+        assert!(!state.repo_picker().is_submitting());
+        assert_eq!(state.repo_picker().pending_target(), None);
+        assert_eq!(state.repo_picker().error(), None);
+    }
+
+    #[test]
+    fn set_repos_keeps_the_picker_open_until_the_requested_target_is_active() {
+        let mut state = test_state();
+        state.repos = vec![repo("favetto", true), repo("web", false)];
+        state.active_repo = Some("favetto".to_string());
+        state.repos_loaded = true;
+        state.open_repo_picker();
+        state.repo_picker.begin_submit(Some("web".to_string()));
+
+        // An in-flight `repos.list` predates the switch, so it must not dismiss
+        // the picker while the request is still unanswered.
+        state.set_repos(
+            vec![repo("favetto", true), repo("web", false)],
+            Some("favetto".to_string()),
+        );
+        assert!(state.repo_picker_open());
+        assert!(state.repo_picker().is_submitting());
+
+        // A switch made by another client is not the picker's request either.
+        state.set_repos(
+            vec![
+                repo("favetto", false),
+                repo("web", false),
+                repo("docs", true),
+            ],
+            Some("docs".to_string()),
+        );
+        assert!(state.repo_picker_open());
+        assert!(state.repo_picker().is_submitting());
+
+        state.set_repos(
+            vec![
+                repo("favetto", false),
+                repo("web", true),
+                repo("docs", false),
+            ],
+            Some("web".to_string()),
+        );
+        assert!(!state.repo_picker_open());
+    }
+
+    #[test]
+    fn set_repos_closes_the_picker_when_global_is_the_requested_target() {
+        let mut state = test_state();
+        state.repos = vec![repo("favetto", true)];
+        state.active_repo = Some("favetto".to_string());
+        state.repos_loaded = true;
+        state.open_repo_picker();
+        state.repo_picker.begin_submit(None);
+
+        state.set_repos(vec![repo("favetto", false)], None);
+
+        assert_eq!(state.active_repo(), None);
+        assert!(!state.repo_picker_open());
+        assert_eq!(state.repo_picker().pending_target(), None);
+    }
+
+    #[test]
+    fn a_rejected_switch_keeps_the_picker_open_with_its_inline_error() {
+        let mut state = test_state();
+        state.repos = vec![repo("favetto", true), repo("web", false)];
+        state.active_repo = Some("favetto".to_string());
+        state.repos_loaded = true;
+        state.open_repo_picker();
+        state.repo_picker.begin_submit(Some("web".to_string()));
+        state
+            .repo_picker
+            .fail("The daemon rejected the switch: not allowed.".to_string());
+
+        // Even a later registry that reports the repo active must not dismiss
+        // the modal before the user has read the rejection.
+        state.set_repos(
+            vec![repo("favetto", false), repo("web", true)],
+            Some("web".to_string()),
+        );
+
+        assert!(state.repo_picker_open());
+        assert!(!state.repo_picker().is_submitting());
+        assert_eq!(
+            state.repo_picker().error(),
+            Some("The daemon rejected the switch: not allowed.")
+        );
     }
 }

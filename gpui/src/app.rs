@@ -2496,8 +2496,9 @@ impl Render for RootView {
         let palette_open = self.palette.is_open();
         let shortcuts_open = self.shortcuts_open;
         let repo_picker_open = self.state.read(cx).repo_picker_open();
-        // An activation response closes the modal asynchronously; return focus
-        // once it is gone, unless another overlay already took it.
+        // A repos response closes the modal asynchronously once the requested
+        // repo is active; return focus once it is gone, unless another overlay
+        // already took it.
         if self.repo_picker_was_open
             && !repo_picker_open
             && !palette_open
