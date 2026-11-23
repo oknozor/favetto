@@ -1266,6 +1266,7 @@ mod tests {
             schedule: None,
             kind: "agent".to_string(),
             needs: None,
+            mcp: None,
             vars,
             prompt: prompt.to_string(),
             repo: repo.map(str::to_string),

@@ -934,6 +934,7 @@ fn spawn_start_oneshot(
                 cwd,
                 rows: None,
                 cols: None,
+                mcp_servers: None,
             })
             .await
             .map(Box::new);
