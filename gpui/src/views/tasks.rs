@@ -21,6 +21,8 @@ use crate::launch::{self, LaunchFailure};
 use crate::routes::Route;
 use crate::state::{ClientState, SnapshotStatus};
 use crate::tasks::{TaskFilter, TaskList, TaskRow};
+use crate::text_element::state_text_element;
+use crate::text_input::TextTarget;
 use crate::theme::Theme;
 
 /// Fixed height of one virtualized task row (36 px target + 2 px separator).
@@ -98,9 +100,9 @@ impl TasksView {
             )
     }
 
-    /// The search field is a div with a fake caret, like the palette input: the
-    /// shell keeps keyboard focus so list shortcuts stay live, and `/` plus the
-    /// `Search` key context route typed characters here.
+    /// The search field is a real text element: the shell keeps keyboard focus
+    /// so list shortcuts stay live, `/` activates search, and the shared
+    /// `TextInput` buffer paints the caret/selection and handles IME.
     fn search_field(
         &self,
         theme: &Theme,
@@ -170,30 +172,10 @@ impl TasksView {
                     .child("⌕"),
             )
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(theme.font.sm))
-                            .text_color(if query.is_empty() {
-                                theme.colors.muted
-                            } else {
-                                theme.colors.text
-                            })
-                            .child(if query.is_empty() {
-                                "Search task names…".to_string()
-                            } else {
-                                query.to_string()
-                            }),
-                    )
-                    .when(active, |text| {
-                        text.child(div().text_color(theme.colors.accent).child("▌"))
-                    }),
+                div().flex_1().min_w_0().text_size(px(theme.font.sm)).child(
+                    state_text_element(&self.state, TextTarget::TasksSearch, theme, cx)
+                        .placeholder("Search task names…"),
+                ),
             )
             .when_some(clear, |field, clear| field.child(clear))
             .child(components::keycap(

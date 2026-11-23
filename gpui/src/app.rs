@@ -11,8 +11,8 @@
 //! [`crate::layout::container_query`] reads the equivalent full-window width.
 
 use gpui::{
-    div, prelude::*, px, Animation, AnimationExt, AnyElement, Context, Div, Entity, FocusHandle,
-    Hsla, IntoElement, MouseButton, Render, Stateful, Window,
+    div, prelude::*, px, Animation, AnimationExt, AnyElement, ClipboardItem, Context, Div, Entity,
+    FocusHandle, Hsla, IntoElement, MouseButton, Render, Stateful, Window,
 };
 
 use crate::actions::{
@@ -27,8 +27,12 @@ use crate::actions::{
     ScheduleFieldNext, ScheduleFieldPrev, ScheduleNew, ScheduleSubmit, ScheduleToggleEnabled,
     SettingsActivate, SettingsFieldNext, SettingsFieldPrev, SettingsSave, SettingsTest, TaskCancel,
     TaskConfirmAccept, TaskConfirmReject, TaskDismissLaunch, TaskFilterNext, TaskFilterPrev,
-    TaskRetry, TaskSearch, TogglePalette, ToggleShortcuts, WorkflowCancelRoot, WorkflowOpenInTasks,
-    WorkflowRetryInstance, WorkflowRootNext, WorkflowRootPrev,
+    TaskRetry, TaskSearch, TextBackspace, TextCopy, TextCut, TextDelete, TextDeleteWordBackward,
+    TextDeleteWordForward, TextMoveDown, TextMoveEnd, TextMoveHome, TextMoveLeft, TextMoveRight,
+    TextMoveUp, TextMoveWordLeft, TextMoveWordRight, TextNewline, TextPaste, TextSelectAll,
+    TextSelectDown, TextSelectEnd, TextSelectHome, TextSelectLeft, TextSelectRight, TextSelectUp,
+    TextSelectWordLeft, TextSelectWordRight, TogglePalette, ToggleShortcuts, WorkflowCancelRoot,
+    WorkflowOpenInTasks, WorkflowRetryInstance, WorkflowRootNext, WorkflowRootPrev,
 };
 use crate::catalog::OneShotFocus;
 use crate::components;
@@ -40,6 +44,8 @@ use crate::routes::Route;
 use crate::schedules::ScheduleField;
 use crate::state::{ClientState, TaskConfirm, Toast, ToastKind};
 use crate::tasks::TaskAction;
+use crate::text_element::{TextEditState, TextElement, TextHost};
+use crate::text_input::{TextInput, TextTarget};
 use crate::theme::{
     Theme, DETAIL_WIDTH, RESIZE_HANDLE, SIDEBAR_WIDTH, STATUS_BAR_HEIGHT, TOP_BAR_HEIGHT,
 };
@@ -64,6 +70,66 @@ struct RouteViews {
     workflows: Entity<WorkflowsView>,
     schedules: Entity<SchedulesView>,
     settings: Entity<SettingsView>,
+}
+
+/// The editing commands the keymap and text actions share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextCommand {
+    MoveLeft,
+    MoveRight,
+    MoveWordLeft,
+    MoveWordRight,
+    MoveHome,
+    MoveEnd,
+    MoveUp,
+    MoveDown,
+    SelectLeft,
+    SelectRight,
+    SelectWordLeft,
+    SelectWordRight,
+    SelectHome,
+    SelectEnd,
+    SelectUp,
+    SelectDown,
+    SelectAll,
+    Backspace,
+    Delete,
+    DeleteWordBackward,
+    DeleteWordForward,
+    Newline,
+}
+
+fn apply_text_command(input: &mut TextInput, command: TextCommand, multiline: bool) -> bool {
+    match command {
+        TextCommand::MoveLeft => input.move_left(),
+        TextCommand::MoveRight => input.move_right(),
+        TextCommand::MoveWordLeft => input.move_word_left(),
+        TextCommand::MoveWordRight => input.move_word_right(),
+        TextCommand::MoveHome => input.move_home(),
+        TextCommand::MoveEnd => input.move_end(),
+        TextCommand::MoveUp => input.move_line_up(),
+        TextCommand::MoveDown => input.move_line_down(),
+        TextCommand::SelectLeft => input.select_left(),
+        TextCommand::SelectRight => input.select_right(),
+        TextCommand::SelectWordLeft => input.select_word_left(),
+        TextCommand::SelectWordRight => input.select_word_right(),
+        TextCommand::SelectHome => input.select_home(),
+        TextCommand::SelectEnd => input.select_end(),
+        TextCommand::SelectUp => input.select_line_up(),
+        TextCommand::SelectDown => input.select_line_down(),
+        TextCommand::SelectAll => input.select_all(),
+        TextCommand::Backspace => input.backspace(),
+        TextCommand::Delete => input.delete(),
+        TextCommand::DeleteWordBackward => input.delete_word_backwards(),
+        TextCommand::DeleteWordForward => input.delete_word_forwards(),
+        TextCommand::Newline => {
+            if !multiline {
+                return false;
+            }
+            input.insert("\n");
+        }
+    }
+    true
 }
 
 /// The root shell view.
@@ -91,6 +157,8 @@ pub struct RootView {
     shortcuts_close_focus: FocusHandle,
     detail_width: f32,
     detail_resize: Option<ResizeStart>,
+    /// Shaped palette lines for click-to-place-caret and drag selection.
+    palette_text: TextEditState,
 }
 
 /// The full-window frame every route lives in.
@@ -144,6 +212,7 @@ impl RootView {
         let toast_copy_focus = cx.focus_handle().tab_index(76).tab_stop(true);
         let shortcuts_close_focus = cx.focus_handle().tab_index(100).tab_stop(true);
 
+        state.update(cx, |state, _| state.set_shell_focus(root_focus.clone()));
         window.focus(&root_focus);
 
         Self {
@@ -170,6 +239,7 @@ impl RootView {
             shortcuts_close_focus,
             detail_width: DETAIL_WIDTH,
             detail_resize: None,
+            palette_text: TextEditState::default(),
         }
     }
 
@@ -994,9 +1064,177 @@ impl RootView {
             )
     }
 
-    fn palette_overlay(&self, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Div {
+    /// Which buffer owns the keyboard/caret. Modals and the palette come first,
+    /// matching the old typed-character routing.
+    fn active_text_target(&self, cx: &gpui::App) -> Option<TextTarget> {
+        if self.shortcuts_open {
+            return None;
+        }
+        if self.palette.is_open() {
+            return Some(TextTarget::Palette);
+        }
+        self.state.read(cx).active_text_target()
+    }
+
+    fn text_is_multiline(&self, target: TextTarget, cx: &gpui::App) -> bool {
+        match target {
+            TextTarget::Palette => false,
+            _ => self.state.read(cx).text_target_is_multiline(target),
+        }
+    }
+
+    fn edit_active_text(&mut self, command: TextCommand, cx: &mut Context<Self>) {
+        let Some(target) = self.active_text_target(cx) else {
+            return;
+        };
+        let multiline = self.text_is_multiline(target, cx);
+        if target == TextTarget::Palette {
+            if apply_text_command(self.palette.input_mut(), command, multiline) {
+                self.palette.after_edit();
+                cx.notify();
+            }
+        } else {
+            self.state.update(cx, |state, cx| {
+                let changed = state
+                    .text_input_mut(target)
+                    .is_some_and(|input| apply_text_command(input, command, multiline));
+                if changed {
+                    state.after_text_edit(target);
+                    cx.notify();
+                }
+            });
+            cx.notify();
+        }
+        cx.stop_propagation();
+    }
+
+    fn copy_active_text(&mut self, cut: bool, cx: &mut Context<Self>) {
+        let Some(target) = self.active_text_target(cx) else {
+            return;
+        };
+        let selected = if target == TextTarget::Palette {
+            let input = self.palette.input();
+            input
+                .has_selection()
+                .then(|| input.selection_text().to_string())
+        } else {
+            self.state.read(cx).text_input(target).and_then(|input| {
+                input
+                    .has_selection()
+                    .then(|| input.selection_text().to_string())
+            })
+        };
+        let Some(selected) = selected else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(selected));
+        if cut {
+            if target == TextTarget::Palette {
+                self.palette.input_mut().delete_selection();
+                self.palette.after_edit();
+            } else {
+                self.state.update(cx, |state, cx| {
+                    if let Some(input) = state.text_input_mut(target) {
+                        input.delete_selection();
+                    }
+                    state.after_text_edit(target);
+                    cx.notify();
+                });
+            }
+            cx.notify();
+        }
+        cx.stop_propagation();
+    }
+
+    fn paste_active_text(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.active_text_target(cx) else {
+            return;
+        };
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        let multiline = self.text_is_multiline(target, cx);
+        let text = if multiline {
+            text
+        } else {
+            text.replace(['\n', '\r'], " ")
+        };
+        if text.is_empty() {
+            return;
+        }
+        if target == TextTarget::Palette {
+            self.palette.input_mut().insert(&text);
+            self.palette.after_edit();
+        } else {
+            self.state.update(cx, |state, cx| {
+                if let Some(input) = state.text_input_mut(target) {
+                    input.insert(&text);
+                }
+                state.after_text_edit(target);
+                cx.notify();
+            });
+        }
+        cx.notify();
+        cx.stop_propagation();
+    }
+
+    fn insert_active_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        let mut target = self.active_text_target(cx);
+        if target.is_none() {
+            // The one-shot picker keeps the agent chip focused until the user
+            // types; typing has always edited the cwd and moved focus there.
+            self.state.update(cx, |state, cx| {
+                if state
+                    .catalog()
+                    .oneshot()
+                    .is_some_and(|form| form.focused == OneShotFocus::Agent)
+                {
+                    state.focus_oneshot(OneShotFocus::Cwd);
+                    target = Some(TextTarget::CatalogOneShotCwd);
+                    cx.notify();
+                }
+            });
+        }
+        let Some(target) = target else {
+            return;
+        };
+        let multiline = self.text_is_multiline(target, cx);
+        let text: String = if multiline {
+            text.chars()
+                .filter(|character| !character.is_control() || *character == '\n')
+                .collect()
+        } else {
+            text.chars()
+                .filter(|character| !character.is_control())
+                .collect()
+        };
+        if text.is_empty() {
+            return;
+        }
+        if target == TextTarget::Palette {
+            self.palette.input_mut().insert(&text);
+            self.palette.after_edit();
+        } else {
+            self.state.update(cx, |state, cx| {
+                if let Some(input) = state.text_input_mut(target) {
+                    input.insert(&text);
+                }
+                state.after_text_edit(target);
+                cx.notify();
+            });
+        }
+        cx.notify();
+        cx.stop_propagation();
+    }
+
+    fn palette_overlay(
+        &self,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        entity: Entity<Self>,
+    ) -> Div {
         let focused = self.palette_focus.is_focused(window);
-        let query = self.palette.query().to_string();
         let selected = self.palette.selected();
         let results = self.palette.filtered();
 
@@ -1028,27 +1266,16 @@ impl RootView {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .flex()
-                    .items_center()
+                    .text_size(px(theme.font.base))
                     .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(theme.font.base))
-                            .text_color(if query.is_empty() {
-                                theme.colors.muted
-                            } else {
-                                theme.colors.text
-                            })
-                            .child(if query.is_empty() {
-                                "Type a command…".to_string()
-                            } else {
-                                query.clone()
-                            }),
-                    )
-                    .when(focused, |text| {
-                        text.child(div().text_color(theme.colors.accent).child("▌"))
-                    }),
+                        TextElement::new(
+                            entity,
+                            TextTarget::Palette,
+                            self.palette_focus.clone(),
+                            theme,
+                        )
+                        .placeholder("Type a command…"),
+                    ),
             )
             .child(components::keycap(theme, "esc"));
 
@@ -1259,6 +1486,16 @@ impl RootView {
             ("Select a command", "↑ ↓"),
             ("Close the composer", "esc"),
         ];
+        let text_fields = [
+            ("Move by character", "← →"),
+            ("Move by word", "⌥← ⌥→"),
+            ("Line start / end", "Home End"),
+            ("Extend the selection", "⇧← ⇧→"),
+            ("Delete a word", "⌥⌫"),
+            ("Copy / cut / paste", "⌘C ⌘X ⌘V"),
+            ("Select all", "⌘A"),
+            ("Newline (multiline)", "⇧↵"),
+        ];
 
         let panel = div()
             .w(px(640.0))
@@ -1316,6 +1553,13 @@ impl RootView {
                     .items_start()
                     .child(shortcut_section(theme, "DETAIL", &detail))
                     .child(shortcut_section(theme, "ANYWHERE", &anywhere)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(theme.spacing.s6))
+                    .items_start()
+                    .child(shortcut_section(theme, "TEXT FIELDS", &text_fields)),
             );
 
         div()
@@ -1727,20 +1971,26 @@ impl RootView {
     /// The searchable repository switcher, modelled on the TUI Ctrl+P picker
     /// and the web switcher. The global row is always first; unavailable
     /// checkouts stay visible but inert and marked `(missing)`.
-    fn repo_overlay(&self, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        let (entries, selected, filter, error, submitting) = {
+    fn repo_overlay(
+        &self,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        entity: Entity<Self>,
+    ) -> Div {
+        let (entries, selected, error, submitting) = {
             let state = self.state.read(cx);
             let picker = state.repo_picker();
             (
                 state.repo_picker_entries(),
                 picker.selected(),
-                picker.filter().to_string(),
                 picker.error().map(str::to_string),
                 picker.is_submitting(),
             )
         };
         let focused = self.repo_picker_focus.is_focused(window);
-        let no_matches = !filter.trim().is_empty() && entries.len() == 1;
+        let no_matches =
+            !self.state.read(cx).repo_picker().filter().trim().is_empty() && entries.len() == 1;
 
         let input = div()
             .id("repo-picker-input")
@@ -1770,27 +2020,16 @@ impl RootView {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .flex()
-                    .items_center()
+                    .text_size(px(theme.font.base))
                     .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(theme.font.base))
-                            .text_color(if filter.is_empty() {
-                                theme.colors.muted
-                            } else {
-                                theme.colors.text
-                            })
-                            .child(if filter.is_empty() {
-                                "Search repositories by name or path…".to_string()
-                            } else {
-                                filter.clone()
-                            }),
-                    )
-                    .when(focused, |text| {
-                        text.child(div().text_color(theme.colors.accent).child("▌"))
-                    }),
+                        TextElement::new(
+                            entity,
+                            TextTarget::RepoPicker,
+                            self.repo_picker_focus.clone(),
+                            theme,
+                        )
+                        .placeholder("Search repositories by name or path…"),
+                    ),
             )
             .child(components::keycap(theme, "esc"));
 
@@ -2112,6 +2351,133 @@ fn shortcut_section(theme: &Theme, title: &str, rows: &[(&str, &str)]) -> Div {
         )
 }
 
+impl TextHost for RootView {
+    fn text_input(&self, target: TextTarget) -> Option<&TextInput> {
+        (target == TextTarget::Palette).then(|| self.palette.input())
+    }
+
+    fn text_input_mut(&mut self, target: TextTarget) -> Option<&mut TextInput> {
+        (target == TextTarget::Palette).then(|| self.palette.input_mut())
+    }
+
+    fn active_text_target(&self) -> Option<TextTarget> {
+        (self.palette.is_open() && !self.shortcuts_open).then_some(TextTarget::Palette)
+    }
+
+    fn focus_text_target(&mut self, _target: TextTarget) {}
+
+    fn after_text_edit(&mut self, _target: TextTarget) {
+        self.palette.after_edit();
+    }
+
+    fn text_edit_state(&self) -> &TextEditState {
+        &self.palette_text
+    }
+
+    fn text_edit_state_mut(&mut self) -> &mut TextEditState {
+        &mut self.palette_text
+    }
+}
+
+impl gpui::EntityInputHandler for RootView {
+    fn text_for_range(
+        &mut self,
+        range_utf16: std::ops::Range<usize>,
+        actual_range: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        crate::text_element::text_for_range(self.palette.input(), range_utf16, actual_range)
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::UTF16Selection> {
+        Some(crate::text_element::selected_text_range(
+            self.palette.input(),
+        ))
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        crate::text_element::marked_text_range(self.palette.input())
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.palette.input_mut().unmark_text();
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<std::ops::Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        crate::text_element::replace_text_in_range(
+            self.palette.input_mut(),
+            range_utf16,
+            text,
+            false,
+        );
+        self.palette.after_edit();
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        new_selected_range_utf16: Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        crate::text_element::replace_and_mark_text_in_range(
+            self.palette.input_mut(),
+            range_utf16,
+            new_text,
+            new_selected_range_utf16,
+            false,
+        );
+        self.palette.after_edit();
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: std::ops::Range<usize>,
+        _element_bounds: gpui::Bounds<gpui::Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::Bounds<gpui::Pixels>> {
+        crate::text_element::bounds_for_range(
+            self.palette.input(),
+            self.palette_text.layout(TextTarget::Palette),
+            range_utf16,
+        )
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        point: gpui::Point<gpui::Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        crate::text_element::character_index_for_point(
+            self.palette.input(),
+            self.palette_text.layout(TextTarget::Palette),
+            point,
+        )
+    }
+}
+
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.state.read(cx).theme(window.appearance());
@@ -2278,6 +2644,24 @@ impl Render for RootView {
         if detail_elicitation_active {
             // The form modal owns typed text and every navigation key.
             key_context.push_str(" Elicitation Search");
+        }
+
+        // The text-editing bindings are registered last in `actions.rs`; the
+        // `TextField`/`Multiline` contexts make which surface wins explicit.
+        let text_target = if self.shortcuts_open {
+            None
+        } else if self.palette.is_open() {
+            Some(TextTarget::Palette)
+        } else {
+            self.state.read(cx).active_text_target()
+        };
+        if text_target.is_some() {
+            key_context.push_str(" TextField");
+        }
+        if text_target.is_some_and(|target| {
+            target != TextTarget::Palette && self.state.read(cx).text_target_is_multiline(target)
+        }) {
+            key_context.push_str(" Multiline");
         }
 
         let root = shell_root()
@@ -2590,182 +2974,101 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &RepoPickerConfirm, _window, cx| {
                 this.accept_repo_picker(cx);
             }))
+            .on_action(cx.listener(|this, _: &TextMoveLeft, _window, cx| {
+                this.edit_active_text(TextCommand::MoveLeft, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TextMoveRight, _window, cx| {
+                this.edit_active_text(TextCommand::MoveRight, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TextMoveWordLeft, _window, cx| {
+                this.edit_active_text(TextCommand::MoveWordLeft, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TextMoveWordRight, _window, cx| {
+                this.edit_active_text(TextCommand::MoveWordRight, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TextMoveHome, _window, cx| {
+                this.edit_active_text(TextCommand::MoveHome, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TextMoveEnd, _window, cx| {
+                this.edit_active_text(TextCommand::MoveEnd, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TextMoveUp, _window, cx| {
+                this.edit_active_text(TextCommand::MoveUp, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TextMoveDown, _window, cx| {
+                this.edit_active_text(TextCommand::MoveDown, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TextSelectLeft, _window, cx| {
+                this.edit_active_text(TextCommand::SelectLeft, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TextSelectRight, _window, cx| {
+                this.edit_active_text(TextCommand::SelectRight, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TextSelectWordLeft, _window, cx| {
+                this.edit_active_text(TextCommand::SelectWordLeft, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TextSelectWordRight, _window, cx| {
+                this.edit_active_text(TextCommand::SelectWordRight, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TextSelectHome, _window, cx| {
+                this.edit_active_text(TextCommand::SelectHome, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TextSelectEnd, _window, cx| {
+                this.edit_active_text(TextCommand::SelectEnd, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TextSelectUp, _window, cx| {
+                this.edit_active_text(TextCommand::SelectUp, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TextSelectDown, _window, cx| {
+                this.edit_active_text(TextCommand::SelectDown, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TextSelectAll, _window, cx| {
+                this.edit_active_text(TextCommand::SelectAll, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TextBackspace, _window, cx| {
+                this.edit_active_text(TextCommand::Backspace, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TextDelete, _window, cx| {
+                this.edit_active_text(TextCommand::Delete, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &TextDeleteWordBackward, _window, cx| {
+                    this.edit_active_text(TextCommand::DeleteWordBackward, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &TextDeleteWordForward, _window, cx| {
+                this.edit_active_text(TextCommand::DeleteWordForward, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TextNewline, _window, cx| {
+                this.edit_active_text(TextCommand::Newline, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TextCopy, _window, cx| {
+                this.copy_active_text(false, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TextCut, _window, cx| {
+                this.copy_active_text(true, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TextPaste, _window, cx| {
+                this.paste_active_text(cx);
+            }))
             .on_key_down(
                 cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
                     let keystroke = &event.keystroke;
-                    if this.palette.is_open() {
-                        if keystroke.modifiers.control
-                            || keystroke.modifiers.platform
-                            || keystroke.modifiers.alt
-                        {
-                            return;
-                        }
-                        if keystroke.key == "backspace" {
-                            this.palette.backspace();
-                            cx.stop_propagation();
-                            cx.notify();
-                            return;
-                        }
-                        if let Some(text) = &keystroke.key_char {
-                            for character in text.chars() {
-                                this.palette.push_char(character);
-                            }
-                            cx.stop_propagation();
-                            cx.notify();
-                        }
-                        return;
-                    }
-
                     if this.shortcuts_open {
                         return;
                     }
-
-                    if this.state.read(cx).repo_picker_open() {
-                        if keystroke.modifiers.control
-                            || keystroke.modifiers.platform
-                            || keystroke.modifiers.alt
-                        {
-                            return;
-                        }
-                        if keystroke.key == "backspace" {
-                            this.state.update(cx, |state, cx| {
-                                state.repo_picker_backspace();
-                                cx.notify();
-                            });
-                            cx.stop_propagation();
-                            cx.notify();
-                            return;
-                        }
-                        if let Some(text) = &keystroke.key_char {
-                            this.state.update(cx, |state, cx| {
-                                for character in text.chars() {
-                                    state.repo_picker_push_char(character);
-                                }
-                                cx.notify();
-                            });
-                            cx.stop_propagation();
-                            cx.notify();
-                        }
-                        return;
-                    }
-
-                    // Inside a Catalog sheet, Enter is a line break for a
-                    // multiline var; the submit chord (secondary-enter) is a
-                    // bound action and never reaches this branch.
-                    if !keystroke.modifiers.control
-                        && !keystroke.modifiers.platform
-                        && !keystroke.modifiers.alt
-                        && keystroke.key == "enter"
-                    {
-                        let form_open = {
-                            let state = this.state.read(cx);
-                            state.active_route() == Route::Catalog
-                                && state.catalog().any_form_open()
-                        };
-                        if form_open {
-                            let inserted = this.state.update(cx, |state, cx| {
-                                let inserted = state.catalog_push_newline();
-                                cx.notify();
-                                inserted
-                            });
-                            if inserted {
-                                cx.stop_propagation();
-                            }
-                            return;
-                        }
-                    }
-
-                    // Typed characters reach the Tasks query or the Catalog
-                    // search/form only in those modes and only when no overlay
-                    // owns the keyboard. Bound keys (arrows, Enter, Esc) never
-                    // reach here as characters.
+                    // Modifier chords are declared as text-editing actions in
+                    // `crate::actions`; only plain typed characters reach here.
                     if keystroke.modifiers.control
                         || keystroke.modifiers.platform
                         || keystroke.modifiers.alt
                     {
                         return;
                     }
-                    let (
-                        task_typing,
-                        catalog_typing,
-                        schedule_typing,
-                        settings_typing,
-                        detail_typing,
-                        elicitation_typing,
-                    ) = {
-                        let state = this.state.read(cx);
-                        let route = state.active_route();
-                        (
-                            route == Route::Tasks
-                                && state.is_tasks_search_active()
-                                && state.task_confirm().is_none(),
-                            route == Route::Catalog
-                                && (state.is_catalog_search_active()
-                                    || state.catalog().any_form_open()),
-                            route == Route::Schedules && state.schedule_editor_open(),
-                            route == Route::Settings && state.settings().is_editing_text(),
-                            state.detail_prompt_active(),
-                            state.detail_elicitation().is_some(),
-                        )
+                    let Some(text) = keystroke.key_char.as_deref() else {
+                        return;
                     };
-                    if !task_typing
-                        && !catalog_typing
-                        && !schedule_typing
-                        && !settings_typing
-                        && !detail_typing
-                        && !elicitation_typing
-                    {
-                        return;
-                    }
-                    if keystroke.key == "backspace" {
-                        this.state.update(cx, |state, cx| {
-                            if elicitation_typing {
-                                if let Some(form) = state.detail_elicitation_mut() {
-                                    form.backspace();
-                                }
-                            } else if detail_typing {
-                                state.detail_prompt_backspace();
-                            } else if schedule_typing {
-                                state.schedule_backspace();
-                            } else if settings_typing {
-                                state.settings_backspace();
-                            } else if catalog_typing {
-                                state.catalog_backspace();
-                            } else {
-                                state.backspace_tasks_query();
-                            }
-                            cx.notify();
-                        });
-                        cx.stop_propagation();
-                        return;
-                    }
-                    if let Some(text) = &keystroke.key_char {
-                        let characters: Vec<char> =
-                            text.chars().filter(|c| !c.is_control()).collect();
-                        if !characters.is_empty() {
-                            this.state.update(cx, |state, cx| {
-                                for character in characters {
-                                    if elicitation_typing {
-                                        if let Some(form) = state.detail_elicitation_mut() {
-                                            form.push_char(character);
-                                        }
-                                    } else if detail_typing {
-                                        state.detail_prompt_push_char(character);
-                                    } else if schedule_typing {
-                                        state.schedule_push_char(character);
-                                    } else if settings_typing {
-                                        state.settings_push_char(character);
-                                    } else if catalog_typing {
-                                        state.catalog_push_char(character);
-                                    } else {
-                                        state.push_tasks_query_char(character);
-                                    }
-                                }
-                                cx.notify();
-                            });
-                            cx.stop_propagation();
-                        }
-                    }
+                    this.insert_active_text(text, cx);
                 }),
             )
             .child(top_bar)
@@ -2773,7 +3076,7 @@ impl Render for RootView {
             .child(status_bar);
 
         if palette_open {
-            root.child(self.palette_overlay(theme, window, cx))
+            root.child(self.palette_overlay(theme, window, cx, cx.entity()))
         } else if shortcuts_open {
             root.child(self.shortcuts_overlay(theme, cx))
         } else {
@@ -2782,7 +3085,7 @@ impl Render for RootView {
                 root = root.child(self.toast_overlay(theme, toast, cx));
             }
             if repo_picker_open {
-                root = root.child(self.repo_overlay(theme, window, cx));
+                root = root.child(self.repo_overlay(theme, window, cx, cx.entity()));
             }
             if let Some(confirm) = &confirm {
                 root = root.child(self.confirm_overlay(theme, confirm, cx));

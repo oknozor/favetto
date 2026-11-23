@@ -13,6 +13,8 @@ use gpui::{
 use crate::components;
 use crate::settings::{latency_label, ConnectionTest, SettingsFocus};
 use crate::state::{ClientState, ConnectionState, SnapshotStatus};
+use crate::text_element::state_text_element;
+use crate::text_input::TextTarget;
 use crate::theme::Theme;
 
 /// Where the About card points.
@@ -22,7 +24,6 @@ const DOCS_URL: &str = "https://github.com/oknozor/favetto/blob/main/docs/design
 struct TextFieldSpec<'a> {
     id: &'static str,
     label: &'a str,
-    value: &'a str,
     placeholder: &'a str,
     focused: bool,
     focus: SettingsFocus,
@@ -102,11 +103,15 @@ impl SettingsView {
         let TextFieldSpec {
             id,
             label,
-            value,
             placeholder,
             focused,
             focus,
         } = field;
+        let target = match focus {
+            SettingsFocus::Endpoint => TextTarget::SettingsEndpoint,
+            SettingsFocus::Token => TextTarget::SettingsToken,
+            _ => TextTarget::SettingsEndpoint,
+        };
         div()
             .id(id)
             .flex()
@@ -141,23 +146,12 @@ impl SettingsView {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .truncate()
                     .font_family("monospace")
                     .text_size(px(theme.font.sm))
-                    .text_color(if value.is_empty() {
-                        theme.colors.muted
-                    } else {
-                        theme.colors.text
-                    })
-                    .child(if value.is_empty() {
-                        placeholder.to_string()
-                    } else {
-                        value.to_string()
-                    }),
+                    .child(
+                        state_text_element(&self.state, target, theme, cx).placeholder(placeholder),
+                    ),
             )
-            .when(focused, |field| {
-                field.child(div().text_color(theme.colors.accent).child("▌"))
-            })
     }
 
     fn error_copy_button(
@@ -179,12 +173,10 @@ impl SettingsView {
     }
 
     fn connection_card(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
-        let (endpoint, token, token_source, focus, normalized, test, save_error, connection) = {
+        let (token_source, focus, normalized, test, save_error, connection) = {
             let state = self.state.read(cx);
             let settings = state.settings();
             (
-                settings.draft_endpoint().to_string(),
-                settings.draft_token().to_string(),
                 state.config().token_source.label(),
                 settings.focus(),
                 settings.normalized(),
@@ -202,7 +194,6 @@ impl SettingsView {
             TextFieldSpec {
                 id: "settings-endpoint",
                 label: "Daemon address",
-                value: &endpoint,
                 placeholder: "127.0.0.1:7878",
                 focused: endpoint_focused,
                 focus: SettingsFocus::Endpoint,
@@ -214,7 +205,6 @@ impl SettingsView {
             TextFieldSpec {
                 id: "settings-token",
                 label: "Token",
-                value: &token,
                 placeholder: "Using the token file",
                 focused: token_focused,
                 focus: SettingsFocus::Token,

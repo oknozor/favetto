@@ -9,6 +9,7 @@
 
 use crate::routes::Route;
 use crate::search::{self, SearchField, SearchQuery};
+use crate::text_input::TextInput;
 
 /// What running a command does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,7 +115,7 @@ fn command_by_id(id: &str) -> Option<&'static Command> {
 #[derive(Debug, Default)]
 pub struct CommandPalette {
     open: bool,
-    query: String,
+    query: TextInput,
     selected: usize,
     recent: Vec<&'static str>,
 }
@@ -138,28 +139,46 @@ impl CommandPalette {
         self.open = false;
     }
 
+    #[allow(dead_code)] // Read by the model's tests; the view reads the buffer.
     pub fn query(&self) -> &str {
+        self.query.value()
+    }
+
+    /// The editable query buffer, shared with the text element and platform
+    /// input handler.
+    pub fn input(&self) -> &TextInput {
         &self.query
     }
 
+    pub fn input_mut(&mut self) -> &mut TextInput {
+        &mut self.query
+    }
+
     /// Set the query from typed input and move the selection to the best match.
+    #[allow(dead_code)] // Exercised by the model's tests.
     pub fn set_query(&mut self, query: String) {
-        self.query = query;
+        self.query.set_value(query);
         self.selected = 0;
     }
 
     /// Append one typed character (used by the text input).
+    #[allow(dead_code)] // Exercised by the model's tests.
     pub fn push_char(&mut self, c: char) {
-        let mut query = self.query.clone();
-        query.push(c);
-        self.set_query(query);
+        self.query.push_char(c);
+        self.selected = 0;
     }
 
     /// Remove the last character of the query.
+    #[allow(dead_code)] // Exercised by the model's tests.
     pub fn backspace(&mut self) {
-        let mut query = self.query.clone();
-        query.pop();
-        self.set_query(query);
+        self.query.backspace();
+        self.selected = 0;
+    }
+
+    /// Re-clamp the highlight after an in-place edit (the caret may be in the
+    /// middle of the query now).
+    pub fn after_edit(&mut self) {
+        self.selected = 0;
     }
 
     pub fn selected(&self) -> usize {
@@ -169,7 +188,7 @@ impl CommandPalette {
     /// The commands matching the current query. With an empty query this is
     /// recents first, then every command in canonical order, each exactly once.
     pub fn filtered(&self) -> Vec<&'static Command> {
-        let query = SearchQuery::new(&self.query);
+        let query = SearchQuery::new(self.query.value());
         if query.is_empty() {
             return self.recent_first();
         }

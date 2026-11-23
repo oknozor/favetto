@@ -26,7 +26,7 @@ use favetto_wire::model::{
     SessionConfigValue, SessionModes, Task, TaskStatus,
 };
 use favetto_wire::rpc::AgentEventPush;
-use gpui::{ClipboardItem, Context, Task as GpuiTask, WindowAppearance};
+use gpui::{ClipboardItem, Context, FocusHandle, Task as GpuiTask, WindowAppearance};
 
 use crate::catalog::{AgentChoice, CatalogState, OneShotFocus};
 use crate::config::{self, ClientConfig, Density, ThemeChoice};
@@ -42,6 +42,8 @@ use crate::schedules::{
 use crate::settings::{SettingsActivate, SettingsFocus, SettingsState};
 use crate::sse::Push;
 use crate::tasks::{self, TaskAction, TaskFilter, TaskList};
+use crate::text_element::{TextEditState, TextHost};
+use crate::text_input::{TextInput, TextTarget};
 use crate::theme::Theme;
 use crate::transport::ClientError;
 use crate::workflow::{
@@ -233,7 +235,7 @@ pub struct ClientState {
     /// The Tasks segmented control.
     tasks_filter: TaskFilter,
     /// The Tasks fuzzy-search query. It survives filter changes.
-    tasks_query: String,
+    tasks_query: TextInput,
     /// True while typed characters go to the Tasks search field (`/`).
     tasks_search_active: bool,
     /// The highlighted Tasks row, preserved by id across live updates.
@@ -285,6 +287,11 @@ pub struct ClientState {
     repos_loaded: bool,
     /// The searchable switcher's transient state.
     repo_picker: RepoPicker,
+    /// The focus handle the shell keeps while a route-level text field is
+    /// active. Platform IME/paste is registered against it.
+    shell_focus: Option<FocusHandle>,
+    /// Shaped-line caches used by click-to-place-caret and drag selection.
+    text_edit: TextEditState,
     /// The foreground task that drains [`Runtime`] updates. Declared before the
     /// runtime so dropping the entity cancels the drain first.
     drain: Option<GpuiTask<()>>,
@@ -347,7 +354,7 @@ impl ClientState {
             snapshot_status: snapshot_status.clone(),
             inbox_selected: None,
             tasks_filter: TaskFilter::default(),
-            tasks_query: String::new(),
+            tasks_query: TextInput::default(),
             tasks_search_active: false,
             tasks_selected: None,
             tasks_selected_index: 0,
@@ -372,6 +379,8 @@ impl ClientState {
             active_repo: None,
             repos_loaded: false,
             repo_picker: RepoPicker::default(),
+            shell_focus: None,
+            text_edit: TextEditState::default(),
             runtime,
             drain,
         };
@@ -990,7 +999,7 @@ impl ClientState {
                 match result {
                     Ok(result) if result.accepted => {
                         if let Some(detail) = self.detail.as_mut() {
-                            detail.prompt.clear();
+                            detail.prompt.set_value(String::new());
                             detail.prompt_selected = None;
                             detail.prompt_error = None;
                         }
@@ -2102,18 +2111,6 @@ impl ClientState {
         self.schedules.close_editor();
     }
 
-    pub fn schedule_push_char(&mut self, character: char) {
-        if let Some(editor) = self.schedules.editor_mut() {
-            editor.push_char(character);
-        }
-    }
-
-    pub fn schedule_backspace(&mut self) {
-        if let Some(editor) = self.schedules.editor_mut() {
-            editor.backspace();
-        }
-    }
-
     pub fn cycle_schedule_focus(&mut self, delta: isize) {
         if let Some(editor) = self.schedules.editor_mut() {
             editor.cycle_focus(delta);
@@ -2264,14 +2261,6 @@ impl ClientState {
 
     pub fn density(&self) -> Density {
         self.config.density
-    }
-
-    pub fn settings_push_char(&mut self, character: char) {
-        self.settings.push_char(character);
-    }
-
-    pub fn settings_backspace(&mut self) {
-        self.settings.backspace();
     }
 
     pub fn settings_cycle_focus(&mut self, delta: isize) {
@@ -2625,37 +2614,6 @@ impl ClientState {
         self.catalog.deactivate_search();
     }
 
-    /// Route one typed character to the launch sheet, the one-shot sheet or the
-    /// search field, in that order (the sheets are modal).
-    pub fn catalog_push_char(&mut self, character: char) {
-        if self.catalog.launch().is_some() {
-            self.catalog.push_launch_char(character);
-        } else if self.catalog.oneshot().is_some() {
-            self.catalog.push_oneshot_char(character);
-        } else if self.catalog.is_search_active() {
-            if let Some(name) = self.catalog.push_search_char(character) {
-                self.load_catalog_preview(&name);
-            }
-        }
-    }
-
-    pub fn catalog_backspace(&mut self) {
-        if self.catalog.launch().is_some() {
-            self.catalog.backspace_launch();
-        } else if self.catalog.oneshot().is_some() {
-            self.catalog.backspace_oneshot();
-        } else if self.catalog.is_search_active() {
-            if let Some(name) = self.catalog.backspace_search() {
-                self.load_catalog_preview(&name);
-            }
-        }
-    }
-
-    /// Enter inside a multiline var inserts a line break and returns true.
-    pub fn catalog_push_newline(&mut self) -> bool {
-        self.catalog.push_launch_newline()
-    }
-
     /// Tab/Shift+Tab inside the active sheet.
     pub fn cycle_catalog_form_focus(&mut self, delta: isize) {
         if self.catalog.launch().is_some() {
@@ -2744,7 +2702,7 @@ impl ClientState {
     pub fn set_catalog_field_value(&mut self, index: usize, value: String) {
         if let Some(form) = self.catalog.launch_mut() {
             if let Some(field) = form.fields.get_mut(index) {
-                field.value = value;
+                field.value = TextInput::new(value);
                 field.error = None;
                 form.server_error = None;
                 form.focused = index;
@@ -2873,7 +2831,7 @@ impl ClientState {
             return;
         }
         let agent = form.agent.clone();
-        let cwd = form.cwd.trim().to_string();
+        let cwd = form.cwd.value().trim().to_string();
         form.submitting = true;
         form.server_error = None;
         match &self.runtime {
@@ -3121,14 +3079,6 @@ impl ClientState {
         self.repo_picker.select(index, &self.repos);
     }
 
-    pub fn repo_picker_push_char(&mut self, character: char) {
-        self.repo_picker.push_char(character, &self.repos);
-    }
-
-    pub fn repo_picker_backspace(&mut self) {
-        self.repo_picker.backspace(&self.repos);
-    }
-
     /// Enter on the picker: activate the highlighted repo, or explain why an
     /// unavailable checkout cannot be selected instead of silently doing nothing.
     pub fn activate_repo_selected(&mut self) {
@@ -3250,7 +3200,7 @@ impl ClientState {
     pub fn task_list(&self) -> Rc<TaskList> {
         let mut derived = self.derived.borrow_mut();
         if derived.task_revision == self.snapshot_revision
-            && derived.task_query == self.tasks_query
+            && derived.task_query == self.tasks_query.value()
             && derived.task_filter == self.tasks_filter
         {
             if let Some(list) = &derived.tasks {
@@ -3260,13 +3210,13 @@ impl ClientState {
         let list = Rc::new(tasks::build(
             &self.tasks,
             &self.sessions,
-            &self.tasks_query,
+            self.tasks_query.value(),
             self.tasks_filter,
             self.active_repo.as_deref(),
             Utc::now(),
         ));
         derived.task_revision = self.snapshot_revision;
-        derived.task_query = self.tasks_query.clone();
+        derived.task_query = self.tasks_query.value().to_string();
         derived.task_filter = self.tasks_filter;
         derived.tasks = Some(list.clone());
         list
@@ -3344,7 +3294,219 @@ impl ClientState {
 
     /// The current fuzzy query.
     pub fn tasks_query(&self) -> &str {
+        self.tasks_query.value()
+    }
+
+    pub fn tasks_query_input(&self) -> &TextInput {
         &self.tasks_query
+    }
+
+    pub fn tasks_query_input_mut(&mut self) -> &mut TextInput {
+        &mut self.tasks_query
+    }
+
+    /// The focus handle the shell holds while a non-modal text field is active.
+    pub fn set_shell_focus(&mut self, focus: FocusHandle) {
+        self.shell_focus = Some(focus);
+    }
+
+    pub fn shell_focus(&self) -> Option<FocusHandle> {
+        self.shell_focus.clone()
+    }
+
+    /// Which buffer owns the keyboard/caret right now. The order matches the
+    /// old `on_key_down` routing: modals first, the follow-up composer before
+    /// route search, then the surface's own field.
+    pub fn active_text_target(&self) -> Option<TextTarget> {
+        if self.repo_picker.is_open() {
+            return Some(TextTarget::RepoPicker);
+        }
+        if let Some(detail) = &self.detail {
+            if let Some(form) = &detail.elicitation {
+                if form.text_input().is_some() {
+                    return Some(TextTarget::Elicitation(form.current));
+                }
+            }
+        }
+        if self.detail_prompt_active() {
+            return Some(TextTarget::DetailPrompt);
+        }
+        match self.active_route {
+            Route::Tasks => {
+                if self.tasks_search_active && self.task_confirm.is_none() {
+                    Some(TextTarget::TasksSearch)
+                } else {
+                    None
+                }
+            }
+            Route::Catalog => {
+                if let Some(form) = self.catalog.launch() {
+                    return form.focused_text_target();
+                }
+                if let Some(form) = self.catalog.oneshot() {
+                    return (form.focused == OneShotFocus::Cwd)
+                        .then_some(TextTarget::CatalogOneShotCwd);
+                }
+                self.catalog
+                    .is_search_active()
+                    .then_some(TextTarget::CatalogSearch)
+            }
+            Route::Schedules => self
+                .schedules
+                .editor()
+                .filter(|editor| editor.focus == ScheduleField::Cron)
+                .map(|_| TextTarget::ScheduleCron),
+            Route::Settings => match self.settings.focus() {
+                Some(SettingsFocus::Endpoint) => Some(TextTarget::SettingsEndpoint),
+                Some(SettingsFocus::Token) => Some(TextTarget::SettingsToken),
+                _ => None,
+            },
+            Route::Inbox | Route::Workflows => None,
+        }
+    }
+
+    /// Whether the target accepts `Shift+Enter` newlines and `Up`/`Down`
+    /// movement between lines.
+    pub fn text_target_is_multiline(&self, target: TextTarget) -> bool {
+        match target {
+            TextTarget::DetailPrompt => true,
+            TextTarget::CatalogLaunchVar(index) => self
+                .catalog
+                .launch()
+                .and_then(|form| form.fields.get(index))
+                .is_some_and(|field| field.var.multiline),
+            _ => false,
+        }
+    }
+
+    pub fn text_input(&self, target: TextTarget) -> Option<&TextInput> {
+        match target {
+            TextTarget::Palette => None,
+            TextTarget::RepoPicker => Some(self.repo_picker.input()),
+            TextTarget::TasksSearch => Some(&self.tasks_query),
+            TextTarget::CatalogSearch => Some(self.catalog.search_input()),
+            TextTarget::CatalogLaunchVar(_) | TextTarget::CatalogLaunchModel => {
+                self.catalog.launch_text_input(target)
+            }
+            TextTarget::CatalogOneShotCwd => self.catalog.oneshot_cwd_input(),
+            TextTarget::ScheduleCron => self
+                .schedules
+                .editor()
+                .and_then(|editor| editor.text_input()),
+            TextTarget::SettingsEndpoint => self.settings.text_input(true),
+            TextTarget::SettingsToken => self.settings.text_input(false),
+            TextTarget::DetailPrompt => self.detail.as_ref().map(|detail| &detail.prompt),
+            TextTarget::Elicitation(index) => self
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.elicitation.as_ref())
+                .and_then(|form| form.text_input_at(index)),
+        }
+    }
+
+    pub fn text_input_mut(&mut self, target: TextTarget) -> Option<&mut TextInput> {
+        match target {
+            TextTarget::Palette => None,
+            TextTarget::RepoPicker => Some(self.repo_picker.input_mut()),
+            TextTarget::TasksSearch => Some(&mut self.tasks_query),
+            TextTarget::CatalogSearch => Some(self.catalog.search_input_mut()),
+            TextTarget::CatalogLaunchVar(_) | TextTarget::CatalogLaunchModel => {
+                self.catalog.launch_text_input_mut(target)
+            }
+            TextTarget::CatalogOneShotCwd => self.catalog.oneshot_cwd_input_mut(),
+            TextTarget::ScheduleCron => self
+                .schedules
+                .editor_mut()
+                .and_then(|editor| editor.text_input_mut()),
+            TextTarget::SettingsEndpoint => self.settings.text_input_mut(true),
+            TextTarget::SettingsToken => self.settings.text_input_mut(false),
+            TextTarget::DetailPrompt => self.detail.as_mut().map(|detail| &mut detail.prompt),
+            TextTarget::Elicitation(index) => self
+                .detail
+                .as_mut()
+                .and_then(|detail| detail.elicitation.as_mut())
+                .and_then(|form| form.text_input_at_mut(index)),
+        }
+    }
+
+    /// Move the logical focus to the clicked target (before placing the caret).
+    pub fn focus_text_target(&mut self, target: TextTarget) {
+        match target {
+            TextTarget::Palette | TextTarget::RepoPicker => {}
+            TextTarget::TasksSearch => self.activate_tasks_search(),
+            TextTarget::CatalogSearch => self.activate_catalog_search(),
+            TextTarget::CatalogLaunchVar(index) => self.focus_catalog_field(index),
+            TextTarget::CatalogLaunchModel => self.focus_catalog_model(),
+            TextTarget::CatalogOneShotCwd => {
+                self.catalog.set_oneshot_focus(OneShotFocus::Cwd);
+            }
+            TextTarget::ScheduleCron => self.focus_schedule_field(ScheduleField::Cron),
+            TextTarget::SettingsEndpoint => {
+                self.settings.set_focus(Some(SettingsFocus::Endpoint));
+            }
+            TextTarget::SettingsToken => {
+                self.settings.set_focus(Some(SettingsFocus::Token));
+            }
+            TextTarget::DetailPrompt => self.start_detail_reply(),
+            TextTarget::Elicitation(index) => {
+                if let Some(form) = self
+                    .detail
+                    .as_mut()
+                    .and_then(|detail| detail.elicitation.as_mut())
+                {
+                    form.set_current(index);
+                }
+            }
+        }
+    }
+
+    /// Side effects that depend on a value: filtering, validation, stale error
+    /// clearing and the slash-command selection.
+    pub fn after_text_edit(&mut self, target: TextTarget) {
+        match target {
+            TextTarget::Palette | TextTarget::RepoPicker => {
+                self.repo_picker.after_edit(&self.repos);
+            }
+            TextTarget::TasksSearch => self.tasks_selected_index = 0,
+            TextTarget::CatalogSearch => {
+                if let Some(name) = self.catalog.after_search_edit() {
+                    self.load_catalog_preview(&name);
+                }
+            }
+            TextTarget::CatalogLaunchVar(_) | TextTarget::CatalogLaunchModel => {
+                if let Some(form) = self.catalog.launch_mut() {
+                    form.after_text_edit();
+                }
+            }
+            TextTarget::CatalogOneShotCwd => {
+                if let Some(form) = self.catalog.oneshot_mut() {
+                    form.focused = OneShotFocus::Cwd;
+                    form.server_error = None;
+                }
+            }
+            TextTarget::ScheduleCron => {
+                if let Some(editor) = self.schedules.editor_mut() {
+                    editor.after_edit();
+                }
+            }
+            TextTarget::SettingsEndpoint | TextTarget::SettingsToken => {
+                self.settings.after_edit();
+            }
+            TextTarget::DetailPrompt => {
+                if let Some(detail) = self.detail.as_mut() {
+                    detail.prompt_selected = None;
+                }
+            }
+            TextTarget::Elicitation(_) => {
+                if let Some(form) = self
+                    .detail
+                    .as_mut()
+                    .and_then(|detail| detail.elicitation.as_mut())
+                {
+                    form.after_edit();
+                }
+            }
+        }
     }
 
     /// True while typed characters go to the search field.
@@ -3362,23 +3524,6 @@ impl ClientState {
     /// typed text survive a row click (Working Memory).
     pub fn deactivate_tasks_search(&mut self) {
         self.tasks_search_active = false;
-    }
-
-    /// Append one typed character to the query.
-    pub fn push_tasks_query_char(&mut self, character: char) {
-        if character.is_control() {
-            return;
-        }
-        let mut query = self.tasks_query.clone();
-        query.push(character);
-        self.set_tasks_query(query);
-    }
-
-    /// Remove the last query character.
-    pub fn backspace_tasks_query(&mut self) {
-        let mut query = self.tasks_query.clone();
-        query.pop();
-        self.set_tasks_query(query);
     }
 
     /// Clear the query and leave search mode. Returns whether anything changed,
@@ -3399,7 +3544,7 @@ impl ClientState {
     }
 
     fn set_tasks_query(&mut self, query: String) {
-        self.tasks_query = query;
+        self.tasks_query.set_value(query);
         self.tasks_selected_index = 0;
     }
 
@@ -4127,25 +4272,6 @@ impl ClientState {
         }
     }
 
-    /// Append one typed character to the follow-up draft (bounded).
-    pub fn detail_prompt_push_char(&mut self, ch: char) {
-        const MAX_PROMPT: usize = 4096;
-        if let Some(detail) = self.detail.as_mut() {
-            if detail.prompt.chars().count() < MAX_PROMPT {
-                detail.prompt.push(ch);
-                detail.prompt_selected = None;
-            }
-        }
-    }
-
-    /// Delete the last draft character.
-    pub fn detail_prompt_backspace(&mut self) {
-        if let Some(detail) = self.detail.as_mut() {
-            detail.prompt.pop();
-            detail.prompt_selected = None;
-        }
-    }
-
     /// Move the highlighted slash-command completion.
     pub fn detail_prompt_move_command(&mut self, delta: isize) {
         if let Some(detail) = self.detail.as_mut() {
@@ -4177,7 +4303,7 @@ impl ClientState {
         if detail.prompt_sending {
             return;
         }
-        let prompt = detail.prompt.trim().to_string();
+        let prompt = detail.prompt.value().trim().to_string();
         if prompt.is_empty() {
             return;
         }
@@ -4474,6 +4600,149 @@ impl ClientState {
 
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+}
+
+impl TextHost for ClientState {
+    fn text_input(&self, target: TextTarget) -> Option<&TextInput> {
+        ClientState::text_input(self, target)
+    }
+
+    fn text_input_mut(&mut self, target: TextTarget) -> Option<&mut TextInput> {
+        ClientState::text_input_mut(self, target)
+    }
+
+    fn active_text_target(&self) -> Option<TextTarget> {
+        ClientState::active_text_target(self)
+    }
+
+    fn focus_text_target(&mut self, target: TextTarget) {
+        ClientState::focus_text_target(self, target);
+    }
+
+    fn after_text_edit(&mut self, target: TextTarget) {
+        ClientState::after_text_edit(self, target);
+    }
+
+    fn text_edit_state(&self) -> &TextEditState {
+        &self.text_edit
+    }
+
+    fn text_edit_state_mut(&mut self) -> &mut TextEditState {
+        &mut self.text_edit
+    }
+}
+
+impl gpui::EntityInputHandler for ClientState {
+    fn text_for_range(
+        &mut self,
+        range_utf16: std::ops::Range<usize>,
+        actual_range: &mut Option<std::ops::Range<usize>>,
+        _window: &mut gpui::Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let target = self.active_text_target()?;
+        let input = self.text_input(target)?;
+        crate::text_element::text_for_range(input, range_utf16, actual_range)
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut gpui::Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::UTF16Selection> {
+        let target = self.active_text_target()?;
+        let input = self.text_input(target)?;
+        Some(crate::text_element::selected_text_range(input))
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut gpui::Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        let target = self.active_text_target()?;
+        let input = self.text_input(target)?;
+        crate::text_element::marked_text_range(input)
+    }
+
+    fn unmark_text(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) {
+        let Some(target) = self.active_text_target() else {
+            return;
+        };
+        if let Some(input) = self.text_input_mut(target) {
+            input.unmark_text();
+        }
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<std::ops::Range<usize>>,
+        text: &str,
+        _window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.active_text_target() else {
+            return;
+        };
+        let multiline = self.text_target_is_multiline(target);
+        if let Some(input) = self.text_input_mut(target) {
+            crate::text_element::replace_text_in_range(input, range_utf16, text, multiline);
+        }
+        self.after_text_edit(target);
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        new_selected_range_utf16: Option<std::ops::Range<usize>>,
+        _window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.active_text_target() else {
+            return;
+        };
+        let multiline = self.text_target_is_multiline(target);
+        if let Some(input) = self.text_input_mut(target) {
+            crate::text_element::replace_and_mark_text_in_range(
+                input,
+                range_utf16,
+                new_text,
+                new_selected_range_utf16,
+                multiline,
+            );
+        }
+        self.after_text_edit(target);
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: std::ops::Range<usize>,
+        _element_bounds: gpui::Bounds<gpui::Pixels>,
+        _window: &mut gpui::Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::Bounds<gpui::Pixels>> {
+        let target = self.active_text_target()?;
+        let input = self.text_input(target)?;
+        let layout = self.text_edit.layout(target);
+        crate::text_element::bounds_for_range(input, layout, range_utf16)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        point: gpui::Point<gpui::Pixels>,
+        _window: &mut gpui::Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let target = self.active_text_target()?;
+        let input = self.text_input(target)?;
+        let layout = self.text_edit.layout(target);
+        crate::text_element::character_index_for_point(input, layout, point)
     }
 }
 
