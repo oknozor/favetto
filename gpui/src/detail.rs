@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::inbox::{self, StatusKind};
+use crate::search::{self, SearchField, SearchQuery};
 use crate::tasks;
 
 /// The maximum number of event frames retained for one open detail. The daemon
@@ -1142,24 +1143,21 @@ impl TaskDetail {
 
     /// The `/prefix` currently being completed, only for a bare first token.
     pub fn command_query(&self) -> Option<&str> {
-        let rest = self.prompt.strip_prefix('/')?;
-        if rest.chars().any(char::is_whitespace) {
-            return None;
-        }
-        Some(rest)
+        command_query(&self.prompt)
     }
 
-    /// Advertised commands matching the current query, in advertised order.
+    /// Advertised commands matching the current query, most relevant first and
+    /// advertised order as the tie-break. Slash completion is case-insensitive.
     pub fn command_matches(&self) -> Vec<&AgentCommand> {
-        let Some(query) = self.command_query() else {
+        let Some(query_text) = self.command_query() else {
             return Vec::new();
         };
         let Some(commands) = &self.commands else {
             return Vec::new();
         };
-        commands
-            .iter()
-            .filter(|command| command.name.starts_with(query))
+        rank_commands(commands, query_text)
+            .into_iter()
+            .map(|(_, command)| command)
             .collect()
     }
 
@@ -1202,6 +1200,52 @@ impl TaskDetail {
             .find(|command| command.name == name)
             .and_then(|command| command.input_hint.as_deref())
     }
+}
+
+/// The `/prefix` currently being completed, only for a bare first token.
+pub fn command_query(prompt: &str) -> Option<&str> {
+    let rest = prompt.strip_prefix('/')?;
+    if rest.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(rest)
+}
+
+/// Advertised commands matching a draft prompt, most relevant first and
+/// advertised order as the tie-break. The index is the command's position in
+/// the advertised list, so a click still selects it after the list is ranked.
+pub fn matching_commands<'a>(
+    commands: &'a [AgentCommand],
+    prompt: &str,
+) -> Vec<(usize, &'a AgentCommand)> {
+    let Some(query_text) = command_query(prompt) else {
+        return Vec::new();
+    };
+    rank_commands(commands, query_text)
+}
+
+/// Rank commands for an already extracted `/prefix` query.
+fn rank_commands<'a>(
+    commands: &'a [AgentCommand],
+    query_text: &str,
+) -> Vec<(usize, &'a AgentCommand)> {
+    let query = SearchQuery::new(query_text);
+    let matcher = search::matcher();
+    let mut scored: Vec<(i64, usize, &AgentCommand)> = commands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command)| {
+            let fields = [SearchField::new(&command.name, search::weight::LABEL)];
+            query
+                .score(&matcher, &fields)
+                .map(|matched| (matched.score, index, command))
+        })
+        .collect();
+    scored.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+    scored
+        .into_iter()
+        .map(|(_, index, command)| (index, command))
+        .collect()
 }
 
 /// A `tasks.events` result that skips event kinds this client does not know.
@@ -1738,6 +1782,21 @@ mod tests {
         detail.prompt_selected = Some(0);
         detail.prompt.pop();
         assert_eq!(detail.prompt, "/test ");
+    }
+
+    #[test]
+    fn slash_completion_is_case_insensitive() {
+        let mut detail = TaskDetail::new(Uuid::from_u128(7));
+        detail.commands = Some(vec![AgentCommand {
+            name: "web".to_string(),
+            description: "Search".to_string(),
+            input_hint: Some("query".to_string()),
+        }]);
+
+        detail.prompt = "/W".to_string();
+        assert_eq!(detail.command_matches().len(), 1);
+        assert!(detail.complete_command());
+        assert_eq!(detail.prompt, "/web ");
     }
 
     #[test]

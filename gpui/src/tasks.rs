@@ -15,12 +15,11 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use favetto_wire::model::{AgentCost, AgentSessionInfo, Task, TaskStatus};
-use fuzzy_matcher::skim::SkimMatcherV2;
-use fuzzy_matcher::FuzzyMatcher;
 use uuid::Uuid;
 
 use crate::inbox::{self, StatusKind};
 use crate::repos::repo_visible;
+use crate::search::{self, SearchField, SearchQuery};
 
 /// A task command that needs explicit confirmation before the RPC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -253,8 +252,8 @@ pub fn build(
         }
     }
 
-    let terms: Vec<&str> = query.split_whitespace().collect();
-    let matcher = SkimMatcherV2::default();
+    let query = SearchQuery::new(query);
+    let matcher = search::matcher();
 
     let mut counts = [0usize; TaskFilter::COUNT];
     let mut matched = 0usize;
@@ -271,7 +270,7 @@ pub fn build(
         let name = inbox::task_display_name(&task.name).to_string();
         let agent = agents.get(key.as_str()).map(|agent| (*agent).to_string());
 
-        let score = match score_row(&matcher, &terms, &task.name, &name, &repo, &agent) {
+        let score = match score_row(&matcher, &query, &task.name, &name, &repo, &agent) {
             Some(score) => score,
             None => continue,
         };
@@ -301,7 +300,7 @@ pub fn build(
         ));
     }
 
-    let query_is_empty = terms.is_empty();
+    let query_is_empty = query.is_empty();
     scored.sort_by(|(left_score, left), (right_score, right)| {
         // With no query, newest first; with one, relevance first and recency
         // as the tie-break.
@@ -329,36 +328,30 @@ pub fn build(
     }
 }
 
-/// Score one task against every whitespace term. Every term must hit at least
-/// one haystack (name, display name, repo or agent); the scores are summed so
-/// a task matching several terms sorts first.
+/// Score one task against every whitespace term with the shared matcher. The
+/// display name outranks the qualified name/repo and the agent, while every
+/// term must hit at least one field.
 fn score_row(
-    matcher: &SkimMatcherV2,
-    terms: &[&str],
+    matcher: &fuzzy_matcher::skim::SkimMatcherV2,
+    query: &SearchQuery<'_>,
     full_name: &str,
     name: &str,
     repo: &Option<String>,
     agent: &Option<String>,
 ) -> Option<i64> {
-    if terms.is_empty() {
+    if query.is_empty() {
         return Some(0);
     }
-    let haystacks = [
-        Some(full_name),
-        Some(name),
-        repo.as_deref(),
-        agent.as_deref(),
+    let fields = [
+        SearchField::new(name, search::weight::LABEL),
+        SearchField::new(full_name, search::weight::NAMESPACE),
+        SearchField::new(
+            repo.as_deref().unwrap_or_default(),
+            search::weight::NAMESPACE,
+        ),
+        SearchField::new(agent.as_deref().unwrap_or_default(), search::weight::META),
     ];
-    let mut total = 0i64;
-    for term in terms {
-        let best = haystacks
-            .iter()
-            .flatten()
-            .filter_map(|haystack| matcher.fuzzy_match(haystack, term))
-            .max()?;
-        total = total.saturating_add(best);
-    }
-    Some(total)
+    query.score(matcher, &fields).map(|matched| matched.score)
 }
 
 #[cfg(test)]

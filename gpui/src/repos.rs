@@ -8,6 +8,8 @@
 
 use favetto_wire::model::RepoInfo;
 
+use crate::search::{self, SearchField, SearchQuery};
+
 /// One row of the repo picker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoOption {
@@ -58,20 +60,40 @@ pub fn active_repo_label(active: Option<&str>, loaded: bool) -> String {
 }
 
 /// The picker rows: a leading `global` row plus the known repos matching
-/// `filter` (a case-insensitive substring of the name or the path).
+/// `filter` with the shared fuzzy matcher. The repo name outranks its path, and
+/// ties keep the registry order so the list is deterministic.
 pub fn repo_picker_entries(repos: &[RepoInfo], filter: &str) -> Vec<RepoOption> {
-    let filter = filter.trim().to_lowercase();
-    let matches = |haystack: &str| haystack.to_lowercase().contains(&filter);
     let mut entries = vec![RepoOption {
         name: None,
         label: "global  —  all repos".to_string(),
         selectable: true,
         active: false,
     }];
-    for repo in repos {
-        if !filter.is_empty() && !matches(&repo.name) && !matches(&repo.path) {
-            continue;
+
+    let query = SearchQuery::new(filter);
+    let matched_repos: Vec<(i64, usize, &RepoInfo)> = if query.is_empty() {
+        repos
+            .iter()
+            .enumerate()
+            .map(|(index, repo)| (0, index, repo))
+            .collect()
+    } else {
+        let matcher = search::matcher();
+        let mut scored = Vec::new();
+        for (index, repo) in repos.iter().enumerate() {
+            let fields = [
+                SearchField::new(&repo.name, search::weight::LABEL),
+                SearchField::new(&repo.path, search::weight::NAMESPACE),
+            ];
+            if let Some(score) = query.score(&matcher, &fields).map(|matched| matched.score) {
+                scored.push((score, index, repo));
+            }
         }
+        scored.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+        scored
+    };
+
+    for (_, _, repo) in matched_repos {
         let marker = if repo.active { "● " } else { "  " };
         let availability = if repo.available { "" } else { "  (missing)" };
         entries.push(RepoOption {
@@ -272,6 +294,26 @@ mod tests {
         assert_eq!(gone.len(), 2);
         assert!(!gone[1].selectable);
         assert!(gone[1].label.ends_with("(missing)"));
+    }
+
+    #[test]
+    fn picker_matches_fuzzily_and_case_insensitively() {
+        let repos = vec![
+            repo("favetto", "/code/favetto", true, false),
+            repo("web", "/srv/web", true, false),
+        ];
+        let fuzzy = repo_picker_entries(&repos, "FVTO");
+        assert_eq!(fuzzy.len(), 2);
+        assert_eq!(fuzzy[1].name.as_deref(), Some("favetto"));
+        assert_eq!(fuzzy[0].name, None, "the global row stays pinned");
+
+        let by_path = repo_picker_entries(&repos, "srwb");
+        assert_eq!(by_path.len(), 2);
+        assert_eq!(by_path[1].name.as_deref(), Some("web"));
+
+        let none = repo_picker_entries(&repos, "zzz");
+        assert_eq!(none.len(), 1);
+        assert_eq!(none[0].name, None);
     }
 
     #[test]

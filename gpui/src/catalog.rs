@@ -13,11 +13,10 @@ use std::collections::HashSet;
 
 use favetto_wire::rpc::CatalogEntry;
 use favetto_wire::task_var::{TaskVar, VarType};
-use fuzzy_matcher::skim::SkimMatcherV2;
-use fuzzy_matcher::FuzzyMatcher;
 use serde_json::{Map, Value};
 
 use crate::repos::catalog_visible;
+use crate::search::{self, SearchField, SearchQuery};
 
 /// The first-fetch state of `catalog.list`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -92,6 +91,35 @@ impl CatalogEntryView {
             .rsplit_once('/')
             .map(|(_, name)| name)
             .unwrap_or(&self.label)
+    }
+
+    /// The searchable fields, weighted so the visible path outranks the prompt
+    /// and metadata. The fully-qualified `name` is deliberately absent: its
+    /// hidden `repo:<name>/` prefix must not make every definition in a repo
+    /// match a namespace query.
+    fn search_fields(&self) -> Vec<SearchField<'_>> {
+        let mut fields = vec![
+            SearchField::new(&self.label, search::weight::LABEL),
+            SearchField::new(&self.folder, search::weight::NAMESPACE),
+            SearchField::new(&self.prompt, search::weight::BODY),
+            SearchField::new(&self.kind, search::weight::META),
+        ];
+        for text in [
+            self.agent.as_deref(),
+            self.provider.as_deref(),
+            self.model.as_deref(),
+            self.schedule.as_deref(),
+            self.needs.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            fields.push(SearchField::new(text, search::weight::META));
+        }
+        for var in &self.vars {
+            fields.push(SearchField::new(&var.name, search::weight::META));
+        }
+        fields
     }
 }
 
@@ -503,23 +531,47 @@ impl CatalogState {
 
     // -- grouping ----------------------------------------------------------
 
-    /// The visible groups after the fuzzy filter, namespaces alphabetically and
-    /// `Global` last. Entries inside a folder are alphabetical, which keeps a
-    /// row's position stable as live pushes change nothing in the catalog.
+    /// Whether the active filter has no terms (whitespace-only counts as empty).
+    fn query_is_empty(&self) -> bool {
+        SearchQuery::new(&self.query).is_empty()
+    }
+
+    /// The visible groups after the fuzzy filter. An empty query keeps the
+    /// daemon-independent alphabetical grouping (`Global` last); with a query,
+    /// entries, folders and namespaces are ordered by their best match so the
+    /// most relevant definition is first.
     pub fn groups(&self) -> Vec<CatalogGroup> {
-        let matcher = SkimMatcherV2::default();
-        let query = self.query.trim();
-        let mut views: Vec<CatalogEntryView> = self
+        let matcher = search::matcher();
+        let query = SearchQuery::new(&self.query);
+        let mut scored: Vec<(i64, CatalogEntryView)> = self
             .entries
             .iter()
             .filter(|entry| self.entry_in_scope(entry))
-            .filter(|entry| query.is_empty() || fuzzy_score(entry, query, &matcher).is_some())
-            .map(CatalogEntryView::new)
+            .filter_map(|entry| {
+                let view = CatalogEntryView::new(entry);
+                let score = if query.is_empty() {
+                    0
+                } else {
+                    let fields = view.search_fields();
+                    query.score(&matcher, &fields)?.score
+                };
+                Some((score, view))
+            })
             .collect();
-        views.sort_by(|left, right| left.name.cmp(&right.name));
+
+        if query.is_empty() {
+            scored.sort_by(|left, right| left.1.name.cmp(&right.1.name));
+        } else {
+            scored.sort_by(|left, right| {
+                right
+                    .0
+                    .cmp(&left.0)
+                    .then_with(|| left.1.name.cmp(&right.1.name))
+            });
+        }
 
         let mut groups: Vec<CatalogGroup> = Vec::new();
-        for view in views {
+        for (_, view) in scored {
             let group_index = groups
                 .iter()
                 .position(|group| group.key == view.namespace)
@@ -558,24 +610,23 @@ impl CatalogState {
             group.folders[folder_index].entries.push(view);
         }
 
-        groups.sort_by(|left, right| {
-            let left_global = left.key == "global";
-            let right_global = right.key == "global";
-            left_global
-                .cmp(&right_global)
-                .then_with(|| left.key.cmp(&right.key))
-        });
+        if query.is_empty() {
+            groups.sort_by(|left, right| {
+                let left_global = left.key == "global";
+                let right_global = right.key == "global";
+                left_global
+                    .cmp(&right_global)
+                    .then_with(|| left.key.cmp(&right.key))
+            });
+        }
         groups
     }
 
     fn visible_entries(&self) -> Vec<CatalogEntryView> {
-        let matcher = SkimMatcherV2::default();
-        let query = self.query.trim();
-        self.entries
-            .iter()
-            .filter(|entry| self.entry_in_scope(entry))
-            .filter(|entry| query.is_empty() || fuzzy_score(entry, query, &matcher).is_some())
-            .map(CatalogEntryView::new)
+        self.groups()
+            .into_iter()
+            .flat_map(|group| group.folders)
+            .flat_map(|folder| folder.entries)
             .collect()
     }
 
@@ -617,8 +668,12 @@ impl CatalogState {
         names
     }
 
+    /// Whether `key` is collapsed for display. While a query is active every
+    /// matching group/folder is auto-expanded so a hit inside a previously
+    /// collapsed branch is always painted; the stored user state is untouched
+    /// and comes back when the query is cleared.
     pub fn is_collapsed(&self, key: &str) -> bool {
-        self.collapsed.contains(key)
+        self.query_is_empty() && self.collapsed.contains(key)
     }
 
     /// The index of a row in the rendered scroll container, counting the
@@ -952,18 +1007,6 @@ pub fn entry_glyph(kind: &str) -> &'static str {
     }
 }
 
-fn fuzzy_score(entry: &CatalogEntry, query: &str, matcher: &SkimMatcherV2) -> Option<i64> {
-    let name = matcher
-        .fuzzy_match(&entry.name, query)
-        .map(|score| score + 200);
-    let prompt = matcher.fuzzy_match(&entry.prompt, query);
-    match (name, prompt) {
-        (None, None) => None,
-        (Some(name), Some(prompt)) => Some(name + prompt),
-        (Some(name), None) | (None, Some(name)) => Some(name),
-    }
-}
-
 /// `string`, `int` or `bool` for a var's type chip.
 pub fn var_type_label(var_type: VarType) -> &'static str {
     match var_type {
@@ -1159,6 +1202,135 @@ mod tests {
         state.push_search_char('h');
         state.push_search_char('a');
         assert_eq!(state.selected(), Some("repo:favetto/release"));
+    }
+
+    #[test]
+    fn the_hidden_repo_prefix_is_not_searchable() {
+        let mut state = CatalogState {
+            entries: vec![entry(
+                "repo:favetto/triage",
+                Some("favetto"),
+                "sort the inbox",
+                vec![],
+            )],
+            status: CatalogStatus::Loaded,
+            ..CatalogState::default()
+        };
+        assert_eq!(state.total_count(), 1);
+        for character in "favetto".chars() {
+            state.push_search_char(character);
+        }
+        assert_eq!(
+            state.matched_count(),
+            0,
+            "repo:favetto is hidden on the row"
+        );
+    }
+
+    #[test]
+    fn multi_term_queries_match_across_fields_in_any_order() {
+        let mut triage = entry(
+            "repo:favetto/triage",
+            Some("favetto"),
+            "sort the inbox",
+            vec![],
+        );
+        triage.model = Some("opus".to_string());
+
+        let mut state = CatalogState {
+            entries: vec![
+                triage,
+                entry(
+                    "repo:favetto/release",
+                    Some("favetto"),
+                    "publish a changelog",
+                    vec![],
+                ),
+            ],
+            status: CatalogStatus::Loaded,
+            ..CatalogState::default()
+        };
+        for character in "opus triage".chars() {
+            state.push_search_char(character);
+        }
+        assert_eq!(state.matched_count(), 1);
+        assert_eq!(state.selected(), Some("repo:favetto/triage"));
+
+        state.clear_search();
+        for character in "triage opus".chars() {
+            state.push_search_char(character);
+        }
+        assert_eq!(state.selected(), Some("repo:favetto/triage"));
+    }
+
+    #[test]
+    fn label_hits_rank_above_prompt_only_hits() {
+        let mut state = CatalogState {
+            entries: vec![
+                entry(
+                    "repo:favetto/release-notes",
+                    Some("favetto"),
+                    "publish a changelog",
+                    vec![],
+                ),
+                entry(
+                    "repo:favetto/changelog",
+                    Some("favetto"),
+                    "write the notes",
+                    vec![],
+                ),
+            ],
+            status: CatalogStatus::Loaded,
+            ..CatalogState::default()
+        };
+        for character in "changelog".chars() {
+            state.push_search_char(character);
+        }
+        assert_eq!(
+            state.visible_names(),
+            vec!["repo:favetto/changelog", "repo:favetto/release-notes"],
+            "the label hit sorts before the prompt-only hit"
+        );
+    }
+
+    #[test]
+    fn searching_auto_expands_a_collapsed_folder_and_restores_it() {
+        let mut state = CatalogState {
+            entries: vec![
+                entry(
+                    "repo:favetto/gpui/01-scaffold",
+                    Some("favetto"),
+                    "shell",
+                    vec![],
+                ),
+                entry("repo:favetto/release", Some("favetto"), "ship", vec![]),
+            ],
+            status: CatalogStatus::Loaded,
+            ..CatalogState::default()
+        };
+        state.toggle_collapsed("repo:favetto/gpui");
+        assert!(state.is_collapsed("repo:favetto/gpui"));
+        assert_eq!(state.visible_names(), vec!["repo:favetto/release"]);
+
+        for character in "scaffold".chars() {
+            state.push_search_char(character);
+        }
+        assert_eq!(
+            state.visible_names(),
+            vec!["repo:favetto/gpui/01-scaffold"],
+            "a hit inside a collapsed folder is visible while searching"
+        );
+        assert!(state
+            .display_index_of("repo:favetto/gpui/01-scaffold")
+            .is_some());
+
+        state.clear_search();
+        assert!(state.is_collapsed("repo:favetto/gpui"));
+        assert_eq!(state.visible_names(), vec!["repo:favetto/release"]);
+        assert_eq!(
+            state.display_index_of("repo:favetto/gpui/01-scaffold"),
+            None
+        );
     }
 
     #[test]
