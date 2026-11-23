@@ -1,13 +1,14 @@
 //! The Workflows model: the roots seen in the current task snapshot, one
-//! root's runtime inspect rows, their five buckets, and the catalog DAG source.
+//! root's runtime inspect rows laid out as a left-to-right DAG, and the catalog
+//! DAG source.
 //!
-//! The daemon already does the hard part: `workflow.inspect` splits the root's
-//! instances into `ready`, `running`, `failed` and `blocked`. This module only
-//! joins that payload with the cached `tasks.list` rows (which carry
-//! `parent_id` for dependency labels), groups the terminal leftovers, and keeps
+//! The daemon already does the hard part: `workflow.inspect` returns every
+//! instance of a root. This module joins that payload with the cached
+//! `tasks.list` rows (which carry `parent_id` and `created_at`), derives the
+//! parent → child edges, places the nodes on a deterministic canvas and keeps
 //! the optimistic cancel/retry state honest. It is deliberately free of GPUI
-//! types so bucket counts, progress and selection are unit-tested without a
-//! window (docs/design/gpui-client.md §4, "Tests").
+//! types so the layout, selection order and blocked markers are unit-tested
+//! without a window (docs/design/gpui-client.md §4, "Tests").
 //!
 //! Progress is never faked: `done / total` is the number of succeeded
 //! instances over the instances the daemon returned. A failed or cancelled row
@@ -24,65 +25,68 @@ use crate::inbox::{self, StatusKind};
 use crate::launch;
 use crate::tasks;
 
-/// One of the five sections of a root's runtime inspect.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum WorkflowBucket {
-    /// Pending with no active `needs` predecessor: the daemon will claim it.
-    Ready,
-    /// Running or awaiting input.
-    Running,
-    /// Failed and retryable.
-    Failed,
-    /// Pending behind an active `needs` predecessor.
-    Blocked,
-    /// Succeeded or cancelled: the instance will not move without a retry.
-    Terminal,
+/// The node card width in the graph canvas.
+pub const NODE_WIDTH: f32 = 180.0;
+/// The node card height in the graph canvas.
+pub const NODE_HEIGHT: f32 = 56.0;
+/// Horizontal gap between columns.
+pub const COLUMN_GAP: f32 = 64.0;
+/// Vertical gap between rows of the same column.
+pub const ROW_GAP: f32 = 20.0;
+/// Padding around the whole graph.
+pub const GRAPH_MARGIN: f32 = 24.0;
+
+/// One node placed on the graph canvas.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WorkflowNode {
+    /// The task id (the stable selection key across refreshes).
+    pub id: Uuid,
+    /// Longest distance from a graph root.
+    pub column: usize,
+    /// Position within the column.
+    pub row: usize,
+    /// Left edge of the node box.
+    pub x: f32,
+    /// Top edge of the node box.
+    pub y: f32,
 }
 
-impl WorkflowBucket {
-    /// The sections in display order. Attention first, history last: the five
-    /// chunks mirror the daemon's own buckets (docs §2, Chunking).
-    pub const ALL: [WorkflowBucket; 5] = [
-        WorkflowBucket::Ready,
-        WorkflowBucket::Running,
-        WorkflowBucket::Failed,
-        WorkflowBucket::Blocked,
-        WorkflowBucket::Terminal,
-    ];
+/// One drawn lineage edge: a parent instance to the instance it started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkflowEdge {
+    /// The predecessor (`parent_id`).
+    pub parent: Uuid,
+    /// The instance that waited for or was spawned by the parent.
+    pub child: Uuid,
+}
 
-    /// The section heading.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Ready => "Ready",
-            Self::Running => "Running",
-            Self::Failed => "Failed",
-            Self::Blocked => "Blocked",
-            Self::Terminal => "Terminal",
-        }
+/// A window-free layout of one root's instances.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WorkflowGraphLayout {
+    /// Placed nodes in column/row order.
+    pub nodes: Vec<WorkflowNode>,
+    /// Drawn edges, in child column/row order.
+    pub edges: Vec<WorkflowEdge>,
+    /// The full canvas width, including margins.
+    pub width: f32,
+    /// The full canvas height, including margins.
+    pub height: f32,
+}
+
+impl WorkflowGraphLayout {
+    /// The placed box for one task id.
+    pub fn node(&self, id: Uuid) -> Option<&WorkflowNode> {
+        self.nodes.iter().find(|node| node.id == id)
     }
 
-    /// What the section means when it has no rows, so an empty bucket is still
-    /// an explanation rather than a blank gap.
-    pub fn empty(self) -> &'static str {
-        match self {
-            Self::Ready => "Nothing queued and waiting for a slot.",
-            Self::Running => "No instance is executing or blocked on a prompt.",
-            Self::Failed => "No failed instances.",
-            Self::Blocked => "No instance is waiting on another instance.",
-            Self::Terminal => "No instance has finished yet.",
-        }
-    }
-
-    /// Derive a bucket from a status. `blocked` only matters for pending rows;
-    /// every other state is already unambiguous.
-    pub fn from_status(status: TaskStatus, blocked: bool) -> Self {
-        match status {
-            TaskStatus::Pending if blocked => Self::Blocked,
-            TaskStatus::Pending => Self::Ready,
-            TaskStatus::Running | TaskStatus::AwaitingInput => Self::Running,
-            TaskStatus::Failed => Self::Failed,
-            TaskStatus::Succeeded | TaskStatus::Cancelled => Self::Terminal,
-        }
+    /// The parent drawn for one child, when it has a valid edge (tests assert
+    /// the edge derivation; the view paints `edges` directly).
+    #[cfg(test)]
+    pub fn parent_of(&self, id: Uuid) -> Option<Uuid> {
+        self.edges
+            .iter()
+            .find(|edge| edge.child == id)
+            .map(|edge| edge.parent)
     }
 }
 
@@ -99,10 +103,12 @@ pub struct WorkflowRow {
     pub attempt: u32,
     /// Bounded outcome text (`Task::error`) when the daemon reports one.
     pub summary: Option<String>,
-    /// Display names of the predecessors this instance waited for.
-    pub dependencies: Vec<String>,
-    /// The section this row renders under.
-    pub bucket: WorkflowBucket,
+    /// The instance that spawned or unblocked this one, from the cached task
+    /// snapshot. `workflow.inspect` omits it; the snapshot usually names it.
+    pub parent_id: Option<Uuid>,
+    /// Creation time, the graph's stable sibling order. Missing when the task
+    /// is no longer in the shared snapshot.
+    pub created_at: Option<DateTime<Utc>>,
     /// Whether the daemon considered the pending row blocked by a predecessor.
     /// Retained so a live `pending` push cannot accidentally unblock it.
     pub blocked: bool,
@@ -115,15 +121,138 @@ impl WorkflowRow {
     pub fn status_kind(&self) -> StatusKind {
         StatusKind::from_task_status(self.status)
     }
+
+    /// A pending instance whose `needs` predecessor has not finished yet. It
+    /// ranks below an unblocked pending instance in the copy and wears a
+    /// dashed outline.
+    pub fn is_blocked(&self) -> bool {
+        self.blocked && self.status == TaskStatus::Pending
+    }
+
+    /// Running or awaiting input: the states that animate while live.
+    pub fn is_active(&self) -> bool {
+        matches!(self.status, TaskStatus::Running | TaskStatus::AwaitingInput)
+    }
+
+    /// Deterministic sibling order: creation time first, then id. A status
+    /// change can never reshuffle the picture.
+    fn order_key(&self) -> (i64, Uuid) {
+        (
+            self.created_at
+                .map(|created| created.timestamp_millis())
+                .unwrap_or(i64::MAX),
+            self.id,
+        )
+    }
 }
 
-/// One rendered section: a bucket and the rows in it, in inspect order.
-#[derive(Clone, Debug, PartialEq)]
-pub struct WorkflowSection {
-    /// The bucket.
-    pub bucket: WorkflowBucket,
-    /// Rows in the order the daemon returned them.
-    pub rows: Vec<WorkflowRow>,
+/// Lay out one root's rows as a left-to-right forest.
+///
+/// Every node gets a column by its longest distance from a graph root, then a
+/// row inside that column. Parents that are missing from the inspect set, point
+/// at the node itself or form an accidental cycle are dropped, so the result is
+/// always a forest and layout can never hang. The runtime data makes cycles
+/// impossible in practice; this is a defensive guard, not a feature.
+pub fn layout_graph(rows: &[WorkflowRow]) -> WorkflowGraphLayout {
+    if rows.is_empty() {
+        return WorkflowGraphLayout::default();
+    }
+
+    let mut ordered: Vec<&WorkflowRow> = rows.iter().collect();
+    ordered.sort_by_key(|row| row.order_key());
+    let ids: HashSet<Uuid> = ordered.iter().map(|row| row.id).collect();
+
+    // Only a known, non-self parent can produce an edge.
+    let mut parent_of: HashMap<Uuid, Uuid> = ordered
+        .iter()
+        .filter_map(|row| {
+            row.parent_id
+                .filter(|parent| *parent != row.id && ids.contains(parent))
+                .map(|parent| (row.id, parent))
+        })
+        .collect();
+
+    // Break accidental cycles deterministically. For a two-node loop this
+    // drops the first-processed node's edge and keeps the other, leaving a
+    // valid forest either way.
+    for row in &ordered {
+        if !parent_of.contains_key(&row.id) {
+            continue;
+        }
+        let mut seen = HashSet::new();
+        let mut current = row.id;
+        loop {
+            if !seen.insert(current) {
+                parent_of.remove(&row.id);
+                break;
+            }
+            match parent_of.get(&current).copied() {
+                Some(parent) if parent == row.id => {
+                    parent_of.remove(&row.id);
+                    break;
+                }
+                Some(parent) => current = parent,
+                None => break,
+            }
+        }
+    }
+
+    // Longest distance from a root. The cycle guard above bounds this walk.
+    let depth = |id: Uuid| -> usize {
+        let mut depth = 0usize;
+        let mut current = id;
+        while let Some(parent) = parent_of.get(&current).copied() {
+            depth += 1;
+            current = parent;
+            if depth > rows.len() {
+                break;
+            }
+        }
+        depth
+    };
+
+    let mut columns: Vec<Vec<&WorkflowRow>> = Vec::new();
+    for row in &ordered {
+        let column = depth(row.id);
+        if columns.len() <= column {
+            columns.resize_with(column + 1, Vec::new);
+        }
+        columns[column].push(*row);
+    }
+
+    let mut nodes = Vec::with_capacity(rows.len());
+    for (column, column_rows) in columns.iter().enumerate() {
+        for (row, task) in column_rows.iter().enumerate() {
+            nodes.push(WorkflowNode {
+                id: task.id,
+                column,
+                row,
+                x: GRAPH_MARGIN + column as f32 * (NODE_WIDTH + COLUMN_GAP),
+                y: GRAPH_MARGIN + row as f32 * (NODE_HEIGHT + ROW_GAP),
+            });
+        }
+    }
+
+    let edges: Vec<WorkflowEdge> = nodes
+        .iter()
+        .filter_map(|node| {
+            parent_of.get(&node.id).map(|parent| WorkflowEdge {
+                parent: *parent,
+                child: node.id,
+            })
+        })
+        .collect();
+
+    let column_count = columns.len() as f32;
+    let row_count = columns.iter().map(Vec::len).max().unwrap_or(0) as f32;
+    WorkflowGraphLayout {
+        nodes,
+        edges,
+        width: GRAPH_MARGIN * 2.0
+            + column_count * NODE_WIDTH
+            + (column_count - 1.0).max(0.0) * COLUMN_GAP,
+        height: GRAPH_MARGIN * 2.0 + row_count * NODE_HEIGHT + (row_count - 1.0).max(0.0) * ROW_GAP,
+    }
 }
 
 /// One root in the Workflows list, aggregated from the current task snapshot.
@@ -207,8 +336,9 @@ impl WorkflowDetail {
     /// Join one `workflow.inspect` payload with the task snapshot.
     ///
     /// The inspect payload deliberately omits `parent_id` and timestamps; the
-    /// snapshot fills the dependency label. `selected` is kept when that
-    /// instance is still present, otherwise the first row is highlighted.
+    /// snapshot fills the edges and the sibling order. `selected` is kept when
+    /// that instance is still present, otherwise the first node in graph order
+    /// is highlighted.
     pub fn from_inspect(inspect: &WorkflowInspect, tasks: &[Task], selected: Option<Uuid>) -> Self {
         let blocked: HashSet<Uuid> = inspect.blocked.iter().copied().collect();
         let cached: HashMap<Uuid, &Task> = tasks.iter().map(|task| (task.id, task)).collect();
@@ -229,14 +359,7 @@ impl WorkflowDetail {
             .tasks
             .iter()
             .map(|task| {
-                let mut dependencies = Vec::new();
-                if let Some(parent) = cached.get(&task.id).and_then(|task| task.parent_id) {
-                    if parent != task.id {
-                        if let Some(name) = names.get(&parent) {
-                            dependencies.push(name.clone());
-                        }
-                    }
-                }
+                let cached_task = cached.get(&task.id).copied();
                 WorkflowRow {
                     id: task.id,
                     name: names
@@ -246,8 +369,8 @@ impl WorkflowDetail {
                     status: task.status,
                     attempt: task.attempt,
                     summary: task.summary.clone(),
-                    dependencies,
-                    bucket: WorkflowBucket::from_status(task.status, blocked.contains(&task.id)),
+                    parent_id: cached_task.and_then(|task| task.parent_id),
+                    created_at: cached_task.map(|task| task.created_at),
                     blocked: blocked.contains(&task.id),
                     retry_pending: false,
                 }
@@ -309,33 +432,24 @@ impl WorkflowDetail {
         }
     }
 
-    /// The five sections in display order, including empty buckets so counts
-    /// always agree with the rows below them.
-    pub fn sections(&self) -> Vec<WorkflowSection> {
-        WorkflowBucket::ALL
+    /// The pure layout of this root's instances.
+    pub fn layout(&self) -> WorkflowGraphLayout {
+        layout_graph(&self.rows)
+    }
+
+    /// The rows in graph order (column, then row).
+    pub fn ordered_rows(&self) -> Vec<&WorkflowRow> {
+        let layout = self.layout();
+        let by_id: HashMap<Uuid, &WorkflowRow> =
+            self.rows.iter().map(|row| (row.id, row)).collect();
+        layout
+            .nodes
             .iter()
-            .map(|bucket| WorkflowSection {
-                bucket: *bucket,
-                rows: self
-                    .rows
-                    .iter()
-                    .filter(|row| row.bucket == *bucket)
-                    .cloned()
-                    .collect(),
-            })
+            .filter_map(|node| by_id.get(&node.id).copied())
             .collect()
     }
 
-    /// The rows in visual order (bucket order, then inspect order).
-    pub fn ordered_rows(&self) -> Vec<&WorkflowRow> {
-        let mut rows = Vec::with_capacity(self.rows.len());
-        for bucket in WorkflowBucket::ALL {
-            rows.extend(self.rows.iter().filter(|row| row.bucket == bucket));
-        }
-        rows
-    }
-
-    /// The highlighted row, falling back to the first row in visual order.
+    /// The highlighted row, falling back to the first row in graph order.
     pub fn selected_row(&self) -> Option<&WorkflowRow> {
         self.selected
             .and_then(|id| self.rows.iter().find(|row| row.id == id))
@@ -357,7 +471,7 @@ impl WorkflowDetail {
         }
     }
 
-    /// Move the highlight by one in visual order, clamped (lists do not wrap).
+    /// Move the highlight by one in graph order, clamped (lists do not wrap).
     pub fn move_selection(&mut self, delta: isize) {
         let ids: Vec<Uuid> = self.ordered_rows().iter().map(|row| row.id).collect();
         if ids.is_empty() {
@@ -391,14 +505,17 @@ impl WorkflowDetail {
         let changed = row.status != task.status
             || row.attempt != task.attempt
             || row.summary != task.error
+            || row.parent_id != task.parent_id
+            || row.created_at != Some(task.created_at)
             || row.retry_pending;
         row.status = task.status;
         row.attempt = task.attempt;
         row.summary = task.error.clone();
+        row.parent_id = task.parent_id;
+        row.created_at = Some(task.created_at);
         if task.status != TaskStatus::Pending {
             row.blocked = false;
         }
-        row.bucket = WorkflowBucket::from_status(task.status, row.blocked);
         row.retry_pending = false;
         if changed {
             self.recompute_state();
@@ -413,7 +530,6 @@ impl WorkflowDetail {
         for row in &mut self.rows {
             if tasks::can_cancel(row.status) {
                 row.status = TaskStatus::Cancelled;
-                row.bucket = WorkflowBucket::Terminal;
                 row.blocked = false;
                 row.retry_pending = false;
                 moved += 1;
@@ -433,7 +549,6 @@ impl WorkflowDetail {
         for row in &mut self.rows {
             if ids.contains(&row.id) {
                 row.status = TaskStatus::Cancelled;
-                row.bucket = WorkflowBucket::Terminal;
                 row.blocked = false;
             }
         }
@@ -441,8 +556,8 @@ impl WorkflowDetail {
         self.recompute_state();
     }
 
-    /// Optimistically move one failed row back to Ready. Returns the prior row
-    /// so a failed RPC can restore exactly that state.
+    /// Optimistically move one failed row back to pending. Returns the prior
+    /// row so a failed RPC can restore exactly that state.
     pub fn begin_retry(&mut self, id: Uuid) -> Option<WorkflowRow> {
         let row = self.rows.iter_mut().find(|row| row.id == id)?;
         if row.status != TaskStatus::Failed || row.retry_pending {
@@ -450,7 +565,6 @@ impl WorkflowDetail {
         }
         let previous = row.clone();
         row.status = TaskStatus::Pending;
-        row.bucket = WorkflowBucket::Ready;
         row.blocked = false;
         row.retry_pending = true;
         row.summary = None;
@@ -473,11 +587,6 @@ impl WorkflowDetail {
     /// attempt and status.
     pub fn finish_retry(&mut self, task: &Task) {
         self.apply_task(task);
-    }
-
-    #[cfg(test)]
-    fn bucket_count(&self, bucket: WorkflowBucket) -> usize {
-        self.rows.iter().filter(|row| row.bucket == bucket).count()
     }
 
     fn select_preferred(&mut self, preferred: Option<Uuid>) {
@@ -555,8 +664,8 @@ pub fn roots(tasks: &[Task]) -> Vec<WorkflowRoot> {
                     status: task.status,
                     attempt: task.attempt,
                     summary: task.error.clone(),
-                    dependencies: Vec::new(),
-                    bucket: WorkflowBucket::from_status(task.status, false),
+                    parent_id: task.parent_id,
+                    created_at: Some(task.created_at),
                     blocked: false,
                     retry_pending: false,
                 })
@@ -746,6 +855,24 @@ mod tests {
         (root, root_task, child)
     }
 
+    fn inspect_with(
+        root: Uuid,
+        root_name: String,
+        views: Vec<favetto_wire::workflow::WorkflowTaskView>,
+        blocked: Vec<Uuid>,
+    ) -> WorkflowInspect {
+        WorkflowInspect {
+            root_id: root,
+            root_task: root_name,
+            state: WorkflowState::Running,
+            tasks: views,
+            ready: vec![],
+            running: vec![],
+            failed: vec![],
+            blocked,
+        }
+    }
+
     #[test]
     fn roots_group_by_root_or_self_and_count_progress() {
         let (root, root_task, child) = two_step();
@@ -795,17 +922,16 @@ mod tests {
     }
 
     #[test]
-    fn inspect_places_rows_in_five_buckets_with_dependency_labels() {
+    fn inspect_derives_edges_blocked_markers_and_graph_order() {
         let (root, mut root_task, mut child) = two_step();
         root_task.status = TaskStatus::Failed;
         child.status = TaskStatus::Pending;
         child.parent_id = Some(root);
 
-        let inspect = WorkflowInspect {
-            root_id: root,
-            root_task: root_task.name.clone(),
-            state: WorkflowState::Running,
-            tasks: vec![
+        let inspect = inspect_with(
+            root,
+            root_task.name.clone(),
+            vec![
                 view(
                     root_task.id,
                     &root_task.name,
@@ -815,108 +941,201 @@ mod tests {
                 ),
                 view(child.id, &child.name, TaskStatus::Pending, 1, None),
             ],
-            ready: vec![],
-            running: vec![],
-            failed: vec![root_task.id],
-            blocked: vec![child.id],
-        };
+            vec![child.id],
+        );
 
-        let detail = WorkflowDetail::from_inspect(&inspect, &[root_task.clone(), child], None);
+        let detail =
+            WorkflowDetail::from_inspect(&inspect, &[root_task.clone(), child.clone()], None);
         assert_eq!(detail.root_id, root);
         assert_eq!(detail.root_name, "build");
         assert_eq!(detail.total(), 2);
         assert_eq!(detail.done(), 0);
         assert_eq!(detail.cancellable(), 1);
-        assert_eq!(detail.bucket_count(WorkflowBucket::Failed), 1);
-        assert_eq!(detail.bucket_count(WorkflowBucket::Blocked), 1);
+        assert_eq!(detail.selected_id(), Some(root_task.id));
 
-        let dependencies = &detail
+        let child_row = detail
             .rows
             .iter()
             .find(|row| row.id == Uuid::from_u128(2))
-            .unwrap()
-            .dependencies;
-        assert_eq!(dependencies, &vec!["build".to_string()]);
-        assert_eq!(detail.selected_id(), Some(root_task.id));
+            .unwrap();
+        assert_eq!(child_row.parent_id, Some(root));
+        assert!(child_row.is_blocked());
+        assert!(!child_row.is_active());
+
+        let layout = detail.layout();
+        assert_eq!(layout.nodes.len(), 2);
+        assert_eq!(layout.node(root).unwrap().column, 0);
+        assert_eq!(layout.node(child.id).unwrap().column, 1);
+        assert_eq!(layout.edges.len(), 1);
+        assert_eq!(layout.edges[0].parent, root);
+        assert_eq!(layout.edges[0].child, child.id);
+        assert!(layout.width > NODE_WIDTH);
+        assert!(layout.height > NODE_HEIGHT);
+
+        let ordered: Vec<Uuid> = detail.ordered_rows().iter().map(|row| row.id).collect();
+        assert_eq!(ordered, vec![root, child.id]);
     }
 
     #[test]
-    fn sections_always_render_all_five_buckets_in_order() {
-        let (root, root_task, child) = two_step();
-        let inspect = WorkflowInspect {
-            root_id: root,
-            root_task: root_task.name.clone(),
-            state: WorkflowState::Running,
-            tasks: vec![
-                view(
-                    root_task.id,
-                    &root_task.name,
-                    TaskStatus::Succeeded,
-                    1,
-                    None,
-                ),
-                view(child.id, &child.name, TaskStatus::Pending, 1, None),
+    fn layout_is_deterministic_and_orders_siblings_by_creation_time() {
+        let root = Uuid::from_u128(1);
+        let mut root_task = task(1, "root", TaskStatus::Running, None);
+        root_task.created_at = at(0);
+        let mut later = task(2, "later", TaskStatus::Pending, Some(root));
+        later.parent_id = Some(root);
+        later.created_at = at(20);
+        let mut earlier = task(3, "earlier", TaskStatus::Pending, Some(root));
+        earlier.parent_id = Some(root);
+        earlier.created_at = at(10);
+
+        let inspect = inspect_with(
+            root,
+            root_task.name.clone(),
+            vec![
+                view(root, "root", TaskStatus::Running, 1, None),
+                view(later.id, "later", TaskStatus::Pending, 1, None),
+                view(earlier.id, "earlier", TaskStatus::Pending, 1, None),
             ],
-            ready: vec![child.id],
-            running: vec![],
-            failed: vec![],
-            blocked: vec![],
-        };
-        let detail = WorkflowDetail::from_inspect(&inspect, &[root_task, child], None);
-        let sections = detail.sections();
-        assert_eq!(
-            sections.iter().map(|s| s.bucket).collect::<Vec<_>>(),
-            WorkflowBucket::ALL.to_vec()
+            vec![],
         );
-        assert_eq!(sections[0].rows.len(), 1);
-        assert_eq!(sections[4].rows.len(), 1);
-        assert_eq!(detail.done(), 1);
-        assert_eq!(detail.progress(), 0.5);
+        let detail = WorkflowDetail::from_inspect(
+            &inspect,
+            &[root_task, later.clone(), earlier.clone()],
+            None,
+        );
+
+        let first = detail.layout();
+        let second = detail.layout();
+        assert_eq!(first, second);
+        let column_one: Vec<Uuid> = first
+            .nodes
+            .iter()
+            .filter(|node| node.column == 1)
+            .map(|node| node.id)
+            .collect();
+        assert_eq!(column_one, vec![earlier.id, later.id]);
+        assert_eq!(first.node(earlier.id).unwrap().row, 0);
+        assert_eq!(first.node(later.id).unwrap().row, 1);
+
+        // Moving the selection walks the drawn order, not the inspect order.
+        let mut detail = detail;
+        detail.move_selection(1);
+        assert_eq!(detail.selected_id(), Some(earlier.id));
+    }
+
+    #[test]
+    fn layout_treats_missing_and_self_parents_as_graph_roots() {
+        let root = Uuid::from_u128(1);
+        let mut self_parent = task(2, "loop", TaskStatus::Pending, Some(root));
+        self_parent.parent_id = Some(self_parent.id);
+        let mut orphan = task(3, "orphan", TaskStatus::Pending, Some(root));
+        orphan.parent_id = Some(Uuid::from_u128(99));
+        let root_task = task(1, "root", TaskStatus::Running, None);
+
+        let inspect = inspect_with(
+            root,
+            root_task.name.clone(),
+            vec![
+                view(root, "root", TaskStatus::Running, 1, None),
+                view(self_parent.id, "loop", TaskStatus::Pending, 1, None),
+                view(orphan.id, "orphan", TaskStatus::Pending, 1, None),
+            ],
+            vec![],
+        );
+        let detail =
+            WorkflowDetail::from_inspect(&inspect, &[root_task, self_parent, orphan], None);
+        let layout = detail.layout();
+        assert_eq!(layout.edges.len(), 0);
+        assert!(layout.nodes.iter().all(|node| node.column == 0));
+    }
+
+    #[test]
+    fn layout_breaks_an_accidental_cycle_without_hanging() {
+        let root = Uuid::from_u128(1);
+        let mut left = task(2, "left", TaskStatus::Pending, Some(root));
+        let mut right = task(3, "right", TaskStatus::Pending, Some(root));
+        left.parent_id = Some(right.id);
+        right.parent_id = Some(left.id);
+        let root_task = task(1, "root", TaskStatus::Running, None);
+
+        let inspect = inspect_with(
+            root,
+            root_task.name.clone(),
+            vec![
+                view(root, "root", TaskStatus::Running, 1, None),
+                view(left.id, "left", TaskStatus::Pending, 1, None),
+                view(right.id, "right", TaskStatus::Pending, 1, None),
+            ],
+            vec![],
+        );
+        let detail = WorkflowDetail::from_inspect(&inspect, &[root_task, left, right], None);
+        let layout = detail.layout();
+        assert_eq!(layout.nodes.len(), 3);
+        assert_eq!(layout.edges.len(), 1);
+        assert!(layout.nodes.iter().all(|node| node.column <= 1));
+    }
+
+    #[test]
+    fn layout_places_fan_out_nodes_in_distinct_rows_without_overlap() {
+        let root = Uuid::from_u128(1);
+        let root_task = task(1, "root", TaskStatus::Running, None);
+        let mut children: Vec<Task> = Vec::new();
+        let mut views = vec![view(root, "root", TaskStatus::Running, 1, None)];
+        for index in 0..3u128 {
+            let id = Uuid::from_u128(10 + index);
+            let mut child = task(10 + index, "child", TaskStatus::Pending, Some(root));
+            child.parent_id = Some(root);
+            child.created_at = at(index as i64 * 5);
+            views.push(view(id, "child", TaskStatus::Pending, 1, None));
+            children.push(child);
+        }
+        let inspect = inspect_with(root, root_task.name.clone(), views, vec![]);
+        let mut all = vec![root_task];
+        all.extend(children);
+        let detail = WorkflowDetail::from_inspect(&inspect, &all, None);
+        let layout = detail.layout();
+
+        let mut boxes: Vec<(f32, f32)> = layout.nodes.iter().map(|node| (node.x, node.y)).collect();
+        boxes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        boxes.dedup();
+        assert_eq!(boxes.len(), layout.nodes.len());
+        assert!(layout.height >= GRAPH_MARGIN * 2.0 + NODE_HEIGHT * 3.0);
     }
 
     #[test]
     fn empty_inspect_has_zero_progress_and_no_selection() {
         let root = Uuid::from_u128(3);
-        let inspect = WorkflowInspect {
-            root_id: root,
-            root_task: "empty".to_string(),
-            state: WorkflowState::Succeeded,
-            tasks: vec![],
-            ready: vec![],
-            running: vec![],
-            failed: vec![],
-            blocked: vec![],
-        };
+        let inspect = inspect_with(root, "empty".to_string(), vec![], vec![]);
         let detail = WorkflowDetail::from_inspect(&inspect, &[], None);
         assert_eq!(detail.progress(), 0.0);
         assert_eq!(detail.selected_id(), None);
         assert_eq!(detail.cancellable(), 0);
+        assert_eq!(detail.layout(), WorkflowGraphLayout::default());
     }
 
     #[test]
-    fn cancel_moves_every_non_terminal_row_to_terminal() {
+    fn cancel_moves_every_non_terminal_row_to_cancelled() {
         let (root, mut root_task, mut child) = two_step();
         root_task.status = TaskStatus::Running;
         child.status = TaskStatus::Pending;
-        let inspect = WorkflowInspect {
-            root_id: root,
-            root_task: root_task.name.clone(),
-            state: WorkflowState::Running,
-            tasks: vec![
+        let inspect = inspect_with(
+            root,
+            root_task.name.clone(),
+            vec![
                 view(root_task.id, &root_task.name, TaskStatus::Running, 1, None),
                 view(child.id, &child.name, TaskStatus::Pending, 1, None),
             ],
-            ready: vec![child.id],
-            running: vec![root_task.id],
-            failed: vec![],
-            blocked: vec![],
-        };
+            vec![],
+        );
         let mut detail = WorkflowDetail::from_inspect(&inspect, &[root_task, child], None);
         assert_eq!(detail.cancellable(), 2);
         assert_eq!(detail.begin_cancel(), 2);
         assert!(detail.pending_cancel);
         assert_eq!(detail.cancellable(), 0);
-        assert_eq!(detail.bucket_count(WorkflowBucket::Terminal), 2);
+        assert!(detail
+            .rows
+            .iter()
+            .all(|row| row.status == TaskStatus::Cancelled));
         assert_eq!(detail.state, WorkflowState::Cancelled);
         detail.finish_cancel(&[Uuid::from_u128(1), Uuid::from_u128(2)]);
         assert!(!detail.pending_cancel);
@@ -924,17 +1143,16 @@ mod tests {
     }
 
     #[test]
-    fn retry_moves_a_failed_row_to_ready_and_reflects_the_new_attempt() {
+    fn retry_moves_a_failed_row_to_pending_and_reflects_the_new_attempt() {
         let (root, mut root_task, mut child) = two_step();
         root_task.status = TaskStatus::Failed;
         root_task.attempt = 1;
         child.status = TaskStatus::Pending;
 
-        let inspect = WorkflowInspect {
-            root_id: root,
-            root_task: root_task.name.clone(),
-            state: WorkflowState::Running,
-            tasks: vec![
+        let inspect = inspect_with(
+            root,
+            root_task.name.clone(),
+            vec![
                 view(
                     root_task.id,
                     &root_task.name,
@@ -944,15 +1162,13 @@ mod tests {
                 ),
                 view(child.id, &child.name, TaskStatus::Pending, 1, None),
             ],
-            ready: vec![child.id],
-            running: vec![],
-            failed: vec![root_task.id],
-            blocked: vec![],
-        };
+            vec![],
+        );
         let mut detail = WorkflowDetail::from_inspect(&inspect, &[root_task.clone(), child], None);
         detail.begin_retry(root_task.id).expect("retryable row");
-        assert_eq!(detail.selected_id(), Some(Uuid::from_u128(2)));
-        assert_eq!(detail.bucket_count(WorkflowBucket::Ready), 2);
+        // The selection is stable by id even though the failed row is now
+        // pending and the graph may have re-ordered.
+        assert_eq!(detail.selected_id(), Some(root_task.id));
         assert!(
             detail
                 .rows
@@ -975,7 +1191,6 @@ mod tests {
         assert_eq!(row.status, TaskStatus::Running);
         assert_eq!(row.attempt, 2);
         assert!(!row.retry_pending);
-        assert_eq!(row.bucket, WorkflowBucket::Running);
 
         // A rejected retry restores the exact prior row.
         let mut detail =
@@ -988,17 +1203,16 @@ mod tests {
             .find(|row| row.id == root_task.id)
             .unwrap();
         assert_eq!(row.status, TaskStatus::Failed);
-        assert_eq!(row.bucket, WorkflowBucket::Failed);
+        assert_eq!(row.status_kind(), StatusKind::Failed);
     }
 
     #[test]
     fn apply_task_moves_the_row_and_keeps_the_selection() {
         let (root, root_task, child) = two_step();
-        let inspect = WorkflowInspect {
-            root_id: root,
-            root_task: root_task.name.clone(),
-            state: WorkflowState::Running,
-            tasks: vec![
+        let inspect = inspect_with(
+            root,
+            root_task.name.clone(),
+            vec![
                 view(
                     root_task.id,
                     &root_task.name,
@@ -1008,16 +1222,14 @@ mod tests {
                 ),
                 view(child.id, &child.name, TaskStatus::Pending, 1, None),
             ],
-            ready: vec![child.id],
-            running: vec![],
-            failed: vec![],
-            blocked: vec![],
-        };
+            vec![],
+        );
         let mut detail =
             WorkflowDetail::from_inspect(&inspect, &[root_task, child], Some(Uuid::from_u128(2)));
         assert_eq!(detail.selected_id(), Some(Uuid::from_u128(2)));
         let mut running_child = task(2, "repo:demo/test", TaskStatus::Running, Some(root));
         running_child.attempt = 3;
+        running_child.parent_id = Some(root);
         assert!(detail.apply_task(&running_child));
         assert_eq!(detail.selected_id(), Some(Uuid::from_u128(2)));
         let row = detail
@@ -1026,7 +1238,8 @@ mod tests {
             .find(|row| row.id == running_child.id)
             .unwrap();
         assert_eq!(row.attempt, 3);
-        assert_eq!(row.bucket, WorkflowBucket::Running);
+        assert!(row.is_active());
+        assert_eq!(detail.layout().parent_of(row.id), Some(root));
     }
 
     #[test]

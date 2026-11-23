@@ -109,13 +109,14 @@ These are framework or current-scope limits, not regressions from this pass:
   errors are copyable through explicit buttons; typed text is append/backspace
   only (`src/views/detail.rs`, `src/views/catalog.rs`, `src/views/settings.rs`).
 - **No embedded Graphviz.** `workflow.get` is readable DOT source with copy and
-  a legend (`src/views/workflows.rs`, `src/workflow.rs`).
+  a legend; the runtime graph is drawn by the client's own layout
+  (`src/views/workflows.rs`, `src/workflow.rs`).
 - **No daemon version.** `system.ping` does not report one; Settings says so
   (`src/views/settings.rs`).
 - **No container queries.** The responsive breakpoint reads the window width
   (`src/layout.rs`, `src/theme.rs`).
-- **Workflows roots/buckets are not virtualized.** Tasks and the detail Output
-  feed are; this is unchanged from step 10 (`gpui/README.md`).
+- **Workflows roots are not virtualized.** Tasks and the detail Output feed are;
+  the runtime graph paints one node per inspected instance (`gpui/README.md`).
 - **No live permission-banner pass in this smoke run.** The live daemon had no
   `awaiting_input` run at the time (Failed 99, Awaiting input 0). The banner and
   exact `request_id` correlation remain covered by the `detail` model tests and

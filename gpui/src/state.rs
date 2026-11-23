@@ -1639,6 +1639,7 @@ impl ClientState {
             self.workflow_inspect = None;
             self.workflow_loading = false;
             self.workflow_dirty = false;
+            self.detail_open = false;
             return;
         }
         let selected = self
@@ -1646,6 +1647,11 @@ impl ClientState {
             .filter(|id| roots.iter().any(|root| root.root_id == *id))
             .unwrap_or_else(|| roots[0].root_id);
         let changed = self.workflow_root != Some(selected);
+        if changed {
+            // A vanished root falls back to the newest one; the node detail
+            // belonged to the old root.
+            self.detail_open = false;
+        }
         self.workflow_root = Some(selected);
         let detail_matches = self
             .workflow_detail
@@ -1698,6 +1704,9 @@ impl ClientState {
 
     /// Select a root in the Workflows list (a row click).
     pub fn select_workflow_root(&mut self, root_id: uuid::Uuid) {
+        // A node detail belongs to one root; switching roots must not leave the
+        // previous root's task under the new graph.
+        self.detail_open = false;
         if self.workflow_root == Some(root_id)
             && self
                 .workflow_detail
@@ -1737,6 +1746,7 @@ impl ClientState {
                 .as_ref()
                 .is_none_or(|detail| detail.root_id != root_id)
         {
+            self.detail_open = false;
             self.workflow_root = Some(root_id);
             self.load_workflow_inspect(root_id);
         }
@@ -1763,6 +1773,10 @@ impl ClientState {
 
     /// The "View workflow" action on a task: use `root_or_self` exactly like
     /// the TUI, so a directly started run inspects its own single-node root.
+    ///
+    /// On the Workflows surface the graph is already mounted, so this selects
+    /// the root in place and closes any node detail instead of reloading the
+    /// route (the embedded detail's own action must not navigate away from it).
     pub fn open_workflow_for_task(&mut self, task_id: uuid::Uuid, cx: &mut Context<Self>) {
         let root_id = self
             .tasks
@@ -1771,6 +1785,9 @@ impl ClientState {
             .map(Task::root_or_self)
             .or_else(|| self.selected_task().map(Task::root_or_self));
         match root_id {
+            Some(root_id) if self.active_route == Route::Workflows => {
+                self.select_workflow_root(root_id);
+            }
             Some(root_id) => self.open_workflow_root(root_id),
             None => self.show_toast(
                 ToastKind::Info,
@@ -1824,11 +1841,34 @@ impl ClientState {
         }
     }
 
-    /// Highlight one workflow instance (a row click).
+    /// Highlight one workflow instance (a graph node click without opening it).
     pub fn select_workflow_instance(&mut self, task_id: uuid::Uuid) {
         if let Some(detail) = self.workflow_detail.as_mut() {
             detail.select(task_id);
         }
+    }
+
+    /// Open one instance's task detail in place on the Workflows surface.
+    ///
+    /// The graph stays mounted: wide windows gain the detail column, narrow
+    /// windows push the detail page and Esc/Back returns to the graph. Progress
+    /// and live events keep folding because this is the same `DetailView` used
+    /// by Inbox and Tasks.
+    pub fn open_workflow_instance(&mut self, task_id: uuid::Uuid) {
+        let Some(detail) = self.workflow_detail.as_mut() else {
+            return;
+        };
+        if !detail.select(task_id) {
+            return;
+        }
+        self.open_task(task_id);
+    }
+
+    /// Enter on the Workflows graph: reveal the selected node's detail in place.
+    pub fn open_workflow_selected_in_place(&mut self) -> Option<uuid::Uuid> {
+        let task_id = self.workflow_detail.as_ref()?.selected_id()?;
+        self.open_workflow_instance(task_id);
+        Some(task_id)
     }
 
     /// Open the highlighted workflow instance in the task detail.

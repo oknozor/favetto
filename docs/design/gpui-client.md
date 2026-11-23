@@ -36,9 +36,10 @@ the desktop app without relearning the product.
   most (what needs me, what ran) are first; configuration is last.
 - **Three regions** — navigation, working list, detail — use the **Law of
   Common Region** and **Law of Proximity** to keep related controls inside one
-  visual boundary. The detail column belongs to the run lists (Inbox and Tasks);
-  Catalog, Workflows, Schedules and Settings use the full width. On narrow
-  windows the detail becomes a pushed page instead of a third column (GPUI
+  visual boundary. The detail column always belongs to the run lists (Inbox and
+  Tasks); Workflows gains it only while a graph node's detail is open, and
+  Catalog, Schedules and Settings use the full width. On narrow windows the
+  detail becomes a pushed page instead of a third column (GPUI
   `container_query`); on wide windows the detail/list boundary is a resizable
   divider, and the Catalog's source pane has the same left-edge divider. Both
   are session-scoped and clamped to keep the list usable.
@@ -155,7 +156,7 @@ same checkout) and `permission = "allow"` (unattended edits). Firing
 | `05-tasks` | List, search, filters, cancel/retry | optimistic actions reconcile on error |
 | `06-task-detail` | Header, tabs, event feed, permission replies | a blocked run can be answered without leaving the app |
 | `07-catalog` | Browse/search/preview, vars form, launch | launching a catalog task succeeds end to end |
-| `08-workflows` | List + inspect, progress, bulk actions | root cancel and node retry work |
+| `08-workflows` | Roots + runtime DAG, progress, node detail, bulk actions | root cancel, node retry and in-place node detail work |
 | `09-schedules-settings` | Schedules CRUD + settings | connection test + agent list work |
 | `10-polish` | A11y, empty/error/loading, reduced motion, performance | keyboard-only pass; no known UX gaps |
 | `11-verify` | Full checks, live smoke run, verification note | `cargo fmt/clippy/test` clean; documented results |

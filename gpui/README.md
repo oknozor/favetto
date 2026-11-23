@@ -161,22 +161,30 @@ The Workflows surface is reached with `g w` or from a run's **View workflow**
 button. It groups the current `tasks.list` snapshot by `root_or_self` and shows
 each root's `done / total` and a progress bar (counted from the instances the
 daemon returns, never estimated). Selecting a root loads `workflow.inspect` and
-renders its five buckets — **Ready**, **Running**, **Failed**, **Blocked** and
-**Terminal** — with status, attempt and the predecessor each instance waited
-for. A directly started run is its own root and carries a short explanation;
-when the snapshot has no roots at all the surface explains where roots come
-from instead of showing a blank panel.
+draws its task instances as a left-to-right DAG: every node carries its display
+name, status icon + label, `attempt n`/failure summary where applicable, a
+`root` chip for the root instance and a dashed `blocked` outline for a pending
+instance waiting on a `needs` predecessor. Edges follow each instance's
+`parent_id`; parentless and unknown-parent instances are graph roots. A directly
+started run is its own root and carries a short explanation; when the snapshot
+has no roots at all the surface explains where roots come from instead of
+showing a blank panel.
 
-`↑`/`↓` move the instance highlight, `↵` opens the instance in the task detail,
-`c` opens the root-cancel confirmation (it names the number of non-terminal
-instances) and `r` retries the highlighted failed instance. `[`/`]` move the
-root highlight without a mouse. The same actions are available as buttons;
-**Refresh** (or the palette's Refresh data) reloads the inspect and the DAG
-source. Cancel marks every non-terminal row immediately and
-retry moves its row to Ready, then both reconcile with the RPC response and the
-next `task.updated` push. `workflow.get` is shown as readable DOT in a monospace
-panel with a one-line edge legend and **Copy DOT** (no Graphviz binary is
-embedded).
+`↑`/`↓` move the node highlight in graph order (the selected node scrolls into
+view), `↵` reveals the task detail **in place** (wide windows add the detail
+column, narrow windows push it; `Esc` returns to the graph), `⇧↵` still opens the
+node in the Tasks route, `c` opens the root-cancel confirmation (it names the
+number of non-terminal instances) and `r` retries the highlighted failed
+instance. `[`/`]` move the root highlight without a mouse and close any open
+node detail. The same actions are available as buttons. Running and awaiting
+nodes get a small repeating status pulse; `FAVETTO_REDUCE_MOTION=1` (or the GTK
+setting) renders the same static icon and label, and no frames are requested
+when nothing is active. **Refresh** (or the palette's Refresh data) reloads the
+inspect and the DAG source. Cancel marks every non-terminal row immediately and
+retry moves its row back to pending, then both reconcile with the RPC response
+and the next `task.updated` push. `workflow.get` remains available as readable
+DOT in a collapsed-by-default monospace panel with a one-line edge legend and
+**Copy DOT** (no Graphviz binary is embedded).
 
 The Schedules surface (`g s`) lists `schedules.list` as a table of enabled
 state, cron expression, task and the daemon-computed next run (absolute UTC plus
@@ -270,9 +278,10 @@ field blank keeps the shared token file.
   relevance ordering, selection resolution, and the terminal/cancellable
   helpers behind `c`/`r`. Unit-tested without a window.
 - `src/workflow.rs` — the pure Workflows model: roots grouped by
-  `root_or_self`, the five runtime buckets, dependency labels joined from the
-  cached task rows, `done / total` progress, optimistic cancel/retry state and
-  the `workflow.get` source model. Unit-tested without a window.
+  `root_or_self`, parent edges joined from the cached task rows, the
+  deterministic cycle-safe left-to-right layout, graph-ordered selection,
+  `done / total` progress, optimistic cancel/retry state and the `workflow.get`
+  source model. Unit-tested without a window.
 - `src/schedules.rs` — the pure Schedules model: cron normalization/validation
   with the daemon's parser configuration, plain-language cadence and next-fire
   hints, the sorted table, the create/edit sheet and the delete confirmation.
@@ -480,24 +489,32 @@ Deviations from the plan are recorded in this file as the chain progresses
   the Workflows list groups the same `tasks.list` rows the Inbox and Tasks use
   by `root_or_self`, newest root first. A root whose root task fell outside the
   500-row window keeps working and is named after its first visible instance.
-- **Five buckets, one terminal section.** `workflow.inspect` returns `ready`,
-  `running`, `failed` and `blocked`; the terminal section is the remaining
-  succeeded/cancelled instances, in inspect order. Empty buckets still render
-  their explanation and a `0`, so counts and rows cannot disagree.
+- **The runtime graph replaces the bucket list.** One node per
+  `workflow.inspect` instance is placed by longest distance from a graph root,
+  then by creation time (`created_at`, then id) so a status push never
+  reshuffles the picture. Edges come from `parent_id`; a missing, self-referential
+  or cyclic parent is dropped and the node becomes a root, so layout is a forest
+  and can never hang. Nodes show their live status as icon + label (never
+  color-only), the root chip and a dashed `blocked` marker for a pending
+  instance waiting on a `needs` predecessor. The graph scrolls both axes and
+  keeps the selected node visible.
+- **The graph shows the run, not the future pipeline.** A `needs` successor does
+  not exist in `workflow.inspect` until its predecessor finishes and the daemon
+  creates it (`start_dependents`), so future catalog nodes are deliberately
+  absent.
 - **Done means succeeded.** `done / total` and the progress bar count only
   `succeeded` instances. A failed or cancelled root therefore never shows a
   full bar even though every row is terminal; totals are never estimated.
-- **Dependencies join through `tasks.list`.** `workflow.inspect` omits
-  `parent_id`, so each row's predecessor label is joined from the cached task
-  rows. A fresh snapshot re-joins the open root locally instead of issuing
-  another inspect RPC.
+- **Edges join through `tasks.list`.** `workflow.inspect` omits `parent_id`, so
+  the parent edge is joined from the cached task rows. A fresh snapshot re-joins
+  the open root locally instead of issuing another inspect RPC.
 - **DAG source, not Graphviz.** `workflow.get` is a catalog-wide DOT string, so
-  it is rendered as readable monospace source beside the runtime view with a
-  short spawn/needs/join legend, **Copy DOT** (no text selection in this GPUI
-  build) and a collapse toggle. No Graphviz binary or DOT parser is embedded.
-- **Only failed instances retry from Workflows.** `r` and the row button call
-  `workflow.retry` for a `failed` row; succeeded/cancelled rows stay retryable
-  from the Tasks surface, which already has the broader terminal rule.
+  it stays available as readable monospace source in a collapsed-by-default
+  panel with a short spawn/needs/join legend, **Copy DOT** (no text selection in
+  this GPUI build) and a toggle. No Graphviz binary or DOT parser is embedded.
+- **Only failed instances retry from Workflows.** `r` and the detail panel's
+  Retry call `workflow.retry` for a `failed` row; succeeded/cancelled rows stay
+  retryable from the Tasks surface, which already has the broader terminal rule.
 - **Cancel is root-scoped and counted.** `c` (or **Cancel root**) opens a
   confirmation naming the exact non-terminal count. The optimistic write marks
   every non-terminal row terminal; a rejected RPC restores the previous detail,
@@ -505,16 +522,21 @@ Deviations from the plan are recorded in this file as the chain progresses
 - **Live refresh is coalesced.** A `task.updated` for a task in the open root
   folds the row immediately, then marks the view dirty so overlapping pushes
   collapse into one follow-up `workflow.inspect`. The highlight follows the
-  instance id and survives bucket moves.
+  task id and survives status changes and any graph re-order.
+- **Node detail opens in place.** Clicking a node or `↵` opens the shared
+  `DetailView` on the Workflows route: wide windows gain the detail column only
+  while a detail is open, narrow windows push the page. Output, events,
+  permission/elicitation prompts and Retry are the same components as Inbox and
+  Tasks; `Esc` closes the panel, switching roots closes it, and `⇧↵` remains the
+  explicit jump to the Tasks route.
 - **Direct starts explain themselves.** A run whose snapshot row has no
   `root_id` is its own root (`root_or_self`); the surface keeps its single
   instance visible and adds a banner explaining that spawned children appear
   there. A snapshot with no roots shows the route's empty state, never a blank
   panel.
-- **No embedded root graph renderer.** The runtime inspect is a structured row
-  view rather than a drawn DAG; the required catalog DAG is the DOT source
-  panel. A layout engine can be added behind the same `WorkflowGraph` model
-  later without changing the RPCs.
+- **No embedded root graph renderer for the catalog.** The runtime instances are
+  a drawn DAG; `workflow.get` (the catalog definition graph) remains DOT source
+  in a collapsed panel. No Graphviz binary or DOT parser is embedded.
 
 ### Step 09 deviations / additions
 
@@ -639,8 +661,9 @@ Run on the local daemon with the pointer used only to give the window focus:
    `escalate` choice; `Esc` closed the sheet without sending anything. `h`
    collapsed the highlighted folder and the selection moved to the next visible
    definition.
-3. `g w` → Workflows; `]` changed the root (progress, buckets and DOT panel
-   updated); `↑`/`↓` changed the instance; `c` opened the root-cancel
+3. `g w` → Workflows; `]` changed the root (progress and graph updated);
+   `↑`/`↓` moved the node highlight and kept it in view; `↵` opened the node
+   detail in place and `Esc` returned to the graph; `c` opened the root-cancel
    confirmation and `Esc` backed out.
 4. `g s` → Schedules; `n` opened the sheet; `Tab` moved focus to the task
    picker; `↓` moved the selection through the catalog; `⌘E` toggles enabled;
@@ -670,7 +693,7 @@ path remains covered by the step-05 live RPC check and its unit tests.
 | 7 | What happens at the peak and the end, especially after error? | The outcome block existed, but a failure could end in a bare string. | Every failure now ends with Copy error + Retry; the transport keeps the older feed. |
 | 8 | What input might be rejected unnecessarily? | Endpoint forms and typed values were liberal; choice-only vars required typing an exact string. | `←`/`→` cycles declared choices; the schedule task picker uses `↑`/`↓`. |
 | 9 | Which 20% carries 80% of the value? | Inbox → Tasks → detail is the core loop; large snapshots were re-rendered. | Virtualized the task and event lists and cached the derivations. |
-| 10 | Are we reducing complexity or moving it to the user? | SSE reconnect, resume cursors and rollback are absorbed by the client; Workflows exposes the raw complexity only as counts and buckets. | Kept that model; added copyable diagnostics rather than more controls. |
+| 10 | Are we reducing complexity or moving it to the user? | SSE reconnect, resume cursors and rollback are absorbed by the client; Workflows exposes the raw complexity only as a laid-out graph, counts and progress. | Kept that model; added copyable diagnostics rather than more controls. |
 
 #### Known limitations
 
@@ -688,10 +711,12 @@ path remains covered by the step-05 live RPC check and its unit tests.
 - **No embedded Graphviz.** `workflow.get` is readable DOT source.
 - **No daemon version.** `system.ping` does not report one; Settings says so.
 - **No container queries.** The responsive breakpoint reads the window width.
-- **The Workflows root and bucket lists are not virtualized.** They are derived
+- **The Workflows graph and root list are not virtualized.** They are derived
   from the same 500-row snapshot; the first 500 roots are still painted. The
-  Tasks table and the detail Output feed, which are the long scroll surfaces,
-  are virtualized.
-- **The toast fade is the only animation.** If a future surface adds motion, it
-  must call `motion::prefers_reduced_motion()` and preserve the final-state
-  information.
+  graph itself paints one card per instance (roots are tens, not thousands).
+  The Tasks table and the detail Output feed, which are the long scroll
+  surfaces, are virtualized.
+- **The toast fade and the live-node pulse are the only animations.** Both call
+  `motion::prefers_reduced_motion()` and preserve the final-state information;
+  the pulse is attached only to running/awaiting nodes and only animates the
+  small status dot, never the node card or its layout.
