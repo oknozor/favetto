@@ -27,8 +27,8 @@ use crate::actions::{
     ScheduleFieldNext, ScheduleFieldPrev, ScheduleNew, ScheduleSubmit, ScheduleToggleEnabled,
     SettingsActivate, SettingsFieldNext, SettingsFieldPrev, SettingsSave, SettingsTest, TaskCancel,
     TaskConfirmAccept, TaskConfirmReject, TaskFilterNext, TaskFilterPrev, TaskRetry, TaskSearch,
-    TogglePalette, ToggleShortcuts, WorkflowCancelRoot, WorkflowRetryInstance, WorkflowRootNext,
-    WorkflowRootPrev,
+    TogglePalette, ToggleShortcuts, WorkflowCancelRoot, WorkflowOpenInTasks, WorkflowRetryInstance,
+    WorkflowRootNext, WorkflowRootPrev,
 };
 use crate::catalog::OneShotFocus;
 use crate::components;
@@ -418,7 +418,7 @@ impl RootView {
                 cx.notify();
             }),
             Route::Workflows => self.state.update(cx, |state, cx| {
-                state.open_workflow_selected();
+                state.open_workflow_selected_in_place();
                 cx.notify();
             }),
             Route::Schedules => self.state.update(cx, |state, cx| {
@@ -2166,18 +2166,21 @@ impl Render for RootView {
                 .min_h_0()
                 .child(sidebar)
                 .child(div().flex_1().min_w_0().child(content))
-                .when(route.shows_detail(), |body| {
-                    body.child(
-                        div()
-                            .relative()
-                            .w(px(detail_width))
-                            .flex_shrink_0()
-                            .border_l_1()
-                            .border_color(theme.colors.border)
-                            .child(detail)
-                            .child(self.detail_resize_handle(cx)),
-                    )
-                }),
+                .when(
+                    route.shows_detail() && (route.always_reserves_detail_column() || detail_open),
+                    |body| {
+                        body.child(
+                            div()
+                                .relative()
+                                .w(px(detail_width))
+                                .flex_shrink_0()
+                                .border_l_1()
+                                .border_color(theme.colors.border)
+                                .child(detail)
+                                .child(self.detail_resize_handle(cx)),
+                        )
+                    },
+                ),
         };
 
         let (
@@ -2431,6 +2434,12 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &WorkflowRetryInstance, _window, cx| {
                 this.state.update(cx, |state, cx| {
                     state.retry_workflow_selected(cx);
+                    cx.notify();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &WorkflowOpenInTasks, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.open_workflow_selected();
                     cx.notify();
                 });
             }))

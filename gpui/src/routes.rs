@@ -90,12 +90,19 @@ impl Route {
         }
     }
 
-    /// Whether the wide layout reserves the run-detail column for this surface.
+    /// Whether this surface can show a run-detail page.
     ///
-    /// Only Inbox and Tasks list runs, so only they have something for the
-    /// detail column to show. Catalog, Workflows, Schedules and Settings own
-    /// their full body and would leave the column as dead space.
+    /// Inbox and Tasks always have a run list behind the detail column.
+    /// Workflows shows the same `DetailView` in place when a graph node is
+    /// opened, but its column is only reserved while a detail is open.
     pub fn shows_detail(self) -> bool {
+        matches!(self, Route::Inbox | Route::Tasks | Route::Workflows)
+    }
+
+    /// Whether the wide layout always reserves the detail column, even with
+    /// nothing open. Inbox and Tasks paint their empty detail state; Workflows
+    /// must give the graph the full width until a node is opened.
+    pub fn always_reserves_detail_column(self) -> bool {
         matches!(self, Route::Inbox | Route::Tasks)
     }
 
@@ -219,17 +226,17 @@ mod tests {
     fn only_the_run_lists_reserve_the_detail_column() {
         assert!(Route::Inbox.shows_detail());
         assert!(Route::Tasks.shows_detail());
-        for route in [
-            Route::Catalog,
-            Route::Workflows,
-            Route::Schedules,
-            Route::Settings,
-        ] {
+        assert!(Route::Workflows.shows_detail());
+        assert!(Route::Inbox.always_reserves_detail_column());
+        assert!(Route::Tasks.always_reserves_detail_column());
+        assert!(!Route::Workflows.always_reserves_detail_column());
+        for route in [Route::Catalog, Route::Schedules, Route::Settings] {
             assert!(
                 !route.shows_detail(),
                 "{} has no run detail to show",
                 route.label()
             );
+            assert!(!route.always_reserves_detail_column());
         }
     }
 }

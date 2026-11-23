@@ -101,6 +101,8 @@ actions!(
         WorkflowCancelRoot,
         /// Retry the highlighted failed workflow instance (`r`).
         WorkflowRetryInstance,
+        /// Open the highlighted graph node in the Tasks route (`secondary-↵`).
+        WorkflowOpenInTasks,
         /// Move the root highlight up ([).
         WorkflowRootPrev,
         /// Move the root highlight down (]).
@@ -356,6 +358,13 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new(
             "r",
             WorkflowRetryInstance,
+            Some("Workflows && !Palette && !Shortcuts && !Confirm"),
+        ),
+        // Enter opens the node detail in place; this chord keeps the explicit
+        // jump to the Tasks route for the highlighted node.
+        KeyBinding::new(
+            "secondary-enter",
+            WorkflowOpenInTasks,
             Some("Workflows && !Palette && !Shortcuts && !Confirm"),
         ),
         KeyBinding::new(
@@ -643,6 +652,7 @@ mod tests {
         for (action, key) in [
             ("WorkflowCancelRoot", "c"),
             ("WorkflowRetryInstance", "r"),
+            ("WorkflowOpenInTasks", "enter"),
             ("WorkflowRootPrev", "["),
             ("WorkflowRootNext", "]"),
         ] {
