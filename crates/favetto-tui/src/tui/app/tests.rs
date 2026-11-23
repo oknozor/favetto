@@ -48,6 +48,7 @@ fn task(name: &str) -> Task {
         agent: None,
         provider: None,
         model: None,
+        latest_usage: None,
     }
 }
 
@@ -952,6 +953,30 @@ fn task_live_state_survives_session_removal() {
 }
 
 #[test]
+fn finished_task_usage_comes_from_the_task_row() {
+    let mut app = App::new();
+    let mut done = task("done");
+    done.status = TaskStatus::Succeeded;
+    done.latest_usage = Some(AgentUsage {
+        input_tokens: 120,
+        output_tokens: 30,
+        cost_usd: Some(0.5),
+        ..Default::default()
+    });
+    let id = done.id;
+    app.tasks = vec![done];
+
+    // No live session and no retained push state: the hydrated run row is the
+    // source, so a task that finished before this client connected still shows
+    // its usage.
+    let (activity, usage) = app.task_activity_usage(&id.to_string());
+    assert_eq!(activity, None);
+    let usage = usage.expect("usage from the task row");
+    assert_eq!(usage.input_tokens, 120);
+    assert_eq!(cost_cell(Some(usage)), "$0.5000");
+}
+
+#[test]
 fn agent_state_push_updates_retained_task_state() {
     let mut app = App::new();
     let mut session = agent_session("s1", false, true, false);
@@ -1326,6 +1351,22 @@ fn activity_token_and_cost_cells_render_compactly() {
     };
     assert_eq!(cost_cell(Some(&credits)), "2.5000 credits");
     assert_eq!(credits.cost_usd, None);
+
+    // Context-only usage renders as context, never as `0/0 tok`.
+    let context_only = AgentUsage {
+        context_used: Some(53_000),
+        context_size: Some(200_000),
+        ..Default::default()
+    };
+    assert_eq!(token_cell(Some(&context_only)), "ctx 53k/200k");
+    assert_eq!(cost_cell(Some(&context_only)), "—");
+
+    // Unknown cost stays distinct from a reported zero.
+    let zero_cost = AgentUsage {
+        cost: Some(favetto_core::model::AgentCost::usd(0.0)),
+        ..Default::default()
+    };
+    assert_eq!(cost_cell(Some(&zero_cost)), "$0.0000");
 }
 
 fn event(id: i64, kind: EventKind, payload: serde_json::Value) -> Event {

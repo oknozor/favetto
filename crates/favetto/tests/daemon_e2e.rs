@@ -19,6 +19,8 @@ use std::time::Duration;
 use favetto_core::rpc::{method, push, Frame, Notification, Request, Response};
 use favetto_core::wire::FrameCodec;
 use futures_util::{SinkExt, StreamExt};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::Row;
 use tokio::net::UnixStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_util::codec::Framed;
@@ -450,6 +452,92 @@ async fn acp_session_close_times_out_without_blocking_teardown() {
         "an advertised close should still be attempted before timing out\n--- daemon log ---\n{}",
         daemon.log()
     );
+    wait_for_agent_exit(&daemon).await;
+}
+
+#[tokio::test]
+async fn acp_prompt_usage_and_final_context_update_are_persisted() {
+    let daemon = DaemonHarness::spawn_with(|root| {
+        let mut env = marker_env(root);
+        env.push((
+            "FAKE_ACP_PROMPT_USAGE".to_string(),
+            r#"{"totalTokens":155,"inputTokens":120,"outputTokens":30,"thoughtTokens":5,"cachedReadTokens":4,"cachedWriteTokens":2}"#.to_string(),
+        ));
+        // Sent immediately before the prompt response: the exit path must drain
+        // it, and its context/cost must not erase the response's token totals.
+        env.push((
+            "FAKE_ACP_USAGE_UPDATE".to_string(),
+            r#"{"used":53000,"size":200000,"cost":{"amount":0.0123,"currency":"USD"}}"#.to_string(),
+        ));
+        env
+    });
+    let task = run_echo_task(&daemon).await;
+    assert_eq!(task["status"], "succeeded");
+    let usage = &task["latest_usage"];
+    assert_eq!(usage["input_tokens"], serde_json::json!(120));
+    assert_eq!(usage["output_tokens"], serde_json::json!(30));
+    assert_eq!(usage["reasoning_tokens"], serde_json::json!(5));
+    assert_eq!(usage["cache_read_tokens"], serde_json::json!(4));
+    assert_eq!(usage["cache_write_tokens"], serde_json::json!(2));
+    assert_eq!(usage["context_used"], serde_json::json!(53_000));
+    assert_eq!(usage["context_size"], serde_json::json!(200_000));
+    assert_eq!(usage["cost_usd"], serde_json::json!(0.0123));
+
+    wait_for_agent_exit(&daemon).await;
+}
+
+#[tokio::test]
+async fn acp_context_only_usage_does_not_persist_zero_token_columns() {
+    let daemon = DaemonHarness::spawn_with(|root| {
+        let mut env = marker_env(root);
+        env.push((
+            "FAKE_ACP_USAGE_UPDATE".to_string(),
+            r#"{"used":53000,"size":200000}"#.to_string(),
+        ));
+        env
+    });
+    let task = run_echo_task(&daemon).await;
+    assert_eq!(task["status"], "succeeded");
+    let usage = &task["latest_usage"];
+    assert_eq!(usage["context_used"], serde_json::json!(53_000));
+    assert_eq!(usage["context_size"], serde_json::json!(200_000));
+    assert!(usage.get("cost_usd").is_none());
+
+    // The context snapshot must not be misread as a genuine all-zero token run.
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(daemon.root.join("data/favetto.db"))
+                .read_only(true),
+        )
+        .await
+        .expect("open daemon database");
+    let row = sqlx::query(
+        "SELECT input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, \
+                cache_write_tokens, context_used, context_size \
+         FROM task_runs WHERE task_id = ? ORDER BY attempt DESC LIMIT 1",
+    )
+    .bind(task["id"].as_str().expect("task id"))
+    .fetch_one(&pool)
+    .await
+    .expect("task run row");
+    for column in [
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+    ] {
+        assert!(
+            row.try_get::<Option<i64>, _>(column).unwrap().is_none(),
+            "{column} must stay NULL for context-only usage\n--- daemon log ---\n{}",
+            daemon.log()
+        );
+    }
+    assert_eq!(row.get::<Option<i64>, _>("context_used"), Some(53_000));
+    assert_eq!(row.get::<Option<i64>, _>("context_size"), Some(200_000));
+
     wait_for_agent_exit(&daemon).await;
 }
 

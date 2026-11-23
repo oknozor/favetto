@@ -293,7 +293,14 @@ pub fn build(
                 agent,
                 attempt: task.attempt,
                 duration: inbox::task_duration(task, now),
-                cost: costs.get(key.as_str()).cloned(),
+                // A live session wins; a finished run falls back to the usage
+                // persisted on its latest attempt so the row keeps its cost.
+                cost: costs.get(key.as_str()).cloned().or_else(|| {
+                    task.latest_usage
+                        .as_ref()
+                        .and_then(|usage| usage.reported_cost())
+                        .filter(|cost| cost.amount.is_finite())
+                }),
                 created_at: task.created_at,
             },
         ));
@@ -373,6 +380,7 @@ mod tests {
             agent: None,
             provider: None,
             model: None,
+            latest_usage: None,
         }
     }
 
@@ -610,6 +618,26 @@ mod tests {
             Some("$0.0200")
         );
         assert_eq!(row.duration, Some(Duration::from_secs(10 * 60)));
+    }
+
+    #[test]
+    fn finished_run_cost_falls_back_to_the_task_usage() {
+        let now = at(0);
+        let mut done = task(9, "repo:favetto/done", TaskStatus::Succeeded, at(-10));
+        done.latest_usage = Some(AgentUsage {
+            input_tokens: 10,
+            output_tokens: 2,
+            cost_usd: Some(0.04),
+            ..AgentUsage::default()
+        });
+
+        let list = build(&[done], &[], "", TaskFilter::All, None, now);
+        let row = list.rows.first().expect("row");
+        assert_eq!(row.cost, Some(AgentCost::usd(0.04)));
+        assert_eq!(
+            inbox::format_cost(row.cost.as_ref()).as_deref(),
+            Some("$0.0400")
+        );
     }
 
     #[test]

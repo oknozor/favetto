@@ -178,8 +178,8 @@ pub struct AgentUsage {
 impl AgentUsage {
     /// Fold `other` into `self` (per-step usage summed into a run total).
     ///
-    /// This is the additive path: use [`Self::replace`] for an agent snapshot
-    /// whose values are already cumulative.
+    /// This is the additive path: use [`Self::apply_snapshot`] for an agent
+    /// snapshot whose values are already cumulative.
     pub fn merge(&mut self, other: &AgentUsage) {
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
@@ -206,9 +206,51 @@ impl AgentUsage {
         }
     }
 
-    /// Replace this usage with a cumulative agent snapshot.
-    pub fn replace(&mut self, other: &AgentUsage) {
-        *self = other.clone();
+    /// Apply an agent snapshot without discarding fields the snapshot omits.
+    ///
+    /// ACP's `usage_update` carries the current context window and an optional
+    /// cumulative cost but no token counters. Replacing the whole value would
+    /// erase token totals captured from a `session/prompt` response (or a
+    /// previous turn), so each group is updated only when the snapshot actually
+    /// reports it:
+    ///
+    /// - token counters are replaced when the snapshot carries any, otherwise
+    ///   the existing totals are kept;
+    /// - context used/size are updated when reported;
+    /// - a reported cost replaces the previous cumulative amount, while an
+    ///   absent cost leaves the known value alone.
+    ///
+    /// This makes a late `usage_update` harmless regardless of whether it
+    /// arrives before or after the prompt-response usage.
+    pub fn apply_snapshot(&mut self, other: &AgentUsage) {
+        if other.has_token_counts() {
+            self.input_tokens = other.input_tokens;
+            self.output_tokens = other.output_tokens;
+            self.reasoning_tokens = other.reasoning_tokens;
+            self.cache_read_tokens = other.cache_read_tokens;
+            self.cache_write_tokens = other.cache_write_tokens;
+        }
+        if let Some(used) = other.context_used {
+            self.context_used = Some(used);
+        }
+        if let Some(size) = other.context_size {
+            self.context_size = Some(size);
+        }
+        if let Some(cost) = other.reported_cost() {
+            self.set_cost(Some(cost));
+        }
+    }
+
+    /// Whether this usage carries any billable token counter.
+    ///
+    /// Used to distinguish a context-only `usage_update` (all counters absent)
+    /// from a prompt response that genuinely reported token totals.
+    pub fn has_token_counts(&self) -> bool {
+        self.input_tokens > 0
+            || self.output_tokens > 0
+            || self.reasoning_tokens > 0
+            || self.cache_read_tokens > 0
+            || self.cache_write_tokens > 0
     }
 
     /// The cost reported by the agent, preferring the currency-aware field and
@@ -1128,8 +1170,8 @@ impl RunSummary {
                 detail.clone(),
             ),
             AgentStateEvent::Usage { usage, snapshot } => {
-                if *snapshot || self.usage.is_empty() {
-                    self.usage = usage.clone();
+                if *snapshot {
+                    self.usage.apply_snapshot(usage);
                 } else {
                     self.usage.merge(usage);
                 }
@@ -1220,22 +1262,80 @@ mod tests {
     }
 
     #[test]
-    fn agent_usage_replaces_cumulative_snapshots() {
+    fn agent_usage_applies_cumulative_snapshots_without_erasing_tokens() {
         let mut usage = AgentUsage::default();
-        usage.replace(&AgentUsage {
+        usage.apply_snapshot(&AgentUsage {
             context_used: Some(1_000),
             context_size: Some(200_000),
             cost: Some(AgentCost::usd(0.01)),
             ..Default::default()
         });
-        usage.replace(&AgentUsage {
+        // A prompt-response total arrives after the context snapshot.
+        usage.merge(&AgentUsage {
+            input_tokens: 120,
+            output_tokens: 30,
+            reasoning_tokens: 5,
+            ..Default::default()
+        });
+        // A late context-only update must not erase the token totals.
+        usage.apply_snapshot(&AgentUsage {
             context_used: Some(2_000),
             context_size: Some(200_000),
             cost: Some(AgentCost::usd(0.02)),
             ..Default::default()
         });
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 30);
+        assert_eq!(usage.reasoning_tokens, 5);
         assert_eq!(usage.reported_cost(), Some(AgentCost::usd(0.02)));
         assert_eq!(usage.context_used, Some(2_000));
+
+        // A snapshot that does carry token counters replaces them.
+        usage.apply_snapshot(&AgentUsage {
+            input_tokens: 7,
+            output_tokens: 3,
+            ..Default::default()
+        });
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.reasoning_tokens, 0);
+        assert_eq!(usage.context_used, Some(2_000));
+        assert_eq!(usage.reported_cost(), Some(AgentCost::usd(0.02)));
+
+        // A snapshot without a cost keeps the known amount.
+        usage.apply_snapshot(&AgentUsage {
+            context_used: Some(3_000),
+            ..Default::default()
+        });
+        assert_eq!(usage.reported_cost(), Some(AgentCost::usd(0.02)));
+        assert!(usage.has_token_counts());
+        assert!(!AgentUsage::default().has_token_counts());
+    }
+
+    #[test]
+    fn run_summary_folds_usage_snapshots_non_destructively() {
+        let mut summary = RunSummary::default();
+        summary.apply_event(&AgentStateEvent::Usage {
+            usage: AgentUsage {
+                input_tokens: 9,
+                output_tokens: 4,
+                ..Default::default()
+            },
+            snapshot: false,
+        });
+        summary.apply_event(&AgentStateEvent::Usage {
+            usage: AgentUsage {
+                context_used: Some(53_000),
+                context_size: Some(200_000),
+                cost: Some(AgentCost::usd(0.0012)),
+                ..Default::default()
+            },
+            snapshot: true,
+        });
+        assert_eq!(summary.usage.input_tokens, 9);
+        assert_eq!(summary.usage.output_tokens, 4);
+        assert_eq!(summary.usage.context_used, Some(53_000));
+        assert_eq!(summary.usage.reported_cost(), Some(AgentCost::usd(0.0012)));
     }
 
     #[test]

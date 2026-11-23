@@ -946,6 +946,7 @@ mod tests {
             agent: None,
             provider: None,
             model: None,
+            latest_usage: None,
         }
     }
 

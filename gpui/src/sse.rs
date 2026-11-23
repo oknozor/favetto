@@ -60,7 +60,7 @@ pub enum Push {
     /// A durable event (`event`).
     Event(Event),
     /// A task row changed (`task.updated`).
-    TaskUpdated(Task),
+    TaskUpdated(Box<Task>),
     /// The catalog changed on disk; re-fetch it (`catalog.updated`).
     CatalogUpdated,
     /// One normalized agent-state event (`agent.event`).
@@ -136,7 +136,9 @@ pub fn decode_push(event: &SseEvent) -> Result<Option<Push>, PushError> {
     };
     let decoded = match method {
         push::EVENT => serde_json::from_value::<Event>(params).map(Push::Event),
-        push::TASK_UPDATED => serde_json::from_value::<Task>(params).map(Push::TaskUpdated),
+        push::TASK_UPDATED => {
+            serde_json::from_value::<Task>(params).map(|task| Push::TaskUpdated(Box::new(task)))
+        }
         push::AGENT_EVENT => return decode_agent_event(params).map(Some).map_err(failure),
         push::AGENT_STATE => serde_json::from_value::<AgentStatePush>(params).map(Push::AgentState),
         push::AGENT_EXIT => serde_json::from_value::<AgentExitPush>(params).map(Push::AgentExit),

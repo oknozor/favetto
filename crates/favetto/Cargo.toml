@@ -26,7 +26,9 @@ test = false
 favetto-core = { path = "../favetto-core" }
 favetto-tui = { path = "../favetto-tui" }
 
-agent-client-protocol = { version = "5.4", default-features = false }
+agent-client-protocol = { version = "5.4", default-features = false, features = [
+    "unstable_end_turn_token_usage",
+] }
 anyhow = "1"
 ascii-dag = "0.11"
 axum = { version = "0.8", features = ["ws"] }

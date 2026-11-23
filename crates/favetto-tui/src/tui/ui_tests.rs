@@ -2380,6 +2380,7 @@ fn geom_task(name: &str) -> favetto_core::model::Task {
         agent: None,
         provider: None,
         model: None,
+        latest_usage: None,
     }
 }
 
@@ -2821,8 +2822,9 @@ fn usage_formatting_helpers_are_compact_and_guarded() {
     assert_eq!(short_tokens(1_234), "1.2k");
     assert_eq!(short_tokens(2_500_000), "2.5M");
 
-    assert_eq!(format_cost(None), "$0");
-    assert_eq!(format_cost(Some(0.0)), "$0");
+    // Unknown cost is not the same as a reported zero.
+    assert_eq!(format_cost(None), "—");
+    assert_eq!(format_cost(Some(0.0)), "$0.0000");
     assert_eq!(format_cost(Some(0.0312)), "$0.0312");
     assert_eq!(cost_bar_value(None), 0);
     assert_eq!(cost_bar_value(Some(0.5)), 500_000);

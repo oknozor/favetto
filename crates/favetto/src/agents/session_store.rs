@@ -231,6 +231,7 @@ mod tests {
             agent: None,
             provider: None,
             model: None,
+            latest_usage: None,
         };
         db::insert_task(&pool, &task).await.unwrap();
         let run = TaskRun {

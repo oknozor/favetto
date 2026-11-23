@@ -699,15 +699,13 @@ fn task_row(
                 .text_color(theme.colors.muted)
                 .child(inbox::format_duration(row.duration)),
         )
-        .when_some(inbox::format_cost(row.cost.as_ref()), |line, cost| {
-            line.child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(px(theme.font.xs))
-                    .text_color(theme.colors.muted)
-                    .child(cost),
-            )
-        })
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(theme.font.xs))
+                .text_color(theme.colors.muted)
+                .child(inbox::format_cost(row.cost.as_ref()).unwrap_or_else(|| "—".to_string())),
+        )
         .on_click(on_click)
 }
 

@@ -314,6 +314,13 @@ pub struct Task {
     /// Absent for tasks that use the definition's or the agent's default model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Usage reported by the task's current attempt, hydrated from its run row
+    /// by `tasks.list` / `tasks.get`. It lets a finished task keep showing its
+    /// token/cost totals after the live agent session leaves the registry (and
+    /// after a daemon restart). Absent while the attempt has reported nothing or
+    /// for payloads written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_usage: Option<AgentUsage>,
 }
 
 impl Task {
@@ -1165,6 +1172,7 @@ mod tests {
             agent: None,
             provider: None,
             model: None,
+            latest_usage: None,
         };
         let json = serde_json::to_value(&task).unwrap();
         assert_eq!(json["session_title"], "Fix the widget");
@@ -1217,6 +1225,7 @@ mod tests {
             agent: None,
             provider: None,
             model: None,
+            latest_usage: None,
         };
         let json = serde_json::to_value(&task).unwrap();
         assert_eq!(json["attempt"], 3);
@@ -1264,6 +1273,7 @@ mod tests {
             agent: None,
             provider: None,
             model: None,
+            latest_usage: None,
         };
         let json = serde_json::to_value(&task).unwrap();
         assert_eq!(json["interactive"], true);
@@ -1313,6 +1323,7 @@ mod tests {
             agent: None,
             provider: None,
             model: None,
+            latest_usage: None,
         };
         let json = serde_json::to_value(&task).unwrap();
         assert_eq!(json["parent_id"], parent.to_string());
@@ -1647,6 +1658,7 @@ mod tests {
             agent: None,
             provider: None,
             model: None,
+            latest_usage: None,
         };
         let json = serde_json::to_value(&task).unwrap();
         assert_eq!(json["failure"]["kind"], "agent");
@@ -1985,6 +1997,7 @@ mod tests {
             agent: None,
             provider: None,
             model: None,
+            latest_usage: None,
         };
         let n = task.into_notification().expect("task serialization");
         assert_eq!(n.method, push::TASK_UPDATED);
