@@ -1242,6 +1242,7 @@ impl CatalogView {
                                         theme,
                                         cx,
                                     )
+                                    .wrap(true)
                                     .placeholder("Definition or agent default"),
                                 ),
                             ),
@@ -1341,6 +1342,7 @@ impl CatalogView {
                                     theme,
                                     cx,
                                 )
+                                .wrap(true)
                                 .placeholder("Type a value…")
                                 .multiline(multiline),
                             ),

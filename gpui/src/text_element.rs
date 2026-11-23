@@ -13,57 +13,100 @@ use std::ops::Range;
 use gpui::{
     fill, point, px, size, App, Bounds, DispatchPhase, Element, ElementId, ElementInputHandler,
     Entity, FocusHandle, GlobalElementId, Hsla, IntoElement, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, ShapedLine, Style, TextRun, UTF16Selection,
-    UnderlineStyle, Window,
+    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Style, TextAlign, TextRun, UTF16Selection,
+    UnderlineStyle, Window, WrappedLine,
 };
 
 use crate::text_input::{TextInput, TextTarget};
 
+/// One `\n`-delimited logical line, shaped into one or more visual rows.
+#[derive(Clone, Debug)]
+struct ShapedTextLine {
+    /// The wrapped shape; `WrappedLine` owns its wrap boundaries and glyphs.
+    line: WrappedLine,
+    /// The line's byte range in the buffer, excluding the trailing newline.
+    start: usize,
+    end: usize,
+    /// Absolute byte offset where each visual row starts.
+    row_starts: Vec<usize>,
+    /// This line's first row in the field's global visual-row coordinates.
+    first_row: usize,
+}
+
+impl ShapedTextLine {
+    fn rows(&self) -> usize {
+        self.row_starts.len()
+    }
+
+    fn row_end(&self, row: usize) -> usize {
+        self.row_starts.get(row + 1).copied().unwrap_or(self.end)
+    }
+}
+
 /// Where the last painted text went. Mouse hit-testing and the platform's
-/// `bounds_for_range` need the shaped lines from the previous frame.
+/// `bounds_for_range` need the wrapped lines from the previous frame.
 #[derive(Clone, Debug)]
 pub struct TextLayout {
     bounds: Bounds<Pixels>,
-    lines: Vec<ShapedLine>,
-    line_starts: Vec<usize>,
-    line_ends: Vec<usize>,
+    lines: Vec<ShapedTextLine>,
     line_height: Pixels,
-    /// Horizontal scroll for single-line values longer than the field.
+    /// First visible visual row (vertical scroll) for wrapped/multiline fields.
+    scroll_row: usize,
+    total_rows: usize,
+    visible_rows: usize,
+    /// Horizontal scroll for single-line, non-wrapping values.
     scroll_x: Pixels,
+    /// Content width the lines were wrapped to.
+    wrap_width: Pixels,
 }
 
 impl TextLayout {
+    fn top_for_row(&self, row: usize) -> Pixels {
+        self.bounds.top() + self.line_height * (row as f32 - self.scroll_row as f32)
+    }
+
     fn index_for_position(&self, position: gpui::Point<Pixels>) -> usize {
         if self.lines.is_empty() {
             return 0;
         }
         let line_height = f32::from(self.line_height).max(1.0);
         let relative_y = f32::from(position.y - self.bounds.top());
-        let line_index = (relative_y / line_height).floor().max(0.0) as usize;
-        let line_index = line_index.min(self.lines.len() - 1);
+        let row = ((relative_y / line_height).floor().max(0.0) as usize + self.scroll_row)
+            .min(self.total_rows.saturating_sub(1));
+        let line = self
+            .lines
+            .iter()
+            .find(|line| row < line.first_row + line.rows())
+            .unwrap_or_else(|| self.lines.last().expect("checked non-empty"));
+        let row_in_line = row.saturating_sub(line.first_row);
         let x = position.x - self.bounds.left() + self.scroll_x;
-        let local = self.lines[line_index].closest_index_for_x(x);
-        let offset = self.line_starts[line_index] + local;
-        offset.min(self.line_ends[line_index])
+        let local = match line.line.index_for_position(
+            point(x, self.line_height * row_in_line as f32),
+            self.line_height,
+        ) {
+            Ok(index) | Err(index) => index,
+        };
+        (line.start + local).min(line.end)
     }
 
     fn bounds_for_range(&self, range: &Range<usize>) -> Option<Bounds<Pixels>> {
-        for (index, line) in self.lines.iter().enumerate() {
-            let start = self.line_starts[index];
-            let end = self.line_ends[index];
-            if range.start <= end && range.end >= start {
-                let local_start = range.start.saturating_sub(start).min(end - start);
-                let local_end = range.end.saturating_sub(start).min(end - start);
-                let top = self.bounds.top() + self.line_height * index as f32;
+        for line in &self.lines {
+            if range.start <= line.end && range.end >= line.start {
+                let len = line.end - line.start;
+                let local_start = range.start.saturating_sub(line.start).min(len);
+                let local_end = range.end.saturating_sub(line.start).min(len);
+                let start = line
+                    .line
+                    .position_for_index(local_start, self.line_height)?;
+                let end = line.line.position_for_index(local_end, self.line_height)?;
+                let top = self.top_for_row(line.first_row);
+                let left = self.bounds.left() - self.scroll_x;
+                let same_row = start.y == end.y;
+                let right = if same_row { end.x } else { self.wrap_width };
+                let bottom = top + if same_row { start.y } else { end.y } + self.line_height;
                 return Some(Bounds::from_corners(
-                    point(
-                        self.bounds.left() + line.x_for_index(local_start) - self.scroll_x,
-                        top,
-                    ),
-                    point(
-                        self.bounds.left() + line.x_for_index(local_end) - self.scroll_x,
-                        top + self.line_height,
-                    ),
+                    point(left + start.x, top + start.y),
+                    point(left + right, bottom),
                 ));
             }
         }
@@ -108,7 +151,6 @@ pub trait TextHost: 'static {
 }
 
 pub struct PrepaintState {
-    lines: Vec<(ShapedLine, Pixels)>,
     selection: Vec<PaintQuad>,
     cursor: Option<PaintQuad>,
     layout: TextLayout,
@@ -125,6 +167,7 @@ pub struct TextElement<V: TextHost> {
     caret_color: Hsla,
     selection_color: Hsla,
     multiline: bool,
+    wrap: bool,
     max_visible_lines: usize,
 }
 
@@ -145,6 +188,7 @@ impl<V: TextHost> TextElement<V> {
             caret_color: theme.colors.accent.into(),
             selection_color: Hsla::from(theme.colors.accent).opacity(0.25),
             multiline: false,
+            wrap: false,
             max_visible_lines: 8,
         }
     }
@@ -157,6 +201,18 @@ impl<V: TextHost> TextElement<V> {
     pub fn multiline(mut self, multiline: bool) -> Self {
         self.multiline = multiline;
         self
+    }
+
+    /// Soft-wrap long values at the field's content width. Multi-line fields
+    /// always wrap; single-line fields opt in so launch-sheet values stay
+    /// readable instead of running past the right edge.
+    pub fn wrap(mut self, wrap: bool) -> Self {
+        self.wrap = wrap;
+        self
+    }
+
+    fn wraps(&self) -> bool {
+        self.wrap || self.multiline
     }
 
     fn register_mouse_handlers(&self, bounds: Bounds<Pixels>, window: &mut Window) {
@@ -252,23 +308,75 @@ impl<V: TextHost + gpui::EntityInputHandler> Element for TextElement<V> {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&gpui::InspectorElementId>,
         window: &mut Window,
-        cx: &mut App,
+        _cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let line_count = self
-            .host
-            .read(cx)
-            .text_input(self.target)
-            .map(|input| input.value().split('\n').count())
-            .unwrap_or(1);
-        let visible = if self.multiline {
-            line_count.min(self.max_visible_lines)
-        } else {
-            1
-        };
+        let host = self.host.clone();
+        let target = self.target;
+        let multiline = self.multiline;
+        let wraps = self.wraps();
+        let max_visible_lines = self.max_visible_lines;
+        let placeholder = self.placeholder.clone();
+        let text_style = window.text_style();
+
         let mut style = Style::default();
         style.size.width = gpui::relative(1.).into();
-        style.size.height = (window.line_height() * visible as f32).into();
-        (window.request_layout(style, [], cx), ())
+        let layout_id =
+            window.request_measured_layout(style, move |known, available, window, cx| {
+                let line_height = window.line_height();
+                let available_width = known.width.or(match available.width {
+                    gpui::AvailableSpace::Definite(width) => Some(width),
+                    _ => None,
+                });
+
+                let value = host
+                    .read(cx)
+                    .text_input(target)
+                    .map(|input| input.value().to_string())
+                    .unwrap_or_default();
+                let mut display = if value.is_empty() {
+                    placeholder.clone().unwrap_or_default()
+                } else {
+                    value
+                };
+                if !multiline {
+                    display = display.replace(['\n', '\r'], " ");
+                }
+
+                let font_size = text_style.font_size.to_pixels(window.rem_size());
+                let shape = |text: &str, window: &mut Window| {
+                    let runs = [text_style.to_run(text.len())];
+                    let width = wraps.then_some(available_width).flatten();
+                    window
+                        .text_system()
+                        .shape_text(text.to_string().into(), font_size, &runs, width, None)
+                        .map(|lines| {
+                            lines
+                                .iter()
+                                .map(|line| line.wrap_boundaries().len() + 1)
+                                .sum::<usize>()
+                        })
+                        .unwrap_or(1)
+                };
+                let rows: usize = if multiline {
+                    display
+                        .split('\n')
+                        .map(|line| shape(line, window))
+                        .sum::<usize>()
+                        .max(1)
+                } else {
+                    shape(&display, window)
+                };
+                let visible = if wraps || multiline {
+                    rows.max(1).min(max_visible_lines)
+                } else {
+                    1
+                };
+                size(
+                    available_width.unwrap_or(Pixels::ZERO),
+                    line_height * visible as f32,
+                )
+            });
+        (layout_id, ())
     }
 
     fn prepaint(
@@ -292,11 +400,15 @@ impl<V: TextHost + gpui::EntityInputHandler> Element for TextElement<V> {
         let font_size = text_style.font_size.to_pixels(window.rem_size());
         let value = input.value().to_string();
         let use_placeholder = value.is_empty() && self.placeholder.is_some();
-        let display = if use_placeholder {
+        let mut display = if use_placeholder {
             self.placeholder.clone().unwrap_or_default()
         } else {
             value.clone()
         };
+        if !self.multiline {
+            // One byte for one byte, so offsets still map onto the buffer.
+            display = display.replace(['\n', '\r'], " ");
+        }
         let color = if use_placeholder {
             self.placeholder_color
         } else {
@@ -328,16 +440,6 @@ impl<V: TextHost + gpui::EntityInputHandler> Element for TextElement<V> {
         } else {
             0
         };
-        let visible = if self.multiline {
-            line_count.min(self.max_visible_lines)
-        } else {
-            1
-        };
-        let first_line = if self.multiline && caret_line >= visible {
-            caret_line + 1 - visible
-        } else {
-            0
-        };
 
         let mut line_starts = Vec::with_capacity(line_count);
         let mut line_ends = Vec::with_capacity(line_count);
@@ -365,75 +467,173 @@ impl<V: TextHost + gpui::EntityInputHandler> Element for TextElement<V> {
             wavy: false,
         };
 
-        let mut lines = Vec::with_capacity(visible);
-        let mut selections = Vec::new();
-        let mut cursor = None;
-        let mut scroll_x = Pixels::ZERO;
-        for line_index in first_line..(first_line + visible).min(line_count) {
+        // Wrapping fields shape to the content width; the other fields keep a
+        // single unwrapped line and scroll horizontally.
+        let wrap_width = bounds.size.width;
+        let shaping_width = self.wraps().then_some(wrap_width);
+        let mut lines = Vec::with_capacity(line_count);
+        let mut total_rows = 0;
+        for line_index in 0..line_count {
             let line_text = raw_lines[line_index];
             let start = line_starts[line_index];
             let end = line_ends[line_index];
             let runs = text_runs(line_text, start, &run, marked.as_ref(), &marked_underline);
-            let shaped = window.text_system().shape_line(
+            let Ok(mut shaped) = window.text_system().shape_text(
                 line_text.to_string().into(),
                 font_size,
                 &runs,
+                shaping_width,
                 None,
-            );
-            let top = bounds.top() + line_height * (line_index - first_line) as f32;
+            ) else {
+                continue;
+            };
+            let Some(shaped_line) = shaped.drain(..).next() else {
+                continue;
+            };
+            let rows = shaped_line.wrap_boundaries().len() + 1;
+            let mut row_starts = Vec::with_capacity(rows);
+            for row in 0..rows {
+                let local = match shaped_line
+                    .index_for_position(point(px(0.), line_height * row as f32), line_height)
+                {
+                    Ok(index) | Err(index) => index,
+                };
+                row_starts.push(start + local.min(end.saturating_sub(start)));
+            }
+            lines.push(ShapedTextLine {
+                line: shaped_line,
+                start,
+                end,
+                row_starts,
+                first_row: total_rows,
+            });
+            total_rows += rows;
+        }
 
-            if active {
-                let selected_start = selection.start.clamp(start, end);
-                let selected_end = selection.end.clamp(start, end);
+        let scrollable = self.wraps() || self.multiline;
+        let visible = if scrollable {
+            total_rows.max(1).min(self.max_visible_lines)
+        } else {
+            1
+        };
+
+        let caret_row = lines
+            .get(caret_line.min(lines.len().saturating_sub(1)))
+            .map(|line| {
+                let local = caret
+                    .saturating_sub(line.start)
+                    .min(line.end.saturating_sub(line.start));
+                let within = line
+                    .line
+                    .position_for_index(local, line_height)
+                    .map(|position| {
+                        (f32::from(position.y) / f32::from(line_height).max(1.0)).round() as usize
+                    })
+                    .unwrap_or(0);
+                line.first_row + within
+            })
+            .unwrap_or(0);
+        let scroll_row = if scrollable && caret_row >= visible {
+            caret_row + 1 - visible
+        } else {
+            0
+        };
+
+        // Keep the caret inside the field on a long single-line value. Wrapped
+        // fields grow instead of scrolling horizontally.
+        let mut scroll_x = Pixels::ZERO;
+        if active && !self.wraps() {
+            if let Some(line) = lines.first() {
+                let local = caret
+                    .saturating_sub(line.start)
+                    .min(line.end.saturating_sub(line.start));
+                if let Some(position) = line.line.position_for_index(local, line_height) {
+                    let width = bounds.size.width;
+                    if position.x > width {
+                        scroll_x = position.x - width + px(4.0);
+                    }
+                }
+            }
+        }
+
+        let mut selections = Vec::new();
+        let mut cursor = None;
+        if active {
+            for line in &lines {
+                let selected_start = selection.start.clamp(line.start, line.end);
+                let selected_end = selection.end.clamp(line.start, line.end);
                 if selected_start < selected_end {
-                    let x_start = shaped.x_for_index(selected_start - start);
-                    let x_end = shaped.x_for_index(selected_end - start);
-                    selections.push(fill(
-                        Bounds::from_corners(
-                            point(bounds.left() + x_start, top),
-                            point(bounds.left() + x_end, top + line_height),
-                        ),
-                        self.selection_color,
-                    ));
+                    // A selection spanning a wrap paints one quad per row.
+                    for row in 0..line.rows() {
+                        let start_byte = selected_start.max(line.row_starts[row]);
+                        let end_byte = selected_end.min(line.row_end(row));
+                        if start_byte >= end_byte {
+                            continue;
+                        }
+                        let x_start = line
+                            .line
+                            .position_for_index(start_byte - line.start, line_height)
+                            .map(|position| position.x)
+                            .unwrap_or(Pixels::ZERO);
+                        let x_end = line
+                            .line
+                            .position_for_index(end_byte - line.start, line_height)
+                            .map(|position| position.x)
+                            .unwrap_or(Pixels::ZERO);
+                        let max_x = bounds.size.width.max(Pixels::ZERO);
+                        let x_start = (x_start - scroll_x).max(Pixels::ZERO).min(max_x);
+                        let x_end = (x_end - scroll_x).max(Pixels::ZERO).min(max_x);
+                        let top = bounds.top() + line_height * (line.first_row + row) as f32
+                            - line_height * scroll_row as f32;
+                        selections.push(fill(
+                            Bounds::from_corners(
+                                point(bounds.left() + x_start, top),
+                                point(bounds.left() + x_end, top + line_height),
+                            ),
+                            self.selection_color,
+                        ));
+                    }
                 }
             }
 
-            if active && selection.is_empty() && caret >= start && caret <= end {
-                let x = shaped.x_for_index(caret - start);
-                cursor = Some(fill(
-                    Bounds::new(point(bounds.left() + x, top), size(px(2.0), line_height)),
-                    self.caret_color,
-                ));
-            }
-            lines.push((shaped, top));
-        }
-
-        // Keep the caret inside the field on a long single-line value.
-        if active && !self.multiline {
-            if let Some((line, _)) = lines.first() {
-                let caret_x = line.x_for_index(caret.min(line.text.len()));
-                let width = bounds.size.width;
-                if caret_x > width {
-                    scroll_x = caret_x - width + px(4.0);
+            if selection.is_empty() {
+                if let Some(line) = lines.get(caret_line.min(lines.len().saturating_sub(1))) {
+                    let local = caret
+                        .saturating_sub(line.start)
+                        .min(line.end.saturating_sub(line.start));
+                    if let Some(position) = line.line.position_for_index(local, line_height) {
+                        let within = (f32::from(position.y) / f32::from(line_height).max(1.0))
+                            .round() as usize;
+                        let global_row = line.first_row + within;
+                        if global_row >= scroll_row && global_row < scroll_row + visible {
+                            let max_x = (bounds.size.width - px(2.0)).max(Pixels::ZERO);
+                            let x = (position.x - scroll_x).max(Pixels::ZERO).min(max_x);
+                            cursor = Some(fill(
+                                Bounds::new(
+                                    point(
+                                        bounds.left() + x,
+                                        bounds.top()
+                                            + line_height * (global_row - scroll_row) as f32,
+                                    ),
+                                    size(px(2.0), line_height),
+                                ),
+                                self.caret_color,
+                            ));
+                        }
+                    }
                 }
             }
-            if let Some(cursor_quad) = cursor.as_mut() {
-                cursor_quad.bounds.origin.x -= scroll_x;
-            }
-            for quad in &mut selections {
-                quad.bounds.origin.x -= scroll_x;
-            }
         }
 
-        let shaped_lines: Vec<ShapedLine> = lines.iter().map(|(line, _)| line.clone()).collect();
-        let visible_end = (first_line + visible).min(line_count);
         let layout = TextLayout {
             bounds,
-            lines: shaped_lines,
-            line_starts: line_starts[first_line..visible_end].to_vec(),
-            line_ends: line_ends[first_line..visible_end].to_vec(),
+            lines,
             line_height,
+            scroll_row,
+            total_rows,
+            visible_rows: visible,
             scroll_x,
+            wrap_width,
         };
         let target = self.target;
         self.host.update(cx, |host, _| {
@@ -442,7 +642,6 @@ impl<V: TextHost + gpui::EntityInputHandler> Element for TextElement<V> {
         });
 
         PrepaintState {
-            lines,
             selection: selections,
             cursor,
             layout,
@@ -464,9 +663,26 @@ impl<V: TextHost + gpui::EntityInputHandler> Element for TextElement<V> {
             for quad in prepaint.selection.drain(..) {
                 window.paint_quad(quad);
             }
-            for (line, top) in &prepaint.lines {
-                let origin = point(bounds.left() - prepaint.layout.scroll_x, *top);
-                line.paint(origin, prepaint.layout.line_height, window, cx)
+            for line in &prepaint.layout.lines {
+                let last_visible = prepaint.layout.scroll_row + prepaint.layout.visible_rows;
+                if line.first_row + line.rows() <= prepaint.layout.scroll_row
+                    || line.first_row >= last_visible
+                {
+                    continue;
+                }
+                let origin = point(
+                    bounds.left() - prepaint.layout.scroll_x,
+                    prepaint.layout.top_for_row(line.first_row),
+                );
+                line.line
+                    .paint(
+                        origin,
+                        prepaint.layout.line_height,
+                        TextAlign::Left,
+                        Some(bounds),
+                        window,
+                        cx,
+                    )
                     .ok();
             }
             if self.focus_handle.is_focused(window) {
@@ -634,6 +850,9 @@ mod tests {
         input: TextInput,
         edit: TextEditState,
         active: bool,
+        multiline: bool,
+        wrap: bool,
+        width: Pixels,
     }
 
     impl Probe {
@@ -646,7 +865,37 @@ mod tests {
                 input,
                 edit: TextEditState::default(),
                 active: true,
+                multiline: true,
+                wrap: false,
+                width: px(240.0),
             }
+        }
+
+        /// A narrow single-line field whose value has to wrap.
+        fn wrapping(cx: &mut Context<Self>, value: &str) -> Self {
+            Self {
+                focus: cx.focus_handle(),
+                input: TextInput::new(value.to_string()),
+                edit: TextEditState::default(),
+                active: true,
+                multiline: false,
+                wrap: true,
+                width: px(120.0),
+            }
+        }
+
+        /// A narrow single-line field with everything selected.
+        fn wrapping_selection(cx: &mut Context<Self>, value: &str) -> Self {
+            let mut probe = Self::wrapping(cx, value);
+            probe.input.select_all();
+            probe
+        }
+
+        /// A narrow multi-line field whose caret sits at the end.
+        fn wrapping_multiline(cx: &mut Context<Self>, value: &str) -> Self {
+            let mut probe = Self::wrapping(cx, value);
+            probe.multiline = true;
+            probe
         }
     }
 
@@ -772,7 +1021,7 @@ mod tests {
             );
             div().size_full().p(px(10.0)).text_size(px(14.0)).child(
                 div()
-                    .w(px(240.0))
+                    .w(self.width)
                     .debug_selector(|| "text-probe".to_string())
                     .child(
                         TextElement::new(
@@ -781,7 +1030,8 @@ mod tests {
                             self.focus.clone(),
                             theme,
                         )
-                        .multiline(true),
+                        .multiline(self.multiline)
+                        .wrap(self.wrap),
                     ),
             )
         }
@@ -814,5 +1064,160 @@ mod tests {
             .expect("the field is laid out");
         assert!(bounds.size.width > px(0.0));
         assert!(bounds.size.height > px(0.0));
+    }
+
+    fn open_probe(
+        cx: &mut TestAppContext,
+        build: impl FnOnce(&mut Context<Probe>) -> Probe,
+    ) -> (&'static mut VisualTestContext, Entity<Probe>) {
+        let probe = cx.update(|cx| cx.new(build));
+        let window = cx.update(|cx| {
+            let probe = probe.clone();
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        Point::default(),
+                        size(px(400.0), px(400.0)),
+                    ))),
+                    ..Default::default()
+                },
+                |window, cx| {
+                    window.focus(&probe.read(cx).focus);
+                    probe
+                },
+            )
+            .expect("opening the test window")
+        });
+        let cx = VisualTestContext::from_window(*window, cx).into_mut();
+        // The first frame measures the wrapped rows, the next one reserves
+        // their height.
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        (cx, probe)
+    }
+
+    #[gpui::test]
+    fn a_long_single_line_value_wraps_and_keeps_the_caret_inside_the_field(
+        cx: &mut TestAppContext,
+    ) {
+        let value = "the quick brown fox jumps over the lazy dog and keeps running far away";
+        let (cx, probe) = open_probe(cx, |cx| Probe::wrapping(cx, value));
+
+        let bounds = cx
+            .debug_bounds("text-probe")
+            .expect("the field is laid out");
+        let (line_height, rows, caret_bounds) = cx.update(|window, cx| {
+            let line_height = window.line_height();
+            let probe = probe.read(cx);
+            let layout = probe
+                .edit
+                .layout(TextTarget::Palette)
+                .expect("prepaint cached the layout");
+            let caret = probe.input.caret();
+            let caret_range = probe.input.range_to_utf16(&(caret..caret));
+            let caret_bounds = bounds_for_range(&probe.input, Some(layout), caret_range)
+                .expect("the caret has IME bounds");
+            (line_height, layout.total_rows, caret_bounds)
+        });
+
+        assert!(
+            rows > 1,
+            "a long value shapes into more than one visual row, got {rows}"
+        );
+        assert!(
+            bounds.size.height > line_height * 1.5,
+            "the field grows to show its wrapped value: {:?}",
+            bounds.size
+        );
+        assert!(caret_bounds.top() >= bounds.top());
+        assert!(caret_bounds.bottom() <= bounds.bottom() + px(0.5));
+        assert!(caret_bounds.left() >= bounds.left() - px(0.5));
+        assert!(caret_bounds.right() <= bounds.right() + px(0.5));
+    }
+
+    #[gpui::test]
+    fn wrapped_hit_testing_and_selection_bounds_use_visual_rows(cx: &mut TestAppContext) {
+        let value = "the quick brown fox jumps over the lazy dog and keeps running far away";
+        let (cx, probe) = open_probe(cx, |cx| Probe::wrapping_selection(cx, value));
+
+        let bounds = cx
+            .debug_bounds("text-probe")
+            .expect("the field is laid out");
+        let (line_height, rows, selection_bounds, first_row, second_row) =
+            cx.update(|window, cx| {
+                let line_height = window.line_height();
+                let probe = probe.read(cx);
+                let layout = probe
+                    .edit
+                    .layout(TextTarget::Palette)
+                    .expect("prepaint cached the layout");
+                let whole = probe.input.range_to_utf16(&(0..probe.input.value().len()));
+                let selection_bounds = bounds_for_range(&probe.input, Some(layout), whole)
+                    .expect("the selection has IME bounds");
+                let first_row = layout.index_for_position(point(
+                    bounds.left() + px(2.0),
+                    bounds.top() + line_height * 0.5,
+                ));
+                let second_row = layout.index_for_position(point(
+                    bounds.left() + px(2.0),
+                    bounds.top() + line_height * 1.5,
+                ));
+                (
+                    line_height,
+                    layout.total_rows,
+                    selection_bounds,
+                    first_row,
+                    second_row,
+                )
+            });
+
+        assert!(rows > 1, "the value wraps, got {rows} rows");
+        assert!(
+            selection_bounds.size.height > line_height * 1.5,
+            "a selection across a wrap covers more than one row"
+        );
+        assert!(
+            second_row > first_row,
+            "a click on the second visual row maps past the first"
+        );
+    }
+
+    #[gpui::test]
+    fn a_multiline_field_grows_to_eight_rows_then_scrolls_to_the_caret(cx: &mut TestAppContext) {
+        let value = (0..40)
+            .map(|index| format!("line {index} with enough words to wrap"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (cx, probe) = open_probe(cx, |cx| Probe::wrapping_multiline(cx, &value));
+
+        let bounds = cx
+            .debug_bounds("text-probe")
+            .expect("the field is laid out");
+        let (line_height, rows, caret_bounds) = cx.update(|window, cx| {
+            let line_height = window.line_height();
+            let probe = probe.read(cx);
+            let layout = probe
+                .edit
+                .layout(TextTarget::Palette)
+                .expect("prepaint cached the layout");
+            let caret = probe.input.caret();
+            let caret_range = probe.input.range_to_utf16(&(caret..caret));
+            let caret_bounds = bounds_for_range(&probe.input, Some(layout), caret_range)
+                .expect("the caret has IME bounds");
+            (line_height, layout.total_rows, caret_bounds)
+        });
+
+        assert!(
+            rows > 8,
+            "the value needs vertical scrolling, got {rows} rows"
+        );
+        assert!(
+            (f32::from(bounds.size.height) - f32::from(line_height) * 8.0).abs() < 1.0,
+            "the field caps at eight visual rows: {:?}",
+            bounds.size
+        );
+        assert!(caret_bounds.top() >= bounds.top());
+        assert!(caret_bounds.bottom() <= bounds.bottom() + px(0.5));
     }
 }
