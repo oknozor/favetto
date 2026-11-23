@@ -16,6 +16,8 @@ use crate::components;
 use crate::routes::Route;
 use crate::schedules::{self, ScheduleEditor, ScheduleField, SchedulesStatus};
 use crate::state::ClientState;
+use crate::text_element::state_text_element;
+use crate::text_input::TextTarget;
 use crate::theme::Theme;
 
 /// The Schedules surface.
@@ -443,23 +445,13 @@ impl SchedulesView {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .truncate()
                     .font_family("monospace")
                     .text_size(px(theme.font.sm))
-                    .text_color(if editor.cron.is_empty() {
-                        theme.colors.muted
-                    } else {
-                        theme.colors.text
-                    })
-                    .child(if editor.cron.is_empty() {
-                        "0 0 9 * * *".to_string()
-                    } else {
-                        editor.cron.clone()
-                    }),
-            )
-            .when(cron_focused, |field| {
-                field.child(div().text_color(theme.colors.accent).child("▌"))
-            });
+                    .child(
+                        state_text_element(&self.state, TextTarget::ScheduleCron, theme, cx)
+                            .placeholder("0 0 9 * * *"),
+                    ),
+            );
 
         let mut cron_field = div()
             .flex()

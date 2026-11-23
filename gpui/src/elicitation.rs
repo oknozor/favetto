@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::text_input::TextInput;
 use favetto_wire::elicitation::{
     ElicitationField, ElicitationFieldKind, ElicitationReply, ElicitationRequest,
     ElicitationValidationError, ElicitationValue,
@@ -18,7 +19,7 @@ pub enum ElicitationStage {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ElicitationDraft {
-    Text(String),
+    Text(TextInput),
     Boolean(bool),
     Enum { selected: usize },
 }
@@ -77,10 +78,10 @@ impl ElicitationFormState {
                 }
                 ElicitationDraft::Text(value) => match &field.kind {
                     ElicitationFieldKind::Integer { .. } => {
-                        if value.trim().is_empty() {
+                        if value.value().trim().is_empty() {
                             None
                         } else {
-                            match value.trim().parse::<i64>() {
+                            match value.value().trim().parse::<i64>() {
                                 Ok(value) => Some(ElicitationValue::Integer(value)),
                                 Err(_) => {
                                     return Err((
@@ -92,10 +93,10 @@ impl ElicitationFormState {
                         }
                     }
                     ElicitationFieldKind::Number { .. } => {
-                        if value.trim().is_empty() {
+                        if value.value().trim().is_empty() {
                             None
                         } else {
-                            match value.trim().parse::<f64>() {
+                            match value.value().trim().parse::<f64>() {
                                 Ok(value) => Some(ElicitationValue::Number(value)),
                                 Err(_) => {
                                     return Err((
@@ -108,7 +109,7 @@ impl ElicitationFormState {
                     }
                     _ => {
                         if field.required || !value.is_empty() {
-                            Some(ElicitationValue::String(value.clone()))
+                            Some(ElicitationValue::String(value.value().to_string()))
                         } else {
                             None
                         }
@@ -162,18 +163,50 @@ impl ElicitationFormState {
         ElicitationReply::Cancel
     }
 
+    #[allow(dead_code)] // Exercised by the model's tests; the view edits the buffer.
     pub fn push_char(&mut self, ch: char) {
         if let Some(ElicitationDraft::Text(value)) = self.drafts.get_mut(self.current) {
-            value.push(ch);
+            value.push_char(ch);
             self.error = None;
         }
     }
 
+    #[allow(dead_code)] // Exercised by the model's tests; the view edits the buffer.
     pub fn backspace(&mut self) {
         if let Some(ElicitationDraft::Text(value)) = self.drafts.get_mut(self.current) {
-            value.pop();
+            value.backspace();
             self.error = None;
         }
+    }
+
+    /// The editable buffer for the current field, when it is text-like.
+    pub fn text_input(&self) -> Option<&TextInput> {
+        self.text_input_at(self.current)
+    }
+
+    pub fn text_input_at(&self, index: usize) -> Option<&TextInput> {
+        match self.drafts.get(index) {
+            Some(ElicitationDraft::Text(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn text_input_at_mut(&mut self, index: usize) -> Option<&mut TextInput> {
+        match self.drafts.get_mut(index) {
+            Some(ElicitationDraft::Text(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Focus one field (a click on its row or the element's bounds).
+    pub fn set_current(&mut self, index: usize) {
+        if index < self.drafts.len() {
+            self.current = index;
+        }
+    }
+
+    pub fn after_edit(&mut self) {
+        self.error = None;
     }
 
     pub fn toggle_or_cycle(&mut self, backwards: bool) {
@@ -237,7 +270,7 @@ impl ElicitationFormState {
                 if value.is_empty() {
                     "—".to_string()
                 } else {
-                    value.clone()
+                    value.value().to_string()
                 }
             }
             _ => String::new(),
@@ -252,14 +285,14 @@ impl ElicitationFormState {
 fn draft_for(field: &ElicitationField) -> ElicitationDraft {
     match &field.kind {
         ElicitationFieldKind::String { default, .. } => {
-            ElicitationDraft::Text(default.clone().unwrap_or_default())
+            ElicitationDraft::Text(TextInput::new(default.clone().unwrap_or_default()))
         }
-        ElicitationFieldKind::Integer { default, .. } => {
-            ElicitationDraft::Text(default.map(|value| value.to_string()).unwrap_or_default())
-        }
-        ElicitationFieldKind::Number { default, .. } => {
-            ElicitationDraft::Text(default.map(|value| value.to_string()).unwrap_or_default())
-        }
+        ElicitationFieldKind::Integer { default, .. } => ElicitationDraft::Text(TextInput::new(
+            default.map(|value| value.to_string()).unwrap_or_default(),
+        )),
+        ElicitationFieldKind::Number { default, .. } => ElicitationDraft::Text(TextInput::new(
+            default.map(|value| value.to_string()).unwrap_or_default(),
+        )),
         ElicitationFieldKind::Boolean { default } => {
             ElicitationDraft::Boolean(default.unwrap_or(false))
         }

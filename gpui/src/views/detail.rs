@@ -39,6 +39,8 @@ use crate::layout::{container_query, LayoutMode};
 use crate::markdown::{self, MarkdownDoc};
 use crate::state::ClientState;
 use crate::tasks;
+use crate::text_element::state_text_element;
+use crate::text_input::TextTarget;
 use crate::theme::Theme;
 use crate::views::markdown::{self as markdown_view, Tone};
 
@@ -1583,7 +1585,7 @@ impl DetailView {
                 state.detail_plan(),
                 state.detail_commands(),
                 detail
-                    .map(|detail| detail.prompt.clone())
+                    .map(|detail| detail.prompt.value().to_string())
                     .unwrap_or_default(),
                 detail.and_then(|detail| detail.prompt_selected),
                 detail.is_some_and(|detail| detail.prompt_open),
@@ -2199,19 +2201,11 @@ impl DetailView {
                         ">"
                     }))
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_color(if prompt.is_empty() {
-                                theme.colors.muted
-                            } else {
-                                theme.colors.text
-                            })
-                            .child(if prompt.is_empty() {
-                                "Type a message, or / for commands".to_string()
-                            } else {
-                                prompt.to_string()
-                            }),
+                        div().flex_1().min_w_0().text_size(px(theme.font.sm)).child(
+                            state_text_element(&self.state, TextTarget::DetailPrompt, theme, cx)
+                                .multiline(true)
+                                .placeholder("Type a message, or / for commands"),
+                        ),
                     )
                     .child(
                         div()
@@ -2629,12 +2623,32 @@ impl DetailView {
                                 .child(description.clone()),
                         );
                     }
-                    row = row.child(
+                    let editable = matches!(
+                        form.drafts.get(index),
+                        Some(crate::elicitation::ElicitationDraft::Text(_))
+                    );
+                    row = row.child(if editable {
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(theme.font.sm))
+                            .child(
+                                state_text_element(
+                                    &self.state,
+                                    TextTarget::Elicitation(index),
+                                    theme,
+                                    cx,
+                                )
+                                .placeholder("Type a value…"),
+                            )
+                            .into_any_element()
+                    } else {
                         div()
                             .text_size(px(theme.font.sm))
                             .text_color(theme.colors.text)
-                            .child(form.display_value(index)),
-                    );
+                            .child(form.display_value(index))
+                            .into_any_element()
+                    });
                     panel = panel.child(row);
                 }
             }

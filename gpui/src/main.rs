@@ -27,6 +27,8 @@ mod settings;
 mod sse;
 mod state;
 mod tasks;
+mod text_element;
+mod text_input;
 mod theme;
 mod transport;
 mod views;

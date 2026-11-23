@@ -167,6 +167,56 @@ actions!(
         Refresh,
         /// Restart the transport.
         Reconnect,
+        /// Move the caret one grapheme left.
+        TextMoveLeft,
+        /// Move the caret one grapheme right.
+        TextMoveRight,
+        /// Move the caret one word left.
+        TextMoveWordLeft,
+        /// Move the caret one word right.
+        TextMoveWordRight,
+        /// Move the caret to the start of the current line.
+        TextMoveHome,
+        /// Move the caret to the end of the current line.
+        TextMoveEnd,
+        /// Move the caret one line up (multiline fields only).
+        TextMoveUp,
+        /// Move the caret one line down (multiline fields only).
+        TextMoveDown,
+        /// Extend the selection one grapheme left.
+        TextSelectLeft,
+        /// Extend the selection one grapheme right.
+        TextSelectRight,
+        /// Extend the selection one word left.
+        TextSelectWordLeft,
+        /// Extend the selection one word right.
+        TextSelectWordRight,
+        /// Extend the selection to the start of the line.
+        TextSelectHome,
+        /// Extend the selection to the end of the line.
+        TextSelectEnd,
+        /// Extend the selection one line up.
+        TextSelectUp,
+        /// Extend the selection one line down.
+        TextSelectDown,
+        /// Select the whole buffer.
+        TextSelectAll,
+        /// Delete the grapheme before the caret.
+        TextBackspace,
+        /// Delete the grapheme at the caret.
+        TextDelete,
+        /// Delete the word before the caret.
+        TextDeleteWordBackward,
+        /// Delete the word after the caret.
+        TextDeleteWordForward,
+        /// Copy the selection to the platform clipboard.
+        TextCopy,
+        /// Cut the selection to the platform clipboard.
+        TextCut,
+        /// Paste the platform clipboard at the caret.
+        TextPaste,
+        /// Insert a newline in a multiline field.
+        TextNewline,
     ]
 );
 
@@ -256,7 +306,7 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new(
             "enter",
             ListOpen,
-            Some("Root && !Palette && !Shortcuts && !Confirm && !Sheet"),
+            Some("Root && !Palette && !Shortcuts && !Confirm && !Sheet && !Launch && !Oneshot"),
         ),
         KeyBinding::new(
             "r",
@@ -343,8 +393,16 @@ pub fn bindings() -> Vec<KeyBinding> {
         ),
         KeyBinding::new("tab", CatalogFieldNext, Some("Catalog && Launch")),
         KeyBinding::new("shift-tab", CatalogFieldPrev, Some("Catalog && Launch")),
-        KeyBinding::new("left", CatalogChoicePrev, Some("Catalog && Launch")),
-        KeyBinding::new("right", CatalogChoiceNext, Some("Catalog && Launch")),
+        KeyBinding::new(
+            "left",
+            CatalogChoicePrev,
+            Some("Catalog && Launch && !TextField"),
+        ),
+        KeyBinding::new(
+            "right",
+            CatalogChoiceNext,
+            Some("Catalog && Launch && !TextField"),
+        ),
         KeyBinding::new("tab", CatalogFieldNext, Some("Catalog && Oneshot")),
         KeyBinding::new("shift-tab", CatalogFieldPrev, Some("Catalog && Oneshot")),
         KeyBinding::new(
@@ -521,13 +579,102 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("down", ElicitationNext, Some("Root && Elicitation")),
         KeyBinding::new("shift-tab", ElicitationPrev, Some("Root && Elicitation")),
         KeyBinding::new("up", ElicitationPrev, Some("Root && Elicitation")),
-        KeyBinding::new("left", ElicitationLeft, Some("Root && Elicitation")),
-        KeyBinding::new("right", ElicitationRight, Some("Root && Elicitation")),
+        KeyBinding::new(
+            "left",
+            ElicitationLeft,
+            Some("Root && Elicitation && !TextField"),
+        ),
+        KeyBinding::new(
+            "right",
+            ElicitationRight,
+            Some("Root && Elicitation && !TextField"),
+        ),
         KeyBinding::new("space", ElicitationToggle, Some("Root && Elicitation")),
         KeyBinding::new("enter", ElicitationConfirm, Some("Root && Elicitation")),
         KeyBinding::new("d", ElicitationDecline, Some("Root && Elicitation")),
         KeyBinding::new("e", ElicitationEdit, Some("Root && Elicitation")),
         KeyBinding::new("escape", ElicitationCancel, Some("Root && Elicitation")),
+        // Text editing. These are registered last so a focused field wins over
+        // the shell/list/arrow bindings at equal predicate depth. `TextField`
+        // and `Multiline` are appended to the root key context only while an
+        // editable field owns the keyboard (see `RootView::render`).
+        KeyBinding::new("left", TextMoveLeft, Some("Root && TextField")),
+        KeyBinding::new("right", TextMoveRight, Some("Root && TextField")),
+        KeyBinding::new("alt-left", TextMoveWordLeft, Some("Root && TextField")),
+        KeyBinding::new("ctrl-left", TextMoveWordLeft, Some("Root && TextField")),
+        KeyBinding::new(
+            "secondary-left",
+            TextMoveWordLeft,
+            Some("Root && TextField"),
+        ),
+        KeyBinding::new("alt-right", TextMoveWordRight, Some("Root && TextField")),
+        KeyBinding::new("ctrl-right", TextMoveWordRight, Some("Root && TextField")),
+        KeyBinding::new(
+            "secondary-right",
+            TextMoveWordRight,
+            Some("Root && TextField"),
+        ),
+        KeyBinding::new("home", TextMoveHome, Some("Root && TextField")),
+        KeyBinding::new("end", TextMoveEnd, Some("Root && TextField")),
+        KeyBinding::new("up", TextMoveUp, Some("Root && TextField && Multiline")),
+        KeyBinding::new("down", TextMoveDown, Some("Root && TextField && Multiline")),
+        KeyBinding::new("shift-left", TextSelectLeft, Some("Root && TextField")),
+        KeyBinding::new("shift-right", TextSelectRight, Some("Root && TextField")),
+        KeyBinding::new(
+            "shift-alt-left",
+            TextSelectWordLeft,
+            Some("Root && TextField"),
+        ),
+        KeyBinding::new(
+            "shift-alt-right",
+            TextSelectWordRight,
+            Some("Root && TextField"),
+        ),
+        KeyBinding::new("shift-home", TextSelectHome, Some("Root && TextField")),
+        KeyBinding::new("shift-end", TextSelectEnd, Some("Root && TextField")),
+        KeyBinding::new(
+            "shift-up",
+            TextSelectUp,
+            Some("Root && TextField && Multiline"),
+        ),
+        KeyBinding::new(
+            "shift-down",
+            TextSelectDown,
+            Some("Root && TextField && Multiline"),
+        ),
+        KeyBinding::new("secondary-a", TextSelectAll, Some("Root && TextField")),
+        KeyBinding::new("backspace", TextBackspace, Some("Root && TextField")),
+        KeyBinding::new("delete", TextDelete, Some("Root && TextField")),
+        KeyBinding::new(
+            "alt-backspace",
+            TextDeleteWordBackward,
+            Some("Root && TextField"),
+        ),
+        KeyBinding::new(
+            "ctrl-backspace",
+            TextDeleteWordBackward,
+            Some("Root && TextField"),
+        ),
+        KeyBinding::new(
+            "secondary-backspace",
+            TextDeleteWordBackward,
+            Some("Root && TextField"),
+        ),
+        KeyBinding::new(
+            "alt-delete",
+            TextDeleteWordForward,
+            Some("Root && TextField"),
+        ),
+        KeyBinding::new(
+            "secondary-delete",
+            TextDeleteWordForward,
+            Some("Root && TextField"),
+        ),
+        KeyBinding::new("secondary-c", TextCopy, Some("Root && TextField")),
+        KeyBinding::new("secondary-x", TextCut, Some("Root && TextField")),
+        KeyBinding::new("secondary-v", TextPaste, Some("Root && TextField")),
+        KeyBinding::new("shift-enter", TextNewline, Some("Root && TextField")),
+        KeyBinding::new("alt-enter", TextNewline, Some("Root && TextField")),
     ]
 }
 
@@ -790,6 +937,96 @@ mod tests {
         let repo_confirm = order.iter().position(|name| name == "RepoPickerConfirm");
         assert!(list_open.is_some() && repo_confirm.is_some());
         assert!(repo_confirm > list_open);
+    }
+
+    #[test]
+    fn text_editing_bindings_win_inside_a_focused_field() {
+        let bindings = bindings();
+        let names: Vec<String> = bindings
+            .iter()
+            .map(|binding| {
+                binding
+                    .action()
+                    .name()
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        for action in [
+            "TextMoveLeft",
+            "TextMoveRight",
+            "TextMoveWordLeft",
+            "TextMoveWordRight",
+            "TextMoveHome",
+            "TextMoveEnd",
+            "TextMoveUp",
+            "TextMoveDown",
+            "TextSelectLeft",
+            "TextSelectRight",
+            "TextSelectAll",
+            "TextBackspace",
+            "TextDelete",
+            "TextDeleteWordBackward",
+            "TextDeleteWordForward",
+            "TextCopy",
+            "TextCut",
+            "TextPaste",
+            "TextNewline",
+        ] {
+            let binding = bindings
+                .iter()
+                .find(|binding| binding.action().name().ends_with(action))
+                .unwrap_or_else(|| panic!("{action} has no binding"));
+            let predicate = binding.predicate().expect("context").to_string();
+            assert!(
+                predicate.contains("TextField"),
+                "{action} must be scoped to a focused field: {predicate}"
+            );
+        }
+
+        // The catalog's arrow-key choice cycle must yield to an editable field.
+        let choice = bindings
+            .iter()
+            .find(|binding| binding.action().name().ends_with("CatalogChoicePrev"))
+            .expect("catalog choice binding");
+        assert!(choice
+            .predicate()
+            .is_some_and(|predicate| predicate.to_string().contains("!TextField")));
+        let elicitation = bindings
+            .iter()
+            .find(|binding| binding.action().name().ends_with("ElicitationLeft"))
+            .expect("elicitation binding");
+        assert!(elicitation
+            .predicate()
+            .is_some_and(|predicate| predicate.to_string().contains("!TextField")));
+
+        // Up/Down stay on the list in single-line fields and move lines only in
+        // a multiline one.
+        let line_up = bindings
+            .iter()
+            .find(|binding| binding.action().name().ends_with("TextMoveUp"))
+            .expect("line up binding");
+        assert!(line_up
+            .predicate()
+            .is_some_and(|predicate| predicate.to_string().contains("Multiline")));
+
+        // A plain Enter inside a catalog sheet must not fall through to the
+        // list's Enter action (the sheets submit with secondary-enter).
+        let list_open = bindings
+            .iter()
+            .find(|binding| binding.action().name().ends_with("ListOpen"))
+            .expect("list open binding");
+        let predicate = list_open.predicate().expect("context").to_string();
+        assert!(predicate.contains("!Launch") && predicate.contains("!Oneshot"));
+
+        // Text bindings are registered after the shell bindings at equal depth.
+        let first_text = names.iter().position(|name| name == "TextMoveLeft");
+        let last_shell = names
+            .iter()
+            .rposition(|name| matches!(name.as_str(), "ElicitationCancel" | "DetailPromptPrev"));
+        assert!(first_text > last_shell);
     }
 
     #[test]

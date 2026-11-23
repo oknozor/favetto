@@ -7,6 +7,7 @@
 //! without a window.
 
 use crate::config::{self, EndpointError, DEFAULT_ENDPOINT};
+use crate::text_input::TextInput;
 
 /// One logical focus target inside Settings. The root owns the actual keyboard
 /// focus, so this value only routes typed characters and draws the caret/ring.
@@ -102,8 +103,8 @@ pub enum ConnectionTest {
 /// The editable Settings state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsState {
-    draft_endpoint: String,
-    draft_token: String,
+    draft_endpoint: TextInput,
+    draft_token: TextInput,
     focus: Option<SettingsFocus>,
     test: ConnectionTest,
     save_error: Option<String>,
@@ -121,20 +122,46 @@ impl SettingsState {
     /// the form (the source is shown under the field instead).
     pub fn new(endpoint: &str, token_override: Option<&str>) -> Self {
         Self {
-            draft_endpoint: endpoint.to_string(),
-            draft_token: token_override.unwrap_or_default().to_string(),
+            draft_endpoint: TextInput::new(endpoint.to_string()),
+            draft_token: TextInput::new(token_override.unwrap_or_default().to_string()),
             focus: None,
             test: ConnectionTest::Idle,
             save_error: None,
         }
     }
 
+    #[allow(dead_code)] // Read by the model's tests; the view paints the buffer.
     pub fn draft_endpoint(&self) -> &str {
-        &self.draft_endpoint
+        self.draft_endpoint.value()
     }
 
     pub fn draft_token(&self) -> &str {
-        &self.draft_token
+        self.draft_token.value()
+    }
+
+    /// The endpoint (`true`) or token (`false`) buffer, regardless of which
+    /// one currently has focus. Formatted/rendered fields keep their value when
+    /// the other field is focused; `is_editing_text` gates editing.
+    pub fn text_input(&self, endpoint: bool) -> Option<&TextInput> {
+        Some(if endpoint {
+            &self.draft_endpoint
+        } else {
+            &self.draft_token
+        })
+    }
+
+    pub fn text_input_mut(&mut self, endpoint: bool) -> Option<&mut TextInput> {
+        Some(if endpoint {
+            &mut self.draft_endpoint
+        } else {
+            &mut self.draft_token
+        })
+    }
+
+    /// Clear the test result and save error after an in-place edit.
+    pub fn after_edit(&mut self) {
+        self.test = ConnectionTest::Idle;
+        self.save_error = None;
     }
 
     pub fn focus(&self) -> Option<SettingsFocus> {
@@ -166,37 +193,35 @@ impl SettingsState {
     }
 
     /// Append a typed character to the focused text field.
+    #[allow(dead_code)] // Exercised by the model's tests.
     pub fn push_char(&mut self, character: char) {
         if character.is_control() {
             return;
         }
         match self.focus {
             Some(SettingsFocus::Endpoint) => {
-                self.draft_endpoint.push(character);
-                self.test = ConnectionTest::Idle;
-                self.save_error = None;
+                self.draft_endpoint.push_char(character);
+                self.after_edit();
             }
             Some(SettingsFocus::Token) => {
-                self.draft_token.push(character);
-                self.test = ConnectionTest::Idle;
-                self.save_error = None;
+                self.draft_token.push_char(character);
+                self.after_edit();
             }
             _ => {}
         }
     }
 
     /// Remove the last character of the focused text field.
+    #[allow(dead_code)] // Exercised by the model's tests.
     pub fn backspace(&mut self) {
         match self.focus {
             Some(SettingsFocus::Endpoint) => {
-                self.draft_endpoint.pop();
-                self.test = ConnectionTest::Idle;
-                self.save_error = None;
+                self.draft_endpoint.backspace();
+                self.after_edit();
             }
             Some(SettingsFocus::Token) => {
-                self.draft_token.pop();
-                self.test = ConnectionTest::Idle;
-                self.save_error = None;
+                self.draft_token.backspace();
+                self.after_edit();
             }
             _ => {}
         }
@@ -205,13 +230,13 @@ impl SettingsState {
     /// The normalized endpoint the draft would save, or the precise reason it
     /// cannot be saved.
     pub fn normalized(&self) -> Result<String, EndpointError> {
-        config::validate_endpoint(&self.draft_endpoint)
+        config::validate_endpoint(self.draft_endpoint.value())
     }
 
     /// The token to send for a test/save: the typed one, otherwise the caller's
     /// fallback (the token currently in effect).
     pub fn token_or(&self, fallback: Option<&str>) -> Option<String> {
-        let typed = self.draft_token.trim();
+        let typed = self.draft_token.value().trim();
         if typed.is_empty() {
             fallback.map(str::to_string)
         } else {
@@ -234,8 +259,8 @@ impl SettingsState {
     }
 
     pub fn set_draft(&mut self, endpoint: &str, token: Option<&str>) {
-        self.draft_endpoint = endpoint.to_string();
-        self.draft_token = token.unwrap_or_default().to_string();
+        self.draft_endpoint = TextInput::new(endpoint.to_string());
+        self.draft_token = TextInput::new(token.unwrap_or_default().to_string());
         self.test = ConnectionTest::Idle;
         self.save_error = None;
     }

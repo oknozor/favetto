@@ -36,6 +36,9 @@ dirs = "7"
 toml = "0.8"
 base64 = "0.22"
 fuzzy-matcher = "0.3"
+# Grapheme-cluster boundaries for the shared text inputs (emoji, combining
+# marks and IME composition must never be split mid-cluster).
+unicode-segmentation = "1"
 # Cron parsing/validation and next-occurrence math. Pinned to the daemon's own
 # parser configuration so the hint and the schedule it saves cannot disagree.
 croner = "3"

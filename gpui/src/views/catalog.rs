@@ -30,6 +30,8 @@ use crate::markdown::{self, MarkdownDoc};
 use crate::resize::{ResizeDrag, ResizePreview, ResizeStart};
 use crate::routes::Route;
 use crate::state::ClientState;
+use crate::text_element::state_text_element;
+use crate::text_input::TextTarget;
 use crate::theme::{Theme, CATALOG_PREVIEW_WIDTH, RESIZE_HANDLE, SIDEBAR_WIDTH};
 use crate::views::markdown::{self as markdown_view, Tone};
 
@@ -232,30 +234,10 @@ impl CatalogView {
                     .child("⌕"),
             )
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(theme.font.sm))
-                            .text_color(if query.is_empty() {
-                                theme.colors.muted
-                            } else {
-                                theme.colors.text
-                            })
-                            .child(if query.is_empty() {
-                                "Search definition names…".to_string()
-                            } else {
-                                query.to_string()
-                            }),
-                    )
-                    .when(active, |text| {
-                        text.child(div().text_color(theme.colors.accent).child("▌"))
-                    }),
+                div().flex_1().min_w_0().text_size(px(theme.font.sm)).child(
+                    state_text_element(&self.state, TextTarget::CatalogSearch, theme, cx)
+                        .placeholder("Search definition names…"),
+                ),
             )
             .when_some(clear, |field, clear| field.child(clear))
             .child(components::keycap(
@@ -1207,7 +1189,6 @@ impl CatalogView {
             );
 
             let model_focused = form.model_index() == Some(form.focused);
-            let model_value = form.model.clone();
             controls = controls.child(
                 div()
                     .flex()
@@ -1255,24 +1236,16 @@ impl CatalogView {
                                 });
                             }))
                             .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_size(px(theme.font.sm))
-                                    .text_color(if model_value.is_empty() {
-                                        theme.colors.muted
-                                    } else {
-                                        theme.colors.text
-                                    })
-                                    .child(if model_value.is_empty() {
-                                        "Definition or agent default".to_string()
-                                    } else {
-                                        model_value.clone()
-                                    }),
-                            )
-                            .when(model_focused, |line| {
-                                line.child(div().text_color(theme.colors.accent).child("▌"))
-                            }),
+                                div().flex_1().min_w_0().text_size(px(theme.font.sm)).child(
+                                    state_text_element(
+                                        &self.state,
+                                        TextTarget::CatalogLaunchModel,
+                                        theme,
+                                        cx,
+                                    )
+                                    .placeholder("Definition or agent default"),
+                                ),
+                            ),
                     ),
             );
         }
@@ -1288,7 +1261,6 @@ impl CatalogView {
         }
         for (index, field) in form.fields.iter().enumerate() {
             let focused = form.focused == index;
-            let value = field.value.clone();
             let multiline = field.var.multiline;
             let prompt = if field.var.prompt.trim().is_empty() {
                 field.var.name.clone()
@@ -1358,35 +1330,28 @@ impl CatalogView {
                 }))
                 .child(
                     div()
+                        .flex_1()
+                        .min_w_0()
                         .flex()
-                        .items_center()
                         .when(multiline, |line| line.items_start())
                         .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .whitespace_normal()
-                                .text_size(px(theme.font.sm))
-                                .text_color(if value.is_empty() {
-                                    theme.colors.muted
-                                } else {
-                                    theme.colors.text
-                                })
-                                .child(if value.is_empty() {
-                                    "Type a value…".to_string()
-                                } else {
-                                    value.clone()
-                                }),
-                        )
-                        .when(focused, |line| {
-                            line.child(div().text_color(theme.colors.accent).child("▌"))
-                        }),
+                            div().flex_1().min_w_0().text_size(px(theme.font.sm)).child(
+                                state_text_element(
+                                    &self.state,
+                                    TextTarget::CatalogLaunchVar(index),
+                                    theme,
+                                    cx,
+                                )
+                                .placeholder("Type a value…")
+                                .multiline(multiline),
+                            ),
+                        ),
                 );
 
             let choice_row = choices.map(|choices| {
                 let mut row = div().flex().flex_wrap().gap(px(theme.spacing.s1));
                 for (choice_index, choice) in choices.into_iter().enumerate() {
-                    let selected = field.value == choice;
+                    let selected = field.value.value() == choice;
                     let choice_value = choice.clone();
                     let state = state.clone();
                     row = row.child(
@@ -1696,7 +1661,6 @@ impl CatalogView {
         };
 
         let cwd_focused = form.focused == OneShotFocus::Cwd;
-        let cwd_value = form.cwd.clone();
         let cwd_box = div()
             .id("catalog-oneshot-cwd")
             .flex()
@@ -1719,25 +1683,11 @@ impl CatalogView {
                 });
             }))
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(theme.font.sm))
-                    .text_color(if cwd_value.is_empty() {
-                        theme.colors.muted
-                    } else {
-                        theme.colors.text
-                    })
-                    .child(if cwd_value.is_empty() {
-                        "Daemon cwd (optional)".to_string()
-                    } else {
-                        cwd_value.clone()
-                    }),
-            )
-            .when(cwd_focused, |field| {
-                field.child(div().text_color(theme.colors.accent).child("▌"))
-            });
+                div().flex_1().min_w_0().text_size(px(theme.font.sm)).child(
+                    state_text_element(&self.state, TextTarget::CatalogOneShotCwd, theme, cx)
+                        .placeholder("Daemon cwd (optional)"),
+                ),
+            );
 
         let server_error = form.server_error.clone().map(|message| {
             let copy = self.error_copy_button(theme, &message, "catalog-sheet-error-copy", cx);

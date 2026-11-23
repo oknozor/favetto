@@ -13,6 +13,8 @@ use croner::parser::{CronParser, Seconds};
 use favetto_wire::model::Schedule;
 use serde_json::Value;
 
+use crate::text_input::TextInput;
+
 /// The first-fetch state of `schedules.list`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum SchedulesStatus {
@@ -54,7 +56,7 @@ impl ScheduleField {
 pub struct ScheduleEditor {
     /// `None` for a new schedule; `Some(id)` edits in place.
     pub id: Option<String>,
-    pub cron: String,
+    pub cron: TextInput,
     pub task: String,
     /// Preserved from the edited schedule; new schedules start from null.
     pub input: Value,
@@ -77,7 +79,7 @@ impl ScheduleEditor {
         let task = default_task.unwrap_or_default();
         let mut editor = Self {
             id: None,
-            cron: String::new(),
+            cron: TextInput::default(),
             task: task.clone(),
             input: Value::Null,
             enabled: true,
@@ -96,7 +98,7 @@ impl ScheduleEditor {
     pub fn edit(schedule: &Schedule, now: DateTime<Utc>) -> Self {
         let mut editor = Self {
             id: Some(schedule.id.clone()),
-            cron: schedule.cron.clone(),
+            cron: TextInput::new(schedule.cron.clone()),
             task: schedule.task.clone(),
             input: schedule.input.clone(),
             enabled: schedule.enabled,
@@ -117,13 +119,14 @@ impl ScheduleEditor {
     }
 
     /// Append a typed character to the focused text field.
+    #[allow(dead_code)] // Exercised by the model's tests.
     pub fn push_char(&mut self, character: char) {
         if character.is_control() {
             return;
         }
         match self.focus {
             ScheduleField::Cron => {
-                self.cron.push(character);
+                self.cron.push_char(character);
                 self.refresh(None);
             }
             ScheduleField::Task | ScheduleField::Enabled => {}
@@ -131,9 +134,27 @@ impl ScheduleEditor {
     }
 
     /// Remove the last character of the focused text field.
+    #[allow(dead_code)] // Exercised by the model's tests.
     pub fn backspace(&mut self) {
         if self.focus == ScheduleField::Cron {
-            self.cron.pop();
+            self.cron.backspace();
+            self.refresh(None);
+        }
+    }
+
+    /// The cron buffer. The field is always painted; `focus` only decides
+    /// whether it owns the keyboard/caret.
+    pub fn text_input_mut(&mut self) -> Option<&mut TextInput> {
+        Some(&mut self.cron)
+    }
+
+    pub fn text_input(&self) -> Option<&TextInput> {
+        Some(&self.cron)
+    }
+
+    /// Re-run the live validation after an in-place edit.
+    pub fn after_edit(&mut self) {
+        if self.focus == ScheduleField::Cron {
             self.refresh(None);
         }
     }
@@ -181,10 +202,10 @@ impl ScheduleEditor {
         let now = now.unwrap_or_else(Utc::now);
         self.hint = None;
         self.cron_error = None;
-        if self.cron.trim().is_empty() {
+        if self.cron.value().trim().is_empty() {
             return;
         }
-        match normalize_cron(&self.cron) {
+        match normalize_cron(self.cron.value()) {
             Ok(normalized) => {
                 self.hint = Some(describe_cron(&normalized, now));
             }
@@ -196,7 +217,7 @@ impl ScheduleEditor {
     /// when the form can be sent.
     pub fn validate(&mut self, now: DateTime<Utc>) -> Option<(String, String, bool)> {
         self.server_error = None;
-        let normalized = match normalize_cron(&self.cron) {
+        let normalized = match normalize_cron(self.cron.value()) {
             Ok(normalized) => {
                 self.cron_error = None;
                 normalized
@@ -802,11 +823,11 @@ mod tests {
             .as_deref()
             .is_some_and(|message| message.contains("Enter a cron expression")));
 
-        editor.cron = "0 0 25 * * *".to_string();
+        editor.cron = TextInput::new("0 0 25 * * *".to_string());
         editor.refresh(Some(now));
         assert!(editor.cron_error.is_some());
 
-        editor.cron = "0 9 * * 1-5".to_string();
+        editor.cron = TextInput::new("0 9 * * 1-5".to_string());
         editor.refresh(Some(now));
         assert!(editor.cron_error.is_none());
         assert!(editor

@@ -17,6 +17,7 @@ use serde_json::{Map, Value};
 
 use crate::repos::catalog_visible;
 use crate::search::{self, SearchField, SearchQuery};
+use crate::text_input::TextInput;
 
 /// The first-fetch state of `catalog.list`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -138,7 +139,7 @@ pub struct CatalogPreview {
 #[derive(Debug, Clone, PartialEq)]
 pub struct VarField {
     pub var: TaskVar,
-    pub value: String,
+    pub value: TextInput,
     pub error: Option<String>,
 }
 
@@ -146,7 +147,7 @@ impl VarField {
     fn new(var: &TaskVar) -> Self {
         Self {
             var: var.clone(),
-            value: var.default.clone().unwrap_or_default(),
+            value: TextInput::new(var.default.clone().unwrap_or_default()),
             error: None,
         }
     }
@@ -164,7 +165,7 @@ pub struct LaunchForm {
     /// default), and changeable before launch.
     pub agent: Option<String>,
     /// The model override typed into the sheet: a bare id or `provider/model`.
-    pub model: String,
+    pub model: TextInput,
     /// The daemon's rejection, kept attached to the form (never a toast-only
     /// error: the user must be able to correct the input).
     pub server_error: Option<String>,
@@ -203,6 +204,7 @@ impl LaunchForm {
                 _ => String::new(),
             }
         };
+        let model = TextInput::new(model);
         Self {
             entry,
             fields,
@@ -263,7 +265,9 @@ impl LaunchForm {
             if choices.is_empty() {
                 return false;
             }
-            let current = choices.iter().position(|choice| choice == &field.value);
+            let current = choices
+                .iter()
+                .position(|choice| choice == field.value.value());
             let next = match current {
                 Some(current) => {
                     let last = choices.len() as isize - 1;
@@ -273,7 +277,7 @@ impl LaunchForm {
             };
             choices[next].clone()
         };
-        field.value = next_value;
+        field.value = TextInput::new(next_value);
         field.error = None;
         true
     }
@@ -306,36 +310,84 @@ impl LaunchForm {
     }
 
     /// Append one typed character to the focused text control.
+    #[allow(dead_code)] // Exercised by the model's tests.
     pub fn push_char(&mut self, character: char) {
         if character.is_control() {
             return;
         }
         let focused = self.focused;
         if self.model_index() == Some(focused) {
-            self.model.push(character);
+            self.model.push_char(character);
             self.server_error = None;
             return;
         }
         let Some(field) = self.fields.get_mut(focused) else {
             return;
         };
-        field.value.push(character);
+        field.value.push_char(character);
         field.error = None;
         self.server_error = None;
     }
 
+    #[allow(dead_code)] // Exercised by the model's tests.
     pub fn pop_char(&mut self) {
         let focused = self.focused;
         if self.model_index() == Some(focused) {
-            self.model.pop();
+            self.model.backspace();
             self.server_error = None;
             return;
         }
         let Some(field) = self.fields.get_mut(focused) else {
             return;
         };
-        field.value.pop();
+        field.value.backspace();
         field.error = None;
+        self.server_error = None;
+    }
+
+    pub fn text_input(&self, target: crate::text_input::TextTarget) -> Option<&TextInput> {
+        use crate::text_input::TextTarget;
+        match target {
+            TextTarget::CatalogLaunchModel if self.model_index().is_some() => Some(&self.model),
+            TextTarget::CatalogLaunchVar(index) => self.fields.get(index).map(|f| &f.value),
+            _ => None,
+        }
+    }
+
+    pub fn text_input_for_target_mut(
+        &mut self,
+        target: crate::text_input::TextTarget,
+    ) -> Option<&mut TextInput> {
+        use crate::text_input::TextTarget;
+        match target {
+            TextTarget::CatalogLaunchModel if self.model_index().is_some() => Some(&mut self.model),
+            TextTarget::CatalogLaunchVar(index) => {
+                self.fields.get_mut(index).map(|field| &mut field.value)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn focused_text_target(&self) -> Option<crate::text_input::TextTarget> {
+        use crate::text_input::TextTarget;
+        if self.model_index() == Some(self.focused) {
+            Some(TextTarget::CatalogLaunchModel)
+        } else if self.focused < self.fields.len() {
+            Some(TextTarget::CatalogLaunchVar(self.focused))
+        } else {
+            None
+        }
+    }
+
+    /// Clear the inline error after an edit from the shared buffer.
+    pub fn after_text_edit(&mut self) {
+        if self.model_index() == Some(self.focused) {
+            self.server_error = None;
+            return;
+        }
+        if let Some(field) = self.fields.get_mut(self.focused) {
+            field.error = None;
+        }
         self.server_error = None;
     }
 
@@ -344,7 +396,7 @@ impl LaunchForm {
         if !self.show_overrides() {
             return (None, None);
         }
-        let model = self.model.trim();
+        let model = self.model.value().trim();
         (
             self.agent.clone(),
             (!model.is_empty()).then(|| model.to_string()),
@@ -356,14 +408,14 @@ impl LaunchForm {
         let mut valid = true;
         for field in &mut self.fields {
             field.error = None;
-            if field.value.trim().is_empty() {
+            if field.value.value().trim().is_empty() {
                 if field.var.required {
                     field.error = Some("This value is required.".to_string());
                     valid = false;
                 }
                 continue;
             }
-            if let Err(error) = field.var.coerce(&field.value) {
+            if let Err(error) = field.var.coerce(field.value.value()) {
                 field.error = Some(error.to_string());
                 valid = false;
             }
@@ -379,13 +431,13 @@ impl LaunchForm {
             if field.error.is_some() {
                 return None;
             }
-            if field.value.trim().is_empty() {
+            if field.value.value().trim().is_empty() {
                 if field.var.required {
                     return None;
                 }
                 continue;
             }
-            let value = field.var.coerce(&field.value).ok()?;
+            let value = field.var.coerce(field.value.value()).ok()?;
             map.insert(field.var.name.clone(), value);
         }
         Some(Value::Object(map))
@@ -413,7 +465,7 @@ pub struct AgentChoice {
 pub struct OneShotForm {
     pub agents: Vec<AgentChoice>,
     pub agent: Option<String>,
-    pub cwd: String,
+    pub cwd: TextInput,
     pub focused: OneShotFocus,
     pub server_error: Option<String>,
     pub submitting: bool,
@@ -430,7 +482,7 @@ impl OneShotForm {
         Self {
             agents,
             agent,
-            cwd: String::new(),
+            cwd: TextInput::default(),
             focused: OneShotFocus::Cwd,
             server_error: None,
             submitting: false,
@@ -466,7 +518,7 @@ impl OneShotForm {
 pub struct CatalogState {
     entries: Vec<CatalogEntry>,
     status: CatalogStatus,
-    query: String,
+    query: TextInput,
     search_active: bool,
     /// Collapsed namespace and folder keys, remembered for the session.
     collapsed: HashSet<String>,
@@ -607,7 +659,15 @@ impl CatalogState {
     // -- search ------------------------------------------------------------
 
     pub fn query(&self) -> &str {
+        self.query.value()
+    }
+
+    pub fn search_input(&self) -> &TextInput {
         &self.query
+    }
+
+    pub fn search_input_mut(&mut self) -> &mut TextInput {
+        &mut self.query
     }
 
     pub fn is_search_active(&self) -> bool {
@@ -622,26 +682,55 @@ impl CatalogState {
         self.search_active = false;
     }
 
+    #[allow(dead_code)] // Exercised by the model's tests.
     pub fn push_search_char(&mut self, character: char) -> Option<String> {
         if character.is_control() {
             return None;
         }
-        self.query.push(character);
+        self.query.push_char(character);
         self.ensure_selection();
         self.preview_needed()
     }
 
+    #[allow(dead_code)] // Exercised by the model's tests.
     pub fn backspace_search(&mut self) -> Option<String> {
-        self.query.pop();
+        self.query.backspace();
         self.ensure_selection();
         self.preview_needed()
+    }
+
+    /// Re-run the filter and return the definition whose preview is needed
+    /// after an in-place edit from the shared text element.
+    pub fn after_search_edit(&mut self) -> Option<String> {
+        self.ensure_selection();
+        self.preview_needed()
+    }
+
+    /// The editable buffer for a launch-sheet target.
+    pub fn launch_text_input(&self, target: crate::text_input::TextTarget) -> Option<&TextInput> {
+        self.launch.as_ref()?.text_input(target)
+    }
+
+    pub fn launch_text_input_mut(
+        &mut self,
+        target: crate::text_input::TextTarget,
+    ) -> Option<&mut TextInput> {
+        self.launch.as_mut()?.text_input_for_target_mut(target)
+    }
+
+    pub fn oneshot_cwd_input(&self) -> Option<&TextInput> {
+        self.oneshot.as_ref().map(|form| &form.cwd)
+    }
+
+    pub fn oneshot_cwd_input_mut(&mut self) -> Option<&mut TextInput> {
+        self.oneshot.as_mut().map(|form| &mut form.cwd)
     }
 
     /// Clear the query and leave search mode. Returns whether anything changed.
     pub fn clear_search(&mut self) -> bool {
         let changed = self.search_active || !self.query.is_empty();
         self.search_active = false;
-        self.query.clear();
+        self.query.set_value(String::new());
         self.ensure_selection();
         changed
     }
@@ -650,7 +739,7 @@ impl CatalogState {
 
     /// Whether the active filter has no terms (whitespace-only counts as empty).
     fn query_is_empty(&self) -> bool {
-        SearchQuery::new(&self.query).is_empty()
+        SearchQuery::new(self.query.value()).is_empty()
     }
 
     /// The visible groups after the fuzzy filter. An empty query keeps the
@@ -659,7 +748,7 @@ impl CatalogState {
     /// most relevant definition is first.
     pub fn groups(&self) -> Vec<CatalogGroup> {
         let matcher = search::matcher();
-        let query = SearchQuery::new(&self.query);
+        let query = SearchQuery::new(self.query.value());
         let mut scored: Vec<(i64, CatalogEntryView)> = self
             .entries
             .iter()
@@ -898,12 +987,14 @@ impl CatalogState {
 
     /// Append one typed character to the focused text control (a var or the
     /// model override). The agent picker is changed with arrows/clicks.
+    #[allow(dead_code)] // Exercised by the model's tests.
     pub fn push_launch_char(&mut self, character: char) {
         if let Some(form) = self.launch.as_mut() {
             form.push_char(character);
         }
     }
 
+    #[allow(dead_code)] // Exercised by the model's tests.
     pub fn backspace_launch(&mut self) {
         if let Some(form) = self.launch.as_mut() {
             form.pop_char();
@@ -911,6 +1002,7 @@ impl CatalogState {
     }
 
     /// Enter inside a multiline var inserts a line break instead of submitting.
+    #[allow(dead_code)] // Exercised by the model's tests.
     pub fn push_launch_newline(&mut self) -> bool {
         let Some(form) = self.launch.as_mut() else {
             return false;
@@ -921,7 +1013,7 @@ impl CatalogState {
         if !field.var.multiline {
             return false;
         }
-        field.value.push('\n');
+        field.value.insert("\n");
         field.error = None;
         form.server_error = None;
         true
@@ -986,6 +1078,7 @@ impl CatalogState {
         self.oneshot = None;
     }
 
+    #[allow(dead_code)] // Exercised by the model's tests.
     pub fn push_oneshot_char(&mut self, character: char) {
         let Some(form) = self.oneshot.as_mut() else {
             return;
@@ -996,16 +1089,17 @@ impl CatalogState {
         // Typing while the agent picker is highlighted edits the cwd: the
         // picker is changed with arrow keys/clicks, never with free text.
         form.focused = OneShotFocus::Cwd;
-        form.cwd.push(character);
+        form.cwd.push_char(character);
         form.server_error = None;
     }
 
+    #[allow(dead_code)] // Exercised by the model's tests.
     pub fn backspace_oneshot(&mut self) {
         let Some(form) = self.oneshot.as_mut() else {
             return;
         };
         form.focused = OneShotFocus::Cwd;
-        form.cwd.pop();
+        form.cwd.backspace();
         form.server_error = None;
     }
 
@@ -1610,10 +1704,10 @@ mod tests {
         );
         assert!(form.input().is_none());
 
-        form.fields[0].value = "  ".to_string();
+        form.fields[0].value = TextInput::new("  ".to_string());
         assert!(!form.validate());
 
-        form.fields[0].value = "42".to_string();
+        form.fields[0].value = TextInput::new("42".to_string());
         assert!(form.validate());
         assert_eq!(form.input().unwrap(), serde_json::json!({ "issue": "42" }));
     }
@@ -1625,8 +1719,8 @@ mod tests {
         let mut choice_var = var("mode", false);
         choice_var.choices = Some(vec!["fast".to_string(), "slow".to_string()]);
         let mut form = LaunchForm::new(entry("plan", None, "plan", vec![int_var, choice_var]));
-        form.fields[0].value = "many".to_string();
-        form.fields[1].value = "medium".to_string();
+        form.fields[0].value = TextInput::new("many".to_string());
+        form.fields[1].value = TextInput::new("medium".to_string());
         assert!(!form.validate());
         assert_eq!(form.fields[0].error.as_deref(), Some("must be an integer"));
         assert_eq!(
@@ -1634,13 +1728,32 @@ mod tests {
             Some("must be one of: fast, slow")
         );
 
-        form.fields[0].value = "3".to_string();
-        form.fields[1].value = "fast".to_string();
+        form.fields[0].value = TextInput::new("3".to_string());
+        form.fields[1].value = TextInput::new("fast".to_string());
         assert!(form.validate());
         assert_eq!(
             form.input().unwrap(),
             serde_json::json!({ "count": 3, "mode": "fast" })
         );
+    }
+
+    #[test]
+    fn a_launch_var_edits_in_the_middle_and_accepts_multiline_newlines() {
+        let mut multiline = var("note", false);
+        multiline.multiline = true;
+        let mut form = LaunchForm::new(entry("plan", None, "plan", vec![multiline]));
+        form.focused = 0;
+        for character in "abcd".chars() {
+            form.push_char(character);
+        }
+        form.fields[0].value.move_to(2);
+        form.push_char('X');
+        assert_eq!(form.fields[0].value, "abXcd");
+        form.pop_char();
+        assert_eq!(form.fields[0].value, "abcd");
+        form.fields[0].value.move_to(2);
+        form.fields[0].value.insert("\n");
+        assert_eq!(form.fields[0].value, "ab\ncd");
     }
 
     #[test]
@@ -1670,7 +1783,7 @@ mod tests {
             "plan",
             vec![var("issue", true), var("note", false)],
         ));
-        form.fields[0].value = "7".to_string();
+        form.fields[0].value = TextInput::new("7".to_string());
         assert!(form.validate());
         assert_eq!(form.input().unwrap(), serde_json::json!({ "issue": "7" }));
     }

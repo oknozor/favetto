@@ -9,6 +9,7 @@
 use favetto_wire::model::RepoInfo;
 
 use crate::search::{self, SearchField, SearchQuery};
+use crate::text_input::TextInput;
 
 /// One row of the repo picker.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,7 +112,7 @@ pub fn repo_picker_entries(repos: &[RepoInfo], filter: &str) -> Vec<RepoOption> 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepoPicker {
     open: bool,
-    filter: String,
+    filter: TextInput,
     selected: usize,
     error: Option<String>,
     submitting: bool,
@@ -122,7 +123,7 @@ impl RepoPicker {
     /// there is one (otherwise the leading `global` row).
     pub fn open(&mut self, repos: &[RepoInfo]) {
         self.open = true;
-        self.filter.clear();
+        self.filter.set_value(String::new());
         self.error = None;
         self.submitting = false;
         self.selected = repos
@@ -136,7 +137,7 @@ impl RepoPicker {
     /// Close the picker and clear its transient state.
     pub fn close(&mut self) {
         self.open = false;
-        self.filter.clear();
+        self.filter.set_value(String::new());
         self.selected = 0;
         self.error = None;
         self.submitting = false;
@@ -147,7 +148,15 @@ impl RepoPicker {
     }
 
     pub fn filter(&self) -> &str {
+        self.filter.value()
+    }
+
+    pub fn input(&self) -> &TextInput {
         &self.filter
+    }
+
+    pub fn input_mut(&mut self) -> &mut TextInput {
+        &mut self.filter
     }
 
     pub fn selected(&self) -> usize {
@@ -164,7 +173,7 @@ impl RepoPicker {
 
     /// The filtered rows, always with the leading `global` row.
     pub fn entries(&self, repos: &[RepoInfo]) -> Vec<RepoOption> {
-        repo_picker_entries(repos, &self.filter)
+        repo_picker_entries(repos, self.filter.value())
     }
 
     /// The highlighted row.
@@ -189,17 +198,24 @@ impl RepoPicker {
     }
 
     /// Append one typed character to the filter.
+    #[allow(dead_code)] // Exercised by the model's tests.
     pub fn push_char(&mut self, character: char, repos: &[RepoInfo]) {
         if character.is_control() {
             return;
         }
-        self.filter.push(character);
+        self.filter.push_char(character);
         self.clamp(repos);
     }
 
     /// Remove the last filter character.
+    #[allow(dead_code)] // Exercised by the model's tests.
     pub fn backspace(&mut self, repos: &[RepoInfo]) {
-        self.filter.pop();
+        self.filter.backspace();
+        self.clamp(repos);
+    }
+
+    /// Re-clamp after an in-place edit from the shared text element.
+    pub fn after_edit(&mut self, repos: &[RepoInfo]) {
         self.clamp(repos);
     }
 

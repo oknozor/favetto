@@ -28,6 +28,8 @@ use favetto_wire::rpc::{AgentAttachResult, AgentEventPush, RpcCall, TasksEventsP
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::text_input::TextInput;
+
 use crate::inbox::{self, StatusKind};
 use crate::search::{self, SearchField, SearchQuery};
 use crate::tasks;
@@ -854,7 +856,7 @@ pub struct TaskDetail {
     /// The current advertised command snapshot.
     pub commands: Option<Vec<AgentCommand>>,
     /// The follow-up prompt draft.
-    pub prompt: String,
+    pub prompt: TextInput,
     /// The highlighted command completion in the prompt.
     pub prompt_selected: Option<usize>,
     /// Whether an `agents.prompt` is in flight.
@@ -902,7 +904,7 @@ impl TaskDetail {
             answered_request: None,
             plan: None,
             commands: None,
-            prompt: String::new(),
+            prompt: TextInput::default(),
             prompt_selected: None,
             prompt_sending: false,
             prompt_open: false,
@@ -953,7 +955,7 @@ impl TaskDetail {
             self.turn_cancel_pending = None;
             self.plan = None;
             self.commands = None;
-            self.prompt.clear();
+            self.prompt.set_value(String::new());
             self.prompt_selected = None;
             self.prompt_sending = false;
             self.prompt_open = false;
@@ -1429,7 +1431,7 @@ impl TaskDetail {
 
     /// The `/prefix` currently being completed, only for a bare first token.
     pub fn command_query(&self) -> Option<&str> {
-        command_query(&self.prompt)
+        command_query(self.prompt.value())
     }
 
     /// Advertised commands matching the current query, most relevant first and
@@ -1470,7 +1472,7 @@ impl TaskDetail {
         let Some(name) = name else {
             return false;
         };
-        self.prompt = format!("/{name} ");
+        self.prompt.set_value(format!("/{name} "));
         self.prompt_selected = None;
         true
     }
@@ -1478,7 +1480,7 @@ impl TaskDetail {
     /// The exact matched command's input hint, when present.
     #[allow(dead_code)] // Kept on the pure model for parity with the TUI; the view reads it inline.
     pub fn command_hint(&self) -> Option<&str> {
-        let rest = self.prompt.strip_prefix('/')?;
+        let rest = self.prompt.value().strip_prefix('/')?;
         let name = rest.split_whitespace().next().unwrap_or_default();
         self.commands
             .as_ref()?
@@ -2172,26 +2174,26 @@ mod tests {
             },
         ]);
 
-        detail.prompt = "/w".to_string();
+        detail.prompt.set_value("/w".to_string());
         assert_eq!(detail.command_query(), Some("w"));
         assert_eq!(detail.command_matches().len(), 1);
         assert!(detail.complete_command());
         assert_eq!(detail.prompt, "/web ");
         assert_eq!(detail.command_hint(), Some("query"));
 
-        detail.prompt = "/nope arg".to_string();
+        detail.prompt.set_value("/nope arg".to_string());
         assert!(!detail.complete_command());
         assert_eq!(
             detail.prompt, "/nope arg",
             "unknown commands stay ordinary prompt text"
         );
 
-        detail.prompt = "/t".to_string();
+        detail.prompt.set_value("/t".to_string());
         assert!(detail.complete_command());
         assert_eq!(detail.prompt, "/test ");
-        detail.prompt.push('x');
+        detail.prompt.push_char('x');
         detail.prompt_selected = Some(0);
-        detail.prompt.pop();
+        detail.prompt.backspace();
         assert_eq!(detail.prompt, "/test ");
     }
 
@@ -2204,7 +2206,7 @@ mod tests {
             input_hint: Some("query".to_string()),
         }]);
 
-        detail.prompt = "/W".to_string();
+        detail.prompt.set_value("/W".to_string());
         assert_eq!(detail.command_matches().len(), 1);
         assert!(detail.complete_command());
         assert_eq!(detail.prompt, "/web ");
