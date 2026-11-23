@@ -16,7 +16,7 @@ use favetto_wire::model::{AgentUsage, Task, TaskRun};
 use favetto_wire::Timestamp;
 use gpui::{
     div, prelude::*, px, AnyElement, Context, Div, Entity, FocusHandle, Hsla, IntoElement, Render,
-    Stateful, Window,
+    ScrollHandle, Stateful, Window,
 };
 
 use crate::components;
@@ -43,6 +43,9 @@ pub struct DetailView {
     session_focus: FocusHandle,
     runs_retry_focus: FocusHandle,
     error_copy_focus: FocusHandle,
+    /// Scroll state for the Runs attempt list.
+    runs_scroll: ScrollHandle,
+    runs_scrollbar: components::ScrollbarDrag,
 }
 
 impl DetailView {
@@ -69,6 +72,8 @@ impl DetailView {
             workflow_focus: cx.focus_handle().tab_index(52).tab_stop(true),
             runs_retry_focus: cx.focus_handle().tab_index(65).tab_stop(true),
             error_copy_focus: cx.focus_handle().tab_index(67).tab_stop(true),
+            runs_scroll: ScrollHandle::new(),
+            runs_scrollbar: components::ScrollbarDrag::new(),
         };
         view.start_clock(cx);
         view
@@ -704,12 +709,29 @@ impl DetailView {
         for run in runs.iter().rev() {
             column = column.child(run_row(theme, run, current_attempt, now));
         }
+        let runs_view = cx.entity().downgrade();
+        let scrollbar = components::vertical_scrollbar(
+            theme,
+            "detail-runs",
+            components::ScrollbarSource::Handle(self.runs_scroll.clone()),
+            &self.runs_scrollbar,
+            move |_window, cx| {
+                let _ = runs_view.update(cx, |_this, cx| cx.notify());
+            },
+        );
         div()
-            .id("detail-runs-scroll")
+            .relative()
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
-            .child(column)
+            .child(
+                div()
+                    .id("detail-runs-scroll")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.runs_scroll)
+                    .child(column),
+            )
+            .when_some(scrollbar, |pane, bar| pane.child(bar))
             .into_any_element()
     }
 
