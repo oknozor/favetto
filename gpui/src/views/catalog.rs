@@ -786,8 +786,7 @@ impl CatalogView {
                         return;
                     };
                     let pointer_x = f32::from(event.event.position.x);
-                    let available_width =
-                        f32::from(window.viewport_size().width) - SIDEBAR_WIDTH - RESIZE_HANDLE;
+                    let available_width = f32::from(window.viewport_size().width) - SIDEBAR_WIDTH;
                     let width = clamp_catalog_preview_width(
                         start.requested_width(pointer_x),
                         available_width,
@@ -1942,8 +1941,7 @@ impl Render for CatalogView {
 
         // Re-clamp on every render, like the detail column, so shrinking the
         // window cannot leave an oversized preview.
-        let available_width =
-            f32::from(window.viewport_size().width) - SIDEBAR_WIDTH - RESIZE_HANDLE;
+        let available_width = f32::from(window.viewport_size().width) - SIDEBAR_WIDTH;
         self.preview_width = clamp_catalog_preview_width(self.preview_width, available_width);
 
         let mut root = div()

@@ -42,7 +42,8 @@ the desktop app without relearning the product.
   detail becomes a pushed page instead of a third column (GPUI
   `container_query`); on wide windows the detail/list boundary is a resizable
   divider, and the Catalog's source pane has the same left-edge divider. Both
-  are session-scoped and clamped to keep the list usable.
+  are session-scoped: a pane can grow until its divider stops an 8 px grab gap
+  short of the navigation rail, and the list beside it collapses to that gap.
 - **One primary action per view** (**Hick's Law**, **Choice Overload**). Inbox
   rows: *open*. Task detail: *answer permission* when blocked, otherwise
   *cancel/retry*. Everything else lives behind the command palette or a menu.

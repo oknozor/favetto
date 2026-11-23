@@ -111,9 +111,11 @@ pinned while the tab body scrolls:
   duration and usage.
 
 On wide windows, the detail column's left edge is an invisible 8 px resize
-handle with a column-resize cursor. Dragging it clamps the width to 280–720 px
-and to the space left by the sidebar and a 360 px working-list floor. The width
-lasts for the session; the narrow pushed page is unchanged.
+handle with a column-resize cursor. Dragging it clamps the width to 280 px at
+the minimum and, at the maximum, to the viewport less the sidebar and an 8 px
+grab gap: the working list collapses to that gap so the divider stops just short
+of the navigation rail and stays grabbable. The width lasts for the session; the
+narrow pushed page is unchanged.
 
 A blocked run pins a warning banner with the request message and its options;
 **Allow once**, **Always allow** (when the agent offers it) and **Reject** map to
@@ -142,10 +144,10 @@ revision, so repainting or scrolling does not re-parse it; **Copy** still puts
 the exact raw source, including the front matter, on the clipboard.
 
 The preview's left edge is an invisible 8 px resize handle with a
-column-resize cursor. Dragging it clamps the width to 280–720 px and to the
-space left by the sidebar and a 360 px definition-list floor. The width lasts
-for the session (selecting another definition or refreshing the catalog keeps
-it); restarting the app restores 350 px.
+column-resize cursor. Dragging it clamps the width to 280 px at the minimum and,
+at the maximum, to the viewport less the sidebar and an 8 px grab gap beside the
+definition list. The width lasts for the session (selecting another definition
+or refreshing the catalog keeps it); restarting the app restores 350 px.
 
 **Start with variables…** (or `Enter`) opens the launch sheet. It shows the
 definition's agent, provider/model, `cwd`, schedule and every declared `[[vars]]`
