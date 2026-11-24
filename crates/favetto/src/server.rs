@@ -1590,10 +1590,11 @@ async fn list_agent_history(
 ) -> anyhow::Result<Vec<AgentSessionHistoryEntry>> {
     let records = db::list_agent_sessions(&state.db, limit).await?;
     let live = live_sessions(state);
-    Ok(records
-        .into_iter()
-        .map(|record| agent_history_entry(state, record, &live))
-        .collect())
+    let mut entries = Vec::with_capacity(records.len());
+    for record in records {
+        entries.push(agent_history_entry(state, record, &live).await);
+    }
+    Ok(entries)
 }
 
 /// Resolve the Favetto-created session associated with one task.
@@ -1612,9 +1613,10 @@ async fn task_session(
         .iter()
         .find(|record| live.contains_key(&record.id))
         .or_else(|| records.first());
-    Ok(preferred
-        .cloned()
-        .map(|record| agent_history_entry(state, record, &live)))
+    match preferred.cloned() {
+        Some(record) => Ok(Some(agent_history_entry(state, record, &live).await)),
+        None => Ok(None),
+    }
 }
 
 /// Snapshot the live sessions keyed by their Favetto-local id.
@@ -1634,7 +1636,7 @@ fn live_sessions(state: &Arc<State>) -> HashMap<String, AgentSessionInfo> {
 /// `loadable` when the stored provider ACP id is present, the record did not
 /// fail, and its configured agent is still available. The provider id itself is
 /// never sent to clients.
-fn agent_history_entry(
+async fn agent_history_entry(
     state: &Arc<State>,
     record: db::AgentSessionRecord,
     live: &HashMap<String, AgentSessionInfo>,
@@ -1667,6 +1669,10 @@ fn agent_history_entry(
             load_error = Some(
                 "no ACP session id was recorded, so this session cannot be restored".to_string(),
             );
+        } else if let Some(error) = crate::executor::session_cwd_error(&record).await {
+            // A dead run worktree is only loadable when its provenance can
+            // recreate the exact path; otherwise the row says why.
+            load_error = Some(error);
         } else {
             match state.registry.get_checked(&record.agent) {
                 Ok(_) => loadable = true,
@@ -1704,7 +1710,7 @@ async fn load_agent(
         }
     }
 
-    let record = db::get_agent_session(&state.db, local_id)
+    let mut record = db::get_agent_session(&state.db, local_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("no persisted agent session '{local_id}'"))?;
 
@@ -1722,6 +1728,14 @@ async fn load_agent(
 
     let name = record.agent.clone();
     let agent = state.registry.get_checked(&name)?;
+    // The recorded cwd may be a run worktree cleanup already removed. Recreate
+    // the exact path before the ACP process starts; never substitute the repo
+    // or daemon cwd, which can make the provider miss its project-scoped store.
+    crate::executor::ensure_session_cwd(&state.db, &mut record)
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("agent session '{local_id}' cannot be restored: {error}")
+        })?;
     let mcp = crate::mcp::resolve_for_restore(state, record.mcp_servers.as_deref());
     state.agents.load(&name, agent, record, mcp).await
 }
@@ -2448,6 +2462,11 @@ async fn delete_task(state: &State, id: Uuid) -> Result<TasksDeleteResult, RpcEr
             &worktree.branch,
         )
         .await;
+    }
+    // The session rows were just deleted, so any checkout they owned and its
+    // hidden ref can never be used again.
+    for workspace in outcome.session_workspaces {
+        crate::executor::remove_session_workspace(&workspace).await;
     }
     state.bus.publish(ServerPush::TaskDeleted(id));
     Ok(TasksDeleteResult { id, deleted: true })

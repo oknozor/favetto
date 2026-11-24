@@ -249,6 +249,18 @@ replayed transcript across reconnects, and accepts follow-up prompts. Loading a
 session does not send a prompt, run its linked task, create a new run, or change
 an interrupted run's status.
 
+A session that ran in a disposable worktree also stores its workspace
+provenance: the repository, the exact launch path, the run branch and commit,
+and a hidden `refs/favetto/session-workspaces/<task-id>` ref that keeps the
+commit reachable after the `favetto/*` branch is deleted. Before
+`session/load`, the daemon recreates that exact absolute path as a detached
+checkout when cleanup removed it. It never substitutes the base repository or
+the daemon's working directory, because provider session stores can be scoped to
+the project path. Restore recovers the conversation and its launch directory;
+uncommitted worktree changes are not recovered. A session whose repository or
+recorded commit is gone is reported as not loadable with the reason, and the
+record remains retryable rather than being permanently marked failed.
+
 `agents.history` lists only sessions **created by Favetto**. Provider-owned
 history is separate and is queried from the agent itself with ACP
 `session/list` through `agents.provider_sessions`; the daemon only issues that

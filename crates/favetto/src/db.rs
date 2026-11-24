@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use favetto_core::Timestamp;
+use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
 };
@@ -199,6 +200,11 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
     status              TEXT NOT NULL,
     error               TEXT,
     mcp_servers         TEXT,
+    -- Provenance for a session whose launch directory was a run worktree. The
+    -- JSON keeps the repository, exact path, branch, commit and a surviving Git
+    -- ref so the directory can be recreated after task cleanup. NULL for a
+    -- session that ran directly in a stable directory.
+    workspace           TEXT,
     created_at          INTEGER NOT NULL,
     updated_at          INTEGER NOT NULL
 );
@@ -338,6 +344,11 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     // set. Stored as a JSON array of registry names; NULL means the row predates
     // the registry and restores with the current default selection.
     let _ = sqlx::query("ALTER TABLE agent_sessions ADD COLUMN mcp_servers TEXT")
+        .execute(pool)
+        .await;
+    // Workspace provenance for sessions launched in a disposable run worktree.
+    // Legacy rows keep NULL; loading falls back to the recorded cwd alone.
+    let _ = sqlx::query("ALTER TABLE agent_sessions ADD COLUMN workspace TEXT")
         .execute(pool)
         .await;
     Ok(())
@@ -1818,6 +1829,47 @@ impl AgentSessionStatus {
     }
 }
 
+/// Provenance for a session whose launch directory was a run worktree.
+///
+/// The worktree is disposable run state: the executor removes it (and its
+/// `favetto/*` branch) when the task finishes with `keep_worktree = false`. An
+/// ACP session still needs the exact absolute directory for `session/load`, so
+/// this descriptor records enough to recreate it as a detached checkout.
+///
+/// `git_ref` is a hidden ref kept outside `refs/heads/favetto/*`, so it survives
+/// branch deletion and keeps `head` reachable through Git garbage collection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionWorkspace {
+    /// Descriptor kind. Reserved for future workspace types; today always
+    /// `git_worktree`.
+    #[serde(default = "default_workspace_kind")]
+    pub kind: String,
+    /// Repository root the worktree was linked from.
+    pub repo: PathBuf,
+    /// Exact absolute launch directory that must be recreated.
+    pub path: PathBuf,
+    /// Run branch that originally checked out the worktree, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Commit at the end of the run, when it could be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    /// Surviving ref that keeps `head` reachable after branch cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+    /// The task's base directory, for diagnostics and fallback identification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_cwd: Option<PathBuf>,
+    /// When this descriptor's directory was last recreated by a restore. The
+    /// retention sweep only reclaims checkouts marked as session-owned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rehydrated_at: Option<Timestamp>,
+}
+
+fn default_workspace_kind() -> String {
+    "git_worktree".to_string()
+}
+
 /// Durable metadata for one ACP session created by Favetto.
 ///
 /// `id` is Favetto's local routing key and is never the agent's ACP session id.
@@ -1846,6 +1898,8 @@ pub struct AgentSessionRecord {
     /// predates the registry and restores with the current default selection;
     /// `Some(empty)` means the session explicitly used none.
     pub mcp_servers: Option<Vec<String>>,
+    /// How to recreate `cwd` if it was a disposable run worktree.
+    pub workspace: Option<SessionWorkspace>,
     /// Current lifecycle state.
     pub status: AgentSessionStatus,
     /// Last error, for a `Failed` record.
@@ -1872,6 +1926,7 @@ impl AgentSessionRecord {
             run_id: None,
             title: None,
             mcp_servers: None,
+            workspace: None,
             status: AgentSessionStatus::Loading,
             error: None,
             created_at: now,
@@ -1888,9 +1943,9 @@ pub async fn insert_agent_session(
 ) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO agent_sessions
-            (id, agent, external_session_id, cwd, task_id, run_id, title, mcp_servers, status,
-             error, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (id, agent, external_session_id, cwd, task_id, run_id, title, mcp_servers, workspace,
+             status, error, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&session.id)
     .bind(&session.agent)
@@ -1902,6 +1957,13 @@ pub async fn insert_agent_session(
     .bind(
         session
             .mcp_servers
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+    )
+    .bind(
+        session
+            .workspace
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?,
@@ -1934,6 +1996,7 @@ pub async fn update_agent_session(
              run_id = ?,
              title = ?,
              mcp_servers = ?,
+             workspace = ?,
              status = ?,
              error = ?,
              updated_at = ?
@@ -1948,6 +2011,13 @@ pub async fn update_agent_session(
     .bind(
         session
             .mcp_servers
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+    )
+    .bind(
+        session
+            .workspace
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?,
@@ -2101,6 +2171,46 @@ pub async fn set_agent_session_title(
     Ok(result.rows_affected() == 1)
 }
 
+/// Persist a session's workspace provenance (or clear it).
+///
+/// The executor writes this immediately before it removes a finished run's
+/// worktree, and a successful rehydration records its timestamp here so the
+/// retention sweep knows the checkout is session-owned.
+pub async fn set_agent_session_workspace(
+    pool: &SqlitePool,
+    id: &str,
+    workspace: Option<&SessionWorkspace>,
+    updated_at: Timestamp,
+) -> anyhow::Result<bool> {
+    let result =
+        sqlx::query("UPDATE agent_sessions SET workspace = ?, updated_at = ? WHERE id = ?")
+            .bind(workspace.map(serde_json::to_string).transpose()?)
+            .bind(ts_ms(updated_at))
+            .bind(id)
+            .execute(pool)
+            .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Sessions carrying a workspace descriptor, regardless of status.
+///
+/// Retention uses this to find rehydrated checkouts it created on behalf of a
+/// restore; ordinary sessions stay in the main history queries.
+pub async fn list_agent_sessions_with_workspace(
+    pool: &SqlitePool,
+) -> anyhow::Result<Vec<AgentSessionRecord>> {
+    let rows = sqlx::query(
+        "SELECT id, agent, external_session_id, cwd, task_id, run_id, title, mcp_servers,
+                workspace, status, error, created_at, updated_at
+         FROM agent_sessions
+         WHERE workspace IS NOT NULL
+         ORDER BY updated_at DESC, created_at DESC, id ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(row_to_agent_session).collect())
+}
+
 /// Fetch one durable session by its Favetto-local id.
 #[allow(dead_code)] // wired into session launch/history by the following steps
 pub async fn get_agent_session(
@@ -2109,7 +2219,7 @@ pub async fn get_agent_session(
 ) -> anyhow::Result<Option<AgentSessionRecord>> {
     let row = sqlx::query(
         "SELECT id, agent, external_session_id, cwd, task_id, run_id, title, mcp_servers,
-                status, error, created_at, updated_at
+                workspace, status, error, created_at, updated_at
          FROM agent_sessions WHERE id = ?",
     )
     .bind(id)
@@ -2130,7 +2240,7 @@ pub async fn get_agent_session_by_external(
 ) -> anyhow::Result<Option<AgentSessionRecord>> {
     let row = sqlx::query(
         "SELECT id, agent, external_session_id, cwd, task_id, run_id, title, mcp_servers,
-                status, error, created_at, updated_at
+                workspace, status, error, created_at, updated_at
          FROM agent_sessions WHERE agent = ? AND external_session_id = ?",
     )
     .bind(agent)
@@ -2148,7 +2258,7 @@ pub async fn list_agent_sessions(
 ) -> anyhow::Result<Vec<AgentSessionRecord>> {
     let rows = sqlx::query(
         "SELECT id, agent, external_session_id, cwd, task_id, run_id, title, mcp_servers,
-                status, error, created_at, updated_at
+                workspace, status, error, created_at, updated_at
          FROM agent_sessions
          ORDER BY updated_at DESC, created_at DESC, id ASC
          LIMIT ?",
@@ -2171,7 +2281,7 @@ pub async fn list_agent_sessions_for_task(
 ) -> anyhow::Result<Vec<AgentSessionRecord>> {
     let rows = sqlx::query(
         "SELECT id, agent, external_session_id, cwd, task_id, run_id, title, mcp_servers,
-                status, error, created_at, updated_at
+                workspace, status, error, created_at, updated_at
          FROM agent_sessions
          WHERE task_id = ?
          ORDER BY updated_at DESC, created_at DESC, id ASC
@@ -2199,6 +2309,11 @@ fn row_to_agent_session(row: &SqliteRow) -> AgentSessionRecord {
         title: row.try_get::<Option<String>, _>("title").ok().flatten(),
         mcp_servers: row
             .try_get::<Option<String>, _>("mcp_servers")
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str(&raw).ok()),
+        workspace: row
+            .try_get::<Option<String>, _>("workspace")
             .ok()
             .flatten()
             .and_then(|raw| serde_json::from_str(&raw).ok()),
@@ -2556,6 +2671,10 @@ pub async fn list_worktrees(pool: &SqlitePool) -> anyhow::Result<Vec<WorktreeRec
 pub struct DeleteTaskOutcome {
     pub deleted: bool,
     pub worktree: Option<WorktreeRecord>,
+    /// Session-owned checkouts whose metadata this call removed. The caller
+    /// reclaims their directories and hidden refs; keeping them would leak a
+    /// checkout no row can reference.
+    pub session_workspaces: Vec<SessionWorkspace>,
 }
 
 /// Permanently delete one terminal task and every Favetto-local row owned by it.
@@ -2585,6 +2704,24 @@ pub async fn delete_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<DeleteTa
     .fetch_optional(&mut *tx)
     .await?
     .map(|row| row_to_worktree(&row));
+
+    let session_workspaces = sqlx::query(
+        "SELECT workspace FROM agent_sessions \
+         WHERE (task_id = ? OR run_id IN (SELECT id FROM task_runs WHERE task_id = ?)) \
+           AND workspace IS NOT NULL",
+    )
+    .bind(&task_id)
+    .bind(&task_id)
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .filter_map(|row| {
+        row.try_get::<Option<String>, _>("workspace")
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<SessionWorkspace>(&raw).ok())
+    })
+    .collect();
 
     let result = sqlx::query(
         "DELETE FROM tasks WHERE id = ? AND status IN ('succeeded', 'failed', 'cancelled')",
@@ -2625,6 +2762,7 @@ pub async fn delete_task(pool: &SqlitePool, id: Uuid) -> anyhow::Result<DeleteTa
     Ok(DeleteTaskOutcome {
         deleted: true,
         worktree,
+        session_workspaces,
     })
 }
 

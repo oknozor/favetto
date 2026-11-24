@@ -1361,6 +1361,215 @@ async fn remove_worktree_deletes_branch_after_directory_vanished() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Regression for #536: a session launched in a run worktree must keep enough
+/// provenance to recreate the exact path after cleanup deletes the directory and
+/// its `favetto/*` branch. The hidden ref keeps the run-only commit reachable.
+#[tokio::test]
+async fn session_workspace_recreates_exact_worktree_after_cleanup() {
+    let dir = scratch_dir("session-workspace-recreate");
+    let repo = dir.join("repo");
+    init_git_repo(&repo).await;
+    let state = join_state(&dir, vec![repo_def("review", &repo, "")]).await;
+
+    let task = lineage_task("review", TaskStatus::Succeeded, None, None);
+    let branch = branch_name(&task);
+    let worktree = dir.join("worktrees").join(task.id.to_string());
+    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    let wt = worktree.to_string_lossy().into_owned();
+    git_run(&repo, &["worktree", "add", "--force", "-B", &branch, &wt]).await;
+
+    // A run-only commit exists on the worktree branch and nowhere else.
+    std::fs::write(worktree.join("run.txt"), "run output").unwrap();
+    git_run(&worktree, &["add", "-A"]).await;
+    git_run(
+        &worktree,
+        &["-c", "commit.gpgsign=false", "commit", "-qm", "run"],
+    )
+    .await;
+    let head = git_rev_parse(&worktree, "HEAD")
+        .await
+        .expect("worktree HEAD");
+
+    let now = Timestamp::now();
+    let run = running_run(task.id);
+    let mut session = db::AgentSessionRecord::loading("local-1", "opencode", &worktree, now);
+    session.task_id = Some(task.id.to_string());
+    session.run_id = Some(run.id.to_string());
+    session.external_session_id = Some("provider-1".to_string());
+    session.status = db::AgentSessionStatus::Ended;
+    db::insert_agent_session(&state.db, &session).await.unwrap();
+
+    let plan = Worktree {
+        repo: repo.clone(),
+        path: worktree.clone(),
+        branch: branch.clone(),
+        base: repo.clone(),
+    };
+    persist_session_workspace(&state, &run, &plan).await;
+    let stored = db::get_agent_session(&state.db, "local-1")
+        .await
+        .unwrap()
+        .unwrap();
+    let workspace = stored.workspace.as_ref().expect("workspace recorded");
+    assert_eq!(workspace.path, worktree);
+    assert_eq!(workspace.head.as_deref(), Some(head.as_str()));
+    assert!(workspace.git_ref.is_some());
+    assert!(workspace.rehydrated_at.is_none());
+
+    remove_worktree(&state.db, task.id, &repo, &worktree, &branch).await;
+    assert!(!worktree.exists(), "cleanup deletes the run worktree");
+    assert!(
+        !git_branches(&repo).await.contains(&branch),
+        "cleanup deletes the run branch"
+    );
+
+    // The recorded commit outlives branch deletion through its hidden ref.
+    let git_ref = workspace.git_ref.clone().unwrap();
+    assert_eq!(
+        git_rev_parse(&repo, &git_ref).await.as_deref(),
+        Some(head.as_str())
+    );
+
+    let mut record = db::get_agent_session(&state.db, "local-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ensure_session_cwd(&state.db, &mut record).await.unwrap());
+    assert_eq!(record.cwd, worktree);
+    assert!(worktree.is_dir(), "the exact recorded path was recreated");
+    assert_eq!(
+        git_rev_parse(&worktree, "HEAD").await.as_deref(),
+        Some(head.as_str()),
+        "the original run commit is checked out"
+    );
+    // A detached checkout must not resurrect the deleted task branch.
+    assert!(
+        !git_branches(&repo).await.contains(&branch),
+        "restore recreated the deleted favetto branch"
+    );
+    assert!(
+        record
+            .workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.rehydrated_at.is_some()),
+        "the recreated checkout is marked session-owned"
+    );
+    let stored = db::get_agent_session(&state.db, "local-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.workspace, record.workspace);
+
+    // Idempotent: an already-present directory is not recreated or re-added.
+    assert!(!ensure_session_cwd(&state.db, &mut record).await.unwrap());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn session_workspace_reports_an_unreachable_recorded_commit() {
+    let dir = scratch_dir("session-workspace-missing");
+    let repo = dir.join("repo");
+    init_git_repo(&repo).await;
+    let state = join_state(&dir, Vec::new()).await;
+
+    let missing = dir.join("worktrees/gone");
+    let mut record =
+        db::AgentSessionRecord::loading("local-1", "opencode", &missing, Timestamp::now());
+    record.external_session_id = Some("provider-1".to_string());
+    record.status = db::AgentSessionStatus::Ended;
+    record.workspace = Some(db::SessionWorkspace {
+        kind: "git_worktree".to_string(),
+        repo: repo.clone(),
+        path: missing.clone(),
+        branch: Some("favetto/gone".to_string()),
+        head: Some("0000000000000000000000000000000000000000".to_string()),
+        git_ref: Some("refs/favetto/session-workspaces/gone".to_string()),
+        base_cwd: Some(repo.clone()),
+        rehydrated_at: None,
+    });
+    db::insert_agent_session(&state.db, &record).await.unwrap();
+
+    // Loadability is honest and names the path and missing commit.
+    let reason = session_cwd_error(&record).await.expect("not loadable");
+    assert!(reason.contains(&missing.display().to_string()), "{reason}");
+    assert!(reason.contains("no longer reachable"), "{reason}");
+
+    // A failed rehydration must not mark the ended record failed; it stays
+    // retryable if the repository is restored later.
+    let error = ensure_session_cwd(&state.db, &mut record)
+        .await
+        .expect_err("unreachable commit");
+    assert!(error.to_string().contains("no longer reachable"), "{error}");
+    let stored = db::get_agent_session(&state.db, "local-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, db::AgentSessionStatus::Ended);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Session-owned checkouts recreated for a restore are reclaimed by retention
+/// after their window; the hidden ref stays so a later load can recreate them.
+#[tokio::test]
+async fn retention_reclaims_rehydrated_session_workspaces() {
+    let dir = scratch_dir("session-workspace-retention");
+    let repo = dir.join("repo");
+    init_git_repo(&repo).await;
+    let state = join_state(&dir, Vec::new()).await;
+
+    let task = lineage_task("review", TaskStatus::Succeeded, None, None);
+    let branch = branch_name(&task);
+    let worktree = dir.join("worktrees").join(task.id.to_string());
+    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    let wt = worktree.to_string_lossy().into_owned();
+    git_run(&repo, &["worktree", "add", "--force", "-B", &branch, &wt]).await;
+    let head = git_rev_parse(&worktree, "HEAD")
+        .await
+        .expect("worktree HEAD");
+    let git_ref = session_workspace_ref("local-1");
+    update_git_ref(&repo, &git_ref, &head).await.unwrap();
+
+    let now = Timestamp::now();
+    let mut session = db::AgentSessionRecord::loading("local-1", "opencode", &worktree, now);
+    session.task_id = Some(task.id.to_string());
+    session.external_session_id = Some("provider-1".to_string());
+    session.status = db::AgentSessionStatus::Ended;
+    session.workspace = Some(db::SessionWorkspace {
+        kind: "git_worktree".to_string(),
+        repo: repo.clone(),
+        path: worktree.clone(),
+        branch: Some(branch.clone()),
+        head: Some(head.clone()),
+        git_ref: Some(git_ref.clone()),
+        base_cwd: Some(repo.clone()),
+        rehydrated_at: Some(now - time::Duration::days(60)),
+    });
+    db::insert_agent_session(&state.db, &session).await.unwrap();
+
+    let stats = prune_worktrees(&state).await.unwrap();
+    assert_eq!(stats.session_workspaces_removed, 1, "stats: {stats:?}");
+    assert!(!worktree.exists(), "session-owned checkout leaked");
+    assert_eq!(
+        git_rev_parse(&repo, &git_ref).await.as_deref(),
+        Some(head.as_str()),
+        "retention must keep the hidden ref for a future load"
+    );
+
+    let mut record = db::get_agent_session(&state.db, "local-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ensure_session_cwd(&state.db, &mut record).await.unwrap());
+    assert!(
+        worktree.is_dir(),
+        "the reclaimed checkout is restorable again"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Regression for #206: a `favetto/*` branch with no `worktrees` row (the
 /// leaked backlog) is invisible to the row-based pass and must be reclaimed by
 /// the git-native sweep.

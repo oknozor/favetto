@@ -744,6 +744,157 @@ async fn persisted_sessions_load_only_when_the_agent_supports_it() {
     assert!(session_row(&pool, &local).await.is_some());
 }
 
+/// Regression for #536: a session whose worktree was removed is recreated at the
+/// exact recorded path before `session/load`. The hidden ref keeps the run-only
+/// commit reachable after the task branch is deleted.
+#[tokio::test]
+async fn load_recreates_a_removed_worktree_before_session_load() {
+    let daemon = Daemon::spawn();
+    wait_for_socket(&daemon.socket).await;
+    let client = Client::connect(Transport::Unix(daemon.socket.clone()))
+        .await
+        .expect("connect to the daemon");
+    let pool = open_db(&daemon.db_path()).await;
+
+    let repo = daemon.root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    test_git(&repo, &["init", "-q"]);
+    test_git(&repo, &["config", "user.email", "t@example.com"]);
+    test_git(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("README.md"), "seed").unwrap();
+    test_git(&repo, &["add", "-A"]);
+    test_git(
+        &repo,
+        &["-c", "commit.gpgsign=false", "commit", "-qm", "init"],
+    );
+    let branch = "favetto/restore-e2e";
+    let worktree = daemon.root.join("worktrees/restore");
+    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    let worktree_arg = worktree.to_string_lossy().into_owned();
+    test_git(
+        &repo,
+        &["worktree", "add", "--force", "-B", branch, &worktree_arg],
+    );
+    std::fs::write(worktree.join("run.txt"), "run output").unwrap();
+    test_git(&worktree, &["add", "-A"]);
+    test_git(
+        &worktree,
+        &["-c", "commit.gpgsign=false", "commit", "-qm", "run"],
+    );
+    let head = test_git(&worktree, &["rev-parse", "HEAD"]);
+    let git_ref = format!("refs/favetto/session-workspaces/{branch}");
+    test_git(&repo, &["update-ref", &git_ref, &head]);
+
+    let started = result(
+        client
+            .request(
+                method::AGENTS_START,
+                json!({ "agent": "echo", "cwd": worktree }),
+            )
+            .await
+            .unwrap(),
+        method::AGENTS_START,
+    );
+    let local = started["session"]["id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let row = wait_for_status(&pool, &local, "ready").await;
+    let external = row.external_session_id.expect("ACP id");
+    close_session(&client, &pool, &local).await;
+
+    // Record the provenance the executor writes before cleanup, then remove the
+    // worktree and branch exactly as a finished run with keep_worktree = false
+    // would.
+    let workspace = json!({
+        "kind": "git_worktree",
+        "repo": repo,
+        "path": worktree,
+        "branch": branch,
+        "head": head,
+        "git_ref": git_ref,
+        "base_cwd": repo,
+    });
+    sqlx::query("UPDATE agent_sessions SET workspace = ? WHERE id = ?")
+        .bind(workspace.to_string())
+        .bind(&local)
+        .execute(&pool)
+        .await
+        .unwrap();
+    test_git(&repo, &["worktree", "remove", "--force", &worktree_arg]);
+    test_git(&repo, &["branch", "-D", "--", branch]);
+    assert!(!worktree.exists(), "simulated cleanup removed the worktree");
+    assert!(
+        !test_git(&repo, &["branch", "--list", branch]).contains(branch),
+        "simulated cleanup removed the run branch"
+    );
+
+    let history = result(
+        client
+            .request(method::AGENTS_HISTORY, json!({ "limit": 10 }))
+            .await
+            .unwrap(),
+        method::AGENTS_HISTORY,
+    );
+    let row = history
+        .as_array()
+        .expect("history rows")
+        .iter()
+        .find(|row| row["id"] == json!(local))
+        .expect("the session survives worktree cleanup");
+    assert_eq!(row["loadable"], true, "{row}");
+    assert_eq!(row["cwd"], json!(worktree));
+
+    let loaded = result(
+        client
+            .request(method::AGENTS_LOAD, json!({ "session_id": local }))
+            .await
+            .unwrap(),
+        method::AGENTS_LOAD,
+    );
+    assert_eq!(loaded["session"]["load_state"], "ready");
+    assert_eq!(
+        loaded["session"]["session_id"], external,
+        "the stored provider ACP id is used"
+    );
+    assert_eq!(
+        test_git(&worktree, &["rev-parse", "HEAD"]),
+        head,
+        "the exact recorded path is recreated at the original commit"
+    );
+    assert_eq!(
+        std::fs::read_to_string(daemon.root.join("echo-load")).unwrap(),
+        format!("{external}\n{}\n", worktree.display()),
+        "session/load runs in the recreated original path"
+    );
+    assert!(
+        !daemon.root.join("echo-prompt").exists(),
+        "a load never sends a prompt"
+    );
+    assert!(
+        !test_git(&repo, &["branch", "--list", branch]).contains(branch),
+        "restore did not recreate the deleted favetto branch"
+    );
+
+    close_session(&client, &pool, &local).await;
+}
+
+/// Run a git command in `repo`, panicking on a non-zero exit.
+fn test_git(repo: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .expect("git command");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 /// Regression for the GPUI task-conversation restore: the connection-scoped
 /// methods were intercepted only by the socket/WebSocket `handle_request`, so
 /// over HTTP `POST /rpc` they fell through to `unknown method: agents.load`.
