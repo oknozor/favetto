@@ -70,6 +70,9 @@ pub struct CatalogView {
     error_copy_focus: FocusHandle,
     search_clear_focus: FocusHandle,
     start_focus: FocusHandle,
+    /// Stable focus handles for per-code-block copy buttons, keyed by the
+    /// Markdown element seed.
+    copy_focuses: components::FocusRegistry,
 }
 
 impl CatalogView {
@@ -96,6 +99,7 @@ impl CatalogView {
             error_copy_focus: cx.focus_handle().tab_index(28).tab_stop(true),
             search_clear_focus: cx.focus_handle().tab_index(29).tab_stop(true),
             start_focus: cx.focus_handle().tab_index(30).tab_stop(true),
+            copy_focuses: components::FocusRegistry::default(),
         }
     }
 
@@ -317,7 +321,7 @@ impl CatalogView {
         components::copy_button(theme, id, "Copy error", &self.error_copy_focus).on_click(
             cx.listener(move |this, _event, _window, cx| {
                 this.state.update(cx, |state, cx| {
-                    state.copy_text(message.clone(), "the error", cx);
+                    state.copy_text(message.clone(), cx);
                     cx.notify();
                 });
             }),
@@ -898,13 +902,20 @@ impl CatalogView {
                         .flex_col()
                         .gap(px(theme.spacing.s2))
                         .min_w_0();
+                    let mut paint = markdown_view::PaintContext {
+                        theme,
+                        base,
+                        state: &self.state,
+                        focuses: &self.copy_focuses,
+                        cx,
+                    };
                     if rendered.header.is_some() {
                         body = body
                             .child(markdown_view::highlighted_tokens(
-                                theme,
-                                base,
+                                &mut paint,
                                 &rendered.header_tokens,
                                 theme.font.sm,
+                                markdown_view::SOURCE_PREVIEW_SEED,
                             ))
                             .child(
                                 div()
@@ -915,8 +926,7 @@ impl CatalogView {
                             );
                     }
                     body.child(markdown_view::markdown_body(
-                        theme,
-                        base,
+                        &mut paint,
                         &rendered.body,
                         Tone::Prose,
                         0,

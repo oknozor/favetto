@@ -402,7 +402,7 @@ impl SchedulesView {
         components::copy_button(theme, id, "Copy error", &self.error_copy_focus).on_click(
             cx.listener(move |this, _event, _window, cx| {
                 this.state.update(cx, |state, cx| {
-                    state.copy_text(message.clone(), "the error", cx);
+                    state.copy_text(message.clone(), cx);
                     cx.notify();
                 });
             }),

@@ -58,6 +58,32 @@ const SESSION_SELECT_WIDTH: f32 = 280.0;
 /// conversation surface so a long model catalogue never spills past the feed.
 const SESSION_SELECT_MAX_HEIGHT: f32 = 320.0;
 
+/// Stable selection keys for surfaces outside the virtualized feed.
+const OUTPUT_SELECTION_KEY: u64 = u64::MAX - 32;
+const RESTORE_SELECTION_KEY: u64 = u64::MAX - 33;
+const BANNER_SELECTION_KEY: u64 = u64::MAX - 34;
+const AUTH_SELECTION_KEY: u64 = u64::MAX - 35;
+const ELICITATION_SELECTION_KEY: u64 = u64::MAX - 1_000_000;
+
+/// A plain text style for a selectable read-only run.
+fn plain_text_style(size: f32, color: gpui::Rgba) -> TextStyle {
+    TextStyle {
+        font_size: px(size).into(),
+        color: Hsla::from(color),
+        ..TextStyle::default()
+    }
+}
+
+/// A monospace text style for a selectable read-only run.
+fn mono_text_style(size: f32, color: gpui::Rgba) -> TextStyle {
+    TextStyle {
+        font_family: "monospace".into(),
+        font_size: px(size).into(),
+        color: Hsla::from(color),
+        ..TextStyle::default()
+    }
+}
+
 /// The action listener attached to an openable session pill.
 type SessionOpenListener = Box<dyn Fn(&SessionSelectOpen, &mut Window, &mut gpui::App)>;
 
@@ -113,6 +139,9 @@ pub struct ConversationPanel {
     /// One focus handle per selector, so closing the list returns focus to the
     /// pill that opened it.
     session_focuses: HashMap<SessionSelectTarget, FocusHandle>,
+    /// Stable focus handles for per-code-block copy buttons across virtualized
+    /// rows, keyed by the row-seeded Markdown id.
+    copy_focuses: components::FocusRegistry,
 }
 
 impl ConversationPanel {
@@ -159,6 +188,7 @@ impl ConversationPanel {
             session_anchor: None,
             session_surface: Rc::new(Cell::new(None)),
             session_focuses: HashMap::new(),
+            copy_focuses: components::FocusRegistry::default(),
         }
     }
 
@@ -803,6 +833,26 @@ impl ConversationPanel {
         )
     }
 
+    /// A read-only string that supports mouse selection, wired to this panel's
+    /// focus registry and the shared selection store.
+    fn selectable_text(
+        &self,
+        theme: &Theme,
+        key: u64,
+        text: String,
+        style: &TextStyle,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut paint = markdown_view::PaintContext {
+            theme,
+            base: style,
+            state: &self.state,
+            focuses: &self.copy_focuses,
+            cx,
+        };
+        markdown_view::plain_selectable(&mut paint, key, text, style)
+    }
+
     /// A small secondary button used by shared chrome.
     fn action_button(
         &self,
@@ -945,6 +995,18 @@ impl ConversationPanel {
                     .to_string()
             });
 
+        let status_style = plain_text_style(theme.font.xs, theme.colors.muted);
+        let status_element = {
+            let mut paint = markdown_view::PaintContext {
+                theme,
+                base: &status_style,
+                state: &self.state,
+                focuses: &self.copy_focuses,
+                cx,
+            };
+            markdown_view::plain_selectable(&mut paint, AUTH_SELECTION_KEY, status, &status_style)
+        };
+
         div()
             .flex()
             .items_center()
@@ -972,7 +1034,7 @@ impl ConversationPanel {
                         div()
                             .text_size(px(theme.font.xs))
                             .text_color(theme.colors.muted)
-                            .child(status),
+                            .child(status_element),
                     ),
             )
             .child(actions)
@@ -1017,6 +1079,23 @@ impl ConversationPanel {
             }
         }
 
+        let message_style = plain_text_style(theme.font.sm, theme.colors.text);
+        let message_element = {
+            let mut paint = markdown_view::PaintContext {
+                theme,
+                base: &message_style,
+                state: &self.state,
+                focuses: &self.copy_focuses,
+                cx,
+            };
+            markdown_view::plain_selectable(
+                &mut paint,
+                BANNER_SELECTION_KEY,
+                request.message.clone(),
+                &message_style,
+            )
+        };
+
         let prompt = div()
             .flex()
             .flex_1()
@@ -1038,7 +1117,7 @@ impl ConversationPanel {
                 div()
                     .text_size(px(theme.font.sm))
                     .text_color(theme.colors.text)
-                    .child(request.message.clone()),
+                    .child(message_element),
             )
             .child(options)
             .when(!request.can_reply(), |prompt| {
@@ -1236,7 +1315,7 @@ impl ConversationPanel {
         let message = data.message.to_string();
         let copy = copy.on_click(cx.listener(move |this, _event, _window, cx| {
             this.state.update(cx, |state, cx| {
-                state.copy_text(message.clone(), "the error", cx);
+                state.copy_text(message.clone(), cx);
                 cx.notify();
             });
         }));
@@ -1297,8 +1376,11 @@ impl ConversationPanel {
             "Copy error",
             &self.error_copy_focus,
         )
-        .on_click(cx.listener(move |_this, _event, _window, cx| {
-            cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_text.clone()));
+        .on_click(cx.listener(move |this, _event, _window, cx| {
+            this.state.update(cx, |state, cx| {
+                state.copy_to_clipboard(copy_text.clone(), cx);
+                cx.notify();
+            });
         }));
         div()
             .flex()
@@ -1583,6 +1665,22 @@ impl ConversationPanel {
                     let handle = self.restored_scroll.clone();
                     cx.defer(move |_cx| handle.scroll_to_bottom());
                 }
+                let transcript_style = mono_text_style(theme.font.xs, theme.colors.text);
+                let transcript = {
+                    let mut paint = markdown_view::PaintContext {
+                        theme,
+                        base: &transcript_style,
+                        state: &self.state,
+                        focuses: &self.copy_focuses,
+                        cx,
+                    };
+                    markdown_view::plain_selectable(
+                        &mut paint,
+                        RESTORE_SELECTION_KEY,
+                        restored.transcript.clone(),
+                        &transcript_style,
+                    )
+                };
                 panel = panel.child(
                     div()
                         .mt(px(theme.spacing.s1))
@@ -1601,7 +1699,8 @@ impl ConversationPanel {
                         .text_size(px(theme.font.xs))
                         .text_color(theme.colors.text)
                         .whitespace_normal()
-                        .child(restored.transcript.clone()),
+                        .cursor_text()
+                        .child(transcript),
                 );
             } else if structured_history {
                 panel = panel.child(
@@ -1963,6 +2062,22 @@ impl ConversationPanel {
                     .child("The daemon truncated this output; the text below is what it kept."),
             );
         }
+        let output_style = mono_text_style(theme.font.sm, theme.colors.text);
+        let output_element = {
+            let mut paint = markdown_view::PaintContext {
+                theme,
+                base: &output_style,
+                state: &self.state,
+                focuses: &self.copy_focuses,
+                cx,
+            };
+            markdown_view::plain_selectable(
+                &mut paint,
+                OUTPUT_SELECTION_KEY,
+                text.clone(),
+                &output_style,
+            )
+        };
         column = column.child(
             div()
                 .id("conversation-output")
@@ -1970,7 +2085,8 @@ impl ConversationPanel {
                 .text_size(px(theme.font.sm))
                 .text_color(theme.colors.text)
                 .whitespace_normal()
-                .child(text.clone()),
+                .cursor_text()
+                .child(output_element),
         );
 
         // Follow the tail only when the content grew, never on every render.
@@ -2149,7 +2265,9 @@ impl ConversationPanel {
 
         let list_theme = *theme;
         let list_feed = feed.clone();
-        let list = list(self.events_list.clone(), move |index, window, _cx| {
+        let list_state = self.state.clone();
+        let list_focuses = self.copy_focuses.clone();
+        let list = list(self.events_list.clone(), move |index, window, cx| {
             let Some(row) = list_feed.get(index) else {
                 return div().into_any_element();
             };
@@ -2157,7 +2275,15 @@ impl ConversationPanel {
             div()
                 .px(px(list_theme.spacing.s3))
                 .pb(px(list_theme.spacing.s2))
-                .child(feed_item(&list_theme, &base, index, row))
+                .child(feed_item(
+                    &list_theme,
+                    &base,
+                    index,
+                    row,
+                    &list_state,
+                    &list_focuses,
+                    cx,
+                ))
                 .into_any_element()
         })
         .size_full();
@@ -2537,26 +2663,47 @@ impl ConversationPanel {
             .border_1()
             .border_color(theme.colors.border)
             .bg(theme.colors.surface);
+        let text_style = plain_text_style(theme.font.sm, theme.colors.text);
+        let muted_style = plain_text_style(theme.font.xs, theme.colors.muted);
+
         panel = panel
             .child(components::section_label(theme, "AGENT FORM"))
             .child(
                 div()
                     .text_size(px(theme.font.sm))
                     .text_color(theme.colors.text)
-                    .child(format!("requested by {}", form.request.agent)),
+                    .child(self.selectable_text(
+                        theme,
+                        ELICITATION_SELECTION_KEY,
+                        format!("requested by {}", form.request.agent),
+                        &text_style,
+                        cx,
+                    )),
             )
             .child(
                 div()
                     .text_size(px(theme.font.xs))
                     .text_color(theme.colors.muted)
-                    .child(form.request.message.clone()),
+                    .child(self.selectable_text(
+                        theme,
+                        ELICITATION_SELECTION_KEY + 1,
+                        form.request.message.clone(),
+                        &muted_style,
+                        cx,
+                    )),
             );
         if let Some(title) = &form.request.form.title {
             panel = panel.child(
                 div()
                     .text_size(px(theme.font.sm))
                     .text_color(theme.colors.text)
-                    .child(title.clone()),
+                    .child(self.selectable_text(
+                        theme,
+                        ELICITATION_SELECTION_KEY + 2,
+                        title.clone(),
+                        &text_style,
+                        cx,
+                    )),
             );
         }
         if let Some(description) = &form.request.form.description {
@@ -2564,7 +2711,13 @@ impl ConversationPanel {
                 div()
                     .text_size(px(theme.font.xs))
                     .text_color(theme.colors.muted)
-                    .child(description.clone()),
+                    .child(self.selectable_text(
+                        theme,
+                        ELICITATION_SELECTION_KEY + 3,
+                        description.clone(),
+                        &muted_style,
+                        cx,
+                    )),
             );
         }
 
@@ -2602,7 +2755,13 @@ impl ConversationPanel {
                             div()
                                 .text_size(px(theme.font.xs))
                                 .text_color(theme.colors.muted)
-                                .child(description.clone()),
+                                .child(self.selectable_text(
+                                    theme,
+                                    ELICITATION_SELECTION_KEY + 10 + index as u64,
+                                    description.clone(),
+                                    &muted_style,
+                                    cx,
+                                )),
                         );
                     }
                     let editable = matches!(
@@ -2628,7 +2787,13 @@ impl ConversationPanel {
                         div()
                             .text_size(px(theme.font.sm))
                             .text_color(theme.colors.text)
-                            .child(form.display_value(index))
+                            .child(self.selectable_text(
+                                theme,
+                                ELICITATION_SELECTION_KEY + 20 + index as u64,
+                                form.display_value(index),
+                                &text_style,
+                                cx,
+                            ))
                             .into_any_element()
                     });
                     panel = panel.child(row);
@@ -2652,7 +2817,15 @@ impl ConversationPanel {
                             .gap(px(theme.spacing.s2))
                             .text_size(px(theme.font.xs))
                             .child(div().text_color(theme.colors.muted).child(label))
-                            .child(div().text_color(theme.colors.text).child(value)),
+                            .child(div().text_color(theme.colors.text).child(
+                                self.selectable_text(
+                                    theme,
+                                    ELICITATION_SELECTION_KEY + 100 + index as u64,
+                                    value,
+                                    &text_style,
+                                    cx,
+                                ),
+                            )),
                     );
                 }
             }
@@ -2986,32 +3159,84 @@ fn outcome_label(outcome: favetto_wire::model::IdleOutcome) -> &'static str {
     }
 }
 
+/// The per-message copy control. Every write funnels through
+/// [`ClientState::copy_to_clipboard`], so the toast is identical everywhere.
+fn feed_copy_button(
+    theme: &Theme,
+    id: (&'static str, u64),
+    focus: &FocusHandle,
+    text: String,
+    state: &Entity<ClientState>,
+) -> Stateful<Div> {
+    let state = state.clone();
+    components::copy_button(theme, id, "⧉ Copy", focus).on_click(move |_event, _window, cx| {
+        state.update(cx, |state, cx| {
+            state.copy_to_clipboard(text.clone(), cx);
+            cx.notify();
+        });
+    })
+}
+
 /// One feed item. Prose and reasoning bodies render as Markdown, while every
 /// other row keeps its existing card/row treatment.
-fn feed_item(theme: &Theme, base: &TextStyle, index: usize, row: &FeedRow) -> Div {
+fn feed_item(
+    theme: &Theme,
+    base: &TextStyle,
+    index: usize,
+    row: &FeedRow,
+    state: &Entity<ClientState>,
+    focuses: &components::FocusRegistry,
+    cx: &mut gpui::App,
+) -> Div {
+    let seed = index as u64 * markdown_view::MARKDOWN_ROW_STRIDE;
+    let plain_key = |slot: u64| seed + markdown_view::MARKDOWN_ROW_STRIDE / 2 + slot;
     match &row.item {
         FeedItem::Message { role, text } => {
+            let color = match role {
+                MessageRole::Assistant => theme.colors.accent,
+                MessageRole::User => theme.colors.success,
+                MessageRole::System | MessageRole::Tool => theme.colors.muted,
+            };
+            let copy_focus = focuses.handle(plain_key(2), cx);
             let header = div()
+                .flex()
+                .items_center()
+                .justify_between()
                 .text_size(px(theme.font.xs))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(match role {
-                    MessageRole::Assistant => theme.colors.accent,
-                    MessageRole::User => theme.colors.success,
-                    MessageRole::System | MessageRole::Tool => theme.colors.muted,
-                })
-                .child(role_label(*role));
-            let body = match row.body.as_deref() {
-                Some(doc) => markdown_view::markdown_body(
+                .child(div().text_color(color).child(role_label(*role)))
+                .child(feed_copy_button(
                     theme,
-                    base,
-                    doc,
-                    Tone::Prose,
-                    index as u64 * markdown_view::MARKDOWN_ROW_STRIDE,
-                ),
-                None => div()
-                    .text_size(px(theme.font.sm))
-                    .text_color(theme.colors.text)
-                    .child(text.clone()),
+                    ("message-copy", seed),
+                    &copy_focus,
+                    text.clone(),
+                    state,
+                ));
+            let body: AnyElement = match row.body.as_deref() {
+                Some(doc) => {
+                    let mut paint = markdown_view::PaintContext {
+                        theme,
+                        base,
+                        state,
+                        focuses,
+                        cx,
+                    };
+                    markdown_view::markdown_body(&mut paint, doc, Tone::Prose, seed)
+                        .into_any_element()
+                }
+                None => {
+                    let mut style = base.clone();
+                    style.font_size = px(theme.font.sm).into();
+                    style.color = Hsla::from(theme.colors.text);
+                    let mut paint = markdown_view::PaintContext {
+                        theme,
+                        base,
+                        state,
+                        focuses,
+                        cx,
+                    };
+                    markdown_view::plain_selectable(&mut paint, plain_key(1), text.clone(), &style)
+                }
             };
             div()
                 .flex()
@@ -3020,37 +3245,68 @@ fn feed_item(theme: &Theme, base: &TextStyle, index: usize, row: &FeedRow) -> Di
                 .child(header)
                 .child(body)
         }
-        FeedItem::OutgoingUser { text, state } => {
+        FeedItem::OutgoingUser {
+            text: raw,
+            state: outgoing,
+        } => {
+            let copy_focus = focuses.handle(plain_key(4), cx);
             let header = div()
                 .flex()
                 .items_center()
+                .justify_between()
                 .gap(px(theme.spacing.s1))
                 .text_size(px(theme.font.xs))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(theme.colors.success)
-                .child("user")
                 .child(
                     div()
-                        .text_size(px(theme.font.xs))
-                        .font_weight(gpui::FontWeight::NORMAL)
-                        .text_color(theme.colors.muted)
-                        .child(match state {
-                            crate::conversation::OutgoingState::Sending => "· sending…",
-                            crate::conversation::OutgoingState::Sent => "· sent",
-                        }),
-                );
-            let body = match row.body.as_deref() {
-                Some(doc) => markdown_view::markdown_body(
+                        .flex()
+                        .items_center()
+                        .gap(px(theme.spacing.s1))
+                        .text_color(theme.colors.success)
+                        .child("user")
+                        .child(
+                            div()
+                                .text_size(px(theme.font.xs))
+                                .font_weight(gpui::FontWeight::NORMAL)
+                                .text_color(theme.colors.muted)
+                                .child(match outgoing {
+                                    crate::conversation::OutgoingState::Sending => "· sending…",
+                                    crate::conversation::OutgoingState::Sent => "· sent",
+                                }),
+                        ),
+                )
+                .child(feed_copy_button(
                     theme,
-                    base,
-                    doc,
-                    Tone::Prose,
-                    index as u64 * markdown_view::MARKDOWN_ROW_STRIDE,
-                ),
-                None => div()
-                    .text_size(px(theme.font.sm))
-                    .text_color(theme.colors.text)
-                    .child(text.clone()),
+                    ("outgoing-copy", seed),
+                    &copy_focus,
+                    raw.clone(),
+                    state,
+                ));
+            let body: AnyElement = match row.body.as_deref() {
+                Some(doc) => {
+                    let mut paint = markdown_view::PaintContext {
+                        theme,
+                        base,
+                        state,
+                        focuses,
+                        cx,
+                    };
+                    markdown_view::markdown_body(&mut paint, doc, Tone::Prose, seed)
+                        .into_any_element()
+                }
+                None => {
+                    let mut style = base.clone();
+                    style.font_size = px(theme.font.sm).into();
+                    style.color = Hsla::from(theme.colors.text);
+                    let mut paint = markdown_view::PaintContext {
+                        theme,
+                        base,
+                        state,
+                        focuses,
+                        cx,
+                    };
+                    markdown_view::plain_selectable(&mut paint, plain_key(3), raw.clone(), &style)
+                }
             };
             div()
                 .flex()
@@ -3059,28 +3315,59 @@ fn feed_item(theme: &Theme, base: &TextStyle, index: usize, row: &FeedRow) -> Di
                 .child(header)
                 .child(body)
         }
-        FeedItem::Reasoning { text, streaming } => {
+        FeedItem::Reasoning {
+            text: raw,
+            streaming,
+        } => {
+            let copy_focus = focuses.handle(plain_key(6), cx);
             let header = div()
                 .flex()
                 .items_center()
+                .justify_between()
                 .gap(px(theme.spacing.s1))
                 .text_size(px(theme.font.xs))
                 .text_color(theme.colors.muted)
-                .child("reasoning")
-                .when(*streaming, |row| row.child("…"));
-            let body = match row.body.as_deref() {
-                Some(doc) => markdown_view::markdown_body(
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(theme.spacing.s1))
+                        .child("reasoning")
+                        .when(*streaming, |row| row.child("…")),
+                )
+                .child(feed_copy_button(
                     theme,
-                    base,
-                    doc,
-                    Tone::Reasoning,
-                    index as u64 * markdown_view::MARKDOWN_ROW_STRIDE,
-                ),
-                None => div()
-                    .text_size(px(theme.font.sm))
-                    .text_color(theme.colors.muted)
-                    .italic()
-                    .child(text.clone()),
+                    ("reasoning-copy", seed),
+                    &copy_focus,
+                    raw.clone(),
+                    state,
+                ));
+            let body: AnyElement = match row.body.as_deref() {
+                Some(doc) => {
+                    let mut paint = markdown_view::PaintContext {
+                        theme,
+                        base,
+                        state,
+                        focuses,
+                        cx,
+                    };
+                    markdown_view::markdown_body(&mut paint, doc, Tone::Reasoning, seed)
+                        .into_any_element()
+                }
+                None => {
+                    let mut style = base.clone();
+                    style.font_size = px(theme.font.sm).into();
+                    style.color = Hsla::from(theme.colors.muted);
+                    style.font_style = gpui::FontStyle::Italic;
+                    let mut paint = markdown_view::PaintContext {
+                        theme,
+                        base,
+                        state,
+                        focuses,
+                        cx,
+                    };
+                    markdown_view::plain_selectable(&mut paint, plain_key(5), raw.clone(), &style)
+                }
             };
             div()
                 .flex()
@@ -3089,29 +3376,41 @@ fn feed_item(theme: &Theme, base: &TextStyle, index: usize, row: &FeedRow) -> Di
                 .child(header)
                 .child(body)
         }
-        FeedItem::ContentBlock { role, content } => div()
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .px(px(theme.spacing.s2))
-            .py(px(theme.spacing.s1))
-            .rounded(px(theme.radii.r4))
-            .border_1()
-            .border_color(Hsla::from(theme.colors.border).opacity(0.45))
-            .child(
-                div()
-                    .text_size(px(theme.font.xs))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.colors.muted)
-                    .child(content_role_label(*role)),
-            )
-            .child(
-                div()
-                    .font_family("monospace")
-                    .text_size(px(theme.font.xs))
-                    .text_color(theme.colors.muted)
-                    .child(content.placeholder()),
-            ),
+        FeedItem::ContentBlock { role, content } => {
+            let mut style = base.clone();
+            style.font_family = "monospace".into();
+            style.font_size = px(theme.font.xs).into();
+            style.color = Hsla::from(theme.colors.muted);
+            let mut paint = markdown_view::PaintContext {
+                theme,
+                base,
+                state,
+                focuses,
+                cx,
+            };
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .px(px(theme.spacing.s2))
+                .py(px(theme.spacing.s1))
+                .rounded(px(theme.radii.r4))
+                .border_1()
+                .border_color(Hsla::from(theme.colors.border).opacity(0.45))
+                .child(
+                    div()
+                        .text_size(px(theme.font.xs))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme.colors.muted)
+                        .child(content_role_label(*role)),
+                )
+                .child(markdown_view::plain_selectable(
+                    &mut paint,
+                    plain_key(7),
+                    content.placeholder(),
+                    &style,
+                ))
+        }
         FeedItem::Tool {
             id,
             name,
@@ -3130,6 +3429,22 @@ fn feed_item(theme: &Theme, base: &TextStyle, index: usize, row: &FeedRow) -> Di
             } else {
                 name.as_str()
             };
+            let mut paint = markdown_view::PaintContext {
+                theme,
+                base,
+                state,
+                focuses,
+                cx,
+            };
+            let mut name_style = base.clone();
+            name_style.font_family = "monospace".into();
+            name_style.font_size = px(theme.font.xs).into();
+            name_style.font_weight = gpui::FontWeight::SEMIBOLD;
+            name_style.color = Hsla::from(theme.colors.text);
+            let mut detail_style = base.clone();
+            detail_style.font_family = "monospace".into();
+            detail_style.font_size = px(theme.font.xs).into();
+            detail_style.color = Hsla::from(theme.colors.muted);
             let mut card = div()
                 .flex()
                 .flex_col()
@@ -3156,12 +3471,12 @@ fn feed_item(theme: &Theme, base: &TextStyle, index: usize, row: &FeedRow) -> Di
                             div()
                                 .flex_1()
                                 .min_w_0()
-                                .truncate()
-                                .font_family("monospace")
-                                .text_size(px(theme.font.xs))
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(theme.colors.text)
-                                .child(name.to_string()),
+                                .child(markdown_view::plain_selectable(
+                                    &mut paint,
+                                    plain_key(8),
+                                    name.to_string(),
+                                    &name_style,
+                                )),
                         )
                         .child(
                             div()
@@ -3172,136 +3487,187 @@ fn feed_item(theme: &Theme, base: &TextStyle, index: usize, row: &FeedRow) -> Di
                         ),
                 );
             if let Some(summary) = detail::compact_json(input) {
-                card = card.child(
-                    div()
-                        .font_family("monospace")
-                        .text_size(px(theme.font.xs))
-                        .text_color(theme.colors.muted)
-                        .child(format!("→ {summary}")),
-                );
+                card = card.child(markdown_view::plain_selectable(
+                    &mut paint,
+                    plain_key(9),
+                    format!("→ {summary}"),
+                    &detail_style,
+                ));
             }
             if let Some(output) = output.as_ref().and_then(detail::compact_json) {
-                card = card.child(
-                    div()
-                        .font_family("monospace")
-                        .text_size(px(theme.font.xs))
-                        .text_color(if *status == ToolStatus::Error {
-                            theme.colors.danger
-                        } else {
-                            theme.colors.muted
-                        })
-                        .child(output),
-                );
+                let mut output_style = detail_style.clone();
+                output_style.color = Hsla::from(if *status == ToolStatus::Error {
+                    theme.colors.danger
+                } else {
+                    theme.colors.muted
+                });
+                card = card.child(markdown_view::plain_selectable(
+                    &mut paint,
+                    plain_key(10),
+                    output,
+                    &output_style,
+                ));
             }
             card
         }
-        FeedItem::Usage(usage) => div()
-            .flex()
-            .items_center()
-            .gap(px(theme.spacing.s1))
-            .text_size(px(theme.font.xs))
-            .text_color(theme.colors.muted)
-            .child("⚡")
-            .child(
-                detail::usage_summary(Some(usage)).unwrap_or_else(|| "usage reported".to_string()),
-            ),
-        FeedItem::Error(message) => div()
-            .flex()
-            .items_start()
-            .gap(px(theme.spacing.s1))
-            .px(px(theme.spacing.s2))
-            .py(px(theme.spacing.s1))
-            .rounded(px(theme.radii.r4))
-            .border_1()
-            .border_color(Hsla::from(theme.colors.danger).opacity(0.45))
-            .bg(Hsla::from(theme.colors.danger).opacity(0.10))
-            .child(
-                div()
-                    .text_size(px(theme.font.xs))
-                    .text_color(theme.colors.danger)
-                    .child("⚠"),
-            )
-            .child(
-                div()
-                    .text_size(px(theme.font.sm))
-                    .text_color(theme.colors.text)
-                    .child(message.clone()),
-            ),
+        FeedItem::Usage(usage) => {
+            let summary =
+                detail::usage_summary(Some(usage)).unwrap_or_else(|| "usage reported".to_string());
+            let mut style = base.clone();
+            style.font_size = px(theme.font.xs).into();
+            style.color = Hsla::from(theme.colors.muted);
+            let mut paint = markdown_view::PaintContext {
+                theme,
+                base,
+                state,
+                focuses,
+                cx,
+            };
+            div()
+                .flex()
+                .items_center()
+                .gap(px(theme.spacing.s1))
+                .text_size(px(theme.font.xs))
+                .text_color(theme.colors.muted)
+                .child("⚡")
+                .child(markdown_view::plain_selectable(
+                    &mut paint,
+                    plain_key(11),
+                    summary,
+                    &style,
+                ))
+        }
+        FeedItem::Error(message) => {
+            let mut style = base.clone();
+            style.font_size = px(theme.font.sm).into();
+            style.color = Hsla::from(theme.colors.text);
+            let mut paint = markdown_view::PaintContext {
+                theme,
+                base,
+                state,
+                focuses,
+                cx,
+            };
+            div()
+                .flex()
+                .items_start()
+                .gap(px(theme.spacing.s1))
+                .px(px(theme.spacing.s2))
+                .py(px(theme.spacing.s1))
+                .rounded(px(theme.radii.r4))
+                .border_1()
+                .border_color(Hsla::from(theme.colors.danger).opacity(0.45))
+                .bg(Hsla::from(theme.colors.danger).opacity(0.10))
+                .child(
+                    div()
+                        .text_size(px(theme.font.xs))
+                        .text_color(theme.colors.danger)
+                        .child("⚠"),
+                )
+                .child(markdown_view::plain_selectable(
+                    &mut paint,
+                    plain_key(12),
+                    message.clone(),
+                    &style,
+                ))
+        }
         FeedItem::Boundary(outcome) => div()
             .py(px(theme.spacing.s1))
             .text_size(px(theme.font.xs))
             .text_color(theme.colors.muted)
             .text_center()
             .child(format!("— turn {}", outcome_label(*outcome))),
-        FeedItem::InputRequest { request, resolved } => div()
-            .flex()
-            .items_start()
-            .gap(px(theme.spacing.s1))
-            .px(px(theme.spacing.s2))
-            .py(px(theme.spacing.s1))
-            .rounded(px(theme.radii.r4))
-            .border_1()
-            .border_color(Hsla::from(theme.colors.warning).opacity(0.4))
-            .bg(Hsla::from(theme.colors.warning).opacity(0.08))
-            .child(
-                div()
-                    .text_size(px(theme.font.xs))
-                    .text_color(theme.colors.warning)
-                    .child(if *resolved { "✓" } else { "⚠" }),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_size(px(theme.font.xs))
-                    .text_color(if *resolved {
-                        theme.colors.muted
-                    } else {
-                        theme.colors.text
-                    })
-                    .child(format!(
-                        "{} · {}",
-                        if *resolved { "answered" } else { "waiting" },
-                        request.message
-                    )),
-            ),
-        FeedItem::Elicitation { request, resolved } => div()
-            .flex()
-            .items_start()
-            .gap(px(theme.spacing.s1))
-            .px(px(theme.spacing.s2))
-            .py(px(theme.spacing.s1))
-            .rounded(px(theme.radii.r4))
-            .border_1()
-            .border_color(Hsla::from(theme.colors.accent).opacity(0.4))
-            .bg(Hsla::from(theme.colors.accent).opacity(0.08))
-            .child(
-                div()
-                    .text_size(px(theme.font.xs))
-                    .text_color(theme.colors.accent)
-                    .child(if *resolved { "✓" } else { "▤" }),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_size(px(theme.font.xs))
-                    .text_color(if *resolved {
-                        theme.colors.muted
-                    } else {
-                        theme.colors.text
-                    })
-                    .child(format!(
-                        "{} · {} · {}",
-                        request.agent,
-                        if *resolved {
-                            "answered"
-                        } else {
-                            "form requested"
-                        },
-                        request.message
-                    )),
-            ),
+        FeedItem::InputRequest { request, resolved } => {
+            let text = format!(
+                "{} · {}",
+                if *resolved { "answered" } else { "waiting" },
+                request.message
+            );
+            let mut style = base.clone();
+            style.font_size = px(theme.font.xs).into();
+            style.color = Hsla::from(if *resolved {
+                theme.colors.muted
+            } else {
+                theme.colors.text
+            });
+            let mut paint = markdown_view::PaintContext {
+                theme,
+                base,
+                state,
+                focuses,
+                cx,
+            };
+            div()
+                .flex()
+                .items_start()
+                .gap(px(theme.spacing.s1))
+                .px(px(theme.spacing.s2))
+                .py(px(theme.spacing.s1))
+                .rounded(px(theme.radii.r4))
+                .border_1()
+                .border_color(Hsla::from(theme.colors.warning).opacity(0.4))
+                .bg(Hsla::from(theme.colors.warning).opacity(0.08))
+                .child(
+                    div()
+                        .text_size(px(theme.font.xs))
+                        .text_color(theme.colors.warning)
+                        .child(if *resolved { "✓" } else { "⚠" }),
+                )
+                .child(markdown_view::plain_selectable(
+                    &mut paint,
+                    plain_key(13),
+                    text,
+                    &style,
+                ))
+        }
+        FeedItem::Elicitation { request, resolved } => {
+            let text = format!(
+                "{} · {} · {}",
+                request.agent,
+                if *resolved {
+                    "answered"
+                } else {
+                    "form requested"
+                },
+                request.message
+            );
+            let mut style = base.clone();
+            style.font_size = px(theme.font.xs).into();
+            style.color = Hsla::from(if *resolved {
+                theme.colors.muted
+            } else {
+                theme.colors.text
+            });
+            let mut paint = markdown_view::PaintContext {
+                theme,
+                base,
+                state,
+                focuses,
+                cx,
+            };
+            div()
+                .flex()
+                .items_start()
+                .gap(px(theme.spacing.s1))
+                .px(px(theme.spacing.s2))
+                .py(px(theme.spacing.s1))
+                .rounded(px(theme.radii.r4))
+                .border_1()
+                .border_color(Hsla::from(theme.colors.accent).opacity(0.4))
+                .bg(Hsla::from(theme.colors.accent).opacity(0.08))
+                .child(
+                    div()
+                        .text_size(px(theme.font.xs))
+                        .text_color(theme.colors.accent)
+                        .child(if *resolved { "✓" } else { "▤" }),
+                )
+                .child(markdown_view::plain_selectable(
+                    &mut paint,
+                    plain_key(14),
+                    text,
+                    &style,
+                ))
+        }
         FeedItem::Session { title } => div()
             .text_size(px(theme.font.xs))
             .text_color(theme.colors.muted)
@@ -3386,12 +3752,6 @@ fn restore_detail_text(restore: &SessionRestore, feed_readable: bool, has_summar
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::Theme;
-    use gpui::TextStyle;
-
-    fn theme() -> &'static Theme {
-        Theme::for_appearance(gpui::WindowAppearance::Dark)
-    }
 
     #[test]
     fn feed_item_falls_back_to_raw_text_without_a_parsed_body() {
@@ -3402,7 +3762,14 @@ mod tests {
             },
             body: None,
         };
-        let _ = feed_item(theme(), &TextStyle::default(), 0, &row);
+        // The paint path uses `row.body` when present and the raw string
+        // otherwise. A missing cached body must never drop the message.
+        match &row.item {
+            FeedItem::Message { text, .. } => {
+                assert_eq!(text, "raw **markdown** source");
+            }
+            other => panic!("expected a message, got {other:?}"),
+        }
         assert!(row.body.is_none());
     }
 

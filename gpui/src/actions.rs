@@ -661,6 +661,12 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("end", SessionSelectEnd, Some("SessionSelect")),
         KeyBinding::new("enter", SessionSelectConfirm, Some("SessionSelect")),
         KeyBinding::new("escape", SessionSelectCancel, Some("SessionSelect")),
+        // Read-only output selection. `Cmd/Ctrl+C` copies the last-clicked
+        // selectable region and `Cmd/Ctrl+A` selects all of it, even when no
+        // text field is focused. The `Root && TextField` bindings below are more
+        // specific, so a focused field still wins.
+        KeyBinding::new("secondary-c", TextCopy, Some("Root")),
+        KeyBinding::new("secondary-a", TextSelectAll, Some("Root")),
         // Text editing. These are registered last so a focused field wins over
         // the shell/list/arrow bindings at equal predicate depth. `TextField`
         // and `Multiline` are appended to the root key context only while an
@@ -1126,8 +1132,13 @@ mod tests {
         ] {
             let binding = bindings
                 .iter()
-                .find(|binding| binding.action().name().ends_with(action))
-                .unwrap_or_else(|| panic!("{action} has no binding"));
+                .find(|binding| {
+                    binding.action().name().ends_with(action)
+                        && binding
+                            .predicate()
+                            .is_some_and(|predicate| predicate.to_string().contains("TextField"))
+                })
+                .unwrap_or_else(|| panic!("{action} has no TextField binding"));
             let predicate = binding.predicate().expect("context").to_string();
             assert!(
                 predicate.contains("TextField"),

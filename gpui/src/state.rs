@@ -42,6 +42,8 @@ use crate::runtime::{PingSnapshot, Runtime, Update};
 use crate::schedules::{
     self, ScheduleDeleteConfirm, ScheduleEditor, ScheduleField, SchedulesState,
 };
+use crate::selectable_text::SelectableTextLayout;
+use crate::selection::{SelectionStore, TextSelection};
 use crate::session_menu::{self, SessionMenu, SessionMenuAction, SessionMenuRow};
 use crate::settings::{SettingsActivate, SettingsFocus, SettingsState};
 use crate::sse::Push;
@@ -56,6 +58,9 @@ use crate::workflow::{
 
 /// How long a toast stays on screen before dismissing itself.
 const TOAST_LINGER: Duration = Duration::from_secs(6);
+
+/// The one success message every clipboard write shows.
+pub const COPIED_TOAST: &str = "Copied to clipboard.";
 
 /// Rows moved by PageUp/PageDown on the Tasks list.
 const TASKS_PAGE_ROWS: usize = 10;
@@ -328,6 +333,9 @@ pub struct ClientState {
     shell_focus: Option<FocusHandle>,
     /// Shaped-line caches used by click-to-place-caret and drag selection.
     text_edit: TextEditState,
+    /// Read-only selections and the shaped layouts mouse hit-testing needs.
+    read_only_selection: SelectionStore,
+    selectable_layouts: HashMap<u64, SelectableTextLayout>,
     /// The foreground task that drains [`Runtime`] updates. Declared before the
     /// runtime so dropping the entity cancels the drain first.
     drain: Option<GpuiTask<()>>,
@@ -420,6 +428,8 @@ impl ClientState {
             repo_picker: RepoPicker::default(),
             shell_focus: None,
             text_edit: TextEditState::default(),
+            read_only_selection: SelectionStore::default(),
+            selectable_layouts: HashMap::new(),
             runtime,
             drain,
         };
@@ -2327,8 +2337,7 @@ impl ClientState {
         self.retry_workflow_instance(task_id, cx);
     }
 
-    /// Copy the catalog DOT source (the monospace pane has no text selection in
-    /// this GPUI build).
+    /// Copy the catalog DOT source.
     pub fn copy_workflow_dot(&mut self, cx: &mut Context<Self>) {
         if self.workflow_graph.dot.is_empty() {
             self.show_toast(
@@ -2338,12 +2347,7 @@ impl ClientState {
             );
             return;
         }
-        cx.write_to_clipboard(ClipboardItem::new_string(self.workflow_graph.dot.clone()));
-        self.show_toast(
-            ToastKind::Success,
-            "Copied the catalog DAG source.".to_string(),
-            cx,
-        );
+        self.copy_to_clipboard(self.workflow_graph.dot.clone(), cx);
     }
 
     /// Ask the runtime for a fresh `schedules.list`. An older table stays
@@ -3209,8 +3213,7 @@ impl ClientState {
         self.ensure_catalog_preview();
     }
 
-    /// Copy the selected definition's Markdown source (the preview pane has no
-    /// text selection in this GPUI build).
+    /// Copy the selected definition's Markdown source.
     pub fn copy_catalog_source(&mut self, cx: &mut Context<Self>) {
         let Some(markdown) = self
             .catalog
@@ -3224,12 +3227,7 @@ impl ClientState {
             );
             return;
         };
-        cx.write_to_clipboard(ClipboardItem::new_string(markdown));
-        self.show_toast(
-            ToastKind::Success,
-            "Copied the definition source.".to_string(),
-            cx,
-        );
+        self.copy_to_clipboard(markdown, cx);
     }
 
     /// Validate the launch sheet and send `tasks.start`. A validation failure
@@ -4279,6 +4277,8 @@ impl ClientState {
 
     /// Move the logical focus to the clicked target (before placing the caret).
     pub fn focus_text_target(&mut self, target: TextTarget) {
+        // A real text field owns the clipboard shortcuts once it is focused.
+        self.clear_read_only_selection();
         match target {
             TextTarget::Palette | TextTarget::RepoPicker => {}
             TextTarget::TasksSearch => self.activate_tasks_search(),
@@ -4319,6 +4319,7 @@ impl ClientState {
     /// Side effects that depend on a value: filtering, validation, stale error
     /// clearing and the slash-command selection.
     pub fn after_text_edit(&mut self, target: TextTarget) {
+        self.clear_read_only_selection();
         match target {
             TextTarget::Palette | TextTarget::RepoPicker => {
                 self.repo_picker.after_edit(&self.repos);
@@ -5346,6 +5347,7 @@ impl ClientState {
         if !self.detail_prompt_enabled() {
             return;
         }
+        self.clear_read_only_selection();
         if self.active_route != Route::Agent {
             if let Some(detail) = self.detail.as_mut() {
                 detail.tab = DetailTab::Output;
@@ -5537,15 +5539,86 @@ impl ClientState {
     }
 
     /// Copy an arbitrary message (an error banner or a diagnostic) to the
-    /// clipboard. Error surfaces use this so a screenshot is never required to
-    /// report a failure.
-    pub fn copy_text(&mut self, text: String, label: &str, cx: &mut Context<Self>) {
-        cx.write_to_clipboard(ClipboardItem::new_string(text));
-        self.show_toast(ToastKind::Info, format!("Copied {label}."), cx);
+    /// clipboard. Every copy path funnels through here so the toast wording and
+    /// kind stay identical.
+    pub fn copy_text(&mut self, text: String, cx: &mut Context<Self>) {
+        self.copy_to_clipboard(text, cx);
     }
 
-    /// Copy the persisted output to the clipboard (the plain-text pane has no
-    /// text selection in this GPUI build, so Copy is the accessible path).
+    /// The one clipboard write in the client: a non-empty value plus the
+    /// standardized success toast.
+    pub fn copy_to_clipboard(&mut self, text: String, cx: &mut Context<Self>) {
+        if text.is_empty() {
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.show_toast(ToastKind::Success, COPIED_TOAST.to_string(), cx);
+    }
+
+    // -- Read-only text selection ------------------------------------------
+
+    /// The shaped layout captured by the last paint of `key`.
+    pub fn selectable_layout(&self, key: u64) -> Option<&SelectableTextLayout> {
+        self.selectable_layouts.get(&key)
+    }
+
+    pub(crate) fn set_selectable_layout(&mut self, key: u64, layout: SelectableTextLayout) {
+        self.selectable_layouts.insert(key, layout);
+    }
+
+    pub fn read_only_selection(&self, key: u64) -> Option<&TextSelection> {
+        self.read_only_selection.selection(key)
+    }
+
+    pub fn read_only_selection_dragging(&self) -> Option<u64> {
+        self.read_only_selection.dragging_key()
+    }
+
+    pub(crate) fn begin_read_only_selection(
+        &mut self,
+        key: u64,
+        text: &str,
+        offset: usize,
+        click_count: usize,
+        shift: bool,
+    ) {
+        self.read_only_selection
+            .begin(key, text, offset, click_count, shift);
+    }
+
+    pub(crate) fn extend_read_only_selection(&mut self, key: u64, offset: usize) {
+        self.read_only_selection.extend(key, offset);
+    }
+
+    pub(crate) fn end_read_only_selection_drag(&mut self, key: u64) {
+        self.read_only_selection.end_drag(key);
+    }
+
+    pub(crate) fn sync_read_only_selection_text(&mut self, key: u64, text: &str) {
+        self.read_only_selection.set_text(key, text);
+    }
+
+    /// A real text field taking focus wins the next clipboard shortcut.
+    pub fn clear_read_only_selection(&mut self) {
+        self.read_only_selection.clear();
+    }
+
+    /// Copy the active read-only selection. Returns `false` when nothing is
+    /// selected so the shell can fall back to a focused text field.
+    pub fn copy_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(text) = self.read_only_selection.active_selected_text() else {
+            return false;
+        };
+        self.copy_to_clipboard(text, cx);
+        true
+    }
+
+    /// `Cmd/Ctrl+A` on the last-clicked output region.
+    pub fn select_all_read_only(&mut self) -> bool {
+        self.read_only_selection.select_all_active()
+    }
+
+    /// Copy the persisted output to the clipboard.
     pub fn copy_detail_output(&mut self, cx: &mut Context<Self>) {
         let Some(output) = self.detail.as_ref().and_then(TaskDetail::output) else {
             self.show_toast(
@@ -5555,12 +5628,7 @@ impl ClientState {
             );
             return;
         };
-        cx.write_to_clipboard(ClipboardItem::new_string(output.text));
-        self.show_toast(
-            ToastKind::Success,
-            "Copied the run output to the clipboard.".to_string(),
-            cx,
-        );
+        self.copy_to_clipboard(output.text, cx);
     }
 
     /// Cancel/retry/delete for the open detail, with the same confirmation and
@@ -5846,6 +5914,75 @@ fn reply_done_message(reply: &InputReply) -> String {
 }
 
 #[cfg(test)]
+impl ClientState {
+    /// A minimal state for view/element tests that must not start the runtime.
+    pub(crate) fn test_instance() -> Self {
+        ClientState {
+            connection: ConnectionState::default(),
+            config: ClientConfig {
+                endpoint: "http://127.0.0.1:4780".to_string(),
+                token: None,
+                token_source: config::TokenSource::Missing(std::path::PathBuf::new()),
+                config_path: std::path::PathBuf::new(),
+                theme: ThemeChoice::default(),
+                density: Density::default(),
+                warnings: Vec::new(),
+            },
+            last_ping: None,
+            cursor: None,
+            push_count: 0,
+            last_push: None,
+            last_error: None,
+            active_route: Route::default(),
+            detail_open: false,
+            tasks: Vec::new(),
+            sessions: Vec::new(),
+            snapshot_revision: 0,
+            derived: RefCell::new(DerivedSnapshot::default()),
+            agents: Vec::new(),
+            catalog: CatalogState::default(),
+            snapshot_status: SnapshotStatus::default(),
+            inbox_selected: None,
+            tasks_filter: TaskFilter::default(),
+            tasks_query: TextInput::default(),
+            tasks_search_active: false,
+            tasks_selected: None,
+            tasks_selected_index: 0,
+            dismissed_launch_failures: HashSet::new(),
+            task_confirm: None,
+            toast: None,
+            toast_id: 0,
+            selected_task: None,
+            detail: None,
+            deleted_task: None,
+            workflow_root: None,
+            workflow_detail: None,
+            workflow_inspect: None,
+            workflow_loading: false,
+            workflow_dirty: false,
+            workflow_graph: WorkflowGraphState::default(),
+            workflow_confirm: None,
+            workflow_cancel_previous: None,
+            workflow_retry_previous: HashMap::new(),
+            schedules: SchedulesState::default(),
+            settings: SettingsState::new("http://127.0.0.1:4780", None),
+            daemon_config: DaemonConfigState::default(),
+            standalone: StandaloneAgent::default(),
+            repos: Vec::new(),
+            active_repo: None,
+            repos_loaded: false,
+            repo_picker: RepoPicker::default(),
+            shell_focus: None,
+            text_edit: TextEditState::default(),
+            read_only_selection: SelectionStore::default(),
+            selectable_layouts: HashMap::new(),
+            drain: None,
+            runtime: None,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime::Command;
@@ -5916,66 +6053,7 @@ mod tests {
     }
 
     fn test_state() -> ClientState {
-        ClientState {
-            connection: ConnectionState::default(),
-            config: ClientConfig {
-                endpoint: "http://127.0.0.1:4780".to_string(),
-                token: None,
-                token_source: config::TokenSource::Missing(std::path::PathBuf::new()),
-                config_path: std::path::PathBuf::new(),
-                theme: ThemeChoice::default(),
-                density: Density::default(),
-                warnings: Vec::new(),
-            },
-            last_ping: None,
-            cursor: None,
-            push_count: 0,
-            last_push: None,
-            last_error: None,
-            active_route: Route::default(),
-            detail_open: false,
-            tasks: Vec::new(),
-            sessions: Vec::new(),
-            snapshot_revision: 0,
-            derived: RefCell::new(DerivedSnapshot::default()),
-            agents: Vec::new(),
-            catalog: CatalogState::default(),
-            snapshot_status: SnapshotStatus::default(),
-            inbox_selected: None,
-            tasks_filter: TaskFilter::default(),
-            tasks_query: TextInput::default(),
-            tasks_search_active: false,
-            tasks_selected: None,
-            tasks_selected_index: 0,
-            dismissed_launch_failures: HashSet::new(),
-            task_confirm: None,
-            toast: None,
-            toast_id: 0,
-            selected_task: None,
-            detail: None,
-            deleted_task: None,
-            workflow_root: None,
-            workflow_detail: None,
-            workflow_inspect: None,
-            workflow_loading: false,
-            workflow_dirty: false,
-            workflow_graph: WorkflowGraphState::default(),
-            workflow_confirm: None,
-            workflow_cancel_previous: None,
-            workflow_retry_previous: HashMap::new(),
-            schedules: SchedulesState::default(),
-            settings: SettingsState::new("http://127.0.0.1:4780", None),
-            daemon_config: DaemonConfigState::default(),
-            standalone: StandaloneAgent::default(),
-            repos: Vec::new(),
-            active_repo: None,
-            repos_loaded: false,
-            repo_picker: RepoPicker::default(),
-            shell_focus: None,
-            text_edit: TextEditState::default(),
-            drain: None,
-            runtime: None,
-        }
+        ClientState::test_instance()
     }
 
     fn repo(name: &str, active: bool) -> RepoInfo {
@@ -6204,5 +6282,35 @@ mod tests {
             commands.try_recv().is_err(),
             "switching must not emit agents.start or agents.close"
         );
+    }
+
+    #[gpui::test]
+    fn every_clipboard_write_uses_the_standard_success_toast(cx: &mut gpui::TestAppContext) {
+        let state = cx.update(|cx| cx.new(|_| ClientState::test_instance()));
+        cx.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.copy_to_clipboard("copied source".to_string(), cx);
+            });
+        });
+
+        let clipboard = cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
+        assert_eq!(clipboard.as_deref(), Some("copied source"));
+        let toast = cx
+            .update(|cx| state.read(cx).toast().cloned())
+            .expect("a toast was shown");
+        assert_eq!(toast.kind, ToastKind::Success);
+        assert_eq!(toast.message, COPIED_TOAST);
+    }
+
+    #[gpui::test]
+    fn an_empty_copy_is_a_no_op(cx: &mut gpui::TestAppContext) {
+        let state = cx.update(|cx| cx.new(|_| ClientState::test_instance()));
+        cx.update(|cx| {
+            state.update(cx, |state, cx| state.copy_to_clipboard(String::new(), cx));
+        });
+        assert!(cx
+            .update(|cx| cx.read_from_clipboard().and_then(|item| item.text()))
+            .is_none());
+        assert!(cx.update(|cx| state.read(cx).toast().is_none()));
     }
 }
