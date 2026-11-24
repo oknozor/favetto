@@ -4,6 +4,8 @@
 //! a spacing value (docs/design/gpui-client.md §3, Aesthetic-Usability).
 
 use std::cell::Cell;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -365,6 +367,28 @@ pub fn with_focus<T: Styled + gpui::InteractiveElement>(element: T, theme: &Them
         .border_2()
         .border_color(transparent_black())
         .focus(focus_ring(theme))
+}
+
+/// A lazily populated map of stable focus handles keyed by a numeric element
+/// seed.
+///
+/// Virtualized rows create their controls on every render; a focus handle made
+/// inline would be thrown away (and focus with it) each frame. Views keep one
+/// registry for a surface and derive a handle from the same row-seeded id they
+/// give the control.
+#[derive(Clone, Default)]
+pub struct FocusRegistry {
+    handles: Rc<RefCell<HashMap<u64, FocusHandle>>>,
+}
+
+impl FocusRegistry {
+    pub fn handle(&self, key: u64, cx: &mut App) -> FocusHandle {
+        self.handles
+            .borrow_mut()
+            .entry(key)
+            .or_insert_with(|| cx.focus_handle().tab_index(90).tab_stop(true))
+            .clone()
+    }
 }
 
 /// A small secondary action used to make an error message copyable. The caller

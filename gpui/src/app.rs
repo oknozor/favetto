@@ -11,8 +11,8 @@
 //! [`crate::layout::container_query`] reads the equivalent full-window width.
 
 use gpui::{
-    div, prelude::*, px, Animation, AnimationExt, AnyElement, ClipboardItem, Context, Div, Entity,
-    FocusHandle, Hsla, IntoElement, MouseButton, Render, Stateful, Window,
+    div, prelude::*, px, Animation, AnimationExt, AnyElement, Context, Div, Entity, FocusHandle,
+    Hsla, IntoElement, MouseButton, Render, Stateful, Window,
 };
 
 use crate::actions::{
@@ -1130,6 +1130,21 @@ impl RootView {
     }
 
     fn copy_active_text(&mut self, cut: bool, cx: &mut Context<Self>) {
+        if !cut {
+            // A read-only selection wins when the last click was on output; a
+            // focused field clears it, so the field path below stays intact.
+            let copied = self.state.update(cx, |state, cx| {
+                let copied = state.copy_selection(cx);
+                if copied {
+                    cx.notify();
+                }
+                copied
+            });
+            if copied {
+                cx.stop_propagation();
+                return;
+            }
+        }
         let Some(target) = self.active_text_target(cx) else {
             return;
         };
@@ -1148,7 +1163,10 @@ impl RootView {
         let Some(selected) = selected else {
             return;
         };
-        cx.write_to_clipboard(ClipboardItem::new_string(selected));
+        self.state.update(cx, |state, cx| {
+            state.copy_to_clipboard(selected, cx);
+            cx.notify();
+        });
         if cut {
             if target == TextTarget::Palette {
                 self.palette.input_mut().delete_selection();
@@ -1165,6 +1183,19 @@ impl RootView {
             cx.notify();
         }
         cx.stop_propagation();
+    }
+
+    fn select_all_active(&mut self, cx: &mut Context<Self>) {
+        let selected = self.state.update(cx, |state, cx| {
+            let selected = state.select_all_read_only();
+            if selected {
+                cx.notify();
+            }
+            selected
+        });
+        if !selected {
+            self.edit_active_text(TextCommand::SelectAll, cx);
+        }
     }
 
     fn paste_active_text(&mut self, cx: &mut Context<Self>) {
@@ -1925,7 +1956,7 @@ impl RootView {
             )
             .on_click(cx.listener(move |this, _event, _window, cx| {
                 this.state.update(cx, |state, cx| {
-                    state.copy_text(copy_text.clone(), "the error", cx);
+                    state.copy_text(copy_text.clone(), cx);
                     cx.notify();
                 });
             }));
@@ -2252,7 +2283,7 @@ impl RootView {
             components::copy_button(theme, "toast-copy", "Copy error", &self.toast_copy_focus)
                 .on_click(cx.listener(move |this, _event, _window, cx| {
                     this.state.update(cx, |state, cx| {
-                        state.copy_text(message.clone(), "the error", cx);
+                        state.copy_text(message.clone(), cx);
                         cx.notify();
                     });
                 }))
@@ -3108,7 +3139,7 @@ impl Render for RootView {
                 this.edit_active_text(TextCommand::SelectDown, cx);
             }))
             .on_action(cx.listener(|this, _: &TextSelectAll, _window, cx| {
-                this.edit_active_text(TextCommand::SelectAll, cx);
+                this.select_all_active(cx);
             }))
             .on_action(cx.listener(|this, _: &TextBackspace, _window, cx| {
                 this.edit_active_text(TextCommand::Backspace, cx);

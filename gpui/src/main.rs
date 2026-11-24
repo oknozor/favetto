@@ -28,6 +28,8 @@ mod routes;
 mod runtime;
 mod schedules;
 mod search;
+mod selectable_text;
+mod selection;
 mod session_menu;
 mod settings;
 mod sse;

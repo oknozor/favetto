@@ -12,12 +12,15 @@
 use std::ops::Range;
 
 use gpui::{
-    div, prelude::*, px, AnyElement, Div, ElementId, FontStyle, FontWeight, Hsla, InteractiveText,
-    IntoElement, StrikethroughStyle, StyledText, TextRun, TextStyle, UnderlineStyle,
+    div, prelude::*, px, AnyElement, App, Div, Entity, FontStyle, FontWeight, Hsla, IntoElement,
+    StrikethroughStyle, TextRun, TextStyle, UnderlineStyle,
 };
 
+use crate::components;
 use crate::markdown::syntax::{self, Token, TokenKind};
 use crate::markdown::{self, Align, Block, Inline, MarkdownDoc};
+use crate::selectable_text::SelectableText;
+use crate::state::ClientState;
 use crate::theme::Theme;
 
 /// Which visual treatment a Markdown body uses.
@@ -30,30 +33,68 @@ pub(crate) enum Tone {
 /// How many element ids each feed row may consume before the next row starts.
 pub(crate) const MARKDOWN_ROW_STRIDE: u64 = 100_000;
 
+/// A seed reserved for the Catalog's highlighted TOML front matter, so it
+/// cannot collide with the first Markdown block (which starts at seed `0`).
+pub(crate) const SOURCE_PREVIEW_SEED: u64 = u64::MAX - 16;
+
+/// Everything the shared Markdown renderer needs while it builds selectable
+/// text and per-block copy buttons.
+pub(crate) struct PaintContext<'a> {
+    pub theme: &'a Theme,
+    pub base: &'a TextStyle,
+    pub state: &'a Entity<ClientState>,
+    pub focuses: &'a components::FocusRegistry,
+    pub cx: &'a mut App,
+}
+
 /// Render a parsed Markdown document with the given tone and id seed.
 pub(crate) fn markdown_body(
-    theme: &Theme,
-    base: &TextStyle,
+    ctx: &mut PaintContext<'_>,
     doc: &MarkdownDoc,
     tone: Tone,
     seed: u64,
 ) -> Div {
     let mut ids = seed;
-    render_blocks(theme, base, &doc.blocks, tone, 0, &mut ids)
+    render_blocks(ctx, &doc.blocks, tone, 0, &mut ids)
 }
 
 /// Render already-tokenised source, preserving the original whitespace.
 pub(crate) fn highlighted_tokens(
-    theme: &Theme,
-    base: &TextStyle,
+    ctx: &mut PaintContext<'_>,
     tokens: &[Token],
     size: f32,
+    seed: u64,
 ) -> Div {
-    let (text, runs) = syntax_styled(theme, base, tokens, size);
+    let mut style = ctx.base.clone();
+    style.font_family = "monospace".into();
+    style.font_size = px(size).into();
+    let (text, runs) = syntax_styled(ctx.theme, ctx.base, tokens, size);
+    let element = SelectableText::new(ctx.state, seed, text, runs, &style, ctx.theme);
     div()
         .min_w_0()
         .whitespace_normal()
-        .child(StyledText::new(text).with_runs(runs))
+        .cursor_text()
+        .child(element)
+}
+
+/// A plain (non-Markdown) read-only string that supports mouse selection.
+pub(crate) fn plain_selectable(
+    ctx: &mut PaintContext<'_>,
+    key: u64,
+    text: String,
+    style: &TextStyle,
+) -> AnyElement {
+    if text.is_empty() {
+        return div().into_any_element();
+    }
+    let runs = vec![style.to_run(text.len())];
+    let element = SelectableText::new(ctx.state, key, text, runs, style, ctx.theme);
+    div()
+        .min_w_0()
+        .whitespace_normal()
+        .cursor_text()
+        .child(element)
+        .into_any_element()
 }
 
 fn syntax_styled(
@@ -76,23 +117,22 @@ fn syntax_styled(
 }
 
 fn render_blocks(
-    theme: &Theme,
-    base: &TextStyle,
+    ctx: &mut PaintContext<'_>,
     blocks: &[Block],
     tone: Tone,
     depth: usize,
     ids: &mut u64,
 ) -> Div {
-    let mut column = div().flex().flex_col().gap(px(theme.spacing.s2)).min_w_0();
+    let gap = ctx.theme.spacing.s2;
+    let mut column = div().flex().flex_col().gap(px(gap)).min_w_0();
     for block in blocks {
-        column = column.child(render_block(theme, base, block, tone, depth, ids));
+        column = column.child(render_block(ctx, block, tone, depth, ids));
     }
     column
 }
 
 fn render_block(
-    theme: &Theme,
-    base: &TextStyle,
+    ctx: &mut PaintContext<'_>,
     block: &Block,
     tone: Tone,
     depth: usize,
@@ -100,51 +140,43 @@ fn render_block(
 ) -> Div {
     match block {
         Block::Heading { level, content } => {
-            let (size, weight, color) = heading_style(theme, *level);
-            let mut heading = div().min_w_0().child(prose_colored(
-                theme, base, content, tone, size, weight, color, ids,
-            ));
+            let (size, weight, color) = heading_style(ctx.theme, *level);
+            let mut heading = div()
+                .min_w_0()
+                .child(prose_colored(ctx, content, tone, size, weight, color, ids));
             if *level <= 2 {
-                heading = heading.pt(px(theme.spacing.s1));
+                heading = heading.pt(px(ctx.theme.spacing.s1));
             }
             heading
         }
         Block::Paragraph(content) => div().min_w_0().child(prose(
-            theme,
-            base,
+            ctx,
             content,
             tone,
-            theme.font.sm,
-            base.font_weight,
+            ctx.theme.font.sm,
+            ctx.base.font_weight,
             ids,
         )),
-        Block::Code { language, code } => render_code_block(theme, base, language, code),
+        Block::Code { language, code } => render_code_block(ctx, language, code, ids),
         Block::List {
             ordered,
             start,
             items,
-        } => render_list(theme, base, *ordered, *start, items, tone, depth, ids),
+        } => render_list(ctx, *ordered, *start, items, tone, depth, ids),
         Block::Quote(blocks) => div()
             .flex()
             .flex_col()
             .min_w_0()
-            .pl(px(theme.spacing.s2))
+            .pl(px(ctx.theme.spacing.s2))
             .border_l_2()
-            .border_color(theme.colors.border)
-            .child(render_blocks(
-                theme,
-                base,
-                blocks,
-                Tone::Reasoning,
-                depth + 1,
-                ids,
-            )),
+            .border_color(ctx.theme.colors.border)
+            .child(render_blocks(ctx, blocks, Tone::Reasoning, depth + 1, ids)),
         Block::Rule => div()
             .w_full()
-            .py(px(theme.spacing.s1))
-            .child(div().w_full().h(px(1.0)).bg(theme.colors.border)),
+            .py(px(ctx.theme.spacing.s1))
+            .child(div().w_full().h(px(1.0)).bg(ctx.theme.colors.border)),
         Block::Table { align, head, rows } => {
-            render_table(theme, base, align, head, rows, tone, depth, ids)
+            render_table(ctx, align, head, rows, tone, depth, ids)
         }
     }
 }
@@ -164,8 +196,7 @@ fn heading_style(theme: &Theme, level: u8) -> (f32, FontWeight, Hsla) {
 }
 
 fn prose(
-    theme: &Theme,
-    base: &TextStyle,
+    ctx: &mut PaintContext<'_>,
     content: &[Inline],
     tone: Tone,
     size: f32,
@@ -173,16 +204,15 @@ fn prose(
     ids: &mut u64,
 ) -> AnyElement {
     let color = match tone {
-        Tone::Prose => Hsla::from(theme.colors.text),
-        Tone::Reasoning => Hsla::from(theme.colors.muted),
+        Tone::Prose => Hsla::from(ctx.theme.colors.text),
+        Tone::Reasoning => Hsla::from(ctx.theme.colors.muted),
     };
-    prose_colored(theme, base, content, tone, size, weight, color, ids)
+    prose_colored(ctx, content, tone, size, weight, color, ids)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn prose_colored(
-    theme: &Theme,
-    base: &TextStyle,
+    ctx: &mut PaintContext<'_>,
     content: &[Inline],
     tone: Tone,
     size: f32,
@@ -193,13 +223,12 @@ fn prose_colored(
     let inline = markdown::flatten(content);
     let id = *ids;
     *ids = (*ids).wrapping_add(1);
-    inline_styled(theme, base, &inline, tone, size, weight, color, id)
+    inline_styled(ctx, &inline, tone, size, weight, color, id)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn inline_styled(
-    theme: &Theme,
-    base: &TextStyle,
+    ctx: &mut PaintContext<'_>,
     inline: &markdown::InlineText,
     tone: Tone,
     size: f32,
@@ -207,27 +236,14 @@ fn inline_styled(
     color: Hsla,
     id: u64,
 ) -> AnyElement {
-    let (runs, links) = inline_runs(theme, base, inline, tone, size, weight, color);
-    let styled = StyledText::new(inline.text.clone()).with_runs(runs);
-    if links.is_empty() {
-        return div()
-            .min_w_0()
-            .whitespace_normal()
-            .child(styled)
-            .into_any_element();
-    }
-
-    let ranges: Vec<Range<usize>> = links.iter().map(|(range, _)| range.clone()).collect();
-    let urls: Vec<String> = links.into_iter().map(|(_, url)| url).collect();
-    let text = InteractiveText::new(ElementId::NamedInteger("md-prose".into(), id), styled)
-        .on_click(ranges, move |index, _window, cx| {
-            if let Some(url) = urls.get(index) {
-                cx.open_url(url);
-            }
-        });
+    let (runs, links) = inline_runs(ctx.theme, ctx.base, inline, tone, size, weight, color);
+    let style = base_style(ctx.base, tone, size, weight, color);
+    let text = SelectableText::new(ctx.state, id, inline.text.clone(), runs, &style, ctx.theme)
+        .links(links);
     div()
         .min_w_0()
         .whitespace_normal()
+        .cursor_text()
         .child(text)
         .into_any_element()
 }
@@ -321,7 +337,11 @@ fn is_openable(url: &str) -> bool {
     lower.starts_with("http://") || lower.starts_with("https://")
 }
 
-fn render_code_block(theme: &Theme, base: &TextStyle, language: &str, code: &str) -> Div {
+fn render_code_block(ctx: &mut PaintContext<'_>, language: &str, code: &str, ids: &mut u64) -> Div {
+    let theme = *ctx.theme;
+    let id = *ids;
+    *ids = (*ids).wrapping_add(1);
+
     let mut container = div()
         .flex()
         .flex_col()
@@ -333,30 +353,52 @@ fn render_code_block(theme: &Theme, base: &TextStyle, language: &str, code: &str
         .bg(Hsla::from(theme.colors.border).opacity(0.12));
 
     let label = syntax::language_name(language);
-    if !label.is_empty() {
-        container = container.child(
-            div()
-                .px(px(theme.spacing.s2))
-                .py(px(theme.spacing.s1))
-                .border_b_1()
-                .border_color(Hsla::from(theme.colors.border).opacity(0.35))
-                .font_family("monospace")
-                .text_size(px(theme.font.xs))
-                .text_color(theme.colors.muted)
-                .child(label),
-        );
-    }
+    let focus = ctx.focuses.handle(id, ctx.cx);
+    let copy_text = code.to_string();
+    let copy_state = ctx.state.clone();
+    let copy = components::copy_button(&theme, ("md-code-copy", id), "⧉ Copy code", &focus)
+        .on_click(move |_event, _window, cx| {
+            copy_state.update(cx, |state, cx| {
+                state.copy_to_clipboard(copy_text.clone(), cx);
+                cx.notify();
+            });
+        });
+    container = container.child(
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(theme.spacing.s2))
+            .px(px(theme.spacing.s2))
+            .py(px(theme.spacing.s1))
+            .border_b_1()
+            .border_color(Hsla::from(theme.colors.border).opacity(0.35))
+            .font_family("monospace")
+            .text_size(px(theme.font.xs))
+            .text_color(theme.colors.muted)
+            .child(if label.is_empty() {
+                div().into_any_element()
+            } else {
+                div().child(label).into_any_element()
+            })
+            .child(copy),
+    );
 
     let tokens = syntax::highlight(language, code);
-    let (text, runs) = syntax_styled(theme, base, &tokens, theme.font.xs);
+    let (text, runs) = syntax_styled(ctx.theme, ctx.base, &tokens, theme.font.xs);
 
     if !text.is_empty() {
+        let mut style = ctx.base.clone();
+        style.font_family = "monospace".into();
+        style.font_size = px(theme.font.xs).into();
+        let element = SelectableText::new(ctx.state, id, text, runs, &style, ctx.theme);
         container = container.child(
             div()
                 .min_w_0()
                 .whitespace_normal()
+                .cursor_text()
                 .p(px(theme.spacing.s2))
-                .child(StyledText::new(text).with_runs(runs)),
+                .child(element),
         );
     }
     container
@@ -378,8 +420,7 @@ fn syntax_color(theme: &Theme, kind: TokenKind) -> gpui::Rgba {
 
 #[allow(clippy::too_many_arguments)]
 fn render_list(
-    theme: &Theme,
-    base: &TextStyle,
+    ctx: &mut PaintContext<'_>,
     ordered: bool,
     start: u64,
     items: &[markdown::ListItem],
@@ -387,6 +428,7 @@ fn render_list(
     depth: usize,
     ids: &mut u64,
 ) -> Div {
+    let theme = *ctx.theme;
     let mut column = div().flex().flex_col().gap(px(theme.spacing.s1)).min_w_0();
     if depth > 0 {
         column = column.pl(px(theme.spacing.s3));
@@ -402,7 +444,7 @@ fn render_list(
         let content = if item.blocks.is_empty() {
             div()
         } else {
-            render_blocks(theme, base, &item.blocks, tone, depth + 1, ids)
+            render_blocks(ctx, &item.blocks, tone, depth + 1, ids)
         };
         column = column.child(
             div()
@@ -426,8 +468,7 @@ fn render_list(
 
 #[allow(clippy::too_many_arguments)]
 fn render_table(
-    theme: &Theme,
-    base: &TextStyle,
+    ctx: &mut PaintContext<'_>,
     align: &[Align],
     head: &[Vec<Inline>],
     rows: &[Vec<Vec<Inline>>],
@@ -435,27 +476,25 @@ fn render_table(
     depth: usize,
     ids: &mut u64,
 ) -> Div {
-    let border = Hsla::from(theme.colors.border).opacity(0.45);
+    let border = Hsla::from(ctx.theme.colors.border).opacity(0.45);
     let mut container = div()
         .flex()
         .flex_col()
         .min_w_0()
         .overflow_hidden()
-        .rounded(px(theme.radii.r4))
+        .rounded(px(ctx.theme.radii.r4))
         .border_1()
         .border_color(border);
 
     if !head.is_empty() {
-        container = container.child(render_table_row(
-            theme, base, head, align, tone, depth, ids, true,
-        ));
+        container = container.child(render_table_row(ctx, head, align, tone, depth, ids, true));
     }
     for (index, row) in rows.iter().enumerate() {
-        let mut rendered = render_table_row(theme, base, row, align, tone, depth, ids, false);
+        let mut rendered = render_table_row(ctx, row, align, tone, depth, ids, false);
         if index > 0 || !head.is_empty() {
             rendered = rendered
                 .border_t_1()
-                .border_color(Hsla::from(theme.colors.border).opacity(0.35));
+                .border_color(Hsla::from(ctx.theme.colors.border).opacity(0.35));
         }
         container = container.child(rendered);
     }
@@ -464,8 +503,7 @@ fn render_table(
 
 #[allow(clippy::too_many_arguments)]
 fn render_table_row(
-    theme: &Theme,
-    base: &TextStyle,
+    ctx: &mut PaintContext<'_>,
     cells: &[Vec<Inline>],
     align: &[Align],
     tone: Tone,
@@ -473,6 +511,7 @@ fn render_table_row(
     ids: &mut u64,
     header: bool,
 ) -> Div {
+    let theme = *ctx.theme;
     let mut row = div()
         .flex()
         .w_full()
@@ -494,9 +533,9 @@ fn render_table_row(
             let weight = if header {
                 FontWeight::SEMIBOLD
             } else {
-                base.font_weight
+                ctx.base.font_weight
             };
-            prose_colored(theme, base, cell, tone, theme.font.xs, weight, color, ids)
+            prose_colored(ctx, cell, tone, theme.font.xs, weight, color, ids)
         };
         let mut cell = div()
             .flex_1()

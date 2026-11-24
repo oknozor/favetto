@@ -118,9 +118,12 @@ pinned while the tab body scrolls:
   daemon restart; a cached live feed stays visible until that summary decodes.
   A run without structured events falls back to the plain persisted transcript,
   with a notice when the daemon truncated it, and a **Raw output** disclosure
-  keeps that transcript one click away when a structured log exists. **Copy
-  output** is the clipboard path, because this GPUI build has no text selection
-  primitive.
+  keeps that transcript one click away when a structured log exists. Agent
+  output is mouse-selectable; `Cmd/Ctrl+C` copies the last-clicked selection
+  and `Cmd/Ctrl+A` selects that whole region. **Copy output** remains the
+  whole-run shortcut. Every clipboard write shows the same success toast, and
+  every fenced code block carries a **Copy code** button that copies the source
+  without its fence or language tag.
 - Live and durable rows share one model: consecutive text/reasoning deltas
   become one block, tool start/finish events merge into one card, usage and
   errors keep their own rows, and a durable summary renders as
@@ -493,11 +496,15 @@ Deviations from the plan are recorded in this file as the chain progresses
 
 ### Step 06 deviations / additions
 
-- **No text selection in this GPUI build.** The pinned `gpui 0.2.2` exposes no
-  selectable-text primitive. Durable agent prose renders as Markdown through the
-  shared Output/Catalog renderer, while a plain/PTY transcript stays monospace;
-  the **Copy output** action is the clipboard path. This is the one place the
-  "selectable" wording cannot be met literally in the current framework.
+- **Read-only selection is per region.** The pinned `gpui 0.2.2` exposes no
+  selectable-text primitive, so the client ships a small read-only element over
+  a GPUI-free selection model. Dragging, double-click (word), triple-click
+  (paragraph), `Cmd/Ctrl+A` and `Cmd/Ctrl+C` work within the clicked output
+  block, and every message, tool card, banner and raw-output pane has a copy
+  affordance. Selection cannot span separate paragraph/code elements inside one
+  virtualized row; whole-message copy and the code-block buttons cover that
+  case. Durable agent prose still renders as Markdown through the shared
+  Output/Catalog renderer, and **Copy output** copies the entire run.
 - **Run-status labels.** `RunStatus` has two outcomes the task enum does not
   (`interrupted`, `timed_out`); the Runs table renders those labels directly and
   keeps `StatusKind` for the shared icon/color vocabulary.
@@ -521,11 +528,11 @@ Deviations from the plan are recorded in this file as the chain progresses
 
 ### Step 07 deviations / additions
 
-- **Preview is rendered, Copy is raw.** As in step 06, this GPUI build has no
-  selectable-text primitive, so the Catalog pane renders the TOML front matter
-  and Markdown body and keeps a **Copy** action for the exact raw source. The
-  Markdown paint path is shared with the Output feed rather than duplicated in
-  the Catalog view.
+- **Preview is rendered and selectable; Copy is raw.** The Catalog pane renders
+  the TOML front matter and Markdown body through the shared Markdown paint path
+  and keeps a **Copy** action for the exact raw source. Because the renderer is
+  shared, preview prose is mouse-selectable and every fenced block gets the same
+  **Copy code** button as the Output feed.
 - **Form editing is append/backspace at the end.** The launch and one-shot
   sheets reuse the shell's typed-character routing (the same model as the
   palette and Tasks search); there is no cursor movement or marked-text IME
@@ -589,8 +596,8 @@ Deviations from the plan are recorded in this file as the chain progresses
   is unit-tested without a window.
 - **DAG source, not Graphviz.** `workflow.get` is a catalog-wide DOT string, so
   it stays available as readable monospace source in a collapsed-by-default
-  panel with a short spawn/needs/join legend, **Copy DOT** (no text selection in
-  this GPUI build) and a toggle. No Graphviz binary or DOT parser is embedded.
+  panel with a short spawn/needs/join legend, **Copy DOT**, selectable text and
+  a toggle. No Graphviz binary or DOT parser is embedded.
 - **Only failed instances retry from Workflows.** `r` and the detail panel's
   Retry call `workflow.retry` for a `failed` row; succeeded/cancelled rows stay
   retryable from the Tasks surface, which already has the broader terminal rule.
@@ -782,8 +789,10 @@ path remains covered by the step-05 live RPC check and its unit tests.
 - **No accessibility tree in this GPUI build.** Widget roles/names are not
   exposed to AT-SPI; the guarantees are visual labels, focus order, keyboard
   operation and target sizes.
-- **No text selection.** Output, source, DOT and errors are copyable via buttons
-  (and error copy) instead of selectable text.
+- **Selection is per rendered region.** Output, source, DOT and errors are
+  selectable, and copy buttons exist for whole messages, code blocks and error
+  banners. A drag cannot span two separate Markdown blocks or an off-screen row
+  in the virtualized feed; use the message/code copy controls for those cases.
 - **Restored transcripts are previews.** Settings caps the replayed text at
   4,000 characters; the TUI Agent panel is the full interactive transcript.
   A session whose daemon stopped before recording an ACP id remains `loading`

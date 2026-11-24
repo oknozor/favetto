@@ -106,9 +106,10 @@ These are framework or current-scope limits, not regressions from this pass:
   guarantees labels, focus order, keyboard operation and 32/40 px targets, but a
   screen reader cannot consume widget roles from this build
   (`src/components.rs`, `src/motion.rs`; README step 10).
-- **No text selection or IME marked-text composition.** Output, source, DOT and
-  errors are copyable through explicit buttons; typed text is append/backspace
-  only (`src/views/detail.rs`, `src/views/catalog.rs`, `src/views/settings.rs`).
+- **Read-only selection is per rendered region; no IME marked-text
+  composition.** Output, source, DOT and errors are mouse-selectable and copyable
+  through explicit buttons; typed text is append/backspace only
+  (`src/selectable_text.rs`, `src/selection.rs`, `src/views/settings.rs`).
 - **No embedded Graphviz.** `workflow.get` is readable DOT source with copy and
   a legend; the runtime graph is drawn by the client's own layout
   (`src/views/workflows.rs`, `src/workflow.rs`).
