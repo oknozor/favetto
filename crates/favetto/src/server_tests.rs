@@ -109,6 +109,276 @@ async fn config_validate_accepts_a_missing_file() {
     assert!(result["path"].as_str().unwrap().ends_with("config.toml"));
 }
 
+/// Dispatch one config request against `state`.
+async fn config_rpc(
+    state: &Arc<State>,
+    method_name: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    let resp = dispatch(
+        state,
+        Request {
+            id: 1,
+            method: method_name.to_string(),
+            params,
+        },
+    )
+    .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    resp.result.expect("config result")
+}
+
+#[tokio::test]
+async fn config_get_missing_file_is_valid_and_opens_with_defaults() {
+    let dir = temp_dir("config-get-missing");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+
+    let result = config_rpc(&state, method::CONFIG_GET, serde_json::json!({})).await;
+    assert_eq!(result["exists"], serde_json::json!(false));
+    assert_eq!(result["raw"], serde_json::json!(""));
+    assert_eq!(result["parse_errors"], serde_json::json!([]));
+    assert!(result["effective"].is_object());
+    assert!(result["revision"].as_str().is_some_and(|r| r.len() == 64));
+}
+
+#[tokio::test]
+async fn config_get_reports_a_malformed_file_without_failing() {
+    let dir = temp_dir("config-get-malformed");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+    std::fs::write(dir.join("config.toml"), "not valid toml [[[").unwrap();
+
+    let result = config_rpc(&state, method::CONFIG_GET, serde_json::json!({})).await;
+    assert_eq!(result["exists"], serde_json::json!(true));
+    assert_eq!(result["raw"], serde_json::json!("not valid toml [[["));
+    let errors = result["parse_errors"].as_array().expect("parse errors");
+    assert!(!errors.is_empty());
+    assert!(result["effective"].is_null());
+}
+
+#[tokio::test]
+async fn config_get_redacts_secrets_and_set_restores_them() {
+    let dir = temp_dir("config-secrets");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+    let original = r#"# keep this comment
+[webhook.github]
+enabled = true
+secret = "webhook-secret"
+
+[agents.custom]
+command = "/bin/true"
+
+[agents.custom.env]
+AGENT_TOKEN = "agent-secret"
+
+[[mcp.servers]]
+name = "seeded"
+command = "/bin/true"
+
+[mcp.servers.env]
+MCP_TOKEN = "mcp-secret"
+"#;
+    std::fs::write(dir.join("config.toml"), original).unwrap();
+
+    let get = config_rpc(&state, method::CONFIG_GET, serde_json::json!({})).await;
+    let raw = get["raw"].as_str().expect("raw");
+    for secret in ["webhook-secret", "agent-secret", "mcp-secret"] {
+        assert!(!raw.contains(secret), "secret `{secret}` leaked: {raw}");
+    }
+    assert!(raw.contains("__FAVETTO_REDACTED__"));
+    assert!(raw.contains("# keep this comment"));
+
+    // Saving the redacted draft unchanged round-trips the literal secrets and
+    // preserves the comment.
+    let result = config_rpc(
+        &state,
+        method::CONFIG_SET,
+        serde_json::json!({
+            "raw": raw,
+            "expected_revision": get["revision"],
+        }),
+    )
+    .await;
+    assert_eq!(result["saved"], serde_json::json!(true), "{result}");
+
+    let written = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+    assert!(written.contains("webhook-secret"), "{written}");
+    assert!(written.contains("agent-secret"), "{written}");
+    assert!(written.contains("mcp-secret"), "{written}");
+    assert!(written.contains("# keep this comment"), "{written}");
+    let config = crate::config::FavettoConfig::parse_str(&written).unwrap();
+    assert_eq!(
+        config.webhook.github.secret.as_deref(),
+        Some("webhook-secret")
+    );
+    assert_eq!(
+        config.agents["custom"]
+            .env
+            .get("AGENT_TOKEN")
+            .map(String::as_str),
+        Some("agent-secret")
+    );
+    assert_eq!(
+        config.mcp.servers[0]
+            .env
+            .get("MCP_TOKEN")
+            .map(String::as_str),
+        Some("mcp-secret")
+    );
+}
+
+#[tokio::test]
+async fn config_set_rejects_an_invalid_draft_without_writing() {
+    let dir = temp_dir("config-set-invalid");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+    let original = "[daemon]\nlisten = \"127.0.0.1:7878\"\n";
+    std::fs::write(dir.join("config.toml"), original).unwrap();
+
+    let result = config_rpc(
+        &state,
+        method::CONFIG_SET,
+        serde_json::json!({ "raw": "[daemon]\nlisten = 42\n" }),
+    )
+    .await;
+    assert_eq!(result["saved"], serde_json::json!(false));
+    assert!(!result["errors"].as_array().unwrap().is_empty(), "{result}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("config.toml")).unwrap(),
+        original
+    );
+}
+
+#[tokio::test]
+async fn config_set_rejects_a_stale_revision() {
+    let dir = temp_dir("config-set-stale");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+    let path = dir.join("config.toml");
+    std::fs::write(&path, "[daemon]\nlisten = \"127.0.0.1:7878\"\n").unwrap();
+    let get = config_rpc(&state, method::CONFIG_GET, serde_json::json!({})).await;
+
+    // Another client writes first.
+    let changed = "[daemon]\nlisten = \"127.0.0.1:9999\"\n";
+    std::fs::write(&path, changed).unwrap();
+
+    let result = config_rpc(
+        &state,
+        method::CONFIG_SET,
+        serde_json::json!({
+            "raw": "[daemon]\nlisten = \"127.0.0.1:1111\"\n",
+            "expected_revision": get["revision"],
+        }),
+    )
+    .await;
+    assert_eq!(result["saved"], serde_json::json!(false));
+    assert!(result["errors"][0]
+        .as_str()
+        .unwrap()
+        .contains("changed on disk"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
+    assert_eq!(
+        result["revision"],
+        serde_json::json!(crate::config::FavettoConfig::revision(changed))
+    );
+}
+
+#[tokio::test]
+async fn config_set_reports_restart_sections_and_the_client_only_tui_section() {
+    let dir = temp_dir("config-set-report");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+
+    let result = config_rpc(
+        &state,
+        method::CONFIG_SET,
+        serde_json::json!({
+            "raw": "[daemon]\nlisten = \"127.0.0.1:9999\"\n\n[tui]\ntheme = \"dark\"\n",
+        }),
+    )
+    .await;
+    assert_eq!(result["saved"], serde_json::json!(true), "{result}");
+    assert_eq!(
+        result["changed_sections"],
+        serde_json::json!(["daemon", "tui"])
+    );
+    assert_eq!(result["restart_required"], serde_json::json!(["daemon"]));
+    assert_eq!(result["live_sections"], serde_json::json!(["tui"]));
+    let warnings = result["warnings"].as_array().unwrap();
+    assert!(warnings.iter().any(|warning| warning
+        .as_str()
+        .is_some_and(|warning| warning.contains("Restart the daemon"))));
+}
+
+#[tokio::test]
+async fn config_validate_accepts_an_inline_draft_and_runs_preflight() {
+    let dir = temp_dir("config-validate-draft");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state(&dir, &tasks_dir).await;
+
+    let valid = config_rpc(
+        &state,
+        method::CONFIG_VALIDATE,
+        serde_json::json!({ "raw": "[daemon]\nlisten = \"127.0.0.1:9999\"\n" }),
+    )
+    .await;
+    assert_eq!(valid["valid"], serde_json::json!(true), "{valid}");
+
+    let invalid = config_rpc(
+        &state,
+        method::CONFIG_VALIDATE,
+        serde_json::json!({ "raw": "[daemon]\nlisten = 42\n" }),
+    )
+    .await;
+    assert_eq!(invalid["valid"], serde_json::json!(false));
+
+    // Preflight rejects a webhook rule naming a task that is not in the catalog.
+    let unknown_task = config_rpc(
+        &state,
+        method::CONFIG_VALIDATE,
+        serde_json::json!({
+            "raw": "[[webhook.github.rules]]\nname = \"r\"\nevent = \"issues\"\ntask = \"missing\"\n",
+        }),
+    )
+    .await;
+    assert_eq!(
+        unknown_task["valid"],
+        serde_json::json!(false),
+        "{unknown_task}"
+    );
+    // A draft never writes the file.
+    assert!(!dir.join("config.toml").exists());
+}
+
+#[test]
+fn env_overrides_map_to_dotted_config_keys() {
+    let overrides = env_overrides_from([
+        (
+            "FAVETTO__DAEMON__LISTEN".to_string(),
+            "0.0.0.0:1".to_string(),
+        ),
+        (
+            "FAVETTO_DAEMON__RETENTION__DAYS".to_string(),
+            "7".to_string(),
+        ),
+        ("FAVETTO_THEME".to_string(), "dark".to_string()),
+        ("PATH".to_string(), "/bin".to_string()),
+    ]);
+    let keys: Vec<&str> = overrides.iter().map(|entry| entry.key.as_str()).collect();
+    assert_eq!(keys, vec!["daemon.listen", "daemon.retention.days"]);
+    let warnings = config_warnings(&overrides);
+    assert!(warnings.iter().any(|warning| warning.contains("FAVETTO_*")));
+}
+
 #[tokio::test]
 async fn workflow_get_returns_dot_and_path() {
     let dir = temp_dir("workflow-get");

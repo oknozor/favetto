@@ -66,6 +66,26 @@ The Settings surface (**⌘,** / **Ctrl+,**) edits the endpoint and token in
 place, can test the connection with `system.ping`, and switches theme and
 density. **Save** rewrites `gpui.toml` and reconnects.
 
+Settings also edits the **daemon's global config** (`config.toml`) through
+`config.get`/`config.set`. The card opens the file as raw TOML so every section
+(`agent`, `agents`, `daemon`, `repos`, `mcp`, `executor`, `git`, `webhook`,
+`tui`, `auth`) is reachable, and a missing file opens with defaults. A malformed
+file still opens with its raw text and parse errors so it can be repaired.
+Saving validates syntax and the daemon's startup preflight (agent registry, git
+signing resolution and webhook rules) before an atomic write; comments, unknown
+keys and the file mode are preserved, and a stale revision is rejected rather
+than clobbering another client's edit.
+
+Secret values (literal webhook secrets, MCP `env`/`headers`, agent `env`) never
+leave the daemon: `config.get` replaces them with `__FAVETTO_REDACTED__`, and a
+save restores the literal value from disk. Removing the key explicitly clears it.
+
+Most sections are read once at startup, so a successful save reports
+`restart_required`; `[tui]` is the exception and is labelled as client-side.
+`FAVETTO_*` environment overrides are listed in the card because the effective
+value can differ from the saved file. Live repository and MCP changes belong to
+the `repos.*`/`mcp.*` RPCs; the config sections are only startup seeds.
+
 ## Common shortcuts
 
 | Shortcut | Action |

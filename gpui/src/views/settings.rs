@@ -41,6 +41,9 @@ pub struct SettingsView {
     docs_focus: FocusHandle,
     error_copy_focus: FocusHandle,
     agents_retry_focus: FocusHandle,
+    daemon_save_focus: FocusHandle,
+    daemon_reload_focus: FocusHandle,
+    daemon_reset_focus: FocusHandle,
 }
 
 impl SettingsView {
@@ -56,6 +59,9 @@ impl SettingsView {
             docs_focus: cx.focus_handle().tab_index(24).tab_stop(true),
             error_copy_focus: cx.focus_handle().tab_index(25).tab_stop(true),
             agents_retry_focus: cx.focus_handle().tab_index(26).tab_stop(true),
+            daemon_save_focus: cx.focus_handle().tab_index(27).tab_stop(true),
+            daemon_reload_focus: cx.focus_handle().tab_index(28).tab_stop(true),
+            daemon_reset_focus: cx.focus_handle().tab_index(29).tab_stop(true),
         }
     }
 
@@ -526,6 +532,350 @@ impl SettingsView {
             )
     }
 
+    fn daemon_config_card(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let (
+            path,
+            exists,
+            status,
+            errors,
+            warnings,
+            overrides,
+            restart,
+            live,
+            dirty,
+            saving,
+            loading,
+            load_error,
+            focus,
+        ) = {
+            let state = self.state.read(cx);
+            let config = state.daemon_config();
+            (
+                config.path().map(str::to_string),
+                config.exists(),
+                state.daemon_config_status(),
+                config.errors().to_vec(),
+                config.warnings().to_vec(),
+                config.overrides().to_vec(),
+                config.restart_required().to_vec(),
+                config.live_sections().to_vec(),
+                config.is_dirty(),
+                config.is_saving(),
+                config.is_loading(),
+                config.load_error().map(str::to_string),
+                state.settings().focus(),
+            )
+        };
+        let focused = focus == Some(SettingsFocus::DaemonConfig);
+        let can_save = self.state.read(cx).daemon_config().can_save();
+        let status_color = match status {
+            crate::daemon_config::DaemonConfigStatus::Invalid => theme.colors.danger,
+            crate::daemon_config::DaemonConfigStatus::Dirty
+            | crate::daemon_config::DaemonConfigStatus::Loading
+            | crate::daemon_config::DaemonConfigStatus::Saving => theme.colors.warning,
+            crate::daemon_config::DaemonConfigStatus::Saved => theme.colors.success,
+            crate::daemon_config::DaemonConfigStatus::Idle => theme.colors.muted,
+        };
+
+        let editor = div()
+            .id("settings-daemon-config-editor")
+            .flex()
+            .flex_col()
+            .min_h(px(220.0))
+            .p(px(theme.spacing.s3))
+            .rounded(px(theme.radii.r4))
+            .border_2()
+            .border_color(if focused {
+                theme.colors.accent
+            } else {
+                theme.colors.border
+            })
+            .bg(theme.colors.bg)
+            .cursor_text()
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.focus_settings(Some(SettingsFocus::DaemonConfig));
+                    cx.notify();
+                });
+            }))
+            .child(
+                div()
+                    .font_family("monospace")
+                    .text_size(px(theme.font.sm))
+                    .child(
+                        state_text_element(
+                            &self.state,
+                            TextTarget::SettingsDaemonConfig,
+                            theme,
+                            cx,
+                        )
+                        .multiline(true)
+                        .max_visible_lines(24)
+                        .placeholder(
+                            "# ~/.config/favetto/config.toml\n# A missing file is valid: defaults apply.",
+                        ),
+                    ),
+            );
+
+        let save = components::with_focus(
+            div()
+                .id("settings-daemon-save")
+                .h(px(36.0))
+                .px(px(theme.spacing.s3))
+                .flex()
+                .items_center()
+                .gap(px(theme.spacing.s2))
+                .rounded(px(theme.radii.r4))
+                .when(can_save, |button| {
+                    button
+                        .bg(Hsla::from(theme.colors.accent).opacity(0.20))
+                        .text_color(theme.colors.accent)
+                        .cursor_pointer()
+                })
+                .when(!can_save, |button| {
+                    button
+                        .border_1()
+                        .border_color(theme.colors.border)
+                        .text_color(theme.colors.muted)
+                        .opacity(0.6)
+                        .cursor_default()
+                })
+                .border_color(if focus == Some(SettingsFocus::DaemonSave) {
+                    theme.colors.accent
+                } else {
+                    theme.colors.border
+                })
+                .text_size(px(theme.font.sm))
+                .track_focus(&self.daemon_save_focus)
+                .child(if saving {
+                    "Saving…".to_string()
+                } else {
+                    "Save daemon config".to_string()
+                })
+                .child(components::keycap(theme, "⌘↵"))
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.state.update(cx, |state, cx| {
+                        state.focus_settings(Some(SettingsFocus::DaemonSave));
+                        state.save_daemon_config(cx);
+                        cx.notify();
+                    });
+                })),
+            theme,
+        );
+
+        let reload = components::with_focus(
+            div()
+                .id("settings-daemon-reload")
+                .h(px(36.0))
+                .px(px(theme.spacing.s3))
+                .flex()
+                .items_center()
+                .gap(px(theme.spacing.s1))
+                .rounded(px(theme.radii.r4))
+                .border_1()
+                .border_color(if focus == Some(SettingsFocus::DaemonReload) {
+                    theme.colors.accent
+                } else {
+                    theme.colors.border
+                })
+                .text_size(px(theme.font.sm))
+                .text_color(theme.colors.text)
+                .cursor_pointer()
+                .track_focus(&self.daemon_reload_focus)
+                .hover(|style| style.bg(theme.colors.bg))
+                .child(if loading { "Loading…" } else { "Reload" })
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.state.update(cx, |state, cx| {
+                        state.focus_settings(Some(SettingsFocus::DaemonReload));
+                        state.reload_daemon_config(cx);
+                        cx.notify();
+                    });
+                })),
+            theme,
+        );
+
+        let reset = components::with_focus(
+            div()
+                .id("settings-daemon-reset")
+                .h(px(36.0))
+                .px(px(theme.spacing.s3))
+                .flex()
+                .items_center()
+                .rounded(px(theme.radii.r4))
+                .border_1()
+                .border_color(theme.colors.border)
+                .text_size(px(theme.font.sm))
+                .text_color(if dirty {
+                    theme.colors.text
+                } else {
+                    theme.colors.muted
+                })
+                .when(dirty, |button| {
+                    button
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.colors.bg))
+                })
+                .track_focus(&self.daemon_reset_focus)
+                .child("Discard edits")
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.state.update(cx, |state, cx| {
+                        state.reset_daemon_config();
+                        cx.notify();
+                    });
+                })),
+            theme,
+        );
+
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        for error in &errors {
+            rows.push(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(px(theme.spacing.s2))
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.danger)
+                    .child("⚠")
+                    .child(div().flex_1().min_w(px(0.0)).child(error.clone()))
+                    .into_any_element(),
+            );
+        }
+        if let Some(load_error) = load_error {
+            rows.push(
+                div()
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.danger)
+                    .child(format!("Config load failed: {load_error}"))
+                    .into_any_element(),
+            );
+        }
+        for warning in &warnings {
+            rows.push(
+                div()
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.warning)
+                    .child(warning.clone())
+                    .into_any_element(),
+            );
+        }
+        if !restart.is_empty() {
+            rows.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(px(theme.spacing.s1))
+                    .text_size(px(theme.font.xs))
+                    .child(
+                        div()
+                            .text_color(theme.colors.warning)
+                            .child("Restart required:"),
+                    )
+                    .children(restart.iter().map(|section| {
+                        div()
+                            .px(px(theme.spacing.s2))
+                            .py(px(1.0))
+                            .rounded(px(theme.radii.r4))
+                            .border_1()
+                            .border_color(theme.colors.border)
+                            .text_color(theme.colors.warning)
+                            .child(section.clone())
+                    }))
+                    .into_any_element(),
+            );
+        }
+        if !live.is_empty() {
+            rows.push(
+                div()
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.success)
+                    .child(format!("Live without restart: {}", live.join(", ")))
+                    .into_any_element(),
+            );
+        }
+        if !overrides.is_empty() {
+            rows.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.muted)
+                    .child("Environment overrides shadow the file:")
+                    .children(overrides.iter().map(|entry| {
+                        div()
+                            .font_family("monospace")
+                            .child(format!("{} ({})", entry.key, entry.source))
+                    }))
+                    .into_any_element(),
+            );
+        }
+
+        card(theme)
+            .child(components::section_label(theme, "DAEMON / GLOBAL CONFIG"))
+            .child(hint(
+                theme,
+                "Edits the daemon's config.toml as raw TOML. The client's gpui.toml stays separate. \
+                 Enter inserts a newline; Tab moves between controls; ⌘↵ saves.",
+            ))
+            .child(value_row(
+                theme,
+                "Daemon config file",
+                path.unwrap_or_else(|| "not loaded".to_string()),
+                true,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(px(theme.spacing.s2))
+                    .text_size(px(theme.font.xs))
+                    .child(
+                        div()
+                            .text_color(status_color)
+                            .child(format!("● {}", status.label())),
+                    )
+                    .child(
+                        div()
+                            .text_color(theme.colors.muted)
+                            .child(if exists {
+                                "file present"
+                            } else {
+                                "missing file — defaults apply"
+                            }),
+                    ),
+            )
+            .child(editor)
+            .child(hint(
+                theme,
+                "The [repos] and [mcp] sections only seed their registries at startup; use the \
+                 repos.*/mcp.* RPCs for live changes. Changing daemon.listen, socket, tasks_dir, \
+                 data_dir, auth.require_tls or an agent command can make the daemon unreachable or \
+                 launch a different executable after restart.",
+            ))
+            .when(!rows.is_empty(), |card| {
+                card.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(theme.spacing.s1))
+                        .children(rows),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s2))
+                    .pt(px(theme.spacing.s1))
+                    .child(reload)
+                    .child(reset)
+                    .child(div().flex_1())
+                    .child(save),
+            )
+    }
+
     fn agents_card(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let (agents, status, has_snapshot) = {
             let state = self.state.read(cx);
@@ -955,7 +1305,7 @@ impl SettingsView {
     }
 
     fn about_card(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
-        let (cwd, daemon_setting, endpoint, config_path) = {
+        let (cwd, daemon_setting, endpoint, client_config_path, daemon_config_path) = {
             let state = self.state.read(cx);
             let cwd = state
                 .last_ping()
@@ -970,6 +1320,11 @@ impl SettingsView {
                 },
                 state.config().endpoint.clone(),
                 state.config().config_path.display().to_string(),
+                state
+                    .daemon_config()
+                    .path()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "unavailable while disconnected".to_string()),
             )
         };
 
@@ -1011,7 +1366,18 @@ impl SettingsView {
             ))
             .child(value_row(theme, "Daemon version", daemon_setting, false))
             .child(value_row(theme, "Endpoint", endpoint, true))
-            .child(value_row(theme, "Settings file", config_path, true))
+            .child(value_row(
+                theme,
+                "Client settings (gpui.toml)",
+                client_config_path,
+                true,
+            ))
+            .child(value_row(
+                theme,
+                "Daemon config (config.toml)",
+                daemon_config_path,
+                true,
+            ))
             .child(
                 div()
                     .text_size(px(theme.font.xs))
@@ -1044,6 +1410,7 @@ impl Render for SettingsView {
                     .gap(px(theme.spacing.s4))
                     .p(px(theme.spacing.s4))
                     .child(self.connection_card(theme, cx))
+                    .child(self.daemon_config_card(theme, cx))
                     .child(self.agents_card(theme, cx))
                     .child(self.appearance_card(theme, cx))
                     .child(self.about_card(theme, cx)),

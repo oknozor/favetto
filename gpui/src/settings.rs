@@ -27,11 +27,17 @@ pub enum SettingsFocus {
     Save,
     /// Reset the draft to the default endpoint and token file.
     Defaults,
+    /// The daemon's raw global `config.toml` draft.
+    DaemonConfig,
+    /// Save the daemon config draft.
+    DaemonSave,
+    /// Discard daemon config edits and reload the on-disk file.
+    DaemonReload,
 }
 
 impl SettingsFocus {
     /// Every focus target in Tab order.
-    pub const ORDER: [Self; 7] = [
+    pub const ORDER: [Self; 10] = [
         Self::Endpoint,
         Self::Token,
         Self::Theme,
@@ -39,11 +45,14 @@ impl SettingsFocus {
         Self::Test,
         Self::Save,
         Self::Defaults,
+        Self::DaemonConfig,
+        Self::DaemonSave,
+        Self::DaemonReload,
     ];
 
     /// Whether typed characters belong to this target.
     pub fn is_text(self) -> bool {
-        matches!(self, Self::Endpoint | Self::Token)
+        matches!(self, Self::Endpoint | Self::Token | Self::DaemonConfig)
     }
 
     fn cycle(self, delta: isize) -> Self {
@@ -68,6 +77,12 @@ pub enum SettingsActivate {
     Save,
     /// Reset the draft to the default endpoint/token file.
     Defaults,
+    /// Insert a newline in the daemon config editor.
+    DaemonNewline,
+    /// Save the daemon config draft.
+    DaemonSave,
+    /// Reload the daemon config from disk.
+    DaemonReload,
     /// Move to the next focus target (a text field cannot be "activated").
     Next,
 }
@@ -252,6 +267,9 @@ impl SettingsState {
             Some(SettingsFocus::Test) => SettingsActivate::Test,
             Some(SettingsFocus::Save) => SettingsActivate::Save,
             Some(SettingsFocus::Defaults) => SettingsActivate::Defaults,
+            Some(SettingsFocus::DaemonConfig) => SettingsActivate::DaemonNewline,
+            Some(SettingsFocus::DaemonSave) => SettingsActivate::DaemonSave,
+            Some(SettingsFocus::DaemonReload) => SettingsActivate::DaemonReload,
             Some(SettingsFocus::Endpoint) | Some(SettingsFocus::Token) | None => {
                 SettingsActivate::Next
             }
@@ -355,11 +373,11 @@ mod tests {
         for _ in 0..SettingsFocus::ORDER.len() - 1 {
             settings.cycle_focus(1);
         }
-        assert_eq!(settings.focus(), Some(SettingsFocus::Defaults));
+        assert_eq!(settings.focus(), Some(SettingsFocus::DaemonReload));
         settings.cycle_focus(1);
         assert_eq!(settings.focus(), Some(SettingsFocus::Endpoint));
         settings.cycle_focus(-1);
-        assert_eq!(settings.focus(), Some(SettingsFocus::Defaults));
+        assert_eq!(settings.focus(), Some(SettingsFocus::DaemonReload));
     }
 
     #[test]

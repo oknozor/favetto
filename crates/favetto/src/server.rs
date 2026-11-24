@@ -525,6 +525,377 @@ fn encode<T: serde::Serialize>(value: T) -> serde_json::Value {
     serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
 }
 
+/// Top-level sections whose file changes are only picked up at daemon startup.
+///
+/// `tui` is deliberately absent: the daemon parses but ignores it, and the TUI
+/// host reads the same file directly.
+const RESTART_SECTIONS: &[&str] = &[
+    "agent", "agents", "daemon", "executor", "git", "webhook", "auth", "repos", "mcp",
+];
+
+/// Flatten an anyhow error chain into one message per cause, as the wire
+/// surfaces it.
+fn error_chain(error: &anyhow::Error) -> Vec<String> {
+    error.chain().map(|cause| cause.to_string()).collect()
+}
+
+/// Read the daemon's config file. A missing file is valid and yields defaults;
+/// a failed read is reported alongside an empty raw value.
+fn read_config_file(path: &std::path::Path) -> (String, bool, Vec<String>) {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => (raw, true, Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            (String::new(), false, Vec::new())
+        }
+        Err(error) => (
+            String::new(),
+            false,
+            vec![format!("could not read {}: {error}", path.display())],
+        ),
+    }
+}
+
+/// `FAVETTO_*` environment variables that shadow a config section.
+fn env_overrides() -> Vec<ConfigOverride> {
+    env_overrides_from(std::env::vars())
+}
+
+fn env_overrides_from<I>(vars: I) -> Vec<ConfigOverride>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut overrides = Vec::new();
+    for (name, _) in vars {
+        let Some(rest) = name.strip_prefix("FAVETTO_") else {
+            continue;
+        };
+        let rest = rest.trim_start_matches('_');
+        if rest.is_empty() {
+            continue;
+        }
+        let key = rest.replace("__", ".").to_ascii_lowercase();
+        let top = key.split('.').next().unwrap_or_default();
+        if !matches!(
+            top,
+            "agent"
+                | "agents"
+                | "daemon"
+                | "repos"
+                | "mcp"
+                | "executor"
+                | "git"
+                | "webhook"
+                | "tui"
+                | "auth"
+        ) {
+            continue;
+        }
+        overrides.push(ConfigOverride {
+            key,
+            source: "env".to_string(),
+        });
+    }
+    overrides.sort_by(|left, right| left.key.cmp(&right.key));
+    overrides.dedup_by(|left, right| left.key == right.key);
+    overrides
+}
+
+/// Warnings shared by `config.get`, `config.validate` and `config.set`.
+fn config_warnings(overrides: &[ConfigOverride]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if !overrides.is_empty() {
+        warnings.push(
+            "FAVETTO_* environment overrides shadow the file; the effective value may differ from \
+             the saved value."
+                .to_string(),
+        );
+    }
+    warnings.push(
+        "[tui] is consumed by the TUI client on its own host; the daemon parses but ignores it."
+            .to_string(),
+    );
+    warnings
+}
+
+/// Run the startup preflight that does not need to mutate daemon state.
+///
+/// This catches drafts that parse but would break startup: an agent registry
+/// that cannot be built, git signing settings that cannot resolve their key,
+/// and webhook rules that name an unknown task.
+fn config_preflight(state: &State, config: &crate::config::FavettoConfig) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    let registry = match crate::agents::AgentRegistry::from_config(config) {
+        Ok(registry) => Some(registry),
+        Err(error) => {
+            errors.extend(error_chain(&error));
+            None
+        }
+    };
+    if let (Some(default), Some(registry)) = (config.agent.default.as_deref(), registry.as_ref()) {
+        if registry.get(default).is_none() {
+            errors.push(format!(
+                "[agent].default = \"{default}\" does not name a configured agent"
+            ));
+        }
+    }
+
+    if let Err(error) = crate::git::resolve_env(&config.git, &state.data_dir) {
+        errors.push(format!("[git]: {}", error_chain(&error).join(": ")));
+    }
+    for (name, agent) in &config.agents {
+        let mut merged = config.git.clone();
+        if let Some(over) = &agent.git {
+            merged = crate::git::overlay(&merged, over);
+        }
+        if let Err(error) = crate::git::resolve_env(&merged, &state.data_dir) {
+            errors.push(format!(
+                "[agents.{name}.git]: {}",
+                error_chain(&error).join(": ")
+            ));
+        }
+    }
+
+    if let Err(error) = crate::webhooks::validate_rules(config, &state.catalog.read()) {
+        errors.extend(error_chain(&error));
+    }
+
+    errors
+}
+
+/// Top-level sections whose serialized values differ between `before` and
+/// `after`, sorted for a stable UI order.
+fn config_changed_sections(
+    before: &crate::config::FavettoConfig,
+    after: &crate::config::FavettoConfig,
+) -> Vec<String> {
+    let before = serde_json::to_value(before).unwrap_or(serde_json::Value::Null);
+    let after = serde_json::to_value(after).unwrap_or(serde_json::Value::Null);
+    let (Some(before), Some(after)) = (before.as_object(), after.as_object()) else {
+        return Vec::new();
+    };
+    let mut keys: std::collections::BTreeSet<&String> = before.keys().collect();
+    keys.extend(after.keys());
+    keys.into_iter()
+        .filter(|key| before.get(*key) != after.get(*key))
+        .cloned()
+        .collect()
+}
+
+/// Sections that differ from what the running daemon loaded and therefore need
+/// a restart to take effect.
+fn config_pending_restart(state: &State, config: &crate::config::FavettoConfig) -> Vec<String> {
+    config_changed_sections(&state.config, config)
+        .into_iter()
+        .filter(|section| RESTART_SECTIONS.contains(&section.as_str()))
+        .collect()
+}
+
+/// The `config.get` implementation.
+fn config_get(state: &State) -> ConfigGetResult {
+    let path = &state.config_path;
+    let (raw, exists, mut parse_errors) = read_config_file(path);
+    let revision = crate::config::FavettoConfig::revision(&raw);
+    let redacted = crate::config::FavettoConfig::redact(&raw);
+    let parsed = if exists {
+        crate::config::FavettoConfig::parse_str(&raw)
+    } else {
+        Ok(crate::config::FavettoConfig::default())
+    };
+    if let Err(error) = &parsed {
+        parse_errors.extend(error_chain(error));
+    }
+
+    let overrides = env_overrides();
+    let warnings = config_warnings(&overrides);
+    let restart_required = match &parsed {
+        Ok(config) => config_pending_restart(state, config),
+        Err(_) => RESTART_SECTIONS
+            .iter()
+            .map(|section| (*section).to_string())
+            .collect(),
+    };
+    let effective = crate::config::FavettoConfig::load_from(path)
+        .ok()
+        .map(|config| config.redacted_json());
+
+    ConfigGetResult {
+        path: path.to_string_lossy().into_owned(),
+        raw: redacted,
+        revision,
+        exists,
+        parse_errors,
+        warnings,
+        overrides,
+        restart_required,
+        effective,
+    }
+}
+
+/// The `config.validate` implementation: the on-disk file by default, or an
+/// inline draft with redacted secrets restored from the file.
+fn config_validate(state: &State, params: &ConfigValidateParams) -> ConfigValidateResult {
+    let path = state.config_path.clone();
+    let overrides = env_overrides();
+    let mut warnings = config_warnings(&overrides);
+
+    if let Some(draft) = params.raw.as_deref() {
+        let (existing, _, errors) = read_config_file(&path);
+        if !errors.is_empty() {
+            return ConfigValidateResult {
+                valid: false,
+                path: path.to_string_lossy().into_owned(),
+                errors,
+                warnings,
+            };
+        }
+        let restored =
+            match crate::config::FavettoConfig::restore_redacted_secrets(draft, &existing) {
+                Ok(restored) => restored,
+                Err(error) => {
+                    return ConfigValidateResult {
+                        valid: false,
+                        path: path.to_string_lossy().into_owned(),
+                        errors: error_chain(&error),
+                        warnings,
+                    };
+                }
+            };
+        match crate::config::FavettoConfig::parse_str(&restored) {
+            Ok(config) => {
+                let errors = config_preflight(state, &config);
+                ConfigValidateResult {
+                    valid: errors.is_empty(),
+                    path: path.to_string_lossy().into_owned(),
+                    errors,
+                    warnings,
+                }
+            }
+            Err(error) => ConfigValidateResult {
+                valid: false,
+                path: path.to_string_lossy().into_owned(),
+                errors: error_chain(&error),
+                warnings,
+            },
+        }
+    } else {
+        let loaded = crate::config::FavettoConfig::load_from(&path);
+        let (valid, errors) = match loaded {
+            Ok(config) => {
+                let errors = config_preflight(state, &config);
+                (errors.is_empty(), errors)
+            }
+            Err(error) => (false, error_chain(&error)),
+        };
+        if !valid {
+            warnings.push(
+                "the on-disk config failed to load; the daemon fell back to defaults.".to_string(),
+            );
+        }
+        ConfigValidateResult {
+            valid,
+            path: path.to_string_lossy().into_owned(),
+            errors,
+            warnings,
+        }
+    }
+}
+
+/// The `config.set` implementation.
+fn config_set(state: &State, params: ConfigSetParams) -> ConfigSetResult {
+    let path = state.config_path.clone();
+    let (existing, _exists, read_errors) = read_config_file(&path);
+    let current_revision = crate::config::FavettoConfig::revision(&existing);
+    let overrides = env_overrides();
+    let warnings = config_warnings(&overrides);
+
+    let rejected = |errors: Vec<String>, revision: String| ConfigSetResult {
+        saved: false,
+        path: path.to_string_lossy().into_owned(),
+        revision,
+        errors,
+        warnings: warnings.clone(),
+        changed_sections: Vec::new(),
+        restart_required: Vec::new(),
+        live_sections: Vec::new(),
+    };
+
+    if !read_errors.is_empty() {
+        return rejected(read_errors, current_revision);
+    }
+    if let Some(expected) = params.expected_revision.as_deref() {
+        if expected != current_revision {
+            return rejected(
+                vec![
+                    "the config changed on disk since it was loaded; reload it before saving"
+                        .to_string(),
+                ],
+                current_revision,
+            );
+        }
+    }
+
+    let restored =
+        match crate::config::FavettoConfig::restore_redacted_secrets(&params.raw, &existing) {
+            Ok(restored) => restored,
+            Err(error) => return rejected(error_chain(&error), current_revision),
+        };
+    let config = match crate::config::FavettoConfig::parse_str(&restored) {
+        Ok(config) => config,
+        Err(error) => return rejected(error_chain(&error), current_revision),
+    };
+    let errors = config_preflight(state, &config);
+    if !errors.is_empty() {
+        return rejected(errors, current_revision);
+    }
+
+    if let Err(error) = crate::config::FavettoConfig::write_atomic(&path, &restored) {
+        return rejected(
+            vec![format!("could not write {}: {error}", path.display())],
+            current_revision,
+        );
+    }
+
+    let before = if existing.is_empty() {
+        crate::config::FavettoConfig::default()
+    } else {
+        crate::config::FavettoConfig::parse_str(&existing)
+            .unwrap_or_else(|_| crate::config::FavettoConfig::default())
+    };
+    let changed_sections = config_changed_sections(&before, &config);
+    let restart_required = config_pending_restart(state, &config);
+    let live_sections: Vec<String> = changed_sections
+        .iter()
+        .filter(|section| !RESTART_SECTIONS.contains(&section.as_str()))
+        .cloned()
+        .collect();
+
+    let mut warnings = warnings;
+    if changed_sections.iter().any(|section| section == "tui") {
+        warnings.push(
+            "The [tui] change is live for TUI clients reading this file, not for the daemon."
+                .to_string(),
+        );
+    }
+    if !restart_required.is_empty() {
+        warnings.push(format!(
+            "Restart the daemon to apply: {}.",
+            restart_required.join(", ")
+        ));
+    }
+
+    ConfigSetResult {
+        saved: true,
+        path: path.to_string_lossy().into_owned(),
+        revision: crate::config::FavettoConfig::revision(&restored),
+        errors: Vec::new(),
+        warnings,
+        changed_sections,
+        restart_required,
+        live_sections,
+    }
+}
+
 /// Resolve a method's typed params and produce its result value.
 async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json::Value, RpcError> {
     match req.method.as_str() {
@@ -536,20 +907,18 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
         }),
 
         method::CONFIG_VALIDATE => {
-            let path = state.config_path.clone();
-            let result = match crate::config::FavettoConfig::load_from(&path) {
-                Ok(_) => ConfigValidateResult {
-                    valid: true,
-                    path: path.to_string_lossy().into_owned(),
-                    errors: Vec::new(),
-                },
-                Err(e) => ConfigValidateResult {
-                    valid: false,
-                    path: path.to_string_lossy().into_owned(),
-                    errors: e.chain().map(|cause| cause.to_string()).collect(),
-                },
-            };
-            to_value(result)
+            // The no-param form predates typed params; keep tolerating an empty
+            // or absent `params` object.
+            let p: ConfigValidateParams =
+                serde_json::from_value(req.params.clone()).unwrap_or_default();
+            to_value(config_validate(state, &p))
+        }
+
+        method::CONFIG_GET => to_value(config_get(state)),
+
+        method::CONFIG_SET => {
+            let p: ConfigSetParams = parse_params(&req.method, &req.params)?;
+            to_value(config_set(state, p))
         }
 
         method::TASKS_LIST => {
