@@ -52,9 +52,7 @@ use crate::text_element::{TextEditState, TextHost};
 use crate::text_input::{TextInput, TextTarget};
 use crate::theme::Theme;
 use crate::transport::ClientError;
-use crate::workflow::{
-    self, WorkflowCancelConfirm, WorkflowDetail, WorkflowGraphState, WorkflowRow,
-};
+use crate::workflow::{self, WorkflowCancelConfirm, WorkflowDetail, WorkflowRow};
 
 /// How long a toast stays on screen before dismissing itself.
 const TOAST_LINGER: Duration = Duration::from_secs(6);
@@ -305,8 +303,6 @@ pub struct ClientState {
     /// A `task.updated` arrived while the inspect read was in flight; reload
     /// once it lands (coalesced, never one RPC per push).
     workflow_dirty: bool,
-    /// The catalog DAG source shown beside the runtime view.
-    workflow_graph: WorkflowGraphState,
     /// The root cancel awaiting confirmation.
     workflow_confirm: Option<WorkflowCancelConfirm>,
     /// The detail before an optimistic root cancel, for a guarded rollback.
@@ -415,7 +411,6 @@ impl ClientState {
             workflow_inspect: None,
             workflow_loading: false,
             workflow_dirty: false,
-            workflow_graph: WorkflowGraphState::default(),
             workflow_confirm: None,
             workflow_cancel_previous: None,
             workflow_retry_previous: HashMap::new(),
@@ -640,10 +635,6 @@ impl ClientState {
                         // `repos.add`/`remove`/`activate` all publish this push,
                         // so another client's switch reaches the bar and scope.
                         self.refresh_repos();
-                        // The DAG source is derived from the same catalog.
-                        if self.active_route == Route::Workflows || self.workflow_graph.loaded {
-                            self.refresh_workflow_graph();
-                        }
                     }
                     // A cron tick recomputes the fired schedule's next run; one
                     // list read keeps the table's countdown honest.
@@ -1561,17 +1552,6 @@ impl ClientState {
                     detail.error = Some(error.to_string());
                 }
             }
-            Update::WorkflowGraphLoaded { result } => {
-                self.workflow_graph.set(result.dot, result.path);
-            }
-            Update::WorkflowGraphFailed { error } => {
-                if error.is_unauthorized() {
-                    self.connection = ConnectionState::Unauthorized {
-                        token_path: self.config.token_source.label(),
-                    };
-                }
-                self.workflow_graph.fail(error.to_string());
-            }
             Update::WorkflowCancelFinished { root_id, result } => {
                 match result {
                     Ok(result) => {
@@ -2020,11 +2000,6 @@ impl ClientState {
         self.workflow_detail.as_ref()
     }
 
-    /// The catalog DAG source (`workflow.get`).
-    pub fn workflow_graph(&self) -> &WorkflowGraphState {
-        &self.workflow_graph
-    }
-
     /// Select a root in the Workflows list (a row click).
     pub fn select_workflow_root(&mut self, root_id: uuid::Uuid) {
         // A node detail belongs to one root; switching roots must not leave the
@@ -2089,9 +2064,6 @@ impl ClientState {
         {
             self.load_workflow_inspect(root_id);
         }
-        if !self.workflow_graph.loaded && !self.workflow_graph.loading {
-            self.refresh_workflow_graph();
-        }
     }
 
     /// The "View workflow" action on a task: use `root_or_self` exactly like
@@ -2120,26 +2092,11 @@ impl ClientState {
         }
     }
 
-    /// Ask for a fresh inspect read and DAG source (the surface's Refresh).
+    /// Ask for a fresh inspect read (the surface's Refresh).
     pub fn refresh_workflow(&mut self) {
         self.refresh_snapshot();
         if let Some(root_id) = self.workflow_root.or_else(|| self.selected_workflow_root()) {
             self.load_workflow_inspect(root_id);
-        }
-        self.refresh_workflow_graph();
-    }
-
-    /// Fetch the catalog DAG source. An older source stays visible on error.
-    pub fn refresh_workflow_graph(&mut self) {
-        if self.workflow_graph.loading {
-            return;
-        }
-        self.workflow_graph.begin_load();
-        match &self.runtime {
-            Some(runtime) => runtime.load_workflow_graph(),
-            None => self
-                .workflow_graph
-                .fail("the transport is not running".to_string()),
         }
     }
 
@@ -2335,19 +2292,6 @@ impl ClientState {
             return;
         };
         self.retry_workflow_instance(task_id, cx);
-    }
-
-    /// Copy the catalog DOT source.
-    pub fn copy_workflow_dot(&mut self, cx: &mut Context<Self>) {
-        if self.workflow_graph.dot.is_empty() {
-            self.show_toast(
-                ToastKind::Info,
-                "The catalog DAG source has not loaded yet.".to_string(),
-                cx,
-            );
-            return;
-        }
-        self.copy_to_clipboard(self.workflow_graph.dot.clone(), cx);
     }
 
     /// Ask the runtime for a fresh `schedules.list`. An older table stays
@@ -3669,7 +3613,6 @@ impl ClientState {
             Route::Catalog => self.refresh_catalog(),
             Route::Workflows => {
                 self.refresh_snapshot();
-                self.refresh_workflow_graph();
                 if let Some(root_id) = self.workflow_root.or_else(|| self.selected_workflow_root())
                 {
                     self.load_workflow_inspect(root_id);
@@ -3741,7 +3684,6 @@ impl ClientState {
             // fetches it and then selects the newest root.
             self.refresh_snapshot();
             self.ensure_workflow_root();
-            self.refresh_workflow_graph();
         } else if route == Route::Schedules {
             self.refresh_schedules();
             // The create/edit sheet's task picker is the same catalog list.
@@ -5960,7 +5902,6 @@ impl ClientState {
             workflow_inspect: None,
             workflow_loading: false,
             workflow_dirty: false,
-            workflow_graph: WorkflowGraphState::default(),
             workflow_confirm: None,
             workflow_cancel_previous: None,
             workflow_retry_previous: HashMap::new(),
