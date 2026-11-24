@@ -1074,7 +1074,7 @@ impl SettingsView {
                 let Some(auth) = &session.auth else {
                     continue;
                 };
-                let row = agent_auth::settings_row(auth, &session.id);
+                let row = agent_auth::settings_row(auth);
                 let row_id = auth_row_id;
                 auth_row_id = auth_row_id.wrapping_add(1);
                 rows.push(

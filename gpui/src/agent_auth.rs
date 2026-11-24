@@ -78,7 +78,10 @@ pub struct AuthStatusRow {
 }
 
 /// Build the read-only Settings row for a session's auth state.
-pub fn settings_row(auth: &AgentAuthState, session_id: &str) -> AuthStatusRow {
+///
+/// Settings has no per-session controls and the session id is an internal
+/// routing key, so neither the headline nor the detail may contain it.
+pub fn settings_row(auth: &AgentAuthState) -> AuthStatusRow {
     let headline = match auth.status {
         AgentAuthStatus::Required => "needs sign-in",
         AgentAuthStatus::Authenticating => "signing in…",
@@ -86,7 +89,6 @@ pub fn settings_row(auth: &AgentAuthState, session_id: &str) -> AuthStatusRow {
         AgentAuthStatus::Authenticated => "signed in",
         AgentAuthStatus::NotRequired => "signed in",
     };
-    let short_id = &session_id[..session_id.len().min(8)];
     let detail = auth
         .message
         .clone()
@@ -98,15 +100,15 @@ pub fn settings_row(auth: &AgentAuthState, session_id: &str) -> AuthStatusRow {
         })
         .unwrap_or_else(|| match auth.status {
             AgentAuthStatus::Required | AgentAuthStatus::Failed => {
-                format!("session {short_id} · sign in from the task details or Agent panel")
+                "sign in from the task details or Agent panel".to_string()
             }
-            AgentAuthStatus::Authenticating | AgentAuthStatus::Authenticated => format!(
-                "session {short_id} · the daemon is completing the agent's own sign-in flow"
-            ),
+            AgentAuthStatus::Authenticating | AgentAuthStatus::Authenticated => {
+                "the daemon is completing the agent's own sign-in flow".to_string()
+            }
             AgentAuthStatus::NotRequired if auth.logout_supported => {
-                format!("session {short_id} · sign out from the task details or Agent panel")
+                "sign out from the task details or Agent panel".to_string()
             }
-            AgentAuthStatus::NotRequired => format!("session {short_id} · no action needed"),
+            AgentAuthStatus::NotRequired => "no action needed".to_string(),
         });
     AuthStatusRow { headline, detail }
 }
@@ -211,7 +213,7 @@ mod tests {
         for status in ALL_STATUSES {
             for logout_supported in [false, true] {
                 let auth = auth(status, logout_supported);
-                let row = settings_row(&auth, "session-1234");
+                let row = settings_row(&auth);
                 assert!(!row.headline.contains("Sign in"), "{:?}", row);
                 assert!(!row.headline.contains("Sign out"), "{:?}", row);
                 assert!(!row.detail.contains("Sign in with"), "{:?}", row);
@@ -223,9 +225,20 @@ mod tests {
     #[test]
     fn settings_points_at_the_contextual_surface() {
         let auth = auth(AgentAuthStatus::Required, false);
-        let row = settings_row(&auth, "abcdefgh-rest");
+        let row = settings_row(&auth);
         assert_eq!(row.headline, "needs sign-in");
-        assert!(row.detail.contains("abcdefgh"));
         assert!(row.detail.contains("task details or Agent panel"));
+    }
+
+    #[test]
+    fn settings_rows_never_expose_the_session_id() {
+        for status in ALL_STATUSES {
+            for logout_supported in [false, true] {
+                let auth = auth(status, logout_supported);
+                let row = settings_row(&auth);
+                assert!(!row.detail.contains("ses_"), "{:?}", row);
+                assert!(!row.detail.contains("session "), "{:?}", row);
+            }
+        }
     }
 }
