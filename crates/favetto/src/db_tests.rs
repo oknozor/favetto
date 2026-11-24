@@ -2188,6 +2188,112 @@ async fn agent_session_metadata_survives_reopen() {
 }
 
 #[tokio::test]
+async fn agent_session_workspace_provenance_round_trips() {
+    let (dir, pool) = scratch_pool("agent-session-workspace").await;
+    let now = Timestamp::now();
+    let workspace = SessionWorkspace {
+        kind: "git_worktree".to_string(),
+        repo: PathBuf::from("/repo"),
+        path: PathBuf::from("/worktrees/task-1"),
+        branch: Some("favetto/task-1".to_string()),
+        head: Some("deadbeef".to_string()),
+        git_ref: Some("refs/favetto/session-workspaces/task-1".to_string()),
+        base_cwd: Some(PathBuf::from("/repo")),
+        rehydrated_at: None,
+    };
+    let mut session = AgentSessionRecord::loading("local-1", "opencode", "/worktrees/task-1", now);
+    session.workspace = Some(workspace.clone());
+    insert_agent_session(&pool, &session).await.unwrap();
+
+    let got = get_agent_session(&pool, "local-1").await.unwrap().unwrap();
+    assert_eq!(got.workspace, Some(workspace.clone()));
+
+    // Rehydration marks the descriptor session-owned; the marker survives a
+    // reopen together with the rest of the provenance.
+    let rehydrated_at = now + time::Duration::minutes(5);
+    let mut rehydrated = workspace;
+    rehydrated.rehydrated_at = Some(rehydrated_at);
+    assert!(
+        set_agent_session_workspace(&pool, "local-1", Some(&rehydrated), rehydrated_at)
+            .await
+            .unwrap()
+    );
+    let listed = list_agent_sessions_with_workspace(&pool).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].workspace, Some(rehydrated.clone()));
+
+    // Clearing the descriptor is explicit, not an accidental update to NULL.
+    assert!(
+        set_agent_session_workspace(&pool, "local-1", None, rehydrated_at)
+            .await
+            .unwrap()
+    );
+    assert!(list_agent_sessions_with_workspace(&pool)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(get_agent_session(&pool, "local-1")
+        .await
+        .unwrap()
+        .unwrap()
+        .workspace
+        .is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn migrate_adds_agent_session_workspace_to_legacy_database() {
+    let dir = std::env::temp_dir().join(format!(
+        "favetto-legacy-agent-sessions-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let pool = open(&dir.join("test.db")).await.unwrap();
+
+    // A pre-workspace `agent_sessions` table; the additive migration must add
+    // the column without losing the existing rows.
+    sqlx::query(
+        "CREATE TABLE agent_sessions (
+            id TEXT PRIMARY KEY,
+            agent TEXT NOT NULL,
+            external_session_id TEXT,
+            cwd TEXT NOT NULL,
+            task_id TEXT,
+            run_id TEXT,
+            title TEXT,
+            status TEXT NOT NULL,
+            error TEXT,
+            mcp_servers TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let now = ts_ms(Timestamp::now());
+    sqlx::query(
+        "INSERT INTO agent_sessions
+            (id, agent, cwd, status, created_at, updated_at)
+         VALUES ('legacy', 'opencode', '/work', 'ended', ?, ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    migrate(&pool).await.unwrap();
+    let got = get_agent_session(&pool, "legacy").await.unwrap().unwrap();
+    assert_eq!(got.status, AgentSessionStatus::Ended);
+    assert!(got.workspace.is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn agent_session_updates_preserve_local_identity_and_created_at() {
     let (dir, pool) = scratch_pool("agent-session-update").await;
     let created_at = from_ms(1_700_000_000_000);

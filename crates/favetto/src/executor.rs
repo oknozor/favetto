@@ -902,6 +902,12 @@ async fn run_one(
     // killed the row or a `tasks.cancel` landed) still reaches it and cleans up,
     // so a cancellation cannot strand the branch or worktree.
     if let Some(wt) = &plan.worktree {
+        // Capture the workspace and a surviving Git ref before cleanup deletes
+        // the branch. The ACP session's stored `cwd` is this worktree, so a
+        // later `agents.load` must be able to recreate the exact path even with
+        // `keep_worktree = false`. This is metadata only: it does not retain the
+        // worktree or change cleanup.
+        persist_session_workspace(state, &finished_run, wt).await;
         if config.executor.keep_worktree {
             tracing::info!(path = %wt.path.display(), "worktree kept");
         } else if session_alive {
@@ -1856,12 +1862,18 @@ pub struct WorktreePruneStats {
     pub branches_removed: usize,
     /// Linked worktrees under the worktree root reclaimed by the sweep.
     pub untracked_worktrees_removed: usize,
+    /// Session-owned checkouts recreated for a restore and reclaimed after
+    /// their retention window.
+    pub session_workspaces_removed: usize,
 }
 
 struct Worktree {
     repo: PathBuf,
     path: PathBuf,
     branch: String,
+    /// The task's base directory before isolation, recorded for diagnostics and
+    /// as provenance if the worktree must be recreated.
+    base: PathBuf,
 }
 
 /// What one repo's git-native [`sweep_repo`] pass reclaimed.
@@ -1907,7 +1919,12 @@ async fn make_plan(
             return Ok(Plan {
                 cwd: path.clone(),
                 needs_lock: false,
-                worktree: Some(Worktree { repo, path, branch }),
+                worktree: Some(Worktree {
+                    repo,
+                    path,
+                    branch,
+                    base: base.to_path_buf(),
+                }),
             });
         }
     }
@@ -2007,6 +2024,313 @@ async fn create_worktree(repo: &Path, path: &Path, branch: &str) -> anyhow::Resu
         );
     }
     Ok(())
+}
+
+/// Hidden ref that keeps a session's recorded run commit reachable after its
+/// `favetto/*` branch is deleted. Deliberately outside `refs/heads/favetto/*`
+/// so branch retention/sweeps never treat it as a task branch. The session id
+/// keeps the ref distinct across retries of the same task id.
+fn session_workspace_ref(session_id: &str) -> String {
+    format!("refs/favetto/session-workspaces/{session_id}")
+}
+
+/// Resolve `rev` to a commit id inside `dir`, or `None` when it is absent.
+async fn git_rev_parse(dir: &Path, rev: &str) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("{rev}^{{commit}}"))
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
+}
+
+/// Point `git_ref` at `head`. The ref is what keeps the commit alive after the
+/// run branch is deleted and Git prunes unreachable objects.
+async fn update_git_ref(repo: &Path, git_ref: &str, head: &str) -> anyhow::Result<()> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["update-ref", git_ref, head])
+        .output()
+        .await?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git update-ref {git_ref} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Pick the first recorded commit-ish still reachable in the repository.
+async fn resolve_restore_target(workspace: &db::SessionWorkspace) -> Option<String> {
+    let mut candidates = Vec::new();
+    if let Some(git_ref) = &workspace.git_ref {
+        candidates.push(git_ref.clone());
+    }
+    if let Some(head) = &workspace.head {
+        candidates.push(head.clone());
+    }
+    if let Some(branch) = &workspace.branch {
+        candidates.push(format!("refs/heads/{branch}"));
+    }
+    for candidate in candidates {
+        if git_rev_parse(&workspace.repo, &candidate).await.is_some() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Persist a run worktree's provenance on every session launched inside it,
+/// and keep its HEAD reachable with a hidden ref.
+///
+/// Called after the run finishes but before the terminal cleanup can delete the
+/// branch. It deliberately does not retain the worktree: `keep_worktree` and
+/// the retention sweep keep their existing ownership rules.
+async fn persist_session_workspace(state: &State, run: &TaskRun, wt: &Worktree) {
+    let Some(head) = git_rev_parse(&wt.path, "HEAD").await else {
+        tracing::warn!(
+            path = %wt.path.display(),
+            "cannot read worktree HEAD; session workspace provenance not recorded"
+        );
+        return;
+    };
+    let task_id = run.task_id.to_string();
+    let run_id = run.id.to_string();
+    let sessions = match db::list_agent_sessions_for_task(&state.db, &task_id, 100).await {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                task_id = %task_id,
+                "failed to list sessions for workspace provenance"
+            );
+            return;
+        }
+    };
+    for session in sessions {
+        // An agent-level cwd override means the worktree was not the launch
+        // directory, so no descriptor belongs on that record.
+        if session.cwd != wt.path {
+            continue;
+        }
+        // Only this attempt's sessions own this checkout. An old attempt reused
+        // the same task id and path, but its provider conversation belongs to a
+        // different commit; overwriting it would restore the wrong tree.
+        let belongs_to_run = session.run_id.as_deref() == Some(run_id.as_str());
+        let created_during_run = session.run_id.is_none()
+            && run
+                .started_at
+                .is_some_and(|started_at| session.created_at >= started_at);
+        if !belongs_to_run && !created_during_run {
+            continue;
+        }
+        let git_ref = session_workspace_ref(&session.id);
+        if let Err(error) = update_git_ref(&wt.repo, &git_ref, &head).await {
+            tracing::warn!(
+                error = %error,
+                path = %wt.path.display(),
+                "failed to keep session workspace commit reachable"
+            );
+        }
+        let workspace = db::SessionWorkspace {
+            kind: "git_worktree".to_string(),
+            repo: wt.repo.clone(),
+            path: wt.path.clone(),
+            branch: Some(wt.branch.clone()),
+            head: Some(head.clone()),
+            git_ref: Some(git_ref),
+            base_cwd: Some(wt.base.clone()),
+            // A previous restore may have rehydrated this path; keep its
+            // ownership marker rather than pretending this is the original.
+            rehydrated_at: session.workspace.as_ref().and_then(|w| w.rehydrated_at),
+        };
+        if let Err(error) = db::set_agent_session_workspace(
+            &state.db,
+            &session.id,
+            Some(&workspace),
+            Timestamp::now(),
+        )
+        .await
+        {
+            tracing::warn!(
+                session = %session.id,
+                error = %error,
+                "failed to record session workspace provenance"
+            );
+        }
+    }
+}
+
+/// Why `record.cwd` cannot be used or recreated, or `None` when it is usable.
+///
+/// History uses this to keep `loadable` honest: a deleted worktree is loadable
+/// only when a durable descriptor and a reachable commit can recreate the exact
+/// path. The message names the path and the missing piece so a client can show
+/// an actionable reason.
+pub(crate) async fn session_cwd_error(record: &db::AgentSessionRecord) -> Option<String> {
+    if record.cwd.is_dir() {
+        return None;
+    }
+    if record.cwd.exists() {
+        return Some(format!(
+            "working directory '{}' exists but is not a directory",
+            record.cwd.display()
+        ));
+    }
+    let Some(workspace) = &record.workspace else {
+        return Some(format!(
+            "working directory '{}' no longer exists and no workspace provenance was recorded",
+            record.cwd.display()
+        ));
+    };
+    if workspace.path != record.cwd {
+        return Some(format!(
+            "working directory '{}' no longer exists and does not match its recorded workspace '{}'",
+            record.cwd.display(),
+            workspace.path.display()
+        ));
+    }
+    if !workspace.repo.is_dir() {
+        return Some(format!(
+            "working directory '{}' is gone and its source repository '{}' no longer exists",
+            record.cwd.display(),
+            workspace.repo.display()
+        ));
+    }
+    if resolve_restore_target(workspace).await.is_none() {
+        let recorded = workspace
+            .git_ref
+            .as_deref()
+            .or(workspace.head.as_deref())
+            .unwrap_or("(no commit recorded)");
+        return Some(format!(
+            "working directory '{}' is gone and its recorded commit '{recorded}' is no longer reachable in '{}'",
+            record.cwd.display(),
+            workspace.repo.display()
+        ));
+    }
+    None
+}
+
+/// Recreate a session's recorded launch directory before `session/load`.
+///
+/// Returns `true` when the directory was recreated (and its descriptor marked
+/// as session-owned), `false` when it already existed. The worktree is added
+/// detached at the recorded commit so a restore never recreates the deleted
+/// `favetto/*` branch or looks like a live task checkout.
+///
+/// A failure leaves the durable record untouched: the next load can be retried,
+/// and loadability derives the same reason without marking the session failed.
+pub(crate) async fn ensure_session_cwd(
+    pool: &SqlitePool,
+    record: &mut db::AgentSessionRecord,
+) -> anyhow::Result<bool> {
+    if record.cwd.is_dir() {
+        return Ok(false);
+    }
+    if record.cwd.exists() {
+        anyhow::bail!(
+            "working directory '{}' exists but is not a directory",
+            record.cwd.display()
+        );
+    }
+    let Some(mut workspace) = record.workspace.clone() else {
+        anyhow::bail!(
+            "working directory '{}' does not exist and the session has no recorded workspace provenance",
+            record.cwd.display()
+        );
+    };
+    if workspace.path != record.cwd {
+        anyhow::bail!(
+            "working directory '{}' does not exist and does not match its recorded workspace '{}'",
+            record.cwd.display(),
+            workspace.path.display()
+        );
+    }
+    if !workspace.repo.is_dir() {
+        anyhow::bail!(
+            "working directory '{}' is gone and its source repository '{}' no longer exists",
+            record.cwd.display(),
+            workspace.repo.display()
+        );
+    }
+    prune_repo(&workspace.repo).await;
+    let Some(target) = resolve_restore_target(&workspace).await else {
+        let recorded = workspace
+            .git_ref
+            .as_deref()
+            .or(workspace.head.as_deref())
+            .unwrap_or("(no commit recorded)");
+        anyhow::bail!(
+            "working directory '{}' is gone and its recorded commit '{recorded}' is no longer reachable in '{}'",
+            record.cwd.display(),
+            workspace.repo.display()
+        );
+    };
+
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&workspace.repo)
+        .args(["worktree", "add", "--detach"])
+        .arg(&workspace.path)
+        .arg(&target)
+        .output()
+        .await?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "cannot recreate session working directory '{}' from {} in '{}': {}",
+            workspace.path.display(),
+            target,
+            workspace.repo.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    workspace.rehydrated_at = Some(Timestamp::now());
+    db::set_agent_session_workspace(pool, &record.id, Some(&workspace), Timestamp::now()).await?;
+    record.workspace = Some(workspace);
+    Ok(true)
+}
+
+/// Remove a session-owned checkout without touching the hidden ref, so a later
+/// load can recreate it again. Used by retention for rehydrated directories.
+async fn remove_session_checkout(repo: &Path, path: &Path) {
+    if !repo.is_dir() {
+        return;
+    }
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "remove", "--force"])
+        .arg(path)
+        .output()
+        .await;
+    prune_repo(repo).await;
+}
+
+/// Remove a deleted session's checkout and hidden ref. The session row is gone,
+/// so neither can ever be used again.
+pub(crate) async fn remove_session_workspace(workspace: &db::SessionWorkspace) {
+    if !workspace.repo.is_dir() {
+        return;
+    }
+    remove_session_checkout(&workspace.repo, &workspace.path).await;
+    if let Some(git_ref) = &workspace.git_ref {
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&workspace.repo)
+            .args(["update-ref", "-d", git_ref])
+            .output()
+            .await;
+    }
 }
 
 /// Delete `branch` with `git branch -D`, returning whether git accepted it.
@@ -2315,6 +2639,41 @@ pub async fn prune_worktrees(state: &State) -> anyhow::Result<WorktreePruneStats
     for repo in &repos {
         stats.repos_pruned += 1;
         prune_repo(repo).await;
+    }
+
+    // Reclaim directories this daemon recreated for a restore. They have no
+    // `worktrees` row (that would make them look like live task checkouts), so
+    // the row-based pass above cannot see them. The hidden session ref stays,
+    // which is what lets a later `agents.load` recreate the path again.
+    if let Some(cutoff) = cutoff {
+        let tracked_paths: HashSet<PathBuf> = db::list_worktrees(&state.db)
+            .await?
+            .into_iter()
+            .map(|record| record.path)
+            .collect();
+        for session in db::list_agent_sessions_with_workspace(&state.db).await? {
+            let Some(workspace) = session.workspace else {
+                continue;
+            };
+            let Some(rehydrated_at) = workspace.rehydrated_at else {
+                continue;
+            };
+            if rehydrated_at >= cutoff || tracked_paths.contains(&workspace.path) {
+                continue;
+            }
+            if session
+                .task_id
+                .as_deref()
+                .is_some_and(|id| state.agents.has_live_interactive(id))
+            {
+                continue;
+            }
+            if !workspace.path.exists() {
+                continue;
+            }
+            remove_session_checkout(&workspace.repo, &workspace.path).await;
+            stats.session_workspaces_removed += 1;
+        }
     }
 
     // Git-native sweep. Re-read the rows after the tracked pass: a branch whose

@@ -51,6 +51,13 @@ Teardown is self-bounding, including after a run is killed or cancelled:
   older favetto or a failed record write left behind. A branch whose task is
   still `pending`/`running`/`awaiting_input`, a live interactive session's
   worktree, and anything kept by `keep_worktree` are never touched.
+- A finished run's ACP session keeps a durable workspace descriptor and a hidden
+  `refs/favetto/session-workspaces/<task-id>` ref. Loading the session recreates
+  the exact original directory as a detached checkout, without recreating the
+  deleted `favetto/*` branch. These session-owned checkouts are reclaimed by the
+  same retention window as kept worktrees (and immediately with `tasks.delete`);
+  the hidden ref is only removed when the session metadata is deleted, so a
+  later load can recreate the checkout again.
 
 `worktree_dir` expands a leading `~` to your home directory; an absolute path is
 used as-is and a non-`~` relative path is resolved against the repo root.

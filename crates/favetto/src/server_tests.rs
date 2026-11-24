@@ -1089,6 +1089,9 @@ async fn tasks_session_resolves_the_most_recent_record_for_the_task() {
     let tasks_dir = dir.join("tasks");
     std::fs::create_dir_all(&tasks_dir).unwrap();
     let state = test_state_with_config(&dir, &tasks_dir, available_agent_config()).await;
+    // History only advertises a session as loadable when its recorded cwd still
+    // exists (or can be rehydrated from workspace provenance).
+    std::fs::create_dir_all(dir.join("work")).unwrap();
     let now = Timestamp::now();
     let task_id = Uuid::new_v4();
     let task_id_text = task_id.to_string();
@@ -1208,6 +1211,9 @@ async fn agents_history_lists_persisted_metadata_and_loadability() {
     let tasks_dir = dir.join("tasks");
     std::fs::create_dir_all(&tasks_dir).unwrap();
     let state = test_state_with_config(&dir, &tasks_dir, available_agent_config()).await;
+    // A persisted session is loadable only when its launch directory survives
+    // or its workspace provenance can recreate it.
+    std::fs::create_dir_all(dir.join("work")).unwrap();
     let now = Timestamp::now();
 
     let mut ready =
@@ -1304,6 +1310,161 @@ async fn agents_history_lists_persisted_metadata_and_loadability() {
             .all(|agent| agent["sessions"].as_array().is_some_and(Vec::is_empty)),
         "persisted history must not be folded into agents.list: {agents}"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Run a git command in `repo`, panicking on a non-zero exit.
+fn test_git(repo: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .expect("git command");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A git repository with one unsigned commit.
+fn init_test_repo(repo: &Path) {
+    std::fs::create_dir_all(repo).unwrap();
+    test_git(repo, &["init", "-q"]);
+    test_git(repo, &["config", "user.email", "t@example.com"]);
+    test_git(repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("README.md"), "seed").unwrap();
+    test_git(repo, &["add", "-A"]);
+    test_git(
+        repo,
+        &["-c", "commit.gpgsign=false", "commit", "-qm", "init"],
+    );
+}
+
+#[tokio::test]
+async fn history_requires_a_restorable_workspace() {
+    let dir = temp_dir("agents-history-workspace");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state_with_config(&dir, &tasks_dir, available_agent_config()).await;
+    let now = Timestamp::now();
+
+    // A deleted worktree with no descriptor cannot be recreated.
+    let no_provenance = dir.join("worktrees/no-provenance");
+    let mut missing =
+        crate::db::AgentSessionRecord::loading("local-missing", "opencode", &no_provenance, now);
+    missing.external_session_id = Some("provider-acp-missing".to_string());
+    missing.status = crate::db::AgentSessionStatus::Ended;
+    crate::db::insert_agent_session(&state.db, &missing)
+        .await
+        .unwrap();
+
+    // The same deleted path with a real repository and surviving ref is
+    // restorable, so it stays loadable.
+    let repo = dir.join("repo");
+    init_test_repo(&repo);
+    let head = test_git(&repo, &["rev-parse", "HEAD"]);
+    let restorable = dir.join("worktrees/restorable");
+    let git_ref = "refs/favetto/session-workspaces/restorable";
+    test_git(&repo, &["update-ref", git_ref, &head]);
+    let mut restorable_record =
+        crate::db::AgentSessionRecord::loading("local-restorable", "opencode", &restorable, now);
+    restorable_record.external_session_id = Some("provider-acp-restorable".to_string());
+    restorable_record.status = crate::db::AgentSessionStatus::Ended;
+    restorable_record.workspace = Some(crate::db::SessionWorkspace {
+        kind: "git_worktree".to_string(),
+        repo: repo.clone(),
+        path: restorable.clone(),
+        branch: Some("favetto/gone".to_string()),
+        head: Some(head.clone()),
+        git_ref: Some(git_ref.to_string()),
+        base_cwd: Some(repo.clone()),
+        rehydrated_at: None,
+    });
+    crate::db::insert_agent_session(&state.db, &restorable_record)
+        .await
+        .unwrap();
+
+    let resp = dispatch(
+        &state,
+        Request {
+            id: 1,
+            method: method::AGENTS_HISTORY.to_string(),
+            params: serde_json::json!({ "limit": 10 }),
+        },
+    )
+    .await;
+    let history = resp.result.expect("agents.history result");
+    let rows = history.as_array().expect("history array");
+    let by_id = |id: &str| {
+        rows.iter()
+            .find(|row| row["id"] == serde_json::json!(id))
+            .unwrap_or_else(|| panic!("missing history row {id}"))
+    };
+
+    let missing = by_id("local-missing");
+    assert_eq!(missing["loadable"], false);
+    let reason = missing["load_error"].as_str().expect("load error");
+    assert!(
+        reason.contains(&no_provenance.display().to_string()),
+        "{reason}"
+    );
+    assert!(reason.contains("no workspace provenance"), "{reason}");
+
+    let restorable = by_id("local-restorable");
+    assert_eq!(restorable["loadable"], true);
+    assert!(restorable.get("load_error").is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn failed_workspace_rehydration_keeps_the_session_retryable() {
+    let dir = temp_dir("agents-load-workspace-failure");
+    let tasks_dir = dir.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let state = test_state_with_config(&dir, &tasks_dir, available_agent_config()).await;
+    let missing = dir.join("worktrees/gone");
+    let now = Timestamp::now();
+
+    let mut record =
+        crate::db::AgentSessionRecord::loading("local-impossible", "opencode", &missing, now);
+    record.external_session_id = Some("provider-acp-impossible".to_string());
+    record.status = crate::db::AgentSessionStatus::Ended;
+    record.workspace = Some(crate::db::SessionWorkspace {
+        kind: "git_worktree".to_string(),
+        repo: dir.join("repo-that-is-gone"),
+        path: missing.clone(),
+        branch: Some("favetto/gone".to_string()),
+        head: Some("deadbeef".to_string()),
+        git_ref: None,
+        base_cwd: None,
+        rehydrated_at: None,
+    });
+    crate::db::insert_agent_session(&state.db, &record)
+        .await
+        .unwrap();
+
+    let error = load_agent(&state, "local-impossible", None)
+        .await
+        .expect_err("the source repository is gone");
+    let message = error.to_string();
+    assert!(
+        message.contains(&missing.display().to_string()),
+        "{message}"
+    );
+    assert!(message.contains("source repository"), "{message}");
+
+    // Unlike a failed ACP load, a failed rehydration never marks the ended
+    // record failed, so the user can retry after restoring the repository.
+    let stored = crate::db::get_agent_session(&state.db, "local-impossible")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, crate::db::AgentSessionStatus::Ended);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
