@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use favetto_wire::model::{
     AgentCommand, AgentPlanEntry, AgentSessionInfo, AgentStateEvent, AwaitingInputKind,
+    SessionConfigChoices, SessionConfigKind, SessionConfigOption, SessionModes,
 };
 use favetto_wire::rpc::AgentEventPush;
 use uuid::Uuid;
@@ -94,6 +95,10 @@ pub struct Conversation {
     /// The live session id whose turn has an in-flight/cancelling
     /// `agents.cancel`. Cleared when the turn reports idle or the RPC fails.
     pub turn_cancel_pending: Option<String>,
+    /// The session id whose `agents.set_option` / `agents.set_mode` is in
+    /// flight. A second selector click is ignored until the daemon snapshot
+    /// lands, so a stale snapshot can never re-send the same target.
+    pub session_option_pending: Option<String>,
     /// The request id most recently answered, hidden until a new request arrives.
     pub answered_request: Option<String>,
     /// The current execution plan snapshot.
@@ -137,6 +142,7 @@ impl Conversation {
             elicitation_pending: None,
             answered_elicitation: None,
             turn_cancel_pending: None,
+            session_option_pending: None,
             answered_request: None,
             plan: None,
             commands: None,
@@ -188,6 +194,7 @@ impl Conversation {
         self.answered_request = None;
         self.reply_pending = None;
         self.turn_cancel_pending = None;
+        self.session_option_pending = None;
         self.plan = None;
         self.commands = None;
         self.prompt.set_value(String::new());
@@ -210,6 +217,7 @@ impl Conversation {
         self.new_events = 0;
         self.plan = None;
         self.commands = None;
+        self.session_option_pending = None;
     }
 
     /// Treat `seq` as the last event already folded into a restored transcript.
@@ -685,6 +693,306 @@ impl Conversation {
     pub fn fail_reply(&mut self) {
         self.reply_pending = None;
     }
+
+    /// Whether an `agents.set_option` / `agents.set_mode` is in flight.
+    pub fn session_option_change_pending(&self) -> bool {
+        self.session_option_pending.is_some()
+    }
+
+    /// Claim the session-option round trip. Returns `false` when one is already
+    /// outstanding, so the view cannot queue a second target against a stale
+    /// snapshot.
+    pub fn begin_session_option_change(&mut self, session_id: &str) -> bool {
+        if self.session_option_pending.is_some() {
+            return false;
+        }
+        self.session_option_pending = Some(session_id.to_string());
+        true
+    }
+
+    /// Release the round trip when its `AgentOptionsChanged` update lands.
+    pub fn finish_session_option_change(&mut self, session_id: &str) -> bool {
+        if self.session_option_pending.as_deref() == Some(session_id) {
+            self.session_option_pending = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Which advertised session control an open select list edits.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum SessionSelectTarget {
+    /// The session's `SessionModes` snapshot (`agents.set_mode`).
+    Modes,
+    /// One `SessionConfigKind::Select` option (`agents.set_option`).
+    Option(String),
+}
+
+/// One advertised value in an open session select list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSelectRow {
+    /// The exact value id (or mode id) sent by the set RPC.
+    pub value: String,
+    /// Human-readable label.
+    pub name: String,
+    /// Optional agent-provided description.
+    pub description: Option<String>,
+    /// Group heading rendered before this row, when the agent grouped choices.
+    pub group: Option<String>,
+    /// Whether this is the value the session currently reports.
+    pub selected: bool,
+}
+
+/// A selector flattened into the list of values the agent advertises.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSelect {
+    /// The control the chosen row is applied to.
+    pub target: SessionSelectTarget,
+    /// The selector label (`mode`, `model`, `thought_level`, …).
+    pub label: String,
+    /// The raw current value id.
+    pub current_value: String,
+    /// The current value's advertised name, or its raw id when it is missing.
+    pub current_name: String,
+    /// Every advertised value, in the agent's order.
+    pub rows: Vec<SessionSelectRow>,
+}
+
+impl SessionSelect {
+    /// Flatten `modes`, or `None` when there is nothing to choose.
+    pub fn modes(modes: &SessionModes) -> Option<Self> {
+        if modes.available_modes.len() < 2 {
+            return None;
+        }
+        let current_value = modes.current_mode_id.clone();
+        let rows: Vec<SessionSelectRow> = modes
+            .available_modes
+            .iter()
+            .map(|mode| SessionSelectRow {
+                value: mode.id.clone(),
+                name: mode.name.clone(),
+                description: mode.description.clone(),
+                group: None,
+                selected: mode.id == current_value,
+            })
+            .collect();
+        let current_name = rows
+            .iter()
+            .find(|row| row.value == current_value)
+            .map(|row| row.name.clone())
+            .unwrap_or_else(|| current_value.clone());
+        Some(Self {
+            target: SessionSelectTarget::Modes,
+            label: "mode".to_string(),
+            current_value,
+            current_name,
+            rows,
+        })
+    }
+
+    /// Flatten a `Select` option, or `None` for booleans, unsupported options
+    /// and single-choice lists (those stay read-only pills).
+    pub fn option(option: &SessionConfigOption) -> Option<Self> {
+        let SessionConfigKind::Select {
+            current_value,
+            choices,
+        } = &option.kind
+        else {
+            return None;
+        };
+        if choices.all().len() < 2 {
+            return None;
+        }
+        let rows = select_rows(choices, current_value);
+        let current_name = rows
+            .iter()
+            .find(|row| row.value == *current_value)
+            .map(|row| row.name.clone())
+            .unwrap_or_else(|| current_value.clone());
+        Some(Self {
+            target: SessionSelectTarget::Option(option.id.clone()),
+            label: option
+                .category
+                .clone()
+                .unwrap_or_else(|| option.name.clone()),
+            current_value: current_value.clone(),
+            current_name,
+            rows,
+        })
+    }
+
+    /// Whether the agent still advertises the current value. A stale id stays
+    /// visible as its raw value but is never marked as a list row.
+    pub fn current_is_advertised(&self) -> bool {
+        self.rows.iter().any(|row| row.value == self.current_value)
+    }
+}
+
+fn select_rows(choices: &SessionConfigChoices, current: &str) -> Vec<SessionSelectRow> {
+    let mut rows = Vec::new();
+    match choices {
+        SessionConfigChoices::Ungrouped { options } => {
+            for choice in options {
+                rows.push(SessionSelectRow {
+                    value: choice.value.clone(),
+                    name: choice.name.clone(),
+                    description: choice.description.clone(),
+                    group: None,
+                    selected: choice.value == current,
+                });
+            }
+        }
+        SessionConfigChoices::Grouped { groups } => {
+            for group in groups {
+                for choice in &group.options {
+                    rows.push(SessionSelectRow {
+                        value: choice.value.clone(),
+                        name: choice.name.clone(),
+                        description: choice.description.clone(),
+                        group: (!group.name.is_empty()).then(|| group.name.clone()),
+                        selected: choice.value == current,
+                    });
+                }
+            }
+        }
+    }
+    rows
+}
+
+/// One open select list and its keyboard highlight.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenSessionSelect {
+    /// The flattened values and the control they apply to.
+    pub select: SessionSelect,
+    /// Index into [`SessionSelect::rows`].
+    pub highlighted: usize,
+}
+
+/// The per-conversation open/closed and keyboard state for a session selector.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionSelectState {
+    open: Option<OpenSessionSelect>,
+}
+
+impl SessionSelectState {
+    /// Whether any select list is open.
+    pub fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
+
+    /// Whether the open list edits `target`.
+    pub fn is_open_for(&self, target: &SessionSelectTarget) -> bool {
+        self.open
+            .as_ref()
+            .is_some_and(|open| &open.select.target == target)
+    }
+
+    /// The open list, if any.
+    pub fn select(&self) -> Option<&SessionSelect> {
+        self.open.as_ref().map(|open| &open.select)
+    }
+
+    /// The target of the open list, if any.
+    pub fn target(&self) -> Option<&SessionSelectTarget> {
+        self.open.as_ref().map(|open| &open.select.target)
+    }
+
+    /// Open `select`, highlighting its current row.
+    pub fn open(&mut self, select: SessionSelect) {
+        let highlighted = select.rows.iter().position(|row| row.selected).unwrap_or(0);
+        self.open = Some(OpenSessionSelect {
+            select,
+            highlighted,
+        });
+    }
+
+    /// Close the list without changing anything.
+    pub fn close(&mut self) {
+        self.open = None;
+    }
+
+    /// Replace the open list's rows with a fresh snapshot of the same target,
+    /// keeping the highlight on the same value when it is still advertised.
+    pub fn refresh(&mut self, select: SessionSelect) {
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        if open.select.target != select.target {
+            return;
+        }
+        let highlighted_value = open
+            .select
+            .rows
+            .get(open.highlighted)
+            .map(|row| row.value.clone());
+        open.select = select;
+        open.highlighted = highlighted_value
+            .and_then(|value| open.select.rows.iter().position(|row| row.value == value))
+            .unwrap_or(0)
+            .min(open.select.rows.len().saturating_sub(1));
+    }
+
+    /// The highlighted row index.
+    pub fn highlighted(&self) -> Option<usize> {
+        self.open.as_ref().map(|open| open.highlighted)
+    }
+
+    /// The highlighted row.
+    pub fn highlighted_row(&self) -> Option<&SessionSelectRow> {
+        let open = self.open.as_ref()?;
+        open.select.rows.get(open.highlighted)
+    }
+
+    /// Move the highlight by `delta`, clamped to the advertised rows.
+    pub fn move_highlight(&mut self, delta: isize) -> bool {
+        let Some(open) = self.open.as_mut() else {
+            return false;
+        };
+        let count = open.select.rows.len();
+        if count == 0 {
+            return false;
+        }
+        let next = (open.highlighted as isize + delta).clamp(0, count as isize - 1);
+        let next = next as usize;
+        if next == open.highlighted {
+            return false;
+        }
+        open.highlighted = next;
+        true
+    }
+
+    /// Highlight the first advertised row.
+    pub fn highlight_first(&mut self) -> bool {
+        let Some(open) = self.open.as_mut() else {
+            return false;
+        };
+        if open.highlighted == 0 || open.select.rows.is_empty() {
+            return false;
+        }
+        open.highlighted = 0;
+        true
+    }
+
+    /// Highlight the last advertised row.
+    pub fn highlight_last(&mut self) -> bool {
+        let Some(open) = self.open.as_mut() else {
+            return false;
+        };
+        let last = open.select.rows.len().saturating_sub(1);
+        if open.select.rows.is_empty() || open.highlighted == last {
+            return false;
+        }
+        open.highlighted = last;
+        true
+    }
+
+    /// The target and exact value of the highlighted row, ready to send.
+    pub fn confirm(&self) -> Option<(SessionSelectTarget, String)> {
+        let row = self.highlighted_row()?;
+        Some((self.target()?.clone(), row.value.clone()))
+    }
 }
 
 #[cfg(test)]
@@ -862,5 +1170,186 @@ mod tests {
         assert!(conversation.events.is_empty());
         assert!(conversation.prompt.is_empty());
         assert!(conversation.plan.is_none());
+    }
+
+    fn modes(current: &str) -> SessionModes {
+        use favetto_wire::model::SessionMode;
+        SessionModes {
+            current_mode_id: current.to_string(),
+            available_modes: vec![
+                SessionMode {
+                    id: "build".to_string(),
+                    name: "Build".to_string(),
+                    description: Some("Edit files".to_string()),
+                },
+                SessionMode {
+                    id: "plan".to_string(),
+                    name: "Plan".to_string(),
+                    description: None,
+                },
+                SessionMode {
+                    id: "review".to_string(),
+                    name: "Review".to_string(),
+                    description: None,
+                },
+            ],
+        }
+    }
+
+    fn select_option(current: &str, choices: SessionConfigChoices) -> SessionConfigOption {
+        SessionConfigOption {
+            id: "model".to_string(),
+            name: "Model".to_string(),
+            description: None,
+            category: Some("model".to_string()),
+            kind: SessionConfigKind::Select {
+                current_value: current.to_string(),
+                choices,
+            },
+        }
+    }
+
+    fn ungrouped(values: &[(&str, &str)]) -> SessionConfigChoices {
+        use favetto_wire::model::SessionConfigChoice;
+        SessionConfigChoices::Ungrouped {
+            options: values
+                .iter()
+                .map(|(value, name)| SessionConfigChoice {
+                    value: value.to_string(),
+                    name: name.to_string(),
+                    description: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn the_mode_select_preserves_order_and_marks_the_current_mode() {
+        let select = SessionSelect::modes(&modes("plan")).expect("three modes make a list");
+        assert_eq!(select.target, SessionSelectTarget::Modes);
+        assert_eq!(select.label, "mode");
+        assert_eq!(select.current_name, "Plan");
+        let values: Vec<&str> = select.rows.iter().map(|row| row.value.as_str()).collect();
+        assert_eq!(values, ["build", "plan", "review"]);
+        assert!(select.rows[1].selected);
+        assert_eq!(select.rows[0].description.as_deref(), Some("Edit files"));
+    }
+
+    #[test]
+    fn a_single_mode_or_single_choice_stays_read_only() {
+        let mut one = modes("build");
+        one.available_modes.truncate(1);
+        assert!(SessionSelect::modes(&one).is_none());
+        assert!(SessionSelect::option(&select_option("a", ungrouped(&[("a", "A")]))).is_none());
+        let boolean = SessionConfigOption {
+            id: "fast".to_string(),
+            name: "Fast".to_string(),
+            description: None,
+            category: None,
+            kind: SessionConfigKind::Boolean {
+                current_value: true,
+            },
+        };
+        assert!(SessionSelect::option(&boolean).is_none());
+    }
+
+    #[test]
+    fn grouped_choices_keep_group_names_and_agent_order() {
+        use favetto_wire::model::{SessionConfigChoice, SessionConfigGroup};
+        let grouped = SessionConfigChoices::Grouped {
+            groups: vec![
+                SessionConfigGroup {
+                    id: "frontier".to_string(),
+                    name: "Frontier".to_string(),
+                    options: vec![SessionConfigChoice {
+                        value: "opus".to_string(),
+                        name: "Opus".to_string(),
+                        description: Some("Most capable".to_string()),
+                    }],
+                },
+                SessionConfigGroup {
+                    id: "fast".to_string(),
+                    name: "Fast".to_string(),
+                    options: vec![SessionConfigChoice {
+                        value: "haiku".to_string(),
+                        name: "Haiku".to_string(),
+                        description: None,
+                    }],
+                },
+            ],
+        };
+        let select = SessionSelect::option(&select_option("haiku", grouped)).expect("two choices");
+        let rows: Vec<(&str, Option<&str>)> = select
+            .rows
+            .iter()
+            .map(|row| (row.value.as_str(), row.group.as_deref()))
+            .collect();
+        assert_eq!(rows, [("opus", Some("Frontier")), ("haiku", Some("Fast"))]);
+        assert!(select.rows[1].selected);
+        assert_eq!(select.rows[0].description.as_deref(), Some("Most capable"));
+    }
+
+    #[test]
+    fn a_stale_current_value_stays_visible_without_inventing_a_row() {
+        let select = SessionSelect::option(&select_option(
+            "retired",
+            ungrouped(&[("a", "A"), ("b", "B")]),
+        ))
+        .expect("two advertised choices");
+        assert_eq!(select.current_name, "retired");
+        assert!(!select.current_is_advertised());
+        assert!(select.rows.iter().all(|row| !row.selected));
+    }
+
+    #[test]
+    fn the_select_state_starts_on_the_current_row_and_clamps_keyboard_moves() {
+        let mut state = SessionSelectState::default();
+        state.open(SessionSelect::modes(&modes("plan")).unwrap());
+        assert_eq!(state.highlighted(), Some(1));
+        assert_eq!(state.highlighted_row().unwrap().value, "plan");
+
+        assert!(state.move_highlight(-1));
+        assert_eq!(state.highlighted(), Some(0));
+        assert!(!state.move_highlight(-1), "the first row is the floor");
+        assert!(state.highlight_last());
+        assert_eq!(state.highlighted(), Some(2));
+        assert!(!state.move_highlight(1), "the last row is the ceiling");
+        assert!(state.highlight_first());
+        assert_eq!(
+            state.confirm(),
+            Some((SessionSelectTarget::Modes, "build".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_select_click_is_ignored_while_a_set_is_in_flight() {
+        let mut conversation = Conversation::for_session("ses_a");
+        assert!(conversation.begin_session_option_change("ses_a"));
+        assert!(conversation.session_option_change_pending());
+        assert!(!conversation.begin_session_option_change("ses_a"));
+        assert!(!conversation.finish_session_option_change("other"));
+        assert!(conversation.finish_session_option_change("ses_a"));
+        assert!(!conversation.session_option_change_pending());
+    }
+
+    #[test]
+    fn refreshing_an_open_list_keeps_the_highlight_on_the_same_value() {
+        let mut state = SessionSelectState::default();
+        state.open(SessionSelect::modes(&modes("plan")).unwrap());
+        assert_eq!(state.highlighted_row().unwrap().value, "plan");
+
+        // The agent still advertises `plan`, but adds a mode in a new position.
+        let mut fresh = modes("build");
+        fresh.available_modes.insert(
+            0,
+            favetto_wire::model::SessionMode {
+                id: "debug".to_string(),
+                name: "Debug".to_string(),
+                description: None,
+            },
+        );
+        state.refresh(SessionSelect::modes(&fresh).unwrap());
+        assert_eq!(state.highlighted_row().unwrap().value, "plan");
+        assert_eq!(state.highlighted(), Some(2));
     }
 }

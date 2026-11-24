@@ -8,6 +8,8 @@
 //! Task-only chrome (the Output/Runs tabs, the persisted raw-output fallback and
 //! the task header) stays in [`crate::views::detail`].
 
+use std::cell::Cell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use favetto_wire::model::{
@@ -16,14 +18,21 @@ use favetto_wire::model::{
     SessionConfigValue, SessionModes, TaskStatus,
 };
 use gpui::{
-    div, list, prelude::*, px, AnyElement, Context, Div, Entity, FocusHandle, Hsla, IntoElement,
-    ListAlignment, ListState, Render, ScrollHandle, ScrollWheelEvent, Stateful, TextStyle, Window,
+    div, list, prelude::*, px, AnyElement, Bounds, Context, Div, Entity, FocusHandle, Hsla,
+    IntoElement, ListAlignment, ListState, MouseButton, Pixels, Point, Render, ScrollHandle,
+    ScrollWheelEvent, Stateful, TextStyle, Window,
 };
 use uuid::Uuid;
 
+use crate::actions::{
+    SessionSelectCancel, SessionSelectConfirm, SessionSelectDown, SessionSelectEnd,
+    SessionSelectHome, SessionSelectOpen, SessionSelectUp,
+};
 use crate::agent_auth;
 use crate::components;
-use crate::conversation::{Conversation, ConversationTarget};
+use crate::conversation::{
+    Conversation, ConversationTarget, SessionSelect, SessionSelectState, SessionSelectTarget,
+};
 use crate::detail::{
     self, FeedItem, OutputSource, OutputText, PendingRequest, SessionRestore, TaskDetail,
     ToolStatus,
@@ -39,6 +48,17 @@ use crate::views::markdown::{self as markdown_view, Tone};
 
 /// Pixels from the bottom within which the viewport counts as "at the tail".
 const FOLLOW_THRESHOLD: f32 = 24.0;
+
+/// The width of the anchored session select list. Wide enough for a model id
+/// plus its description, narrow enough to sit inside the detail column.
+const SESSION_SELECT_WIDTH: f32 = 280.0;
+
+/// The tallest the list may grow before it scrolls. It also clamps to the
+/// conversation surface so a long model catalogue never spills past the feed.
+const SESSION_SELECT_MAX_HEIGHT: f32 = 320.0;
+
+/// The action listener attached to an openable session pill.
+type SessionOpenListener = Box<dyn Fn(&SessionSelectOpen, &mut Window, &mut gpui::App)>;
 
 /// The shared conversation surface.
 pub struct ConversationPanel {
@@ -82,6 +102,16 @@ pub struct ConversationPanel {
     restored_scroll: ScrollHandle,
     /// The session/length last scrolled to the restored transcript's tail.
     restored_scroll_key: Option<(String, usize)>,
+    /// The open model/mode/thought-level select list, if any.
+    session_select: SessionSelectState,
+    /// Window-space bottom-left of the pill that opened the list.
+    session_anchor: Option<Point<Pixels>>,
+    /// Fresh bounds of the conversation surface, captured during prepaint so
+    /// the list can be positioned relative to it without reflowing the feed.
+    session_surface: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// One focus handle per selector, so closing the list returns focus to the
+    /// pill that opened it.
+    session_focuses: HashMap<SessionSelectTarget, FocusHandle>,
 }
 
 impl ConversationPanel {
@@ -124,6 +154,10 @@ impl ConversationPanel {
             raw_output_target: None,
             restored_scroll: ScrollHandle::new(),
             restored_scroll_key: None,
+            session_select: SessionSelectState::default(),
+            session_anchor: None,
+            session_surface: Rc::new(Cell::new(None)),
+            session_focuses: HashMap::new(),
         }
     }
 
@@ -285,16 +319,23 @@ impl ConversationPanel {
     }
 
     /// The session option/mode strip. It renders the daemon's complete snapshot;
-    /// clicking a supported selector cycles to the next advertised value and
-    /// sends a validated `agents.set_option` / `set_mode`.
+    /// clicking a model, mode or thought-level selector opens a list of every
+    /// advertised value. The exact value the user picks is sent through a
+    /// validated `agents.set_option` / `set_mode`; nothing cycles.
     fn session_options_bar(
-        &self,
+        &mut self,
         theme: &Theme,
         snapshot: (String, Vec<SessionConfigOption>, Option<SessionModes>),
         cx: &mut Context<Self>,
     ) -> Option<Div> {
         let (_session_id, options, modes) = snapshot;
+        let pending = self
+            .state
+            .read(cx)
+            .active_conversation()
+            .is_some_and(|conversation| conversation.session_option_change_pending());
         let mut pills: Vec<AnyElement> = Vec::new();
+        let mut targets: Vec<SessionSelectTarget> = Vec::new();
 
         if let Some(modes) = modes.filter(|modes| !modes.available_modes.is_empty()) {
             let current = modes
@@ -303,24 +344,15 @@ impl ConversationPanel {
                 .find(|mode| mode.id == modes.current_mode_id)
                 .map(|mode| mode.name.clone())
                 .unwrap_or_else(|| modes.current_mode_id.clone());
-            if let Some(next) = next_mode(&modes, &modes.current_mode_id) {
-                let mode_id = next.id.clone();
-                let index = pills.len();
-                pills.push(self.session_pill(
-                    theme,
-                    index,
-                    "mode",
-                    current,
-                    Some(format!("Next: {}", next.name)),
-                    cx.listener(move |this, _event, _window, cx| {
-                        this.state.update(cx, |state, cx| {
-                            state.set_detail_session_mode(mode_id.clone(), cx);
-                            cx.notify();
-                        });
-                    }),
-                ));
-            } else {
-                pills.push(read_only_pill(theme, "mode", current));
+            let target = SessionSelectTarget::Modes;
+            targets.push(target.clone());
+            match SessionSelect::modes(&modes) {
+                Some(select) => {
+                    self.session_select.refresh(select.clone());
+                    let index = pills.len();
+                    pills.push(self.openable_session_pill(theme, index, select, pending, cx));
+                }
+                None => pills.push(read_only_pill(theme, "mode", current, "only mode")),
             }
         }
 
@@ -335,59 +367,51 @@ impl ConversationPanel {
                     current_value,
                     choices,
                 } => {
-                    let all = choices.all();
-                    let current = all
-                        .iter()
-                        .find(|choice| &choice.value == current_value)
-                        .map(|choice| choice.name.clone())
-                        .unwrap_or_else(|| current_value.clone());
-                    let next = all
-                        .iter()
-                        .position(|choice| &choice.value == current_value)
-                        .map(|index| &all[(index + 1) % all.len()])
-                        .filter(|_choice| all.len() > 1);
-                    if let Some(next) = next {
-                        let option_id = option.id.clone();
-                        let value = SessionConfigValue::ValueId {
-                            value: next.value.clone(),
-                        };
-                        let index = pills.len();
-                        pills.push(self.session_pill(
-                            theme,
-                            index,
-                            &label,
-                            current,
-                            Some(format!("Next: {}", next.name)),
-                            cx.listener(move |this, _event, _window, cx| {
-                                this.state.update(cx, |state, cx| {
-                                    state.set_detail_session_option(
-                                        option_id.clone(),
-                                        value.clone(),
-                                        cx,
-                                    );
-                                    cx.notify();
-                                });
-                            }),
-                        ));
-                    } else {
-                        pills.push(read_only_pill(theme, &label, current));
+                    let target = SessionSelectTarget::Option(option.id.clone());
+                    targets.push(target.clone());
+                    match SessionSelect::option(&option) {
+                        Some(select) => {
+                            self.session_select.refresh(select.clone());
+                            let index = pills.len();
+                            pills.push(
+                                self.openable_session_pill(theme, index, select, pending, cx),
+                            );
+                        }
+                        None => {
+                            let current = choices
+                                .all()
+                                .iter()
+                                .find(|choice| &choice.value == current_value)
+                                .map(|choice| choice.name.clone())
+                                .unwrap_or_else(|| current_value.clone());
+                            pills.push(read_only_pill(theme, &label, current, "no other values"));
+                        }
                     }
                 }
                 SessionConfigKind::Boolean { current_value } => {
+                    targets.push(SessionSelectTarget::Option(option.id.clone()));
                     let value = SessionConfigValue::Boolean {
                         value: !current_value,
                     };
                     let option_id = option.id.clone();
                     let index = pills.len();
+                    let hint = if pending {
+                        "applying…".to_string()
+                    } else {
+                        format!(
+                            "click to turn {}",
+                            if *current_value { "off" } else { "on" }
+                        )
+                    };
                     pills.push(self.session_pill(
                         theme,
                         index,
                         &label,
-                        if *current_value { "on" } else { "off" }.to_string(),
-                        Some(format!(
-                            "Click to turn {}",
-                            if *current_value { "off" } else { "on" }
-                        )),
+                        if *current_value { "on" } else { "off" },
+                        "",
+                        Some(hint),
+                        !pending,
+                        None,
                         cx.listener(move |this, _event, _window, cx| {
                             this.state.update(cx, |state, cx| {
                                 state.set_detail_session_option(
@@ -398,11 +422,23 @@ impl ConversationPanel {
                                 cx.notify();
                             });
                         }),
+                        None,
                     ));
                 }
                 SessionConfigKind::Other => {
-                    pills.push(read_only_pill(theme, &label, "unsupported".to_string()));
+                    targets.push(SessionSelectTarget::Option(option.id.clone()));
+                    pills.push(read_only_pill(theme, &label, "unsupported".to_string(), ""));
                 }
+            }
+        }
+
+        // A snapshot that no longer carries the open selector closes it rather
+        // than leaving a stale list over the feed.
+        let open_target = self.session_select.target().cloned();
+        if let Some(open_target) = open_target {
+            if !targets.contains(&open_target) {
+                self.session_select.close();
+                self.session_anchor = None;
             }
         }
 
@@ -425,17 +461,143 @@ impl ConversationPanel {
         )
     }
 
+    /// Build one model/mode/thought-level pill that opens `select` on click.
+    fn openable_session_pill(
+        &mut self,
+        theme: &Theme,
+        index: usize,
+        select: SessionSelect,
+        pending: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let focus = self.selector_focus(&select.target, cx);
+        let label = select.label.clone();
+        let current = select.current_name.clone();
+        let anchor = Rc::new(Cell::new(None));
+        let focus_click = focus.clone();
+        let select_click = select.clone();
+        let anchor_click = anchor.clone();
+        let hint = pending.then(|| "applying…".to_string());
+        let on_click = cx.listener(move |this, _event, window, cx| {
+            window.focus(&focus_click);
+            this.open_session_select(select_click.clone(), anchor_click.get(), window, cx);
+        });
+        let on_open = if pending {
+            None
+        } else {
+            let focus_open = focus.clone();
+            let anchor_open = anchor.clone();
+            let select_open = select;
+            Some(
+                Box::new(cx.listener(move |this, _: &SessionSelectOpen, window, cx| {
+                    window.focus(&focus_open);
+                    this.open_session_select(select_open.clone(), anchor_open.get(), window, cx);
+                })) as SessionOpenListener,
+            )
+        };
+        let pill = self.session_pill(
+            theme,
+            index,
+            &label,
+            &current,
+            "▾",
+            hint,
+            !pending,
+            Some(&focus),
+            on_click,
+            on_open,
+        );
+        anchored_pill(pill, anchor)
+    }
+
+    /// The focus handle for one selector, created once per advertised control.
+    fn selector_focus(
+        &mut self,
+        target: &SessionSelectTarget,
+        cx: &mut Context<Self>,
+    ) -> FocusHandle {
+        self.session_focuses
+            .entry(target.clone())
+            .or_insert_with(|| cx.focus_handle().tab_index(76).tab_stop(true))
+            .clone()
+    }
+
+    /// Open (or toggle closed) the list for `select`.
+    fn open_session_select(
+        &mut self,
+        select: SessionSelect,
+        anchor: Option<Point<Pixels>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = select.target.clone();
+        if self.session_select.is_open_for(&target) {
+            self.session_select.close();
+            self.session_anchor = None;
+        } else {
+            self.session_anchor = anchor;
+            self.session_select.open(select);
+            if let Some(focus) = self.session_focuses.get(&target) {
+                window.focus(focus);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Apply the exact value the user picked and close the list.
+    fn apply_session_choice(
+        &mut self,
+        target: SessionSelectTarget,
+        value: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.session_select.close();
+        self.session_anchor = None;
+        self.state.update(cx, |state, cx| {
+            match target {
+                SessionSelectTarget::Modes => state.set_detail_session_mode(value, cx),
+                SessionSelectTarget::Option(option_id) => state.set_detail_session_option(
+                    option_id,
+                    SessionConfigValue::ValueId { value },
+                    cx,
+                ),
+            }
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn session_select_move(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.session_select.move_highlight(delta) {
+            cx.notify();
+        }
+    }
+
+    fn session_select_confirm(&mut self, cx: &mut Context<Self>) {
+        let Some((target, value)) = self.session_select.confirm() else {
+            return;
+        };
+        self.apply_session_choice(target, value, cx);
+    }
+
+    /// One option pill. `suffix` is the `▾` on an openable selector and empty
+    /// for a boolean toggle; a disabled pill still shows the snapshot value and
+    /// an `applying…` note while the set RPC is outstanding.
+    #[allow(clippy::too_many_arguments)]
     fn session_pill(
         &self,
         theme: &Theme,
         index: usize,
         label: &str,
-        value: String,
+        value: &str,
+        suffix: &str,
         hint: Option<String>,
+        enabled: bool,
+        focus: Option<&FocusHandle>,
         on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+        on_open: Option<SessionOpenListener>,
     ) -> AnyElement {
-        let hint = hint.unwrap_or_default();
-        div()
+        let pill = div()
             .id(("session-option", index))
             .flex()
             .items_center()
@@ -447,24 +609,197 @@ impl ConversationPanel {
             .border_color(theme.colors.border)
             .bg(theme.colors.bg)
             .text_size(px(theme.font.xs))
-            .text_color(theme.colors.text)
-            .cursor_pointer()
-            .hover(|style| style.border_color(theme.colors.accent))
+            .text_color(if enabled {
+                theme.colors.text
+            } else {
+                theme.colors.muted
+            });
+        let pill = match focus {
+            Some(focus) => pill.track_focus(focus),
+            None => pill,
+        };
+        let pill = pill
             .child(
                 div()
                     .text_color(theme.colors.muted)
                     .child(format!("{label}:")),
             )
-            .child(div().child(format!("{value} ▾")))
-            .when(!hint.is_empty(), |pill| {
+            .child(div().child(format!("{value}{suffix}")))
+            .when_some(hint.filter(|hint| !hint.is_empty()), |pill, hint| {
                 pill.child(
                     div()
                         .text_color(theme.colors.muted)
                         .child(format!("({hint})")),
                 )
-            })
-            .on_click(on_click)
-            .into_any_element()
+            });
+        let pill = components::with_focus(pill, theme);
+        if enabled {
+            let pill = pill
+                .cursor_pointer()
+                .hover(|style| style.border_color(theme.colors.accent))
+                .on_click(on_click);
+            let pill = match on_open {
+                Some(on_open) => pill.on_action(on_open),
+                None => pill,
+            };
+            pill.into_any_element()
+        } else {
+            pill.into_any_element()
+        }
+    }
+
+    /// The anchored popover listing every advertised value of the open
+    /// selector. It is a child of the conversation surface (not the strip) so
+    /// it paints above the feed and never reflows it.
+    fn session_select_overlay(
+        &self,
+        theme: &Theme,
+        surface: Option<Bounds<Pixels>>,
+        cx: &mut Context<Self>,
+    ) -> Option<Stateful<Div>> {
+        let select = self.session_select.select()?;
+        let (left, top, max_height) = match (surface, self.session_anchor) {
+            (Some(surface), Some(anchor)) => {
+                let max_left =
+                    (f32::from(surface.size.width) - SESSION_SELECT_WIDTH - theme.spacing.s2)
+                        .max(0.0);
+                let left = (f32::from(anchor.x - surface.origin.x)).clamp(0.0, max_left);
+                let top = (f32::from(anchor.y - surface.origin.y) + theme.spacing.s1).max(0.0);
+                let max_height = (f32::from(surface.size.height) - top - theme.spacing.s2)
+                    .clamp(theme.controls.min * 3.0, SESSION_SELECT_MAX_HEIGHT);
+                (left, top, max_height)
+            }
+            _ => (theme.spacing.s3, 44.0, SESSION_SELECT_MAX_HEIGHT),
+        };
+        let highlighted = self.session_select.highlighted().unwrap_or(0);
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let mut previous_group: Option<&str> = None;
+        for (index, row) in select.rows.iter().enumerate() {
+            if row.group.as_deref() != previous_group {
+                if let Some(group) = row.group.as_deref() {
+                    rows.push(
+                        div()
+                            .px(px(theme.spacing.s2))
+                            .pt(px(theme.spacing.s1))
+                            .child(components::section_label(theme, &group.to_uppercase()))
+                            .into_any_element(),
+                    );
+                }
+                previous_group = row.group.as_deref();
+            }
+            let target = select.target.clone();
+            let value = row.value.clone();
+            let selected = row.selected;
+            let is_highlighted = index == highlighted;
+            rows.push(
+                div()
+                    .id(("session-select-row", index))
+                    .flex()
+                    .items_start()
+                    .gap(px(theme.spacing.s1))
+                    .min_h(px(theme.controls.min))
+                    .px(px(theme.spacing.s2))
+                    .py(px(theme.spacing.s1))
+                    .rounded(px(theme.radii.r4))
+                    .when(is_highlighted, |row| {
+                        row.bg(Hsla::from(theme.colors.accent).opacity(0.12))
+                            .border_1()
+                            .border_color(Hsla::from(theme.colors.accent).opacity(0.55))
+                    })
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.colors.bg))
+                    .child(
+                        div()
+                            .w(px(12.0))
+                            .flex_shrink_0()
+                            .text_color(theme.colors.accent)
+                            .child(if selected { "✓" } else { "" }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(px(1.0))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_color(if selected {
+                                        theme.colors.accent
+                                    } else {
+                                        theme.colors.text
+                                    })
+                                    .child(row.name.clone()),
+                            )
+                            .when_some(row.description.clone(), |body, description| {
+                                body.child(
+                                    div()
+                                        .text_size(px(theme.font.xs))
+                                        .text_color(theme.colors.muted)
+                                        .child(description),
+                                )
+                            }),
+                    )
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.apply_session_choice(target.clone(), value.clone(), cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+
+        let current_note = (!select.current_is_advertised())
+            .then(|| format!("Current: {} (not advertised)", select.current_name.as_str()));
+
+        Some(
+            div()
+                .id("session-select")
+                .absolute()
+                .left(px(left))
+                .top(px(top))
+                .w(px(SESSION_SELECT_WIDTH))
+                .max_h(px(max_height))
+                .overflow_y_scroll()
+                .occlude()
+                .rounded(px(theme.radii.r8))
+                .border_1()
+                .border_color(theme.colors.border)
+                .bg(theme.colors.surface)
+                .text_size(px(theme.font.sm))
+                .text_color(theme.colors.text)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(1.0))
+                        .px(px(theme.spacing.s2))
+                        .pt(px(theme.spacing.s2))
+                        .pb(px(theme.spacing.s1))
+                        .child(components::section_label(
+                            theme,
+                            &format!("SELECT {}", select.label.to_uppercase()),
+                        ))
+                        .when_some(current_note, |header, note| {
+                            header.child(
+                                div()
+                                    .text_size(px(theme.font.xs))
+                                    .text_color(theme.colors.muted)
+                                    .child(note),
+                            )
+                        }),
+                )
+                .children(rows)
+                .child(
+                    div()
+                        .border_t_1()
+                        .border_color(theme.colors.border)
+                        .px(px(theme.spacing.s2))
+                        .py(px(theme.spacing.s1))
+                        .text_size(px(theme.font.xs))
+                        .text_color(theme.colors.muted)
+                        .child("↑↓ move · ↵ apply · esc close"),
+                ),
+        )
     }
 
     /// A small secondary button used by shared chrome.
@@ -2402,8 +2737,28 @@ impl Render for ConversationPanel {
         };
         let elicitation = self.state.read(cx).detail_elicitation().cloned();
 
+        if session_options.is_none() {
+            self.session_select.close();
+            self.session_anchor = None;
+        }
         let options_bar =
             session_options.and_then(|snapshot| self.session_options_bar(theme, snapshot, cx));
+        let session_overlay = self.session_select_overlay(theme, self.session_surface.get(), cx);
+        let session_backdrop = session_overlay.is_some().then(|| {
+            div()
+                .id("session-select-backdrop")
+                .absolute()
+                .inset_0()
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, _window, cx| {
+                        this.session_select.close();
+                        this.session_anchor = None;
+                        cx.notify();
+                    }),
+                )
+        });
         let auth_banner = auth
             .as_ref()
             .map(|(session_id, auth)| self.auth_banner(theme, session_id, auth, cx));
@@ -2426,6 +2781,7 @@ impl Render for ConversationPanel {
             .active_conversation()
             .is_some_and(|conversation| conversation.terminal);
         let body = self.merged_output_body(theme, cx);
+        let surface_bounds = self.session_surface.clone();
 
         div()
             .relative()
@@ -2433,6 +2789,40 @@ impl Render for ConversationPanel {
             .flex_col()
             .flex_1()
             .min_h_0()
+            .on_children_prepainted(move |bounds, _window, _cx| {
+                if let Some(first) = bounds.first() {
+                    surface_bounds.set(Some(*first));
+                }
+            })
+            .when(self.session_select.is_open(), |surface| {
+                // `Search` keeps the shell's single-key jumps from firing
+                // behind the open popover.
+                surface.key_context("SessionSelect Search")
+            })
+            .on_action(cx.listener(|this, _: &SessionSelectUp, _window, cx| {
+                this.session_select_move(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SessionSelectDown, _window, cx| {
+                this.session_select_move(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SessionSelectHome, _window, cx| {
+                if this.session_select.highlight_first() {
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SessionSelectEnd, _window, cx| {
+                if this.session_select.highlight_last() {
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SessionSelectConfirm, _window, cx| {
+                this.session_select_confirm(cx);
+            }))
+            .on_action(cx.listener(|this, _: &SessionSelectCancel, _window, cx| {
+                this.session_select.close();
+                this.session_anchor = None;
+                cx.notify();
+            }))
             .when_some(options_bar, |surface, bar| surface.child(bar))
             .when_some(auth_banner, |surface, banner| surface.child(banner))
             .when_some(banner, |surface, banner| surface.child(banner))
@@ -2447,29 +2837,30 @@ impl Render for ConversationPanel {
                     .child(self.follow_toggle(theme, follow, live, cx)),
             )
             .child(body)
+            .when_some(session_backdrop, |surface, backdrop| {
+                surface.child(backdrop)
+            })
+            .when_some(session_overlay, |surface, overlay| surface.child(overlay))
             .when_some(elicitation_modal, |surface, modal| surface.child(modal))
     }
 }
 
-/// The next advertised mode after `current`, wrapping once. `None` when there is
-/// nothing else to switch to.
-fn next_mode<'a>(
-    modes: &'a SessionModes,
-    current: &str,
-) -> Option<&'a favetto_wire::model::SessionMode> {
-    if modes.available_modes.len() < 2 {
-        return None;
-    }
-    let index = modes
-        .available_modes
-        .iter()
-        .position(|mode| mode.id == current)?;
-    modes
-        .available_modes
-        .get((index + 1) % modes.available_modes.len())
+/// Wrap an openable pill so prepaint records its window-space bottom-left for
+/// the anchored overlay. The wrapper is zero-impact on the strip's layout.
+fn anchored_pill(pill: AnyElement, anchor: Rc<Cell<Option<Point<Pixels>>>>) -> AnyElement {
+    div()
+        .relative()
+        .key_context("SessionPill")
+        .on_children_prepainted(move |bounds, _window, _cx| {
+            if let Some(first) = bounds.first() {
+                anchor.set(Some(first.bottom_left()));
+            }
+        })
+        .child(pill)
+        .into_any_element()
 }
 
-fn read_only_pill(theme: &Theme, label: &str, value: String) -> AnyElement {
+fn read_only_pill(theme: &Theme, label: &str, value: String, hint: &str) -> AnyElement {
     div()
         .flex()
         .items_center()
@@ -2483,6 +2874,7 @@ fn read_only_pill(theme: &Theme, label: &str, value: String) -> AnyElement {
         .text_color(theme.colors.muted)
         .child(format!("{label}:"))
         .child(value)
+        .when(!hint.is_empty(), |pill| pill.child(format!("({hint})")))
         .into_any_element()
 }
 
@@ -2850,42 +3242,6 @@ mod tests {
 
     fn theme() -> &'static Theme {
         Theme::for_appearance(gpui::WindowAppearance::Dark)
-    }
-
-    #[test]
-    fn next_mode_wraps_and_rejects_an_unadvertised_current() {
-        use favetto_wire::model::{SessionMode, SessionModes};
-
-        let modes = SessionModes {
-            current_mode_id: "build".to_string(),
-            available_modes: vec![
-                SessionMode {
-                    id: "build".to_string(),
-                    name: "Build".to_string(),
-                    description: None,
-                },
-                SessionMode {
-                    id: "plan".to_string(),
-                    name: "Plan".to_string(),
-                    description: None,
-                },
-            ],
-        };
-        assert_eq!(
-            next_mode(&modes, "build").map(|mode| mode.id.as_str()),
-            Some("plan")
-        );
-        assert_eq!(
-            next_mode(&modes, "plan").map(|mode| mode.id.as_str()),
-            Some("build")
-        );
-        assert!(next_mode(&modes, "stale").is_none());
-
-        let one = SessionModes {
-            current_mode_id: "build".to_string(),
-            available_modes: vec![modes.available_modes[0].clone()],
-        };
-        assert!(next_mode(&one, "build").is_none());
     }
 
     #[test]

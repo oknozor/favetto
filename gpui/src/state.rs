@@ -1276,43 +1276,46 @@ impl ClientState {
                 // The load changed the live roster (`agents.list`).
                 self.refresh_snapshot();
             }
-            Update::AgentOptionsChanged { session_id, result } => match result {
-                Ok(snapshot) => {
-                    if let Some(session) = self
-                        .sessions
-                        .iter_mut()
-                        .find(|session| session.id == snapshot.session_id)
-                    {
-                        session.config_options = snapshot.config_options;
-                        session.modes = snapshot.modes;
-                    } else if let Some(session) = self
-                        .sessions
-                        .iter_mut()
-                        .find(|session| session.id == session_id)
-                    {
-                        session.config_options = snapshot.config_options;
-                        session.modes = snapshot.modes;
+            Update::AgentOptionsChanged { session_id, result } => {
+                self.finish_session_option_change(&session_id);
+                match result {
+                    Ok(snapshot) => {
+                        if let Some(session) = self
+                            .sessions
+                            .iter_mut()
+                            .find(|session| session.id == snapshot.session_id)
+                        {
+                            session.config_options = snapshot.config_options;
+                            session.modes = snapshot.modes;
+                        } else if let Some(session) = self
+                            .sessions
+                            .iter_mut()
+                            .find(|session| session.id == session_id)
+                        {
+                            session.config_options = snapshot.config_options;
+                            session.modes = snapshot.modes;
+                        }
+                        self.touch_snapshot();
+                        self.show_toast(
+                            ToastKind::Success,
+                            "Session options updated.".to_string(),
+                            cx,
+                        );
                     }
-                    self.touch_snapshot();
-                    self.show_toast(
-                        ToastKind::Success,
-                        "Session options updated.".to_string(),
-                        cx,
-                    );
-                }
-                Err(error) => {
-                    if error.is_unauthorized() {
-                        self.connection = ConnectionState::Unauthorized {
-                            token_path: self.config.token_source.label(),
-                        };
+                    Err(error) => {
+                        if error.is_unauthorized() {
+                            self.connection = ConnectionState::Unauthorized {
+                                token_path: self.config.token_source.label(),
+                            };
+                        }
+                        self.show_toast(
+                            ToastKind::Error,
+                            format!("Could not change session options: {error}."),
+                            cx,
+                        );
                     }
-                    self.show_toast(
-                        ToastKind::Error,
-                        format!("Could not change session options: {error}."),
-                        cx,
-                    );
                 }
-            },
+            }
             Update::AuthFinished {
                 session_id,
                 method_id,
@@ -4724,13 +4727,23 @@ impl ClientState {
             );
             return;
         };
-        match &self.runtime {
-            Some(runtime) => runtime.set_agent_option(session_id, option_id, value),
-            None => self.show_toast(
+        if self.runtime.is_none() {
+            self.show_toast(
                 ToastKind::Error,
                 "The daemon connection is not available.".to_string(),
                 cx,
-            ),
+            );
+            return;
+        }
+        if let Some(conversation) = self.active_conversation_mut() {
+            if !conversation.begin_session_option_change(&session_id) {
+                // A second target would race the first against a stale
+                // snapshot; the first response re-enables the selector.
+                return;
+            }
+        }
+        if let Some(runtime) = &self.runtime {
+            runtime.set_agent_option(session_id, option_id, value);
         }
     }
 
@@ -4744,13 +4757,40 @@ impl ClientState {
             );
             return;
         };
-        match &self.runtime {
-            Some(runtime) => runtime.set_agent_mode(session_id, mode_id),
-            None => self.show_toast(
+        if self.runtime.is_none() {
+            self.show_toast(
                 ToastKind::Error,
                 "The daemon connection is not available.".to_string(),
                 cx,
-            ),
+            );
+            return;
+        }
+        if let Some(conversation) = self.active_conversation_mut() {
+            if !conversation.begin_session_option_change(&session_id) {
+                return;
+            }
+        }
+        if let Some(runtime) = &self.runtime {
+            runtime.set_agent_mode(session_id, mode_id);
+        }
+    }
+
+    /// Release the in-flight option/mode guard once the daemon answers.
+    fn finish_session_option_change(&mut self, session_id: &str) {
+        if let Some(conversation) = self.active_conversation_mut() {
+            if conversation.finish_session_option_change(session_id) {
+                return;
+            }
+        }
+        if self
+            .standalone
+            .conversation
+            .finish_session_option_change(session_id)
+        {
+            return;
+        }
+        if let Some(detail) = self.detail.as_mut() {
+            detail.conversation.finish_session_option_change(session_id);
         }
     }
 

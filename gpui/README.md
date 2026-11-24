@@ -74,8 +74,13 @@ checkout (never the daemon cwd or a task worktree). `i` interrupts the current
 turn, `x` closes the session through `agents.close`, and `m` opens the same
 slash-command composer as the task detail. With `repo: global` active the
 surface asks you to select a repository first. Model, thinking level and
-build/plan mode are exposed by the agent's advertised session options, not a
-hardcoded selector.
+build/plan mode come from the agent's advertised session options rather than a
+hardcoded selector. Clicking one opens a list of every advertised value (grouped
+and described as the agent reports them); pick a row with the mouse or
+`↑`/`↓`/`Home`/`End`, confirm with `Enter`, and dismiss with `Esc` without
+changing anything. The exact chosen value is applied with `agents.set_option` or
+`agents.set_mode`; a selector is disabled until that call returns, so a stale
+snapshot never re-sends the same target.
 
 On the Catalog surface, `↑`/`↓` move the definition highlight, `Enter` opens
 the launch sheet, `/` focuses the search field, `h` collapses/expands the

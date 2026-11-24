@@ -169,6 +169,20 @@ actions!(
         ElicitationEdit,
         /// Cancel the ACP form (Esc).
         ElicitationCancel,
+        /// Open the focused session selector.
+        SessionSelectOpen,
+        /// Move the open session select list up.
+        SessionSelectUp,
+        /// Move the open session select list down.
+        SessionSelectDown,
+        /// Jump to the first value in the open session select list.
+        SessionSelectHome,
+        /// Jump to the last value in the open session select list.
+        SessionSelectEnd,
+        /// Apply the highlighted session select value.
+        SessionSelectConfirm,
+        /// Close the session select list without changing the session.
+        SessionSelectCancel,
         /// Refresh the connection and the current surface.
         Refresh,
         /// Restart the transport.
@@ -615,6 +629,18 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("d", ElicitationDecline, Some("Root && Elicitation")),
         KeyBinding::new("e", ElicitationEdit, Some("Root && Elicitation")),
         KeyBinding::new("escape", ElicitationCancel, Some("Root && Elicitation")),
+        // The session select list is a popover owned by its focused pill. These
+        // bindings are registered after the shell/list bindings so they win
+        // while the list is open, and its `Search` context suppresses the
+        // single-key route jumps.
+        KeyBinding::new("enter", SessionSelectOpen, Some("SessionPill")),
+        KeyBinding::new("space", SessionSelectOpen, Some("SessionPill")),
+        KeyBinding::new("up", SessionSelectUp, Some("SessionSelect")),
+        KeyBinding::new("down", SessionSelectDown, Some("SessionSelect")),
+        KeyBinding::new("home", SessionSelectHome, Some("SessionSelect")),
+        KeyBinding::new("end", SessionSelectEnd, Some("SessionSelect")),
+        KeyBinding::new("enter", SessionSelectConfirm, Some("SessionSelect")),
+        KeyBinding::new("escape", SessionSelectCancel, Some("SessionSelect")),
         // Text editing. These are registered last so a focused field wins over
         // the shell/list/arrow bindings at equal predicate depth. `TextField`
         // and `Multiline` are appended to the root key context only while an
@@ -961,6 +987,47 @@ mod tests {
         let repo_confirm = order.iter().position(|name| name == "RepoPickerConfirm");
         assert!(list_open.is_some() && repo_confirm.is_some());
         assert!(repo_confirm > list_open);
+    }
+
+    #[test]
+    fn session_select_keys_are_scoped_to_the_open_list() {
+        for (action, key) in [
+            ("SessionSelectUp", "up"),
+            ("SessionSelectDown", "down"),
+            ("SessionSelectHome", "home"),
+            ("SessionSelectEnd", "end"),
+            ("SessionSelectConfirm", "enter"),
+            ("SessionSelectCancel", "escape"),
+        ] {
+            let matches: Vec<_> = bindings()
+                .into_iter()
+                .filter(|binding| {
+                    binding.action().name().ends_with(action)
+                        && binding
+                            .keystrokes()
+                            .iter()
+                            .any(|stroke| stroke.key() == key)
+                })
+                .collect();
+            assert_eq!(matches.len(), 1, "{action} must have one binding");
+            assert!(
+                matches[0]
+                    .predicate()
+                    .is_some_and(|predicate| predicate.to_string().contains("SessionSelect")),
+                "{action} must only fire while a session select list is open"
+            );
+        }
+
+        // A focused pill opens its list with Enter or Space; these are scoped
+        // to the pill, not to the open list.
+        let opens: Vec<_> = bindings()
+            .into_iter()
+            .filter(|binding| binding.action().name().ends_with("SessionSelectOpen"))
+            .collect();
+        assert_eq!(opens.len(), 2, "Enter and Space both open the selector");
+        assert!(opens.iter().all(|binding| binding
+            .predicate()
+            .is_some_and(|predicate| predicate.to_string().contains("SessionPill"))));
     }
 
     #[test]
