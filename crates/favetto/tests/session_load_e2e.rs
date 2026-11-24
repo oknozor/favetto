@@ -52,21 +52,27 @@ impl Daemon {
                 "[agent]\ndefault = \"echo\"\n\n\
                  [agents.echo]\ncommand = {agent:?}\nargs = []\n\
                  [agents.echo.env]\n\
+                 FAKE_ACP_LENIENT_SESSIONS = \"1\"\n\
                  FAKE_ACP_LOAD_MARKER = {echo_load:?}\n\
                  FAKE_ACP_PROMPT_MARKER = {echo_prompt:?}\n\n\
                  [agents.nope]\ncommand = {agent:?}\nargs = []\n\
-                 [agents.nope.env]\nFAKE_ACP_LOAD_SUPPORTED = \"0\"\n\n\
+                 [agents.nope.env]\n\
+                 FAKE_ACP_LENIENT_SESSIONS = \"1\"\n\
+                 FAKE_ACP_LOAD_SUPPORTED = \"0\"\n\n\
                  [agents.bad]\ncommand = {agent:?}\nargs = []\n\
                  [agents.bad.env]\n\
+                 FAKE_ACP_LENIENT_SESSIONS = \"1\"\n\
                  FAKE_ACP_LOAD_RESULT = \"error\"\n\
                  FAKE_ACP_LOAD_MARKER = {bad_load:?}\n\n\
                  [agents.replay]\ncommand = {agent:?}\nargs = []\n\
                  [agents.replay.env]\n\
+                 FAKE_ACP_LENIENT_SESSIONS = \"1\"\n\
                  FAKE_ACP_LOAD_GATE_DIR = {replay_gate:?}\n\
                  FAKE_ACP_LOAD_USER = \"restored question\"\n\
                  FAKE_ACP_LOAD_UPDATES = \"history-one|history-two|history-three\"\n\n\
                  [agents.replay-bad]\ncommand = {agent:?}\nargs = []\n\
                  [agents.replay-bad.env]\n\
+                 FAKE_ACP_LENIENT_SESSIONS = \"1\"\n\
                  FAKE_ACP_LOAD_RESULT = \"error\"\n\
                  FAKE_ACP_LOAD_GATE_DIR = {replay_bad_gate:?}\n\
                  FAKE_ACP_LOAD_UPDATES = \"partial-one|partial-two\"\n"
@@ -332,7 +338,7 @@ fn echo_config(env: &str) -> String {
     format!(
         "[agent]\ndefault = \"echo\"\n\n\
          [agents.echo]\ncommand = {agent:?}\nargs = []\n\
-         [agents.echo.env]\n{env}"
+         [agents.echo.env]\n{env}FAKE_ACP_LENIENT_SESSIONS = \"1\"\n"
     )
 }
 

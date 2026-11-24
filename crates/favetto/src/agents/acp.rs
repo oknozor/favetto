@@ -26,8 +26,9 @@ use std::time::{Duration, Instant};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::schema::{
     AgentCapabilities, AuthMethod, AuthenticateRequest, AvailableCommand as AcpAvailableCommand,
-    AvailableCommandInput as AcpAvailableCommandInput, CancelNotification, ClientCapabilities,
-    ContentBlock, CreateElicitationRequest, CreateElicitationResponse, DeleteSessionRequest,
+    AvailableCommandInput as AcpAvailableCommandInput, BooleanConfigOptionCapabilities,
+    CancelNotification, ClientCapabilities, ClientSessionCapabilities, ContentBlock,
+    CreateElicitationRequest, CreateElicitationResponse, DeleteSessionRequest,
     ElicitationAcceptAction, ElicitationAction, ElicitationCapabilities, ElicitationContentValue,
     ElicitationFormCapabilities, ElicitationMode, ElicitationPropertySchema, ElicitationSchema,
     ElicitationScope, EmbeddedResourceResource, EnvVariable, HttpHeader, InitializeRequest,
@@ -38,7 +39,7 @@ use agent_client_protocol::v1::schema::{
     ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigId as AcpSessionConfigId,
     SessionConfigKind as AcpSessionConfigKind, SessionConfigOption as AcpSessionConfigOption,
     SessionConfigOptionCategory as AcpSessionConfigCategory,
-    SessionConfigOptionValue as AcpSessionConfigValue,
+    SessionConfigOptionValue as AcpSessionConfigValue, SessionConfigOptionsCapabilities,
     SessionConfigSelectOptions as AcpSelectOptions,
     SessionConfigValueId as AcpSessionConfigValueId, SessionId, SessionModeId as AcpSessionModeId,
     SessionModeState as AcpSessionModeState, SessionNotification, SessionUpdate,
@@ -2129,11 +2130,18 @@ pub(crate) enum ElicitationReplyError {
     Closed(String),
 }
 
-/// The client capabilities Favetto advertises: form elicitation only. URL mode
-/// remains unadvertised until a separate user-consented browser flow exists.
+/// The client capabilities Favetto advertises: form elicitation and boolean
+/// session config options. URL elicitation remains unadvertised until a separate
+/// user-consented browser flow exists.
 fn client_capabilities() -> ClientCapabilities {
+    // ACP-CONFIG-003: agents may only include `type: "boolean"` config options
+    // when the client advertises `session.configOptions.boolean`. Favetto's
+    // option UI already renders and sets boolean values, so declare support.
+    let config_options =
+        SessionConfigOptionsCapabilities::new().boolean(BooleanConfigOptionCapabilities::new());
     ClientCapabilities::new()
         .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()))
+        .session(ClientSessionCapabilities::new().config_options(config_options))
 }
 
 impl AcpResponder {
@@ -4878,12 +4886,17 @@ mod tests {
     }
 
     #[test]
-    fn client_capabilities_advertise_form_elicitation_only() {
+    fn client_capabilities_advertise_form_elicitation_and_boolean_config_options() {
         let json = serde_json::to_value(client_capabilities()).unwrap();
         assert_eq!(json["elicitation"]["form"], serde_json::json!({}));
         assert!(
             json["elicitation"].get("url").is_none(),
             "URL mode must stay unadvertised: {json}"
+        );
+        assert_eq!(
+            json["session"]["configOptions"]["boolean"],
+            serde_json::json!({}),
+            "boolean config options must be advertised: {json}"
         );
     }
 

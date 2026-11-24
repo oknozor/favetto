@@ -8,9 +8,22 @@
 //!
 //! This is a test fixture, not a real agent. It is compiled as a `[[bin]]` so the
 //! daemon can launch it exactly like any other ACP server.
+//!
+//! It is kept conformant with the official ACP TCK (agentclientprotocol/acp-tck,
+//! run in CI by `.github/workflows/acp-tck.yml`): requests before `initialize`
+//! get `-32600`, invalid params `-32602`, unknown sessions `-32002` with
+//! `data.sessionId`, capability-gated methods that were not advertised `-32601`,
+//! every `session/new` mints a distinct `sessionId`, `type: "boolean"` config
+//! options are only included when the client advertised
+//! `clientCapabilities.session.configOptions.boolean`, and stdio MCP servers
+//! from `session/new` are connected to. Tests that need the legacy
+//! accept-any-session behavior (loading provider session ids that were never
+//! created by this process) set `FAKE_ACP_LENIENT_SESSIONS=1`. Set
+//! `FAKE_ACP_TRANSCRIPT=<path>` to record every incoming client message.
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -19,9 +32,12 @@ const SESSION_ID: &str = "ses_fake_acp";
 const DEFAULT_MODEL: &str = "fake/model-a";
 const DEFAULT_THOUGHT: &str = "medium";
 
-/// The config options this fake agent advertises.
-fn config_options(current_model: &str, current_thought: &str) -> Value {
-    json!([
+/// The config options this fake agent advertises. The `fast` boolean option is
+/// only included when the client advertised
+/// `clientCapabilities.session.configOptions.boolean` (ACP-CONFIG-003: an agent
+/// MUST NOT include a `type: "boolean"` option otherwise).
+fn config_options(current_model: &str, current_thought: &str, include_boolean: bool) -> Value {
+    let mut options = json!([
         {
             "id": "model",
             "name": "Model",
@@ -44,15 +60,20 @@ fn config_options(current_model: &str, current_thought: &str) -> Value {
                 { "value": "medium", "name": "Medium" },
                 { "value": "high", "name": "High" }
             ]
-        },
-        {
-            "id": "fast",
-            "name": "Fast mode",
-            "category": "speed",
-            "type": "boolean",
-            "currentValue": false
         }
-    ])
+    ]);
+    if include_boolean {
+        if let Some(options) = options.as_array_mut() {
+            options.push(json!({
+                "id": "fast",
+                "name": "Fast mode",
+                "category": "speed",
+                "type": "boolean",
+                "currentValue": false
+            }));
+        }
+    }
+    options
 }
 
 /// The modes this fake agent advertises.
@@ -84,6 +105,11 @@ fn main() {
     inject_transport_fault(&mut stdout);
 
     let mut authenticated = std::env::var_os("FAKE_ACP_AUTH_REQUIRED").is_none();
+    let mut initialized = false;
+    let mut boolean_config_advertised = false;
+    let mut session_seq = 0u32;
+    let mut known_sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut closed_sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut lines = stdin.lock().lines();
     let mut prompt_turn = 0u32;
     while let Some(Ok(line)) = lines.next() {
@@ -91,6 +117,7 @@ fn main() {
         if line.is_empty() {
             continue;
         }
+        record_transcript(line);
         let Ok(message) = serde_json::from_str::<Value>(line) else {
             continue;
         };
@@ -98,6 +125,19 @@ fn main() {
             continue;
         };
         let id = message.get("id").cloned();
+
+        // ACP-ERROR-005: any request before `initialize` gets -32600.
+        if !initialized && method != "initialize" {
+            if let Some(id) = id {
+                error(
+                    &mut stdout,
+                    id,
+                    -32600,
+                    "initialize must be the first request",
+                );
+            }
+            continue;
+        }
 
         match method {
             "initialize" => {
@@ -148,28 +188,57 @@ fn main() {
                 }
                 let mut response = json!({
                     "protocolVersion": 1,
-                    "agentCapabilities": capabilities
+                    "agentCapabilities": capabilities,
+                    "agentInfo": { "name": "fake-acp-agent", "version": "0.1.0" }
                 });
                 if let Ok(methods) = std::env::var("FAKE_ACP_AUTH_METHODS") {
                     response["authMethods"] =
                         serde_json::from_str(&methods).unwrap_or_else(|_| json!([]));
                 }
+                // ACP-CONFIG-003 gates `type: "boolean"` config options on the
+                // client advertising `clientCapabilities.session.configOptions.boolean`.
+                boolean_config_advertised = message
+                    .pointer("/params/clientCapabilities/session/configOptions/boolean")
+                    .is_some();
+                initialized = true;
                 respond(&mut stdout, id, response);
             }
             "session/new" => {
                 record_mcp("session/new", &message);
+                // ACP-ERROR-002: `cwd` is a required param of `session/new`.
+                if message
+                    .pointer("/params/cwd")
+                    .and_then(Value::as_str)
+                    .is_none()
+                {
+                    if let Some(id) = id {
+                        error(&mut stdout, id, -32602, "missing required param: cwd");
+                    }
+                    continue;
+                }
                 if !authenticated {
                     if let Some(id) = id {
                         error(&mut stdout, id, -32000, "Authentication required");
                     }
                     continue;
                 }
+                // ACP-SESSION-002: every `session/new` on a connection mints a
+                // distinct session id (the first keeps the classic `<pid>` form).
+                session_seq += 1;
+                session_id = if session_seq == 1 {
+                    format!("{SESSION_ID}-{}", std::process::id())
+                } else {
+                    format!("{SESSION_ID}-{}-{}", std::process::id(), session_seq)
+                };
+                known_sessions.insert(session_id.clone());
+                // ACP-SESSION-004: connect to every stdio MCP server handed to us.
+                connect_stdio_mcp_servers(&message);
                 respond(
                     &mut stdout,
                     id,
                     json!({
                         "sessionId": session_id.clone(),
-                        "configOptions": config_options(&selected_model, &selected_thought),
+                        "configOptions": config_options(&selected_model, &selected_thought, boolean_config_advertised),
                         "modes": session_modes(&current_mode)
                     }),
                 );
@@ -205,6 +274,13 @@ fn main() {
             }
             "session/load" => {
                 record_mcp("session/load", &message);
+                // ACP-ERROR-006: `session/load` requires the advertised `loadSession` capability.
+                if !load_supported() {
+                    if let Some(id) = id {
+                        error(&mut stdout, id, -32601, "method not found");
+                    }
+                    continue;
+                }
                 if !authenticated {
                     if let Some(id) = id {
                         error(&mut stdout, id, -32000, "Authentication required");
@@ -217,6 +293,20 @@ fn main() {
                     .and_then(Value::as_str)
                     .unwrap_or(&session_id)
                     .to_string();
+                // ACP-ERROR-004: loading a session that does not exist is
+                // -32002 with data.sessionId, not a silent create-and-succeed.
+                if !lenient_sessions() && !known_sessions.contains(&loaded) {
+                    if let Some(id) = id {
+                        error_data(
+                            &mut stdout,
+                            id,
+                            -32002,
+                            "session not found",
+                            json!({ "sessionId": loaded }),
+                        );
+                    }
+                    continue;
+                }
                 if let Some(marker) = std::env::var_os("FAKE_ACP_LOAD_MARKER") {
                     let cwd = params
                         .and_then(|params| params.get("cwd"))
@@ -225,6 +315,7 @@ fn main() {
                     let _ = std::fs::write(marker, format!("{loaded}\n{cwd}\n"));
                 }
                 session_id = loaded;
+                known_sessions.insert(session_id.clone());
                 // Replaying history: an optional user message followed by one
                 // assistant chunk per `|`-separated piece, all before the load
                 // response exactly as a real agent's `session/load` replay is.
@@ -274,13 +365,20 @@ fn main() {
                         &mut stdout,
                         id,
                         json!({
-                            "configOptions": config_options(&selected_model, &selected_thought),
+                            "configOptions": config_options(&selected_model, &selected_thought, boolean_config_advertised),
                             "modes": session_modes(&current_mode)
                         }),
                     );
                 }
             }
             "session/list" => {
+                // ACP-ERROR-006: `session/list` requires the advertised `list` capability.
+                if !env_flag("FAKE_ACP_LIST_SUPPORTED") {
+                    if let Some(id) = id {
+                        error(&mut stdout, id, -32601, "method not found");
+                    }
+                    continue;
+                }
                 let params = message.get("params");
                 let filter = params
                     .and_then(|params| params.get("cwd"))
@@ -323,13 +421,34 @@ fn main() {
             }
             "session/resume" => {
                 record_mcp("session/resume", &message);
+                // ACP-ERROR-006: `session/resume` requires the advertised `resume` capability.
+                if !env_flag("FAKE_ACP_RESUME_SUPPORTED") {
+                    if let Some(id) = id {
+                        error(&mut stdout, id, -32601, "method not found");
+                    }
+                    continue;
+                }
                 let resumed = message
                     .get("params")
                     .and_then(|params| params.get("sessionId"))
                     .and_then(Value::as_str)
                     .unwrap_or(&session_id)
                     .to_string();
+                // ACP-ERROR-004: resuming an unknown session is -32002, not a silent adopt.
+                if !lenient_sessions() && !known_sessions.contains(&resumed) {
+                    if let Some(id) = id {
+                        error_data(
+                            &mut stdout,
+                            id,
+                            -32002,
+                            "session not found",
+                            json!({ "sessionId": resumed }),
+                        );
+                    }
+                    continue;
+                }
                 session_id = resumed;
+                known_sessions.insert(session_id.clone());
                 if std::env::var("FAKE_ACP_RESUME_RESULT").as_deref() == Ok("error") {
                     if let Some(id) = id {
                         error(&mut stdout, id, -32000, "cannot resume session");
@@ -338,11 +457,18 @@ fn main() {
                     respond(
                         &mut stdout,
                         id,
-                        json!({ "configOptions": config_options(&selected_model, &selected_thought) }),
+                        json!({ "configOptions": config_options(&selected_model, &selected_thought, boolean_config_advertised) }),
                     );
                 }
             }
             "session/delete" => {
+                // ACP-ERROR-006: `session/delete` requires the advertised `delete` capability.
+                if !env_flag("FAKE_ACP_DELETE_SUPPORTED") {
+                    if let Some(id) = id {
+                        error(&mut stdout, id, -32601, "method not found");
+                    }
+                    continue;
+                }
                 let deleted = message
                     .get("params")
                     .and_then(|params| params.get("sessionId"))
@@ -360,6 +486,21 @@ fn main() {
                 }
             }
             "session/set_config_option" => {
+                // ACP-ERROR-004: unknown session -> -32002 with data.sessionId.
+                if !lenient_sessions()
+                    && !session_known(&message, &known_sessions, &closed_sessions)
+                {
+                    if let Some(id) = id {
+                        error_data(
+                            &mut stdout,
+                            id,
+                            -32002,
+                            "session not found",
+                            json!({ "sessionId": requested_session(&message) }),
+                        );
+                    }
+                    continue;
+                }
                 let params = message.get("params");
                 let config_id = params
                     .and_then(|params| params.get("configId"))
@@ -385,7 +526,9 @@ fn main() {
                             false
                         }
                     }
-                    "fast" => {
+                    // Only settable when the boolean config gate was advertised by
+                    // the client (it is not part of the advertised options otherwise).
+                    "fast" if boolean_config_advertised => {
                         if let Some(wanted) = value.and_then(Value::as_bool) {
                             selected_fast = wanted;
                             true
@@ -396,7 +539,11 @@ fn main() {
                     _ => false,
                 };
                 if accepted {
-                    let mut options = config_options(&selected_model, &selected_thought);
+                    let mut options = config_options(
+                        &selected_model,
+                        &selected_thought,
+                        boolean_config_advertised,
+                    );
                     if let Some(fast) = options.as_array_mut().and_then(|options| {
                         options.iter_mut().find(|option| option["id"] == "fast")
                     }) {
@@ -408,6 +555,21 @@ fn main() {
                 }
             }
             "session/set_mode" => {
+                // ACP-ERROR-004: unknown session -> -32002 with data.sessionId.
+                if !lenient_sessions()
+                    && !session_known(&message, &known_sessions, &closed_sessions)
+                {
+                    if let Some(id) = id {
+                        error_data(
+                            &mut stdout,
+                            id,
+                            -32002,
+                            "session not found",
+                            json!({ "sessionId": requested_session(&message) }),
+                        );
+                    }
+                    continue;
+                }
                 let wanted = message
                     .get("params")
                     .and_then(|params| params.get("modeId"))
@@ -422,6 +584,22 @@ fn main() {
                 }
             }
             "session/prompt" => {
+                // ACP-ERROR-003: prompting a session that was never created, or
+                // that this connection already closed, is -32002 with data.sessionId.
+                if !lenient_sessions()
+                    && !session_known(&message, &known_sessions, &closed_sessions)
+                {
+                    if let Some(id) = id {
+                        error_data(
+                            &mut stdout,
+                            id,
+                            -32002,
+                            "session not found",
+                            json!({ "sessionId": requested_session(&message) }),
+                        );
+                    }
+                    continue;
+                }
                 prompt_turn += 1;
                 run_prompt(
                     &mut stdout,
@@ -434,11 +612,19 @@ fn main() {
                 );
             }
             "session/close" => {
+                // ACP-ERROR-006: `session/close` requires the advertised `close` capability.
+                if !close_advertised() {
+                    if let Some(id) = id {
+                        error(&mut stdout, id, -32601, "method not found");
+                    }
+                    continue;
+                }
                 // Record that the optional request arrived, even when this fake
                 // is configured to ignore it.
                 if let Some(marker) = std::env::var_os("FAKE_ACP_CLOSE_MARKER") {
                     let _ = std::fs::write(marker, b"session/close\n");
                 }
+                closed_sessions.insert(requested_session(&message));
                 // Simulate agents that advertise close but never answer it.
                 if std::env::var_os("FAKE_ACP_IGNORE_CLOSE").is_none() {
                     respond(&mut stdout, id, json!({}));
@@ -620,6 +806,7 @@ fn run_prompt<B: BufRead>(
             let Some(Ok(line)) = lines.next() else {
                 return;
             };
+            record_transcript(&line);
             let Ok(incoming) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
@@ -702,6 +889,7 @@ fn run_elicitation<B: BufRead>(
         let Some(Ok(line)) = lines.next() else {
             return;
         };
+        record_transcript(&line);
         let Ok(incoming) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -979,6 +1167,141 @@ fn error(stdout: &mut std::io::Stdout, id: Value, code: i64, message: &str) {
         stdout,
         json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }),
     );
+}
+
+/// An error response carrying a `data` object (used for -32002 session errors).
+fn error_data(stdout: &mut std::io::Stdout, id: Value, code: i64, message: &str, data: Value) {
+    write_json(
+        stdout,
+        json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message, "data": data } }),
+    );
+}
+
+/// Append one raw incoming line to `$FAKE_ACP_TRANSCRIPT`, when configured.
+fn record_transcript(line: &str) {
+    let Some(path) = std::env::var_os("FAKE_ACP_TRANSCRIPT") else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+/// The `sessionId` a request names, or the empty string.
+fn requested_session(message: &Value) -> String {
+    message
+        .pointer("/params/sessionId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Whether the request names a session this process created and has not closed.
+fn session_known(
+    message: &Value,
+    known: &std::collections::HashSet<String>,
+    closed: &std::collections::HashSet<String>,
+) -> bool {
+    let id = requested_session(message);
+    !id.is_empty() && known.contains(&id) && !closed.contains(&id)
+}
+
+/// Legacy accept-any-session behavior for tests that load provider session ids
+/// which were never created by this process (cross-daemon-restart flows).
+fn lenient_sessions() -> bool {
+    std::env::var_os("FAKE_ACP_LENIENT_SESSIONS").is_some()
+}
+
+/// Best-effort connect to each stdio MCP server in a session setup request
+/// (ACP-SESSION-004): spawn it with a clean environment plus the entry's own
+/// `env`, send one MCP `initialize`, wait briefly for the reply, then stop it.
+/// Never fails the session: spawn/read errors are ignored.
+fn connect_stdio_mcp_servers(message: &Value) {
+    let Some(servers) = message
+        .pointer("/params/mcpServers")
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    for server in servers {
+        let is_stdio = server.get("type").and_then(Value::as_str) == Some("stdio")
+            || (server.get("type").is_none() && server.get("command").is_some());
+        if !is_stdio {
+            continue;
+        }
+        let Some(command) = server.get("command").and_then(Value::as_str) else {
+            continue;
+        };
+        let args: Vec<String> = server
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|args| {
+                args.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut child_cmd = std::process::Command::new(command);
+        child_cmd
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        // A clean environment: never leak the agent's own env (e.g. TCK canaries)
+        // into the MCP server; only pass through what the entry names plus the
+        // basics needed to locate and run the command.
+        child_cmd.env_clear();
+        for key in ["PATH", "HOME", "SYSTEMROOT", "TMPDIR", "TEMP", "TMP"] {
+            if let Some(value) = std::env::var_os(key) {
+                child_cmd.env(key, value);
+            }
+        }
+        if let Some(env) = server.get("env").and_then(Value::as_array) {
+            for entry in env {
+                if let (Some(name), Some(value)) = (
+                    entry.get("name").and_then(Value::as_str),
+                    entry.get("value").and_then(Value::as_str),
+                ) {
+                    child_cmd.env(name, value);
+                }
+            }
+        }
+        let Ok(mut child) = child_cmd.spawn() else {
+            continue;
+        };
+        if let Some(mut child_stdin) = child.stdin.take() {
+            let init = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": { "name": "fake-acp-agent", "version": "0.1.0" }
+                }
+            });
+            let _ = writeln!(child_stdin, "{init}");
+            let _ = child_stdin.flush();
+        }
+        // Wait briefly for any reply so the server has processed `initialize`.
+        if let Some(child_stdout) = child.stdout.take() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut reader = std::io::BufReader::new(child_stdout);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                let _ = tx.send(());
+            });
+            let _ = rx.recv_timeout(Duration::from_secs(2));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 fn notify(stdout: &mut std::io::Stdout, params: Value) {

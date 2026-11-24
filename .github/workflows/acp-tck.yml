@@ -1,0 +1,87 @@
+name: ACP TCK
+
+# Runs the official Agent Client Protocol Test Compatibility Kit
+# (https://github.com/agentclientprotocol/acp-tck) against the repo's only
+# ACP agent-role implementation: the `fake-acp-agent` test fixture
+# (crates/favetto/tests/fixtures/fake_acp_agent.rs). Favetto itself is the ACP
+# *client* role, which the TCK cannot drive (it launches agents as stdio
+# subprocesses), so the fixture is what gets scored.
+#
+# The TCK is pinned to a release tag for reproducibility; bump ACP_TCK_REF
+# deliberately. The v1 suite gates pull requests: the fixture must stay
+# conformant. The v2 run stays informational because the fixture negotiates
+# protocolVersion 1, so it is blocked by a version mismatch by design. JSON
+# reports and console logs are always uploaded as artifacts.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/acp-tck.yml
+      - crates/favetto/Cargo.toml
+      - crates/favetto/tests/fixtures/**
+      - Cargo.lock
+  pull_request:
+    paths:
+      - .github/workflows/acp-tck.yml
+      - crates/favetto/Cargo.toml
+      - crates/favetto/tests/fixtures/**
+      - Cargo.lock
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  ACP_TCK_REF: v0.5.0
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  acp-tck:
+    name: acp-tck v1 (fake-acp-agent)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the fake ACP agent fixture
+        run: cargo build --locked -p favetto --bin fake-acp-agent
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install uv
+        run: python -m pip install uv
+      - name: Prepare the agent working directory
+        run: mkdir -p "$RUNNER_TEMP/acp-tck-wd"
+      - name: Run ACP TCK v1 against fake-acp-agent
+        run: |
+          uvx --from "git+https://github.com/agentclientprotocol/acp-tck@${{ env.ACP_TCK_REF }}" acp-tck \
+            --agent-cwd "$RUNNER_TEMP/acp-tck-wd" \
+            --timeout 30 --test-timeout 120 \
+            --report-json "$RUNNER_TEMP/acp-tck-report-v1.json" \
+            -- "$PWD/target/debug/fake-acp-agent" 2>&1 | tee "$RUNNER_TEMP/acp-tck-v1.log"
+      - name: Run ACP TCK v2 against fake-acp-agent (informational only)
+        # The fixture negotiates protocolVersion 1, so the v2 run is blocked by
+        # version mismatch by design and must not fail the job.
+        continue-on-error: true
+        run: |
+          uvx --from "git+https://github.com/agentclientprotocol/acp-tck@${{ env.ACP_TCK_REF }}" acp-tck \
+            --protocol-version 2 \
+            --agent-cwd "$RUNNER_TEMP/acp-tck-wd" \
+            --timeout 30 --test-timeout 120 \
+            --report-json "$RUNNER_TEMP/acp-tck-report-v2.json" \
+            -- "$PWD/target/debug/fake-acp-agent" 2>&1 | tee "$RUNNER_TEMP/acp-tck-v2.log"
+      - name: Upload TCK reports and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acp-tck-reports
+          path: ${{ env.RUNNER_TEMP }}/acp-tck-*.{json,log}
+          retention-days: 30
+          overwrite: true

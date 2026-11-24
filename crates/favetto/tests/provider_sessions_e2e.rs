@@ -52,6 +52,7 @@ impl Daemon {
                 "[agent]\ndefault = \"echo\"\n\n\
                  [agents.echo]\ncommand = {agent:?}\nargs = []\n\
                  [agents.echo.env]\n\
+                 FAKE_ACP_LENIENT_SESSIONS = \"1\"\n\
                  FAKE_ACP_LIST_SUPPORTED = \"1\"\n\
                  FAKE_ACP_DELETE_SUPPORTED = \"1\"\n\
                  FAKE_ACP_LIST_COUNT = \"3\"\n\
@@ -62,6 +63,7 @@ impl Daemon {
                  FAKE_ACP_LOAD_UPDATES = \"provider one|provider two\"\n\n\
                  [agents.resume-only]\ncommand = {agent:?}\nargs = []\n\
                  [agents.resume-only.env]\n\
+                 FAKE_ACP_LENIENT_SESSIONS = \"1\"\n\
                  FAKE_ACP_LIST_SUPPORTED = \"1\"\n\
                  FAKE_ACP_RESUME_SUPPORTED = \"1\"\n\
                  FAKE_ACP_LOAD_SUPPORTED = \"0\"\n\
@@ -69,10 +71,12 @@ impl Daemon {
                  FAKE_ACP_PROVIDER_CWD = {work:?}\n\n\
                  [agents.nope]\ncommand = {agent:?}\nargs = []\n\
                  [agents.nope.env]\n\
+                 FAKE_ACP_LENIENT_SESSIONS = \"1\"\n\
                  FAKE_ACP_LOAD_SUPPORTED = \"0\"\n\
                  FAKE_ACP_PROVIDER_CWD = {work:?}\n\n\
                  [agents.bad-delete]\ncommand = {agent:?}\nargs = []\n\
                  [agents.bad-delete.env]\n\
+                 FAKE_ACP_LENIENT_SESSIONS = \"1\"\n\
                  FAKE_ACP_LIST_SUPPORTED = \"1\"\n\
                  FAKE_ACP_DELETE_SUPPORTED = \"1\"\n\
                  FAKE_ACP_DELETE_RESULT = \"error\"\n\
