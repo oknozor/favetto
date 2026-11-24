@@ -84,9 +84,12 @@ fn config(root: &Path) -> String {
     format!(
         "[agent]\ndefault = \"plain\"\n\n\
          [agents.plain]\ncommand = {agent:?}\nargs = []\n\
-         [agents.plain.env]\nFAKE_ACP_MCP_MARKER = {plain:?}\n\n\
+         [agents.plain.env]\n\
+         FAKE_ACP_LENIENT_SESSIONS = \"1\"\n\
+         FAKE_ACP_MCP_MARKER = {plain:?}\n\n\
          [agents.caps]\ncommand = {agent:?}\nargs = []\n\
          [agents.caps.env]\n\
+         FAKE_ACP_LENIENT_SESSIONS = \"1\"\n\
          FAKE_ACP_MCP_MARKER = {caps:?}\n\
          FAKE_ACP_MCP_HTTP = \"1\"\n\n\
          [[mcp.servers]]\n\

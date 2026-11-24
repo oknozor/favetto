@@ -1051,3 +1051,79 @@ async fn agent_side_config_and_mode_updates_replace_the_session_snapshot() {
     );
     assert_eq!(options["modes"]["current_mode_id"], "plan");
 }
+
+/// Regression for ACP-CONFIG-003: the fake agent only advertises its `fast`
+/// boolean option when the client's `initialize` advertises
+/// `session.configOptions.boolean`. Assert both ends on the wire: the recorded
+/// client handshake and the options the daemon publishes from the agent.
+#[tokio::test]
+async fn acp_client_advertises_boolean_config_options_on_the_wire() {
+    let daemon = DaemonHarness::spawn_with(|root| {
+        vec![(
+            "FAKE_ACP_TRANSCRIPT".to_string(),
+            root.join("acp-client-transcript")
+                .to_string_lossy()
+                .into_owned(),
+        )]
+    });
+    wait_for_unix_socket(daemon.socket(), &daemon).await;
+    let mut client = WireClient::connect(daemon.socket()).await;
+
+    let started = client
+        .request(method::AGENTS_START, serde_json::json!({ "agent": "echo" }))
+        .await;
+    assert!(
+        started.error.is_none(),
+        "agents.start failed: {:?}",
+        started.error
+    );
+    let session_id = started.result.expect("agents.start result")["session"]["id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    // The session snapshot is published only after the agent answered
+    // `session/new`, so the handshake has been fully recorded by then.
+    let options = loop {
+        let response = client
+            .request(
+                method::AGENTS_OPTIONS,
+                serde_json::json!({ "session_id": session_id }),
+            )
+            .await;
+        assert!(
+            response.error.is_none(),
+            "agents.options failed: {:?}",
+            response.error
+        );
+        let result = response.result.expect("agents.options result");
+        if result["config_options"]
+            .as_array()
+            .is_some_and(|options| !options.is_empty())
+        {
+            break result;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    assert!(
+        options["config_options"]
+            .as_array()
+            .is_some_and(|options| options.iter().any(|option| option["id"] == "fast")),
+        "the fixture must advertise its boolean option once the client opts in: {options:?}"
+    );
+
+    let transcript = std::fs::read_to_string(daemon.root.join("acp-client-transcript"))
+        .expect("the fake agent transcript");
+    let initialize = transcript
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|message| message["method"] == "initialize")
+        .unwrap_or_else(|| panic!("no initialize request in the transcript:\n{transcript}"));
+    assert_eq!(initialize["params"]["protocolVersion"], 1);
+    assert_eq!(
+        initialize["params"]["clientCapabilities"]["session"]["configOptions"]["boolean"],
+        serde_json::json!({}),
+        "Favetto must advertise boolean config option support: {initialize}"
+    );
+}

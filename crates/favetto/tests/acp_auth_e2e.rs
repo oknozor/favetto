@@ -103,7 +103,11 @@ fn spawn_child(root: &Path) -> Child {
 
 fn agent_block(name: &str, env: &str) -> String {
     let agent = env!("CARGO_BIN_EXE_fake-acp-agent");
-    format!("[agents.{name}]\ncommand = {agent:?}\nargs = []\n[agents.{name}.env]\n{env}\n")
+    // These tests load session ids created by an earlier agent process (the
+    // fake models an agent with server-side persistence).
+    format!(
+        "[agents.{name}]\ncommand = {agent:?}\nargs = []\n[agents.{name}.env]\n{env}FAKE_ACP_LENIENT_SESSIONS = \"1\"\n"
+    )
 }
 
 async fn wait_for_socket(path: &Path) {
