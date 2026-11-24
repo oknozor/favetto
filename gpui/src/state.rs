@@ -1295,8 +1295,8 @@ impl ClientState {
                     .and_then(|detail| detail.finish_restore(result));
                 if let Some(after) = reload_after {
                     // The replayed conversation belongs to a different session
-                    // than the previous feed cursor; backfill only rows newer
-                    // than the transcript snapshot.
+                    // than the previous feed; rebuild its structured history
+                    // from zero so the shared feed renders the restored rows.
                     if let Some(runtime) = &self.runtime {
                         runtime.load_task_events(task_id, after);
                     }

@@ -1459,18 +1459,44 @@ impl ConversationPanel {
         restore: &SessionRestore,
         cx: &mut Context<Self>,
     ) -> Option<Stateful<Div>> {
-        // Only assistant prose makes the feed a readable replay. Lifecycle,
-        // tool, plan, usage and title-only rows must not hide the transcript.
-        let feed_readable = self.state.read(cx).detail().is_some_and(|detail| {
-            detail::feed_has_readable_text(&detail::build_feed(&detail.events))
-        });
+        // The structured feed is the primary replay. Only when it has no prose
+        // and no durable RunSummary does the raw ACP transcript act as a
+        // fallback.
+        let (feed_readable, has_summary) =
+            self.state
+                .read(cx)
+                .detail()
+                .map_or((false, false), |detail| {
+                    let live_present = !detail.events.is_empty()
+                        || !detail.plan().is_empty()
+                        || detail.events_ignored > 0;
+                    let summary = detail
+                        .task
+                        .as_ref()
+                        .and_then(|task| task.output.as_ref())
+                        .and_then(detail::extract_run_summary)
+                        .is_some();
+                    let summary_shown = matches!(
+                        detail::output_source(
+                            detail.status().unwrap_or(TaskStatus::Pending),
+                            live_present,
+                            summary,
+                        ),
+                        OutputSource::Summary
+                    );
+                    (
+                        detail::feed_has_readable_text(&detail::build_feed(&detail.events)),
+                        summary_shown,
+                    )
+                });
+        let structured_history = feed_readable || has_summary;
         let (headline, color) = match restore {
             SessionRestore::Checking => ("Restoring conversation…".to_string(), theme.colors.muted),
             SessionRestore::Attaching { .. } => {
                 ("Restoring conversation…".to_string(), theme.colors.warning)
             }
             SessionRestore::Restored(restored) => {
-                if restored.has_transcript() || feed_readable {
+                if restored.has_transcript() || structured_history {
                     ("Restored conversation".to_string(), theme.colors.success)
                 } else {
                     (
@@ -1488,7 +1514,7 @@ impl ConversationPanel {
                 theme.colors.danger,
             ),
         };
-        let detail = restore_detail_text(restore, feed_readable);
+        let detail = restore_detail_text(restore, feed_readable, has_summary);
 
         let restoring = matches!(
             restore,
@@ -1536,10 +1562,10 @@ impl ConversationPanel {
             );
 
         if let SessionRestore::Restored(restored) = restore {
-            if restored.has_transcript() {
+            if show_raw_transcript(restored.has_transcript(), feed_readable, has_summary) {
                 // The transcript is a snapshot, so scroll it to the tail once
-                // per restored session/content size; the deduplicated live feed
-                // below carries anything newer.
+                // per restored session/content size; the structured feed below
+                // carries anything newer.
                 let key = (restored.session_id.clone(), restored.transcript.len());
                 if self.restored_scroll_key.as_ref() != Some(&key) {
                     self.restored_scroll_key = Some(key);
@@ -1548,8 +1574,15 @@ impl ConversationPanel {
                 }
                 panel = panel.child(
                     div()
-                        .id("conversation-restored-transcript")
                         .mt(px(theme.spacing.s1))
+                        .text_size(px(theme.font.xs))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme.colors.muted)
+                        .child("Raw agent transcript"),
+                );
+                panel = panel.child(
+                    div()
+                        .id("conversation-restored-transcript")
                         .max_h(px(240.0))
                         .overflow_y_scroll()
                         .track_scroll(&self.restored_scroll)
@@ -1559,20 +1592,12 @@ impl ConversationPanel {
                         .whitespace_normal()
                         .child(restored.transcript.clone()),
                 );
-                if feed_readable {
-                    panel = panel.child(
-                        div()
-                            .text_size(px(theme.font.xs))
-                            .text_color(theme.colors.muted)
-                            .child("New activity is shown in the structured feed below."),
-                    );
-                }
-            } else if feed_readable {
+            } else if structured_history {
                 panel = panel.child(
                     div()
                         .text_size(px(theme.font.xs))
                         .text_color(theme.colors.muted)
-                        .child("The replayed conversation is shown in the structured feed below."),
+                        .child("The restored conversation is shown below."),
                 );
             }
         }
@@ -3313,9 +3338,16 @@ fn at_bottom(scroll: &ScrollHandle) -> bool {
     offset >= max - FOLLOW_THRESHOLD
 }
 
+/// Whether the raw ACP transcript should be painted. The structured feed and
+/// the durable `RunSummary` always win; the transcript is only a fallback for
+/// sessions with no usable structured replay.
+fn show_raw_transcript(has_transcript: bool, feed_readable: bool, has_summary: bool) -> bool {
+    has_transcript && !feed_readable && !has_summary
+}
+
 /// The detail line under the restore banner. The session id is an internal
 /// routing key, so this never includes it.
-fn restore_detail_text(restore: &SessionRestore, feed_readable: bool) -> String {
+fn restore_detail_text(restore: &SessionRestore, feed_readable: bool, has_summary: bool) -> String {
     match restore {
         SessionRestore::Checking => {
             "Looking up the agent session associated with this run.".to_string()
@@ -3326,10 +3358,12 @@ fn restore_detail_text(restore: &SessionRestore, feed_readable: bool) -> String 
         ),
         SessionRestore::Restored(restored) => {
             let identity = format!("{} · {}", restored.agent, restored.state_label());
-            if restored.has_transcript() {
-                identity
-            } else if feed_readable {
-                format!("{identity} · the replay is shown in the feed below.")
+            if feed_readable {
+                format!("{identity} · the replay is shown in the structured feed below.")
+            } else if has_summary {
+                format!("{identity} · the run summary is shown below.")
+            } else if restored.has_transcript() {
+                format!("{identity} · no structured replay; showing the raw agent transcript.")
             } else {
                 format!("{identity} · waiting for the agent's first response.")
             }
@@ -3368,7 +3402,7 @@ mod tests {
             agent: "opencode".to_string(),
             live: true,
         };
-        let detail = restore_detail_text(&attaching, false);
+        let detail = restore_detail_text(&attaching, false, false);
         assert_eq!(detail, "Attaching to the opencode session · live.");
         assert!(!detail.contains("ses_internal"));
 
@@ -3379,8 +3413,30 @@ mod tests {
             seq: 0,
             transcript: String::new(),
         });
-        let detail = restore_detail_text(&restored, false);
+        let detail = restore_detail_text(&restored, false, false);
         assert!(detail.starts_with("opencode · ended"), "{detail}");
         assert!(!detail.contains("ses_internal"));
+    }
+
+    #[test]
+    fn the_raw_transcript_is_only_a_fallback_when_no_structured_history_exists() {
+        // Structured prose wins.
+        assert!(!show_raw_transcript(true, true, false));
+        // A terminal run's RunSummary wins over the raw transcript.
+        assert!(!show_raw_transcript(true, false, true));
+        // Sparse structured rows are not readable prose, so the transcript
+        // remains the fallback.
+        assert!(show_raw_transcript(true, false, false));
+        assert!(!show_raw_transcript(false, false, false));
+    }
+
+    #[test]
+    fn a_terminal_run_prefers_the_durable_summary_over_the_transcript() {
+        let source = crate::detail::output_source(TaskStatus::Succeeded, true, true);
+        assert_eq!(source, OutputSource::Summary);
+        assert!(
+            !show_raw_transcript(true, false, true),
+            "the transcript is not repeated above the summary"
+        );
     }
 }
