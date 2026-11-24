@@ -24,7 +24,9 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | Method | Purpose |
 |--------|---------|
 | `system.ping` | Liveness check. |
-| `config.validate` | Validate the daemon's on-disk config file. |
+| `config.validate` | Validate the daemon's on-disk config file, or an inline draft, without writing it. |
+| `config.get` | Read the daemon's global config with secrets redacted, plus its path, revision and effective values. |
+| `config.set` | Validate and atomically write the daemon's global config behind a revision check, reporting restart-required sections. |
 | `tasks.list` | List tasks (metadata only; output is omitted). |
 | `tasks.get` | Fetch a single task by id, including its stored output. |
 | `tasks.runs` | List a task's execution attempts (run history). |
@@ -107,7 +109,26 @@ object
 
 ### `config.validate`
 
-Validate the daemon's on-disk config file.
+Validate the daemon's on-disk config file, or an inline draft, without writing it.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `raw` | string (optional) | null | no |  |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `valid` | boolean | — | yes | True when the file parsed, or is absent so defaults apply. |
+| `path` | string | — | yes | The resolved config path the daemon was started with. |
+| `errors` | string[] | `[]` | no | One message per parse/deserialization/preflight failure; empty when `valid`. |
+| `warnings` | string[] | `[]` | no | Non-fatal notes, such as environment overrides or client-only sections. |
+
+### `config.get`
+
+Read the daemon's global config with secrets redacted, plus its path, revision and effective values.
 
 **Request**
 
@@ -117,9 +138,39 @@ object
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `valid` | boolean | — | yes | True when the file parsed, or is absent so defaults apply. |
 | `path` | string | — | yes | The resolved config path the daemon was started with. |
-| `errors` | string[] | — | yes | One message per parse/deserialization failure; empty when `valid`. |
+| `raw` | string | — | yes | Raw TOML with secret values replaced by `"__FAVETTO_REDACTED__"`. |
+| `revision` | string | — | yes | SHA-256 of the on-disk bytes (the empty string when the file is absent). |
+| `exists` | boolean | — | yes | Whether the file exists on the daemon host. |
+| `parse_errors` | string[] | `[]` | no | Parse/deserialization errors; empty when the file is valid. |
+| `warnings` | string[] | `[]` | no | Non-fatal notes, including environment overrides and client-only sections. |
+| `overrides` | ConfigOverride[] | `[]` | no | `FAVETTO_*` environment variables that shadow the file. |
+| `restart_required` | string[] | `[]` | no | Sections whose pending file changes need a daemon restart. |
+| `effective` | any | — | no | The effective config (file plus environment) with secrets redacted. |
+
+### `config.set`
+
+Validate and atomically write the daemon's global config behind a revision check, reporting restart-required sections.
+
+**Request**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `raw` | string | — | yes | The full draft TOML. Redaction sentinels are restored from the file on disk before validation. |
+| `expected_revision` | string (optional) | null | no | The revision the edit was based on. A mismatch rejects the save so two clients cannot silently clobber each other. |
+
+**Response**
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `saved` | boolean | — | yes | Whether the file was written. `false` means validation or the revision check rejected the draft and the file was left untouched. |
+| `path` | string | — | yes | The resolved config path. |
+| `revision` | string | — | yes | The revision after the save; on rejection, the revision currently on disk so the client can reload and retry. |
+| `errors` | string[] | `[]` | no | Validation/preflight errors; empty when `saved`. |
+| `warnings` | string[] | `[]` | no | Non-fatal notes. |
+| `changed_sections` | string[] | `[]` | no | Top-level sections this draft changed. |
+| `restart_required` | string[] | `[]` | no | Sections whose changes only take effect after a daemon restart. |
+| `live_sections` | string[] | `[]` | no | Sections whose changes are live without a restart (client-only `tui`). |
 
 ### `tasks.list`
 

@@ -99,8 +99,12 @@ impl From<RpcError> for RpcErrorObject {
 /// Well-known client → server method names.
 pub mod method {
     pub const PING: &str = "system.ping";
-    /// Validate the daemon's on-disk config file.
+    /// Validate the daemon's on-disk config file, or a draft passed inline.
     pub const CONFIG_VALIDATE: &str = "config.validate";
+    /// Read the daemon's global config with secrets redacted.
+    pub const CONFIG_GET: &str = "config.get";
+    /// Validate and atomically write the daemon's global config.
+    pub const CONFIG_SET: &str = "config.set";
     pub const TASKS_LIST: &str = "tasks.list";
     /// Fetch a single task by id, including its stored output blob.
     pub const TASKS_GET: &str = "tasks.get";
@@ -272,7 +276,18 @@ pub const CLIENT_METHODS: &[(&str, &str)] = &[
     (method::PING, "Liveness check."),
     (
         method::CONFIG_VALIDATE,
-        "Validate the daemon's on-disk config file.",
+        "Validate the daemon's on-disk config file, or an inline draft, without \
+         writing it.",
+    ),
+    (
+        method::CONFIG_GET,
+        "Read the daemon's global config with secrets redacted, plus its path, \
+         revision and effective values.",
+    ),
+    (
+        method::CONFIG_SET,
+        "Validate and atomically write the daemon's global config behind a \
+         revision check, reporting restart-required sections.",
     ),
     (
         method::TASKS_LIST,
@@ -652,6 +667,8 @@ mod tests {
         let methods: HashSet<&str> = [
             method::PING,
             method::CONFIG_VALIDATE,
+            method::CONFIG_GET,
+            method::CONFIG_SET,
             method::TASKS_LIST,
             method::TASKS_GET,
             method::TASKS_RUNS,

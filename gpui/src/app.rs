@@ -667,7 +667,7 @@ impl RootView {
 
     fn save_settings(&mut self, cx: &mut Context<Self>) {
         self.state.update(cx, |state, cx| {
-            state.save_connection_settings(cx);
+            state.settings_save(cx);
             cx.notify();
         });
     }

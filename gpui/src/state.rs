@@ -32,6 +32,7 @@ use crate::agent::{self, StandaloneAgent};
 use crate::catalog::{AgentChoice, CatalogState, OneShotFocus};
 use crate::config::{self, ClientConfig, Density, ThemeChoice};
 use crate::conversation::{Conversation, ConversationTarget};
+use crate::daemon_config::{DaemonConfigState, DaemonConfigStatus};
 use crate::detail::{DetailTab, PendingElicitation, PendingRequest, TaskDetail};
 use crate::inbox::{self, InboxKey, InboxRows};
 use crate::launch::{self, LaunchFailure};
@@ -310,6 +311,8 @@ pub struct ClientState {
     schedules: SchedulesState,
     /// The Settings draft, test result and logical focus.
     settings: SettingsState,
+    /// The daemon's raw global `config.toml` draft and save/validation state.
+    daemon_config: DaemonConfigState,
     /// The known-repos registry from `repos.list`.
     repos: Vec<RepoInfo>,
     /// The daemon-wide active repo name; `None` is the global view.
@@ -409,6 +412,7 @@ impl ClientState {
             workflow_retry_previous: HashMap::new(),
             schedules: SchedulesState::default(),
             settings,
+            daemon_config: DaemonConfigState::default(),
             repos: Vec::new(),
             active_repo: None,
             repos_loaded: false,
@@ -439,6 +443,7 @@ impl ClientState {
                     self.refresh_catalog();
                     self.refresh_schedules();
                     self.refresh_repos();
+                    self.refresh_daemon_config();
                 } else if !self.connection.is_connected()
                     && !self.has_snapshot_data()
                     && matches!(
@@ -1729,6 +1734,42 @@ impl ClientState {
                     .settings
                     .finish_test_failed(endpoint, error.to_string()),
             },
+            Update::DaemonConfigLoaded { result } => match result {
+                Ok(result) => self.daemon_config.apply_get(&result),
+                Err(error) => {
+                    if error.is_unauthorized() {
+                        self.connection = ConnectionState::Unauthorized {
+                            token_path: self.config.token_source.label(),
+                        };
+                    }
+                    self.daemon_config.fail_load(error.to_string());
+                }
+            },
+            Update::DaemonConfigSaved { result } => match result {
+                Ok(result) => {
+                    let saved = result.saved;
+                    let revision = result.revision.clone();
+                    self.daemon_config.apply_set(&result);
+                    if saved {
+                        // The effective config changed (but not the daemon's
+                        // in-memory copy); reload the read-only roster so the
+                        // client does not imply a restart already happened.
+                        self.show_toast(
+                            ToastKind::Success,
+                            format!("Saved the daemon config (revision {revision})."),
+                            cx,
+                        );
+                    }
+                }
+                Err(error) => {
+                    if error.is_unauthorized() {
+                        self.connection = ConnectionState::Unauthorized {
+                            token_path: self.config.token_source.label(),
+                        };
+                    }
+                    self.daemon_config.fail_save(error.to_string());
+                }
+            },
         }
     }
 
@@ -2532,8 +2573,90 @@ impl ClientState {
             SettingsActivate::Test => self.test_connection(cx),
             SettingsActivate::Save => self.save_connection_settings(cx),
             SettingsActivate::Defaults => self.use_default_settings(cx),
+            SettingsActivate::DaemonNewline => {
+                self.daemon_config.insert_newline();
+                cx.notify();
+            }
+            SettingsActivate::DaemonSave => self.save_daemon_config(cx),
+            SettingsActivate::DaemonReload => self.reload_daemon_config(cx),
             SettingsActivate::Next => self.settings.cycle_focus(1),
         }
+    }
+
+    /// The daemon global config draft.
+    pub fn daemon_config(&self) -> &DaemonConfigState {
+        &self.daemon_config
+    }
+
+    /// Ask for the daemon's `config.get` snapshot. A dirty draft is preserved.
+    pub fn refresh_daemon_config(&mut self) {
+        let Some(runtime) = &self.runtime else {
+            self.daemon_config
+                .fail_load("The client runtime is not running.".to_string());
+            return;
+        };
+        self.daemon_config.begin_load();
+        runtime.load_daemon_config();
+    }
+
+    /// Validate and write the draft. The daemon never partially applies it; the
+    /// result says which sections need a restart.
+    pub fn save_daemon_config(&mut self, cx: &mut Context<Self>) {
+        if !self.daemon_config.has_loaded() {
+            self.refresh_daemon_config();
+            return;
+        }
+        if !self.daemon_config.is_dirty() {
+            return;
+        }
+        let Some(runtime) = &self.runtime else {
+            self.daemon_config
+                .fail_save("The client runtime is not running.".to_string());
+            cx.notify();
+            return;
+        };
+        let raw = self.daemon_config.raw().to_string();
+        let expected_revision = self.daemon_config.revision().map(str::to_string);
+        self.daemon_config.begin_save();
+        runtime.save_daemon_config(raw, expected_revision);
+        cx.notify();
+    }
+
+    /// Discard edits back to the last loaded snapshot without another RPC.
+    pub fn reset_daemon_config(&mut self) {
+        self.daemon_config.reset();
+    }
+
+    /// Discard edits and re-read the file from the daemon.
+    pub fn reload_daemon_config(&mut self, cx: &mut Context<Self>) {
+        // A user-initiated reload is explicit: drop the draft so the incoming
+        // snapshot is applied even when the editor was dirty.
+        self.daemon_config.reset();
+        self.daemon_config.begin_load();
+        match &self.runtime {
+            Some(runtime) => runtime.load_daemon_config(),
+            None => self
+                .daemon_config
+                .fail_load("The client runtime is not running.".to_string()),
+        }
+        cx.notify();
+    }
+
+    /// `<secondary-enter>`: save whichever Settings surface has focus.
+    pub fn settings_save(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.settings.focus(),
+            Some(SettingsFocus::DaemonConfig | SettingsFocus::DaemonSave)
+        ) {
+            self.save_daemon_config(cx);
+        } else {
+            self.save_connection_settings(cx);
+        }
+    }
+
+    /// The daemon config card's status label.
+    pub fn daemon_config_status(&self) -> DaemonConfigStatus {
+        self.daemon_config.status()
     }
 
     /// Persist and apply a theme preference. The palette switches live; a write
@@ -3302,7 +3425,10 @@ impl ClientState {
                 self.refresh_schedules();
                 self.refresh_catalog();
             }
-            Route::Settings => self.refresh_snapshot(),
+            Route::Settings => {
+                self.refresh_snapshot();
+                self.refresh_daemon_config();
+            }
         }
         self.ping();
     }
@@ -3369,6 +3495,9 @@ impl ClientState {
         } else if route == Route::Settings || route == Route::Agent {
             // The Agents card and the Agent panel share the session roster.
             self.refresh_snapshot();
+            if route == Route::Settings {
+                self.refresh_daemon_config();
+            }
         }
     }
 
@@ -3798,6 +3927,7 @@ impl ClientState {
             Route::Settings => match self.settings.focus() {
                 Some(SettingsFocus::Endpoint) => Some(TextTarget::SettingsEndpoint),
                 Some(SettingsFocus::Token) => Some(TextTarget::SettingsToken),
+                Some(SettingsFocus::DaemonConfig) => Some(TextTarget::SettingsDaemonConfig),
                 _ => None,
             },
             Route::Inbox | Route::Workflows | Route::Agent => None,
@@ -3808,6 +3938,7 @@ impl ClientState {
     /// movement between lines.
     pub fn text_target_is_multiline(&self, target: TextTarget) -> bool {
         match target {
+            TextTarget::SettingsDaemonConfig => true,
             TextTarget::DetailPrompt => true,
             TextTarget::AgentModel => false,
             TextTarget::CatalogLaunchVar(index) => self
@@ -3835,6 +3966,7 @@ impl ClientState {
                 .and_then(|editor| editor.text_input()),
             TextTarget::SettingsEndpoint => self.settings.text_input(true),
             TextTarget::SettingsToken => self.settings.text_input(false),
+            TextTarget::SettingsDaemonConfig => Some(self.daemon_config.draft()),
             TextTarget::DetailPrompt => self
                 .active_conversation()
                 .map(|conversation| &conversation.prompt),
@@ -3863,6 +3995,7 @@ impl ClientState {
                 .and_then(|editor| editor.text_input_mut()),
             TextTarget::SettingsEndpoint => self.settings.text_input_mut(true),
             TextTarget::SettingsToken => self.settings.text_input_mut(false),
+            TextTarget::SettingsDaemonConfig => Some(self.daemon_config.draft_mut()),
             TextTarget::DetailPrompt => self
                 .active_conversation_mut()
                 .map(|conversation| &mut conversation.prompt),
@@ -3892,6 +4025,9 @@ impl ClientState {
             }
             TextTarget::SettingsToken => {
                 self.settings.set_focus(Some(SettingsFocus::Token));
+            }
+            TextTarget::SettingsDaemonConfig => {
+                self.settings.set_focus(Some(SettingsFocus::DaemonConfig));
             }
             TextTarget::DetailPrompt => self.focus_detail_prompt(),
             TextTarget::AgentModel => self.focus_agent_model(),
@@ -3939,6 +4075,7 @@ impl ClientState {
             TextTarget::SettingsEndpoint | TextTarget::SettingsToken => {
                 self.settings.after_edit();
             }
+            TextTarget::SettingsDaemonConfig => self.daemon_config.after_edit(),
             TextTarget::DetailPrompt => {
                 if let Some(conversation) = self.active_conversation_mut() {
                     conversation.prompt_selected = None;
@@ -5488,6 +5625,7 @@ mod tests {
             workflow_retry_previous: HashMap::new(),
             schedules: SchedulesState::default(),
             settings: SettingsState::new("http://127.0.0.1:4780", None),
+            daemon_config: DaemonConfigState::default(),
             standalone: StandaloneAgent::default(),
             repos: Vec::new(),
             active_repo: None,

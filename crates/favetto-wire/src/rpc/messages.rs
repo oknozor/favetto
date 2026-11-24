@@ -77,11 +77,21 @@ pub struct PingResult {
 // config
 // ---------------------------------------------------------------------------
 
-/// `config.validate` params: none ([`EmptyParams`]).
+/// `config.validate` params.
 ///
-/// `config.validate` result: whether the daemon's on-disk config file parsed,
-/// the resolved path it was read from, and the parse/deserialization errors when
-/// it did not. A missing file is valid (defaults apply).
+/// An absent `raw` validates the daemon's on-disk file (the TUI startup check);
+/// a `raw` draft is validated after restoring any redacted secrets from the
+/// file, without touching it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ConfigValidateParams {
+    #[serde(default, deserialize_with = "lenient")]
+    pub raw: Option<String>,
+}
+
+/// `config.validate` result: whether the config parsed, the resolved path it was
+/// read from, and the parse/deserialization or preflight errors when it did not.
+/// A missing file is valid (defaults apply).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ConfigValidateResult {
@@ -89,8 +99,100 @@ pub struct ConfigValidateResult {
     pub valid: bool,
     /// The resolved config path the daemon was started with.
     pub path: String,
-    /// One message per parse/deserialization failure; empty when `valid`.
+    /// One message per parse/deserialization/preflight failure; empty when
+    /// `valid`.
+    #[serde(default)]
     pub errors: Vec<String>,
+    /// Non-fatal notes, such as environment overrides or client-only sections.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+/// One environment override of a config value, reported by `config.get`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ConfigOverride {
+    /// The dotted config key the override targets (e.g. `daemon.listen`).
+    pub key: String,
+    /// Where the override comes from (`env`).
+    pub source: String,
+}
+
+/// `config.get` params: none.
+///
+/// `config.get` result: the daemon's global config path, its raw TOML with
+/// secrets redacted, a revision identifier for optimistic concurrency, and the
+/// parsed/effective values. A missing file is valid and opens with defaults; a
+/// malformed file still returns its raw text plus `parse_errors`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ConfigGetResult {
+    /// The resolved config path the daemon was started with.
+    pub path: String,
+    /// Raw TOML with secret values replaced by `"__FAVETTO_REDACTED__"`.
+    pub raw: String,
+    /// SHA-256 of the on-disk bytes (the empty string when the file is absent).
+    pub revision: String,
+    /// Whether the file exists on the daemon host.
+    pub exists: bool,
+    /// Parse/deserialization errors; empty when the file is valid.
+    #[serde(default)]
+    pub parse_errors: Vec<String>,
+    /// Non-fatal notes, including environment overrides and client-only
+    /// sections.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    /// `FAVETTO_*` environment variables that shadow the file.
+    #[serde(default)]
+    pub overrides: Vec<ConfigOverride>,
+    /// Sections whose pending file changes need a daemon restart.
+    #[serde(default)]
+    pub restart_required: Vec<String>,
+    /// The effective config (file plus environment) with secrets redacted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective: Option<serde_json::Value>,
+}
+
+/// `config.set` params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ConfigSetParams {
+    /// The full draft TOML. Redaction sentinels are restored from the file on
+    /// disk before validation.
+    pub raw: String,
+    /// The revision the edit was based on. A mismatch rejects the save so two
+    /// clients cannot silently clobber each other.
+    #[serde(default, deserialize_with = "lenient")]
+    pub expected_revision: Option<String>,
+}
+
+/// `config.set` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ConfigSetResult {
+    /// Whether the file was written. `false` means validation or the revision
+    /// check rejected the draft and the file was left untouched.
+    pub saved: bool,
+    /// The resolved config path.
+    pub path: String,
+    /// The revision after the save; on rejection, the revision currently on
+    /// disk so the client can reload and retry.
+    pub revision: String,
+    /// Validation/preflight errors; empty when `saved`.
+    #[serde(default)]
+    pub errors: Vec<String>,
+    /// Non-fatal notes.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    /// Top-level sections this draft changed.
+    #[serde(default)]
+    pub changed_sections: Vec<String>,
+    /// Sections whose changes only take effect after a daemon restart.
+    #[serde(default)]
+    pub restart_required: Vec<String>,
+    /// Sections whose changes are live without a restart (client-only `tui`).
+    #[serde(default)]
+    pub live_sections: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1120,7 +1222,11 @@ rpc_calls! {
     /// Typed call for `system.ping`.
     PingCall => method::PING, PingParams, PingResult;
     /// Typed call for `config.validate`.
-    ConfigValidateCall => method::CONFIG_VALIDATE, EmptyParams, ConfigValidateResult;
+    ConfigValidateCall => method::CONFIG_VALIDATE, ConfigValidateParams, ConfigValidateResult;
+    /// Typed call for `config.get`.
+    ConfigGetCall => method::CONFIG_GET, EmptyParams, ConfigGetResult;
+    /// Typed call for `config.set`.
+    ConfigSetCall => method::CONFIG_SET, ConfigSetParams, ConfigSetResult;
     /// Typed call for `tasks.list`.
     TasksListCall => method::TASKS_LIST, TasksListParams, TasksListResult;
     /// Typed call for `tasks.get`.
@@ -1272,8 +1378,18 @@ pub const CLIENT_CALLS: &[RpcCallSpec] = &[
     },
     RpcCallSpec {
         method: method::CONFIG_VALIDATE,
-        params_schema: schema_of::<EmptyParams>,
+        params_schema: schema_of::<ConfigValidateParams>,
         result_schema: schema_of::<ConfigValidateResult>,
+    },
+    RpcCallSpec {
+        method: method::CONFIG_GET,
+        params_schema: schema_of::<EmptyParams>,
+        result_schema: schema_of::<ConfigGetResult>,
+    },
+    RpcCallSpec {
+        method: method::CONFIG_SET,
+        params_schema: schema_of::<ConfigSetParams>,
+        result_schema: schema_of::<ConfigSetResult>,
     },
     RpcCallSpec {
         method: method::TASKS_LIST,
@@ -1893,6 +2009,7 @@ mod tests {
             valid: false,
             path: "/home/u/.config/favetto/config.toml".to_string(),
             errors: vec!["invalid type: string, expected a boolean".to_string()],
+            warnings: Vec::new(),
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(
@@ -1901,9 +2018,67 @@ mod tests {
                 "valid": false,
                 "path": "/home/u/.config/favetto/config.toml",
                 "errors": ["invalid type: string, expected a boolean"],
+                "warnings": [],
             })
         );
         let back: ConfigValidateResult = serde_json::from_value(json).unwrap();
         assert_eq!(back, result);
+
+        // An older client/daemon payload without the new fields still decodes.
+        let legacy: ConfigValidateResult = serde_json::from_value(serde_json::json!({
+            "valid": true,
+            "path": "/tmp/config.toml",
+            "errors": [],
+        }))
+        .unwrap();
+        assert!(legacy.warnings.is_empty());
+    }
+
+    #[test]
+    fn config_get_and_set_round_trip() {
+        let get = ConfigGetResult {
+            path: "/home/u/.config/favetto/config.toml".to_string(),
+            raw: "[daemon]\nlisten = \"127.0.0.1:7878\"\n".to_string(),
+            revision: "abc123".to_string(),
+            exists: true,
+            parse_errors: Vec::new(),
+            warnings: vec!["environment overrides are in effect".to_string()],
+            overrides: vec![ConfigOverride {
+                key: "daemon.listen".to_string(),
+                source: "env".to_string(),
+            }],
+            restart_required: vec!["daemon".to_string()],
+            effective: Some(serde_json::json!({ "daemon": { "listen": null } })),
+        };
+        let back: ConfigGetResult =
+            serde_json::from_value(serde_json::to_value(&get).unwrap()).unwrap();
+        assert_eq!(back, get);
+
+        let set = ConfigSetResult {
+            saved: true,
+            path: "/home/u/.config/favetto/config.toml".to_string(),
+            revision: "def456".to_string(),
+            errors: Vec::new(),
+            warnings: Vec::new(),
+            changed_sections: vec!["daemon".to_string()],
+            restart_required: vec!["daemon".to_string()],
+            live_sections: Vec::new(),
+        };
+        let json = serde_json::to_value(&set).unwrap();
+        assert_eq!(json["saved"], true);
+        assert_eq!(json["changed_sections"], serde_json::json!(["daemon"]));
+        let back: ConfigSetResult = serde_json::from_value(json).unwrap();
+        assert_eq!(back, set);
+
+        // Params tolerate a missing revision (an unconditional save) and a
+        // missing/ill-typed raw draft.
+        let params: ConfigSetParams = serde_json::from_value(serde_json::json!({
+            "raw": "[daemon]\n",
+        }))
+        .unwrap();
+        assert!(params.expected_revision.is_none());
+        let params: ConfigValidateParams =
+            serde_json::from_value(serde_json::json!({ "raw": 42 })).unwrap();
+        assert!(params.raw.is_none());
     }
 }

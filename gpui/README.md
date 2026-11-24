@@ -235,7 +235,7 @@ saved row appears immediately with its `next_run`.
 Deleting names the task and cadence, and the row disappears only after the
 daemon answers.
 
-Settings (`⌘,`/`Ctrl+,`) is stacked into four cards. **Connection** edits the
+Settings (`⌘,`/`Ctrl+,`) is stacked into five cards. **Connection** edits the
 daemon address and token in place: `host:port`, `http(s)://…` and full `/rpc`
 URLs are accepted, the normalized base URL is previewed before saving, and a bad
 address shows the precise reason without touching the live connection. **Test
@@ -249,10 +249,18 @@ conversation on demand through `tasks.session` and restores it with `agents.load
 when it ended loadable. Restoration never starts a session, sends a prompt or
 changes the task row; the replayed conversation appears in the task detail's
 Output surface, labelled with its Favetto-local session id, agent and state.
-**Appearance** switches System/Dark/Light and Comfortable/Compact live and
-persists both. **About** shows the client version, daemon cwd, endpoint, config
-path and a docs link, and states that no telemetry is collected.
-`Tab`/`Shift+Tab` walk the controls and `Enter` activates the focused one;
+**Daemon / global config** edits the daemon's `config.toml` as raw TOML through
+`config.get`/`config.set`: path, revision, raw text, parse errors, effective
+values, `FAVETTO_*` overrides and restart badges. It is separate from
+`gpui.toml`; a missing file opens with defaults and a malformed file opens with
+its raw text and errors. Secrets are redacted in the response and restored on
+save. **Save daemon config** validates the draft and the startup preflight
+before an atomic, revision-checked write; a successful save reports which
+sections need a daemon restart (`[tui]` is client-side). **Appearance** switches
+System/Dark/Light and Comfortable/Compact live and persists both. **About**
+shows the client version, daemon cwd, endpoint, both config paths and a docs
+link, and states that no telemetry is collected. `Tab`/`Shift+Tab` walk the
+controls, `Enter` activates the focused one (a newline in the raw TOML editor),
 `⌘↵` saves, `⌘T` tests.
 
 ## Pointing it at a daemon

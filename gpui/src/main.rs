@@ -11,6 +11,7 @@ mod catalog;
 mod components;
 mod config;
 mod conversation;
+mod daemon_config;
 mod detail;
 mod elicitation;
 mod inbox;

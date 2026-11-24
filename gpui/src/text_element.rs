@@ -211,6 +211,12 @@ impl<V: TextHost> TextElement<V> {
         self
     }
 
+    /// Cap the painted height of a multiline field (default 8 rows).
+    pub fn max_visible_lines(mut self, lines: usize) -> Self {
+        self.max_visible_lines = lines;
+        self
+    }
+
     fn wraps(&self) -> bool {
         self.wrap || self.multiline
     }

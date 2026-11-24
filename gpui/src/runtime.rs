@@ -32,7 +32,8 @@ use favetto_wire::rpc::{
     AgentCancelResult, AgentCloseResult, AgentElicitationReplyParams, AgentElicitationReplyResult,
     AgentLogoutParams, AgentLogoutResult, AgentOptionsResult, AgentPromptParams, AgentPromptResult,
     AgentReplyParams, AgentReplyResult, AgentSetModeParams, AgentSetOptionParams, CatalogEntry,
-    CatalogGetParams, EmptyParams, PingParams, PingResult, ReposActivateParams, ReposListResult,
+    CatalogGetParams, ConfigGetCall, ConfigGetResult, ConfigSetCall, ConfigSetParams,
+    ConfigSetResult, EmptyParams, PingParams, PingResult, ReposActivateParams, ReposListResult,
     ScheduleDeleteParams, ScheduleUpsertParams, SchedulesDeleteResult, SessionIdParams,
     StartAgentParams, StartOneshotParams, StartOneshotResult, TaskIdParams, TasksDeleteResult,
     TasksEventsParams, TasksListParams, TasksSessionResult, TasksStartParams,
@@ -177,6 +178,13 @@ pub enum Command {
     TestConnection {
         endpoint: String,
         token: Option<String>,
+    },
+    /// Fetch the daemon's global `config.toml` (`config.get`).
+    LoadDaemonConfig,
+    /// Validate and save the daemon's global `config.toml` (`config.set`).
+    SaveDaemonConfig {
+        raw: String,
+        expected_revision: Option<String>,
     },
     /// Stop the worker thread.
     Shutdown,
@@ -367,6 +375,14 @@ pub enum Update {
         endpoint: String,
         result: Result<PingResult, ClientError>,
         round_trip: Duration,
+    },
+    /// `config.get` completed.
+    DaemonConfigLoaded {
+        result: Result<Box<ConfigGetResult>, ClientError>,
+    },
+    /// `config.set` completed.
+    DaemonConfigSaved {
+        result: Result<Box<ConfigSetResult>, ClientError>,
     },
 }
 
@@ -671,6 +687,19 @@ impl Runtime {
     pub fn test_connection(&self, endpoint: String, token: Option<String>) {
         self.send(Command::TestConnection { endpoint, token });
     }
+
+    /// Fetch the daemon's global config (Settings → Daemon configuration).
+    pub fn load_daemon_config(&self) {
+        self.send(Command::LoadDaemonConfig);
+    }
+
+    /// Validate and save the daemon's global config.
+    pub fn save_daemon_config(&self, raw: String, expected_revision: Option<String>) {
+        self.send(Command::SaveDaemonConfig {
+            raw,
+            expected_revision,
+        });
+    }
 }
 
 impl Drop for Runtime {
@@ -916,6 +945,15 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
             }
             Command::TestConnection { endpoint, token } => {
                 spawn_connection_test(updates.clone(), endpoint, token);
+            }
+            Command::LoadDaemonConfig => {
+                spawn_daemon_config_load(client.clone(), updates.clone());
+            }
+            Command::SaveDaemonConfig {
+                raw,
+                expected_revision,
+            } => {
+                spawn_daemon_config_save(client.clone(), updates.clone(), raw, expected_revision);
             }
         }
     }
@@ -1608,6 +1646,37 @@ fn spawn_connection_test(updates: Sender<Update>, endpoint: String, token: Optio
             result,
             round_trip: started.elapsed(),
         });
+    });
+}
+
+/// Spawn one `config.get` read for Settings → Daemon configuration.
+fn spawn_daemon_config_load(client: Arc<RpcClient>, updates: Sender<Update>) {
+    tokio::spawn(async move {
+        let result = client
+            .call::<ConfigGetCall>(EmptyParams {})
+            .await
+            .map(Box::new);
+        let _ = updates.try_send(Update::DaemonConfigLoaded { result });
+    });
+}
+
+/// Spawn one `config.set` save. Validation failures arrive as a successful
+/// result with `saved: false`.
+fn spawn_daemon_config_save(
+    client: Arc<RpcClient>,
+    updates: Sender<Update>,
+    raw: String,
+    expected_revision: Option<String>,
+) {
+    tokio::spawn(async move {
+        let result = client
+            .call::<ConfigSetCall>(ConfigSetParams {
+                raw,
+                expected_revision,
+            })
+            .await
+            .map(Box::new);
+        let _ = updates.try_send(Update::DaemonConfigSaved { result });
     });
 }
 

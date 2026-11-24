@@ -18,7 +18,9 @@ dirs = "7"
 hex = "0.4"
 rmp-serde = "1.3"
 schemars = { version = "1", features = ["derive", "uuid1"] }
+sha2 = "0.11"
 toml = "1.1"
+toml_edit = "0.25"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "2"
