@@ -65,6 +65,9 @@ pub struct Conversation {
     pub events_session: Option<String>,
     /// The highest seen per-session `seq`.
     pub events_cursor: u64,
+    /// Event sequences already folded into a restored transcript. Feed rows at
+    /// or below this floor are dropped instead of painting the same text twice.
+    pub events_floor: u64,
     /// Whether the first backfill is in flight.
     pub events_loading: bool,
     /// The last backfill failure.
@@ -121,6 +124,7 @@ impl Conversation {
             events: Vec::new(),
             events_session: None,
             events_cursor: 0,
+            events_floor: 0,
             events_loading: false,
             events_error: None,
             events_loaded: false,
@@ -176,6 +180,7 @@ impl Conversation {
         self.events.clear();
         self.events_session = None;
         self.events_cursor = 0;
+        self.events_floor = 0;
         self.events_loaded = false;
         self.events_ignored = 0;
         self.events_revision = self.events_revision.wrapping_add(1);
@@ -198,12 +203,28 @@ impl Conversation {
         self.events.clear();
         self.events_session = None;
         self.events_cursor = 0;
+        self.events_floor = 0;
         self.events_loaded = false;
         self.events_ignored = 0;
         self.events_revision = self.events_revision.wrapping_add(1);
         self.new_events = 0;
         self.plan = None;
         self.commands = None;
+    }
+
+    /// Treat `seq` as the last event already folded into a restored transcript.
+    ///
+    /// Rows at or below the floor are discarded now and skipped by later
+    /// backfills/live pushes, so the transcript and the structured feed cannot
+    /// paint the same text twice.
+    pub fn restore_events_after(&mut self, seq: u64) {
+        self.events_floor = seq;
+        let before = self.events.len();
+        self.events.retain(|event| event.seq > seq);
+        self.events_cursor = self.events_cursor.max(seq);
+        if self.events.len() != before {
+            self.events_revision = self.events_revision.wrapping_add(1);
+        }
     }
 
     /// Merge a backfill with any live events already received.
@@ -223,6 +244,9 @@ impl Conversation {
         let mut highest = next_cursor;
         let mut latest_session = session_id;
         for event in events {
+            if event.seq <= self.events_floor {
+                continue;
+            }
             highest = highest.max(event.seq);
             if latest_session.is_none() {
                 latest_session = Some(event.session_id.clone());
@@ -285,6 +309,9 @@ impl Conversation {
     /// whether it was new; a new event while the viewport is pinned off the tail
     /// increments [`Conversation::new_events`].
     pub fn push_event(&mut self, push: AgentEventPush) -> bool {
+        if push.seq <= self.events_floor {
+            return false;
+        }
         if self
             .events
             .iter()

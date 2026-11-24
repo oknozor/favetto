@@ -1189,11 +1189,12 @@ impl ClientState {
                         }
                         // Pull the first plan/command snapshot for the new turn.
                         if task_accepted {
-                            if let (Some(runtime), Some(task_id)) = (
+                            if let (Some(runtime), Some(task_id), Some(after)) = (
                                 &self.runtime,
                                 self.detail.as_ref().map(|detail| detail.task_id),
+                                self.detail.as_ref().map(|detail| detail.events_cursor),
                             ) {
-                                runtime.load_task_events(task_id);
+                                runtime.load_task_events(task_id, after);
                             }
                         }
                     }
@@ -1260,16 +1261,16 @@ impl ClientState {
                 let result = result
                     .map(|attached| *attached)
                     .map_err(|error| error.to_string());
-                let reload_events = self
+                let reload_after = self
                     .detail
                     .as_mut()
-                    .map(|detail| detail.finish_restore(result))
-                    .unwrap_or(false);
-                if reload_events {
+                    .and_then(|detail| detail.finish_restore(result));
+                if let Some(after) = reload_after {
                     // The replayed conversation belongs to a different session
-                    // than the previous feed cursor; backfill it exactly once.
+                    // than the previous feed cursor; backfill only rows newer
+                    // than the transcript snapshot.
                     if let Some(runtime) = &self.runtime {
-                        runtime.load_task_events(task_id);
+                        runtime.load_task_events(task_id, after);
                     }
                 }
                 // The load changed the live roster (`agents.list`).
@@ -4966,7 +4967,11 @@ impl ClientState {
 
     /// Retry the structured-event backfill for the open detail.
     pub fn retry_detail_events(&mut self) {
-        let Some(task_id) = self.detail.as_ref().map(|detail| detail.task_id) else {
+        let Some((task_id, after)) = self
+            .detail
+            .as_ref()
+            .map(|detail| (detail.task_id, detail.events_cursor))
+        else {
             return;
         };
         if let Some(detail) = self.detail.as_mut() {
@@ -4974,7 +4979,7 @@ impl ClientState {
             detail.events_error = None;
         }
         match &self.runtime {
-            Some(runtime) => runtime.load_task_events(task_id),
+            Some(runtime) => runtime.load_task_events(task_id, after),
             None => {
                 if let Some(detail) = self.detail.as_mut() {
                     detail.fail_events("the transport is not running".to_string());

@@ -77,6 +77,11 @@ pub struct ConversationPanel {
     /// structured log. The Agent route never offers this control.
     raw_output_open: bool,
     raw_output_target: Option<ConversationTarget>,
+    /// Scroll state for the bounded restored transcript, so it opens on the
+    /// most recent response rather than its oldest lines.
+    restored_scroll: ScrollHandle,
+    /// The session/length last scrolled to the restored transcript's tail.
+    restored_scroll_key: Option<(String, usize)>,
 }
 
 impl ConversationPanel {
@@ -117,6 +122,8 @@ impl ConversationPanel {
             output_rendered: 0,
             raw_output_open: false,
             raw_output_target: None,
+            restored_scroll: ScrollHandle::new(),
+            restored_scroll_key: None,
         }
     }
 
@@ -1066,16 +1073,16 @@ impl ConversationPanel {
 
     /// A read-only banner/transcript for the task-scoped agent conversation.
     fn restore_panel(
-        &self,
+        &mut self,
         theme: &Theme,
         restore: &SessionRestore,
         cx: &mut Context<Self>,
     ) -> Option<Stateful<Div>> {
-        let feed_present = self
-            .state
-            .read(cx)
-            .detail()
-            .is_some_and(|detail| !detail.events.is_empty());
+        // Only assistant prose makes the feed a readable replay. Lifecycle,
+        // tool, plan, usage and title-only rows must not hide the transcript.
+        let feed_readable = self.state.read(cx).detail().is_some_and(|detail| {
+            detail::feed_has_readable_text(&detail::build_feed(&detail.events))
+        });
         let (headline, detail, color) = match restore {
             SessionRestore::Checking => (
                 "Restoring conversation…".to_string(),
@@ -1094,16 +1101,33 @@ impl ConversationPanel {
                 ),
                 theme.colors.warning,
             ),
-            SessionRestore::Restored(restored) => (
-                "Restored conversation".to_string(),
-                format!(
+            SessionRestore::Restored(restored) => {
+                let identity = format!(
                     "{} · session {} · {}",
                     restored.agent,
                     restored.session_id,
                     restored.state_label()
-                ),
-                theme.colors.success,
-            ),
+                );
+                if restored.has_transcript() {
+                    (
+                        "Restored conversation".to_string(),
+                        identity,
+                        theme.colors.success,
+                    )
+                } else if feed_readable {
+                    (
+                        "Restored conversation".to_string(),
+                        format!("{identity} · the replay is shown in the feed below."),
+                        theme.colors.success,
+                    )
+                } else {
+                    (
+                        "Conversation restored, but it has no readable text yet".to_string(),
+                        format!("{identity} · waiting for the agent's first response."),
+                        theme.colors.warning,
+                    )
+                }
+            }
             SessionRestore::Unavailable(reason) => (
                 "No agent conversation to restore".to_string(),
                 reason.clone(),
@@ -1145,20 +1169,38 @@ impl ConversationPanel {
             );
 
         if let SessionRestore::Restored(restored) = restore {
-            if restored.has_transcript() && !feed_present {
+            if restored.has_transcript() {
+                // The transcript is a snapshot, so scroll it to the tail once
+                // per restored session/content size; the deduplicated live feed
+                // below carries anything newer.
+                let key = (restored.session_id.clone(), restored.transcript.len());
+                if self.restored_scroll_key.as_ref() != Some(&key) {
+                    self.restored_scroll_key = Some(key);
+                    let handle = self.restored_scroll.clone();
+                    cx.defer(move |_cx| handle.scroll_to_bottom());
+                }
                 panel = panel.child(
                     div()
                         .id("conversation-restored-transcript")
                         .mt(px(theme.spacing.s1))
                         .max_h(px(240.0))
                         .overflow_y_scroll()
+                        .track_scroll(&self.restored_scroll)
                         .font_family("monospace")
                         .text_size(px(theme.font.xs))
                         .text_color(theme.colors.text)
                         .whitespace_normal()
                         .child(restored.transcript.clone()),
                 );
-            } else if feed_present {
+                if feed_readable {
+                    panel = panel.child(
+                        div()
+                            .text_size(px(theme.font.xs))
+                            .text_color(theme.colors.muted)
+                            .child("New activity is shown in the structured feed below."),
+                    );
+                }
+            } else if feed_readable {
                 panel = panel.child(
                     div()
                         .text_size(px(theme.font.xs))
@@ -1199,7 +1241,11 @@ impl ConversationPanel {
                     .and_then(TaskDetail::status)
                     .unwrap_or(TaskStatus::Pending),
                 detail.is_some_and(TaskDetail::is_terminal),
-                detail.is_some_and(|detail| !detail.events.is_empty() || !detail.plan().is_empty()),
+                detail.is_some_and(|detail| {
+                    !detail.events.is_empty()
+                        || !detail.plan().is_empty()
+                        || detail.events_ignored > 0
+                }),
                 detail.and_then(TaskDetail::output),
                 detail.is_some_and(|detail| detail.task_loading && detail.task.is_none()),
                 detail.and_then(|detail| detail.task_error.clone()),
