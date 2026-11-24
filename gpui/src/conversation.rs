@@ -11,15 +11,16 @@
 use std::collections::HashMap;
 
 use favetto_wire::model::{
-    AgentCommand, AgentPlanEntry, AgentSessionInfo, AgentStateEvent, AwaitingInputKind,
-    SessionConfigChoices, SessionConfigKind, SessionConfigOption, SessionModes,
+    AgentActivity, AgentCommand, AgentPlanEntry, AgentSessionInfo, AgentStateEvent,
+    AwaitingInputKind, ContentRole, InputRequest, MessageRole, RunSummary, SessionConfigChoices,
+    SessionConfigKind, SessionConfigOption, SessionModes,
 };
 use favetto_wire::rpc::AgentEventPush;
 use uuid::Uuid;
 
 use crate::detail::{
-    build_feed, command_query, matching_commands, FeedItem, PendingElicitation, PendingRequest,
-    MAX_RETAINED_EVENTS,
+    build_feed_with_outgoing, command_query, matching_commands, summary_feed, FeedItem,
+    PendingElicitation, PendingRequest, MAX_RETAINED_EVENTS,
 };
 use crate::text_input::TextInput;
 
@@ -53,6 +54,59 @@ impl ConversationTarget {
             }
         }
     }
+
+    /// A stable key for animation ids: the run id or the session id, never the
+    /// row index, so a re-render keeps its phase.
+    pub fn animation_key(&self) -> String {
+        match self {
+            ConversationTarget::Task(task_id) => task_id.to_string(),
+            ConversationTarget::Session(session_id) => format!("session-{session_id}"),
+        }
+    }
+}
+
+/// A locally echoed user prompt, shown immediately while the daemon accepts and
+/// the agent starts working. The row is transient: it is dropped once the agent
+/// echoes the same prompt back through the structured feed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutgoingState {
+    /// `agents.prompt` is in flight; the composer keeps the draft until accepted.
+    Sending,
+    /// The daemon accepted the prompt.
+    Sent,
+}
+
+/// One locally echoed prompt and where it sits in the feed timeline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutgoingMessage {
+    /// Monotonic per-conversation id, used for stable animation/list keys.
+    pub id: u64,
+    /// The prompt text exactly as sent.
+    pub text: String,
+    /// Whether the daemon has accepted the prompt.
+    pub state: OutgoingState,
+    /// The highest feed seq at send time. The row renders before any later
+    /// event, so a response always appears below its prompt.
+    pub anchor: u64,
+}
+
+/// The tone of a live activity row. The label always carries the meaning; the
+/// tone only picks the semantic color.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivityTone {
+    /// The agent is working.
+    Active,
+    /// The agent is blocked on the user.
+    Waiting,
+}
+
+/// A derived, always-visible "the agent is working" line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActivityIndicator {
+    /// The text label, for example "Thinking" or "Running read".
+    pub label: String,
+    /// The semantic color.
+    pub tone: ActivityTone,
 }
 
 /// The task-neutral structured conversation.
@@ -115,6 +169,18 @@ pub struct Conversation {
     pub prompt_focused: bool,
     /// The last prompt-send failure.
     pub prompt_error: Option<String>,
+    /// Locally echoed prompts, newest last.
+    pub outgoing: Vec<OutgoingMessage>,
+    /// The session the in-flight prompt was sent to, so its reply is routed even
+    /// before the feed has recorded a session id.
+    outgoing_session: Option<String>,
+    /// The next [`OutgoingMessage::id`].
+    next_outgoing_id: u64,
+    /// A prompt was accepted but the daemon has not reported activity yet, so
+    /// the client still paints "Thinking" rather than a frozen panel.
+    pub turn_pending: bool,
+    /// The structured activity the daemon last reported for this session.
+    pub activity: Option<AgentActivity>,
     /// Whether the conversation can no longer change.
     pub terminal: bool,
     /// Whether the owning row says the agent is blocked on input.
@@ -151,6 +217,11 @@ impl Conversation {
             prompt_sending: false,
             prompt_focused: false,
             prompt_error: None,
+            outgoing: Vec::new(),
+            outgoing_session: None,
+            next_outgoing_id: 0,
+            turn_pending: false,
+            activity: None,
             terminal: false,
             awaiting_input: false,
         }
@@ -170,6 +241,17 @@ impl Conversation {
     pub fn mark_status(&mut self, terminal: bool, awaiting_input: bool) {
         self.terminal = terminal;
         self.awaiting_input = awaiting_input;
+        if terminal {
+            // A terminal run/session must never keep a spinner alive.
+            self.activity = None;
+            self.turn_pending = false;
+            self.prompt_sending = false;
+            for message in &mut self.outgoing {
+                if message.state == OutgoingState::Sending {
+                    message.state = OutgoingState::Sent;
+                }
+            }
+        }
     }
 
     /// Whether the always-visible follow-up composer can accept a prompt.
@@ -202,6 +284,10 @@ impl Conversation {
         self.prompt_sending = false;
         self.prompt_focused = false;
         self.prompt_error = None;
+        self.outgoing.clear();
+        self.outgoing_session = None;
+        self.turn_pending = false;
+        self.activity = None;
     }
 
     /// Drop the previous attempt's feed so a replayed conversation is not
@@ -218,6 +304,10 @@ impl Conversation {
         self.plan = None;
         self.commands = None;
         self.session_option_pending = None;
+        self.outgoing.clear();
+        self.outgoing_session = None;
+        self.turn_pending = false;
+        self.activity = None;
     }
 
     /// Treat `seq` as the last event already folded into a restored transcript.
@@ -305,6 +395,13 @@ impl Conversation {
         self.events_error = None;
         self.events_loaded = true;
         self.events_ignored = ignored;
+        // A backfilled feed carries the daemon's history, so the newest
+        // activity-bearing frame is the honest current activity.
+        let mut activity = None;
+        for event in &self.events {
+            note_activity(&mut activity, &event.event);
+        }
+        self.activity = activity;
     }
 
     /// Fold a backfill failure in; loaded events are kept.
@@ -338,6 +435,24 @@ impl Conversation {
             }
             _ => {}
         }
+        let mut activity = self.activity.clone();
+        note_activity(&mut activity, &push.event);
+        self.activity = activity;
+        // Any real agent signal supersedes the optimistic "Thinking" placeholder.
+        if !matches!(
+            &push.event,
+            AgentStateEvent::Plan { .. }
+                | AgentStateEvent::AvailableCommands { .. }
+                | AgentStateEvent::ConfigOptions { .. }
+                | AgentStateEvent::Modes { .. }
+                | AgentStateEvent::CurrentMode { .. }
+                | AgentStateEvent::Session { .. }
+                | AgentStateEvent::Title { .. }
+                | AgentStateEvent::Auth { .. }
+                | AgentStateEvent::Usage { .. }
+        ) {
+            self.turn_pending = false;
+        }
         self.events.push(push);
         self.events.sort_by_key(|event| event.seq);
         self.trim_events();
@@ -360,9 +475,182 @@ impl Conversation {
         }
     }
 
-    /// The grouped event feed.
+    /// The grouped event feed, with locally echoed prompts interleaved and
+    /// deduplicated against an agent-emitted user echo.
     pub fn feed(&self) -> Vec<FeedItem> {
-        build_feed(&self.events)
+        let mut items = build_feed_with_outgoing(&self.events, &self.outgoing);
+        if !self.outgoing.is_empty() {
+            let echoed: Vec<String> = items
+                .iter()
+                .filter_map(|item| match item {
+                    FeedItem::Message {
+                        role: MessageRole::User,
+                        text,
+                    } => Some(normalize_prompt(text)),
+                    _ => None,
+                })
+                .collect();
+            if !echoed.is_empty() {
+                items.retain(|item| match item {
+                    FeedItem::OutgoingUser { text, .. } => {
+                        let local = normalize_prompt(text);
+                        !echoed.iter().any(|echo| prompts_match(&local, echo))
+                    }
+                    _ => true,
+                });
+            }
+        }
+        items
+    }
+
+    /// The durable summary feed, keeping the locally echoed prompts so a
+    /// terminal run does not present the summary as an assistant-only
+    /// conversation.
+    pub fn summary_feed(&self, summary: &RunSummary) -> Vec<FeedItem> {
+        let mut items: Vec<FeedItem> = self
+            .outgoing
+            .iter()
+            .map(|message| FeedItem::OutgoingUser {
+                text: message.text.clone(),
+                state: message.state,
+            })
+            .collect();
+        items.extend(summary_feed(summary));
+        items
+    }
+
+    /// Echo a prompt locally the moment Enter is pressed.
+    pub fn queue_prompt(&mut self, text: String, session_id: impl Into<String>) {
+        let anchor = self.events_cursor;
+        let id = self.next_outgoing_id;
+        self.next_outgoing_id = self.next_outgoing_id.wrapping_add(1);
+        self.outgoing.push(OutgoingMessage {
+            id,
+            text,
+            state: OutgoingState::Sending,
+            anchor,
+        });
+        self.outgoing_session = Some(session_id.into());
+        self.prompt_sending = true;
+        self.prompt_error = None;
+        self.events_revision = self.events_revision.wrapping_add(1);
+        if !self.follow {
+            self.new_events = self.new_events.saturating_add(1);
+        }
+    }
+
+    /// Whether this conversation owns the reply for `session_id`: either it sent
+    /// the in-flight prompt, or the session is the one it is showing.
+    pub fn owns_prompt_reply(&self, session_id: &str, sessions: &[AgentSessionInfo]) -> bool {
+        self.outgoing_session.as_deref() == Some(session_id)
+            || self.owns_session(session_id, sessions)
+    }
+
+    /// The daemon accepted the prompt: mark the row sent, clear the draft only
+    /// now, and start the optimistic "Thinking" phase until real activity lands.
+    pub fn accept_prompt(&mut self) {
+        if let Some(message) = self
+            .outgoing
+            .iter_mut()
+            .rev()
+            .find(|message| message.state == OutgoingState::Sending)
+        {
+            message.state = OutgoingState::Sent;
+        }
+        self.outgoing_session = None;
+        self.prompt_sending = false;
+        self.turn_pending = true;
+        self.clear_prompt();
+        self.events_revision = self.events_revision.wrapping_add(1);
+    }
+
+    /// The send failed: keep the draft recoverable and drop the local row.
+    pub fn fail_prompt(&mut self) {
+        if let Some(index) = self
+            .outgoing
+            .iter()
+            .rposition(|message| message.state == OutgoingState::Sending)
+        {
+            self.outgoing.remove(index);
+        }
+        self.outgoing_session = None;
+        self.prompt_sending = false;
+        self.turn_pending = false;
+        self.events_revision = self.events_revision.wrapping_add(1);
+    }
+
+    /// Apply the activity from an `agent.state` push. `None` leaves the last
+    /// known value alone so a sparse push cannot blank a live spinner.
+    pub fn apply_activity(&mut self, activity: Option<AgentActivity>) {
+        if let Some(activity) = activity {
+            self.turn_pending = false;
+            self.activity = Some(activity);
+        }
+    }
+
+    /// Reconcile activity with the authoritative `agents.list` roster.
+    ///
+    /// A snapshot can lag the push it follows, so a stale `Idle` never cancels
+    /// the optimistic "Thinking" of a prompt the daemon just accepted; the
+    /// per-event `agent.state` push remains authoritative for that.
+    pub fn sync_activity(&mut self, sessions: &[AgentSessionInfo]) {
+        let Some(activity) = sessions
+            .iter()
+            .find(|session| self.target.matches_session(session))
+            .and_then(|session| session.activity.clone())
+        else {
+            return;
+        };
+        if self.turn_pending && matches!(activity, AgentActivity::Idle) {
+            return;
+        }
+        self.apply_activity(Some(activity));
+    }
+
+    /// The always-visible activity label, or `None` when the agent is idle or
+    /// the conversation is terminal.
+    pub fn activity_indicator(&self) -> Option<ActivityIndicator> {
+        if self.terminal {
+            return None;
+        }
+        if self.prompt_sending {
+            return Some(ActivityIndicator {
+                label: "Sending…".to_string(),
+                tone: ActivityTone::Active,
+            });
+        }
+        let active = |label: String| ActivityIndicator {
+            label,
+            tone: ActivityTone::Active,
+        };
+        match self.activity.as_ref() {
+            Some(AgentActivity::Starting) => return Some(active("Starting…".to_string())),
+            Some(AgentActivity::Thinking) => return Some(active("Thinking".to_string())),
+            Some(AgentActivity::Responding) => return Some(active("Responding".to_string())),
+            Some(AgentActivity::Tool { name, .. }) => {
+                return Some(active(format!("Running {name}")))
+            }
+            Some(AgentActivity::Waiting { .. }) => {
+                return Some(ActivityIndicator {
+                    label: "Waiting for you".to_string(),
+                    tone: ActivityTone::Waiting,
+                });
+            }
+            Some(AgentActivity::Idle) => {
+                if !self.turn_pending {
+                    return None;
+                }
+            }
+            Some(AgentActivity::Exited { .. }) => return None,
+            None => {}
+        }
+        if self.turn_pending {
+            return Some(active("Thinking".to_string()));
+        }
+        self.awaiting_input.then(|| ActivityIndicator {
+            label: "Waiting for you".to_string(),
+            tone: ActivityTone::Waiting,
+        })
     }
 
     /// Whether a live push belongs to this conversation.
@@ -395,6 +683,16 @@ impl Conversation {
                         || self.events_session.as_deref() == Some(session_id.as_str()))
             }
         }
+    }
+
+    /// Whether `session_id` is the session behind this conversation. Unlike
+    /// [`Self::is_session`], a task target matches its live session too, so a
+    /// per-session push can be applied without a full roster refresh.
+    pub fn owns_session(&self, session_id: &str, sessions: &[AgentSessionInfo]) -> bool {
+        self.is_session(session_id)
+            || sessions
+                .iter()
+                .any(|session| session.id == session_id && self.target.matches_session(session))
     }
 
     /// The latest unresolved structured prompt in the event feed.
@@ -995,6 +1293,63 @@ impl SessionSelectState {
     }
 }
 
+/// Fold one structured event into the derived activity label.
+fn note_activity(activity: &mut Option<AgentActivity>, event: &AgentStateEvent) {
+    let next = match event {
+        AgentStateEvent::TurnStarted | AgentStateEvent::ReasoningDelta { .. } => {
+            Some(AgentActivity::Thinking)
+        }
+        AgentStateEvent::TextDelta { .. } => Some(AgentActivity::Responding),
+        AgentStateEvent::ContentBlock { role, .. } => Some(if *role == ContentRole::Thought {
+            AgentActivity::Thinking
+        } else {
+            AgentActivity::Responding
+        }),
+        AgentStateEvent::ToolStarted { name, .. } => Some(AgentActivity::Tool {
+            name: name.clone(),
+            description: None,
+        }),
+        AgentStateEvent::ToolFinished { .. } | AgentStateEvent::ToolUpdated { .. } => {
+            Some(AgentActivity::Thinking)
+        }
+        AgentStateEvent::InputRequested { request } => Some(AgentActivity::Waiting {
+            request: request.clone(),
+        }),
+        AgentStateEvent::InputResolved { .. } => Some(AgentActivity::Thinking),
+        AgentStateEvent::ElicitationRequested { request } => Some(AgentActivity::Waiting {
+            request: InputRequest {
+                id: request.id.clone(),
+                kind: AwaitingInputKind::Elicitation,
+                message: request.message.clone(),
+                options: Vec::new(),
+                allow_always: false,
+                form: Some(request.form.clone()),
+            },
+        }),
+        AgentStateEvent::ElicitationResolved { .. } => Some(AgentActivity::Thinking),
+        AgentStateEvent::Idle { .. } => Some(AgentActivity::Idle),
+        AgentStateEvent::Error { .. } => None,
+        _ => return,
+    };
+    *activity = next;
+}
+
+/// Normalize a prompt for echo comparison: trimmed with collapsed whitespace.
+fn normalize_prompt(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether an agent-emitted user message is the echo of a local prompt. A
+/// streamed echo is a prefix/suffix of the full local text until it completes.
+fn prompts_match(local: &str, echoed: &str) -> bool {
+    if local == echoed {
+        return true;
+    }
+    local.chars().count() >= 3
+        && echoed.chars().count() >= 3
+        && (local.contains(echoed) || echoed.contains(local))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1351,5 +1706,241 @@ mod tests {
         state.refresh(SessionSelect::modes(&fresh).unwrap());
         assert_eq!(state.highlighted_row().unwrap().value, "plan");
         assert_eq!(state.highlighted(), Some(2));
+    }
+
+    #[test]
+    fn an_accepted_prompt_echoes_a_sent_user_row_and_starts_thinking() {
+        let mut conversation = Conversation::for_session("ses_a");
+        conversation.prompt.set_value("hello".to_string());
+        conversation.queue_prompt("hello".to_string(), "ses_a");
+        assert!(conversation.prompt_sending);
+        assert_eq!(
+            conversation.activity_indicator().map(|a| a.label),
+            Some("Sending…".to_string())
+        );
+
+        conversation.accept_prompt();
+        assert!(conversation.prompt.is_empty());
+        assert!(!conversation.prompt_sending);
+        assert_eq!(
+            conversation.outgoing[0].state,
+            OutgoingState::Sent,
+            "the local row keeps its sent state"
+        );
+        assert_eq!(
+            conversation.activity_indicator().map(|a| a.label),
+            Some("Thinking".to_string()),
+            "accepted prompts show immediate activity"
+        );
+        assert!(matches!(
+            &conversation.feed()[0],
+            FeedItem::OutgoingUser { text, state: OutgoingState::Sent } if text == "hello"
+        ));
+    }
+
+    #[test]
+    fn a_failed_send_keeps_the_draft_and_drops_the_local_row() {
+        let mut conversation = Conversation::for_session("ses_a");
+        conversation.prompt.set_value("draft".to_string());
+        conversation.queue_prompt("draft".to_string(), "ses_a");
+        conversation.fail_prompt();
+
+        assert_eq!(conversation.prompt.value(), "draft");
+        assert!(conversation.outgoing.is_empty());
+        assert!(conversation.activity_indicator().is_none());
+    }
+
+    #[test]
+    fn a_second_prompt_appends_a_second_user_row_in_order() {
+        let mut conversation = Conversation::for_session("ses_a");
+        conversation.queue_prompt("first".to_string(), "ses_a");
+        conversation.accept_prompt();
+        conversation.push_event(push(
+            1,
+            "ses_a",
+            AgentStateEvent::TextDelta {
+                role: MessageRole::Assistant,
+                text: "one".to_string(),
+            },
+        ));
+        conversation.queue_prompt("second".to_string(), "ses_a");
+        conversation.accept_prompt();
+
+        let outgoing: Vec<_> = conversation
+            .feed()
+            .into_iter()
+            .filter_map(|item| match item {
+                FeedItem::OutgoingUser { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outgoing, vec!["first".to_string(), "second".to_string()]);
+    }
+
+    #[test]
+    fn an_agent_echo_suppresses_the_local_user_row() {
+        let mut conversation = Conversation::for_session("ses_a");
+        conversation.queue_prompt("hello world".to_string(), "ses_a");
+        conversation.accept_prompt();
+        conversation.push_event(push(
+            1,
+            "ses_a",
+            AgentStateEvent::TextDelta {
+                role: MessageRole::User,
+                text: "hello world".to_string(),
+            },
+        ));
+
+        let feed = conversation.feed();
+        assert!(
+            !feed
+                .iter()
+                .any(|item| matches!(item, FeedItem::OutgoingUser { .. })),
+            "the agent echo supersedes the local row"
+        );
+        assert_eq!(
+            feed.iter()
+                .filter(|item| matches!(
+                    item,
+                    FeedItem::Message {
+                        role: MessageRole::User,
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "the prompt is never shown twice"
+        );
+    }
+
+    #[test]
+    fn every_activity_variant_maps_to_a_label_or_none() {
+        let mut conversation = Conversation::for_session("ses_a");
+        let cases = [
+            (AgentActivity::Starting, Some("Starting…")),
+            (AgentActivity::Thinking, Some("Thinking")),
+            (AgentActivity::Responding, Some("Responding")),
+            (
+                AgentActivity::Tool {
+                    name: "read".to_string(),
+                    description: None,
+                },
+                Some("Running read"),
+            ),
+            (
+                AgentActivity::Waiting {
+                    request: InputRequest {
+                        id: "perm_1".to_string(),
+                        kind: AwaitingInputKind::Permission,
+                        message: "Allow?".to_string(),
+                        options: vec!["yes".to_string()],
+                        allow_always: false,
+                        form: None,
+                    },
+                },
+                Some("Waiting for you"),
+            ),
+            (AgentActivity::Idle, None),
+            (AgentActivity::Exited { code: Some(0) }, None),
+        ];
+        for (activity, expected) in cases {
+            conversation.apply_activity(Some(activity));
+            assert_eq!(
+                conversation.activity_indicator().map(|a| a.label),
+                expected.map(str::to_string)
+            );
+        }
+    }
+
+    #[test]
+    fn idle_and_terminal_status_clear_the_activity() {
+        let mut conversation = Conversation::for_session("ses_a");
+        conversation.queue_prompt("hello".to_string(), "ses_a");
+        conversation.accept_prompt();
+        assert!(conversation.activity_indicator().is_some());
+
+        conversation.apply_activity(Some(AgentActivity::Idle));
+        assert!(conversation.activity_indicator().is_none());
+
+        conversation.apply_activity(Some(AgentActivity::Thinking));
+        conversation.mark_status(true, false);
+        assert!(conversation.activity_indicator().is_none());
+    }
+
+    #[test]
+    fn structured_events_keep_the_activity_honest_without_a_state_push() {
+        let mut conversation = Conversation::for_session("ses_a");
+        conversation.push_event(push(1, "ses_a", AgentStateEvent::TurnStarted));
+        assert_eq!(
+            conversation.activity_indicator().map(|a| a.label),
+            Some("Thinking".to_string())
+        );
+        conversation.push_event(push(
+            2,
+            "ses_a",
+            AgentStateEvent::ToolStarted {
+                id: "call_1".to_string(),
+                name: "read".to_string(),
+                input: serde_json::Value::Null,
+                detail: None,
+            },
+        ));
+        assert_eq!(
+            conversation.activity_indicator().map(|a| a.label),
+            Some("Running read".to_string())
+        );
+        conversation.push_event(push(
+            3,
+            "ses_a",
+            AgentStateEvent::Idle {
+                outcome: favetto_wire::model::IdleOutcome::Succeeded,
+            },
+        ));
+        assert!(conversation.activity_indicator().is_none());
+    }
+
+    #[test]
+    fn a_stale_idle_snapshot_does_not_cancel_a_just_accepted_prompt() {
+        let mut conversation = Conversation::for_session("ses_a");
+        conversation.queue_prompt("hello".to_string(), "ses_a");
+        conversation.accept_prompt();
+
+        let mut live = session("ses_a", None);
+        live.activity = Some(AgentActivity::Idle);
+        conversation.sync_activity(&[live.clone()]);
+        assert_eq!(
+            conversation.activity_indicator().map(|a| a.label),
+            Some("Thinking".to_string()),
+            "a lagging roster must not blank the new turn's spinner"
+        );
+
+        live.activity = Some(AgentActivity::Responding);
+        conversation.sync_activity(&[live]);
+        assert_eq!(
+            conversation.activity_indicator().map(|a| a.label),
+            Some("Responding".to_string())
+        );
+    }
+
+    #[test]
+    fn a_local_prompt_stays_in_the_durable_summary() {
+        let mut conversation = Conversation::for_session("ses_a");
+        conversation.queue_prompt("remember this".to_string(), "ses_a");
+        conversation.accept_prompt();
+        let items = conversation.summary_feed(&RunSummary {
+            text: "assistant answer".to_string(),
+            ..Default::default()
+        });
+        assert!(matches!(
+            &items[0],
+            FeedItem::OutgoingUser { text, .. } if text == "remember this"
+        ));
+        assert!(matches!(
+            &items[1],
+            FeedItem::Message {
+                role: MessageRole::Assistant,
+                ..
+            }
+        ));
     }
 }

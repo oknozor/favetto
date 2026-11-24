@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use favetto_wire::model::{AgentUsage, Task, TaskRun};
+use favetto_wire::model::{AgentActivity, AgentUsage, Task, TaskRun};
 use favetto_wire::Timestamp;
 use gpui::{
     div, prelude::*, px, AnyElement, Context, Div, Entity, FocusHandle, Hsla, IntoElement, Render,
@@ -133,6 +133,7 @@ impl DetailView {
                     "Interrupt turn"
                 },
                 !cancel_pending,
+                cancel_pending,
                 cx.listener(|this, _event, _window, cx| {
                     this.state.update(cx, |state, cx| {
                         state.interrupt_detail_turn(cx);
@@ -376,6 +377,7 @@ impl DetailView {
         theme: &Theme,
         label: &'static str,
         enabled: bool,
+        spinning: bool,
         on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
     ) -> Stateful<Div> {
         components::with_focus(
@@ -385,11 +387,21 @@ impl DetailView {
                 .flex()
                 .items_center()
                 .h(px(theme.controls.min))
+                .gap(px(theme.spacing.s1))
                 .px(px(theme.spacing.s2))
                 .rounded(px(theme.radii.r4))
                 .border_1()
                 .border_color(Hsla::from(theme.colors.border))
                 .text_size(px(theme.font.xs))
+                .when(spinning, |button| {
+                    button.child(components::animated_icon(
+                        "◐",
+                        true,
+                        theme.colors.accent,
+                        theme.font.xs,
+                        components::motion_id("detail-interrupt-spinner", "turn"),
+                    ))
+                })
                 .when(enabled, |button| {
                     button
                         .text_color(theme.colors.text)
@@ -607,6 +619,7 @@ impl DetailView {
         let RunsBody {
             runs,
             current_attempt,
+            activity,
             loading,
             loaded,
             error: runs_error,
@@ -663,7 +676,10 @@ impl DetailView {
         }
         column = column.child(runs_header(theme));
         for run in runs.iter().rev() {
-            column = column.child(run_row(theme, run, current_attempt, now));
+            let live = (run.attempt == current_attempt)
+                .then_some(activity)
+                .flatten();
+            column = column.child(run_row(theme, run, current_attempt, now, live));
         }
         let runs_view = cx.entity().downgrade();
         let scrollbar = components::vertical_scrollbar(
@@ -727,6 +743,7 @@ struct ErrorBody<'a> {
 struct RunsBody<'a> {
     runs: &'a [TaskRun],
     current_attempt: u32,
+    activity: Option<&'a AgentActivity>,
     loading: bool,
     loaded: bool,
     error: Option<String>,
@@ -737,13 +754,14 @@ impl Render for DetailView {
         let theme = self.state.read(cx).theme(window.appearance());
         let narrow = container_query(window.viewport_size().width) == LayoutMode::Narrow;
 
-        let (task, agent, usage, tab) = {
+        let (task, agent, usage, tab, activity) = {
             let state = self.state.read(cx);
             (
                 state.selected_task().cloned(),
                 state.detail_agent(),
                 state.detail_usage(),
                 state.detail_tab(),
+                state.detail_agent_activity(),
             )
         };
 
@@ -795,6 +813,7 @@ impl Render for DetailView {
                     RunsBody {
                         runs: &runs,
                         current_attempt,
+                        activity: activity.as_ref(),
                         loading,
                         loaded,
                         error,
@@ -877,7 +896,13 @@ fn runs_header(theme: &Theme) -> Div {
         )
 }
 
-fn run_row(theme: &Theme, run: &TaskRun, current_attempt: u32, now: Timestamp) -> Div {
+fn run_row(
+    theme: &Theme,
+    run: &TaskRun,
+    current_attempt: u32,
+    now: Timestamp,
+    activity: Option<&AgentActivity>,
+) -> Div {
     let status = detail::run_status_kind(run.status);
     let color = status_color(theme, status);
     let current = run.attempt == current_attempt;
@@ -931,7 +956,16 @@ fn run_row(theme: &Theme, run: &TaskRun, current_attempt: u32, now: Timestamp) -
                             theme.font.xs,
                             components::motion_id("run-spinner", run.id),
                         ))
-                        .child(detail::run_status_label(run.status)),
+                        .child(detail::run_status_label(run.status))
+                        .when_some(activity.and_then(detail::activity_label), |row, label| {
+                            row.child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(theme.colors.muted)
+                                    .child(format!("· {label}")),
+                            )
+                        }),
                 )
                 .child(
                     div()

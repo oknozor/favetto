@@ -20,9 +20,9 @@ use std::time::Duration;
 
 use favetto_wire::elicitation::ElicitationRequest;
 use favetto_wire::model::{
-    AgentCommand, AgentPlanEntry, AgentSessionHistoryEntry, AgentSessionState, AgentStateEvent,
-    AgentUsage, AwaitingInputKind, ContentRole, IdleOutcome, InputRequest, MessageContent,
-    MessageRole, RunStatus, RunSummary, Task, TaskRun, TaskStatus,
+    AgentActivity, AgentCommand, AgentPlanEntry, AgentSessionHistoryEntry, AgentSessionState,
+    AgentStateEvent, AgentUsage, AwaitingInputKind, ContentRole, IdleOutcome, InputRequest,
+    MessageContent, MessageRole, RunStatus, RunSummary, Task, TaskRun, TaskStatus,
 };
 use favetto_wire::rpc::{AgentAttachResult, AgentEventPush, RpcCall, TasksEventsParams};
 use favetto_wire::Timestamp;
@@ -412,6 +412,13 @@ pub enum FeedItem {
     Session { title: Option<String> },
     /// The session's title changed.
     Title(String),
+    /// A locally echoed user prompt, shown before the agent's own stream.
+    OutgoingUser {
+        /// The prompt text.
+        text: String,
+        /// Whether the daemon has accepted it.
+        state: crate::conversation::OutgoingState,
+    },
 }
 
 /// Whether a grouped feed contains text worth reading as a conversation.
@@ -437,13 +444,26 @@ pub fn feed_has_readable_text(items: &[FeedItem]) -> bool {
 /// merge into the card opened by `ToolStarted`. An unknown event kind never
 /// reaches this function: [`crate::sse`] and [`DetailEventsResult`] drop it
 /// first, so a newer daemon cannot break the feed.
+#[allow(dead_code)] // The events-only wrapper is used by the pure feed tests.
 pub fn build_feed(events: &[AgentEventPush]) -> Vec<FeedItem> {
+    build_feed_with_outgoing(events, &[])
+}
+
+/// Group an ordered event window plus locally echoed prompts into display
+/// items. A local prompt renders before the first event with a higher `seq`,
+/// so a response always follows the prompt that caused it.
+pub fn build_feed_with_outgoing(
+    events: &[AgentEventPush],
+    outgoing: &[crate::conversation::OutgoingMessage],
+) -> Vec<FeedItem> {
     let mut items: Vec<FeedItem> = Vec::new();
     let mut tools: HashMap<&str, usize> = HashMap::new();
     let mut pending_inputs: HashMap<&str, usize> = HashMap::new();
     let mut pending_elicitations: HashMap<&str, usize> = HashMap::new();
+    let mut outgoing = outgoing.iter().peekable();
 
     for push in events {
+        flush_outgoing(&mut items, &mut outgoing, push.seq);
         if !matches!(&push.event, AgentStateEvent::ReasoningDelta { .. }) {
             if let Some(FeedItem::Reasoning { streaming, .. }) = items.last_mut() {
                 *streaming = false;
@@ -603,7 +623,33 @@ pub fn build_feed(events: &[AgentEventPush]) -> Vec<FeedItem> {
         }
     }
 
+    for message in outgoing {
+        items.push(FeedItem::OutgoingUser {
+            text: message.text.clone(),
+            state: message.state,
+        });
+    }
+
     items
+}
+
+/// Move every local prompt whose timeline anchor is older than `seq` into the
+/// item list, keeping send order.
+fn flush_outgoing<'a>(
+    items: &mut Vec<FeedItem>,
+    outgoing: &mut std::iter::Peekable<std::slice::Iter<'a, crate::conversation::OutgoingMessage>>,
+    seq: u64,
+) {
+    while let Some(message) = outgoing.peek() {
+        if message.anchor >= seq {
+            break;
+        }
+        let message = outgoing.next().expect("peeked");
+        items.push(FeedItem::OutgoingUser {
+            text: message.text.clone(),
+            state: message.state,
+        });
+    }
 }
 
 /// A compact one-line rendering of a tool input/output value.
@@ -630,6 +676,18 @@ pub fn compact_json(value: &serde_json::Value) -> Option<String> {
         let mut cut: String = text.chars().take(LIMIT).collect();
         cut.push('…');
         Some(cut)
+    }
+}
+
+/// A short label for a live activity, or `None` when the agent is idle/exited.
+pub fn activity_label(activity: &AgentActivity) -> Option<String> {
+    match activity {
+        AgentActivity::Starting => Some("starting…".to_string()),
+        AgentActivity::Thinking => Some("thinking".to_string()),
+        AgentActivity::Responding => Some("responding".to_string()),
+        AgentActivity::Tool { name, .. } => Some(format!("running {name}")),
+        AgentActivity::Waiting { .. } => Some("waiting for you".to_string()),
+        AgentActivity::Idle | AgentActivity::Exited { .. } => None,
     }
 }
 
@@ -1519,6 +1577,37 @@ mod tests {
             FeedItem::Boundary(IdleOutcome::Succeeded)
         ));
         assert!(matches!(&feed[6], FeedItem::Error(message) if message == "boom"));
+    }
+
+    #[test]
+    fn local_prompts_render_after_the_events_that_preceded_them() {
+        use crate::conversation::{OutgoingMessage, OutgoingState};
+
+        let outgoing = vec![OutgoingMessage {
+            id: 0,
+            text: "hi".to_string(),
+            state: OutgoingState::Sent,
+            anchor: 1,
+        }];
+        let feed = build_feed_with_outgoing(
+            &[
+                text(1, MessageRole::Assistant, "earlier"),
+                text(2, MessageRole::Assistant, "answer"),
+            ],
+            &outgoing,
+        );
+        assert!(matches!(
+            &feed[0],
+            FeedItem::Message { text, .. } if text == "earlier"
+        ));
+        assert!(matches!(
+            &feed[1],
+            FeedItem::OutgoingUser { text, .. } if text == "hi"
+        ));
+        assert!(matches!(
+            &feed[2],
+            FeedItem::Message { text, .. } if text == "answer"
+        ));
     }
 
     #[test]

@@ -230,6 +230,45 @@ pub fn empty_state(
     body: &str,
     primary_hint: &str,
 ) -> Div {
+    empty_state_with_icon(
+        theme,
+        icon.to_string().into_any_element(),
+        eyebrow,
+        title,
+        body,
+        primary_hint,
+    )
+}
+
+/// Like [`empty_state`], but the glyph spins while `running` (the Agent panel's
+/// "starting the session…" state). Under reduced motion the glyph is static.
+pub fn animated_empty_state(
+    theme: &Theme,
+    icon: &'static str,
+    running: bool,
+    eyebrow: &str,
+    title: &str,
+    body: &str,
+    primary_hint: &str,
+) -> Div {
+    let glyph = animated_icon(
+        icon,
+        running,
+        theme.colors.accent,
+        theme.font.xl,
+        motion_id("empty-state-spinner", title),
+    );
+    empty_state_with_icon(theme, glyph, eyebrow, title, body, primary_hint)
+}
+
+fn empty_state_with_icon(
+    theme: &Theme,
+    icon: AnyElement,
+    eyebrow: &str,
+    title: &str,
+    body: &str,
+    primary_hint: &str,
+) -> Div {
     div()
         .size_full()
         .flex()
@@ -251,7 +290,7 @@ pub fn empty_state(
                 .bg(Hsla::from(theme.colors.accent).opacity(0.12))
                 .text_color(theme.colors.accent)
                 .text_size(px(theme.font.xl))
-                .child(icon.to_string()),
+                .child(icon),
         )
         .child(section_label(theme, eyebrow))
         .child(

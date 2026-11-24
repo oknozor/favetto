@@ -1767,6 +1767,21 @@ mod content_block_state_tests {
         });
         assert_eq!(live.activity, Some(AgentActivity::Thinking));
     }
+
+    #[test]
+    fn an_acp_turn_start_publishes_thinking_until_idle() {
+        let mut live = AgentLiveState::default();
+        live.apply(&AgentStateEvent::TurnStarted);
+        assert_eq!(
+            live.activity,
+            Some(AgentActivity::Thinking),
+            "the prompt loop's TurnStarted makes activity available immediately"
+        );
+        live.apply(&AgentStateEvent::Idle {
+            outcome: favetto_core::model::IdleOutcome::Succeeded,
+        });
+        assert_eq!(live.activity, Some(AgentActivity::Idle));
+    }
 }
 
 #[cfg(test)]
