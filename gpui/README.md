@@ -113,8 +113,8 @@ pinned while the tab body scrolls:
   A run without structured events falls back to the plain persisted transcript,
   with a notice when the daemon truncated it, and a **Raw output** disclosure
   keeps that transcript one click away when a structured log exists. **Copy
-  output** (and **copy** beside the session id) is the clipboard path, because
-  this GPUI build has no text selection primitive.
+  output** is the clipboard path, because this GPUI build has no text selection
+  primitive.
 - Live and durable rows share one model: consecutive text/reasoning deltas
   become one block, tool start/finish events merge into one card, usage and
   errors keep their own rows, and a durable summary renders as
@@ -253,7 +253,7 @@ There is no global session browser: opening a task resolves its own agent
 conversation on demand through `tasks.session` and restores it with `agents.load`
 when it ended loadable. Restoration never starts a session, sends a prompt or
 changes the task row; the replayed conversation appears in the task detail's
-Output surface, labelled with its Favetto-local session id, agent and state.
+Output surface, labelled with its agent and lifecycle state.
 **Daemon / global config** edits the daemon's `config.toml` as raw TOML through
 `config.get`/`config.set`: path, revision, raw text, parse errors, effective
 values, `FAVETTO_*` overrides and restart badges. It is separate from
@@ -479,9 +479,8 @@ Deviations from the plan are recorded in this file as the chain progresses
 - **No text selection in this GPUI build.** The pinned `gpui 0.2.2` exposes no
   selectable-text primitive. Durable agent prose renders as Markdown through the
   shared Output/Catalog renderer, while a plain/PTY transcript stays monospace;
-  the **Copy output** action (plus **copy** beside the session id) is the
-  clipboard path. This is the one place the "selectable" wording cannot be met
-  literally in the current framework.
+  the **Copy output** action is the clipboard path. This is the one place the
+  "selectable" wording cannot be met literally in the current framework.
 - **Run-status labels.** `RunStatus` has two outcomes the task enum does not
   (`interrupted`, `timed_out`); the Runs table renders those labels directly and
   keeps `StatusKind` for the shared icon/color vocabulary.

@@ -49,7 +49,7 @@ At the time of the run `repos.list` reported active repo `favetto`, while
 | Connect | Status pill **● Connected**; status bar showed endpoint, `ping ok` and a 0 ms round trip. |
 | Inbox load | Inbox showed **86 Needs you** rows (recent failures), with the sidebar badge matching. |
 | List tasks | `g t` opened Tasks and loaded **500 shown of 500**; filter counts were All 500 / Running 1 / Awaiting input 0 / Failed 99 / Succeeded 397 at capture time. |
-| Open a task | `Enter` (and a row click) opened the highlighted `gpui/11-verify` run. The pinned header showed status `running`, `repo favetto`, `agent opencode`, `attempt 1`, elapsed time and the live session id. |
+| Open a task | `Enter` (and a row click) opened the highlighted `gpui/11-verify` run. The pinned header showed status `running`, `repo favetto`, `agent opencode`, `attempt 1` and elapsed time. |
 | Switch tabs | Output → Runs both rendered. Output showed the merged live/durable feed (including tool-use rows, or its explicit "No structured output yet" state); Runs showed attempt 1 as running. |
 | Catalog preview | `g c` (and the command palette) opened Catalog with **73 definitions** grouped by repo. The selected `repo:bookman/fx_pr_conflict` preview highlighted its TOML front matter, drew the `---` separator and rendered the Markdown body (headings, lists and fenced code); **Copy** still supplied the raw source. No launch sheet was submitted. |
 | Settings | `Ctrl+,` opened Settings. **Test connection** (`Ctrl+T`) reported `✓ http://127.0.0.1:7878 answered in 1 ms · cwd /home/okno`. Agents listed claude/opencode/pi/vibe as available. |

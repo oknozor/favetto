@@ -40,7 +40,6 @@ pub struct DetailView {
     copy_focus: FocusHandle,
     delete_focus: FocusHandle,
     workflow_focus: FocusHandle,
-    session_focus: FocusHandle,
     runs_retry_focus: FocusHandle,
     error_copy_focus: FocusHandle,
     /// Scroll state for the Runs attempt list.
@@ -68,7 +67,6 @@ impl DetailView {
             retry_focus: cx.focus_handle().tab_index(54).tab_stop(true),
             copy_focus: cx.focus_handle().tab_index(55).tab_stop(true),
             delete_focus: cx.focus_handle().tab_index(49).tab_stop(true),
-            session_focus: cx.focus_handle().tab_index(51).tab_stop(true),
             workflow_focus: cx.focus_handle().tab_index(52).tab_stop(true),
             runs_retry_focus: cx.focus_handle().tab_index(65).tab_stop(true),
             error_copy_focus: cx.focus_handle().tab_index(67).tab_stop(true),
@@ -217,45 +215,6 @@ impl DetailView {
             )
         });
 
-        let session_row = data.session_id.map(|session_id| {
-            let value = session_id.to_string();
-            let copy = components::with_focus(
-                div()
-                    .id("detail-copy-session")
-                    .px(px(theme.spacing.s1))
-                    .rounded(px(theme.radii.r4))
-                    .text_color(theme.colors.muted)
-                    .cursor_pointer()
-                    .track_focus(&self.session_focus)
-                    .hover(|style| style.bg(theme.colors.bg))
-                    .child("copy")
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.state.update(cx, |state, cx| {
-                            state.copy_session_id(value.clone(), cx);
-                            cx.notify();
-                        });
-                    })),
-                theme,
-            );
-            div()
-                .flex()
-                .items_center()
-                .gap(px(theme.spacing.s2))
-                .min_w_0()
-                .text_size(px(theme.font.xs))
-                .text_color(theme.colors.muted)
-                .child("session")
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .font_family("monospace")
-                        .text_color(theme.colors.text)
-                        .child(session_id.to_string()),
-                )
-                .child(copy)
-        });
-
         div()
             .flex()
             .flex_col()
@@ -329,10 +288,7 @@ impl DetailView {
                     .items_center()
                     .gap(px(theme.spacing.s2))
                     .min_w_0()
-                    .when_some(session_row, |row, session| {
-                        row.child(div().flex_1().min_w_0().child(session))
-                    })
-                    .when(data.session_id.is_none(), |row| row.child(div().flex_1()))
+                    .child(div().flex_1())
                     .when_some(interrupt, |row, interrupt| row.child(interrupt))
                     .child(workflow)
                     .child(cancel)
@@ -755,7 +711,6 @@ impl DetailView {
 struct HeaderData<'a> {
     task: &'a Task,
     agent: Option<&'a str>,
-    session_id: Option<&'a str>,
     usage: Option<&'a AgentUsage>,
 }
 
@@ -782,12 +737,11 @@ impl Render for DetailView {
         let theme = self.state.read(cx).theme(window.appearance());
         let narrow = container_query(window.viewport_size().width) == LayoutMode::Narrow;
 
-        let (task, agent, session_id, usage, tab) = {
+        let (task, agent, usage, tab) = {
             let state = self.state.read(cx);
             (
                 state.selected_task().cloned(),
                 state.detail_agent(),
-                state.detail_session_id(),
                 state.detail_usage(),
                 state.detail_tab(),
             )
@@ -815,7 +769,6 @@ impl Render for DetailView {
             HeaderData {
                 task: &task,
                 agent: agent.as_deref(),
-                session_id: session_id.as_deref(),
                 usage: usage.as_ref(),
             },
             narrow,

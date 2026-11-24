@@ -1418,62 +1418,31 @@ impl ConversationPanel {
         let feed_readable = self.state.read(cx).detail().is_some_and(|detail| {
             detail::feed_has_readable_text(&detail::build_feed(&detail.events))
         });
-        let (headline, detail, color) = match restore {
-            SessionRestore::Checking => (
-                "Restoring conversation…".to_string(),
-                "Looking up the agent session associated with this run.".to_string(),
-                theme.colors.muted,
-            ),
-            SessionRestore::Attaching {
-                session_id,
-                agent,
-                live,
-            } => (
-                "Restoring conversation…".to_string(),
-                format!(
-                    "Attaching to session {session_id} ({agent}){}.",
-                    if *live { " · live" } else { "" }
-                ),
-                theme.colors.warning,
-            ),
+        let (headline, color) = match restore {
+            SessionRestore::Checking => ("Restoring conversation…".to_string(), theme.colors.muted),
+            SessionRestore::Attaching { .. } => {
+                ("Restoring conversation…".to_string(), theme.colors.warning)
+            }
             SessionRestore::Restored(restored) => {
-                let identity = format!(
-                    "{} · session {} · {}",
-                    restored.agent,
-                    restored.session_id,
-                    restored.state_label()
-                );
-                if restored.has_transcript() {
-                    (
-                        "Restored conversation".to_string(),
-                        identity,
-                        theme.colors.success,
-                    )
-                } else if feed_readable {
-                    (
-                        "Restored conversation".to_string(),
-                        format!("{identity} · the replay is shown in the feed below."),
-                        theme.colors.success,
-                    )
+                if restored.has_transcript() || feed_readable {
+                    ("Restored conversation".to_string(), theme.colors.success)
                 } else {
                     (
                         "Conversation restored, but it has no readable text yet".to_string(),
-                        format!("{identity} · waiting for the agent's first response."),
                         theme.colors.warning,
                     )
                 }
             }
-            SessionRestore::Unavailable(reason) => (
+            SessionRestore::Unavailable(_) => (
                 "No agent conversation to restore".to_string(),
-                reason.clone(),
                 theme.colors.muted,
             ),
-            SessionRestore::Failed(reason) => (
+            SessionRestore::Failed(_) => (
                 "The agent conversation could not be restored".to_string(),
-                reason.clone(),
                 theme.colors.danger,
             ),
         };
+        let detail = restore_detail_text(restore, feed_readable);
 
         let mut panel = div()
             .id("conversation-restore")
@@ -3234,6 +3203,31 @@ fn at_bottom(scroll: &ScrollHandle) -> bool {
     offset >= max - FOLLOW_THRESHOLD
 }
 
+/// The detail line under the restore banner. The session id is an internal
+/// routing key, so this never includes it.
+fn restore_detail_text(restore: &SessionRestore, feed_readable: bool) -> String {
+    match restore {
+        SessionRestore::Checking => {
+            "Looking up the agent session associated with this run.".to_string()
+        }
+        SessionRestore::Attaching { agent, live, .. } => format!(
+            "Attaching to the {agent} session{}.",
+            if *live { " · live" } else { "" }
+        ),
+        SessionRestore::Restored(restored) => {
+            let identity = format!("{} · {}", restored.agent, restored.state_label());
+            if restored.has_transcript() {
+                identity
+            } else if feed_readable {
+                format!("{identity} · the replay is shown in the feed below.")
+            } else {
+                format!("{identity} · waiting for the agent's first response.")
+            }
+        }
+        SessionRestore::Unavailable(reason) | SessionRestore::Failed(reason) => reason.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3255,5 +3249,28 @@ mod tests {
         };
         let _ = feed_item(theme(), &TextStyle::default(), 0, &row);
         assert!(row.body.is_none());
+    }
+
+    #[test]
+    fn restore_banner_text_never_reveals_the_session_id() {
+        let attaching = SessionRestore::Attaching {
+            session_id: "ses_internal".to_string(),
+            agent: "opencode".to_string(),
+            live: true,
+        };
+        let detail = restore_detail_text(&attaching, false);
+        assert_eq!(detail, "Attaching to the opencode session · live.");
+        assert!(!detail.contains("ses_internal"));
+
+        let restored = SessionRestore::Restored(crate::detail::RestoredSession {
+            session_id: "ses_internal".to_string(),
+            agent: "opencode".to_string(),
+            state: favetto_wire::model::AgentSessionState::Ended,
+            seq: 0,
+            transcript: String::new(),
+        });
+        let detail = restore_detail_text(&restored, false);
+        assert!(detail.starts_with("opencode · ended"), "{detail}");
+        assert!(!detail.contains("ses_internal"));
     }
 }

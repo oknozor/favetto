@@ -31,7 +31,6 @@ pub struct AgentView {
     new_focus: FocusHandle,
     interrupt_focus: FocusHandle,
     close_focus: FocusHandle,
-    copy_focus: FocusHandle,
 }
 
 impl AgentView {
@@ -45,7 +44,6 @@ impl AgentView {
             new_focus: cx.focus_handle().tab_index(41).tab_stop(true),
             interrupt_focus: cx.focus_handle().tab_index(42).tab_stop(true),
             close_focus: cx.focus_handle().tab_index(43).tab_stop(true),
-            copy_focus: cx.focus_handle().tab_index(44).tab_stop(true),
         }
     }
 
@@ -184,45 +182,6 @@ impl AgentView {
             }),
         );
 
-        let session_row = data.session_id.map(|session_id| {
-            let value = session_id.to_string();
-            let copy = components::with_focus(
-                div()
-                    .id("agent-copy-session")
-                    .px(px(theme.spacing.s1))
-                    .rounded(px(theme.radii.r4))
-                    .text_color(theme.colors.muted)
-                    .cursor_pointer()
-                    .track_focus(&self.copy_focus)
-                    .hover(|style| style.bg(theme.colors.bg))
-                    .child("copy")
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.state.update(cx, |state, cx| {
-                            state.copy_session_id(value.clone(), cx);
-                            cx.notify();
-                        });
-                    })),
-                theme,
-            );
-            div()
-                .flex()
-                .items_center()
-                .gap(px(theme.spacing.s2))
-                .min_w_0()
-                .text_size(px(theme.font.xs))
-                .text_color(theme.colors.muted)
-                .child("session")
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .font_family("monospace")
-                        .text_color(theme.colors.text)
-                        .child(session_id.to_string()),
-                )
-                .child(copy)
-        });
-
         let cwd = data
             .cwd
             .map(|path| path.display().to_string())
@@ -311,10 +270,7 @@ impl AgentView {
                     .items_center()
                     .gap(px(theme.spacing.s2))
                     .min_w_0()
-                    .when_some(session_row, |row, session| {
-                        row.child(div().flex_1().min_w_0().child(session))
-                    })
-                    .when(data.session_id.is_none(), |row| row.child(div().flex_1()))
+                    .child(div().flex_1())
                     .when_some(interrupt, |row, interrupt| row.child(interrupt))
                     .when_some(close, |row, close| row.child(close))
                     .child(new),

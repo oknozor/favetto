@@ -242,8 +242,8 @@ The desktop client does not enumerate history. Opening a task issues one
 indexed, task-scoped `tasks.session` lookup; a live associated session is
 attached and an ended, loadable one is restored once with `agents.load`. The
 replayed conversation appears in the task detail's Output surface, labelled with
-its Favetto-local id, agent and state, and a finished run stays finished: the
-restore never starts a session, sends a prompt, retries the task or changes its
+its agent and lifecycle state, and a finished run stays finished: the restore
+never starts a session, sends a prompt, retries the task or changes its
 status/output.
 
 Restoring is durable across daemon restarts and store reopens. The daemon looks

@@ -5261,15 +5261,6 @@ impl ClientState {
         );
     }
 
-    /// Copy the agent's session id (the header's copyable identity).
-    pub fn copy_session_id(&mut self, session_id: String, cx: &mut Context<Self>) {
-        if session_id.is_empty() {
-            return;
-        }
-        cx.write_to_clipboard(ClipboardItem::new_string(session_id));
-        self.show_toast(ToastKind::Success, "Copied the session id.".to_string(), cx);
-    }
-
     /// Cancel/retry/delete for the open detail, with the same confirmation and
     /// validation as the list rows (docs §2, Von Restorff: one visible danger
     /// control).
