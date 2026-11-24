@@ -152,9 +152,15 @@ new session replaces the active one (the previous session is closed). The
 pre-start model field accepts a bare model id or `provider/model`. After start,
 model, thinking level and build/plan mode are changed through the agent's
 advertised config options and modes (`agents.set_option` / `agents.set_mode`);
-the panel does not invent a model selector when the agent advertises none. An
-`agent.exit` push leaves the composer disabled and shows the exit state, and
-**Close** uses `agents.close`.
+the panel does not invent a model selector when the agent advertises none.
+Clicking a selector opens an anchored list of every advertised value, with the
+current value marked by `✓` and any agent-provided group names and descriptions
+shown in place. Choosing a row applies exactly that value (nothing cycles);
+`↑`/`↓`/`Home`/`End` move the highlight, `Enter` applies it and `Esc` closes the
+list without a change. While the call is outstanding the selector is disabled,
+so a stale snapshot cannot re-send a target, and a failure keeps the previous
+value while surfacing the usual error toast. An `agent.exit` push leaves the
+composer disabled and shows the exit state, and **Close** uses `agents.close`.
 
 ## Lifecycle
 
