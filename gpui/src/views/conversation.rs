@@ -31,7 +31,8 @@ use crate::actions::{
 use crate::agent_auth;
 use crate::components;
 use crate::conversation::{
-    Conversation, ConversationTarget, SessionSelect, SessionSelectState, SessionSelectTarget,
+    ActivityIndicator, ActivityTone, Conversation, ConversationTarget, SessionSelect,
+    SessionSelectState, SessionSelectTarget,
 };
 use crate::detail::{
     self, FeedItem, OutputSource, OutputText, PendingRequest, SessionRestore, TaskDetail,
@@ -1400,10 +1401,55 @@ impl ConversationPanel {
         // every body state (loading, error, empty, live feed, raw transcript)
         // instead of being replaced by it.
         column = column.child(div().flex_1().min_h_0().flex().flex_col().child(body));
+        let activity = {
+            let state = self.state.read(cx);
+            state.active_conversation().and_then(|conversation| {
+                conversation
+                    .activity_indicator()
+                    .map(|indicator| (indicator, conversation.target.animation_key()))
+            })
+        };
+        if let Some((indicator, key)) = activity {
+            column = column.child(self.activity_line(theme, &indicator, &key));
+        }
         if let Some(composer) = self.prompt_composer(theme, cx) {
             column = column.child(composer);
         }
         column.into_any_element()
+    }
+
+    /// The pinned "agent is working" line between the feed and the composer. It
+    /// stays visible even when the feed is scrolled off the tail, and reduced
+    /// motion keeps the glyph and label static.
+    fn activity_line(&self, theme: &Theme, indicator: &ActivityIndicator, key: &str) -> Div {
+        let color = match indicator.tone {
+            ActivityTone::Active => theme.colors.accent,
+            ActivityTone::Waiting => theme.colors.warning,
+        };
+        let mut row = div()
+            .flex()
+            .items_center()
+            .gap(px(theme.spacing.s1))
+            .mx(px(theme.spacing.s3))
+            .px(px(theme.spacing.s2))
+            .py(px(theme.spacing.s1))
+            .rounded(px(theme.radii.r4))
+            .border_1()
+            .border_color(Hsla::from(color).opacity(0.35))
+            .bg(Hsla::from(color).opacity(0.08))
+            .text_size(px(theme.font.xs))
+            .text_color(color);
+        row = match indicator.tone {
+            ActivityTone::Active => row.child(components::animated_icon(
+                "◐",
+                true,
+                color,
+                theme.font.xs,
+                components::motion_id("activity-spinner", key),
+            )),
+            ActivityTone::Waiting => row.child("⚠"),
+        };
+        row.child(indicator.label.clone())
     }
 
     /// A read-only banner/transcript for the task-scoped agent conversation.
@@ -1444,6 +1490,17 @@ impl ConversationPanel {
         };
         let detail = restore_detail_text(restore, feed_readable);
 
+        let restoring = matches!(
+            restore,
+            SessionRestore::Checking | SessionRestore::Attaching { .. }
+        );
+        let restore_key = self
+            .state
+            .read(cx)
+            .active_conversation()
+            .map(|conversation| conversation.target.animation_key())
+            .unwrap_or_else(|| "restore".to_string());
+
         let mut panel = div()
             .id("conversation-restore")
             .flex()
@@ -1462,7 +1519,13 @@ impl ConversationPanel {
                     .text_size(px(theme.font.xs))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(color)
-                    .child("●")
+                    .child(components::animated_icon(
+                        "●",
+                        restoring,
+                        color,
+                        theme.font.xs,
+                        components::motion_id("restore-spinner", &restore_key),
+                    ))
                     .child(headline),
             )
             .child(
@@ -1937,7 +2000,15 @@ impl ConversationPanel {
                     .active_conversation()
                     .map(Conversation::feed)
                     .unwrap_or_default(),
-                OutputSource::Summary => summary.map(detail::summary_feed).unwrap_or_default(),
+                OutputSource::Summary => summary
+                    .map(|summary| {
+                        self.state
+                            .read(cx)
+                            .active_conversation()
+                            .map(|conversation| conversation.summary_feed(summary))
+                            .unwrap_or_else(|| detail::summary_feed(summary))
+                    })
+                    .unwrap_or_default(),
                 OutputSource::Plain => Vec::new(),
             };
 
@@ -1951,9 +2022,9 @@ impl ConversationPanel {
                 .into_iter()
                 .map(|item| {
                     let body = match &item {
-                        FeedItem::Message { text, .. } | FeedItem::Reasoning { text, .. } => {
-                            Some(markdown.doc(text))
-                        }
+                        FeedItem::Message { text, .. }
+                        | FeedItem::Reasoning { text, .. }
+                        | FeedItem::OutgoingUser { text, .. } => Some(markdown.doc(text)),
                         _ => None,
                     };
                     FeedRow { item, body }
@@ -2893,6 +2964,45 @@ fn feed_item(theme: &Theme, base: &TextStyle, index: usize, row: &FeedRow) -> Di
                     MessageRole::System | MessageRole::Tool => theme.colors.muted,
                 })
                 .child(role_label(*role));
+            let body = match row.body.as_deref() {
+                Some(doc) => markdown_view::markdown_body(
+                    theme,
+                    base,
+                    doc,
+                    Tone::Prose,
+                    index as u64 * markdown_view::MARKDOWN_ROW_STRIDE,
+                ),
+                None => div()
+                    .text_size(px(theme.font.sm))
+                    .text_color(theme.colors.text)
+                    .child(text.clone()),
+            };
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(header)
+                .child(body)
+        }
+        FeedItem::OutgoingUser { text, state } => {
+            let header = div()
+                .flex()
+                .items_center()
+                .gap(px(theme.spacing.s1))
+                .text_size(px(theme.font.xs))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.colors.success)
+                .child("user")
+                .child(
+                    div()
+                        .text_size(px(theme.font.xs))
+                        .font_weight(gpui::FontWeight::NORMAL)
+                        .text_color(theme.colors.muted)
+                        .child(match state {
+                            crate::conversation::OutgoingState::Sending => "· sending…",
+                            crate::conversation::OutgoingState::Sent => "· sent",
+                        }),
+                );
             let body = match row.body.as_deref() {
                 Some(doc) => markdown_view::markdown_body(
                     theme,

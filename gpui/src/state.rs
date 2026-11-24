@@ -21,9 +21,9 @@ use std::time::Duration;
 
 use favetto_wire::elicitation::ElicitationReply;
 use favetto_wire::model::{
-    AgentAuthState, AgentAuthStatus, AgentCatalogEntry, AgentCommand, AgentPlanEntry,
-    AgentSessionInfo, AgentUsage, EventKind, InputReply, RepoInfo, SessionConfigOption,
-    SessionConfigValue, SessionModes, Task, TaskStatus,
+    AgentActivity, AgentAuthState, AgentAuthStatus, AgentCatalogEntry, AgentCommand,
+    AgentPlanEntry, AgentSessionInfo, AgentUsage, EventKind, InputReply, RepoInfo,
+    SessionConfigOption, SessionConfigValue, SessionModes, Task, TaskStatus,
 };
 use favetto_wire::Timestamp;
 use gpui::{ClipboardItem, Context, FocusHandle, Task as GpuiTask, WindowAppearance};
@@ -607,8 +607,29 @@ impl ClientState {
                         self.refresh_snapshot();
                     }
                     // A blocked or resolved prompt changes the agent roster,
-                    // which only `agents.list` can reconcile.
-                    Push::AgentState(_) => self.refresh_snapshot(),
+                    // which only `agents.list` can reconcile. Apply the activity
+                    // locally first so the spinner is immediate, then refresh.
+                    Push::AgentState(state) => {
+                        let sessions = self.sessions.clone();
+                        if let Some(detail) = self.detail.as_mut() {
+                            if detail
+                                .conversation
+                                .owns_session(&state.session_id, &sessions)
+                            {
+                                detail.conversation.apply_activity(state.activity.clone());
+                            }
+                        }
+                        if self
+                            .standalone
+                            .conversation
+                            .owns_session(&state.session_id, &sessions)
+                        {
+                            self.standalone
+                                .conversation
+                                .apply_activity(state.activity.clone());
+                        }
+                        self.refresh_snapshot();
+                    }
                     // The definition files changed on disk: reload the list and
                     // drop the cached source so the preview shows the new text.
                     Push::CatalogUpdated => {
@@ -633,6 +654,8 @@ impl ClientState {
                     }
                     Push::AgentExit(exit) => {
                         let stopped = self.standalone.record_exit(exit.clone());
+                        self.standalone.conversation.activity = None;
+                        self.standalone.conversation.turn_pending = false;
                         if stopped {
                             self.refresh_snapshot();
                         }
@@ -685,11 +708,13 @@ impl ClientState {
                 let sessions = self.sessions.clone();
                 if let Some(detail) = self.detail.as_mut() {
                     detail.sync_elicitation(&sessions);
+                    detail.conversation.sync_activity(&sessions);
                 }
                 self.sync_standalone_default_agent();
                 let standalone_session = self.active_agent_session().cloned();
                 self.standalone.sync_status(standalone_session.as_ref());
                 self.standalone.conversation.sync_elicitation(&sessions);
+                self.standalone.conversation.sync_activity(&sessions);
                 // The Workflows root list is derived from this same snapshot,
                 // so a recovered daemon fills it without another RPC. The open
                 // root re-joins its dependency labels against the new rows.
@@ -1168,32 +1193,28 @@ impl ClientState {
                 prompt,
                 result,
             } => {
-                if let Some(detail) = self.detail.as_mut() {
-                    if detail
-                        .events_session
-                        .as_deref()
-                        .is_none_or(|id| id == session_id)
-                    {
-                        detail.prompt_sending = false;
-                    }
-                }
-                if self.standalone.conversation.is_session(&session_id) {
-                    self.standalone.conversation.prompt_sending = false;
-                }
+                let sessions = self.sessions.clone();
+                let task_owned = self.detail.as_ref().is_some_and(|detail| {
+                    detail
+                        .conversation
+                        .owns_prompt_reply(&session_id, &sessions)
+                });
+                let agent_owned = self
+                    .standalone
+                    .conversation
+                    .owns_prompt_reply(&session_id, &sessions);
                 match result {
                     Ok(result) if result.accepted => {
-                        let mut task_accepted = false;
-                        if let Some(detail) = self.detail.as_mut() {
-                            if detail.conversation.is_session(&session_id) {
-                                detail.conversation.clear_prompt();
-                                task_accepted = true;
+                        if task_owned {
+                            if let Some(detail) = self.detail.as_mut() {
+                                detail.conversation.accept_prompt();
                             }
                         }
-                        if self.standalone.conversation.is_session(&session_id) {
-                            self.standalone.conversation.clear_prompt();
+                        if agent_owned {
+                            self.standalone.conversation.accept_prompt();
                         }
                         // Pull the first plan/command snapshot for the new turn.
-                        if task_accepted {
+                        if task_owned {
                             if let (Some(runtime), Some(task_id), Some(after)) = (
                                 &self.runtime,
                                 self.detail.as_ref().map(|detail| detail.task_id),
@@ -1204,17 +1225,15 @@ impl ClientState {
                         }
                     }
                     Ok(_) => {
-                        if self
-                            .detail
-                            .as_ref()
-                            .is_some_and(|detail| detail.conversation.is_session(&session_id))
-                        {
+                        if task_owned {
                             if let Some(detail) = self.detail.as_mut() {
+                                detail.conversation.fail_prompt();
                                 detail.prompt_error =
                                     Some("The daemon did not accept the prompt.".to_string());
                             }
                         }
-                        if self.standalone.conversation.is_session(&session_id) {
+                        if agent_owned {
+                            self.standalone.conversation.fail_prompt();
                             self.standalone.conversation.prompt_error =
                                 Some("The daemon did not accept the prompt.".to_string());
                         }
@@ -1230,10 +1249,14 @@ impl ClientState {
                                 token_path: self.config.token_source.label(),
                             };
                         }
-                        if let Some(detail) = self.detail.as_mut() {
-                            detail.prompt_error = Some(error.to_string());
+                        if task_owned {
+                            if let Some(detail) = self.detail.as_mut() {
+                                detail.conversation.fail_prompt();
+                                detail.prompt_error = Some(error.to_string());
+                            }
                         }
-                        if self.standalone.conversation.is_session(&session_id) {
+                        if agent_owned {
+                            self.standalone.conversation.fail_prompt();
                             self.standalone.conversation.prompt_error = Some(error.to_string());
                         }
                         let _ = prompt;
@@ -4747,6 +4770,37 @@ impl ClientState {
         })
     }
 
+    /// The live activity for the selected run's agent, from the roster or the
+    /// locally applied push. `None` once the run is terminal or idle.
+    pub fn detail_agent_activity(&self) -> Option<AgentActivity> {
+        if self.active_route == Route::Agent {
+            return self
+                .standalone
+                .conversation
+                .activity
+                .clone()
+                .filter(|activity| {
+                    !matches!(activity, AgentActivity::Idle | AgentActivity::Exited { .. })
+                });
+        }
+        let task_id = self.selected_task?;
+        let task_id = task_id.to_string();
+        let from_session = self
+            .sessions
+            .iter()
+            .find(|session| session.task_id.as_deref() == Some(task_id.as_str()))
+            .and_then(|session| session.activity.clone());
+        from_session
+            .or_else(|| {
+                self.detail
+                    .as_ref()
+                    .and_then(|detail| detail.conversation.activity.clone())
+            })
+            .filter(|activity| {
+                !matches!(activity, AgentActivity::Idle | AgentActivity::Exited { .. })
+            })
+    }
+
     /// The agent's own session id, from whichever source has it.
     pub fn detail_session_id(&self) -> Option<String> {
         let detail = self.detail.as_ref()?;
@@ -5104,14 +5158,13 @@ impl ClientState {
             return;
         };
         if let Some(conversation) = self.active_conversation_mut() {
-            conversation.prompt_sending = true;
-            conversation.prompt_error = None;
+            conversation.queue_prompt(prompt.clone(), session_id.clone());
         }
         match &self.runtime {
             Some(runtime) => runtime.prompt(session_id, prompt),
             None => {
                 if let Some(conversation) = self.active_conversation_mut() {
-                    conversation.prompt_sending = false;
+                    conversation.fail_prompt();
                     conversation.prompt_error = Some("The transport is not running.".to_string());
                 }
                 self.show_toast(

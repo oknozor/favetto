@@ -55,6 +55,7 @@ impl AgentView {
         label: &'static str,
         danger: bool,
         enabled: bool,
+        spinning: bool,
         focus: &FocusHandle,
         on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
     ) -> Stateful<Div> {
@@ -63,6 +64,13 @@ impl AgentView {
         } else {
             theme.colors.text
         };
+        let spinner = components::animated_icon(
+            "◐",
+            spinning,
+            theme.colors.accent,
+            theme.font.xs,
+            components::motion_id("agent-action-spinner", id),
+        );
         components::with_focus(
             div()
                 .id(id)
@@ -70,6 +78,7 @@ impl AgentView {
                 .flex()
                 .items_center()
                 .h(px(theme.controls.min))
+                .gap(px(theme.spacing.s1))
                 .px(px(theme.spacing.s2))
                 .rounded(px(theme.radii.r4))
                 .border_1()
@@ -93,6 +102,7 @@ impl AgentView {
                         .opacity(0.55)
                         .cursor_default()
                 })
+                .when(spinning, |button| button.child(spinner))
                 .child(label),
             theme,
         )
@@ -106,7 +116,7 @@ impl AgentView {
         cx: &mut Context<Self>,
     ) -> Div {
         let (status, color) = if data.starting {
-            ("starting".to_string(), theme.colors.accent)
+            ("starting…".to_string(), theme.colors.accent)
         } else if let Some(exit) = data.exit {
             let code = exit
                 .code
@@ -126,14 +136,20 @@ impl AgentView {
             .and_then(|usage| detail::usage_summary(Some(usage)));
         let live = data.session.is_some_and(|session| session.running) && data.exit.is_none();
         let busy = data.starting || data.closing;
+        let cancel_pending = self.state.read(cx).detail_turn_cancel_pending();
 
         let interrupt = live.then(|| {
             self.button(
                 theme,
                 "agent-interrupt",
-                "Interrupt turn",
+                if cancel_pending {
+                    "Interrupting…"
+                } else {
+                    "Interrupt turn"
+                },
                 false,
                 !busy,
+                cancel_pending,
                 &self.interrupt_focus,
                 cx.listener(|this, _event, _window, cx| {
                     this.state.update(cx, |state, cx| {
@@ -150,6 +166,7 @@ impl AgentView {
                 if data.closing { "Closing…" } else { "Close" },
                 true,
                 !busy,
+                data.closing,
                 &self.close_focus,
                 cx.listener(|this, _event, _window, cx| {
                     this.state.update(cx, |state, cx| {
@@ -169,6 +186,7 @@ impl AgentView {
             },
             false,
             !busy,
+            false,
             if data.session_id.is_some() {
                 &self.new_focus
             } else {
@@ -216,7 +234,16 @@ impl AgentView {
                             .bg(Hsla::from(color).opacity(0.12))
                             .text_size(px(theme.font.xs))
                             .text_color(color)
-                            .child("✦")
+                            .child(components::animated_icon(
+                                "✦",
+                                data.starting,
+                                color,
+                                theme.font.xs,
+                                components::motion_id(
+                                    "agent-header-spinner",
+                                    data.session_id.unwrap_or("agent"),
+                                ),
+                            ))
                             .child(status),
                     )
                     .child(
@@ -605,9 +632,10 @@ impl Render for AgentView {
         });
 
         let empty = if starting {
-            Some(components::empty_state(
+            Some(components::animated_empty_state(
                 theme,
                 "◐",
+                true,
                 "AGENT",
                 "Starting the session…",
                 "The daemon is opening the agent in the active repository's main checkout.",

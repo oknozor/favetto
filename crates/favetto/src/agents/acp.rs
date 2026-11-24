@@ -1770,8 +1770,11 @@ pub(crate) fn spawn(
                         };
 
                         // A new prompt is a new turn: cancellation reset here,
-                        // never at connection lifetime.
+                        // never at connection lifetime. Publish the turn start
+                        // so clients can paint "Thinking" before the first
+                        // thought/tool/text event arrives.
                         prompt_turn.lock().begin();
+                        let _ = events_tx.send(AcpEvent::State(AgentStateEvent::TurnStarted));
                         let response = connection
                             .send_request(PromptRequest::new(
                                 session_id.clone(),
