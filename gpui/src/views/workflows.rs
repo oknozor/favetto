@@ -1,5 +1,5 @@
-//! Workflows: the roots seen in the task snapshot, one root's runtime
-//! instances as a left-to-right DAG, and the catalog DAG source.
+//! Workflows: the roots seen in the task snapshot and one root's runtime
+//! instances as a left-to-right DAG.
 //!
 //! The aggregation, edge derivation, pure layout, progress and optimistic
 //! action state live in [`crate::workflow`] (pure and unit-tested); this file
@@ -8,9 +8,7 @@
 //! (docs §2, Working Memory).
 //!
 //! Nodes are live task instances, not catalog definitions: a `needs`
-//! successor appears once the daemon creates it. The catalog DOT panel stays
-//! collapsed by default because it describes the definition graph, not this
-//! run.
+//! successor appears once the daemon creates it.
 
 use gpui::{
     canvas, div, point, prelude::*, px, AnyElement, Context, Div, ElementId, Entity, FocusHandle,
@@ -23,9 +21,7 @@ use crate::launch::{self, LaunchFailure};
 use crate::routes::Route;
 use crate::state::{ClientState, SnapshotStatus};
 use crate::theme::Theme;
-use crate::workflow::{
-    self, WorkflowDetail, WorkflowGraphLayout, WorkflowGraphState, WorkflowNode, WorkflowRow,
-};
+use crate::workflow::{self, WorkflowDetail, WorkflowGraphLayout, WorkflowNode, WorkflowRow};
 
 /// The stable key of one laid-out root: used to memoize the pure layout and to
 /// remember which node was last scrolled into view.
@@ -46,21 +42,14 @@ pub struct WorkflowsView {
     state: Entity<ClientState>,
     roots_scroll: ScrollHandle,
     graph_scroll: ScrollHandle,
-    dot_scroll: ScrollHandle,
     root_scrolled_to: Option<uuid::Uuid>,
     graph_scrolled_to: Option<(uuid::Uuid, uuid::Uuid)>,
     /// Memoized layout: animation frames never re-run the placement pass.
     graph_cache: Option<(GraphSignature, WorkflowGraphLayout)>,
     refresh_focus: FocusHandle,
     cancel_focus: FocusHandle,
-    copy_focus: FocusHandle,
-    dot_toggle_focus: FocusHandle,
     retry_focus: FocusHandle,
-    graph_retry_focus: FocusHandle,
     error_copy_focus: FocusHandle,
-    /// The catalog DOT panel starts collapsed so the runtime graph owns the
-    /// body; the toggle still reveals the catalog source.
-    show_dot: bool,
 }
 
 impl WorkflowsView {
@@ -70,7 +59,6 @@ impl WorkflowsView {
             state,
             roots_scroll: ScrollHandle::new(),
             graph_scroll: ScrollHandle::new(),
-            dot_scroll: ScrollHandle::new(),
             root_scrolled_to: None,
             graph_scrolled_to: None,
             graph_cache: None,
@@ -78,10 +66,6 @@ impl WorkflowsView {
             cancel_focus: cx.focus_handle().tab_index(21).tab_stop(true),
             retry_focus: cx.focus_handle().tab_index(22).tab_stop(true),
             error_copy_focus: cx.focus_handle().tab_index(23).tab_stop(true),
-            copy_focus: cx.focus_handle().tab_index(24).tab_stop(true),
-            dot_toggle_focus: cx.focus_handle().tab_index(25).tab_stop(true),
-            graph_retry_focus: cx.focus_handle().tab_index(26).tab_stop(true),
-            show_dot: false,
         }
     }
 
@@ -1095,169 +1079,6 @@ impl WorkflowsView {
             }))
     }
 
-    fn dot_panel(&self, theme: &Theme, graph: &WorkflowGraphState, cx: &mut Context<Self>) -> Div {
-        let copy = components::with_focus(
-            div()
-                .id("workflow-copy-dot")
-                .flex()
-                .items_center()
-                .h(px(theme.controls.min))
-                .px(px(theme.spacing.s2))
-                .rounded(px(theme.radii.r4))
-                .border_1()
-                .border_color(theme.colors.border)
-                .text_size(px(theme.font.xs))
-                .text_color(theme.colors.text)
-                .cursor_pointer()
-                .track_focus(&self.copy_focus)
-                .child("Copy DOT")
-                .on_click(cx.listener(|this, _event, _window, cx| {
-                    this.state.update(cx, |state, cx| {
-                        state.copy_workflow_dot(cx);
-                        cx.notify();
-                    });
-                })),
-            theme,
-        );
-
-        let toggle = components::with_focus(
-            div()
-                .id("workflow-toggle-dot")
-                .flex()
-                .items_center()
-                .h(px(theme.controls.min))
-                .px(px(theme.spacing.s2))
-                .rounded(px(theme.radii.r4))
-                .text_size(px(theme.font.xs))
-                .text_color(theme.colors.muted)
-                .cursor_pointer()
-                .track_focus(&self.dot_toggle_focus)
-                .hover(|style| style.bg(theme.colors.bg))
-                .child(if self.show_dot { "Hide" } else { "Show" })
-                .on_click(cx.listener(|this, _event, _window, cx| {
-                    this.show_dot = !this.show_dot;
-                    cx.notify();
-                })),
-            theme,
-        );
-
-        let header = div()
-            .flex()
-            .items_center()
-            .gap(px(theme.spacing.s2))
-            .px(px(theme.spacing.s3))
-            .py(px(theme.spacing.s2))
-            .border_b_1()
-            .border_color(theme.colors.border)
-            .child(components::section_label(theme, "CATALOG DAG SOURCE"))
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .font_family("monospace")
-                    .text_size(px(theme.font.xs))
-                    .text_color(theme.colors.muted)
-                    .child(graph.path_label().to_string()),
-            )
-            .child(div().flex_1())
-            .when(self.show_dot && !graph.dot.is_empty(), |header| {
-                header.child(copy)
-            })
-            .child(toggle);
-
-        let mut panel = div()
-            .flex()
-            .flex_col()
-            .flex_shrink_0()
-            .max_h(px(if self.show_dot { 240.0 } else { 44.0 }))
-            .border_t_1()
-            .border_color(theme.colors.border)
-            .bg(theme.colors.bg)
-            .child(header);
-
-        if !self.show_dot {
-            return panel;
-        }
-
-        panel = panel.child(
-            div()
-                .px(px(theme.spacing.s3))
-                .py(px(2.0))
-                .text_size(px(theme.font.xs))
-                .text_color(theme.colors.muted)
-                .child(WorkflowGraphState::LEGEND),
-        );
-
-        let body: AnyElement = if graph.dot.is_empty() {
-            if let Some(error) = &graph.error {
-                self.graph_error(theme, error, cx).into_any_element()
-            } else if graph.loading {
-                hint(theme, "Reading workflow.get…").into_any_element()
-            } else {
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .child(
-                        div()
-                            .text_size(px(theme.font.sm))
-                            .text_color(theme.colors.text)
-                            .child("The catalog has no task definitions yet."),
-                    )
-                    .child(hint(
-                        theme,
-                        "The DOT source appears once the daemon discovers definitions.",
-                    ))
-                    .into_any_element()
-            }
-        } else {
-            div()
-                .id("workflow-dot")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .track_scroll(&self.dot_scroll)
-                .p(px(theme.spacing.s3))
-                .font_family("monospace")
-                .text_size(px(theme.font.xs))
-                .text_color(theme.colors.text)
-                .whitespace_normal()
-                .child(graph.dot.clone())
-                .into_any_element()
-        };
-
-        panel.child(div().flex_1().min_h_0().p(px(theme.spacing.s2)).child(body))
-    }
-
-    fn graph_error(&self, theme: &Theme, message: &str, cx: &mut Context<Self>) -> Div {
-        div()
-            .flex()
-            .items_center()
-            .gap(px(theme.spacing.s2))
-            .child(
-                div()
-                    .text_color(theme.colors.danger)
-                    .text_size(px(theme.font.xs))
-                    .child("⚠"),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_size(px(theme.font.xs))
-                    .text_color(theme.colors.text)
-                    .child(format!("workflow.get failed: {message}")),
-            )
-            .child(self.error_copy_button(theme, message, "workflow-graph-error-copy", cx))
-            .child(self.retry_button(
-                theme,
-                "workflow-retry-graph",
-                "Retry",
-                &self.graph_retry_focus,
-                cx,
-            ))
-    }
-
     fn empty_detail(&self, theme: &Theme) -> Div {
         div()
             .flex_1()
@@ -1384,13 +1205,12 @@ impl WorkflowsView {
 impl Render for WorkflowsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.state.read(cx).theme(window.appearance());
-        let (roots, selected, detail, graph, snapshot_status, has_snapshot, launch_failures) = {
+        let (roots, selected, detail, snapshot_status, has_snapshot, launch_failures) = {
             let state = self.state.read(cx);
             (
                 state.workflow_roots(),
                 state.selected_workflow_root(),
                 state.workflow_detail().cloned(),
-                state.workflow_graph().clone(),
                 state.snapshot_status().clone(),
                 state.has_snapshot_data(),
                 state.launch_failures(),
@@ -1499,7 +1319,6 @@ impl Render for WorkflowsView {
             } else {
                 column = column.child(self.graph_body(theme, &detail, &layout, cx));
             }
-            column = column.child(self.dot_panel(theme, &graph, cx));
             column.into_any_element()
         };
 

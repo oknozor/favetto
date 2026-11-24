@@ -230,12 +230,9 @@ node detail. The same actions are available as buttons. Running nodes spin the
 status glyph; awaiting nodes get a small repeating attention pulse;
 `FAVETTO_REDUCE_MOTION=1` (or the GTK setting) renders the same static icon and
 label, and no frames are requested when nothing is active. **Refresh** (or the
-palette's Refresh data) reloads the
-inspect and the DAG source. Cancel marks every non-terminal row immediately and
-retry moves its row back to pending, then both reconcile with the RPC response
-and the next `task.updated` push. `workflow.get` remains available as readable
-DOT in a collapsed-by-default monospace panel with a one-line edge legend and
-**Copy DOT** (no Graphviz binary is embedded).
+palette's Refresh data) reloads the inspect. Cancel marks every non-terminal row
+immediately and retry moves its row back to pending, then both reconcile with
+the RPC response and the next `task.updated` push.
 
 The Schedules surface (`g s`) lists `schedules.list` as a table of enabled
 state, cron expression, task and the daemon-computed next run (absolute UTC plus
@@ -353,8 +350,8 @@ field blank keeps the shared token file.
 - `src/workflow.rs` — the pure Workflows model: roots grouped by
   `root_or_self`, parent edges joined from the cached task rows, the
   deterministic cycle-safe left-to-right layout, graph-ordered selection,
-  `done / total` progress, optimistic cancel/retry state and the `workflow.get`
-  source model. Unit-tested without a window.
+  `done / total` progress and optimistic cancel/retry state. Unit-tested
+  without a window.
 - `src/schedules.rs` — the pure Schedules model: cron normalization/validation
   with the daemon's parser configuration, plain-language cadence and next-fire
   hints, the sorted table, the create/edit sheet and the delete confirmation.
@@ -594,10 +591,6 @@ Deviations from the plan are recorded in this file as the chain progresses
   the graph scrolls. The head is muted with the stroke, or accent when the
   child is selected; its geometry lives in a pure `edge_geometry` helper so it
   is unit-tested without a window.
-- **DAG source, not Graphviz.** `workflow.get` is a catalog-wide DOT string, so
-  it stays available as readable monospace source in a collapsed-by-default
-  panel with a short spawn/needs/join legend, **Copy DOT**, selectable text and
-  a toggle. No Graphviz binary or DOT parser is embedded.
 - **Only failed instances retry from Workflows.** `r` and the detail panel's
   Retry call `workflow.retry` for a `failed` row; succeeded/cancelled rows stay
   retryable from the Tasks surface, which already has the broader terminal rule.
@@ -621,8 +614,8 @@ Deviations from the plan are recorded in this file as the chain progresses
   there. A snapshot with no roots shows the route's empty state, never a blank
   panel.
 - **No embedded root graph renderer for the catalog.** The runtime instances are
-  a drawn DAG; `workflow.get` (the catalog definition graph) remains DOT source
-  in a collapsed panel. No Graphviz binary or DOT parser is embedded.
+  a drawn DAG; the catalog definition graph is not rendered in the Workflows
+  surface. No Graphviz binary or DOT parser is embedded.
 
 ### Step 09 deviations / additions
 
@@ -789,7 +782,7 @@ path remains covered by the step-05 live RPC check and its unit tests.
 - **No accessibility tree in this GPUI build.** Widget roles/names are not
   exposed to AT-SPI; the guarantees are visual labels, focus order, keyboard
   operation and target sizes.
-- **Selection is per rendered region.** Output, source, DOT and errors are
+- **Selection is per rendered region.** Output, source and errors are
   selectable, and copy buttons exist for whole messages, code blocks and error
   banners. A drag cannot span two separate Markdown blocks or an off-screen row
   in the virtualized feed; use the message/code copy controls for those cases.
@@ -799,7 +792,8 @@ path remains covered by the step-05 live RPC check and its unit tests.
   and cannot be restored.
 - **No IME marked-text composition.** Typed characters are appended at the end;
   cursor movement inside a field is not implemented.
-- **No embedded Graphviz.** `workflow.get` is readable DOT source.
+- **No embedded Graphviz.** The Workflows graph is drawn by the client from
+  `workflow.inspect`; the catalog's raw DOT is not rendered.
 - **No daemon version.** `system.ping` does not report one; Settings says so.
 - **No container queries.** The responsive breakpoint reads the window width.
 - **Scrollbars are drawn by the client.** The pinned `gpui 0.2.2` paints no

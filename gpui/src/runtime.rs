@@ -37,8 +37,8 @@ use favetto_wire::rpc::{
     PingResult, ReposActivateParams, ReposListResult, ScheduleDeleteParams, ScheduleUpsertParams,
     SchedulesDeleteResult, SessionIdParams, StartAgentParams, StartOneshotParams,
     StartOneshotResult, TaskIdParams, TasksDeleteResult, TasksEventsParams, TasksListParams,
-    TasksSessionResult, TasksStartParams, WorkflowCancelResultBody, WorkflowGetResult,
-    WorkflowInspectParams, WorkflowRetryParams,
+    TasksSessionResult, TasksStartParams, WorkflowCancelResultBody, WorkflowInspectParams,
+    WorkflowRetryParams,
 };
 use favetto_wire::workflow::WorkflowInspect;
 use uuid::Uuid;
@@ -156,8 +156,6 @@ pub enum Command {
     Logout { session_id: String },
     /// Fetch one root's runtime workflow graph (`workflow.inspect`).
     LoadWorkflowInspect { root_id: Uuid },
-    /// Fetch the catalog DAG source (`workflow.get`).
-    LoadWorkflowGraph,
     /// Cancel every non-terminal instance under a root (`workflow.cancel`).
     CancelWorkflow { root_id: Uuid },
     /// Re-enqueue one terminal instance (`workflow.retry`).
@@ -350,10 +348,6 @@ pub enum Update {
     },
     /// `workflow.inspect` failed for one root.
     WorkflowInspectFailed { root_id: Uuid, error: ClientError },
-    /// `workflow.get` completed (DOT source, path and structured graph).
-    WorkflowGraphLoaded { result: Box<WorkflowGetResult> },
-    /// `workflow.get` failed.
-    WorkflowGraphFailed { error: ClientError },
     /// `workflow.cancel` completed for the root.
     WorkflowCancelFinished {
         root_id: Uuid,
@@ -671,11 +665,6 @@ impl Runtime {
         self.send(Command::LoadWorkflowInspect { root_id });
     }
 
-    /// Fetch the catalog DAG source.
-    pub fn load_workflow_graph(&self) {
-        self.send(Command::LoadWorkflowGraph);
-    }
-
     /// Cancel the non-terminal instances under a root.
     pub fn cancel_workflow(&self, root_id: Uuid) {
         self.send(Command::CancelWorkflow { root_id });
@@ -951,9 +940,6 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
             }
             Command::LoadWorkflowInspect { root_id } => {
                 spawn_workflow_inspect(client.clone(), updates.clone(), root_id);
-            }
-            Command::LoadWorkflowGraph => {
-                spawn_workflow_graph(client.clone(), updates.clone());
             }
             Command::CancelWorkflow { root_id } => {
                 spawn_workflow_cancel(client.clone(), updates.clone(), root_id);
@@ -1588,19 +1574,6 @@ fn spawn_workflow_inspect(client: Arc<RpcClient>, updates: Sender<Update>, root_
                 view: Box::new(view),
             },
             Err(error) => Update::WorkflowInspectFailed { root_id, error },
-        };
-        let _ = updates.try_send(update);
-    });
-}
-
-/// Spawn one `workflow.get` for the catalog DAG source panel.
-fn spawn_workflow_graph(client: Arc<RpcClient>, updates: Sender<Update>) {
-    tokio::spawn(async move {
-        let update = match client.workflow_get(EmptyParams {}).await {
-            Ok(result) => Update::WorkflowGraphLoaded {
-                result: Box::new(result),
-            },
-            Err(error) => Update::WorkflowGraphFailed { error },
         };
         let _ = updates.try_send(update);
     });

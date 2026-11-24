@@ -278,8 +278,6 @@ typed_calls! {
     agents_authenticate => AgentsAuthenticateCall,
     /// `agents.logout`.
     agents_logout => AgentsLogoutCall,
-    /// `workflow.get`.
-    workflow_get => WorkflowGetCall,
     /// `workflow.inspect`.
     workflow_inspect => WorkflowInspectCall,
     /// `workflow.cancel`.
@@ -474,7 +472,6 @@ mod tests {
     fn workflow_requests_carry_the_root_or_task_id() {
         let root_id = uuid::Uuid::from_u128(7);
         let task_id = uuid::Uuid::from_u128(8);
-        let graph = encode_request::<WorkflowGetCall>(1, &EmptyParams {}).expect("encode get");
         let inspect = encode_request::<WorkflowInspectCall>(2, &WorkflowInspectParams { root_id })
             .expect("encode inspect");
         let cancel = encode_request::<WorkflowCancelCall>(3, &WorkflowInspectParams { root_id })
@@ -483,7 +480,6 @@ mod tests {
             .expect("encode retry");
 
         for (bytes, method_name) in [
-            (graph, method::WORKFLOW_GET),
             (inspect, method::WORKFLOW_INSPECT),
             (cancel, method::WORKFLOW_CANCEL),
             (retry, method::WORKFLOW_RETRY),
