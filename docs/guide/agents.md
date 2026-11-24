@@ -162,6 +162,18 @@ so a stale snapshot cannot re-send a target, and a failure keeps the previous
 value while surfacing the usual error toast. An `agent.exit` push leaves the
 composer disabled and shows the exit state, and **Close** uses `agents.close`.
 
+The panel routes only the selected session's structured events, permissions and
+elicitations. A task launched from the Agent panel runs its own headless ACP
+session; that session's events never enter the panel's feed. **Sessions** (`s`)
+opens an on-demand switcher merging live/retained `agents.list` rows with
+durable `agents.history`. Selecting a live row reattaches it with
+`agents.attach`; selecting an ended, loadable row restores it with
+`agents.load`. Switching never starts, closes or retries a session, and a
+bounded per-session cache preserves each visited conversation's feed, activity
+and composer draft. Rows that are failed, loading or not loadable are disabled
+with the reason inline, and the current session is marked rather than offered
+as a switch target.
+
 ## Lifecycle
 
 Agents launch through a small supervisor (`favetto __agent-exec`) that owns a
@@ -238,13 +250,14 @@ loadable row previews its local id, agent, title, directory and state, then
 loads when selected. Rows that are loading, failed, or cannot be loaded explain
 why and do nothing rather than opening a blank session.
 
-The desktop client does not enumerate history. Opening a task issues one
-indexed, task-scoped `tasks.session` lookup; a live associated session is
-attached and an ended, loadable one is restored once with `agents.load`. The
-replayed conversation appears in the task detail's Output surface, labelled with
-its agent and lifecycle state, and a finished run stays finished: the restore
-never starts a session, sends a prompt, retries the task or changes its
-status/output.
+The desktop client now enumerates history on demand from the Agent surface's
+**Sessions** menu (`agents.history` merged with `agents.list`). Opening a task
+still issues one indexed, task-scoped `tasks.session` lookup; a live associated
+session is attached and an ended, loadable one is restored once with
+`agents.load`. The replayed conversation appears in the task detail's Output
+surface, labelled with its agent and lifecycle state, and a finished run stays
+finished: the restore never starts a session, sends a prompt, retries the task
+or changes its status/output.
 
 Restoring is durable across daemon restarts and store reopens. The daemon looks
 up the stored ACP id from its own record, passes it to `session/load`, and keeps
@@ -292,8 +305,10 @@ is refused; close its local session first.
 The TUI **Ctrl+O** picker shows both local and provider rows. Provider rows are
 labelled `provider`; they can be resumed when load/resume is advertised and
 deleted (Ctrl+D in the TUI) when delete is advertised. Unsupported actions are
-absent or disabled with an inline explanation. The desktop client does not list
-either kind: it restores only the session associated with the task being opened.
+absent or disabled with an inline explanation. The GPUI Agent **Sessions** menu
+lists only Favetto-local live and durable history rows; provider-owned sessions
+remain a TUI-only surface for now. Opening a task in GPUI restores only the
+session associated with that task.
 
 Whether a local past session is loadable also depends on the agent advertising
 the ACP `loadSession` capability. An unsupported capability, an agent-reported

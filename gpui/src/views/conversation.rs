@@ -1373,27 +1373,32 @@ impl ConversationPanel {
     /// summary, or the plain persisted transcript. The Agent route always uses
     /// its live structured feed.
     fn merged_output_body(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let body = if self.agent_route(cx) {
+        let agent_route = self.agent_route(cx);
+        let body = if agent_route {
             self.session_output_content(theme, cx).into_any_element()
         } else {
-            let restore = self
-                .state
+            self.merged_output_content(theme, cx)
+        };
+
+        let restore = if agent_route {
+            self.state.read(cx).standalone_agent().restore.clone()
+        } else {
+            self.state
                 .read(cx)
                 .detail()
-                .map(|detail| detail.restore.clone());
-            let panel = restore.and_then(|restore| self.restore_panel(theme, &restore, cx));
-            let body = self.merged_output_content(theme, cx);
-            match panel {
-                Some(panel) => div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h_0()
-                    .child(panel)
-                    .child(div().flex_1().min_h_0().child(body))
-                    .into_any_element(),
-                None => body,
-            }
+                .map(|detail| detail.restore.clone())
+        };
+        let panel = restore.and_then(|restore| self.restore_panel(theme, &restore, cx));
+        let body = match panel {
+            Some(panel) => div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .child(panel)
+                .child(div().flex_1().min_h_0().child(body))
+                .into_any_element(),
+            None => body,
         };
 
         let mut column = div().flex_1().min_h_0().flex().flex_col();
@@ -1459,36 +1464,42 @@ impl ConversationPanel {
         restore: &SessionRestore,
         cx: &mut Context<Self>,
     ) -> Option<Stateful<Div>> {
-        // The structured feed is the primary replay. Only when it has no prose
-        // and no durable RunSummary does the raw ACP transcript act as a
-        // fallback.
-        let (feed_readable, has_summary) =
+        // The structured feed is the primary replay. On the task route a
+        // durable `RunSummary` also wins over the raw transcript; the Agent
+        // route has no summary and reads its feed from the active conversation.
+        let agent_route = self.agent_route(cx);
+        let feed_readable = if agent_route {
             self.state
                 .read(cx)
-                .detail()
-                .map_or((false, false), |detail| {
-                    let live_present = !detail.events.is_empty()
-                        || !detail.plan().is_empty()
-                        || detail.events_ignored > 0;
-                    let summary = detail
-                        .task
-                        .as_ref()
-                        .and_then(|task| task.output.as_ref())
-                        .and_then(detail::extract_run_summary)
-                        .is_some();
-                    let summary_shown = matches!(
-                        detail::output_source(
-                            detail.status().unwrap_or(TaskStatus::Pending),
-                            live_present,
-                            summary,
-                        ),
-                        OutputSource::Summary
-                    );
-                    (
-                        detail::feed_has_readable_text(&detail::build_feed(&detail.events)),
-                        summary_shown,
-                    )
-                });
+                .active_conversation()
+                .is_some_and(|conversation| {
+                    detail::feed_has_readable_text(&detail::build_feed(&conversation.events))
+                })
+        } else {
+            self.state.read(cx).detail().is_some_and(|detail| {
+                detail::feed_has_readable_text(&detail::build_feed(&detail.events))
+            })
+        };
+        let has_summary = !agent_route
+            && self.state.read(cx).detail().is_some_and(|detail| {
+                let live_present = !detail.events.is_empty()
+                    || !detail.plan().is_empty()
+                    || detail.events_ignored > 0;
+                let summary = detail
+                    .task
+                    .as_ref()
+                    .and_then(|task| task.output.as_ref())
+                    .and_then(detail::extract_run_summary)
+                    .is_some();
+                matches!(
+                    detail::output_source(
+                        detail.status().unwrap_or(TaskStatus::Pending),
+                        live_present,
+                        summary,
+                    ),
+                    OutputSource::Summary
+                )
+            });
         let structured_history = feed_readable || has_summary;
         let (headline, color) = match restore {
             SessionRestore::Checking => ("Restoring conversation…".to_string(), theme.colors.muted),

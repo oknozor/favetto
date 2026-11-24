@@ -250,8 +250,12 @@ typed_calls! {
     catalog_get => CatalogGetCall,
     /// `agents.list`.
     agents_list => AgentsListCall,
+    /// `agents.history`.
+    agents_history => AgentsHistoryCall,
     /// `agents.start`.
     agents_start => AgentsStartCall,
+    /// `agents.attach`.
+    agents_attach => AgentsAttachCall,
     /// `agents.close`.
     agents_close => AgentsCloseCall,
     /// `agents.load`.

@@ -17,6 +17,7 @@ use crate::components;
 use crate::detail;
 use crate::layout::{container_query, LayoutMode};
 use crate::routes::Route;
+use crate::session_menu::{SessionMenuRow, SessionMenuState};
 use crate::state::ClientState;
 use crate::text_element::state_text_element;
 use crate::text_input::TextTarget;
@@ -29,6 +30,7 @@ pub struct AgentView {
     conversation: Entity<ConversationPanel>,
     start_focus: FocusHandle,
     new_focus: FocusHandle,
+    sessions_focus: FocusHandle,
     interrupt_focus: FocusHandle,
     close_focus: FocusHandle,
 }
@@ -42,6 +44,7 @@ impl AgentView {
             conversation,
             start_focus: cx.focus_handle().tab_index(40).tab_stop(true),
             new_focus: cx.focus_handle().tab_index(41).tab_stop(true),
+            sessions_focus: cx.focus_handle().tab_index(44).tab_stop(true),
             interrupt_focus: cx.focus_handle().tab_index(42).tab_stop(true),
             close_focus: cx.focus_handle().tab_index(43).tab_stop(true),
         }
@@ -199,6 +202,24 @@ impl AgentView {
                 });
             }),
         );
+        let sessions = self.button(
+            theme,
+            "agent-sessions",
+            if data.switching {
+                "Switching…"
+            } else {
+                "Sessions"
+            },
+            false,
+            !busy,
+            data.switching,
+            &self.sessions_focus,
+            cx.listener(|this, _event, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.toggle_agent_sessions_menu(cx);
+                });
+            }),
+        );
 
         let cwd = data
             .cwd
@@ -294,14 +315,24 @@ impl AgentView {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(theme.spacing.s2))
                     .min_w_0()
                     .child(div().flex_1())
                     .when_some(interrupt, |row, interrupt| row.child(interrupt))
+                    .child(sessions)
                     .when_some(close, |row, close| row.child(close))
                     .child(new),
             )
+            .when_some(data.switch_error, |header, error| {
+                header.child(
+                    div()
+                        .text_size(px(theme.font.xs))
+                        .text_color(theme.colors.danger)
+                        .child(error.to_string()),
+                )
+            })
             .when_some(data.start_error, |header, error| {
                 header.child(
                     div()
@@ -324,6 +355,172 @@ impl AgentView {
                         .child(error.to_string()),
                 )
             })
+    }
+
+    fn session_menu(
+        &self,
+        theme: &Theme,
+        rows: &[SessionMenuRow],
+        highlighted: usize,
+        loading: bool,
+        error: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mut list = div()
+            .id("agent-session-list")
+            .flex()
+            .flex_col()
+            .gap(px(1.0))
+            .max_h(px(280.0))
+            .overflow_y_scroll();
+        if rows.is_empty() {
+            list = list.child(
+                div()
+                    .px(px(theme.spacing.s3))
+                    .py(px(theme.spacing.s2))
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.muted)
+                    .child(if loading {
+                        "Loading sessions…"
+                    } else {
+                        "No live or recorded agent sessions yet."
+                    }),
+            );
+        }
+        for (index, row) in rows.iter().enumerate() {
+            let selectable = row.selectable();
+            let selected = index == highlighted && selectable;
+            let current = row.current;
+            let color = match row.state {
+                SessionMenuState::Active => theme.colors.success,
+                SessionMenuState::Loading => theme.colors.warning,
+                SessionMenuState::Ended => theme.colors.muted,
+                SessionMenuState::Failed | SessionMenuState::Unsupported => theme.colors.danger,
+            };
+            let id = row.id.clone();
+            let mut entry = div()
+                .id(("agent-session-row", index))
+                .flex()
+                .flex_col()
+                .gap(px(1.0))
+                .px(px(theme.spacing.s3))
+                .py(px(theme.spacing.s2))
+                .border_l_2()
+                .border_color(if selected {
+                    theme.colors.accent
+                } else if current {
+                    theme.colors.success
+                } else {
+                    theme.colors.border
+                })
+                .bg(if selected {
+                    Hsla::from(theme.colors.accent).opacity(0.12)
+                } else {
+                    Hsla::from(theme.colors.bg).opacity(0.0)
+                })
+                .when(selectable, |row| {
+                    row.cursor_pointer()
+                        .hover(|style| style.bg(Hsla::from(theme.colors.bg).opacity(0.9)))
+                })
+                .when(!selectable, |row| row.opacity(0.72))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.state.update(cx, |state, cx| {
+                        state.choose_agent_session(&id, cx);
+                        cx.notify();
+                    });
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(theme.spacing.s2))
+                        .min_w_0()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(theme.font.sm))
+                                .text_color(theme.colors.text)
+                                .child(row.display_title()),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(px(theme.font.xs))
+                                .text_color(color)
+                                .child(row.state_label()),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_x(px(theme.spacing.s2))
+                        .text_size(px(theme.font.xs))
+                        .text_color(theme.colors.muted)
+                        .child(row.agent.clone())
+                        .when_some(row.location_label(), |meta, cwd| meta.child(cwd))
+                        .when_some(row.task.clone(), |meta, task| {
+                            meta.child(format!("task · {task}"))
+                        }),
+                );
+            if !selectable && !current {
+                if let Some(reason) = row.blocked_reason() {
+                    entry = entry.child(
+                        div()
+                            .text_size(px(theme.font.xs))
+                            .text_color(theme.colors.danger)
+                            .child(reason),
+                    );
+                }
+            }
+            list = list.child(entry);
+        }
+        if loading && !rows.is_empty() {
+            list = list.child(
+                div()
+                    .px(px(theme.spacing.s3))
+                    .py(px(theme.spacing.s1))
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.muted)
+                    .child("Refreshing history…"),
+            );
+        }
+        if let Some(error) = error {
+            list = list.child(
+                div()
+                    .px(px(theme.spacing.s3))
+                    .py(px(theme.spacing.s1))
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.danger)
+                    .child(error.to_string()),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .border_b_1()
+            .border_color(theme.colors.border)
+            .bg(theme.colors.surface)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s2))
+                    .px(px(theme.spacing.s3))
+                    .py(px(theme.spacing.s2))
+                    .child(components::section_label(theme, "SESSIONS"))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_size(px(theme.font.xs))
+                            .text_color(theme.colors.muted)
+                            .child("↑↓ select · ↵ open · esc close"),
+                    ),
+            )
+            .child(list)
     }
 
     fn start_form(&self, theme: &Theme, data: StartFormData<'_>, cx: &mut Context<Self>) -> Div {
@@ -482,8 +679,10 @@ struct HeaderData<'a> {
     exit: Option<&'a favetto_wire::rpc::AgentExitPush>,
     starting: bool,
     closing: bool,
+    switching: bool,
     start_error: Option<&'a str>,
     close_error: Option<&'a str>,
+    switch_error: Option<&'a str>,
 }
 
 /// The pre-start form's data.
@@ -531,6 +730,8 @@ impl Render for AgentView {
             start_error,
             closing,
             close_error,
+            switching,
+            switch_error,
             cwd,
             agent_repo,
             chosen,
@@ -547,6 +748,8 @@ impl Render for AgentView {
                 agent.start_error.clone(),
                 agent.closing,
                 agent.close_error.clone(),
+                agent.pending_switch.is_some(),
+                agent.switch_error.clone(),
                 agent.cwd.clone(),
                 agent.repo.clone(),
                 agent.chosen_agent.clone(),
@@ -554,6 +757,26 @@ impl Render for AgentView {
                 state.available_agent_choices(),
             )
         };
+        let menu_rows = self.state.read(cx).agent_session_rows();
+        let (menu_open, menu_highlighted, menu_loading, menu_error) = {
+            let menu = self.state.read(cx).agent_session_menu();
+            (
+                menu.is_open(),
+                menu.highlighted(),
+                menu.history_loading,
+                menu.history_error.clone(),
+            )
+        };
+        let menu = menu_open.then(|| {
+            self.session_menu(
+                theme,
+                &menu_rows,
+                menu_highlighted,
+                menu_loading,
+                menu_error.as_deref(),
+                cx,
+            )
+        });
         let _ = self.state.read(cx).agent_model_input();
         let has_session = session_id.is_some();
         let header_repo = if has_session {
@@ -579,12 +802,15 @@ impl Render for AgentView {
                         exit: exit.as_ref(),
                         starting,
                         closing,
+                        switching,
                         start_error: start_error.as_deref(),
                         close_error: close_error.as_deref(),
+                        switch_error: switch_error.as_deref(),
                     },
                     narrow,
                     cx,
                 ))
+                .when_some(menu, |surface, menu| surface.child(menu))
                 .child(components::empty_state(
                     theme,
                     "✦",
@@ -609,8 +835,10 @@ impl Render for AgentView {
                 exit: exit.as_ref(),
                 starting,
                 closing,
+                switching,
                 start_error: start_error.as_deref(),
                 close_error: close_error.as_deref(),
+                switch_error: switch_error.as_deref(),
             },
             narrow,
             cx,
@@ -667,6 +895,7 @@ impl Render for AgentView {
             .flex_col()
             .bg(theme.colors.surface)
             .child(header)
+            .when_some(menu, |surface, menu| surface.child(menu))
             .when_some(start_form, |surface, form| surface.child(form))
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))
     }

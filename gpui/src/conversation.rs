@@ -651,9 +651,7 @@ impl Conversation {
                 })
             }
             ConversationTarget::Session(session_id) => {
-                !session_id.is_empty()
-                    && (event.session_id == *session_id
-                        || self.events_session.as_deref() == Some(session_id.as_str()))
+                !session_id.is_empty() && event.session_id == *session_id
             }
         }
     }
@@ -937,8 +935,16 @@ impl Conversation {
     }
 
     /// Whether a prompt/options operation addresses this conversation.
+    ///
+    /// A free-standing session is keyed only by its target id: the first
+    /// accepted event must never widen the conversation to another session.
+    /// A task conversation may still use the session the daemon resolved for
+    /// its run when the roster has not caught up.
     pub fn is_session(&self, session_id: &str) -> bool {
-        self.target.is_session(session_id) || self.events_session.as_deref() == Some(session_id)
+        match &self.target {
+            ConversationTarget::Session(_) => self.target.is_session(session_id),
+            ConversationTarget::Task(_) => self.events_session.as_deref() == Some(session_id),
+        }
     }
 
     /// Record an accepted ACP form reply and clear the matching form.
@@ -1379,6 +1385,19 @@ mod tests {
         assert!(!conversation.accepts_event(&push(2, "ses_b", AgentStateEvent::TurnStarted), &[]));
         assert!(!Conversation::for_session("")
             .accepts_event(&push(3, "", AgentStateEvent::TurnStarted), &[]));
+    }
+
+    #[test]
+    fn an_accepted_session_event_does_not_widen_the_conversation_to_other_sessions() {
+        let mut conversation = Conversation::for_session("ses_a");
+        assert!(conversation.push_event(push(1, "ses_a", AgentStateEvent::TurnStarted)));
+        assert_eq!(conversation.events_session.as_deref(), Some("ses_a"));
+
+        // Regression: the old predicate compared `events_session` to the
+        // target, so after the first event every session was accepted.
+        assert!(!conversation.accepts_event(&push(2, "ses_b", AgentStateEvent::TurnStarted), &[]));
+        assert_eq!(conversation.events.len(), 1);
+        assert!(!conversation.is_session("ses_b"));
     }
 
     #[test]

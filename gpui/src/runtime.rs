@@ -31,13 +31,14 @@ use favetto_wire::rpc::{
     AgentAttachResult, AgentAuthenticateParams, AgentAuthenticateResult, AgentCancelParams,
     AgentCancelResult, AgentCloseResult, AgentElicitationReplyParams, AgentElicitationReplyResult,
     AgentLogoutParams, AgentLogoutResult, AgentOptionsResult, AgentPromptParams, AgentPromptResult,
-    AgentReplyParams, AgentReplyResult, AgentSetModeParams, AgentSetOptionParams, CatalogEntry,
-    CatalogGetParams, ConfigGetCall, ConfigGetResult, ConfigSetCall, ConfigSetParams,
-    ConfigSetResult, EmptyParams, PingParams, PingResult, ReposActivateParams, ReposListResult,
-    ScheduleDeleteParams, ScheduleUpsertParams, SchedulesDeleteResult, SessionIdParams,
-    StartAgentParams, StartOneshotParams, StartOneshotResult, TaskIdParams, TasksDeleteResult,
-    TasksEventsParams, TasksListParams, TasksSessionResult, TasksStartParams,
-    WorkflowCancelResultBody, WorkflowGetResult, WorkflowInspectParams, WorkflowRetryParams,
+    AgentReplyParams, AgentReplyResult, AgentSetModeParams, AgentSetOptionParams,
+    AgentsHistoryParams, AgentsHistoryResult, CatalogEntry, CatalogGetParams, ConfigGetCall,
+    ConfigGetResult, ConfigSetCall, ConfigSetParams, ConfigSetResult, EmptyParams, PingParams,
+    PingResult, ReposActivateParams, ReposListResult, ScheduleDeleteParams, ScheduleUpsertParams,
+    SchedulesDeleteResult, SessionIdParams, StartAgentParams, StartOneshotParams,
+    StartOneshotResult, TaskIdParams, TasksDeleteResult, TasksEventsParams, TasksListParams,
+    TasksSessionResult, TasksStartParams, WorkflowCancelResultBody, WorkflowGetResult,
+    WorkflowInspectParams, WorkflowRetryParams,
 };
 use favetto_wire::workflow::WorkflowInspect;
 use uuid::Uuid;
@@ -92,6 +93,10 @@ pub enum Command {
     },
     /// Close one standalone ACP session (`agents.close`).
     CloseAgent { session_id: String },
+    /// Fetch durable Favetto-local session history (`agents.history`).
+    LoadAgentHistory,
+    /// Reattach a live/retained session by Favetto-local id (`agents.attach`).
+    AttachAgentSession { session_id: String },
     /// Send `tasks.cancel` or `tasks.retry` for one task. `previous` is the row
     /// the UI optimistically replaced and `optimistic` is the replacement, so a
     /// failed RPC can restore the former only if no newer push replaced it.
@@ -240,6 +245,15 @@ pub enum Update {
     },
     /// `agents.start` completed for the Agent panel.
     AgentStartFinished {
+        result: Result<Box<AgentAttachResult>, ClientError>,
+    },
+    /// `agents.history` completed for the Agent panel's session switcher.
+    AgentHistoryLoaded {
+        result: Result<AgentsHistoryResult, ClientError>,
+    },
+    /// `agents.attach` completed for an explicit session switch.
+    AgentAttached {
+        session_id: String,
         result: Result<Box<AgentAttachResult>, ClientError>,
     },
     /// `agents.close` completed for one standalone session.
@@ -436,6 +450,22 @@ impl Runtime {
         let _ = self.commands.try_send(command);
     }
 
+    /// A runtime handle with no worker thread, used by UI tests that assert the
+    /// exact command a user action emits.
+    #[cfg(test)]
+    pub fn test_handle() -> (Self, Receiver<Command>) {
+        let (commands, command_rx) = async_channel::bounded(16);
+        let (_update_tx, updates) = async_channel::bounded(16);
+        (
+            Self {
+                commands,
+                updates,
+                thread: None,
+            },
+            command_rx,
+        )
+    }
+
     /// A clone of the update stream for the foreground drain loop.
     pub fn updates(&self) -> Receiver<Update> {
         self.updates.clone()
@@ -509,6 +539,16 @@ impl Runtime {
     /// Close one standalone agent session.
     pub fn close_agent(&self, session_id: String) {
         self.send(Command::CloseAgent { session_id });
+    }
+
+    /// Fetch durable Favetto-local session history for the switcher.
+    pub fn load_agent_history(&self) {
+        self.send(Command::LoadAgentHistory);
+    }
+
+    /// Reattach a live/retained session by its Favetto-local id.
+    pub fn attach_agent_session(&self, session_id: String) {
+        self.send(Command::AttachAgentSession { session_id });
     }
 
     /// Run `tasks.cancel`/`tasks.retry` for a row the UI already changed.
@@ -803,6 +843,12 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
             }
             Command::CloseAgent { session_id } => {
                 spawn_close_agent(client.clone(), updates.clone(), session_id);
+            }
+            Command::LoadAgentHistory => {
+                spawn_agent_history(client.clone(), updates.clone());
+            }
+            Command::AttachAgentSession { session_id } => {
+                spawn_agent_attach(client.clone(), updates.clone(), session_id);
             }
             Command::TaskAction {
                 action,
@@ -1111,6 +1157,35 @@ fn spawn_close_agent(client: Arc<RpcClient>, updates: Sender<Update>, session_id
             })
             .await;
         let _ = updates.try_send(Update::AgentClosed { session_id, result });
+    });
+}
+
+/// How many durable history rows the session switcher reads. The daemon caps
+/// the value at 500; 100 keeps a normal history visible in one round trip.
+pub const AGENT_HISTORY_LIMIT: u64 = 100;
+
+/// Spawn one `agents.history` read for the Agent panel's session switcher.
+fn spawn_agent_history(client: Arc<RpcClient>, updates: Sender<Update>) {
+    tokio::spawn(async move {
+        let result = client
+            .agents_history(AgentsHistoryParams {
+                limit: Some(AGENT_HISTORY_LIMIT),
+            })
+            .await;
+        let _ = updates.try_send(Update::AgentHistoryLoaded { result });
+    });
+}
+
+/// Spawn one `agents.attach` for an explicit session switch.
+fn spawn_agent_attach(client: Arc<RpcClient>, updates: Sender<Update>, session_id: String) {
+    tokio::spawn(async move {
+        let result = client
+            .agents_attach(SessionIdParams {
+                session_id: session_id.clone(),
+            })
+            .await
+            .map(Box::new);
+        let _ = updates.try_send(Update::AgentAttached { session_id, result });
     });
 }
 

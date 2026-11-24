@@ -35,6 +35,8 @@ actions!(
         GoAgent,
         /// Start a fresh standalone agent session (`n` on the Agent surface).
         AgentNewSession,
+        /// Open or close the Agent panel's live + history session switcher (`s`).
+        AgentSessions,
         /// Interrupt the standalone agent's current turn (`i`).
         AgentInterrupt,
         /// Close the standalone agent session (`x`).
@@ -280,17 +282,28 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new(
             "n",
             AgentNewSession,
+            Some(
+                "Agent && !Sessions && !Palette && !Shortcuts && !Search && !Confirm && !TextField",
+            ),
+        ),
+        KeyBinding::new(
+            "s",
+            AgentSessions,
             Some("Agent && !Palette && !Shortcuts && !Search && !Confirm && !TextField"),
         ),
         KeyBinding::new(
             "i",
             AgentInterrupt,
-            Some("Agent && !Palette && !Shortcuts && !Search && !Confirm && !TextField"),
+            Some(
+                "Agent && !Sessions && !Palette && !Shortcuts && !Search && !Confirm && !TextField",
+            ),
         ),
         KeyBinding::new(
             "x",
             AgentClose,
-            Some("Agent && !Palette && !Shortcuts && !Search && !Confirm && !TextField"),
+            Some(
+                "Agent && !Sessions && !Palette && !Shortcuts && !Search && !Confirm && !TextField",
+            ),
         ),
         KeyBinding::new(
             "g c",
@@ -1162,6 +1175,7 @@ mod tests {
     fn agent_shortcuts_are_scoped_to_the_agent_surface() {
         for (action, key) in [
             ("AgentNewSession", "n"),
+            ("AgentSessions", "s"),
             ("AgentInterrupt", "i"),
             ("AgentClose", "x"),
         ] {
@@ -1176,12 +1190,20 @@ mod tests {
                 })
                 .collect();
             assert_eq!(matches.len(), 1, "{action} must have one binding");
+            let predicate = matches[0]
+                .predicate()
+                .expect("agent shortcut has a context")
+                .to_string();
             assert!(
-                matches[0]
-                    .predicate()
-                    .is_some_and(|predicate| predicate.to_string().contains("Agent")),
+                predicate.contains("Agent"),
                 "{action} must be scoped to Agent"
             );
+            if action != "AgentSessions" {
+                assert!(
+                    predicate.contains("!Sessions"),
+                    "{action} must not fire while the session switcher is open"
+                );
+            }
         }
     }
 
