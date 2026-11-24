@@ -46,7 +46,7 @@ pub async fn serve_unix(path: &Path, state: Arc<State>) -> anyhow::Result<()> {
 }
 
 /// Serve the daemon's HTTP/WebSocket API surface (axum). The router is assembled
-/// by the caller (`daemon::run`) so it can include the webhook routes.
+/// by the caller (`daemon::run`) so it can add the HTTP handlers.
 pub async fn serve_http(listen: &str, app: Router) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(addr = %listen, "favetto HTTP/WebSocket API listening");

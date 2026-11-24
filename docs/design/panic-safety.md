@@ -88,7 +88,6 @@ the audit is complete:
 | `src/agents/mod.rs` (session/task-id formatting) | UUID strings and fixed-width prefixes are 36/8 chars |
 | `src/agents/opencode/observer.rs` (SSE/JSON parsing) | length and char-boundary checks |
 | `src/executor.rs` (`branch_name`, git output parsing) | char-boundary guard / `windows(2)` |
-| `src/webhooks.rs` (signature hex decode) | length check before slicing |
 | `src/agents/pi.rs` (stream framing) | length / char-boundary guard |
 | `src/agents/vibe/stream.rs` (stream framing) | length / char-boundary guard |
 | `favetto-core/src/wire.rs` (`src[0..4]`) | guarded by `src.len() < 4` (different crate) |

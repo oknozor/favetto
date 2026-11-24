@@ -53,22 +53,32 @@ async fn row_to_event_falls_back_to_unknown() {
 }
 
 #[tokio::test]
-async fn webhook_delivery_is_recorded_once() {
-    let dir = std::env::temp_dir().join(format!("favetto-delivery-{}", std::process::id()));
+async fn migrate_drops_legacy_webhook_deliveries_table() {
+    let dir = std::env::temp_dir().join(format!("favetto-migrate-hooks-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let pool = open(&dir.join("test.db")).await.unwrap();
+    // Simulate a database created by an older daemon that still had receivers.
+    sqlx::query(
+        "CREATE TABLE webhook_deliveries (
+            delivery_id TEXT PRIMARY KEY,
+            provider    TEXT NOT NULL,
+            received_at INTEGER NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
     migrate(&pool).await.unwrap();
 
-    assert!(record_delivery(&pool, "github", "delivery-1")
-        .await
-        .unwrap());
-    assert!(!record_delivery(&pool, "github", "delivery-1")
-        .await
-        .unwrap());
-    assert!(record_delivery(&pool, "github", "delivery-2")
-        .await
-        .unwrap());
+    let exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'webhook_deliveries'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(exists, 0);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

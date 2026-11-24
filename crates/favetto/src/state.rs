@@ -16,13 +16,11 @@ use crate::auth::LoginLimiter;
 use crate::config::FavettoConfig;
 use crate::db;
 use crate::event_bus::{EventBus, ServerPush};
-use crate::hooks::Hook;
 use crate::mcp::McpRegistry;
 use crate::metrics::Metrics;
 use crate::pair::PairStore;
 use crate::repos::KnownRepo;
 use crate::tasks::TaskDef;
-use crate::webhooks::WebhookSecrets;
 
 /// Everything the daemon owns that connections and background tasks need access to.
 ///
@@ -32,7 +30,6 @@ pub struct State {
     pub db: SqlitePool,
     pub bus: EventBus,
     pub token: Token,
-    pub webhooks: WebhookSecrets,
     pub agents: AgentManager,
     /// Configured external agents, resolved once at startup.
     pub registry: AgentRegistry,
@@ -54,9 +51,6 @@ pub struct State {
     pub pair: PairStore,
     /// Per-`(username, client)` failed-login throttling for `POST /auth/login`.
     pub login_limiter: LoginLimiter,
-    /// Live hook list (mutable so the TUI can add notification hooks).
-    pub hook_store: Arc<RwLock<Vec<Hook>>>,
-    /// Cached provider/model catalogs, keyed by agent name (fetched lazily).
     /// Per-daemon counters rendered on `/metrics`.
     pub metrics: Metrics,
     /// Known repositories whose `.favetto/tasks/` catalogs are loaded.
@@ -79,7 +73,6 @@ pub struct StateInit {
     pub db: SqlitePool,
     pub bus: EventBus,
     pub token: Token,
-    pub webhooks: WebhookSecrets,
     pub agents: AgentManager,
     pub registry: AgentRegistry,
     pub config: Arc<FavettoConfig>,
@@ -88,7 +81,6 @@ pub struct StateInit {
     pub tasks_dir: PathBuf,
     pub catalog: Arc<RwLock<Vec<TaskDef>>>,
     pub scheduler: Scheduler,
-    pub hook_store: Arc<RwLock<Vec<Hook>>>,
 }
 
 impl State {
@@ -108,7 +100,6 @@ impl State {
             db: init.db,
             bus: init.bus,
             token: init.token,
-            webhooks: init.webhooks,
             agents,
             registry: init.registry,
             actions: ActionRegistry::new(),
@@ -120,7 +111,6 @@ impl State {
             scheduler: init.scheduler,
             pair: PairStore::new(),
             login_limiter,
-            hook_store: init.hook_store,
             metrics: Metrics::default(),
             repos: Arc::new(RwLock::new(Vec::new())),
             active_repo: Arc::new(RwLock::new(None)),
@@ -132,9 +122,8 @@ impl State {
 
     /// Persist an event and broadcast it, wiring the assigned monotonic id back in.
     ///
-    /// This is the single durable path for emitting events: webhook receivers and
-    /// hooks all funnel through here, guaranteeing the bus only carries
-    /// already-persisted records.
+    /// This is the single durable path for emitting events, guaranteeing the bus
+    /// only carries already-persisted records.
     pub async fn emit_event(&self, kind: EventKind, payload: serde_json::Value) {
         let event = Event {
             id: 0,

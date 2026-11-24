@@ -864,23 +864,6 @@ pub struct NotificationTestResult {
     pub sent: bool,
 }
 
-/// `hooks.upsert` params.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct HookUpsertParams {
-    pub event: String,
-    pub channel: String,
-    #[serde(default, deserialize_with = "lenient")]
-    pub config: Option<serde_json::Value>,
-}
-
-/// `hooks.upsert` result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct HookUpsertResult {
-    pub added: bool,
-}
-
 /// `usage.stats` params. `period` defaults to `day` when omitted or malformed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -1213,8 +1196,6 @@ rpc_calls! {
     NotificationsListCall => method::NOTIFICATIONS_LIST, NotificationsListParams, NotificationsListResult;
     /// Typed call for `notifications.test`.
     NotificationsTestCall => method::NOTIFICATIONS_TEST, NotificationTestParams, NotificationTestResult;
-    /// Typed call for `hooks.upsert`.
-    HooksUpsertCall => method::HOOKS_UPSERT, HookUpsertParams, HookUpsertResult;
     /// Typed call for `usage.stats`.
     UsageStatsCall => method::USAGE_STATS, UsageStatsParams, UsageStatsResult;
     /// Typed call for `repos.list`.
@@ -1504,11 +1485,6 @@ pub const CLIENT_CALLS: &[RpcCallSpec] = &[
         method: method::NOTIFICATIONS_TEST,
         params_schema: schema_of::<NotificationTestParams>,
         result_schema: schema_of::<NotificationTestResult>,
-    },
-    RpcCallSpec {
-        method: method::HOOKS_UPSERT,
-        params_schema: schema_of::<HookUpsertParams>,
-        result_schema: schema_of::<HookUpsertResult>,
     },
     RpcCallSpec {
         method: method::USAGE_STATS,

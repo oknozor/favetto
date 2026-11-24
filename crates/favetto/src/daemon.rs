@@ -1,6 +1,5 @@
-//! The `daemon` subcommand: wire up persistence, the event bus, webhooks, hooks,
-//! the scheduler, the executor, and transports, then run until a shutdown signal
-//! arrives.
+//! The `daemon` subcommand: wire up persistence, the event bus, the scheduler,
+//! the executor, and transports, then run until a shutdown signal arrives.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,8 +11,7 @@ use favetto_core::auth::Token;
 use crate::cli::DaemonArgs;
 use crate::config::FavettoConfig;
 use crate::state::{State, StateInit};
-use crate::webhooks::WebhookSecrets;
-use crate::{db, event_bus, hooks, transport};
+use crate::{db, event_bus, transport};
 
 pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     // Load config (CLI --config, then ~/.config/favetto/config.toml).
@@ -98,17 +96,10 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     agents.configure_git(&config, data_dir.clone())?;
     let scheduler = crate::scheduler::Scheduler::new().await?;
 
-    // Resolve webhook secrets from config/env before starting up.
-    let webhooks = WebhookSecrets::from_config(&config);
-
-    // Notification hooks start empty; the TUI adds them live via `hooks.upsert`.
-    let hook_store = Arc::new(parking_lot::RwLock::new(Vec::new()));
-
     let state = Arc::new(State::new(StateInit {
         db: pool,
         bus,
         token,
-        webhooks,
         agents,
         registry,
         config,
@@ -117,7 +108,6 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         tasks_dir,
         catalog,
         scheduler,
-        hook_store: hook_store.clone(),
     }));
 
     // Seed the persisted known-repos registry from `[repos].known`, load it, and
@@ -148,13 +138,11 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     }
     *state.active_repo.write() = active;
 
-    // Assemble the catalog (global + every repo) before validating webhook rules,
-    // which match against the live task names.
+    // Assemble the catalog (global + every repo).
     {
         let defs = crate::repos::load_all(&state, &[]);
         *state.catalog.write() = defs;
     }
-    crate::webhooks::validate_rules(&state.config, &state.catalog.read())?;
 
     // Materialize the catalog graph once at startup so `<data_dir>/workflow.dot`
     // exists even before the first catalog change.
@@ -174,11 +162,10 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         Err(e) => tracing::warn!(error = %e, "startup reconcile failed"),
     }
 
-    // Start the scheduler, executor, and hook engine, then register catalog
-    // schedules (recurring tasks) with the scheduler.
+    // Start the scheduler and executor, then register catalog schedules
+    // (recurring tasks) with the scheduler.
     crate::scheduler::start(&state).await?;
     crate::executor::spawn(state.clone());
-    hooks::HookEngine::new(hook_store, state.clone()).spawn();
     crate::scheduler::reconcile_catalog_schedules(&state).await?;
 
     // Reclaim worktrees left by finished tasks once at startup. Never fatal.
@@ -299,7 +286,6 @@ pub(crate) fn http_app(state: &Arc<State>) -> Router {
         .merge(transport::routes())
         .route("/events", get(crate::server::events_handler))
         .route("/metrics", get(crate::metrics::metrics_handler))
-        .merge(crate::webhooks::routes())
         .merge(crate::auth::routes())
         .merge(crate::pair::routes())
         .with_state(state.clone())

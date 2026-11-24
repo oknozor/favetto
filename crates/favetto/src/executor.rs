@@ -309,7 +309,7 @@ async fn dispatch_loop(state: Arc<State>, cfg: ExecutorSettings) {
             };
 
             // Required input variables must be present even for unattended starts
-            // (hooks / needs / spawn / schedule / raw RPC), which never prompt.
+            // (needs / spawn / schedule / raw RPC), which never prompt.
             if let Some(missing) = missing_required_vars(&def, &task.input).first() {
                 fail_task(
                     &state,
@@ -375,7 +375,7 @@ async fn dispatch_loop(state: Arc<State>, cfg: ExecutorSettings) {
 }
 
 /// Workflow lineage for a task enqueued by another task. Empty for a task
-/// started directly (manual, scheduled, RPC, hook, webhook).
+/// started directly (manual, scheduled, RPC).
 #[derive(Debug, Clone, Copy, Default)]
 struct Lineage {
     parent_id: Option<Uuid>,

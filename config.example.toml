@@ -168,31 +168,6 @@ min_worktrees = 0  # always keep the newest N finished worktrees
 # passphrase_env = "FAVETTO_GIT_SIGNING_PASSPHRASE"     # never store secrets here
 # passphrase_command = ["secret-tool", "lookup", "service", "favetto-git-signing"]
 
-# GitHub webhook triggers. GitHub POSTs signed events to /webhooks/github;
-# each matching rule enqueues the named catalog task with a truncated summary of
-# the event as its input (reachable in prompts as {{ input.repo }}, etc.).
-# Rules and the secret are read at startup; restart the daemon after editing.
-[webhook.github]
-enabled = true
-secret_env = "GITHUB_WEBHOOK_SECRET"   # preferred
-# secret = "..."                        # literal alternative (discouraged)
-
-# When an issue is opened in any oknozor repo, run the triage task.
-[[webhook.github.rules]]
-name = "triage-opened-issues"
-event = "issues"
-action = "opened"
-task = "favetto/triage_issues"
-filter = { repo = "oknozor/*" }
-
-# When a bug-labelled PR is opened against main by the owner, plan it.
-[[webhook.github.rules]]
-name = "plan-bug-prs"
-event = "pull_request"
-action = "opened"
-task = "favetto/plan_issue"
-filter = { labels_contains = ["bug"], base_ref = "main", author = "oknozor" }
-
 # TUI theming. `theme` is a built-in ("opencode", "catppuccin") or a user theme
 # loaded from `~/.config/favetto/themes/<name>.json` (or `.favetto/themes/`).
 # `theme_mode` is "system" (derive from the terminal), "dark", or "light".

@@ -30,7 +30,7 @@
 //! its path relative to that root, without the `.md` extension, with `/`
 //! separators (e.g. `pipelines/plan`); a root-level file keeps its bare stem
 //! (`triage`). The same relative path is used by `catalog.get`, `tasks.start`,
-//! `needs`/`spawn`, webhook rules, `catalog:<name>` schedule ids and
+//! `needs`/`spawn`, `catalog:<name>` schedule ids and
 //! `{{ task.name }}`, so two files with the same stem in different folders are
 //! distinct tasks.
 

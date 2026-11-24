@@ -638,8 +638,8 @@ async fn refresh_lists(client: &Client, app: &mut App) {
 ///
 /// Every call is user-initiated (Catalog **Enter** / the variable popup), so the
 /// run is marked `interactive`: the executor launches the agent's real TUI and
-/// the Agent panel attaches to it live. Programmatic starts (scheduler, hooks,
-/// webhooks, `needs`, `spawn`) stay headless.
+/// the Agent panel attaches to it live. Programmatic starts (scheduler,
+/// `needs`, `spawn`) stay headless.
 async fn start_task(client: &Client, app: &mut App, mut params: serde_json::Value) {
     let name = params
         .get("name")

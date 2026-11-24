@@ -18,7 +18,7 @@ own agent loop, and there are no per-vendor adapters.
 ┌───────────────────────────────────────────────────────────────┐
 │                  Favetto Daemon                               │
 │   Scheduler ─► Task Queue ─► ACP Sessions ─► ACP agent servers │
-│   Event Bus · Hook Engine · Notification Bus                  │
+│   Event Bus · Notification Bus                                │
 │   Persistence (SQLite/sqlx) · Remote API (axum)               │
 └───────────────────────────────────────────────────────────────┘
 ```
@@ -94,7 +94,7 @@ The published site is the manual:
 
 | Page | Covers |
 |------|--------|
-| [Guide](https://oknozor.github.io/favetto/guide/installation) | Install, first task, catalog, variables, agents, schedules, webhooks, worktrees, signing, remote access, TUI. |
+| [Guide](https://oknozor.github.io/favetto/guide/installation) | Install, first task, catalog, variables, agents, schedules, worktrees, signing, remote access, TUI. |
 | [CLI reference](https://oknozor.github.io/favetto/reference/cli) | Every subcommand and flag, generated from clap. |
 | [Configuration reference](https://oknozor.github.io/favetto/reference/config) | Every config section and field, generated from the Rust types. |
 | [Task file format](https://oknozor.github.io/favetto/reference/tasks) | Header keys, `[[vars]]`, and prompt templates. |

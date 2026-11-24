@@ -58,9 +58,6 @@ pub struct FavettoConfig {
     /// commit can never block on an interactive pinentry/askpass prompt.
     #[serde(default)]
     pub git: GitSettings,
-    /// Webhook trigger rules (currently GitHub).
-    #[serde(default)]
-    pub webhook: WebhookSettings,
     /// Client-side TUI settings. Ignored by the daemon, which reads the same file.
     #[serde(default)]
     pub tui: TuiSettings,
@@ -181,70 +178,6 @@ impl Default for SoundSettings {
             events: default_sound_events(),
         }
     }
-}
-
-/// Webhook trigger settings. Currently only GitHub is supported.
-#[derive(Debug, Clone, Default, JsonSchema, Serialize, Deserialize)]
-pub struct WebhookSettings {
-    #[serde(default)]
-    pub github: GithubWebhookSettings,
-}
-
-/// GitHub webhook receiver + trigger rules.
-///
-/// GitHub POSTs signed events to `/webhooks/github`; each matching rule enqueues
-/// the named catalog task with a truncated summary of the event as its input.
-/// Rules and the secret are read at daemon startup, so a restart is required after
-/// editing them.
-#[derive(Debug, Clone, Default, JsonSchema, Serialize, Deserialize)]
-pub struct GithubWebhookSettings {
-    /// Opt-in; disabled unless set.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Name of the env var holding the signing secret.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub secret_env: Option<String>,
-    /// Literal secret (accepted but discouraged).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub secret: Option<String>,
-    #[serde(default)]
-    pub rules: Vec<GithubRule>,
-}
-
-/// A single `[[webhook.github.rules]]` entry.
-#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
-pub struct GithubRule {
-    pub name: String,
-    /// `X-GitHub-Event` value (e.g. `"issues"`). Validated at startup.
-    pub event: String,
-    /// Optional action; unset matches any action.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub action: Option<String>,
-    /// Catalog task name. Validated at startup.
-    pub task: String,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default)]
-    pub filter: GithubFilter,
-}
-
-/// Optional narrowing for a [`GithubRule`]. Unset fields match anything; all set
-/// fields must match (AND).
-///
-/// `repo`, `author`, `base_ref`, and `head_ref` are globs; `labels_contains` is
-/// any-of exact.
-#[derive(Debug, Clone, Default, JsonSchema, Serialize, Deserialize)]
-pub struct GithubFilter {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repo: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub author: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub labels_contains: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_ref: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub head_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, JsonSchema, Serialize, Deserialize)]
@@ -786,7 +719,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_webhook_github_rules() {
+    fn ignores_legacy_webhook_section() {
+        // Operators may still have `[webhook.github]` in their config file from
+        // before the receivers were removed; the section is a silent no-op.
         let cfg: FavettoConfig = toml::from_str(
             r#"
             [webhook.github]
@@ -796,25 +731,11 @@ mod tests {
             [[webhook.github.rules]]
             name = "triage-opened-issues"
             event = "issues"
-            action = "opened"
             task = "triage_favetto_issues"
-            filter = { repo = "oknozor/*", labels_contains = ["bug"] }
             "#,
         )
         .unwrap();
-
-        let gh = &cfg.webhook.github;
-        assert!(gh.enabled);
-        assert_eq!(gh.secret_env.as_deref(), Some("GITHUB_WEBHOOK_SECRET"));
-        assert_eq!(gh.rules.len(), 1);
-        let rule = &gh.rules[0];
-        assert_eq!(rule.name, "triage-opened-issues");
-        assert_eq!(rule.event, "issues");
-        assert_eq!(rule.action.as_deref(), Some("opened"));
-        assert_eq!(rule.task, "triage_favetto_issues");
-        assert!(rule.enabled);
-        assert_eq!(rule.filter.repo.as_deref(), Some("oknozor/*"));
-        assert_eq!(rule.filter.labels_contains, vec!["bug".to_string()]);
+        assert_eq!(cfg.agents.len(), 0);
     }
 
     #[test]

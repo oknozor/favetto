@@ -25,7 +25,6 @@ extension, with `/` separators. Use that identity everywhere a task is named:
 - starting a task from the TUI or `tasks.start`,
 - `catalog.get` for the preview,
 - `needs` and `spawn`,
-- webhook `rule.task`,
 - `catalog:<name>` schedule ids,
 - <span v-pre>`{{ task.name }}`</span> in a prompt.
 
@@ -52,7 +51,7 @@ with the wrong provider.
 ::: warning Renaming is a new task
 Moving `triage.md` to `pipeline/triage.md` changes its identity from `triage` to
 `pipeline/triage`. The old `catalog:triage` schedule is dropped and recreated,
-and any `needs`/`spawn`/webhook rule that named `triage` must be updated.
+and any `needs`/`spawn` that named `triage` must be updated.
 :::
 
 ## Agent tasks and action tasks
@@ -143,8 +142,7 @@ collide. Global tasks keep their bare relative identity. Because the
 `repo:` prefix is reserved, a global task path may not start with it.
 
 Everything that names a task accepts the qualified identity: `tasks.start`,
-`catalog.get`/`catalog.add`/`catalog.update`, schedules, webhooks, `needs`,
-`spawn`, and <span v-pre>`{{ task.name }}`</span>. Inside a repo-local task a
+`catalog.get`/`catalog.add`/`catalog.update`, schedules, `needs`, `spawn`, and <span v-pre>`{{ task.name }}`</span>. Inside a repo-local task a
 bare `needs`/`spawn` that matches another task in *the same repo* is resolved
 automatically; a cross-repo reference must be written in full.
 

@@ -34,7 +34,6 @@ export default defineConfig({
               text: "Schedules & dependencies",
               link: "/guide/schedules-and-dependencies",
             },
-            { text: "Webhooks & hooks", link: "/guide/webhooks" },
             { text: "Parallel execution", link: "/guide/parallel-worktrees" },
             { text: "Git & signing", link: "/guide/git-signing" },
             { text: "Remote access", link: "/guide/remote-access" },

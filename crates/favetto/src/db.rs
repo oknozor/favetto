@@ -80,12 +80,6 @@ CREATE TABLE IF NOT EXISTS notifications (
     sent_at     INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS webhook_deliveries (
-    delivery_id TEXT PRIMARY KEY,
-    provider    TEXT NOT NULL,
-    received_at INTEGER NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS worktrees (
     task_id    TEXT PRIMARY KEY,
     repo       TEXT NOT NULL,
@@ -252,6 +246,11 @@ pub async fn open(path: &Path) -> anyhow::Result<SqlitePool> {
 /// Apply the M1 schema.
 pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query(SCHEMA).execute(pool).await?;
+    // Drop the table left by the removed inbound webhook receivers. Best-effort:
+    // an old database that never had it (or a read-only replica) must still start.
+    let _ = sqlx::query("DROP TABLE IF EXISTS webhook_deliveries")
+        .execute(pool)
+        .await;
     // Additive migration for databases created before `session_id` /
     // `session_title` existed. `ALTER TABLE ... ADD COLUMN` errors if the column
     // is already present; that is the expected case for new databases, so the
@@ -1163,29 +1162,6 @@ fn row_to_notification(row: &SqliteRow) -> NotificationRecord {
         status: row.get("status"),
         sent_at: from_ms(row.get("sent_at")),
     }
-}
-
-// ---------------------------------------------------------------------------
-// Webhook deliveries
-// ---------------------------------------------------------------------------
-
-/// Record a webhook delivery. Returns `true` if this is the first time the
-/// delivery was seen, `false` if it is a redelivery (already recorded).
-pub async fn record_delivery(
-    pool: &SqlitePool,
-    provider: &str,
-    delivery_id: &str,
-) -> anyhow::Result<bool> {
-    let res = sqlx::query(
-        "INSERT OR IGNORE INTO webhook_deliveries (delivery_id, provider, received_at)
-         VALUES (?, ?, ?)",
-    )
-    .bind(delivery_id)
-    .bind(provider)
-    .bind(ts_ms(Timestamp::now()))
-    .execute(pool)
-    .await?;
-    Ok(res.rows_affected() == 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -2521,7 +2497,6 @@ pub struct PruneStats {
     pub dependencies_deleted: u64,
     pub events_deleted: u64,
     pub notifications_deleted: u64,
-    pub webhook_deliveries_deleted: u64,
     pub vacuumed: bool,
 }
 
@@ -2583,20 +2558,13 @@ pub async fn prune(
         .execute(pool)
         .await?
         .rows_affected();
-    stats.webhook_deliveries_deleted =
-        sqlx::query("DELETE FROM webhook_deliveries WHERE received_at < ?")
-            .bind(cutoff)
-            .execute(pool)
-            .await?
-            .rows_affected();
     if vacuum
         && (stats.outputs_cleared
             + stats.tasks_deleted
             + stats.runs_deleted
             + stats.dependencies_deleted
             + stats.events_deleted
-            + stats.notifications_deleted
-            + stats.webhook_deliveries_deleted)
+            + stats.notifications_deleted)
             > 0
     {
         // VACUUM must not run inside a transaction; sqlx executes it in autocommit.

@@ -73,7 +73,7 @@ step.
   [Variables & prompts](/guide/variables-and-prompts),
   [Embedded agents](/guide/agents),
   [Schedules & dependencies](/guide/schedules-and-dependencies),
-  [Webhooks](/guide/webhooks), [Remote access](/guide/remote-access),
+  [Remote access](/guide/remote-access),
   [TUI](/guide/tui), [GPUI desktop client](/guide/desktop-client).
 - **Reference** — [CLI](/reference/cli), [Configuration](/reference/config),
   [Task file format](/reference/tasks), [Event kinds](/reference/events),

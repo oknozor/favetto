@@ -217,8 +217,6 @@ pub mod method {
     pub const NOTIFICATIONS_LIST: &str = "notifications.list";
     /// Send a test notification through a channel.
     pub const NOTIFICATIONS_TEST: &str = "notifications.test";
-    /// Add a notification hook reacting to an event kind.
-    pub const HOOKS_UPSERT: &str = "hooks.upsert";
     /// Aggregate persisted per-run token/cost usage into a per-bucket series for
     /// a day/week/month/year period, plus window totals.
     pub const USAGE_STATS: &str = "usage.stats";
@@ -470,10 +468,6 @@ pub const CLIENT_METHODS: &[(&str, &str)] = &[
         "Send a test notification through a channel.",
     ),
     (
-        method::HOOKS_UPSERT,
-        "Add a notification hook reacting to an event kind.",
-    ),
-    (
         method::USAGE_STATS,
         "Aggregate persisted per-run token/cost usage into a per-bucket series \
          (day/week/month/year) plus window totals.",
@@ -698,7 +692,6 @@ mod tests {
             method::SCHEDULES_DELETE,
             method::NOTIFICATIONS_LIST,
             method::NOTIFICATIONS_TEST,
-            method::HOOKS_UPSERT,
             method::USAGE_STATS,
             method::REPOS_LIST,
             method::REPOS_ADD,

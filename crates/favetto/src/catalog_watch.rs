@@ -299,7 +299,6 @@ mod tests {
             db: pool,
             bus: EventBus::new(64),
             token: favetto_core::auth::Token::generate(),
-            webhooks: crate::webhooks::WebhookSecrets::from_config(&config),
             agents: crate::agents::AgentManager::new(),
             registry: crate::agents::AgentRegistry::default(),
             config,
@@ -307,7 +306,6 @@ mod tests {
             tasks_dir: tasks_dir.to_path_buf(),
             catalog,
             scheduler,
-            hook_store: Arc::new(parking_lot::RwLock::new(Vec::new())),
         }))
     }
 
@@ -793,7 +791,6 @@ mod repo_tests {
             db: pool,
             bus: EventBus::new(64),
             token: favetto_core::auth::Token::generate(),
-            webhooks: crate::webhooks::WebhookSecrets::from_config(&config),
             agents: crate::agents::AgentManager::new(),
             registry: crate::agents::AgentRegistry::default(),
             config,
@@ -801,7 +798,6 @@ mod repo_tests {
             tasks_dir: tasks_dir.to_path_buf(),
             catalog,
             scheduler,
-            hook_store: Arc::new(parking_lot::RwLock::new(Vec::new())),
         }))
     }
 

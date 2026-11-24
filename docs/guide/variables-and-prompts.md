@@ -78,7 +78,7 @@ Prompt bodies and `spawn_file` paths are rendered before use.
 |-------------|-------------|
 | <span v-pre>`{{ task.id }}`</span> | The task's UUID. |
 | <span v-pre>`{{ task.name }}`</span> | The task's catalog identity. |
-| <span v-pre>`{{ input.<name> }}`</span> | A collected variable, a webhook summary field, or a spawned element. |
+| <span v-pre>`{{ input.<name> }}`</span> | A collected variable or a spawned element. |
 | <span v-pre>`{{ prev.* }}`</span> | The result of the `needs` predecessor. |
 
 Strings render raw, objects and arrays render as compact JSON, and missing paths

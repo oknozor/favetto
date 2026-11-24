@@ -165,7 +165,3 @@ pub(crate) const HTTP_ENDPOINT_LOGIN: &str =
 /// Pairing HTTP endpoint bullet.
 pub(crate) const HTTP_ENDPOINT_PAIR: &str =
     "- `POST /pair/generate` (bearer-guarded) and `POST /pair/exchange` — pairing.\n";
-
-/// GitHub webhook HTTP endpoint bullet.
-pub(crate) const HTTP_ENDPOINT_WEBHOOKS: &str =
-    "- `POST /webhooks/github` — GitHub webhook receiver (see [Webhooks & hooks](../guide/webhooks)).\n";

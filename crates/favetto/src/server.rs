@@ -1033,14 +1033,6 @@ async fn dispatch_method(state: &Arc<State>, req: &Request) -> Result<serde_json
             to_value(NotificationTestResult { sent: true })
         }
 
-        method::HOOKS_UPSERT => {
-            let p: HookUpsertParams = parse_params(&req.method, &req.params)?;
-            match upsert_hook(state, p) {
-                Ok(()) => to_value(HookUpsertResult { added: true }),
-                Err(e) => Err(RpcError::InvalidParams(e.to_string())),
-            }
-        }
-
         method::USAGE_STATS => {
             let p: UsageStatsParams = parse_params(&req.method, &req.params)?;
             let period = p.period.unwrap_or_default();
@@ -2382,23 +2374,6 @@ async fn update_catalog_task(
 
 async fn delete_schedule(state: &Arc<State>, id: &str) -> anyhow::Result<()> {
     crate::scheduler::remove(state, id).await
-}
-
-/// Add a notification hook reacting to an event kind (live, in-memory).
-fn upsert_hook(state: &Arc<State>, params: HookUpsertParams) -> anyhow::Result<()> {
-    let HookUpsertParams {
-        event,
-        channel,
-        config,
-    } = params;
-    let event = favetto_core::model::EventKind::from_name(&event)
-        .ok_or_else(|| anyhow::anyhow!("missing or invalid 'event' kind"))?;
-    let config = config.unwrap_or(serde_json::Value::Null);
-
-    let hook = crate::hooks::notify_hook(event, channel, config);
-    state.hook_store.write().push(hook);
-    tracing::info!("added notification hook");
-    Ok(())
 }
 
 /// Permanently delete a terminal task and its Favetto-local history.

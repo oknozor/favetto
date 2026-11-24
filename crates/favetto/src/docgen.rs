@@ -470,7 +470,6 @@ pub fn render_remote_api() -> String {
     out.push_str(HTTP_ENDPOINT_METRICS);
     out.push_str(HTTP_ENDPOINT_LOGIN);
     out.push_str(HTTP_ENDPOINT_PAIR);
-    out.push_str(HTTP_ENDPOINT_WEBHOOKS);
     let _ = writeln!(out);
     out
 }

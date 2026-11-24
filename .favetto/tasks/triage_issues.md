@@ -30,7 +30,7 @@ crates:
   models.dev) in `lib.rs`.
 - `crates/favetto-tui` — the dependency-light terminal client binary.
 - `crates/favetto` — the daemon binary: task executor, PTY agent sessions,
-  scheduler, hooks, notifications, webhooks, and SQLite persistence.
+  scheduler, notifications, and SQLite persistence.
 
 Longer design work lives under `docs/design/`; an issue that belongs to a design
 program is attached to a tracking issue as a sub-issue. Read the tracking issue

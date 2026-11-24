@@ -53,7 +53,6 @@ Press **?** at any time to open the same reference as a floating overlay. `?` or
 | Global | `Ctrl+X` `l` | launch a catalog task |
 | Global | `Ctrl+X` `a` | add task to catalog |
 | Global | `Ctrl+X` `s` | create schedule |
-| Global | `Ctrl+X` `c` | create notification hook |
 | Global | `Ctrl+X` `r` | switch repo |
 | Global | `Ctrl+X` `R` | add repo |
 | Global | `Ctrl+X` `t` | change theme |
@@ -223,7 +222,6 @@ combinations are:
 | `Ctrl+X` `l` | launch a catalog task |
 | `Ctrl+X` `a` | add task to catalog |
 | `Ctrl+X` `s` | create schedule |
-| `Ctrl+X` `c` | create notification hook |
 | `Ctrl+X` `r` | switch repo |
 | `Ctrl+X` `R` | add repo |
 | `Ctrl+X` `t` | change theme |
@@ -272,8 +270,8 @@ completed/failed as soon as the agent finishes the seeded turn, so a `spawn` or
 `needs` pipeline continues without you having to quit the CLI; the TUI is then
 left open so you can still inspect it or keep working by hand. Agents whose
 interactive mode exits on its own are completed/failed when the session exits
-instead. Only programmatic runs (schedules, hooks/webhooks, `needs`, `spawn`)
-stay headless and finish on their own.
+instead. Only programmatic runs (schedules, `needs`, `spawn`) stay headless and
+finish on their own.
 
 Opening the Agent panel on a running task never starts a second ACP session:
 the daemon attaches to that task's existing live session, and the panel backfills
@@ -322,7 +320,7 @@ it inherited.
 
 The **Tasks** and **Events** tables each carry a **REPO** column: the name of
 the repo a run or event belongs to, or `global` for a bare task name and for
-integration (webhook) events. When a specific repo is active (`Ctrl+P → Switch
+unscoped integration events. When a specific repo is active (`Ctrl+P → Switch
 repo`), both tabs are scoped to that repo's rows only; the selected row is
 clamped into view and the mouse hit-testing follows the filtered rows. The
 **Catalog** tab is scoped the same way but additionally keeps the global

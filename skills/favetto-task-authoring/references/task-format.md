@@ -160,7 +160,7 @@ release/changelog.md   →  release/changelog
 ```
 
 The same identity is used by `tasks.start`, `catalog.get`, `needs`/`spawn`,
-webhook `rule.task`, `catalog:<name>` schedules, and `{{ task.name }}`. Two files
+`catalog:<name>` schedules, and `{{ task.name }}`. Two files
 with the same stem in different folders are distinct tasks. **Moving a task into
 a subfolder changes its identity** and therefore breaks anything that named the
 old identity.
