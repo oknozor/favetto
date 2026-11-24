@@ -724,7 +724,6 @@ pub struct Form {
 pub enum FormKind {
     AddTask,
     CreateSchedule,
-    CreateNotification,
     AddRepo,
 }
 
@@ -1093,7 +1092,6 @@ pub enum MenuAction {
     LaunchTask,
     AddTask,
     CreateSchedule,
-    CreateNotification,
     SwitchRepo,
     AddRepo,
     ChangeTheme,
@@ -1102,12 +1100,11 @@ pub enum MenuAction {
 
 impl MenuAction {
     /// Every palette command, in the order shown by the Ctrl+X leader hint.
-    pub const ALL: [MenuAction; 9] = [
+    pub const ALL: [MenuAction; 8] = [
         MenuAction::NewOneShot,
         MenuAction::LaunchTask,
         MenuAction::AddTask,
         MenuAction::CreateSchedule,
-        MenuAction::CreateNotification,
         MenuAction::SwitchRepo,
         MenuAction::AddRepo,
         MenuAction::ChangeTheme,
@@ -1121,7 +1118,6 @@ impl MenuAction {
             MenuAction::LaunchTask => "Launch task",
             MenuAction::AddTask => "Add task to catalog",
             MenuAction::CreateSchedule => "Create schedule",
-            MenuAction::CreateNotification => "Create notification hook",
             MenuAction::SwitchRepo => "Switch repo",
             MenuAction::AddRepo => "Add repo",
             MenuAction::ChangeTheme => "Change theme",
@@ -1137,7 +1133,6 @@ impl MenuAction {
             MenuAction::LaunchTask => 'l',
             MenuAction::AddTask => 'a',
             MenuAction::CreateSchedule => 's',
-            MenuAction::CreateNotification => 'c',
             MenuAction::SwitchRepo => 'r',
             MenuAction::AddRepo => 'R',
             MenuAction::ChangeTheme => 't',
@@ -1189,7 +1184,6 @@ pub const MENU_ENTRIES: &[MenuEntry] = &[
     MenuEntry::Header("Catalog"),
     MenuEntry::Action(MenuAction::AddTask),
     MenuEntry::Action(MenuAction::CreateSchedule),
-    MenuEntry::Action(MenuAction::CreateNotification),
     MenuEntry::Header("Repositories"),
     MenuEntry::Action(MenuAction::SwitchRepo),
     MenuEntry::Action(MenuAction::AddRepo),
@@ -3352,22 +3346,18 @@ impl App {
                 self.popup = Popup::None;
                 UiAction::OpenDocs
             }
-            MenuAction::AddTask
-            | MenuAction::CreateSchedule
-            | MenuAction::CreateNotification
-            | MenuAction::AddRepo => {
+            MenuAction::AddTask | MenuAction::CreateSchedule | MenuAction::AddRepo => {
                 self.open_form(action);
                 UiAction::None
             }
         }
     }
 
-    /// Build the floating form for a catalog/schedule/hook/repo command.
+    /// Build the floating form for a catalog/schedule/repo command.
     fn open_form(&mut self, action: MenuAction) {
         let kind = match action {
             MenuAction::AddTask => FormKind::AddTask,
             MenuAction::CreateSchedule => FormKind::CreateSchedule,
-            MenuAction::CreateNotification => FormKind::CreateNotification,
             _ => FormKind::AddRepo,
         };
         let (title, fields) = match kind {
@@ -3387,10 +3377,6 @@ impl App {
             FormKind::CreateSchedule => (
                 "Create schedule",
                 vec!["Cron expression", "Task name", "Input JSON (optional)"],
-            ),
-            FormKind::CreateNotification => (
-                "Create notification hook",
-                vec!["Event kind", "Channel", "Config JSON (optional)"],
             ),
             FormKind::AddRepo => (
                 "Add repo",
@@ -3808,14 +3794,6 @@ impl App {
                     "cron": v(0),
                     "task": v(1),
                     "input": json(&v(2)),
-                }),
-            },
-            FormKind::CreateNotification => UiAction::Submit {
-                method: method::HOOKS_UPSERT,
-                params: serde_json::json!({
-                    "event": v(0),
-                    "channel": v(1),
-                    "config": json(&v(2)),
                 }),
             },
             FormKind::AddRepo => UiAction::Submit {

@@ -15,7 +15,6 @@ Every section is optional; favetto falls back to built-in defaults for anything 
 | `mcp` | McpSettings | `{"servers":[]}` | no | MCP servers Favetto may forward to ACP agents. The daemon persists edits in SQLite; this section only seeds the registry at startup. |
 | `executor` | ExecutorSettings | `{"parallel":false,"max_concurrency":4,"worktree":true,"worktree_retention":{"days":30,"min_worktrees":0},"keep_worktree":false,"max_output_bytes":262144,"detect_awaiting_input":true,"awaiting_input_quiet_ms":8000,"stale_run":"fail","retry":{"max_attempts":1,"backoff":"exponential","initial_ms":5000,"max_ms":300000,"retry_on":["infrastructure","timeout"]}}` | no | Task executor concurrency / isolation. |
 | `git` | GitSettings | `{}` | no | Non-interactive git provisioning for agent processes. Defaults to `signing = "off"`, which forces `commit.gpgsign = false` so an agent commit can never block on an interactive pinentry/askpass prompt. |
-| `webhook` | WebhookSettings | `{"github":{"enabled":false,"rules":[]}}` | no | Webhook trigger rules (currently GitHub). |
 | `tui` | TuiSettings | `{"sound":{"enabled":true,"player":"auto","min_interval_ms":400,"only_when_unfocused":false,"events":{"attention":"none","awaiting_input":"attention","task_failed":"failure","task_finished":"success","task_started":"none"}},"theme":"opencode","theme_mode":"system","show_header":true,"show_footer":true}` | no | Client-side TUI settings. Ignored by the daemon, which reads the same file. |
 | `auth` | AuthSettings | `{"login_rate_limit":5,"login_window_secs":300,"require_tls":false}` | no | Authentication settings for the username/password login policy. |
 
@@ -264,59 +263,6 @@ Why a task ended in failure, so a controller can distinguish a genuine
 agent failure from an infrastructure fault.
 
 string
-
-## WebhookSettings
-
-Webhook trigger settings. Currently only GitHub is supported.
-
-| Field | Type | Default | Required | Description |
-|-------|------|---------|----------|-------------|
-| `github` | GithubWebhookSettings | `{"enabled":false,"rules":[]}` | no |  |
-
-## GithubWebhookSettings
-
-GitHub webhook receiver + trigger rules.
-
-GitHub POSTs signed events to `/webhooks/github`; each matching rule enqueues
-the named catalog task with a truncated summary of the event as its input.
-Rules and the secret are read at daemon startup, so a restart is required after
-editing them.
-
-| Field | Type | Default | Required | Description |
-|-------|------|---------|----------|-------------|
-| `enabled` | boolean | `false` | no | Opt-in; disabled unless set. |
-| `secret_env` | string (optional) | — | no | Name of the env var holding the signing secret. |
-| `secret` | string (optional) | — | no | Literal secret (accepted but discouraged). |
-| `rules` | GithubRule[] | `[]` | no |  |
-
-## GithubRule
-
-A single `[[webhook.github.rules]]` entry.
-
-| Field | Type | Default | Required | Description |
-|-------|------|---------|----------|-------------|
-| `name` | string | — | yes |  |
-| `event` | string | — | yes | `X-GitHub-Event` value (e.g. `"issues"`). Validated at startup. |
-| `action` | string (optional) | — | no | Optional action; unset matches any action. |
-| `task` | string | — | yes | Catalog task name. Validated at startup. |
-| `enabled` | boolean | `true` | no |  |
-| `filter` | GithubFilter | `{}` | no |  |
-
-## GithubFilter
-
-Optional narrowing for a [`GithubRule`]. Unset fields match anything; all set
-fields must match (AND).
-
-`repo`, `author`, `base_ref`, and `head_ref` are globs; `labels_contains` is
-any-of exact.
-
-| Field | Type | Default | Required | Description |
-|-------|------|---------|----------|-------------|
-| `repo` | string (optional) | — | no |  |
-| `author` | string (optional) | — | no |  |
-| `labels_contains` | string[] | — | no |  |
-| `base_ref` | string (optional) | — | no |  |
-| `head_ref` | string (optional) | — | no |  |
 
 ## TuiSettings
 

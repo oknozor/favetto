@@ -127,8 +127,8 @@ mapping, and the rule to re-inspect between mutations.
 The server deliberately exposes **no raw PTY access** and no administration
 surface. `agents.reply` is the only agent-input tool; `agents.input`,
 `agents.start`, `agents.resize`, `agents.attach`, `agents.close`,
-`tasks.start_oneshot`, `catalog.add`, `catalog.update`, `schedules.*`,
-`notifications.*`, and `hooks.upsert` are not available. The daemon and
+`tasks.start_oneshot`, `catalog.add`, `catalog.update`, `schedules.*`, and
+`notifications.*` are not available. The daemon and
 `favetto-core` are unchanged: this is another external supervisor, like the
 reference example in the [supervisor contract](../reference/supervisor-contract).
 

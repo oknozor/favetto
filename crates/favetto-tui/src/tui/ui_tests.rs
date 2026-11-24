@@ -263,8 +263,8 @@ fn command_palette_renders_title_search_and_groups() {
     assert!(text.contains("Open docs"), "docs command missing: {text:?}");
     // Every command carries its right-aligned Ctrl+X shortcut.
     for shortcut in [
-        "Ctrl+X n", "Ctrl+X l", "Ctrl+X a", "Ctrl+X s", "Ctrl+X c", "Ctrl+X r", "Ctrl+X R",
-        "Ctrl+X t", "Ctrl+X h",
+        "Ctrl+X n", "Ctrl+X l", "Ctrl+X a", "Ctrl+X s", "Ctrl+X r", "Ctrl+X R", "Ctrl+X t",
+        "Ctrl+X h",
     ] {
         assert!(
             text.contains(shortcut),

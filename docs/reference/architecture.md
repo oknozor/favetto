@@ -17,7 +17,7 @@ adapters.
 ┌───────────────────────────────────────────────────────────────┐
 │                  Favetto Daemon                          │
 │   Scheduler ─► Task Queue ─► ACP Sessions ─► ACP agent servers │
-│   Event Bus · Hook Engine · Notification Bus                  │
+│   Event Bus · Notification Bus                                │
 │   Persistence (SQLite/sqlx) · Remote API (axum)               │
 └───────────────────────────────────────────────────────────────┘
 ```
@@ -30,7 +30,7 @@ adapters.
   screens and keystrokes.
 - **Remote-TUI-first** — the TUI client and the daemon are decoupled over a single
   wire protocol; local attach is just a special case of remote attach.
-- **Event-driven core** — everything is a task, an event, or a hook.
+- **Event-driven core** — everything is a task, an event, or a workflow step.
 - **Declarative tasks** — each task is a Markdown file with a TOML header
   (`agent` or `kind = "action"`, plus optional schedule/dependency) and a prompt
   body. An agent task delegates to an external CLI; an action task runs a
@@ -60,7 +60,7 @@ docs/                         VitePress site: guide + generated reference
 | **Core + remote TUI** | daemon, SQLite, event bus, MessagePack wire protocol over Unix socket + WebSocket, token auth, ratatui client |
 | **Agent sessions** | generic ACP runtime, streamed structured events, permission policy per task, remote event replay |
 | **Scheduler + notifications** | cron, task queue → agent sessions, notification channels, Scheduler + Notifications TUI tabs |
-| **Integrations + hardening** | metrics, pairing, webhook receivers + config-driven rules, parallel git-worktree execution |
+| **Integrations + hardening** | metrics, pairing, parallel git-worktree execution |
 
 ## Wire protocol
 

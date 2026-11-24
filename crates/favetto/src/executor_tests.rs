@@ -4,7 +4,6 @@ use crate::config::FavettoConfig;
 use crate::event_bus::EventBus;
 use crate::state::StateInit;
 use crate::tasks::{TaskVar, VarType};
-use crate::webhooks::WebhookSecrets;
 use favetto_core::auth::Token;
 use parking_lot::RwLock;
 
@@ -1225,10 +1224,6 @@ async fn join_state_with_config(
         db: pool,
         bus: EventBus::new(64),
         token: Token::generate(),
-        webhooks: WebhookSecrets {
-            github: None,
-            linear: None,
-        },
         agents: AgentManager::new(),
         registry,
         config: Arc::new(cfg),
@@ -1236,7 +1231,6 @@ async fn join_state_with_config(
         tasks_dir: dir.to_path_buf(),
         catalog: Arc::new(RwLock::new(catalog)),
         scheduler: crate::scheduler::Scheduler::new().await.unwrap(),
-        hook_store: Arc::new(RwLock::new(Vec::new())),
     }))
 }
 

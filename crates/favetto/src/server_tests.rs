@@ -50,7 +50,6 @@ async fn test_state_with_config(
         db: pool,
         bus: crate::event_bus::EventBus::new(64),
         token: favetto_core::auth::Token::generate(),
-        webhooks: crate::webhooks::WebhookSecrets::from_config(&config),
         agents: crate::agents::AgentManager::new(),
         registry,
         config,
@@ -59,7 +58,6 @@ async fn test_state_with_config(
         tasks_dir: tasks_dir.to_path_buf(),
         catalog,
         scheduler,
-        hook_store: Arc::new(parking_lot::RwLock::new(Vec::new())),
     }))
 }
 
@@ -953,7 +951,6 @@ async fn agent_state_with_config(
         db: pool,
         bus: crate::event_bus::EventBus::new(64),
         token: favetto_core::auth::Token::generate(),
-        webhooks: crate::webhooks::WebhookSecrets::from_config(&cfg),
         agents: crate::agents::AgentManager::new(),
         registry,
         config: Arc::new(cfg),
@@ -962,7 +959,6 @@ async fn agent_state_with_config(
         tasks_dir: tasks_dir.to_path_buf(),
         catalog,
         scheduler,
-        hook_store: Arc::new(parking_lot::RwLock::new(Vec::new())),
     }))
 }
 
@@ -1970,7 +1966,6 @@ proptest! {
         let _: Result<CatalogAddParams, _> = parse_params(method::CATALOG_ADD, &value);
         let _: Result<CatalogUpdateParams, _> = parse_params(method::CATALOG_UPDATE, &value);
         let _: Result<ScheduleUpsertParams, _> = parse_params(method::SCHEDULES_UPSERT, &value);
-        let _: Result<HookUpsertParams, _> = parse_params(method::HOOKS_UPSERT, &value);
         let _: Result<AgentReplyParams, _> = parse_params(method::AGENTS_REPLY, &value);
         let _: Result<AgentElicitationReplyParams, _> =
             parse_params(method::AGENTS_REPLY_ELICITATION, &value);

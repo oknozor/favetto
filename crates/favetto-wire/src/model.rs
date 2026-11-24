@@ -242,8 +242,8 @@ impl Failure {
 
 /// A unit of work the favetto is driving.
 ///
-/// Tasks are created by integrations, hooks, the scheduler, or manually via the
-/// API, then handed to the executor which runs the referenced catalog task through
+/// Tasks are created by the scheduler, workflow steps, or manually via the API,
+/// then handed to the executor which runs the referenced catalog task through
 /// its external agent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -285,7 +285,7 @@ pub struct Task {
     pub session_title: Option<String>,
     /// The task that directly enqueued this one (a `spawn` parent, a `needs`
     /// predecessor, …). `None` for a task started directly (manual, scheduled,
-    /// RPC, hook, webhook).
+    /// RPC).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<Uuid>,
     /// The workflow origin this run belongs to. A directly-started task has no
@@ -295,8 +295,8 @@ pub struct Task {
     pub root_id: Option<Uuid>,
     /// True when the run was started by a user and should execute in the agent's
     /// interactive TUI (the Agent panel attaches to it live). Programmatic starts
-    /// (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run
-    /// headless. Defaults to false so older payloads and rows decode unchanged.
+    /// (scheduler, `needs`, `spawn`) leave this false and run headless. Defaults
+    /// to false so older payloads and rows decode unchanged.
     #[serde(default)]
     pub interactive: bool,
     /// Optional per-launch agent override. A manual launch can run the task with
@@ -353,9 +353,9 @@ impl Task {
 /// Kinds of events emitted on the event bus.
 ///
 /// Task and cron events are produced by the daemon's own lifecycle (the executor,
-/// the scheduler and the RPC surface); integration events (`IssueCreated`,
-/// `PrMerged`, `PushReceived`, ...) are emitted by webhook receivers as GitHub
-/// (or other provider) activity arrives.
+/// the scheduler and the RPC surface). Integration kinds (`IssueCreated`,
+/// `PrMerged`, `PushReceived`, ...) are kept for wire/storage compatibility and
+/// future integrations.
 ///
 /// The macro below is the single source of truth. The enum variants,
 /// [`EventKind::ALL`], [`EventKind::as_str`], [`EventKind::description`] and

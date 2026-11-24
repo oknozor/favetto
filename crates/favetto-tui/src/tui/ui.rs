@@ -1625,7 +1625,6 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+X l", "launch a catalog task"),
             ("Ctrl+X a", "add task to catalog"),
             ("Ctrl+X s", "create schedule"),
-            ("Ctrl+X c", "create notification hook"),
             ("Ctrl+X r", "switch repo"),
             ("Ctrl+X R", "add repo"),
             ("Ctrl+X t", "change theme"),

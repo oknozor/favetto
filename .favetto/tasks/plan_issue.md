@@ -21,7 +21,7 @@ crates:
   `rpc.rs`, `model.rs`, `auth.rs`).
 - `crates/favetto-providers` — provider/model catalog (`lib.rs`).
 - `crates/favetto` — daemon/TUI binary: `daemon.rs`, `server.rs`, `executor.rs`,
-  `tasks.rs`, `agents.rs`, `scheduler.rs`, `hooks.rs`, `notify.rs`, `webhooks.rs`,
+  `tasks.rs`, `agents.rs`, `scheduler.rs`, `notify.rs`,
   `db.rs`, `state.rs`, `config.rs`, `template.rs`, `client.rs`, `transport.rs`,
   `metrics.rs`, plus the `tui/` module tree.
 

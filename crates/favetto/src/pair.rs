@@ -156,9 +156,6 @@ mod tests {
             db: pool,
             bus: crate::event_bus::EventBus::new(8),
             token: favetto_core::auth::Token::generate(),
-            webhooks: crate::webhooks::WebhookSecrets::from_config(
-                &crate::config::FavettoConfig::default(),
-            ),
             agents: crate::agents::AgentManager::new(),
             registry: crate::agents::AgentRegistry::default(),
             config: Arc::new(crate::config::FavettoConfig::default()),
@@ -166,7 +163,6 @@ mod tests {
             tasks_dir: dir,
             catalog: Arc::new(parking_lot::RwLock::new(Vec::new())),
             scheduler: crate::scheduler::Scheduler::new().await.unwrap(),
-            hook_store: Arc::new(parking_lot::RwLock::new(Vec::new())),
         }))
     }
 

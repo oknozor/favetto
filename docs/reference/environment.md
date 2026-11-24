@@ -32,8 +32,6 @@ and integration secrets. Anything not listed here is configured in
 
 | Variable | Used by | Description |
 |----------|---------|-------------|
-| `GITHUB_WEBHOOK_SECRET` | daemon | Default signing secret for `/webhooks/github` when `[webhook.github]` has no `secret`/`secret_env`. |
-| `LINEAR_WEBHOOK_SECRET` | daemon | HMAC secret for the Linear webhook receiver. |
 | `OPENCODE_MODELS_URL` | daemon | Overrides the model catalog URL (`https://models.dev/api.json`). |
 
 `[git].passphrase_env` names any variable of your choosing that holds a signing

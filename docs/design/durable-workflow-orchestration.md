@@ -169,7 +169,7 @@ shape. Layer a documented convention on top, produced from the agent's structure
 
 ```json
 {
-  "summary": "Implemented GitHub webhook signature verification.",
+  "summary": "Implemented the scheduled retention sweep.",
   "artifacts": [
     { "kind": "source", "path": "src/github.rs" },
     { "kind": "commit", "ref": "favetto/implement-github-abc12345" }

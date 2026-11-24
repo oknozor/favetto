@@ -271,7 +271,6 @@ pub const EXCLUDED: &[&str] = &[
     method::SCHEDULES_DELETE,
     method::NOTIFICATIONS_LIST,
     method::NOTIFICATIONS_TEST,
-    method::HOOKS_UPSERT,
     method::PING,
     method::REPOS_LIST,
     method::REPOS_ADD,

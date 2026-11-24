@@ -3938,7 +3938,7 @@ fn repo_picker_backspace_widens_and_global_row_clears() {
 fn menu_change_theme_opens_the_picker() {
     let mut app = App::new();
     app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
-    for _ in 0..7 {
+    for _ in 0..6 {
         app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
     }
     let action = app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
@@ -4012,7 +4012,7 @@ fn menu_switch_repo_and_add_repo_open_their_surfaces() {
     let mut app = App::new();
     app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
     assert!(matches!(app.popup, Popup::Menu { .. }));
-    for _ in 0..5 {
+    for _ in 0..4 {
         app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
     }
     let action = app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
@@ -4021,7 +4021,7 @@ fn menu_switch_repo_and_add_repo_open_their_surfaces() {
 
     app.popup = Popup::None;
     app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
-    for _ in 0..6 {
+    for _ in 0..5 {
         app.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
     }
     app.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
@@ -4123,10 +4123,6 @@ fn menu_dispatches_commands_by_identity() {
     action = app.dispatch_menu_action(MenuAction::CreateSchedule);
     assert!(matches!(action, UiAction::None));
     assert!(matches!(app.popup, Popup::Form(ref f) if f.kind == FormKind::CreateSchedule));
-
-    action = app.dispatch_menu_action(MenuAction::CreateNotification);
-    assert!(matches!(action, UiAction::None));
-    assert!(matches!(app.popup, Popup::Form(ref f) if f.kind == FormKind::CreateNotification));
 
     action = app.dispatch_menu_action(MenuAction::AddRepo);
     assert!(matches!(action, UiAction::None));

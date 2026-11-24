@@ -301,7 +301,6 @@ async fn mcp_supervisor_drives_a_two_step_workflow() {
         "catalog.add",
         "catalog.update",
         "schedules.upsert",
-        "hooks.upsert",
     ] {
         assert!(!names.contains(&excluded), "exposed tool `{excluded}`");
     }

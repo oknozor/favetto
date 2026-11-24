@@ -193,7 +193,7 @@ parsing a raw transcript. The existing keys (`agent`, `session_id`,
   "output": "<capped raw transcript>",
   "result": { "…": "agent-specific parsed result, or null" },
   "envelope": {
-    "summary": "Implemented GitHub webhook signature verification.",
+    "summary": "Implemented the scheduled retention sweep.",
     "artifacts": [{ "kind": "source", "path": "src/github.rs" }],
     "findings": [],
     "outputs": { "tests_passed": true },
@@ -244,7 +244,7 @@ context:
 |-------------|-------------|
 | <span v-pre>`{{ task.id }}`</span> | The task's UUID. |
 | <span v-pre>`{{ task.name }}`</span> | The task's catalog identity (relative path, no `.md`). |
-| <span v-pre>`{{ input.<name> }}`</span> | A collected variable or the input produced by `spawn`/webhooks. |
+| <span v-pre>`{{ input.<name> }}`</span> | A collected variable or the input produced by `spawn`. |
 | <span v-pre>`{{ prev.* }}`</span> | The result of the `needs` predecessor (also `input._prev`). For `<task>:all_finished`, `prev` is the fan-in aggregate (`root`, `target`, `count`, `succeeded`, `failed`, `cancelled`, `tasks`). |
 
 Strings render raw, objects and arrays as compact JSON, and missing paths as
@@ -259,11 +259,11 @@ without the `.md` extension, with `/` separators: `pipelines/plan.md` is the tas
 Two files with the same stem in different folders are distinct tasks.
 
 That identity is used consistently by `tasks.start` and `catalog.get`,
-`needs`/`spawn`, webhook `rule.task`, `catalog:<name>` schedule ids, and
+`needs`/`spawn`, `catalog:<name>` schedule ids, and
 <span v-pre>`{{ task.name }}`</span>. **Moving a task into a subfolder changes
 its identity**: an
-existing `catalog:<old>` schedule is dropped and recreated, and any `needs`,
-`spawn`, or webhook rule that named the old name must be updated.
+existing `catalog:<old>` schedule is dropped and recreated, and any `needs` or
+`spawn` that named the old name must be updated.
 
 ### Repository-local tasks
 

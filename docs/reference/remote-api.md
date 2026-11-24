@@ -71,7 +71,6 @@ A `Request` carries `id`, `method`, and `params`; the matching `Response` carrie
 | `schedules.delete` | Delete a cron schedule. |
 | `notifications.list` | List recent notifications. |
 | `notifications.test` | Send a test notification through a channel. |
-| `hooks.upsert` | Add a notification hook reacting to an event kind. |
 | `usage.stats` | Aggregate persisted per-run token/cost usage into a per-bucket series (day/week/month/year) plus window totals. |
 | `repos.list` | List known repositories and the daemon-wide active one. |
 | `repos.add` | Register a repository (by daemon-host path) as a known repo. |
@@ -163,9 +162,9 @@ Fetch a single task by id, including its stored output.
 | `failure` | Failure (optional) | — | no | Machine-readable failure classification when `status == Failed`. Absent on success and on rows/payloads written before typed failures existed. |
 | `session_id` | string (optional) | — | no | The agent's own session id (e.g. opencode's session id), captured from a task run's output so the session can be reattached later. |
 | `session_title` | string (optional) | — | no | The agent's human-readable session title (e.g. opencode's generated title), resolved once at run completion from the agent's session store. Absent until a run finishes or when the agent reports no title. |
-| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
+| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC). |
 | `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
-| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
+| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
 | `agent` | string (optional) | — | no | Optional per-launch agent override. A manual launch can run the task with a different configured agent than the catalog definition pins. The executor resolves it before the definition's `agent` and the global `[agent].default`. Absent for tasks that use the definition default. |
 | `provider` | string (optional) | — | no | Optional per-launch model provider override. Resolved atomically with [`Self::model`]: an override of either field never mixes with the definition's provider/model pair. |
 | `model` | string (optional) | — | no | Optional per-launch model id override (a bare id or `provider/model`). Absent for tasks that use the definition's or the agent's default model. |
@@ -251,9 +250,9 @@ Cancel a task.
 | `failure` | Failure (optional) | — | no | Machine-readable failure classification when `status == Failed`. Absent on success and on rows/payloads written before typed failures existed. |
 | `session_id` | string (optional) | — | no | The agent's own session id (e.g. opencode's session id), captured from a task run's output so the session can be reattached later. |
 | `session_title` | string (optional) | — | no | The agent's human-readable session title (e.g. opencode's generated title), resolved once at run completion from the agent's session store. Absent until a run finishes or when the agent reports no title. |
-| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
+| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC). |
 | `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
-| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
+| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
 | `agent` | string (optional) | — | no | Optional per-launch agent override. A manual launch can run the task with a different configured agent than the catalog definition pins. The executor resolves it before the definition's `agent` and the global `[agent].default`. Absent for tasks that use the definition default. |
 | `provider` | string (optional) | — | no | Optional per-launch model provider override. Resolved atomically with [`Self::model`]: an override of either field never mixes with the definition's provider/model pair. |
 | `model` | string (optional) | — | no | Optional per-launch model id override (a bare id or `provider/model`). Absent for tasks that use the definition's or the agent's default model. |
@@ -287,9 +286,9 @@ Retry a terminal task, preserving its prior run history.
 | `failure` | Failure (optional) | — | no | Machine-readable failure classification when `status == Failed`. Absent on success and on rows/payloads written before typed failures existed. |
 | `session_id` | string (optional) | — | no | The agent's own session id (e.g. opencode's session id), captured from a task run's output so the session can be reattached later. |
 | `session_title` | string (optional) | — | no | The agent's human-readable session title (e.g. opencode's generated title), resolved once at run completion from the agent's session store. Absent until a run finishes or when the agent reports no title. |
-| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
+| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC). |
 | `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
-| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
+| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
 | `agent` | string (optional) | — | no | Optional per-launch agent override. A manual launch can run the task with a different configured agent than the catalog definition pins. The executor resolves it before the definition's `agent` and the global `[agent].default`. Absent for tasks that use the definition default. |
 | `provider` | string (optional) | — | no | Optional per-launch model provider override. Resolved atomically with [`Self::model`]: an override of either field never mixes with the definition's provider/model pair. |
 | `model` | string (optional) | — | no | Optional per-launch model id override (a bare id or `provider/model`). Absent for tasks that use the definition's or the agent's default model. |
@@ -345,9 +344,9 @@ Start a catalog task by name.
 | `failure` | Failure (optional) | — | no | Machine-readable failure classification when `status == Failed`. Absent on success and on rows/payloads written before typed failures existed. |
 | `session_id` | string (optional) | — | no | The agent's own session id (e.g. opencode's session id), captured from a task run's output so the session can be reattached later. |
 | `session_title` | string (optional) | — | no | The agent's human-readable session title (e.g. opencode's generated title), resolved once at run completion from the agent's session store. Absent until a run finishes or when the agent reports no title. |
-| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
+| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC). |
 | `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
-| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
+| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
 | `agent` | string (optional) | — | no | Optional per-launch agent override. A manual launch can run the task with a different configured agent than the catalog definition pins. The executor resolves it before the definition's `agent` and the global `[agent].default`. Absent for tasks that use the definition default. |
 | `provider` | string (optional) | — | no | Optional per-launch model provider override. Resolved atomically with [`Self::model`]: an override of either field never mixes with the definition's provider/model pair. |
 | `model` | string (optional) | — | no | Optional per-launch model id override (a bare id or `provider/model`). Absent for tasks that use the definition's or the agent's default model. |
@@ -546,9 +545,9 @@ Add one runtime task to an existing workflow root, optionally depending on exist
 | `failure` | Failure (optional) | — | no | Machine-readable failure classification when `status == Failed`. Absent on success and on rows/payloads written before typed failures existed. |
 | `session_id` | string (optional) | — | no | The agent's own session id (e.g. opencode's session id), captured from a task run's output so the session can be reattached later. |
 | `session_title` | string (optional) | — | no | The agent's human-readable session title (e.g. opencode's generated title), resolved once at run completion from the agent's session store. Absent until a run finishes or when the agent reports no title. |
-| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
+| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC). |
 | `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
-| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
+| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
 | `agent` | string (optional) | — | no | Optional per-launch agent override. A manual launch can run the task with a different configured agent than the catalog definition pins. The executor resolves it before the definition's `agent` and the global `[agent].default`. Absent for tasks that use the definition default. |
 | `provider` | string (optional) | — | no | Optional per-launch model provider override. Resolved atomically with [`Self::model`]: an override of either field never mixes with the definition's provider/model pair. |
 | `model` | string (optional) | — | no | Optional per-launch model id override (a bare id or `provider/model`). Absent for tasks that use the definition's or the agent's default model. |
@@ -599,9 +598,9 @@ Retry a terminal task, preserving its prior run history. Single-task alias of `t
 | `failure` | Failure (optional) | — | no | Machine-readable failure classification when `status == Failed`. Absent on success and on rows/payloads written before typed failures existed. |
 | `session_id` | string (optional) | — | no | The agent's own session id (e.g. opencode's session id), captured from a task run's output so the session can be reattached later. |
 | `session_title` | string (optional) | — | no | The agent's human-readable session title (e.g. opencode's generated title), resolved once at run completion from the agent's session store. Absent until a run finishes or when the agent reports no title. |
-| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
+| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC). |
 | `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
-| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
+| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
 | `agent` | string (optional) | — | no | Optional per-launch agent override. A manual launch can run the task with a different configured agent than the catalog definition pins. The executor resolves it before the definition's `agent` and the global `[agent].default`. Absent for tasks that use the definition default. |
 | `provider` | string (optional) | — | no | Optional per-launch model provider override. Resolved atomically with [`Self::model`]: an override of either field never mixes with the definition's provider/model pair. |
 | `model` | string (optional) | — | no | Optional per-launch model id override (a bare id or `provider/model`). Absent for tasks that use the definition's or the agent's default model. |
@@ -1067,24 +1066,6 @@ Send a test notification through a channel.
 |-------|------|---------|----------|-------------|
 | `sent` | boolean | — | yes |  |
 
-### `hooks.upsert`
-
-Add a notification hook reacting to an event kind.
-
-**Request**
-
-| Field | Type | Default | Required | Description |
-|-------|------|---------|----------|-------------|
-| `event` | string | — | yes |  |
-| `channel` | string | — | yes |  |
-| `config` | any | null | no |  |
-
-**Response**
-
-| Field | Type | Default | Required | Description |
-|-------|------|---------|----------|-------------|
-| `added` | boolean | — | yes |  |
-
 ### `usage.stats`
 
 Aggregate persisted per-run token/cost usage into a per-bucket series (day/week/month/year) plus window totals.
@@ -1413,9 +1394,9 @@ A task row changed.
 | `failure` | Failure (optional) | — | no | Machine-readable failure classification when `status == Failed`. Absent on success and on rows/payloads written before typed failures existed. |
 | `session_id` | string (optional) | — | no | The agent's own session id (e.g. opencode's session id), captured from a task run's output so the session can be reattached later. |
 | `session_title` | string (optional) | — | no | The agent's human-readable session title (e.g. opencode's generated title), resolved once at run completion from the agent's session store. Absent until a run finishes or when the agent reports no title. |
-| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC, hook, webhook). |
+| `parent_id` | string (optional) | — | no | The task that directly enqueued this one (a `spawn` parent, a `needs` predecessor, …). `None` for a task started directly (manual, scheduled, RPC). |
 | `root_id` | string (optional) | — | no | The workflow origin this run belongs to. A directly-started task has no root of its own (it *is* the root, so [`Task::root_or_self`] falls back to its id); a spawned child inherits its parent's root. |
-| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, webhooks, hooks, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
+| `interactive` | boolean | `false` | no | True when the run was started by a user and should execute in the agent's interactive TUI (the Agent panel attaches to it live). Programmatic starts (scheduler, `needs`, `spawn`) leave this false and run headless. Defaults to false so older payloads and rows decode unchanged. |
 | `agent` | string (optional) | — | no | Optional per-launch agent override. A manual launch can run the task with a different configured agent than the catalog definition pins. The executor resolves it before the definition's `agent` and the global `[agent].default`. Absent for tasks that use the definition default. |
 | `provider` | string (optional) | — | no | Optional per-launch model provider override. Resolved atomically with [`Self::model`]: an override of either field never mixes with the definition's provider/model pair. |
 | `model` | string (optional) | — | no | Optional per-launch model id override (a bare id or `provider/model`). Absent for tasks that use the definition's or the agent's default model. |
@@ -1509,5 +1490,4 @@ The daemon also serves HTTP endpoints alongside the RPC transports:
 - `GET /metrics` — Prometheus metrics.
 - `POST /auth/login` — username/password login (returns the bearer token).
 - `POST /pair/generate` (bearer-guarded) and `POST /pair/exchange` — pairing.
-- `POST /webhooks/github` — GitHub webhook receiver (see [Webhooks & hooks](../guide/webhooks)).
 

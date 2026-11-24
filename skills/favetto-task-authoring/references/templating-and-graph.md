@@ -11,7 +11,7 @@ to leave single braces alone (for example, code blocks).
 |-------------|-------------|
 | `{{ task.id }}` | The task run's UUID. |
 | `{{ task.name }}` | The catalog identity (relative path, no `.md`). |
-| `{{ input.<name> }}` | A collected `[[vars]]` value, or input produced by `spawn`/webhooks. |
+| `{{ input.<name> }}` | A collected `[[vars]]` value, or input produced by `spawn`. |
 | `{{ prev.* }}` | The result of the `needs` predecessor (also available as `input._prev`). |
 
 For `needs = "<task>:all_finished"`, `prev` is the fan-in aggregate:
