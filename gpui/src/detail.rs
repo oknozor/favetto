@@ -819,10 +819,12 @@ pub struct RestoredSession {
     pub agent: String,
     /// The session lifecycle at replay time.
     pub state: AgentSessionState,
-    /// The last normalized-event sequence already folded into `transcript`.
+    /// The last normalized-event sequence folded into `transcript`.
     ///
-    /// The live feed resumes strictly after this cursor, so the restored
-    /// transcript and the structured rows never paint the same text twice.
+    /// The structured feed is rebuilt independently of this cursor: the replay
+    /// events at or below it are still rendered through the shared conversation
+    /// view, and the raw transcript is only a fallback when no structured prose
+    /// or durable summary exists.
     pub seq: u64,
     /// The replayed plain-text conversation, bounded for display.
     pub transcript: String,
@@ -862,7 +864,7 @@ pub fn restored_session(
         .map_err(|_| "the daemon returned an unreadable session transcript".to_string())?;
     let transcript = String::from_utf8(bytes)
         .map_err(|_| "the daemon returned a transcript that is not valid UTF-8".to_string())?;
-    let transcript = strip_ansi(&transcript);
+    let transcript = strip_tool_markers(&strip_ansi(&transcript));
     let state = if attached.session.running {
         AgentSessionState::Active
     } else {
@@ -875,6 +877,29 @@ pub fn restored_session(
         seq: attached.seq,
         transcript: bound_transcript(&transcript),
     })
+}
+
+/// Remove the ACP adapter's synthetic `[tool] name: title` lines from a plain
+/// transcript.
+///
+/// Those lines are a lossy stand-in for tool calls, not conversation prose. The
+/// structured feed already renders tool cards; when the transcript is the only
+/// fallback it should still read as text rather than leak the marker format.
+pub fn strip_tool_markers(transcript: &str) -> String {
+    if !transcript.lines().any(is_tool_marker_line) {
+        return transcript.to_string();
+    }
+    transcript
+        .lines()
+        .filter(|line| !is_tool_marker_line(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn is_tool_marker_line(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix("[tool]")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
 }
 
 fn bound_transcript(transcript: &str) -> String {
@@ -1073,25 +1098,23 @@ impl TaskDetail {
 
     /// Fold a completed `agents.load` in.
     ///
-    /// Returns the feed cursor to reload from when the restored session changed,
-    /// so the caller backfills only rows newer than the transcript snapshot.
+    /// Returns zero so the caller rebuilds the structured replay from the
+    /// earliest available event. The attach cursor only marks where the ACP
+    /// transcript ends; dropping rows at or below it would discard the very
+    /// events that render the restored history.
     pub fn finish_restore(&mut self, result: Result<AgentAttachResult, String>) -> Option<u64> {
         let expected = self.restore_session.clone()?;
         match result.and_then(|attached| restored_session(attached, &expected)) {
             Ok(restored) => {
                 let changed = self.events_session.as_deref() != Some(restored.session_id.as_str());
-                let seq = restored.seq;
                 if changed {
-                    // Drop the previous attempt's feed so a replayed
-                    // conversation is not filtered out by the old cursor.
+                    // Drop the previous attempt's feed so the replayed
+                    // conversation cannot mix with another session.
                     self.conversation.reset_events_for_restore();
                 }
-                // Rows already folded into the transcript must not reappear in
-                // the live feed, including an in-flight backfill from zero.
-                self.conversation.restore_events_after(seq);
                 self.restore = SessionRestore::Restored(restored);
                 self.restore_session = None;
-                changed.then_some(seq)
+                Some(0)
             }
             Err(message) => {
                 self.fail_restore(message);
@@ -2280,12 +2303,11 @@ mod tests {
         assert!(detail.events.is_empty());
         assert!(detail.events_session.is_none());
         assert_eq!(detail.events_cursor, 0);
-        assert_eq!(detail.events_floor, 0);
         assert!(!detail.events_loaded);
     }
 
     #[test]
-    fn restore_keeps_a_live_sessions_attach_cursor_and_drops_replayed_rows() {
+    fn restore_keeps_replay_rows_at_and_below_the_attach_cursor() {
         let mut detail = TaskDetail::new(Uuid::from_u128(7));
         detail.push_event(text(3, MessageRole::Assistant, "already in transcript"));
         detail.push_event(text(8, MessageRole::Assistant, "newer"));
@@ -2299,27 +2321,28 @@ mod tests {
             5,
         )));
 
-        // The same session is already attached: no second backfill is needed.
-        assert_eq!(reload, None);
+        // The same session is already attached: its feed is the replay source,
+        // and the caller still re-reads it from zero to capture any replay rows.
+        assert_eq!(reload, Some(0));
         let SessionRestore::Restored(restored) = &detail.restore else {
             panic!("expected a restored session");
         };
         assert_eq!(restored.seq, 5);
         assert_eq!(restored.state, AgentSessionState::Active);
         assert!(restored.has_transcript());
-        // Rows covered by the transcript are dropped; newer rows survive.
+        // Rows on both sides of the attach cursor stay available, so the
+        // structured feed can render the restored history.
         assert_eq!(
             detail
                 .events
                 .iter()
                 .map(|event| event.seq)
                 .collect::<Vec<_>>(),
-            vec![8]
+            vec![3, 8]
         );
-        assert_eq!(detail.events_floor, 5);
         assert_eq!(detail.events_cursor, 8);
 
-        // Late/in-flight backfill rows below the snapshot are deduplicated too.
+        // A late/in-flight backfill from zero merges with those rows.
         detail.merge_events(
             Some("ses_1".to_string()),
             vec![
@@ -2337,14 +2360,14 @@ mod tests {
                 .iter()
                 .map(|event| event.seq)
                 .collect::<Vec<_>>(),
-            vec![8, 9]
+            vec![3, 4, 8, 9]
         );
-        assert!(!detail.push_event(text(5, MessageRole::Assistant, "stale live")));
+        assert!(detail.push_event(text(5, MessageRole::Assistant, "live")));
         assert!(detail.push_event(text(10, MessageRole::Assistant, "next")));
     }
 
     #[test]
-    fn restore_backfills_from_the_attach_seq_when_the_session_changes() {
+    fn restore_backfills_from_zero_when_the_session_changes() {
         let mut detail = TaskDetail::new(Uuid::from_u128(7));
         detail.push_event(text(4, MessageRole::Assistant, "previous session"));
 
@@ -2356,25 +2379,25 @@ mod tests {
         ));
         let reload = detail.finish_restore(Ok(attached_state("local-past", "replay", true, 12)));
 
-        assert_eq!(reload, Some(12));
+        assert_eq!(reload, Some(0));
         assert!(detail.events.is_empty());
-        assert_eq!(detail.events_cursor, 12);
-        assert_eq!(detail.events_floor, 12);
+        assert_eq!(detail.events_cursor, 0);
     }
 
     #[test]
-    fn a_new_attempt_clears_the_restore_floor() {
+    fn a_new_attempt_clears_the_restored_history() {
         let mut detail = TaskDetail::new(Uuid::from_u128(7));
         detail.set_task(task(TaskStatus::Running));
         detail.begin_restore();
         detail.attach_restore(&history_entry("ses_1", AgentSessionState::Active, true));
         detail.finish_restore(Ok(attached_state("ses_1", "old", true, 9)));
-        assert_eq!(detail.events_floor, 9);
+        detail.push_event(text(9, MessageRole::Assistant, "old answer"));
+        assert_eq!(detail.events.len(), 1);
 
         let mut retry = task(TaskStatus::Running);
         retry.attempt = 2;
         detail.update_summary(retry);
-        assert_eq!(detail.events_floor, 0);
+        assert!(detail.events.is_empty());
         assert!(detail.push_event(text(3, MessageRole::Assistant, "fresh")));
     }
 
@@ -2437,7 +2460,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_does_not_duplicate_text_already_in_the_transcript() {
+    fn restore_keeps_structured_history_alongside_the_transcript() {
         let mut detail = TaskDetail::new(Uuid::from_u128(7));
         detail.push_event(text(3, MessageRole::Assistant, "assistant answer"));
 
@@ -2449,7 +2472,7 @@ mod tests {
             true,
             3,
         )));
-        assert!(detail.events.is_empty(), "replayed rows are deduplicated");
+        assert_eq!(detail.events.len(), 1, "the replay event is kept");
 
         // New live text still lands in the feed after the transcript snapshot.
         assert!(detail.push_event(text(4, MessageRole::Assistant, "next answer")));
@@ -2459,6 +2482,8 @@ mod tests {
             panic!("expected a restored session");
         };
         assert!(restored.transcript.contains("assistant answer"));
+        // Consecutive assistant deltas coalesce into one block, so both the
+        // replay and the live row are present exactly once.
         assert_eq!(
             feed.iter()
                 .filter_map(|item| match item {
@@ -2466,8 +2491,87 @@ mod tests {
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
-            vec!["next answer"]
+            vec!["assistant answernext answer"]
         );
+    }
+
+    #[test]
+    fn restored_structured_events_render_messages_reasoning_and_tools() {
+        let mut detail = TaskDetail::new(Uuid::from_u128(7));
+        detail.push_event(text(1, MessageRole::User, "inspect the repo"));
+        detail.push_event(text(2, MessageRole::Assistant, "I'll look around."));
+        detail.push_event(push(
+            3,
+            AgentStateEvent::ReasoningDelta {
+                text: "need to list files".to_string(),
+            },
+        ));
+        detail.push_event(push(
+            4,
+            AgentStateEvent::ToolStarted {
+                id: "c1".to_string(),
+                name: "shell".to_string(),
+                input: serde_json::json!({ "command": "ls" }),
+                detail: None,
+            },
+        ));
+
+        detail.begin_restore();
+        detail.attach_restore(&history_entry("ses_1", AgentSessionState::Active, true));
+        detail.finish_restore(Ok(attached_state("ses_1", "legacy replay", true, 4)));
+
+        let feed = build_feed(&detail.events);
+        assert!(feed.iter().any(|item| matches!(
+            item,
+            FeedItem::Message {
+                role: MessageRole::User,
+                ..
+            }
+        )));
+        assert!(feed
+            .iter()
+            .any(|item| matches!(item, FeedItem::Message { .. })));
+        assert!(feed
+            .iter()
+            .any(|item| matches!(item, FeedItem::Reasoning { .. })));
+        assert!(feed.iter().any(|item| matches!(
+            item,
+            FeedItem::Tool { name, .. } if name == "shell"
+        )));
+        // The synthetic ACP marker never enters the structured feed.
+        assert!(!format!("{feed:?}").contains("[tool]"));
+    }
+
+    #[test]
+    fn the_raw_transcript_fallback_drops_synthetic_tool_markers() {
+        let transcript = "question\n\n[tool] shell: Run ls\nanswer\n[tool] read: src/main.rs\n";
+        let stripped = strip_tool_markers(transcript);
+        assert!(!stripped.contains("[tool]"));
+        assert!(stripped.contains("question"));
+        assert!(stripped.contains("answer"));
+
+        let mut detail = TaskDetail::new(Uuid::from_u128(7));
+        detail.begin_restore();
+        detail.attach_restore(&history_entry("local-past", AgentSessionState::Ended, true));
+        detail.finish_restore(Ok(attached("local-past", transcript)));
+        let SessionRestore::Restored(restored) = &detail.restore else {
+            panic!("expected a restored session");
+        };
+        assert!(!restored.transcript.contains("[tool]"));
+        assert!(restored.transcript.contains("answer"));
+    }
+
+    #[test]
+    fn a_transcript_with_only_tool_markers_has_no_fallback_text() {
+        let transcript = "[tool] shell: Run ls\n[tool] read: src/main.rs\n";
+        let mut detail = TaskDetail::new(Uuid::from_u128(7));
+        detail.begin_restore();
+        detail.attach_restore(&history_entry("local-past", AgentSessionState::Ended, true));
+        detail.finish_restore(Ok(attached("local-past", transcript)));
+        let SessionRestore::Restored(restored) = &detail.restore else {
+            panic!("expected a restored session");
+        };
+        assert!(!restored.has_transcript());
     }
 
     #[test]

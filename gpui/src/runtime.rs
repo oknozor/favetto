@@ -110,7 +110,7 @@ pub enum Command {
     /// Fetch only the detail's persisted output (the Output tab's Retry).
     LoadTask { task_id: Uuid },
     /// Re-run the structured-event backfill from `after` (the output tab's
-    /// Retry, or the cursor after a restored transcript).
+    /// Retry, or zero after a restored session changed).
     LoadTaskEvents { task_id: Uuid, after: u64 },
     /// Re-fetch the attempt table (the Runs tab's Retry).
     LoadTaskRuns { task_id: Uuid },
