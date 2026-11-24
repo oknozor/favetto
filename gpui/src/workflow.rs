@@ -1,6 +1,5 @@
-//! The Workflows model: the roots seen in the current task snapshot, one
-//! root's runtime inspect rows laid out as a left-to-right DAG, and the catalog
-//! DAG source.
+//! The Workflows model: the roots seen in the current task snapshot and one
+//! root's runtime inspect rows laid out as a left-to-right DAG.
 //!
 //! The daemon already does the hard part: `workflow.inspect` returns every
 //! instance of a root. This module joins that payload with the cached
@@ -816,58 +815,6 @@ pub fn roots(tasks: &[Task], launch_failures: &[LaunchFailure]) -> Vec<WorkflowR
     roots
 }
 
-/// The catalog DAG source (`workflow.get`) and its load state.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct WorkflowGraphState {
-    /// The Graphviz DOT source.
-    pub dot: String,
-    /// Where the daemon persists the rendered graph, when it reports one.
-    pub path: String,
-    /// True while a read is in flight.
-    pub loading: bool,
-    /// True once a source has been read successfully.
-    pub loaded: bool,
-    /// The last read error; an older source is kept behind it.
-    pub error: Option<String>,
-}
-
-impl WorkflowGraphState {
-    /// Mark a read in flight without discarding the current source.
-    pub fn begin_load(&mut self) {
-        self.loading = true;
-        self.error = None;
-    }
-
-    /// Store a successful `workflow.get`.
-    pub fn set(&mut self, dot: String, path: String) {
-        self.dot = dot;
-        self.path = path;
-        self.loading = false;
-        self.loaded = true;
-        self.error = None;
-    }
-
-    /// Record a failed read, keeping any older source visible.
-    pub fn fail(&mut self, message: String) {
-        self.loading = false;
-        self.error = Some(message);
-    }
-
-    /// The short legend beside the DOT panel. No Graphviz binary is embedded;
-    /// this text keeps the edge vocabulary readable (docs §5 step 08).
-    pub const LEGEND: &'static str = "spawn = parent → child · needs = waits for a task · \
-needs:succeeded / needs:failed = outcome gate · join = waits for all";
-
-    /// The path line, with a calm fallback when the daemon did not report one.
-    pub fn path_label(&self) -> &str {
-        if self.path.is_empty() {
-            "not persisted yet"
-        } else {
-            &self.path
-        }
-    }
-}
-
 /// A root cancellation awaiting confirmation. The body names the number of
 /// instances the RPC will transition (docs §2: the destructive action names
 /// its consequence).
@@ -1536,26 +1483,6 @@ mod tests {
         assert_eq!(state_kind(WorkflowState::Running).label(), "running");
         assert_eq!(state_kind(WorkflowState::Failed), StatusKind::Failed);
         assert_eq!(state_kind(WorkflowState::Cancelled).label(), "cancelled");
-    }
-
-    #[test]
-    fn graph_state_keeps_the_old_source_behind_an_error() {
-        let mut graph = WorkflowGraphState::default();
-        graph.begin_load();
-        assert!(graph.loading);
-        graph.set("digraph {}".to_string(), "/tmp/g.dot".to_string());
-        assert!(graph.loaded);
-        assert_eq!(graph.path_label(), "/tmp/g.dot");
-
-        graph.begin_load();
-        graph.fail("offline".to_string());
-        assert_eq!(graph.dot, "digraph {}");
-        assert!(graph
-            .error
-            .as_deref()
-            .is_some_and(|e| e.contains("offline")));
-        assert!(WorkflowGraphState::LEGEND.contains("spawn"));
-        assert!(WorkflowGraphState::LEGEND.contains("join"));
     }
 
     #[test]
