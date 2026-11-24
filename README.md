@@ -26,6 +26,19 @@ own agent loop, and there are no per-vendor adapters.
 > **Documentation:** <https://oknozor.github.io/favetto/> — the full manual:
 > a task-oriented guide and a complete CLI/config/task/event/API reference.
 
+## Screenshots
+
+The native GPUI desktop client (`gpui/`), connected to a live daemon:
+
+| | | |
+|---|---|---|
+| ![Inbox — what needs you now](docs/public/screenshots/gpui-inbox.png) | ![Tasks — every run](docs/public/screenshots/gpui-tasks.png) | ![Agent — free-standing ACP session](docs/public/screenshots/gpui-agent.png) |
+| **Inbox** `g i` | **Tasks** `g t` | **Agent** `g a` |
+| ![Catalog — task definitions](docs/public/screenshots/gpui-catalog.png) | ![Workflows — DAG and progress](docs/public/screenshots/gpui-workflows.png) | ![Schedules — recurring triggers](docs/public/screenshots/gpui-schedules.png) |
+| **Catalog** `g c` | **Workflows** `g w` | **Schedules** `g s` |
+| ![Command palette](docs/public/screenshots/gpui-palette.png) | ![Keyboard shortcuts](docs/public/screenshots/gpui-shortcuts.png) | ![Settings — connection and agents](docs/public/screenshots/gpui-settings.png) |
+| **Command palette** `ctrl-k` | **Shortcuts** `?` | **Settings** `ctrl-,` |
+
 ## Install
 
 ```bash
