@@ -108,8 +108,9 @@ pub enum Command {
     LoadTaskSession { task_id: Uuid, request_id: u64 },
     /// Fetch only the detail's persisted output (the Output tab's Retry).
     LoadTask { task_id: Uuid },
-    /// Re-run the structured-event backfill (the output tab's Retry).
-    LoadTaskEvents { task_id: Uuid },
+    /// Re-run the structured-event backfill from `after` (the output tab's
+    /// Retry, or the cursor after a restored transcript).
+    LoadTaskEvents { task_id: Uuid, after: u64 },
     /// Re-fetch the attempt table (the Runs tab's Retry).
     LoadTaskRuns { task_id: Uuid },
     /// Answer one blocked prompt. The request id comes from the session's
@@ -526,9 +527,9 @@ impl Runtime {
         });
     }
 
-    /// Re-run the structured-event backfill for the open detail.
-    pub fn load_task_events(&self, task_id: Uuid) {
-        self.send(Command::LoadTaskEvents { task_id });
+    /// Re-run the structured-event backfill for the open detail from `after`.
+    pub fn load_task_events(&self, task_id: Uuid, after: u64) {
+        self.send(Command::LoadTaskEvents { task_id, after });
     }
 
     /// Re-fetch the attempt table for the open detail.
@@ -792,7 +793,7 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
             }
             Command::LoadTaskDetail { task_id } => {
                 spawn_task_load(client.clone(), updates.clone(), task_id);
-                spawn_events_load(client.clone(), updates.clone(), task_id);
+                spawn_events_load(client.clone(), updates.clone(), task_id, 0);
                 spawn_runs_load(client.clone(), updates.clone(), task_id);
             }
             Command::LoadTaskSession {
@@ -804,8 +805,8 @@ async fn worker(config: ClientConfig, commands: Receiver<Command>, updates: Send
             Command::LoadTask { task_id } => {
                 spawn_task_load(client.clone(), updates.clone(), task_id);
             }
-            Command::LoadTaskEvents { task_id } => {
-                spawn_events_load(client.clone(), updates.clone(), task_id);
+            Command::LoadTaskEvents { task_id, after } => {
+                spawn_events_load(client.clone(), updates.clone(), task_id, after);
             }
             Command::LoadTaskRuns { task_id } => {
                 spawn_runs_load(client.clone(), updates.clone(), task_id);
@@ -1203,7 +1204,7 @@ fn spawn_task_session(
 /// surface is a live view, and a run with more history than that is better
 /// served by the persisted output. The pages are merged into one update so the
 /// UI never renders a half-filled gap.
-fn spawn_events_load(client: Arc<RpcClient>, updates: Sender<Update>, task_id: Uuid) {
+fn spawn_events_load(client: Arc<RpcClient>, updates: Sender<Update>, task_id: Uuid, after: u64) {
     tokio::spawn(async move {
         const PAGE: u64 = 2000;
         const MAX_PAGES: usize = 10;
@@ -1211,8 +1212,8 @@ fn spawn_events_load(client: Arc<RpcClient>, updates: Sender<Update>, task_id: U
         let mut session_id: Option<String> = None;
         let mut events = Vec::new();
         let mut ignored = 0usize;
-        let mut next_cursor = 0u64;
-        let mut after = 0u64;
+        let mut next_cursor = after;
+        let mut after = after;
         let mut plan = None;
         let mut commands = None;
 
