@@ -71,7 +71,7 @@ without relearning the product.
 | **Catalog** | Find and launch a definition | Start with variables |
 | **Workflows** | One root's DAG and progress | Inspect; cancel root / retry node |
 | **Schedules** | Recurring triggers | Create/edit/delete |
-| **Settings** | Connection, daemon config, agents, theme | Test connection; edit/save daemon config |
+| **Settings** | Connection, daemon config, agents, theme | Test connection; edit/save the daemon config form |
 
 The task detail and the Agent surface share one conversation implementation
 (`gpui/src/conversation.rs` for the model and `gpui/src/views/conversation.rs`

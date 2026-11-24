@@ -169,6 +169,7 @@ pub struct TextElement<V: TextHost> {
     multiline: bool,
     wrap: bool,
     max_visible_lines: usize,
+    masked: bool,
 }
 
 impl<V: TextHost> TextElement<V> {
@@ -190,6 +191,7 @@ impl<V: TextHost> TextElement<V> {
             multiline: false,
             wrap: false,
             max_visible_lines: 8,
+            masked: false,
         }
     }
 
@@ -200,6 +202,14 @@ impl<V: TextHost> TextElement<V> {
 
     pub fn multiline(mut self, multiline: bool) -> Self {
         self.multiline = multiline;
+        self
+    }
+
+    /// Paint bullets instead of the buffer's characters. The buffer still holds
+    /// the real value, so editing and IME keep working; only the painted text is
+    /// masked.
+    pub fn masked(mut self, masked: bool) -> Self {
+        self.masked = masked;
         self
     }
 
@@ -321,6 +331,7 @@ impl<V: TextHost + gpui::EntityInputHandler> Element for TextElement<V> {
         let multiline = self.multiline;
         let wraps = self.wraps();
         let max_visible_lines = self.max_visible_lines;
+        let masked = self.masked;
         let placeholder = self.placeholder.clone();
         let text_style = window.text_style();
 
@@ -341,6 +352,8 @@ impl<V: TextHost + gpui::EntityInputHandler> Element for TextElement<V> {
                     .unwrap_or_default();
                 let mut display = if value.is_empty() {
                     placeholder.clone().unwrap_or_default()
+                } else if masked {
+                    mask_text(&value)
                 } else {
                     value
                 };
@@ -408,6 +421,8 @@ impl<V: TextHost + gpui::EntityInputHandler> Element for TextElement<V> {
         let use_placeholder = value.is_empty() && self.placeholder.is_some();
         let mut display = if use_placeholder {
             self.placeholder.clone().unwrap_or_default()
+        } else if self.masked {
+            mask_text(&value)
         } else {
             value.clone()
         };
@@ -422,15 +437,22 @@ impl<V: TextHost + gpui::EntityInputHandler> Element for TextElement<V> {
         };
         let selection = if use_placeholder {
             0..0
+        } else if self.masked {
+            let range = input.selected_range().clone();
+            mask_offset(&value, range.start)..mask_offset(&value, range.end)
         } else {
             input.selected_range().clone()
         };
-        let marked = if use_placeholder {
+        let marked = if use_placeholder || self.masked {
             None
         } else {
             input.marked_range().cloned()
         };
-        let caret = input.caret().min(display.len());
+        let caret = if self.masked && !use_placeholder {
+            mask_offset(&value, input.caret())
+        } else {
+            input.caret().min(display.len())
+        };
 
         let raw_lines: Vec<&str> = if self.multiline {
             display.split('\n').collect()
@@ -840,6 +862,25 @@ fn sanitize(text: &str, multiline: bool) -> String {
     }
 }
 
+/// Mask every grapheme so a secret value never appears on screen. The mask is
+/// one ASCII byte per grapheme, which keeps the painted width stable while
+/// letting selection/caret offsets map through [`mask_offset`].
+fn mask_text(value: &str) -> String {
+    use unicode_segmentation::UnicodeSegmentation as _;
+    value
+        .graphemes(true)
+        .map(|grapheme| if grapheme == "\n" { '\n' } else { '*' })
+        .collect()
+}
+
+fn mask_offset(value: &str, offset: usize) -> usize {
+    use unicode_segmentation::UnicodeSegmentation as _;
+    value
+        .get(..offset.min(value.len()))
+        .map(|prefix| prefix.graphemes(true).count())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1225,5 +1266,16 @@ mod tests {
         );
         assert!(caret_bounds.top() >= bounds.top());
         assert!(caret_bounds.bottom() <= bounds.bottom() + px(0.5));
+    }
+
+    #[test]
+    fn masking_hides_every_grapheme_and_keeps_offsets_aligned() {
+        assert_eq!(mask_text("hunter2"), "*******");
+        assert_eq!(mask_text("a\nb"), "*\n*");
+        assert_eq!(mask_offset("hunter2", 3), 3);
+        // Multi-byte graphemes collapse to one paint character each, so the
+        // caret/selection offsets stay inside the masked string.
+        assert_eq!(mask_offset("é", "é".len()), 1);
+        assert_eq!(mask_offset("👨‍👩‍👧‍👦x", "👨‍👩‍👧‍👦".len()), 1);
     }
 }

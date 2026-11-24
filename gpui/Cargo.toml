@@ -34,6 +34,9 @@ futures-util = "0.3"
 async-channel = "2"
 dirs = "7"
 toml = "0.8"
+# Patch the form's values into the loaded document so comments, unknown keys and
+# ordering survive the round trip (`config.set` already writes with toml_edit).
+toml_edit = "0.22"
 base64 = "0.22"
 fuzzy-matcher = "0.3"
 # Grapheme-cluster boundaries for the shared text inputs (emoji, combining

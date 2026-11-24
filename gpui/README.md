@@ -261,19 +261,29 @@ conversation on demand through `tasks.session` and restores it with `agents.load
 when it ended loadable. Restoration never starts a session, sends a prompt or
 changes the task row; the replayed conversation appears in the task detail's
 Output surface, labelled with its agent and lifecycle state.
-**Daemon / global config** edits the daemon's `config.toml` as raw TOML through
-`config.get`/`config.set`: path, revision, raw text, parse errors, effective
-values, `FAVETTO_*` overrides and restart badges. It is separate from
-`gpui.toml`; a missing file opens with defaults and a malformed file opens with
-its raw text and errors. Secrets are redacted in the response and restored on
-save. **Save daemon config** validates the draft and the startup preflight
-before an atomic, revision-checked write; a successful save reports which
-sections need a daemon restart (`[tui]` is client-side). **Appearance** switches
-System/Dark/Light and Comfortable/Compact live and persists both. **About**
-shows the client version, daemon cwd, endpoint, both config paths and a docs
-link, and states that no telemetry is collected. `Tab`/`Shift+Tab` walk the
-controls, `Enter` activates the focused one (a newline in the raw TOML editor),
-`⌘↵` saves, `⌘T` tests.
+**Daemon / global config** edits the daemon's `config.toml` as a schema-backed
+form through `config.get`/`config.set`. Controls are generated from the committed
+JSON schema, so strings/paths use text inputs, booleans checkboxes, integers
+validated numeric inputs with units, enums chips, lists repeatable rows and
+`env`/`headers` key/value rows; agents, repository seeds and MCP servers are
+add/remove cards. Descriptions and defaults come from the schema, an optional
+field can be reset to its default, and a per-field badge marks `FAVETTO_*`
+overrides. It is separate from `gpui.toml`; a missing file opens with defaults.
+
+**Advanced / raw TOML** keeps the repair path: comments, unknown keys, client-side
+`[tui]` settings and a malformed file are edited as text. Form edits patch the
+loaded document rather than reserializing it, so comments, unknown keys and the
+file mode survive. Secrets (agent `env`, MCP `env`/`headers`) are masked, an
+untouched secret stays "unchanged" and the redaction sentinel is echoed on save so
+the daemon restores it; **Clear** removes the key. **Save daemon config**
+validates the draft and the startup preflight before an atomic, revision-checked
+write; daemon errors are attached to the field they name when possible, and a
+successful save reports which sections need a daemon restart (`[tui]` is
+client-side). **Appearance** switches System/Dark/Light and Comfortable/Compact
+live and persists both. **About** shows the client version, daemon cwd, endpoint,
+both config paths and a docs link, and states that no telemetry is collected.
+`Tab`/`Shift+Tab` walk form controls, `Enter`/`Space` toggles a checkbox or cycles
+an enum, `Enter` on text moves on, `⌘↵` saves, `⌘T` tests.
 
 ## Pointing it at a daemon
 

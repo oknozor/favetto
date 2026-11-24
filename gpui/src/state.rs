@@ -2581,6 +2581,10 @@ impl ClientState {
     }
 
     pub fn settings_cycle_focus(&mut self, delta: isize) {
+        self.settings
+            .set_daemon_controls(self.daemon_config.control_count());
+        self.settings
+            .set_daemon_advanced(self.daemon_config.is_advanced());
         self.settings.cycle_focus(delta);
     }
 
@@ -2618,6 +2622,30 @@ impl ClientState {
                 self.daemon_config.insert_newline();
                 cx.notify();
             }
+            SettingsActivate::DaemonControl => {
+                let Some(SettingsFocus::DaemonControl(index)) = self.settings.focus() else {
+                    return;
+                };
+                if !self.daemon_config.toggle_control(index) {
+                    self.settings
+                        .set_daemon_controls(self.daemon_config.control_count());
+                    self.settings.cycle_focus(1);
+                }
+                cx.notify();
+            }
+            SettingsActivate::DaemonAdvanced => {
+                let advanced = !self.daemon_config.is_advanced();
+                self.daemon_config.set_advanced(advanced);
+                let advanced = self.daemon_config.is_advanced();
+                self.settings.set_focus(Some(if advanced {
+                    SettingsFocus::DaemonRaw
+                } else if self.daemon_config.control_count() > 0 {
+                    SettingsFocus::DaemonControl(0)
+                } else {
+                    SettingsFocus::DaemonForm
+                }));
+                cx.notify();
+            }
             SettingsActivate::DaemonSave => self.save_daemon_config(cx),
             SettingsActivate::DaemonReload => self.reload_daemon_config(cx),
             SettingsActivate::Next => self.settings.cycle_focus(1),
@@ -2627,6 +2655,10 @@ impl ClientState {
     /// The daemon global config draft.
     pub fn daemon_config(&self) -> &DaemonConfigState {
         &self.daemon_config
+    }
+
+    pub fn daemon_config_mut(&mut self) -> &mut DaemonConfigState {
+        &mut self.daemon_config
     }
 
     /// Ask for the daemon's `config.get` snapshot. A dirty draft is preserved.
@@ -2647,7 +2679,7 @@ impl ClientState {
             self.refresh_daemon_config();
             return;
         }
-        if !self.daemon_config.is_dirty() {
+        if !self.daemon_config.can_save() {
             return;
         }
         let Some(runtime) = &self.runtime else {
@@ -2656,7 +2688,7 @@ impl ClientState {
             cx.notify();
             return;
         };
-        let raw = self.daemon_config.raw().to_string();
+        let raw = self.daemon_config.draft_toml();
         let expected_revision = self.daemon_config.revision().map(str::to_string);
         self.daemon_config.begin_save();
         runtime.save_daemon_config(raw, expected_revision);
@@ -2687,7 +2719,13 @@ impl ClientState {
     pub fn settings_save(&mut self, cx: &mut Context<Self>) {
         if matches!(
             self.settings.focus(),
-            Some(SettingsFocus::DaemonConfig | SettingsFocus::DaemonSave)
+            Some(
+                SettingsFocus::DaemonControl(_)
+                    | SettingsFocus::DaemonRaw
+                    | SettingsFocus::DaemonForm
+                    | SettingsFocus::DaemonAdvanced
+                    | SettingsFocus::DaemonSave
+            )
         ) {
             self.save_daemon_config(cx);
         } else {
@@ -4145,7 +4183,12 @@ impl ClientState {
             Route::Settings => match self.settings.focus() {
                 Some(SettingsFocus::Endpoint) => Some(TextTarget::SettingsEndpoint),
                 Some(SettingsFocus::Token) => Some(TextTarget::SettingsToken),
-                Some(SettingsFocus::DaemonConfig) => Some(TextTarget::SettingsDaemonConfig),
+                Some(SettingsFocus::DaemonControl(index)) => self
+                    .daemon_config()
+                    .form()
+                    .and_then(|form| form.text_input(index))
+                    .map(|_| TextTarget::SettingsDaemonControl(index)),
+                Some(SettingsFocus::DaemonRaw) => Some(TextTarget::SettingsDaemonRaw),
                 _ => None,
             },
             Route::Inbox | Route::Workflows | Route::Agent => None,
@@ -4156,7 +4199,7 @@ impl ClientState {
     /// movement between lines.
     pub fn text_target_is_multiline(&self, target: TextTarget) -> bool {
         match target {
-            TextTarget::SettingsDaemonConfig => true,
+            TextTarget::SettingsDaemonRaw => true,
             TextTarget::DetailPrompt => true,
             TextTarget::AgentModel => false,
             TextTarget::CatalogLaunchVar(index) => self
@@ -4184,7 +4227,11 @@ impl ClientState {
                 .and_then(|editor| editor.text_input()),
             TextTarget::SettingsEndpoint => self.settings.text_input(true),
             TextTarget::SettingsToken => self.settings.text_input(false),
-            TextTarget::SettingsDaemonConfig => Some(self.daemon_config.draft()),
+            TextTarget::SettingsDaemonRaw => Some(self.daemon_config.draft()),
+            TextTarget::SettingsDaemonControl(index) => self
+                .daemon_config
+                .form()
+                .and_then(|form| form.text_input(index)),
             TextTarget::DetailPrompt => self
                 .active_conversation()
                 .map(|conversation| &conversation.prompt),
@@ -4213,7 +4260,11 @@ impl ClientState {
                 .and_then(|editor| editor.text_input_mut()),
             TextTarget::SettingsEndpoint => self.settings.text_input_mut(true),
             TextTarget::SettingsToken => self.settings.text_input_mut(false),
-            TextTarget::SettingsDaemonConfig => Some(self.daemon_config.draft_mut()),
+            TextTarget::SettingsDaemonRaw => Some(self.daemon_config.draft_mut()),
+            TextTarget::SettingsDaemonControl(index) => self
+                .daemon_config
+                .form_mut()
+                .and_then(|form| form.text_input_mut(index)),
             TextTarget::DetailPrompt => self
                 .active_conversation_mut()
                 .map(|conversation| &mut conversation.prompt),
@@ -4244,8 +4295,12 @@ impl ClientState {
             TextTarget::SettingsToken => {
                 self.settings.set_focus(Some(SettingsFocus::Token));
             }
-            TextTarget::SettingsDaemonConfig => {
-                self.settings.set_focus(Some(SettingsFocus::DaemonConfig));
+            TextTarget::SettingsDaemonRaw => {
+                self.settings.set_focus(Some(SettingsFocus::DaemonRaw));
+            }
+            TextTarget::SettingsDaemonControl(index) => {
+                self.settings
+                    .set_focus(Some(SettingsFocus::DaemonControl(index)));
             }
             TextTarget::DetailPrompt => self.focus_detail_prompt(),
             TextTarget::AgentModel => self.focus_agent_model(),
@@ -4293,7 +4348,10 @@ impl ClientState {
             TextTarget::SettingsEndpoint | TextTarget::SettingsToken => {
                 self.settings.after_edit();
             }
-            TextTarget::SettingsDaemonConfig => self.daemon_config.after_edit(),
+            TextTarget::SettingsDaemonRaw => self.daemon_config.after_edit(),
+            TextTarget::SettingsDaemonControl(index) => {
+                self.daemon_config.after_control_edit(index)
+            }
             TextTarget::DetailPrompt => {
                 if let Some(conversation) = self.active_conversation_mut() {
                     conversation.prompt_selected = None;

@@ -27,8 +27,14 @@ pub enum SettingsFocus {
     Save,
     /// Reset the draft to the default endpoint and token file.
     Defaults,
-    /// The daemon's raw global `config.toml` draft.
-    DaemonConfig,
+    /// Show or hide the advanced raw TOML repair editor.
+    DaemonAdvanced,
+    /// A generated form control in the daemon `config.toml` form.
+    DaemonControl(usize),
+    /// The sentinel slot that enters the daemon form's controls.
+    DaemonForm,
+    /// The raw TOML repair editor.
+    DaemonRaw,
     /// Save the daemon config draft.
     DaemonSave,
     /// Discard daemon config edits and reload the on-disk file.
@@ -37,7 +43,7 @@ pub enum SettingsFocus {
 
 impl SettingsFocus {
     /// Every focus target in Tab order.
-    pub const ORDER: [Self; 10] = [
+    pub const ORDER: [Self; 11] = [
         Self::Endpoint,
         Self::Token,
         Self::Theme,
@@ -45,17 +51,22 @@ impl SettingsFocus {
         Self::Test,
         Self::Save,
         Self::Defaults,
-        Self::DaemonConfig,
+        Self::DaemonAdvanced,
+        Self::DaemonForm,
         Self::DaemonSave,
         Self::DaemonReload,
     ];
 
-    /// Whether typed characters belong to this target.
+    /// Whether typed characters belong to this target. Toggle controls also
+    /// report `true`; their `TextTarget` is simply absent.
     pub fn is_text(self) -> bool {
-        matches!(self, Self::Endpoint | Self::Token | Self::DaemonConfig)
+        matches!(
+            self,
+            Self::Endpoint | Self::Token | Self::DaemonControl(_) | Self::DaemonRaw
+        )
     }
 
-    fn cycle(self, delta: isize) -> Self {
+    fn cycle_static(self, delta: isize) -> Self {
         let index = Self::ORDER
             .iter()
             .position(|focus| *focus == self)
@@ -77,8 +88,12 @@ pub enum SettingsActivate {
     Save,
     /// Reset the draft to the default endpoint/token file.
     Defaults,
-    /// Insert a newline in the daemon config editor.
+    /// Insert a newline in the raw repair editor.
     DaemonNewline,
+    /// Toggle or activate one generated form control.
+    DaemonControl,
+    /// Show or hide the advanced raw TOML repair editor.
+    DaemonAdvanced,
     /// Save the daemon config draft.
     DaemonSave,
     /// Reload the daemon config from disk.
@@ -123,6 +138,10 @@ pub struct SettingsState {
     focus: Option<SettingsFocus>,
     test: ConnectionTest,
     save_error: Option<String>,
+    /// Number of generated daemon-form controls, refreshed by ClientState.
+    daemon_controls: usize,
+    /// Whether the advanced raw editor is the active daemon-config surface.
+    daemon_advanced: bool,
 }
 
 impl Default for SettingsState {
@@ -142,6 +161,8 @@ impl SettingsState {
             focus: None,
             test: ConnectionTest::Idle,
             save_error: None,
+            daemon_controls: 0,
+            daemon_advanced: false,
         }
     }
 
@@ -197,9 +218,54 @@ impl SettingsState {
 
     /// Tab / Shift+Tab. From "nothing focused" Tab starts at the first field
     /// and Shift+Tab starts at the last action.
+    pub fn set_daemon_controls(&mut self, controls: usize) {
+        self.daemon_controls = controls;
+    }
+
+    pub fn set_daemon_advanced(&mut self, advanced: bool) {
+        self.daemon_advanced = advanced;
+    }
+
     pub fn cycle_focus(&mut self, delta: isize) {
-        self.focus = Some(match self.focus {
-            Some(focus) => focus.cycle(delta),
+        let focus = self.focus;
+        self.focus = Some(match focus {
+            Some(SettingsFocus::DaemonControl(index)) => {
+                let next = index as isize + delta;
+                if next >= 0 && (next as usize) < self.daemon_controls {
+                    SettingsFocus::DaemonControl(next as usize)
+                } else if delta > 0 {
+                    SettingsFocus::DaemonForm.cycle_static(1)
+                } else {
+                    SettingsFocus::DaemonForm.cycle_static(-1)
+                }
+            }
+            Some(SettingsFocus::DaemonForm) if delta > 0 => {
+                if self.daemon_advanced {
+                    SettingsFocus::DaemonRaw
+                } else if self.daemon_controls > 0 {
+                    SettingsFocus::DaemonControl(0)
+                } else {
+                    SettingsFocus::DaemonForm.cycle_static(1)
+                }
+            }
+            Some(focus) => {
+                let next = focus.cycle_static(delta);
+                if next == SettingsFocus::DaemonForm {
+                    if self.daemon_advanced {
+                        SettingsFocus::DaemonRaw
+                    } else if self.daemon_controls > 0 {
+                        SettingsFocus::DaemonControl(if delta > 0 {
+                            0
+                        } else {
+                            self.daemon_controls - 1
+                        })
+                    } else {
+                        next.cycle_static(1)
+                    }
+                } else {
+                    next
+                }
+            }
             None if delta > 0 => SettingsFocus::ORDER[0],
             None => *SettingsFocus::ORDER
                 .last()
@@ -267,12 +333,15 @@ impl SettingsState {
             Some(SettingsFocus::Test) => SettingsActivate::Test,
             Some(SettingsFocus::Save) => SettingsActivate::Save,
             Some(SettingsFocus::Defaults) => SettingsActivate::Defaults,
-            Some(SettingsFocus::DaemonConfig) => SettingsActivate::DaemonNewline,
+            Some(SettingsFocus::DaemonAdvanced) => SettingsActivate::DaemonAdvanced,
+            Some(SettingsFocus::DaemonControl(_)) => SettingsActivate::DaemonControl,
+            Some(SettingsFocus::DaemonRaw) => SettingsActivate::DaemonNewline,
             Some(SettingsFocus::DaemonSave) => SettingsActivate::DaemonSave,
             Some(SettingsFocus::DaemonReload) => SettingsActivate::DaemonReload,
-            Some(SettingsFocus::Endpoint) | Some(SettingsFocus::Token) | None => {
-                SettingsActivate::Next
-            }
+            Some(SettingsFocus::DaemonForm)
+            | Some(SettingsFocus::Endpoint)
+            | Some(SettingsFocus::Token)
+            | None => SettingsActivate::Next,
         }
     }
 
@@ -370,7 +439,7 @@ mod tests {
         let mut settings = SettingsState::default();
         settings.cycle_focus(1);
         assert_eq!(settings.focus(), Some(SettingsFocus::Endpoint));
-        for _ in 0..SettingsFocus::ORDER.len() - 1 {
+        for _ in 0..SettingsFocus::ORDER.len() - 2 {
             settings.cycle_focus(1);
         }
         assert_eq!(settings.focus(), Some(SettingsFocus::DaemonReload));
@@ -408,6 +477,27 @@ mod tests {
             settings.normalized(),
             Ok("http://127.0.0.1:7878".to_string())
         );
+    }
+
+    #[test]
+    fn tab_enters_the_daemon_form_and_walks_each_control() {
+        let mut settings = SettingsState::default();
+        settings.set_daemon_controls(3);
+        settings.set_focus(Some(SettingsFocus::DaemonAdvanced));
+        settings.cycle_focus(1);
+        assert_eq!(settings.focus(), Some(SettingsFocus::DaemonControl(0)));
+        settings.cycle_focus(1);
+        assert_eq!(settings.focus(), Some(SettingsFocus::DaemonControl(1)));
+        settings.cycle_focus(1);
+        assert_eq!(settings.focus(), Some(SettingsFocus::DaemonControl(2)));
+        settings.cycle_focus(1);
+        assert_eq!(settings.focus(), Some(SettingsFocus::DaemonSave));
+        settings.cycle_focus(-1);
+        assert_eq!(settings.focus(), Some(SettingsFocus::DaemonControl(2)));
+        // Backing out of the first control returns to the advanced toggle.
+        settings.set_focus(Some(SettingsFocus::DaemonControl(0)));
+        settings.cycle_focus(-1);
+        assert_eq!(settings.focus(), Some(SettingsFocus::DaemonAdvanced));
     }
 
     #[test]
