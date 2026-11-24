@@ -21,6 +21,7 @@ use gpui::{
 };
 use uuid::Uuid;
 
+use crate::agent_auth;
 use crate::components;
 use crate::conversation::{Conversation, ConversationTarget};
 use crate::detail::{
@@ -508,6 +509,9 @@ impl ConversationPanel {
         auth: &AgentAuthState,
         cx: &mut Context<Self>,
     ) -> Div {
+        if !agent_auth::banner_visible(auth) {
+            return div();
+        }
         let (headline, color) = match auth.status {
             AgentAuthStatus::Required => (
                 "Agent needs sign-in before this session can start.",
@@ -521,27 +525,17 @@ impl ConversationPanel {
                 theme.colors.danger,
             ),
             AgentAuthStatus::NotRequired | AgentAuthStatus::Authenticated => {
-                if !auth.logout_supported {
-                    return div();
-                }
                 ("Signed in to the agent.", theme.colors.success)
             }
         };
-        let supported: Vec<_> = auth
-            .methods
-            .iter()
-            .filter(|method| method.supported)
-            .collect();
         let mut actions = div()
             .flex()
             .flex_wrap()
             .items_center()
             .gap(px(theme.spacing.s1));
-        for (index, method) in supported.iter().enumerate() {
+        for (index, method) in agent_auth::sign_in_methods(auth).into_iter().enumerate() {
             let session_id = session_id.to_string();
             let method_id = method.id.clone();
-            let enabled = auth.status != AgentAuthStatus::Authenticating
-                && auth.status != AgentAuthStatus::Authenticated;
             actions = actions.child(components::with_focus(
                 div()
                     .id(("conversation-auth", index))
@@ -554,29 +548,20 @@ impl ConversationPanel {
                     .border_1()
                     .border_color(Hsla::from(theme.colors.border))
                     .text_size(px(theme.font.xs))
-                    .when(enabled, |button| {
-                        button
-                            .text_color(theme.colors.text)
-                            .cursor_pointer()
-                            .hover(|style| style.bg(Hsla::from(theme.colors.accent).opacity(0.16)))
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                this.state.update(cx, |state, cx| {
-                                    state.authenticate(session_id.clone(), method_id.clone(), cx);
-                                    cx.notify();
-                                });
-                            }))
-                    })
-                    .when(!enabled, |button| {
-                        button
-                            .text_color(theme.colors.muted)
-                            .opacity(0.55)
-                            .cursor_default()
-                    })
+                    .text_color(theme.colors.text)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(Hsla::from(theme.colors.accent).opacity(0.16)))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.state.update(cx, |state, cx| {
+                            state.authenticate(session_id.clone(), method_id.clone(), cx);
+                            cx.notify();
+                        });
+                    }))
                     .child(format!("Sign in with {}", method.name)),
                 theme,
             ));
         }
-        if auth.logout_supported {
+        if agent_auth::can_sign_out(auth) {
             let session_id = session_id.to_string();
             actions = actions.child(components::with_focus(
                 div()
@@ -602,11 +587,7 @@ impl ConversationPanel {
                 theme,
             ));
         }
-        let terminal_only = supported.is_empty()
-            && auth
-                .methods
-                .iter()
-                .any(|method| method.kind == favetto_wire::model::AgentAuthMethodKind::Terminal);
+        let terminal_only = agent_auth::terminal_only(auth);
         let status = auth
             .message
             .clone()

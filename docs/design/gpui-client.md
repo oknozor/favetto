@@ -82,6 +82,11 @@ frozen main-checkout cwd and the session lifecycle. The Agent route starts a
 session with `agents.start` and **no** `task_id`, using the active repo's
 `RepoInfo.path` as `cwd`; it never uses the daemon cwd or a task worktree.
 
+ACP auth actions are gated by `gpui/src/agent_auth.rs` to mirror the daemon:
+sign-in is offered only for `required`/`failed` sessions and sign-out only for a
+`not_required` session whose agent advertises logout. The Settings Agents card
+reports auth status read-only and never emits per-session actions.
+
 ---
 
 ## 2. Law-backed design decisions

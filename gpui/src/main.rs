@@ -6,6 +6,7 @@
 
 mod actions;
 mod agent;
+mod agent_auth;
 mod app;
 mod catalog;
 mod components;

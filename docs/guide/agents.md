@@ -106,10 +106,16 @@ daemon keeps the agent process alive and reports an `auth` state on the session
 
 In the TUI Agent panel, **Ctrl+A** opens the sign-in chooser for sessions that
 advertise an agent-handled method or logout; the panel shows progress and errors
-without printing credentials or raw terminal output. The GPUI client shows the
-same state and actions in the task detail, the free-standing Agent surface and
-the **Settings → Agents** card. After sign-in the daemon retries the paused
-session setup automatically.
+without printing credentials or raw terminal output.
+
+The GPUI client shows the same state in the task detail and the free-standing
+Agent surface. Actions follow the session's auth state rather than the
+advertised method list: sign-in is offered only while the session is `required`
+or `failed`, and sign-out only while it is `not_required` and the agent
+advertises logout. The **Settings → Agents** card is read-only and never exposes
+per-session sign-in or sign-out actions; it points at the session surface
+instead. After sign-in the daemon retries the paused session setup
+automatically.
 
 ## Availability
 
