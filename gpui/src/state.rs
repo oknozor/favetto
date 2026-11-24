@@ -42,6 +42,7 @@ use crate::runtime::{PingSnapshot, Runtime, Update};
 use crate::schedules::{
     self, ScheduleDeleteConfirm, ScheduleEditor, ScheduleField, SchedulesState,
 };
+use crate::session_menu::{self, SessionMenu, SessionMenuAction, SessionMenuRow};
 use crate::settings::{SettingsActivate, SettingsFocus, SettingsState};
 use crate::sse::Push;
 use crate::tasks::{self, TaskAction, TaskCommand, TaskFilter, TaskList};
@@ -565,13 +566,8 @@ impl ClientState {
                                 detail.sync_elicitation(&sessions);
                             }
                         }
-                        let standalone_match = self
-                            .standalone
-                            .session_id
-                            .as_deref()
-                            .is_some_and(|_| self.standalone.accepts_event(event));
+                        let standalone_match = self.standalone.fold_event(event, &sessions);
                         if standalone_match {
-                            self.standalone.conversation.push_event(event.clone());
                             self.standalone.conversation.sync_elicitation(&sessions);
                         }
                         // The cancelled turn's Idle event is the final feedback
@@ -619,15 +615,11 @@ impl ClientState {
                                 detail.conversation.apply_activity(state.activity.clone());
                             }
                         }
-                        if self
-                            .standalone
-                            .conversation
-                            .owns_session(&state.session_id, &sessions)
-                        {
-                            self.standalone
-                                .conversation
-                                .apply_activity(state.activity.clone());
-                        }
+                        self.standalone.fold_activity(
+                            &state.session_id,
+                            state.activity.clone(),
+                            &sessions,
+                        );
                         self.refresh_snapshot();
                     }
                     // The definition files changed on disk: reload the list and
@@ -654,12 +646,11 @@ impl ClientState {
                     }
                     Push::AgentExit(exit) => {
                         let stopped = self.standalone.record_exit(exit.clone());
-                        self.standalone.conversation.activity = None;
-                        self.standalone.conversation.turn_pending = false;
                         if stopped {
-                            self.refresh_snapshot();
+                            self.standalone.conversation.activity = None;
+                            self.standalone.conversation.turn_pending = false;
                         }
-                        let _ = &exit;
+                        self.refresh_snapshot();
                     }
                     Push::UnsupportedAgentEvent { .. } => {}
                     Push::Unknown(_) => {}
@@ -822,10 +813,24 @@ impl ClientState {
                     }
                 }
             },
+            Update::AgentHistoryLoaded { result } => match result {
+                Ok(history) => self.standalone.session_menu.set_history(history),
+                Err(error) => {
+                    if error.is_unauthorized() {
+                        self.connection = ConnectionState::Unauthorized {
+                            token_path: self.config.token_source.label(),
+                        };
+                    }
+                    self.standalone
+                        .session_menu
+                        .fail_history(format!("Could not read session history: {error}."));
+                }
+            },
             Update::AgentStartFinished { result } => match result {
                 Ok(attached) => {
                     let previous = self.standalone.adopt(*attached);
                     if let Some(previous) = previous {
+                        self.standalone.forget(&previous);
                         if let Some(runtime) = &self.runtime {
                             runtime.close_agent(previous);
                         }
@@ -850,6 +855,9 @@ impl ClientState {
                         Some(format!("The daemon could not start the session: {error}."));
                 }
             },
+            Update::AgentAttached { session_id, result } => {
+                self.finish_agent_session_switch(session_id, result, cx);
+            }
             Update::AgentClosed { session_id, result } => {
                 let current = self.standalone.session_id.as_deref() == Some(session_id.as_str());
                 match result {
@@ -1024,16 +1032,17 @@ impl ClientState {
                 }
             }
             Update::ReplyFinished {
+                session_id,
                 request_id,
                 reply,
                 result,
-                ..
             } => {
                 let task_open = self.detail.as_ref().is_some_and(|detail| {
                     detail.reply_pending.as_deref() == Some(request_id.as_str())
                 });
-                let agent_open = self.standalone.conversation.reply_pending.as_deref()
-                    == Some(request_id.as_str());
+                let agent_open = self.standalone.conversation.is_session(&session_id)
+                    && self.standalone.conversation.reply_pending.as_deref()
+                        == Some(request_id.as_str());
                 if task_open {
                     if let Some(detail) = self.detail.as_mut() {
                         detail.reply_pending = None;
@@ -1079,16 +1088,17 @@ impl ClientState {
                 self.refresh_snapshot();
             }
             Update::ElicitationReplyFinished {
+                session_id,
                 request_id,
                 reply,
                 result,
-                ..
             } => {
                 let task_open = self.detail.as_ref().is_some_and(|detail| {
                     detail.elicitation_pending.as_deref() == Some(request_id.as_str())
                 });
-                let agent_open = self.standalone.conversation.elicitation_pending.as_deref()
-                    == Some(request_id.as_str());
+                let agent_open = self.standalone.conversation.is_session(&session_id)
+                    && self.standalone.conversation.elicitation_pending.as_deref()
+                        == Some(request_id.as_str());
                 if task_open {
                     if let Some(detail) = self.detail.as_mut() {
                         detail.elicitation_pending = None;
@@ -1269,6 +1279,10 @@ impl ClientState {
                 }
             }
             Update::AgentSessionLoaded { session_id, result } => {
+                if self.standalone.pending_switch.as_deref() == Some(session_id.as_str()) {
+                    self.finish_agent_session_switch(session_id, result, cx);
+                    return;
+                }
                 // Only the open detail's own attach may change restore state; a
                 // reply for a closed run or a superseded attempt is dropped.
                 let task_id = self
@@ -3304,6 +3318,183 @@ impl ClientState {
     /// The free-standing Agent panel state.
     pub fn standalone_agent(&self) -> &StandaloneAgent {
         &self.standalone
+    }
+
+    /// The Agent panel's session switcher state.
+    pub fn agent_session_menu(&self) -> &SessionMenu {
+        &self.standalone.session_menu
+    }
+
+    /// The merged live + durable-history rows shown by the switcher.
+    pub fn agent_session_rows(&self) -> Vec<SessionMenuRow> {
+        session_menu::merge_rows(
+            &self.sessions,
+            &self.standalone.session_menu.history,
+            &self.tasks,
+            self.standalone.session_id.as_deref(),
+        )
+    }
+
+    /// Open or close the session switcher and refresh its history.
+    pub fn toggle_agent_sessions_menu(&mut self, cx: &mut Context<Self>) {
+        if self.standalone.session_menu.is_open() {
+            self.close_agent_sessions_menu();
+            return;
+        }
+        if self.standalone.starting || self.standalone.closing {
+            return;
+        }
+        if let Some(conversation) = self.active_conversation_mut() {
+            conversation.prompt_focused = false;
+            conversation.prompt_selected = None;
+        }
+        self.standalone.model_focused = false;
+        self.standalone.switch_error = None;
+        self.standalone.session_menu.open();
+        let rows = self.agent_session_rows();
+        self.standalone.session_menu.ensure_highlight(&rows);
+        match &self.runtime {
+            Some(runtime) => runtime.load_agent_history(),
+            None => self.standalone.session_menu.fail_history(
+                "The transport is not running, so history is unavailable.".to_string(),
+            ),
+        }
+        cx.notify();
+    }
+
+    /// Close the session switcher without changing the conversation.
+    pub fn close_agent_sessions_menu(&mut self) {
+        self.standalone.session_menu.close();
+    }
+
+    /// Whether the session switcher owns the Agent surface's list keys.
+    pub fn agent_sessions_menu_open(&self) -> bool {
+        self.standalone.session_menu.is_open()
+    }
+
+    /// Move the switcher highlight, skipping the current and disabled rows.
+    pub fn move_agent_session_selection(&mut self, delta: isize) {
+        let rows = self.agent_session_rows();
+        self.standalone.session_menu.ensure_highlight(&rows);
+        self.standalone.session_menu.move_selection(delta, &rows);
+    }
+
+    /// Open the highlighted row (Enter on the switcher).
+    pub fn open_highlighted_agent_session(&mut self, cx: &mut Context<Self>) {
+        let rows = self.agent_session_rows();
+        self.standalone.session_menu.ensure_highlight(&rows);
+        let Some(row) = self.standalone.session_menu.highlighted_row(&rows).cloned() else {
+            return;
+        };
+        self.choose_agent_session(&row.id, cx);
+    }
+
+    /// Explicitly switch to one row's session. Only attach/load are sent; the
+    /// panel never starts or closes a session here.
+    pub fn choose_agent_session(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        if self.standalone.pending_switch.is_some() {
+            return;
+        }
+        let rows = self.agent_session_rows();
+        let Some(row) = rows.iter().find(|row| row.id == session_id).cloned() else {
+            return;
+        };
+        if !row.selectable() {
+            if let Some(reason) = row.blocked_reason() {
+                self.show_toast(ToastKind::Info, reason, cx);
+            }
+            return;
+        }
+        if self.runtime.is_none() {
+            self.standalone.switch_error =
+                Some("The transport is not running, so the session was not opened.".to_string());
+            self.show_toast(
+                ToastKind::Error,
+                "Could not switch sessions: the transport is not running.".to_string(),
+                cx,
+            );
+            return;
+        }
+        self.standalone.pending_switch = Some(row.id.clone());
+        self.standalone.switch_error = None;
+        self.standalone.session_menu.close();
+        match (row.action, &self.runtime) {
+            (SessionMenuAction::Attach, Some(runtime)) => {
+                runtime.attach_agent_session(row.id);
+            }
+            (SessionMenuAction::Load, Some(runtime)) => {
+                runtime.load_agent_session(row.id);
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// Fold one explicit attach/load reply in, dropping stale targets.
+    fn finish_agent_session_switch(
+        &mut self,
+        session_id: String,
+        result: Result<Box<favetto_wire::rpc::AgentAttachResult>, ClientError>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.standalone.pending_switch.as_deref() != Some(session_id.as_str()) {
+            return;
+        }
+        self.standalone.pending_switch = None;
+        match result {
+            Ok(attached) => {
+                let attached = *attached;
+                if attached.session.id != session_id {
+                    self.standalone.switch_error = Some(format!(
+                        "The daemon returned session '{}' instead of the selected one.",
+                        attached.session.id
+                    ));
+                    self.show_toast(
+                        ToastKind::Error,
+                        "The daemon opened a different session than the one selected.".to_string(),
+                        cx,
+                    );
+                    return;
+                }
+                let history = self
+                    .standalone
+                    .session_menu
+                    .history
+                    .iter()
+                    .find(|entry| entry.id == session_id)
+                    .cloned();
+                let cwd = history.map(|entry| entry.cwd);
+                let repo = cwd.as_ref().and_then(|cwd| {
+                    self.repos
+                        .iter()
+                        .find(|repo| cwd.as_path() == std::path::Path::new(&repo.path))
+                        .map(|repo| repo.name.clone())
+                });
+                self.standalone.switch_to(attached);
+                self.standalone.set_location(cwd, repo);
+                let sessions = self.sessions.clone();
+                self.standalone.conversation.sync_elicitation(&sessions);
+                self.refresh_snapshot();
+                self.show_toast(
+                    ToastKind::Success,
+                    "Switched to the selected agent session.".to_string(),
+                    cx,
+                );
+            }
+            Err(error) => {
+                if error.is_unauthorized() {
+                    self.connection = ConnectionState::Unauthorized {
+                        token_path: self.config.token_source.label(),
+                    };
+                }
+                self.standalone.switch_error = Some(format!("Could not switch sessions: {error}."));
+                self.show_toast(
+                    ToastKind::Error,
+                    format!("Could not switch agent sessions: {error}."),
+                    cx,
+                );
+            }
+        }
     }
 
     /// The active standalone session from `agents.list`, falling back to the
@@ -5599,6 +5790,8 @@ fn reply_done_message(reply: &InputReply) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::Command;
+    use gpui::AppContext as _;
 
     #[test]
     fn connection_labels_name_the_state_and_the_fix() {
@@ -5872,5 +6065,86 @@ mod tests {
             "an unavailable repo must block the start"
         );
         assert_eq!(repo_checkout(&repos, Some("unknown")), None);
+    }
+
+    fn menu_session(id: &str, running: bool) -> AgentSessionInfo {
+        AgentSessionInfo {
+            id: id.to_string(),
+            agent: "opencode".to_string(),
+            backend: Default::default(),
+            task_id: None,
+            running,
+            headless: false,
+            session_id: None,
+            awaiting_input: None,
+            activity: None,
+            usage: None,
+            load_state: Default::default(),
+            load_error: None,
+            config_options: Vec::new(),
+            modes: None,
+            auth: None,
+            mcp: None,
+        }
+    }
+
+    fn menu_history(id: &str) -> favetto_wire::model::AgentSessionHistoryEntry {
+        favetto_wire::model::AgentSessionHistoryEntry {
+            id: id.to_string(),
+            agent: "opencode".to_string(),
+            title: None,
+            cwd: PathBuf::from(format!("/code/{id}")),
+            task_id: None,
+            state: favetto_wire::model::AgentSessionState::Ended,
+            loadable: true,
+            load_error: None,
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
+        }
+    }
+
+    #[gpui::test]
+    fn explicit_session_selection_emits_only_attach_or_load(cx: &mut gpui::TestAppContext) {
+        let (runtime, commands) = Runtime::test_handle();
+        let state = cx.update(|cx| {
+            cx.new(|_cx| {
+                let mut state = test_state();
+                state.runtime = Some(runtime);
+                state
+            })
+        });
+
+        state.update(cx, |state, cx| {
+            state.sessions = vec![menu_session("ses_live", true)];
+            state
+                .standalone
+                .session_menu
+                .set_history(vec![menu_history("ses_past")]);
+            state.choose_agent_session("ses_live", cx);
+        });
+        assert_eq!(
+            commands.try_recv(),
+            Ok(Command::AttachAgentSession {
+                session_id: "ses_live".to_string()
+            })
+        );
+
+        // Drop the simulated in-flight reply so the next selection is accepted.
+        state.update(cx, |state, _cx| {
+            state.standalone.pending_switch = None;
+        });
+        state.update(cx, |state, cx| {
+            state.choose_agent_session("ses_past", cx);
+        });
+        assert_eq!(
+            commands.try_recv(),
+            Ok(Command::LoadAgentSession {
+                session_id: "ses_past".to_string()
+            })
+        );
+        assert!(
+            commands.try_recv().is_err(),
+            "switching must not emit agents.start or agents.close"
+        );
     }
 }

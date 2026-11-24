@@ -16,13 +16,13 @@ use gpui::{
 };
 
 use crate::actions::{
-    self, AgentClose, AgentInterrupt, AgentNewSession, CatalogChoiceNext, CatalogChoicePrev,
-    CatalogFieldNext, CatalogFieldPrev, CatalogLaunchSubmit, CatalogNewOneshot, CatalogSearch,
-    CatalogToggleFolder, CloseOverlay, DetailPromptComplete, DetailPromptNext, DetailPromptPrev,
-    DetailPromptSend, ElicitationCancel, ElicitationConfirm, ElicitationDecline, ElicitationEdit,
-    ElicitationLeft, ElicitationNext, ElicitationPrev, ElicitationRight, ElicitationToggle,
-    FocusNext, FocusPrev, GoAgent, GoCatalog, GoInbox, GoSchedules, GoSettings, GoTasks,
-    GoWorkflows, ListDown, ListEnd, ListHome, ListOpen, ListPageDown, ListPageUp, ListUp,
+    self, AgentClose, AgentInterrupt, AgentNewSession, AgentSessions, CatalogChoiceNext,
+    CatalogChoicePrev, CatalogFieldNext, CatalogFieldPrev, CatalogLaunchSubmit, CatalogNewOneshot,
+    CatalogSearch, CatalogToggleFolder, CloseOverlay, DetailPromptComplete, DetailPromptNext,
+    DetailPromptPrev, DetailPromptSend, ElicitationCancel, ElicitationConfirm, ElicitationDecline,
+    ElicitationEdit, ElicitationLeft, ElicitationNext, ElicitationPrev, ElicitationRight,
+    ElicitationToggle, FocusNext, FocusPrev, GoAgent, GoCatalog, GoInbox, GoSchedules, GoSettings,
+    GoTasks, GoWorkflows, ListDown, ListEnd, ListHome, ListOpen, ListPageDown, ListPageUp, ListUp,
     PaletteConfirm, PaletteDown, PaletteUp, Refresh, RepoPickerConfirm, RepoPickerDown,
     RepoPickerUp, ScheduleDelete, ScheduleEdit, ScheduleFieldNext, ScheduleFieldPrev, ScheduleNew,
     ScheduleSubmit, ScheduleToggleEnabled, SettingsActivate, SettingsFieldNext, SettingsFieldPrev,
@@ -398,7 +398,9 @@ impl RootView {
                 cx.notify();
             }),
             Route::Agent => self.state.update(cx, |state, cx| {
-                if state.standalone_agent().session_id.is_none() {
+                if state.agent_sessions_menu_open() {
+                    state.move_agent_session_selection(delta);
+                } else if state.standalone_agent().session_id.is_none() {
                     state.cycle_standalone_agent(delta);
                 }
                 cx.notify();
@@ -494,7 +496,11 @@ impl RootView {
                 cx.notify();
             }),
             Route::Agent => self.state.update(cx, |state, cx| {
-                state.start_standalone_agent(cx);
+                if state.agent_sessions_menu_open() {
+                    state.open_highlighted_agent_session(cx);
+                } else {
+                    state.start_standalone_agent(cx);
+                }
                 cx.notify();
             }),
             Route::Catalog => self.state.update(cx, |state, cx| {
@@ -1499,6 +1505,7 @@ impl RootView {
         ];
         let agent = [
             ("New session", "n"),
+            ("Switch live / history session", "s"),
             ("Interrupt the turn", "i"),
             ("Close the session", "x"),
             ("Send the prompt", "↵"),
@@ -2604,6 +2611,7 @@ impl Render for RootView {
             settings_typing,
             detail_prompt_active,
             detail_elicitation_active,
+            agent_sessions_open,
         ) = {
             let state = self.state.read(cx);
             (
@@ -2621,6 +2629,7 @@ impl Render for RootView {
                 state.settings().is_editing_text(),
                 state.detail_prompt_active(),
                 state.detail_elicitation().is_some(),
+                state.agent_sessions_menu_open(),
             )
         };
         let mut key_context = String::from("Root");
@@ -2635,6 +2644,9 @@ impl Render for RootView {
             }
         } else if route == Route::Agent {
             key_context.push_str(" Agent");
+            if agent_sessions_open {
+                key_context.push_str(" Sessions");
+            }
             if detail_prompt_active {
                 key_context.push_str(" Search");
             }
@@ -2730,6 +2742,13 @@ impl Render for RootView {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &CloseOverlay, window, cx| {
+                if this.state.read(cx).agent_sessions_menu_open() {
+                    this.state.update(cx, |state, _cx| {
+                        state.close_agent_sessions_menu();
+                    });
+                    cx.stop_propagation();
+                    return;
+                }
                 if this.state.read(cx).detail_prompt_active() {
                     this.state.update(cx, |state, cx| {
                         state.blur_detail_prompt();
@@ -2923,6 +2942,12 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &AgentNewSession, _window, cx| {
                 this.state.update(cx, |state, cx| {
                     state.start_standalone_agent(cx);
+                    cx.notify();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &AgentSessions, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.toggle_agent_sessions_menu(cx);
                     cx.notify();
                 });
             }))

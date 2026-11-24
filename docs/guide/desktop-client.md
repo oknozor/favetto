@@ -116,6 +116,19 @@ session through `agents.close`, and **m** focuses the same slash-command
 composer as the task detail. Model, thinking level and build/plan mode appear in
 the shared session strip whenever the agent advertises them.
 
+**Sessions** (`s`) opens the on-demand session switcher. It lists live/retained
+sessions first, then durable Favetto history newest first, without showing the
+raw session id. A row shows the agent/title, lifecycle (`running`, `awaiting
+input`, `ended`, `loading`, `failed` or `cannot load`), cwd and any linked task;
+the current session is marked and cannot be selected. Choosing a live row sends
+`agents.attach`, choosing an ended loadable row sends `agents.load`, and failed
+or unsupported rows explain why they are disabled. Selecting a row never starts
+or closes a session: **New session** remains the only action that replaces the
+conversation. The panel keeps a bounded per-session conversation cache, so
+switching away and back preserves that session's feed, activity and composer
+draft. `↑`/`↓` move the highlight, `Enter` opens the row and `Esc` closes the
+menu.
+
 A finished run's detail header also offers **Delete run**, which permanently
 removes the run, its recorded attempts and its dependency edges after a
 confirmation that names the run. It is only shown for `succeeded`, `failed` and

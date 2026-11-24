@@ -136,3 +136,8 @@ These are framework or current-scope limits, not regressions from this pass:
 3. **Keep this check repeatable.** The commands and the disposable-daemon setup
    above assume a live local daemon; a future verification step could wrap the
    stop/restart portion in a script under `gpui/` without changing the client.
+4. **Exercise the Agent session switcher against real history.** Open **Agent**
+   (`g a`), press `s`, and verify that a live row attaches, an ended loadable row
+   loads, a failed row explains its reason, and switching away and back keeps
+   the previous feed and composer draft. A task launched from the panel must
+   leave the selected feed unchanged (`src/session_menu.rs`, `src/agent.rs`).

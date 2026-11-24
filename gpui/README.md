@@ -72,11 +72,17 @@ On the Agent surface (`g a`), pick an available agent and press `Enter` or `n`
 to start a free-standing `agents.start` session in the active repo's main
 checkout (never the daemon cwd or a task worktree). `i` interrupts the current
 turn, `x` closes the session through `agents.close`, and `m` opens the same
-slash-command composer as the task detail. With `repo: global` active the
-surface asks you to select a repository first. Model, thinking level and
-build/plan mode come from the agent's advertised session options rather than a
-hardcoded selector. Clicking one opens a list of every advertised value (grouped
-and described as the agent reports them); pick a row with the mouse or
+slash-command composer as the task detail. `s` opens the session switcher: live
+`agents.list` rows come first, durable `agents.history` rows follow newest
+first, and the current session is marked. A live row attaches with
+`agents.attach`; an ended loadable row restores with `agents.load`; failed or
+unsupported rows are disabled with their reason. Switching never starts, closes
+or replaces a session — only `n` starts a new one — and a bounded per-session
+cache keeps each visited feed, activity and composer draft. With `repo: global`
+active the surface asks you to select a repository first. Model, thinking level
+and build/plan mode come from the agent's advertised session options rather than
+a hardcoded selector. Clicking one opens a list of every advertised value
+(grouped and described as the agent reports them); pick a row with the mouse or
 `↑`/`↓`/`Home`/`End`, confirm with `Enter`, and dismiss with `Esc` without
 changing anything. The exact chosen value is applied with `agents.set_option` or
 `agents.set_mode`; a selector is disabled until that call returns, so a stale
@@ -138,9 +144,10 @@ The task detail's Output tab and the Agent surface use the same conversation
 implementation (`src/conversation.rs` for the model and
 `src/views/conversation.rs` for the view). The detail wraps it with its task row,
 Output/Runs tabs and task-scoped restore; the Agent surface wraps it with a
-task-free header, the agent/model start form and a live session that survives
-route switches. There is no second copy of the feed, composer, permission
-banner, elicitation modal or session-option logic.
+task-free header, the agent/model start form and a bounded per-session cache
+that survives route switches and explicit session changes. There is no second
+copy of the feed, composer, permission banner, elicitation modal or
+session-option logic.
 
 A blocked run pins a warning banner with the request message and its options;
 **Allow once**, **Always allow** (when the agent offers it) and **Reject** map to
