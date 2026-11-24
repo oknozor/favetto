@@ -575,6 +575,13 @@ pub fn bindings() -> Vec<KeyBinding> {
             SettingsActivate,
             Some("Settings && !Palette && !Shortcuts"),
         ),
+        // Space toggles a boolean or cycles an enum, matching the elicitation
+        // form. Text fields keep space as input (`!TextField`).
+        KeyBinding::new(
+            "space",
+            SettingsActivate,
+            Some("Settings && !Palette && !Shortcuts && !TextField"),
+        ),
         KeyBinding::new(
             "secondary-enter",
             SettingsSave,

@@ -13,6 +13,7 @@ mod components;
 mod config;
 mod conversation;
 mod daemon_config;
+mod daemon_form;
 mod detail;
 mod elicitation;
 mod inbox;

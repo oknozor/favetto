@@ -67,24 +67,35 @@ place, can test the connection with `system.ping`, and switches theme and
 density. **Save** rewrites `gpui.toml` and reconnects.
 
 Settings also edits the **daemon's global config** (`config.toml`) through
-`config.get`/`config.set`. The card opens the file as raw TOML so every section
-(`agent`, `agents`, `daemon`, `repos`, `mcp`, `executor`, `git`, `webhook`,
-`tui`, `auth`) is reachable, and a missing file opens with defaults. A malformed
-file still opens with its raw text and parse errors so it can be repaired.
-Saving validates syntax and the daemon's startup preflight (agent registry, git
-signing resolution and webhook rules) before an atomic write; comments, unknown
-keys and the file mode are preserved, and a stale revision is rejected rather
-than clobbering another client's edit.
+`config.get`/`config.set` as a schema-backed form. Every documented section
+(`agent`, `agents`, `daemon`, `executor`, `git`, `auth`, `repos`, `mcp`) has
+labelled controls: text/path inputs, checkboxes, validated integers with units,
+enum chips, repeatable list rows, key/value map rows, and add/remove cards for
+agents, repository seeds and MCP servers. Defaults and field descriptions come
+from the generated schema, optional values can be reset to their default, and a
+missing file opens with defaults. `[tui]` is labelled client-side and lives in
+the advanced view.
 
-Secret values (literal webhook secrets, MCP `env`/`headers`, agent `env`) never
-leave the daemon: `config.get` replaces them with `__FAVETTO_REDACTED__`, and a
-save restores the literal value from disk. Removing the key explicitly clears it.
+The **Advanced / raw TOML** disclosure keeps the repair path: comments, unknown
+keys and a malformed file are edited as text without blocking Settings. Form
+edits are patched into the loaded document, so comments, unknown keys and the
+file mode survive. Saving validates syntax and the daemon's startup preflight
+(agent registry, git signing resolution, MCP seeds) before an atomic write, and a
+stale revision is rejected rather than clobbering another client's edit.
+
+Secret values (MCP `env`/`headers`, agent `env`) never leave the daemon:
+`config.get` replaces them with `__FAVETTO_REDACTED__`. The form masks them,
+starts an untouched secret in an "unchanged" state, and echoes the sentinel back
+on save so the daemon restores the literal value from disk; **Clear** removes the
+key explicitly. Daemon preflight errors are attached to the named field when the
+message starts with its dotted path and remain in the card-level summary.
 
 Most sections are read once at startup, so a successful save reports
 `restart_required`; `[tui]` is the exception and is labelled as client-side.
-`FAVETTO_*` environment overrides are listed in the card because the effective
-value can differ from the saved file. Live repository and MCP changes belong to
-the `repos.*`/`mcp.*` RPCs; the config sections are only startup seeds.
+`FAVETTO_*` environment overrides are shown per field and in the card summary
+because the effective value can differ from the saved file. Live repository and
+MCP changes belong to the `repos.*`/`mcp.*` RPCs; the config sections are only
+startup seeds.
 
 ## Common shortcuts
 

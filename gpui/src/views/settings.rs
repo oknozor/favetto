@@ -532,6 +532,675 @@ impl SettingsView {
             )
     }
 
+    fn daemon_text_control(
+        &self,
+        theme: &Theme,
+        control: usize,
+        focused: bool,
+        placeholder: &str,
+        masked: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        div()
+            .id(("settings-daemon-control", control))
+            .flex_1()
+            .min_w_0()
+            .h(px(34.0))
+            .px(px(theme.spacing.s2))
+            .flex()
+            .items_center()
+            .rounded(px(theme.radii.r4))
+            .border_1()
+            .border_color(if focused {
+                theme.colors.accent
+            } else {
+                theme.colors.border
+            })
+            .bg(theme.colors.bg)
+            .cursor_text()
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.focus_settings(Some(SettingsFocus::DaemonControl(control)));
+                    cx.notify();
+                });
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .font_family("monospace")
+                    .text_size(px(theme.font.sm))
+                    .child(
+                        state_text_element(
+                            &self.state,
+                            TextTarget::SettingsDaemonControl(control),
+                            theme,
+                            cx,
+                        )
+                        .placeholder(placeholder)
+                        .masked(masked),
+                    ),
+            )
+    }
+
+    fn daemon_small_button(
+        &self,
+        theme: &Theme,
+        id: impl Into<gpui::ElementId>,
+        label: impl Into<String>,
+        cx: &mut Context<Self>,
+        action: impl Fn(&mut ClientState) + 'static,
+    ) -> Stateful<Div> {
+        components::with_focus(
+            div()
+                .id(id)
+                .h(px(theme.controls.min))
+                .px(px(theme.spacing.s2))
+                .flex()
+                .items_center()
+                .gap(px(theme.spacing.s1))
+                .rounded(px(theme.radii.r4))
+                .border_1()
+                .border_color(theme.colors.border)
+                .text_size(px(theme.font.xs))
+                .text_color(theme.colors.text)
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.colors.bg))
+                .child(label.into())
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.state.update(cx, |state, cx| {
+                        action(state);
+                        cx.notify();
+                    });
+                })),
+            theme,
+        )
+    }
+
+    fn daemon_enum_chips(
+        &self,
+        theme: &Theme,
+        field: usize,
+        choices: &[crate::daemon_form::EnumChoice],
+        selected: Option<&str>,
+        optional: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mut chips = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(theme.spacing.s1));
+        if optional {
+            let is_selected = selected.is_none();
+            chips = chips.child(self.daemon_choice_chip(
+                theme,
+                element_id(format!("daemon-enum-{field}-unset")),
+                "Unset / default",
+                is_selected,
+                cx,
+                move |state| state.daemon_config_mut().set_enum(field, None),
+            ));
+        }
+        for (index, choice) in choices.iter().enumerate() {
+            let choice_value = choice.value.clone();
+            let is_selected = selected == Some(choice.value.as_str());
+            chips = chips.child(self.daemon_choice_chip(
+                theme,
+                element_id(format!("daemon-enum-{field}-{index}")),
+                choice.label().to_string(),
+                is_selected,
+                cx,
+                move |state| {
+                    state
+                        .daemon_config_mut()
+                        .set_enum(field, Some(choice_value.clone()))
+                },
+            ));
+        }
+        chips
+    }
+
+    fn daemon_choice_chip(
+        &self,
+        theme: &Theme,
+        id: impl Into<gpui::ElementId>,
+        label: impl Into<String>,
+        selected: bool,
+        cx: &mut Context<Self>,
+        action: impl Fn(&mut ClientState) + 'static,
+    ) -> Stateful<Div> {
+        let mut chip = div()
+            .id(id)
+            .h(px(theme.controls.min))
+            .px(px(theme.spacing.s2))
+            .flex()
+            .items_center()
+            .gap(px(theme.spacing.s1))
+            .rounded(px(theme.radii.r4))
+            .border_1()
+            .border_color(if selected {
+                theme.colors.accent
+            } else {
+                theme.colors.border
+            })
+            .text_size(px(theme.font.xs))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    action(state);
+                    cx.notify();
+                });
+            }));
+        if selected {
+            chip = chip
+                .bg(Hsla::from(theme.colors.accent).opacity(0.16))
+                .text_color(theme.colors.accent)
+                .child("✓");
+        } else {
+            chip = chip
+                .text_color(theme.colors.text)
+                .hover(|style| style.bg(theme.colors.bg));
+        }
+        chip.child(label.into())
+    }
+
+    fn daemon_field_row(
+        &self,
+        theme: &Theme,
+        form: &crate::daemon_form::ConfigForm,
+        field_index: usize,
+        overrides: &[favetto_wire::rpc::ConfigOverride],
+        focus: Option<SettingsFocus>,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        use crate::daemon_form::{ControlRef, FieldKind};
+
+        let field = &form.fields()[field_index];
+        let controls = form.field_controls(field_index);
+        let overridden = overrides.iter().any(|entry| {
+            entry.key == field.path
+                || field.path.starts_with(&format!("{}.", entry.key))
+                || entry.key.starts_with(&format!("{}.", field.path))
+        });
+
+        let mut header = div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap(px(theme.spacing.s1))
+            .child(
+                div()
+                    .text_size(px(theme.font.sm))
+                    .text_color(theme.colors.text)
+                    .child(field.label.clone()),
+            );
+        if field.required {
+            header = header.child(
+                div()
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.warning)
+                    .child("required"),
+            );
+        }
+        if let Some(default) = &field.default {
+            header = header.child(
+                div()
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.muted)
+                    .child(format!("default: {default}")),
+            );
+        }
+        if overridden {
+            header = header.child(
+                div()
+                    .px(px(theme.spacing.s1))
+                    .rounded(px(theme.radii.r4))
+                    .border_1()
+                    .border_color(theme.colors.warning)
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.warning)
+                    .child("FAVETTO_* override"),
+            );
+        }
+        if field.boot_only {
+            header = header.child(
+                div()
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.warning)
+                    .child("boot-only"),
+            );
+        }
+        header = header.child(div().flex_1());
+        if field.is_present() {
+            header = header.child(self.daemon_small_button(
+                theme,
+                ("daemon-reset-field", field_index),
+                "Reset",
+                cx,
+                move |state| state.daemon_config_mut().reset_field(field_index),
+            ));
+        }
+
+        let mut row = div()
+            .id(("daemon-field", field_index))
+            .flex()
+            .flex_col()
+            .gap(px(theme.spacing.s1))
+            .px(px(theme.spacing.s2))
+            .py(px(theme.spacing.s1))
+            .rounded(px(theme.radii.r4))
+            .child(header);
+        if !field.help.is_empty() {
+            row = row.child(
+                div()
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.muted)
+                    .child(field.help.clone()),
+            );
+        }
+
+        let placeholder = match &field.default {
+            Some(default) => format!("Unset (default: {default})"),
+            None => "Unset".to_string(),
+        };
+        let control_row = match &field.kind {
+            FieldKind::Text { numeric: true, .. } => {
+                let unit = field_unit(&field.path);
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s2))
+                    .child(
+                        self.daemon_text_control(
+                            theme,
+                            controls.first().map(|(index, _)| *index).unwrap_or(0),
+                            focus
+                                == controls
+                                    .first()
+                                    .map(|(index, _)| SettingsFocus::DaemonControl(*index)),
+                            &placeholder,
+                            false,
+                            cx,
+                        ),
+                    )
+                    .when_some(unit, |row, unit| {
+                        row.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(px(theme.font.xs))
+                                .text_color(theme.colors.muted)
+                                .child(unit),
+                        )
+                    })
+                    .into_any_element()
+            }
+            FieldKind::Text { .. } => self
+                .daemon_text_control(
+                    theme,
+                    controls.first().map(|(index, _)| *index).unwrap_or(0),
+                    focus
+                        == controls
+                            .first()
+                            .map(|(index, _)| SettingsFocus::DaemonControl(*index)),
+                    &placeholder,
+                    false,
+                    cx,
+                )
+                .into_any_element(),
+            FieldKind::Bool { value, present } => {
+                let control = controls.first().map(|(index, _)| *index).unwrap_or(0);
+                let label = if *present {
+                    if *value {
+                        "Enabled"
+                    } else {
+                        "Disabled"
+                    }
+                } else {
+                    "Use default"
+                };
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.s2))
+                    .child(
+                        div()
+                            .id(("daemon-bool", field_index))
+                            .h(px(theme.controls.min))
+                            .px(px(theme.spacing.s2))
+                            .flex()
+                            .items_center()
+                            .gap(px(theme.spacing.s2))
+                            .rounded(px(theme.radii.r4))
+                            .border_1()
+                            .border_color(if focus == Some(SettingsFocus::DaemonControl(control)) {
+                                theme.colors.accent
+                            } else {
+                                theme.colors.border
+                            })
+                            .bg(theme.colors.bg)
+                            .cursor_pointer()
+                            .text_size(px(theme.font.sm))
+                            .text_color(theme.colors.text)
+                            .child(if *present && *value { "☑" } else { "☐" })
+                            .child(label)
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.state.update(cx, |state, cx| {
+                                    state.focus_settings(Some(SettingsFocus::DaemonControl(
+                                        control,
+                                    )));
+                                    let current = state
+                                        .daemon_config()
+                                        .form()
+                                        .and_then(|form| form.field(field_index))
+                                        .is_some_and(|field| {
+                                            matches!(
+                                                field.kind,
+                                                FieldKind::Bool { value: true, .. }
+                                            )
+                                        });
+                                    state.daemon_config_mut().set_bool(field_index, !current);
+                                    cx.notify();
+                                });
+                            })),
+                    )
+                    .into_any_element()
+            }
+            FieldKind::Enum {
+                choices,
+                selected,
+                optional,
+            } => self
+                .daemon_enum_chips(
+                    theme,
+                    field_index,
+                    choices,
+                    selected.as_deref(),
+                    *optional,
+                    cx,
+                )
+                .into_any_element(),
+            FieldKind::List { rows, choices, .. } => {
+                let mut list = div().flex().flex_col().gap(px(theme.spacing.s1));
+                if let Some(choices) = choices {
+                    for (row, row_input) in rows.iter().enumerate() {
+                        let selected = row_input.value().to_string();
+                        let selected = if selected.is_empty() {
+                            choices.first().map(|choice| choice.value.clone())
+                        } else {
+                            Some(selected)
+                        };
+                        let mut choices_row = div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(theme.spacing.s1));
+                        for (choice_index, choice) in choices.iter().enumerate() {
+                            let value = choice.value.clone();
+                            choices_row = choices_row.child(self.daemon_choice_chip(
+                                theme,
+                                element_id(format!(
+                                    "daemon-list-choice-{field_index}-{row}-{choice_index}"
+                                )),
+                                choice.label().to_string(),
+                                selected.as_deref() == Some(value.as_str()),
+                                cx,
+                                move |state| {
+                                    state.daemon_config_mut().set_list_choice(
+                                        field_index,
+                                        row,
+                                        value.clone(),
+                                    );
+                                },
+                            ));
+                        }
+                        list = list.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(theme.spacing.s2))
+                                .child(choices_row)
+                                .child(self.daemon_small_button(
+                                    theme,
+                                    element_id(format!("daemon-list-remove-{field_index}-{row}")),
+                                    "Remove",
+                                    cx,
+                                    move |state| {
+                                        state.daemon_config_mut().remove_list_item(field_index, row)
+                                    },
+                                )),
+                        );
+                    }
+                } else {
+                    for (row, input) in rows.iter().enumerate() {
+                        let control = controls
+                            .iter()
+                            .find(|(_, control)| {
+                                matches!(control, ControlRef::ListItem(_, index) if *index == row)
+                            })
+                            .map(|(index, _)| *index)
+                            .unwrap_or(0);
+                        list = list.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(theme.spacing.s2))
+                                .child(self.daemon_text_control(
+                                    theme,
+                                    control,
+                                    focus == Some(SettingsFocus::DaemonControl(control)),
+                                    "Value",
+                                    false,
+                                    cx,
+                                ))
+                                .child(self.daemon_small_button(
+                                    theme,
+                                    element_id(format!("daemon-list-remove-{field_index}-{row}")),
+                                    "Remove",
+                                    cx,
+                                    move |state| {
+                                        state.daemon_config_mut().remove_list_item(field_index, row)
+                                    },
+                                )),
+                        );
+                        let _ = input;
+                    }
+                }
+                list = list.child(self.daemon_small_button(
+                    theme,
+                    ("daemon-list-add", field_index),
+                    "Add entry",
+                    cx,
+                    move |state| state.daemon_config_mut().add_list_item(field_index),
+                ));
+                list.into_any_element()
+            }
+            FieldKind::Map { rows, secret } => {
+                let secret_value = *secret;
+                let mut map = div().flex().flex_col().gap(px(theme.spacing.s1));
+                for (row, entry) in rows.iter().enumerate() {
+                    let key_control = controls
+                        .iter()
+                        .find(|(_, control)| {
+                            matches!(control, ControlRef::MapKey(_, index) if *index == row)
+                        })
+                        .map(|(index, _)| *index)
+                        .unwrap_or(0);
+                    let value_control = controls
+                        .iter()
+                        .find(|(_, control)| {
+                            matches!(control, ControlRef::MapValue(_, index) if *index == row)
+                        })
+                        .map(|(index, _)| *index)
+                        .unwrap_or(0);
+                    let value_placeholder = if secret_value && entry.unchanged {
+                        "Unchanged secret — type to replace"
+                    } else if secret_value {
+                        "Secret value"
+                    } else {
+                        "Value"
+                    };
+                    map = map.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(theme.spacing.s2))
+                            .child(
+                                div()
+                                    .w(px(180.0))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .flex_col()
+                                    .child(self.daemon_text_control(
+                                        theme,
+                                        key_control,
+                                        focus == Some(SettingsFocus::DaemonControl(key_control)),
+                                        "Key",
+                                        false,
+                                        cx,
+                                    ))
+                                    .when_some(entry.key_error.clone(), |cell, error| {
+                                        cell.child(
+                                            div()
+                                                .text_size(px(theme.font.xs))
+                                                .text_color(theme.colors.danger)
+                                                .child(error),
+                                        )
+                                    }),
+                            )
+                            .child(self.daemon_text_control(
+                                theme,
+                                value_control,
+                                focus == Some(SettingsFocus::DaemonControl(value_control)),
+                                value_placeholder,
+                                secret_value,
+                                cx,
+                            ))
+                            .child(self.daemon_small_button(
+                                theme,
+                                element_id(format!("daemon-map-clear-{field_index}-{row}")),
+                                if secret_value { "Clear" } else { "Remove" },
+                                cx,
+                                move |state| {
+                                    if secret_value {
+                                        state.daemon_config_mut().clear_secret(field_index, row)
+                                    } else {
+                                        state.daemon_config_mut().remove_map_row(field_index, row)
+                                    }
+                                },
+                            )),
+                    );
+                }
+                map = map.child(self.daemon_small_button(
+                    theme,
+                    ("daemon-map-add", field_index),
+                    "Add entry",
+                    cx,
+                    move |state| state.daemon_config_mut().add_map_row(field_index),
+                ));
+                map.into_any_element()
+            }
+        };
+        row = row.child(control_row);
+        if let Some(error) = &field.error {
+            row = row.child(
+                div()
+                    .text_size(px(theme.font.xs))
+                    .text_color(theme.colors.danger)
+                    .child(format!("⚠ {error}")),
+            );
+        }
+        row
+    }
+
+    fn daemon_form_view(
+        &self,
+        theme: &Theme,
+        form: &crate::daemon_form::ConfigForm,
+        overrides: &[favetto_wire::rpc::ConfigOverride],
+        focus: Option<SettingsFocus>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        use crate::daemon_form::LayoutItem;
+
+        let mut body = div().flex().flex_col().gap(px(theme.spacing.s2));
+        for item in form.layout() {
+            match item {
+                LayoutItem::Section(section) => {
+                    body = body.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .pt(px(theme.spacing.s2))
+                            .child(components::section_label(theme, section.label()))
+                            .when_some(section.note(), |section, note| {
+                                section.child(
+                                    div()
+                                        .text_size(px(theme.font.xs))
+                                        .text_color(theme.colors.muted)
+                                        .child(note),
+                                )
+                            }),
+                    );
+                }
+                LayoutItem::Group(index) => {
+                    let group = &form.groups()[*index];
+                    let mut header = div()
+                        .id(("daemon-group", *index))
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap(px(theme.spacing.s2))
+                        .py(px(2.0))
+                        .border_b_1()
+                        .border_color(theme.colors.border);
+                    if !group.title.is_empty() {
+                        header = header.child(
+                            div()
+                                .text_size(px(theme.font.xs))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme.colors.muted)
+                                .child(group.title.clone()),
+                        );
+                    }
+                    header = header.child(div().flex_1());
+                    if let Some(remove) = group.remove.clone() {
+                        header = header.child(self.daemon_small_button(
+                            theme,
+                            ("daemon-remove", *index),
+                            "Remove",
+                            cx,
+                            move |state| {
+                                state.daemon_config_mut().remove(&remove);
+                                state.focus_settings(None);
+                            },
+                        ));
+                    }
+                    if let Some(add) = group.add.clone() {
+                        header = header.child(self.daemon_small_button(
+                            theme,
+                            ("daemon-add", *index),
+                            add.label(),
+                            cx,
+                            move |state| {
+                                state.daemon_config_mut().add(&add);
+                                state.focus_settings(None);
+                            },
+                        ));
+                    }
+                    body = body.child(header);
+                }
+                LayoutItem::Field(index) => {
+                    body = body
+                        .child(self.daemon_field_row(theme, form, *index, overrides, focus, cx));
+                }
+                LayoutItem::EndGroup(_) => {}
+            }
+        }
+        body
+    }
+
     fn daemon_config_card(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let (
             path,
@@ -547,6 +1216,8 @@ impl SettingsView {
             loading,
             load_error,
             focus,
+            advanced,
+            form,
         ) = {
             let state = self.state.read(cx);
             let config = state.daemon_config();
@@ -564,9 +1235,10 @@ impl SettingsView {
                 config.is_loading(),
                 config.load_error().map(str::to_string),
                 state.settings().focus(),
+                config.is_advanced(),
+                config.form().cloned(),
             )
         };
-        let focused = focus == Some(SettingsFocus::DaemonConfig);
         let can_save = self.state.read(cx).daemon_config().can_save();
         let status_color = match status {
             crate::daemon_config::DaemonConfigStatus::Invalid => theme.colors.danger,
@@ -576,46 +1248,6 @@ impl SettingsView {
             crate::daemon_config::DaemonConfigStatus::Saved => theme.colors.success,
             crate::daemon_config::DaemonConfigStatus::Idle => theme.colors.muted,
         };
-
-        let editor = div()
-            .id("settings-daemon-config-editor")
-            .flex()
-            .flex_col()
-            .min_h(px(220.0))
-            .p(px(theme.spacing.s3))
-            .rounded(px(theme.radii.r4))
-            .border_2()
-            .border_color(if focused {
-                theme.colors.accent
-            } else {
-                theme.colors.border
-            })
-            .bg(theme.colors.bg)
-            .cursor_text()
-            .on_click(cx.listener(|this, _event, _window, cx| {
-                this.state.update(cx, |state, cx| {
-                    state.focus_settings(Some(SettingsFocus::DaemonConfig));
-                    cx.notify();
-                });
-            }))
-            .child(
-                div()
-                    .font_family("monospace")
-                    .text_size(px(theme.font.sm))
-                    .child(
-                        state_text_element(
-                            &self.state,
-                            TextTarget::SettingsDaemonConfig,
-                            theme,
-                            cx,
-                        )
-                        .multiline(true)
-                        .max_visible_lines(24)
-                        .placeholder(
-                            "# ~/.config/favetto/config.toml\n# A missing file is valid: defaults apply.",
-                        ),
-                    ),
-            );
 
         let save = components::with_focus(
             div()
@@ -720,11 +1352,75 @@ impl SettingsView {
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.state.update(cx, |state, cx| {
                         state.reset_daemon_config();
+                        state.focus_settings(None);
                         cx.notify();
                     });
                 })),
             theme,
         );
+
+        let advanced_toggle = self.daemon_small_button(
+            theme,
+            "settings-daemon-advanced",
+            if advanced {
+                "Back to form"
+            } else {
+                "Advanced / raw TOML"
+            },
+            cx,
+            |state| {
+                let next = !state.daemon_config().is_advanced();
+                state.daemon_config_mut().set_advanced(next);
+                let advanced = state.daemon_config().is_advanced();
+                state.focus_settings(Some(if advanced {
+                    SettingsFocus::DaemonRaw
+                } else if state.daemon_config().control_count() > 0 {
+                    SettingsFocus::DaemonControl(0)
+                } else {
+                    SettingsFocus::DaemonForm
+                }));
+            },
+        );
+
+        let editor = div()
+            .id("settings-daemon-config-editor")
+            .flex()
+            .flex_col()
+            .min_h(px(220.0))
+            .p(px(theme.spacing.s3))
+            .rounded(px(theme.radii.r4))
+            .border_2()
+            .border_color(if focus == Some(SettingsFocus::DaemonRaw) {
+                theme.colors.accent
+            } else {
+                theme.colors.border
+            })
+            .bg(theme.colors.bg)
+            .cursor_text()
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.focus_settings(Some(SettingsFocus::DaemonRaw));
+                    cx.notify();
+                });
+            }))
+            .child(
+                div()
+                    .font_family("monospace")
+                    .text_size(px(theme.font.sm))
+                    .child(
+                        state_text_element(
+                            &self.state,
+                            TextTarget::SettingsDaemonRaw,
+                            theme,
+                            cx,
+                        )
+                        .multiline(true)
+                        .max_visible_lines(24)
+                        .placeholder(
+                            "# ~/.config/favetto/config.toml\n# A missing file is valid: defaults apply.",
+                        ),
+                    ),
+            );
 
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
         for error in &errors {
@@ -811,12 +1507,18 @@ impl SettingsView {
             );
         }
 
+        let form_body = form
+            .as_ref()
+            .map(|form| self.daemon_form_view(theme, form, &overrides, focus, cx));
+
         card(theme)
             .child(components::section_label(theme, "DAEMON / GLOBAL CONFIG"))
             .child(hint(
                 theme,
-                "Edits the daemon's config.toml as raw TOML. The client's gpui.toml stays separate. \
-                 Enter inserts a newline; Tab moves between controls; ⌘↵ saves.",
+                "Edit the daemon's config.toml with typed controls. Values are patched into the \
+                 loaded file, so comments and unknown keys survive; Save still validates, checks \
+                 the revision and writes atomically. Use the advanced view for comments, unknown \
+                 keys, client-side [tui] settings and malformed-file repair.",
             ))
             .child(value_row(
                 theme,
@@ -836,23 +1538,26 @@ impl SettingsView {
                             .text_color(status_color)
                             .child(format!("● {}", status.label())),
                     )
-                    .child(
-                        div()
-                            .text_color(theme.colors.muted)
-                            .child(if exists {
-                                "file present"
-                            } else {
-                                "missing file — defaults apply"
-                            }),
-                    ),
+                    .child(div().text_color(theme.colors.muted).child(if exists {
+                        "file present"
+                    } else {
+                        "missing file — defaults apply"
+                    }))
+                    .child(div().flex_1())
+                    .child(advanced_toggle),
             )
-            .child(editor)
+            .when(advanced || form_body.is_none(), |card| card.child(editor))
+            .when(!advanced, |card| match form_body {
+                Some(form_body) => card.child(form_body),
+                None => card,
+            })
             .child(hint(
                 theme,
                 "The [repos] and [mcp] sections only seed their registries at startup; use the \
-                 repos.*/mcp.* RPCs for live changes. Changing daemon.listen, socket, tasks_dir, \
+                 repos.*/mcp.* RPCs for live changes. Changing daemon listen/socket/tasks_dir/\
                  data_dir, auth.require_tls or an agent command can make the daemon unreachable or \
-                 launch a different executable after restart.",
+                 launch a different executable after restart. [tui] is client-side and lives in \
+                 the advanced view.",
             ))
             .when(!rows.is_empty(), |card| {
                 card.child(
@@ -1415,6 +2120,26 @@ impl Render for SettingsView {
                     .child(self.appearance_card(theme, cx))
                     .child(self.about_card(theme, cx)),
             )
+    }
+}
+
+fn element_id(value: String) -> gpui::ElementId {
+    gpui::ElementId::Name(gpui::SharedString::new(value))
+}
+
+fn field_unit(path: &str) -> Option<&'static str> {
+    if path.ends_with("_ms") {
+        Some("milliseconds")
+    } else if path.ends_with("_secs") {
+        Some("seconds")
+    } else if path.ends_with("_bytes") {
+        Some("bytes")
+    } else if path.ends_with("days") {
+        Some("days")
+    } else if path.ends_with("_worktrees") || path.ends_with("min_tasks") {
+        Some("count")
+    } else {
+        None
     }
 }
 

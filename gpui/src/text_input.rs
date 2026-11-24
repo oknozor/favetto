@@ -627,8 +627,10 @@ pub enum TextTarget {
     SettingsEndpoint,
     /// The Settings bearer token.
     SettingsToken,
-    /// The Settings raw daemon `config.toml` editor.
-    SettingsDaemonConfig,
+    /// One generated control in the Settings daemon config form.
+    SettingsDaemonControl(usize),
+    /// The Settings advanced/raw daemon `config.toml` editor.
+    SettingsDaemonRaw,
     /// The task detail's / Agent panel's follow-up composer.
     DetailPrompt,
     /// The Agent panel's model override before a session starts.
