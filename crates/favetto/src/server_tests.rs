@@ -213,10 +213,6 @@ MCP_TOKEN = "mcp-secret"
     assert!(written.contains("# keep this comment"), "{written}");
     let config = crate::config::FavettoConfig::parse_str(&written).unwrap();
     assert_eq!(
-        config.webhook.github.secret.as_deref(),
-        Some("webhook-secret")
-    );
-    assert_eq!(
         config.agents["custom"]
             .env
             .get("AGENT_TOKEN")
@@ -341,20 +337,6 @@ async fn config_validate_accepts_an_inline_draft_and_runs_preflight() {
     .await;
     assert_eq!(invalid["valid"], serde_json::json!(false));
 
-    // Preflight rejects a webhook rule naming a task that is not in the catalog.
-    let unknown_task = config_rpc(
-        &state,
-        method::CONFIG_VALIDATE,
-        serde_json::json!({
-            "raw": "[[webhook.github.rules]]\nname = \"r\"\nevent = \"issues\"\ntask = \"missing\"\n",
-        }),
-    )
-    .await;
-    assert_eq!(
-        unknown_task["valid"],
-        serde_json::json!(false),
-        "{unknown_task}"
-    );
     // A draft never writes the file.
     assert!(!dir.join("config.toml").exists());
 }

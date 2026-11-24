@@ -620,8 +620,7 @@ fn config_warnings(overrides: &[ConfigOverride]) -> Vec<String> {
 /// Run the startup preflight that does not need to mutate daemon state.
 ///
 /// This catches drafts that parse but would break startup: an agent registry
-/// that cannot be built, git signing settings that cannot resolve their key,
-/// and webhook rules that name an unknown task.
+/// that cannot be built and git signing settings that cannot resolve their key.
 fn config_preflight(state: &State, config: &crate::config::FavettoConfig) -> Vec<String> {
     let mut errors = Vec::new();
 
@@ -654,10 +653,6 @@ fn config_preflight(state: &State, config: &crate::config::FavettoConfig) -> Vec
                 error_chain(&error).join(": ")
             ));
         }
-    }
-
-    if let Err(error) = crate::webhooks::validate_rules(config, &state.catalog.read()) {
-        errors.extend(error_chain(&error));
     }
 
     errors

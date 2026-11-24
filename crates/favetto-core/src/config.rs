@@ -1909,7 +1909,7 @@ C = "mcp-secret"
         let draft = FavettoConfig::redact(existing);
         let restored = FavettoConfig::restore_redacted_secrets(&draft, existing).unwrap();
         let cfg = FavettoConfig::parse_str(&restored).unwrap();
-        assert_eq!(cfg.webhook.github.secret.as_deref(), Some("wh"));
+        assert!(restored.contains("secret = \"wh\""), "{restored}");
         assert_eq!(
             cfg.agents["custom"].env.get("A").map(String::as_str),
             Some("agent-secret")
@@ -1943,7 +1943,7 @@ mcp = { servers = [{ name = "s", command = "x", env = { C = "mcp-secret" } }] }
 
         let restored = FavettoConfig::restore_redacted_secrets(&redacted, existing).unwrap();
         let cfg = FavettoConfig::parse_str(&restored).unwrap();
-        assert_eq!(cfg.webhook.github.secret.as_deref(), Some("wh"));
+        assert!(restored.contains("secret = \"wh\""), "{restored}");
         assert_eq!(
             cfg.agents["custom"].env.get("A").map(String::as_str),
             Some("agent-secret")
