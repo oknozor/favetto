@@ -41,7 +41,7 @@ futures-util = { version = "0.3", features = ["std", "sink", "io", "async-await"
 hex = "0.4"
 http = "1"
 libc = "0.2"
-parking_lot = "0.12"
+parking_lot = "0.13"
 thiserror = "2"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 schemars = { version = "1", features = ["derive"] }
@@ -62,7 +62,7 @@ throbber-widgets-tui = "0.11"
 url = "2"
 
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-notify = "8.2.0"
+notify = "9.0.0"
 
 [dev-dependencies]
 favetto-mcp = { path = "../favetto-mcp" }
